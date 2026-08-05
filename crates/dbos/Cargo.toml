@@ -1,0 +1,33 @@
+[package]
+name = "dbos"
+description = "Lightweight durable workflows on Postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["engine"]
+# Gates the durable execution engine: registry, contexts, workflows, steps, queues,
+# scheduler, messaging, and the client. With it off, what remains is the system database
+# and Conductor layers — the surface a future FFI host would consume. Nothing is behind
+# it yet, but it exists now so `cargo check --no-default-features` is a standing CI gate
+# rather than something switched on once the boundary is already blurred.
+engine = []
+# A `macros` feature (implying `engine`) arrives with the `dbos-macros` crate. Adding a
+# feature is not a breaking change, so it waits until it re-exports something.
+
+[dependencies]
+
+[dev-dependencies]
+# Integration tests need a real database, and testcontainers is the only way they get one:
+# no environment variable points the suite at a long-lived server, so a green `cargo test`
+# means the same thing on a laptop as in CI.
+testcontainers = "0.27"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -1,0 +1,55 @@
+# cargo-deny configuration — one of the standing CI gates.
+#
+# Written against cargo-deny 0.20. The point of this file is that a dependency
+# with an incompatible license or a known advisory fails the build rather than
+# being noticed at publish time, when the repo goes public.
+
+[graph]
+# v1 targets what the CI matrix builds. Narrowing the graph keeps the advisory
+# and license checks focused on code we actually ship.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# No blanket ignores. An advisory we choose to accept gets its ID listed here with
+# a comment saying why and what would retire it — never a silent global exception.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only, matching the four reference implementations (all MIT).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Duplicate versions are a warning, not an error: with sqlx and tokio in the graph
+# some duplication is out of our hands, and failing CI on a transitive dependency's
+# version skew would make the gate noise rather than signal.
+skip = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# crates.io only. A git dependency in a library published to crates.io cannot be
+# published at all, so this is a gate against a mistake we would find out about late.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

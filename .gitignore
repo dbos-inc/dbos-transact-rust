@@ -1,0 +1,11 @@
+/target/
+
+# Cargo.lock is deliberately NOT ignored. The workspace will ship a binary
+# (dbos-cli) and CI pins an MSRV, both of which want a reproducible dependency
+# graph; current Cargo guidance is to commit the lockfile for mixed workspaces.
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

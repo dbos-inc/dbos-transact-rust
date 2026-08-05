@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings everywhere, not only where a lint flag is passed.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned by tag here for readability. Pin them by commit SHA
+# before this repository goes public.
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+
+  deny:
+    name: Licenses and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    # Keep in step with `rust-version` in the workspace manifest: latest stable minus two.
+    # This job is the only thing that makes that number true.
+    env:
+      # Overrides rust-toolchain.toml, which tracks stable on purpose.
+      RUSTUP_TOOLCHAIN: "1.95"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --all-features
+
+  core-only:
+    name: Core-only build
+    runs-on: ubuntu-latest
+    # The library must compile with the engine feature off. This is the boundary between
+    # the system database / Conductor layers and everything built on top of them, and a
+    # compile failure here is the only thing that catches a stray dependency across it.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --no-default-features
+
+  test:
+    name: Test (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    # Both v1 backends are required, not advisory. The Cockroach leg has already caught
+    # two integer-width divergences that no amount of reading the SQL would have surfaced.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: postgres
+            cockroach: "false"
+          - backend: cockroach
+            cockroach: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        env:
+          DBOS_TEST_USE_COCKROACH_DB: ${{ matrix.cockroach }}
+        run: cargo test --all-features
+      - name: No containers left behind
+        # The harness shares one container by reference count and removes it when the last
+        # test drops it. A leak here is silent locally and would accumulate a container per
+        # CI run, so it is asserted rather than assumed. The label is applied by the
+        # harness itself — testcontainers-rs stamps `org.testcontainers.managed-by` but
+        # nothing that identifies these containers as ours.
+        run: |
+          filter='label=dev.dbos.test-harness=true'
+          remaining=$(docker ps -aq --filter "$filter" | wc -l)
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::$remaining test container(s) left behind by the suite"
+            docker ps -a --filter "$filter"
+            exit 1
+          fi

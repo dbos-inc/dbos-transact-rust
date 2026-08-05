@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+# One member today. Each crate is created by the work that first ships code into it,
+# rather than scaffolded up front: `dbos-macros` arrives with the attribute macros, and
+# `dbos-transact` only when a signpost release to `dbos` is cut.
+members = ["crates/dbos"]
+
+[workspace.package]
+# Published placeholders occupy 0.1.1 on crates.io, so the first real release must be
+# 0.1.2 or later. Nothing here is published yet.
+version = "0.1.2"
+edition = "2024"
+# Latest stable minus two, rolling. Stable was 1.97.1 on 2026-08-05. Bump this when
+# stable moves; CI is what makes it real.
+rust-version = "1.95"
+license = "MIT"
+authors = ["DBOS, Inc."]
+# `repository` is deliberately unset while dbos-inc/dbos-transact-rust is private: a
+# repository link that 404s is worse than none. Set it when the repo goes public, which
+# has to happen before any non-placeholder release anyway.

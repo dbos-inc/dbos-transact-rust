@@ -1,0 +1,131 @@
+//! Tests for the test harness itself.
+//!
+//! There is no library code to exercise yet, so what these assert is that the thing
+//! everything later depends on actually works: a real database on both v1 backends,
+//! containers shared rather than multiplied, and nothing left running afterwards.
+
+mod support;
+
+use std::sync::Arc;
+
+use support::{Backend, SharedSlot, raw_database, test_database};
+
+/// The harness reaches a real server and can run SQL on a fresh database.
+///
+/// Deliberately the raw lane: "no tables" is only true before migrations exist, so asserting
+/// it against the pooled lane would start failing the moment that lane means what it says.
+#[tokio::test]
+async fn connects_to_a_fresh_database() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+
+    // Explicitly `BIGINT` rather than a bare `SELECT 1`: CockroachDB types an integer
+    // literal as `INT8` where Postgres types it `INT4`, so a bare literal decodes into
+    // different Rust types on the two backends. Same lesson as the `SERIAL` test below —
+    // never let an integer's width be inferred.
+    let one: i64 = sqlx::query_scalar("SELECT 1::BIGINT")
+        .fetch_one(&pool)
+        .await
+        .expect("SELECT 1 failed");
+    assert_eq!(one, 1);
+
+    // Fresh means empty: no leftovers from another test's database.
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("failed to count tables");
+    assert_eq!(tables, 0, "a fresh test database should have no tables");
+}
+
+/// Two databases held at the same time come from one container.
+///
+/// This is the property that makes the suite affordable on CockroachDB, where schema
+/// changes are online and therefore slow. If this regresses, a CRDB run gets very slow
+/// rather than failing, so it is worth asserting directly.
+#[tokio::test]
+async fn overlapping_tests_share_one_container() {
+    let first = test_database().await;
+    let second = test_database().await;
+
+    assert_eq!(
+        first.server().container_id(),
+        second.server().container_id(),
+        "databases held at the same time should share one container",
+    );
+    assert_ne!(
+        first.url(),
+        second.url(),
+        "each test should get its own database",
+    );
+}
+
+/// The shared slot hands out one value and releases it once nobody holds it.
+///
+/// This is the property that keeps containers from accumulating one per run, and it is
+/// tested here on a plain value rather than on the live server: every other test in this
+/// binary holds the real one concurrently, so asserting release against it would be
+/// asserting that no other test is running.
+#[tokio::test]
+async fn shared_slot_releases_once_nobody_holds_it() {
+    let slot: SharedSlot<u32> = SharedSlot::new();
+
+    let first = slot.get_or_init(|| async { 1 }).await;
+    let second = slot.get_or_init(|| async { 2 }).await;
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "a second caller should share the first caller's value, not create another",
+    );
+    assert_eq!(*second, 1, "the factory should not have run a second time");
+
+    drop(first);
+    drop(second);
+
+    let third = slot.get_or_init(|| async { 3 }).await;
+    assert_eq!(
+        *third, 3,
+        "once the last holder drops, the next caller should get a fresh value — if this \
+         is 1, the slot is holding a strong reference and containers will leak",
+    );
+}
+
+/// `SERIAL` is not the same type on both backends: `INT4` on Postgres, `INT8` on
+/// CockroachDB.
+///
+/// This divergence was caught by the first CockroachDB CI run before the 2026-08-04 repo
+/// reset, and no amount of reading the migrations would have surfaced it. It is recorded
+/// here as an executable note, and it is why the DBOS schema uses explicit `BIGINT`
+/// rather than `SERIAL`. It also proves the backend switch actually reaches
+/// a different engine, which a `SELECT 1` cannot.
+#[tokio::test]
+async fn serial_width_diverges_between_backends() {
+    // Raw lane: this creates a table, and a pooled database must not be handed on dirty.
+    let db = raw_database().await;
+    let pool = db.pool().await;
+
+    sqlx::raw_sql("CREATE TABLE serial_probe (id SERIAL PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .expect("failed to create the probe table");
+
+    let data_type: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_name = 'serial_probe' AND column_name = 'id'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("failed to read the column type");
+
+    let expected = match db.backend() {
+        Backend::Postgres => "integer",
+        Backend::Cockroach => "bigint",
+    };
+    assert_eq!(
+        data_type.to_ascii_lowercase(),
+        expected,
+        "SERIAL width on {:?} — if this changed, re-check every integer column in the \
+         migrations before trusting it",
+        db.backend(),
+    );
+}

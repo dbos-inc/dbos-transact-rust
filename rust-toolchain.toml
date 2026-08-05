@@ -1,0 +1,6 @@
+[toolchain]
+# Track stable rather than pinning a version: the MSRV policy is rolling (latest stable
+# minus two), so a pin here would fight the policy CI enforces. What this file guarantees
+# is that everyone has the components the lint and format gates need.
+channel = "stable"
+components = ["rustfmt", "clippy"]
