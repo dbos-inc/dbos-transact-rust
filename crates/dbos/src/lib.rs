@@ -17,3 +17,5 @@
 //!   database and Conductor layers, which is the surface a future FFI host would consume.
 
 #![forbid(unsafe_code)]
+
+pub mod sysdb;
