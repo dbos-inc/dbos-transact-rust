@@ -23,7 +23,9 @@
 /// PostgreSQL. Each takes the keyword as its first `%s` — render with [`RenderArgs::online`].
 ///
 /// Empty on CockroachDB, which applies schema changes online regardless.
-pub const ONLINE_MIGRATIONS: &[u32] = &[22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37];
+pub const ONLINE_MIGRATIONS: &[u32] = &[
+    22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47,
+];
 
 /// Returns whether `version` is an online migration — see [`ONLINE_MIGRATIONS`].
 pub fn is_online(version: u32) -> bool {
@@ -226,6 +228,11 @@ sources![
     (40, "40_add_attributes.sql"),
     (41, "41_add_schedule_name.sql"),
     (42, "42_add_debounce_columns.sql"),
+    (43, "43_drop_streams_trigger.sql"),
+    (44, "44_drop_workflow_events_trigger.sql"),
+    (45, "45_add_partition_dequeue_index.sql"),
+    (46, "46_add_partition_dequeue_index_v2.sql"),
+    (47, "47_drop_partition_dequeue_index.sql"),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -246,6 +253,20 @@ pub const MIGRATION_10_PK_PROBE: MigrationSource = MigrationSource {
 pub fn source(name: &str) -> Option<&'static MigrationSource> {
     SOURCES.iter().find(|s| s.name == name)
 }
+
+/// The highest migration this implementation defines on its own.
+///
+/// Migrations from [`SHARED_MIGRATION_BASE`] up are defined identically by every DBOS
+/// implementation; everything below is each implementation's own history.
+pub const LOCAL_MIGRATIONS: u32 = 47;
+
+/// The index from which every implementation defines the same migration at the same number.
+///
+/// Below it each implementation keeps its own history and its own count, so the version
+/// recorded in `dbos_migrations` only means the same thing across implementations at or above
+/// this point. Local histories are padded up to `SHARED_MIGRATION_BASE - 1` so the shared
+/// series always begins here.
+pub const SHARED_MIGRATION_BASE: u32 = 100;
 
 /// Which SQL dialect the system database speaks.
 ///
@@ -322,7 +343,7 @@ pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool)
     };
     let sql_of = |name: &str| render(file(name), values).expect("corpus renders");
 
-    (1..=42)
+    (1..=LOCAL_MIGRATIONS)
         .map(|version| {
             let mut guard = None;
             let sql = match version {
@@ -356,7 +377,9 @@ pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool)
                     }
                     sql
                 }
-                39 if !notify => String::new(),
+                // 39 installs a trigger; 43 and 44 drop triggers that exist only when
+                // notifications are on. All three are no-ops otherwise.
+                39 | 43 | 44 if !notify => String::new(),
                 v => {
                     let name = SOURCES
                         .iter()
@@ -388,17 +411,17 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 47 files: 46 the runner applies, plus the migration-10 probe, which is bound
+        // 52 files: 51 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 46);
+        assert_eq!(SOURCES.len(), 51);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
         versions.dedup();
         assert_eq!(
             versions,
-            (1..=42).collect::<Vec<_>>(),
-            "the corpus should cover migrations 1 through 42 with no gaps",
+            (1..=LOCAL_MIGRATIONS).collect::<Vec<_>>(),
+            "the corpus should cover every migration up to LOCAL_MIGRATIONS with no gaps",
         );
 
         // Four files share a version with another: the LISTEN/NOTIFY halves of migrations 1
@@ -462,12 +485,12 @@ mod tests {
         }
         // 47 files, less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 45, "expected 45 files to carry a numbered header");
+        assert_eq!(checked, 50, "expected 50 files to carry a numbered header");
     }
 
     #[test]
     fn online_migrations_match_the_reference_set() {
-        assert_eq!(ONLINE_MIGRATIONS.len(), 13);
+        assert_eq!(ONLINE_MIGRATIONS.len(), 16);
         assert!(is_online(22) && is_online(37));
         // The gaps are real: 28, 33, and 36 are not online.
         assert!(!is_online(28) && !is_online(33) && !is_online(36));

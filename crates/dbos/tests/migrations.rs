@@ -92,8 +92,8 @@ async fn the_corpus_applies_to_a_real_database() {
     let migrations = build_migrations(schema, dialect_for(db.backend()), true);
     assert_eq!(
         migrations.len(),
-        42,
-        "the corpus covers migrations 1 through 42"
+        dbos::sysdb::migrations::LOCAL_MIGRATIONS as usize,
+        "one entry per locally-defined migration",
     );
     apply_all(&pool, schema, &migrations).await;
 
@@ -156,6 +156,55 @@ async fn late_migrations_take_effect() {
             "workflow_status is missing {expected}; got {cols:?}",
         );
     }
+}
+
+/// Migrations 43 and 44 leave only the notifications trigger behind.
+///
+/// Migration 1 installs notification and workflow-events triggers and 39 adds the streams
+/// one; 43 and 44 then drop two of the three, because those writes are coalesced by the
+/// notifier off the write path. Only `notifications` still fires per row.
+#[tokio::test]
+async fn only_the_notifications_trigger_survives() {
+    let db = raw_database().await;
+    if db.backend() == Backend::Cockroach {
+        return; // CockroachDB installs none of them.
+    }
+    let pool = db.pool().await;
+    let schema = "dbos";
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    apply_all(
+        &pool,
+        schema,
+        &build_migrations(schema, Dialect::Postgres, true),
+    )
+    .await;
+
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT trigger_name FROM information_schema.triggers \
+         WHERE trigger_schema = $1 ORDER BY 1",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list triggers");
+    assert_eq!(names, vec!["dbos_notifications_trigger".to_owned()]);
+
+    // The v1 partition index is created by 45 and dropped by 47; only v2 survives.
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = $1 \
+         AND indexname LIKE 'idx_workflow_status_partition%' ORDER BY 1",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list indexes");
+    assert_eq!(
+        indexes,
+        vec!["idx_workflow_status_partition_dequeue_v2".to_owned()],
+    );
 }
 
 /// Migration 10 is skipped, because migration 1 already created the primary key.
@@ -227,7 +276,10 @@ async fn dialects_agree_on_the_number_of_versions() {
 
     // No migration is marked online on CockroachDB, where DDL is online anyway.
     assert!(crdb.iter().all(|m| !m.online));
-    assert_eq!(pg.iter().filter(|m| m.online).count(), 13);
+    assert_eq!(
+        pg.iter().filter(|m| m.online).count(),
+        dbos::sysdb::migrations::ONLINE_MIGRATIONS.len(),
+    );
 }
 
 /// The corpus applies with notifications turned off, which is a supported configuration.
