@@ -659,3 +659,432 @@ async fn the_opt_out_surfaces_a_killed_connection() {
         other => panic!("the connection kill did not land; got {other:?}"),
     }
 }
+
+/// Seeds a fixed set of workflows for the filter tests, and returns the database holding them.
+///
+/// Five workflows chosen so that every filter has both a match and a non-match. Some columns are
+/// then set with raw SQL: `forked_from`, `was_forked_from`, `completed_at`, and
+/// `started_at_epoch_ms` are not settable at creation in any implementation, but the filters on
+/// them are real and are worth proving before fork and execution land.
+async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
+    let (sys, db) = sysdb().await;
+
+    let seeds = [
+        NewWorkflow {
+            name: Some("checkout".to_owned()),
+            class_name: Some("Checkout".to_owned()),
+            config_name: Some("primary".to_owned()),
+            application_version: Some("v1".to_owned()),
+            executor_id: Some("alpha".to_owned()),
+            authenticated_user: Some("alice".to_owned()),
+            attributes: Some(r#"{"tenant": "acme", "tier": "gold"}"#.to_owned()),
+            ..NewWorkflow::new("wf-a")
+        },
+        NewWorkflow {
+            name: Some("refund".to_owned()),
+            application_version: Some("v2".to_owned()),
+            executor_id: Some("beta".to_owned()),
+            authenticated_user: Some("bob".to_owned()),
+            queue_name: Some("orders".to_owned()),
+            deduplication_id: Some("dedup-b".to_owned()),
+            schedule_name: Some("nightly".to_owned()),
+            parent_workflow_id: Some("wf-a".to_owned()),
+            attributes: Some(r#"{"tenant": "globex"}"#.to_owned()),
+            ..NewWorkflow::new("wf-b")
+        },
+        NewWorkflow {
+            name: Some("checkout".to_owned()),
+            queue_name: Some("orders".to_owned()),
+            delay: Some(std::time::Duration::from_secs(300)),
+            is_debounced: true,
+            deduplication_id: Some("dedup-c".to_owned()),
+            ..NewWorkflow::new("wf-c")
+        },
+        NewWorkflow {
+            name: Some("audit".to_owned()),
+            queue_name: Some("reports".to_owned()),
+            parent_workflow_id: Some("wf-a".to_owned()),
+            ..NewWorkflow::new("wf-d")
+        },
+        // A `%` in the id, to prove a prefix filter treats it as text and not a wildcard.
+        NewWorkflow {
+            name: Some("audit".to_owned()),
+            ..NewWorkflow::new("other-100%-done")
+        },
+    ];
+    for wf in &seeds {
+        sys.init_workflow_status(InitWorkflowStatus::new(wf))
+            .await
+            .expect("seed insert failed");
+    }
+
+    // Columns no caller can set at creation.
+    let mut conn = db.admin_connection().await;
+    for (sql, id) in [
+        (
+            "UPDATE dbos.workflow_status SET forked_from = 'wf-a', was_forked_from = false WHERE workflow_uuid = $1",
+            "wf-c",
+        ),
+        (
+            "UPDATE dbos.workflow_status SET was_forked_from = true WHERE workflow_uuid = $1",
+            "wf-a",
+        ),
+        (
+            "UPDATE dbos.workflow_status SET completed_at = 5000, started_at_epoch_ms = 4000 WHERE workflow_uuid = $1",
+            "wf-b",
+        ),
+        (
+            "UPDATE dbos.workflow_status SET completed_at = 9000, started_at_epoch_ms = 8000 WHERE workflow_uuid = $1",
+            "wf-d",
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .execute(&mut conn)
+            .await
+            .expect("seed update failed");
+    }
+
+    (sys, db)
+}
+
+/// Ids the filter selects, in the order the query returned them.
+async fn ids(
+    sys: &PostgresSystemDatabase,
+    filter: &dbos::sysdb::types::WorkflowFilter,
+) -> Vec<String> {
+    sys.list_workflows(filter)
+        .await
+        .expect("list failed")
+        .into_iter()
+        .map(|r| r.workflow_id)
+        .collect()
+}
+
+/// Every filter narrows to what it claims to.
+///
+/// One test rather than twenty-odd, because the value here is coverage of the *set*: the filters
+/// are a union across four implementations that do not agree on it, and one missing `WHERE`
+/// clause is exactly the kind of thing a per-filter test suite tends not to be written for.
+#[tokio::test]
+async fn every_filter_narrows() {
+    use dbos::sysdb::types::WorkflowFilter as F;
+    let (sys, _db) = seeded().await;
+
+    let cases: Vec<(&str, F, &[&str])> = vec![
+        (
+            "no filter",
+            F::default(),
+            &["wf-a", "wf-b", "wf-c", "wf-d", "other-100%-done"],
+        ),
+        (
+            "workflow_ids",
+            F {
+                workflow_ids: vec!["wf-a".into(), "wf-d".into()],
+                ..F::default()
+            },
+            &["wf-a", "wf-d"],
+        ),
+        (
+            "workflow_id_prefixes",
+            F {
+                workflow_id_prefixes: vec!["wf-".into()],
+                ..F::default()
+            },
+            &["wf-a", "wf-b", "wf-c", "wf-d"],
+        ),
+        // The `%` is data, not a wildcard: a naive LIKE would match every id here.
+        (
+            "prefix with a wildcard character",
+            F {
+                workflow_id_prefixes: vec!["other-100%".into()],
+                ..F::default()
+            },
+            &["other-100%-done"],
+        ),
+        (
+            "names",
+            F {
+                names: vec!["checkout".into()],
+                ..F::default()
+            },
+            &["wf-a", "wf-c"],
+        ),
+        (
+            "class_names",
+            F {
+                class_names: vec!["Checkout".into()],
+                ..F::default()
+            },
+            &["wf-a"],
+        ),
+        (
+            "config_names",
+            F {
+                config_names: vec!["primary".into()],
+                ..F::default()
+            },
+            &["wf-a"],
+        ),
+        (
+            "status",
+            F {
+                status: vec![WorkflowStatus::Delayed],
+                ..F::default()
+            },
+            &["wf-c"],
+        ),
+        (
+            "application_versions",
+            F {
+                application_versions: vec!["v2".into()],
+                ..F::default()
+            },
+            &["wf-b"],
+        ),
+        (
+            "executor_ids",
+            F {
+                executor_ids: vec!["alpha".into()],
+                ..F::default()
+            },
+            &["wf-a"],
+        ),
+        (
+            "authenticated_users",
+            F {
+                authenticated_users: vec!["bob".into()],
+                ..F::default()
+            },
+            &["wf-b"],
+        ),
+        (
+            "queue_names",
+            F {
+                queue_names: vec!["orders".into()],
+                ..F::default()
+            },
+            &["wf-b", "wf-c"],
+        ),
+        (
+            "queues_only",
+            F {
+                queues_only: true,
+                ..F::default()
+            },
+            &["wf-b", "wf-c", "wf-d"],
+        ),
+        (
+            "schedule_names",
+            F {
+                schedule_names: vec!["nightly".into()],
+                ..F::default()
+            },
+            &["wf-b"],
+        ),
+        (
+            "deduplication_ids",
+            F {
+                deduplication_ids: vec!["dedup-c".into()],
+                ..F::default()
+            },
+            &["wf-c"],
+        ),
+        (
+            "is_debounced",
+            F {
+                is_debounced: Some(true),
+                ..F::default()
+            },
+            &["wf-c"],
+        ),
+        (
+            "parent_workflow_ids",
+            F {
+                parent_workflow_ids: vec!["wf-a".into()],
+                ..F::default()
+            },
+            &["wf-b", "wf-d"],
+        ),
+        (
+            "has_parent",
+            F {
+                has_parent: Some(true),
+                ..F::default()
+            },
+            &["wf-b", "wf-d"],
+        ),
+        (
+            "has_parent = false",
+            F {
+                has_parent: Some(false),
+                ..F::default()
+            },
+            &["wf-a", "wf-c", "other-100%-done"],
+        ),
+        (
+            "forked_from",
+            F {
+                forked_from: vec!["wf-a".into()],
+                ..F::default()
+            },
+            &["wf-c"],
+        ),
+        (
+            "was_forked_from",
+            F {
+                was_forked_from: Some(true),
+                ..F::default()
+            },
+            &["wf-a"],
+        ),
+        (
+            "completed_after",
+            F {
+                completed_after: Some(Timestamp::from_epoch_ms(6000)),
+                ..F::default()
+            },
+            &["wf-d"],
+        ),
+        (
+            "completed_before",
+            F {
+                completed_before: Some(Timestamp::from_epoch_ms(6000)),
+                ..F::default()
+            },
+            &["wf-b"],
+        ),
+        (
+            "started_after",
+            F {
+                started_after: Some(Timestamp::from_epoch_ms(6000)),
+                ..F::default()
+            },
+            &["wf-d"],
+        ),
+        (
+            "started_before",
+            F {
+                started_before: Some(Timestamp::from_epoch_ms(6000)),
+                ..F::default()
+            },
+            &["wf-b"],
+        ),
+        // Containment, not equality: `wf-a` has a second key beyond the one asked for.
+        (
+            "attributes",
+            F {
+                attributes: Some(r#"{"tenant": "acme"}"#.into()),
+                ..F::default()
+            },
+            &["wf-a"],
+        ),
+        (
+            "combined filters are ANDed",
+            F {
+                names: vec!["checkout".into()],
+                queues_only: true,
+                ..F::default()
+            },
+            &["wf-c"],
+        ),
+    ];
+
+    for (label, filter, expected) in cases {
+        let mut got = ids(&sys, &filter).await;
+        got.sort();
+        let mut want: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
+        want.sort();
+        assert_eq!(got, want, "filter `{label}` selected the wrong workflows");
+    }
+}
+
+/// Ordering, limit, and offset page through the results.
+#[tokio::test]
+async fn results_are_ordered_and_pageable() {
+    use dbos::sysdb::types::WorkflowFilter as F;
+    let (sys, _db) = seeded().await;
+    let only_wf = F {
+        workflow_id_prefixes: vec!["wf-".into()],
+        ..F::default()
+    };
+
+    // Seeded in order, and `created_at` is stamped at insert, so oldest-first is insertion order.
+    let ascending = ids(&sys, &only_wf).await;
+    assert_eq!(ascending, ["wf-a", "wf-b", "wf-c", "wf-d"]);
+
+    let descending = ids(
+        &sys,
+        &F {
+            sort_desc: true,
+            ..only_wf.clone()
+        },
+    )
+    .await;
+    assert_eq!(descending, ["wf-d", "wf-c", "wf-b", "wf-a"]);
+
+    let page = ids(
+        &sys,
+        &F {
+            limit: Some(2),
+            offset: Some(1),
+            ..only_wf.clone()
+        },
+    )
+    .await;
+    assert_eq!(
+        page,
+        ["wf-b", "wf-c"],
+        "limit and offset should page in sort order"
+    );
+
+    // Offset without limit is legal, and is how a caller skips a known prefix.
+    let rest = ids(
+        &sys,
+        &F {
+            offset: Some(3),
+            ..only_wf
+        },
+    )
+    .await;
+    assert_eq!(rest, ["wf-d"]);
+}
+
+/// Declining a payload leaves it absent rather than changing which rows come back.
+#[tokio::test]
+async fn payloads_can_be_left_unloaded() {
+    use dbos::sysdb::types::WorkflowFilter as F;
+    let (sys, db) = sysdb().await;
+    let wf = NewWorkflow {
+        input: Some(r#"{"positionalArgs":[1]}"#.to_owned()),
+        ..NewWorkflow::new("wf-payload")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .unwrap();
+    sys.update_workflow_outcome("wf-payload", WorkflowStatus::Success, Some("42"), None)
+        .await
+        .unwrap();
+    drop(db);
+
+    let loaded = &sys.list_workflows(&F::default()).await.unwrap()[0];
+    assert_eq!(loaded.input.as_deref(), Some(r#"{"positionalArgs":[1]}"#));
+    assert_eq!(loaded.output.as_deref(), Some("42"));
+
+    let bare = &sys
+        .list_workflows(&F {
+            load_input: false,
+            load_output: false,
+            ..F::default()
+        })
+        .await
+        .unwrap()[0];
+    assert_eq!(bare.workflow_id, "wf-payload", "the row is still returned");
+    assert_eq!(bare.input, None, "input was not asked for");
+    assert_eq!(bare.output, None, "output was not asked for");
+    assert_eq!(
+        bare.status,
+        WorkflowStatus::Success,
+        "declining payloads must not affect any other column",
+    );
+}

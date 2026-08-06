@@ -22,7 +22,7 @@ pub mod types;
 
 use async_trait::async_trait;
 
-use types::{NewWorkflow, Timestamp, WorkflowRecord, WorkflowStatus};
+use types::{NewWorkflow, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus};
 
 /// What went wrong talking to the system database.
 ///
@@ -217,6 +217,13 @@ pub trait SystemDatabase: Send + Sync {
     /// Reads one workflow, or `None` if there is no such id.
     async fn get_workflow_status(&self, workflow_id: &str)
     -> Result<Option<WorkflowRecord>, Error>;
+
+    /// Reads the workflows matching a filter, oldest first unless told otherwise.
+    ///
+    /// This is one query with every filter folded into its `WHERE` clause, not a scan the caller
+    /// narrows. `WorkflowFilter::default()` therefore returns the whole table, and callers that
+    /// mean to page should say so with [`WorkflowFilter::limit`].
+    async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error>;
 
     /// Records a terminal outcome, but only while the workflow is still running.
     ///

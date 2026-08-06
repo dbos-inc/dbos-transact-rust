@@ -497,3 +497,141 @@ mod tests {
         assert!(!WorkflowStatus::MaxRecoveryAttemptsExceeded.is_terminal());
     }
 }
+
+/// Which workflows to list, and how much of each to load.
+///
+/// Every field is a narrowing, and the default narrows nothing — so
+/// `WorkflowFilter::default()` lists everything. List fields match any of their entries and are
+/// ignored when empty; `Option<bool>` fields are three-valued, where `None` does not filter.
+///
+/// The set is the union of all four implementations, which do not agree on it. Go has 28
+/// filters, Python 26, Java adds two Go lacks. Where they diverge it is noted on the field, so a
+/// missing filter reads as a decision rather than an oversight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowFilter {
+    /// Exact workflow ids.
+    pub workflow_ids: Vec<String>,
+    /// Workflow ids starting with any of these.
+    pub workflow_id_prefixes: Vec<String>,
+
+    /// Registered function names.
+    pub names: Vec<String>,
+    /// Class names, for class-bound workflows. **Java only.**
+    pub class_names: Vec<String>,
+    /// Configured instance names. **Java only**, where it is `instanceName`.
+    pub config_names: Vec<String>,
+    /// Statuses to include.
+    pub status: Vec<WorkflowStatus>,
+
+    /// Application versions.
+    pub application_versions: Vec<String>,
+    /// Executors that claimed the workflow.
+    pub executor_ids: Vec<String>,
+    /// Authenticated principals at submission.
+    pub authenticated_users: Vec<String>,
+
+    /// Queues the workflow was submitted to.
+    pub queue_names: Vec<String>,
+    /// Only workflows that went through a queue at all.
+    pub queues_only: bool,
+    /// Schedules that triggered the workflow.
+    pub schedule_names: Vec<String>,
+    /// Deduplication keys. **Go only.**
+    pub deduplication_ids: Vec<String>,
+    /// Whether the deduplication key is a debounce key. **Go only.**
+    pub is_debounced: Option<bool>,
+
+    /// Workflows started by any of these.
+    pub parent_workflow_ids: Vec<String>,
+    /// Whether the workflow has a parent at all.
+    pub has_parent: Option<bool>,
+    /// Workflows forked from any of these.
+    pub forked_from: Vec<String>,
+    /// Whether this workflow was itself forked from another.
+    pub was_forked_from: Option<bool>,
+
+    /// Created at or after this instant.
+    ///
+    /// Go and Python call this `start_time`, which reads as "when the workflow started". It does
+    /// not — it filters `created_at`, and a workflow may be created long before it starts.
+    /// [`started_after`](Self::started_after) is the one that filters on starting.
+    pub created_after: Option<Timestamp>,
+    /// Created at or before this instant. Go and Python call this `end_time`.
+    pub created_before: Option<Timestamp>,
+    /// Finished at or after this instant.
+    pub completed_after: Option<Timestamp>,
+    /// Finished at or before this instant.
+    pub completed_before: Option<Timestamp>,
+    /// Started at or after this instant.
+    ///
+    /// Every other implementation calls this `dequeued_after`, because the column is written
+    /// when a queued workflow is dequeued. It is not queue-specific — it is
+    /// [`WorkflowRecord::started_at`], the `started_at_epoch_ms` column — and naming it after
+    /// the queue implies a filter that would exclude workflows that never sat on one.
+    pub started_after: Option<Timestamp>,
+    /// Started at or before this instant. Elsewhere `dequeued_before`.
+    pub started_before: Option<Timestamp>,
+
+    /// Encoded JSON the workflow's attributes must contain.
+    ///
+    /// Containment, not equality: `{"tenant": "acme"}` matches a workflow with that key among
+    /// others. Served by the GIN index on the column.
+    pub attributes: Option<String>,
+
+    /// Most rows to return.
+    pub limit: Option<i64>,
+    /// Rows to skip.
+    pub offset: Option<i64>,
+    /// Newest first, rather than oldest first.
+    pub sort_desc: bool,
+    /// Whether to load the `input` column.
+    ///
+    /// Listing thousands of workflows pulls their arguments with them, which is usually not what
+    /// the caller wanted. Turning this off leaves [`WorkflowRecord::input`] `None` — which is
+    /// indistinguishable from a workflow that has no input.
+    pub load_input: bool,
+    /// Whether to load the `output` and `error` columns, with the same caveat.
+    pub load_output: bool,
+}
+
+impl Default for WorkflowFilter {
+    /// Narrows nothing, and loads everything.
+    ///
+    /// `load_input` and `load_output` default *on*, following Python, so a caller that does not
+    /// think about them gets whole records rather than silently empty payloads. That is the one
+    /// place this type cannot be `#[derive(Default)]`.
+    fn default() -> Self {
+        Self {
+            workflow_ids: Vec::new(),
+            workflow_id_prefixes: Vec::new(),
+            names: Vec::new(),
+            class_names: Vec::new(),
+            config_names: Vec::new(),
+            status: Vec::new(),
+            application_versions: Vec::new(),
+            executor_ids: Vec::new(),
+            authenticated_users: Vec::new(),
+            queue_names: Vec::new(),
+            queues_only: false,
+            schedule_names: Vec::new(),
+            deduplication_ids: Vec::new(),
+            is_debounced: None,
+            parent_workflow_ids: Vec::new(),
+            has_parent: None,
+            forked_from: Vec::new(),
+            was_forked_from: None,
+            created_after: None,
+            created_before: None,
+            completed_after: None,
+            completed_before: None,
+            started_after: None,
+            started_before: None,
+            attributes: None,
+            limit: None,
+            offset: None,
+            sort_desc: false,
+            load_input: true,
+            load_output: true,
+        }
+    }
+}

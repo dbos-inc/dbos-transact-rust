@@ -9,7 +9,7 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use super::migrations::quote_identifier;
 use super::retry::{RetryPolicy, with_retry};
-use super::types::{Timestamp, WorkflowRecord, WorkflowStatus, duration_from_ms};
+use super::types::{Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms};
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite,
     SystemDatabase, WorkflowInitResult, runner,
@@ -521,6 +521,158 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await?;
 
             row.as_ref().map(record_from_row).transpose()
+        })
+        .await
+    }
+
+    async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error> {
+        let table = self.table("workflow_status");
+        // `status` is the one filter whose values are not already strings.
+        let status: Vec<&str> = filter
+            .status
+            .iter()
+            .copied()
+            .map(WorkflowStatus::as_str)
+            .collect();
+        let (table, pool, status) = (table.as_str(), &self.pool, status.as_slice());
+
+        with_retry(&self.retry, "list_workflows", move || async move {
+            // Rebuilt per attempt rather than hoisted: a `QueryBuilder` owns its arguments and
+            // is consumed by `build`, and rendering a few hundred bytes of SQL is not the cost
+            // worth optimising against a retry that has already waited a second.
+            let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+            // One row reader for every query means the column list cannot vary, so the columns
+            // the caller declined are selected as NULL rather than dropped. The cast is needed:
+            // a bare NULL has no type, and the driver has to be told what it is decoding.
+            q.push(match (filter.load_input, filter.load_output) {
+                (true, true) => RECORD_COLUMNS.to_owned(),
+                (load_input, load_output) => {
+                    let mut columns = RECORD_COLUMNS.to_owned();
+                    if !load_input {
+                        columns = columns.replace("inputs,", "NULL::text AS inputs,");
+                    }
+                    if !load_output {
+                        columns = columns
+                            .replace("output,", "NULL::text AS output,")
+                            .replace("error,", "NULL::text AS error,");
+                    }
+                    columns
+                }
+            });
+            q.push(" FROM ").push(table);
+
+            // `separated(" AND ")` writes the separator only between clauses, so neither a
+            // leading `WHERE` with no filters nor a trailing `AND` is possible by construction.
+            let mut first = true;
+            let mut clause = |q: &mut sqlx::QueryBuilder<sqlx::Postgres>, sql: &str| {
+                q.push(if first { " WHERE " } else { " AND " });
+                first = false;
+                q.push(sql);
+            };
+
+            // `= ANY($n)` rather than `IN ($1, $2, …)`: one placeholder for the whole list,
+            // whatever its length, so the SQL text does not vary with the caller's input.
+            macro_rules! any_of {
+                ($values:expr, $column:literal) => {
+                    if !$values.is_empty() {
+                        clause(&mut q, concat!($column, " = ANY("));
+                        q.push_bind($values).push(")");
+                    }
+                };
+            }
+            any_of!(&filter.workflow_ids[..], "workflow_uuid");
+            any_of!(&filter.names[..], "name");
+            any_of!(&filter.class_names[..], "class_name");
+            any_of!(&filter.config_names[..], "config_name");
+            any_of!(status, "status");
+            any_of!(&filter.application_versions[..], "application_version");
+            any_of!(&filter.executor_ids[..], "executor_id");
+            any_of!(&filter.authenticated_users[..], "authenticated_user");
+            any_of!(&filter.queue_names[..], "queue_name");
+            any_of!(&filter.schedule_names[..], "schedule_name");
+            any_of!(&filter.deduplication_ids[..], "deduplication_id");
+            any_of!(&filter.parent_workflow_ids[..], "parent_workflow_id");
+            any_of!(&filter.forked_from[..], "forked_from");
+
+            if !filter.workflow_id_prefixes.is_empty() {
+                // `LIKE ANY(...)` needs the wildcard appended to each pattern, and `%` and `_`
+                // in a caller's prefix would otherwise be wildcards themselves.
+                let patterns: Vec<String> = filter
+                    .workflow_id_prefixes
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}%",
+                            p.replace('\\', r"\\")
+                                .replace('%', r"\%")
+                                .replace('_', r"\_")
+                        )
+                    })
+                    .collect();
+                clause(&mut q, "workflow_uuid LIKE ANY(");
+                q.push_bind(patterns).push(")");
+            }
+
+            macro_rules! compare {
+                ($value:expr, $sql:literal) => {
+                    if let Some(v) = $value {
+                        clause(&mut q, $sql);
+                        q.push_bind(v.as_epoch_ms());
+                    }
+                };
+            }
+            compare!(filter.created_after, "created_at >= ");
+            compare!(filter.created_before, "created_at <= ");
+            compare!(filter.completed_after, "completed_at >= ");
+            compare!(filter.completed_before, "completed_at <= ");
+            compare!(filter.started_after, "started_at_epoch_ms >= ");
+            compare!(filter.started_before, "started_at_epoch_ms <= ");
+
+            macro_rules! flag {
+                ($value:expr, $sql:literal) => {
+                    if let Some(v) = $value {
+                        clause(&mut q, $sql);
+                        q.push_bind(v);
+                    }
+                };
+            }
+            flag!(filter.was_forked_from, "was_forked_from = ");
+            flag!(filter.is_debounced, "is_debounced = ");
+
+            if filter.queues_only {
+                clause(&mut q, "queue_name IS NOT NULL");
+            }
+            if let Some(has_parent) = filter.has_parent {
+                clause(
+                    &mut q,
+                    if has_parent {
+                        "parent_workflow_id IS NOT NULL"
+                    } else {
+                        "parent_workflow_id IS NULL"
+                    },
+                );
+            }
+            if let Some(attributes) = &filter.attributes {
+                // Containment, served by the GIN index. SQLite cannot reproduce `@>` and Go
+                // rejects the filter there; both Postgres and CockroachDB support it.
+                clause(&mut q, "attributes @> ");
+                q.push_bind(attributes).push("::jsonb");
+            }
+
+            q.push(if filter.sort_desc {
+                " ORDER BY created_at DESC"
+            } else {
+                " ORDER BY created_at ASC"
+            });
+            if let Some(limit) = filter.limit {
+                q.push(" LIMIT ").push_bind(limit);
+            }
+            if let Some(offset) = filter.offset {
+                q.push(" OFFSET ").push_bind(offset);
+            }
+
+            let rows = q.build().fetch_all(pool).await?;
+            rows.iter().map(record_from_row).collect()
         })
         .await
     }
