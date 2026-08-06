@@ -315,6 +315,34 @@ async fn the_corpus_applies_without_listen_notify() {
         "no triggers should exist with notifications off"
     );
 
+    // The *functions* go too — migration 20 must not try to harden what migration 1 never
+    // installed — while the SQL-client functions, which have nothing to do with notifications,
+    // must still be there.
+    let functions: Vec<String> = sqlx::query_scalar(
+        "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = $1 ORDER BY 1",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list functions");
+    for absent in [
+        "notifications_function",
+        "workflow_events_function",
+        "streams_function",
+    ] {
+        assert!(
+            !functions.iter().any(|f| f == absent),
+            "{absent} should not exist with notifications off, got {functions:?}",
+        );
+    }
+    for present in ["enqueue_workflow", "send_message"] {
+        assert!(
+            functions.iter().any(|f| f == present),
+            "{present} is unrelated to notifications and should exist, got {functions:?}",
+        );
+    }
+
     // The tables still arrive; only the notification plumbing is absent.
     assert!(
         table_names(&pool, schema)

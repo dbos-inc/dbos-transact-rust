@@ -264,6 +264,170 @@ async fn sweeps_invalid_indexes_left_by_an_interrupted_build() {
     assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
 }
 
+/// Migration 10 backfills the primary key when a database genuinely lacks it.
+///
+/// Every other test exercises the *skip* path, because a schema this implementation created
+/// already has `message_uuid ... PRIMARY KEY` from migration 1. That leaves the branch
+/// migration 10 actually exists for completely uncovered — the case of a database created by a
+/// version old enough to have missed it.
+///
+/// Simulated the way Java's suite does: apply a migration 1 with the primary key stripped out,
+/// record version 1, then run everything and check the key arrives.
+#[tokio::test]
+async fn migration_ten_backfills_a_missing_primary_key() {
+    let db = raw_database().await;
+    if db.backend() == support::Backend::Cockroach {
+        return; // The guard path is covered on PostgreSQL; CockroachDB has the same runner logic.
+    }
+    let pool = db.pool().await;
+
+    // Migration 1 as it was before the primary key was added.
+    let original = dbos::sysdb::migrations::source("1_initial_dbos_schema.sql")
+        .unwrap()
+        .sql
+        .replace(
+            "message_uuid TEXT NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY",
+            "message_uuid TEXT NOT NULL DEFAULT gen_random_uuid()",
+        );
+    assert!(
+        !original.contains("PRIMARY KEY, -- Built-in function"),
+        "the primary key should have been stripped",
+    );
+
+    let quoted = quote_identifier(SCHEMA);
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "CREATE SCHEMA IF NOT EXISTS {quoted};
+         CREATE TABLE {quoted}.dbos_migrations (version BIGINT NOT NULL PRIMARY KEY);"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Both halves, as a real database of that vintage would have had: the base tables and the
+    // LISTEN/NOTIFY triggers. Without the second half, migration 20 later tries to harden a
+    // trigger function that was never created.
+    let values = dbos::sysdb::migrations::Placeholders {
+        schema: &quoted,
+        concurrently: "CONCURRENTLY",
+    };
+    let notify_half = dbos::sysdb::migrations::source("1_initial_dbos_schema_listen_notify.sql")
+        .unwrap()
+        .sql;
+    for part in [original.as_str(), notify_half] {
+        sqlx::raw_sql(AssertSqlSafe(
+            dbos::sysdb::migrations::render(part, values).unwrap(),
+        ))
+        .execute(&pool)
+        .await
+        .expect("the original migration 1 should apply");
+    }
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "INSERT INTO {quoted}.dbos_migrations (version) VALUES (1)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let has_pk = || async {
+        sqlx::query(
+            "SELECT 1 FROM pg_constraint c \
+             JOIN pg_class cl ON c.conrelid = cl.oid \
+             JOIN pg_namespace n ON cl.relnamespace = n.oid \
+             WHERE n.nspname = $1 AND cl.relname = 'notifications' AND c.contype = 'p'",
+        )
+        .bind(SCHEMA)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .is_some()
+    };
+    assert!(!has_pk().await, "the old schema should have no primary key");
+
+    let outcome = runner::run(&pool, SCHEMA, true)
+        .await
+        .expect("migration failed");
+
+    assert!(
+        has_pk().await,
+        "migration 10 should have backfilled the notifications primary key",
+    );
+    assert!(
+        outcome.applied.contains(&10),
+        "migration 10 should report as applied, got {:?}",
+        outcome.applied,
+    );
+    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+}
+
+/// A failing migration leaves the recorded version where it was.
+///
+/// The version is what every implementation reads to decide what is left to do, so advancing
+/// it past work that did not happen would strand the database: the failed migration would
+/// never be retried, by this process or any other.
+#[tokio::test]
+async fn a_failed_migration_does_not_advance_the_version() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let dialect = runner::detect_dialect(&pool).await.unwrap();
+
+    let mut migrations = dbos::sysdb::migrations::build_migrations(SCHEMA, dialect, true);
+    let broken_at = 12usize; // migration 12, chosen for having no dependents before it
+    migrations[broken_at - 1].sql = "THIS IS NOT VALID SQL".to_owned();
+
+    let err = runner::apply(&pool, SCHEMA, &migrations)
+        .await
+        .expect_err("a broken migration should fail the run");
+    match err {
+        runner::MigrateError::Migration { version, .. } => assert_eq!(version, broken_at as u32),
+        other => panic!("expected a migration failure, got {other:?}"),
+    }
+
+    assert_eq!(
+        version(&pool).await,
+        (broken_at - 1) as i64,
+        "the version should stop at the last migration that succeeded",
+    );
+
+    // The real list still completes from there.
+    let outcome = runner::run(&pool, SCHEMA, true)
+        .await
+        .expect("recovery failed");
+    assert_eq!(outcome.from_version, (broken_at - 1) as i64);
+    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+}
+
+/// Re-running the online migrations is safe.
+///
+/// They are the ones that cannot commit with their version write — `CONCURRENTLY` is illegal
+/// inside a transaction — so a crash between the statement and the bump re-runs them. That is
+/// only survivable because each is `IF NOT EXISTS` or `IF EXISTS`, which this checks by
+/// rewinding past all of them and running again.
+#[tokio::test]
+async fn online_migrations_are_idempotent() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    runner::run(&pool, SCHEMA, true).await.unwrap();
+
+    // 22 is the first online migration, so rewinding to 21 makes every one of them pending
+    // again against a schema where their indexes already exist.
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "UPDATE {}.dbos_migrations SET version = 21",
+        quote_identifier(SCHEMA)
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = runner::run(&pool, SCHEMA, true)
+        .await
+        .expect("re-running the online migrations should succeed");
+    assert!(
+        outcome.applied.contains(&22),
+        "the online migrations should have re-run, got {:?}",
+        outcome.applied,
+    );
+    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+}
+
 /// Concurrent migrators converge instead of one of them failing.
 ///
 /// There is no advisory lock — CockroachDB has none — so two cold starts race on the same DDL.

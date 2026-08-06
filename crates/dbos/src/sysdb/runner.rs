@@ -25,21 +25,77 @@ const PEER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How often to re-read the recorded version while waiting for a peer.
 const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long to wait when an error does not look like a collision.
+///
+/// Not zero, because the classification below is a heuristic and has been wrong twice: a brief
+/// pause lets an unrecognised collision resolve itself, while keeping a genuinely broken
+/// migration to a few seconds rather than the full peer timeout on every attempt.
+const UNKNOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Whether an error is PostgreSQL objecting that something already exists.
 ///
 /// **`CREATE ... IF NOT EXISTS` is not atomic.** Two connections can both find the object
 /// absent and both try to create it; one then fails on a catalog unique index. The
 /// postcondition still holds — the object exists — so these are success, not failure.
+/// PostgreSQL's "that object already exists" codes.
+///
+/// Two migrators racing produce one of these on whichever loses: `CREATE ... IF NOT EXISTS` is
+/// not atomic, and `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS` on older servers at all. The
+/// list is the class-42 duplicate family plus the catalogue unique violation a schema race
+/// surfaces as.
+const ALREADY_EXISTS: &[&str] = &[
+    "23505", // unique_violation — the pg_namespace/pg_class catalogue race
+    "42701", // duplicate_column
+    "42710", // duplicate_object
+    "42723", // duplicate_function
+    "42P04", // duplicate_database
+    "42P06", // duplicate_schema
+    "42P07", // duplicate_table
+];
+
+/// Transient failures that resolve on their own.
+const TRANSIENT: &[&str] = &[
+    "40P01", // deadlock_detected — two concurrent CREATE INDEX CONCURRENTLY runs
+    "40001", // serialization_failure
+    "55P03", // lock_not_available
+];
+
+fn has_code(error: &sqlx::Error, codes: &[&str]) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|c| codes.contains(&c.as_ref()))
+}
+
+/// Whether an error could plausibly be another process migrating at the same time.
+///
+/// Waiting only helps if someone else is going to finish the work. Broken SQL never becomes
+/// valid, so a syntax error or a missing function fails immediately rather than sitting out the
+/// peer timeout on every attempt — which turned a bad migration into a 30-second stall.
+///
+/// **The cost of being wrong is asymmetric, and not in the obvious direction.** Omitting a code
+/// that *is* a collision turns a routine race into a failed start, which is how `42701` was
+/// found. Including one that is not merely delays an error that was going to happen anyway. So
+/// this errs towards waiting.
+fn is_possibly_concurrent(error: &sqlx::Error) -> bool {
+    if has_code(error, ALREADY_EXISTS) || has_code(error, TRANSIENT) {
+        return true;
+    }
+    // Not everything concurrent has a code of its own. Two migrators altering the same
+    // `pg_proc` row — migration 20 hardening `search_path` — collide as `XX000`, PostgreSQL's
+    // catch-all, with the only signal in the text.
+    error
+        .as_database_error()
+        .is_some_and(|e| e.message().contains("concurrently updated"))
+}
+
+/// Whether an error is PostgreSQL objecting that something already exists.
+///
+/// **`CREATE ... IF NOT EXISTS` is not atomic.** Two connections can both find the object
+/// absent and both try to create it; one then fails on a catalogue unique index. The
+/// postcondition still holds — the object exists — so these are success, not failure.
 fn is_already_exists(error: &sqlx::Error) -> bool {
-    let Some(db) = error.as_database_error() else {
-        return false;
-    };
-    matches!(
-        db.code().as_deref(),
-        // unique_violation (the catalog race), duplicate_schema, duplicate_table,
-        // duplicate_object, duplicate_function.
-        Some("23505" | "42P06" | "42P07" | "42710" | "42723")
-    )
+    has_code(error, ALREADY_EXISTS)
 }
 
 /// Why migrating failed.
@@ -235,9 +291,22 @@ pub async fn run(
     use_listen_notify: bool,
 ) -> Result<Outcome, MigrateError> {
     let dialect = detect_dialect(pool).await?;
+    let migrations = build_migrations(schema, dialect, use_listen_notify);
+    apply(pool, schema, &migrations).await
+}
+
+/// Applies a prepared migration list, which is what [`run`] does once it has built one.
+///
+/// Separate so a caller can supply a list [`build_migrations`] would not produce — a shortened
+/// one, or one with a deliberately broken entry. Tests use it to prove the runner's failure
+/// handling; nothing in production should need it.
+pub async fn apply(
+    pool: &PgPool,
+    schema: &str,
+    migrations: &[Migration],
+) -> Result<Outcome, MigrateError> {
     ensure_schema(pool, schema).await?;
 
-    let migrations = build_migrations(schema, dialect, use_listen_notify);
     let latest = migrations.len() as i64;
     let from_version = recorded_version(pool, schema).await?;
     let mut had_row = from_version > 0;
@@ -268,7 +337,7 @@ pub async fn run(
     let mut last_applied = from_version;
     let mut applied = Vec::new();
 
-    for migration in &migrations {
+    for migration in migrations {
         let version = i64::from(migration.version);
         if version <= last_applied {
             continue;
@@ -320,9 +389,16 @@ async fn apply_one(
                 return Ok(());
             }
             Err(source) => {
-                // A peer migrating at the same time is the expected cause, so wait for it to
-                // commit rather than retrying straight back into the same collision.
-                if let Some(now) = await_peer(pool, schema, version).await {
+                // Wait for a peer to finish rather than retrying into the same collision — but
+                // only at full length when the error looks like one. Broken SQL never becomes
+                // valid, and sitting out three peer timeouts for it turns a clear failure into
+                // a half-minute stall.
+                let wait = if is_possibly_concurrent(&source) {
+                    PEER_WAIT
+                } else {
+                    UNKNOWN_WAIT
+                };
+                if let Some(now) = await_peer(pool, schema, version, wait).await {
                     tracing::debug!(
                         version = migration.version,
                         "another process applied this migration concurrently"
@@ -353,8 +429,13 @@ async fn apply_one(
 ///
 /// `None` means nothing advanced within [`PEER_WAIT`] — so there was probably no peer, the
 /// failure was this process's own, and the caller should retry the migration itself.
-async fn await_peer(pool: &PgPool, schema: &str, version: i64) -> Option<i64> {
-    let deadline = std::time::Instant::now() + PEER_WAIT;
+async fn await_peer(
+    pool: &PgPool,
+    schema: &str,
+    version: i64,
+    wait: std::time::Duration,
+) -> Option<i64> {
+    let deadline = std::time::Instant::now() + wait;
     loop {
         if let Ok(now) = recorded_version(pool, schema).await
             && now >= version
