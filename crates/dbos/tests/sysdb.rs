@@ -3,8 +3,11 @@
 mod support;
 
 use dbos::sysdb::postgres::PostgresSystemDatabase;
+use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{NewWorkflow, Timestamp, WorkflowStatus};
-use dbos::sysdb::{DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite, SystemDatabase};
+use dbos::sysdb::{
+    BackendErrorKind, DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite, SystemDatabase,
+};
 
 use support::test_database;
 
@@ -502,4 +505,157 @@ async fn the_trait_is_object_safe() {
             .unwrap()
             .is_some()
     );
+}
+
+/// A rejected statement comes back at once, with the SQLSTATE the database gave.
+///
+/// The timeout is the assertion that matters. `42P01 undefined_table` classified as anything
+/// but permanent would be retried for ever, and this test would hang rather than fail — so it
+/// is given a deadline far shorter than the one-second first backoff.
+#[tokio::test]
+async fn a_rejected_statement_is_not_retried() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    // Nothing has migrated this schema, so the table genuinely is not there.
+    let sys = PostgresSystemDatabase::from_pool(pool, "no_such_schema");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        sys.get_workflow_status("wf-1"),
+    )
+    .await
+    .expect("a permanent failure was retried instead of being returned");
+
+    match result {
+        Err(Error::Backend(e)) => {
+            assert_eq!(e.kind, BackendErrorKind::Permanent);
+            assert_eq!(
+                e.sqlstate.as_deref(),
+                Some("42P01"),
+                "the SQLSTATE should survive onto the error, got {e:?}",
+            );
+        }
+        other => panic!("expected a permanent backend error, got {other:?}"),
+    }
+}
+
+/// A failure to reach the database is a connection failure, and opting out surfaces it.
+///
+/// With the default policy this call would block until the database came back, which is the
+/// trade the retry layer exists to make. The opt-out is what makes the classification testable
+/// without waiting for it.
+#[tokio::test]
+async fn an_unreachable_database_is_a_connection_failure() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let sys = PostgresSystemDatabase::from_pool(pool.clone(), DEFAULT_SCHEMA).with_retry_policy(
+        RetryPolicy {
+            retry_connection_errors: false,
+            ..RetryPolicy::default()
+        },
+    );
+    pool.close().await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        sys.get_workflow_status("wf-1"),
+    )
+    .await
+    .expect("the opt-out should have returned rather than retried");
+
+    match result {
+        Err(Error::Backend(e)) => assert_eq!(
+            e.kind,
+            BackendErrorKind::Connection,
+            "a closed pool is a connection failure, got {e:?}",
+        ),
+        other => panic!("expected a connection error, got {other:?}"),
+    }
+}
+
+/// A connection killed underneath a live pool is waited out, and the operation still succeeds.
+///
+/// This is the case the whole layer exists for, and the only one that exercises it end to end:
+/// classification, the backoff, and sqlx replacing the dead connection on the second attempt.
+/// Java tests the same thing with `ChaosTest.causeChaos`, which is the same `pg_terminate_backend`
+/// used here.
+///
+/// `test_before_acquire(false)` is what makes it deterministic. sqlx otherwise validates a
+/// pooled connection before handing it out, so a killed one is replaced silently and the retry
+/// never engages — the test would pass while proving nothing.
+#[tokio::test]
+async fn a_killed_connection_is_waited_out() {
+    const TAG: &str = "chaos-waited-out";
+    let db = test_database().await;
+    let pool = db
+        .pool_options()
+        .test_before_acquire(false)
+        .connect_with(db.options().application_name(TAG))
+        .await
+        .expect("failed to connect");
+    let sys =
+        PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).with_retry_policy(RetryPolicy {
+            initial_backoff: std::time::Duration::from_millis(50),
+            ..RetryPolicy::default()
+        });
+
+    let wf = workflow("wf-chaos");
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .expect("insert failed");
+
+    // Every pooled connection is now dead, and the pool does not know it.
+    db.kill_connections(TAG).await;
+
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        sys.get_workflow_status("wf-chaos"),
+    )
+    .await
+    .expect("the retry never recovered")
+    .expect("the read should have succeeded on a later attempt");
+
+    assert_eq!(
+        read.expect("the workflow should still exist").workflow_id,
+        "wf-chaos",
+        "the row is durable; only the connection was lost",
+    );
+}
+
+/// The same kill, with retrying opted out, surfaces the failure instead of waiting.
+///
+/// This is the guard on the test above. If `kill_connections` stopped landing — a driver change,
+/// a Cockroach syntax drift — that test would still pass, having quietly proven nothing. This
+/// one fails, because it asserts the error is really there to be retried.
+#[tokio::test]
+async fn the_opt_out_surfaces_a_killed_connection() {
+    const TAG: &str = "chaos-opt-out";
+    let db = test_database().await;
+    let pool = db
+        .pool_options()
+        .test_before_acquire(false)
+        .connect_with(db.options().application_name(TAG))
+        .await
+        .expect("failed to connect");
+    let sys =
+        PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).with_retry_policy(RetryPolicy {
+            retry_connection_errors: false,
+            ..RetryPolicy::default()
+        });
+
+    let wf = workflow("wf-chaos-optout");
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .expect("insert failed");
+
+    db.kill_connections(TAG).await;
+
+    match sys.get_workflow_status("wf-chaos-optout").await {
+        Err(Error::Backend(e)) => assert_eq!(
+            e.kind,
+            BackendErrorKind::Connection,
+            "a terminated backend should classify as a connection failure, got {e:?}",
+        ),
+        other => panic!("the connection kill did not land; got {other:?}"),
+    }
 }

@@ -471,6 +471,11 @@ impl TestDatabase {
         &self.url
     }
 
+    /// Connection options for this database.
+    pub fn options(&self) -> PgConnectOptions {
+        self.options.clone()
+    }
+
     pub fn backend(&self) -> Backend {
         self.server.backend()
     }
@@ -481,10 +486,48 @@ impl TestDatabase {
 
     /// Opens a pool against this database.
     pub async fn pool(&self) -> sqlx::PgPool {
-        sqlx::pool::PoolOptions::new()
-            .max_connections(5)
+        self.pool_options()
             .connect_with(self.options.clone())
             .await
             .expect("failed to connect to the test database")
+    }
+
+    /// The pool settings [`pool`](Self::pool) uses, for tests that need to vary them.
+    pub fn pool_options(&self) -> sqlx::pool::PoolOptions<sqlx::Postgres> {
+        sqlx::pool::PoolOptions::new().max_connections(5)
+    }
+
+    /// Opens a connection outside any pool, for acting on the server rather than through it.
+    pub async fn admin_connection(&self) -> sqlx::PgConnection {
+        use sqlx::Connection;
+        sqlx::PgConnection::connect_with(&self.options)
+            .await
+            .expect("failed to open an admin connection")
+    }
+
+    /// Terminates the connections tagged with `application_name`, killing them where they sit.
+    ///
+    /// Java's `ChaosTest.causeChaos` kills everything on the database. That cannot work here:
+    /// tests run in parallel against a shared server, and CockroachDB's session list is
+    /// **cluster-wide** with no database column — killing by database would take out unrelated
+    /// tests. Tagging the pool under test and killing only that tag is scoped correctly on both
+    /// backends, and the admin connection below is untagged, so it does not kill itself.
+    pub async fn kill_connections(&self, application_name: &str) {
+        use sqlx::Executor;
+        let mut admin = self.admin_connection().await;
+        let sql = match self.backend() {
+            Backend::Cockroach => format!(
+                "CANCEL SESSIONS (SELECT session_id FROM [SHOW CLUSTER SESSIONS] \
+                 WHERE application_name = '{application_name}')"
+            ),
+            Backend::Postgres => format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE application_name = '{application_name}' AND pid <> pg_backend_pid()"
+            ),
+        };
+        admin
+            .execute(sqlx::AssertSqlSafe(sql))
+            .await
+            .expect("failed to terminate connections");
     }
 }

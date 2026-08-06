@@ -16,6 +16,7 @@ pub const DEFAULT_SCHEMA: &str = "dbos";
 
 pub mod migrations;
 pub mod postgres;
+pub mod retry;
 pub mod runner;
 pub mod types;
 
@@ -30,7 +31,7 @@ use types::{NewWorkflow, Timestamp, WorkflowRecord, WorkflowStatus};
 #[derive(Debug)]
 pub enum Error {
     /// The database rejected or could not serve the request.
-    Backend(String),
+    Backend(BackendError),
     /// A stored value could not be understood — an unrecognised status, a missing column.
     ///
     /// Usually means the database was written by an implementation that knows something this
@@ -58,7 +59,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Backend(m) => write!(f, "system database error: {m}"),
+            Error::Backend(e) => write!(f, "system database error: {e}"),
             Error::Malformed(m) => write!(f, "unexpected value in the system database: {m}"),
             Error::ConflictingWorkflow {
                 workflow_id,
@@ -73,6 +74,48 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A failure the database or its driver reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendError {
+    /// What the driver said.
+    pub message: String,
+    /// The SQLSTATE, when the failure came from the database rather than the connection.
+    pub sqlstate: Option<String>,
+    /// Whether waiting and asking again could succeed.
+    pub kind: BackendErrorKind,
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.sqlstate {
+            Some(code) => write!(f, "{} ({code})", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+/// Whether a backend failure is worth asking again about.
+///
+/// Classification is the backend's job, not the retry loop's: SQLSTATEs are Postgres's, and a
+/// SQLite backend would decide on message text instead. Python and Go both split it this way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendErrorKind {
+    /// The connection failed, or the server cannot serve requests right now.
+    ///
+    /// Retried by default, and the one class [`retry::RetryPolicy`] can be told to give up on:
+    /// a caller that would rather see the failure than block can opt out.
+    Connection,
+    /// Contention — a serialization failure or a deadlock.
+    ///
+    /// Always retried, whatever the policy says. The database is working; it asked this
+    /// transaction to step aside so another could commit, and not asking again loses the write.
+    Transient,
+    /// The database understood the request and rejected it.
+    ///
+    /// A syntax error, a constraint violation, a missing table. Asking again cannot help.
+    Permanent,
+}
 
 /// The result of trying to record a workflow's final outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
