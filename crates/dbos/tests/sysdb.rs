@@ -3,32 +3,19 @@
 mod support;
 
 use dbos::sysdb::postgres::PostgresSystemDatabase;
-use dbos::sysdb::types::{Timestamp, WorkflowRecord, WorkflowStatus};
+use dbos::sysdb::types::{NewWorkflow, Timestamp, WorkflowStatus};
 use dbos::sysdb::{DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite, SystemDatabase};
 
 use support::test_database;
 
-fn record(id: &str) -> WorkflowRecord {
-    WorkflowRecord {
-        workflow_id: id.to_owned(),
-        status: WorkflowStatus::Pending,
+fn workflow(id: &str) -> NewWorkflow {
+    NewWorkflow {
         name: Some("checkout".to_owned()),
-        class_name: None,
-        config_name: None,
         input: Some(r#"{"positionalArgs":[1],"namedArgs":{}}"#.to_owned()),
-        output: None,
-        error: None,
         serialization: Some("portable_json".to_owned()),
         executor_id: Some("local".to_owned()),
         application_version: Some("v1".to_owned()),
-        recovery_attempts: 0,
-        queue_name: None,
-        created_at: Timestamp::from_epoch_ms(1_700_000_000_000),
-        updated_at: Timestamp::from_epoch_ms(1_700_000_000_000),
-        started_at: None,
-        completed_at: None,
-        forked_from: None,
-        parent_workflow_id: None,
+        ..NewWorkflow::new(id)
     }
 }
 
@@ -43,7 +30,7 @@ async fn sysdb() -> (PostgresSystemDatabase, support::TestDatabase) {
 async fn a_workflow_round_trips() {
     let (sys, _db) = sysdb().await;
     let written = sys
-        .init_workflow_status(InitWorkflowStatus::new(&record("wf-1")))
+        .init_workflow_status(InitWorkflowStatus::new(&workflow("wf-1")))
         .await
         .expect("insert failed");
     assert_eq!(written.status, WorkflowStatus::Pending);
@@ -71,7 +58,7 @@ async fn a_workflow_round_trips() {
 #[tokio::test]
 async fn payloads_are_stored_verbatim() {
     let (sys, _db) = sysdb().await;
-    let mut r = record("wf-opaque");
+    let mut r = workflow("wf-opaque");
     // Deliberately not valid JSON, to show nothing here parses it.
     r.input = Some("not json at all \u{1F600} '\"; --".to_owned());
     sys.init_workflow_status(InitWorkflowStatus::new(&r))
@@ -101,12 +88,12 @@ async fn a_missing_workflow_reads_as_none() {
 #[tokio::test]
 async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(InitWorkflowStatus::new(&record("wf-dup")))
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-dup")))
         .await
         .unwrap();
 
     // The same id running a different function is a programming error, not a race.
-    let mut different = record("wf-dup");
+    let mut different = workflow("wf-dup");
     different.name = Some("a-different-function".to_owned());
     let err = sys
         .init_workflow_status(InitWorkflowStatus::new(&different))
@@ -119,7 +106,7 @@ async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
 
     // Re-submitting the same workflow is fine, and the original row stands.
     let again = sys
-        .init_workflow_status(InitWorkflowStatus::new(&record("wf-dup")))
+        .init_workflow_status(InitWorkflowStatus::new(&workflow("wf-dup")))
         .await
         .expect("re-submitting the same workflow should succeed");
     assert_eq!(again.status, WorkflowStatus::Pending);
@@ -134,7 +121,7 @@ async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
 #[tokio::test]
 async fn only_recoveries_and_dequeues_count_as_attempts() {
     let (sys, _db) = sysdb().await;
-    let r = record("wf-attempts");
+    let r = workflow("wf-attempts");
 
     let first = sys
         .init_workflow_status(InitWorkflowStatus::new(&r))
@@ -161,12 +148,52 @@ async fn only_recoveries_and_dequeues_count_as_attempts() {
     assert_eq!(recovered.recovery_attempts, 2, "a recovery is an attempt");
 }
 
+/// The initial status follows from the queue and the delay, and is not the caller's to choose.
+///
+/// Java derives it the same way. A caller that could name the status could enqueue a workflow
+/// as `SUCCESS` and have it never run.
+#[tokio::test]
+async fn the_initial_status_is_derived_from_the_queue_and_delay() {
+    let (sys, _db) = sysdb().await;
+    let cases = [
+        (None, None, WorkflowStatus::Pending),
+        (Some("orders"), None, WorkflowStatus::Enqueued),
+        (
+            Some("orders"),
+            Some(std::time::Duration::from_secs(5)),
+            WorkflowStatus::Delayed,
+        ),
+        // A delay without a queue is still PENDING: nothing dequeues it, so nothing waits.
+        (
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            WorkflowStatus::Pending,
+        ),
+    ];
+    for (index, (queue, delay, expected)) in cases.into_iter().enumerate() {
+        let wf = NewWorkflow {
+            queue_name: queue.map(str::to_owned),
+            delay,
+            ..workflow(&format!("wf-status-{index}"))
+        };
+        assert_eq!(
+            wf.initial_status(),
+            expected,
+            "case {index} derived wrongly"
+        );
+        let init = sys
+            .init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+        assert_eq!(init.status, expected, "case {index} stored wrongly");
+    }
+}
+
 /// A queued workflow does not accrue attempts, because it is not running.
 #[tokio::test]
 async fn queued_workflows_do_not_accrue_attempts() {
     let (sys, _db) = sysdb().await;
-    let mut r = record("wf-queued");
-    r.status = WorkflowStatus::Enqueued;
+    let mut r = workflow("wf-queued");
     r.queue_name = Some("orders".to_owned());
 
     let first = sys
@@ -196,19 +223,17 @@ async fn queued_workflows_do_not_accrue_attempts() {
 #[tokio::test]
 async fn exceeding_the_recovery_limit_parks_the_workflow() {
     let (sys, _db) = sysdb().await;
-    let r = record("wf-dlq");
+    let r = workflow("wf-dlq");
     sys.init_workflow_status(InitWorkflowStatus::new(&r))
         .await
         .unwrap();
 
-    // Each recovery is a different attempt, so each carries its own owner.
+    // Each recovery is a separate attempt, and so gets its own owner identity.
     let mut last = Ok(());
-    for attempt in 0..5 {
-        let owner = format!("owner-{attempt}");
+    for _ in 0..5 {
         last = sys
             .init_workflow_status(InitWorkflowStatus {
                 max_recovery_attempts: Some(2),
-                owner_xid: Some(&owner),
                 is_recovery: true,
                 ..InitWorkflowStatus::new(&r)
             })
@@ -234,25 +259,20 @@ async fn exceeding_the_recovery_limit_parks_the_workflow() {
 ///
 /// `executor_id` cannot decide this — it defaults to `"local"` and so collides between
 /// processes on one machine. `owner_xid` is per-attempt, which is the point of migration 7.
+/// Each call generates its own, so two calls here are two owners without saying so.
 #[tokio::test]
 async fn a_second_owner_records_but_does_not_execute() {
     let (sys, _db) = sysdb().await;
-    let r = record("wf-owned");
+    let r = workflow("wf-owned");
 
     let first = sys
-        .init_workflow_status(InitWorkflowStatus {
-            owner_xid: Some("owner-a"),
-            ..InitWorkflowStatus::new(&r)
-        })
+        .init_workflow_status(InitWorkflowStatus::new(&r))
         .await
         .unwrap();
     assert!(first.should_execute);
 
     let second = sys
-        .init_workflow_status(InitWorkflowStatus {
-            owner_xid: Some("owner-b"),
-            ..InitWorkflowStatus::new(&r)
-        })
+        .init_workflow_status(InitWorkflowStatus::new(&r))
         .await
         .unwrap();
     assert!(
@@ -263,7 +283,6 @@ async fn a_second_owner_records_but_does_not_execute() {
     // Recovery is exactly the case where taking it over is correct.
     let recovering = sys
         .init_workflow_status(InitWorkflowStatus {
-            owner_xid: Some("owner-b"),
             is_recovery: true,
             ..InitWorkflowStatus::new(&r)
         })
@@ -276,11 +295,11 @@ async fn a_second_owner_records_but_does_not_execute() {
 #[tokio::test]
 async fn the_stored_serialization_is_reported_back() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(InitWorkflowStatus::new(&record("wf-fmt")))
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-fmt")))
         .await
         .unwrap();
 
-    let mut later = record("wf-fmt");
+    let mut later = workflow("wf-fmt");
     later.serialization = Some("rust_serde".to_owned());
     let outcome = sys
         .init_workflow_status(InitWorkflowStatus::new(&later))
@@ -302,7 +321,7 @@ async fn the_stored_serialization_is_reported_back() {
 #[tokio::test]
 async fn an_owner_is_generated_when_none_is_supplied() {
     let (sys, _db) = sysdb().await;
-    let r = record("wf-auto-owner");
+    let r = workflow("wf-auto-owner");
 
     let first = sys
         .init_workflow_status(InitWorkflowStatus::new(&r))
@@ -321,6 +340,107 @@ async fn an_owner_is_generated_when_none_is_supplied() {
     );
 }
 
+/// Every field a caller can set is written, and comes back on the row.
+///
+/// [`NewWorkflow`] has 24 fields and most tests set a handful. Without this, a field could be
+/// dropped from the `INSERT` and nothing would notice — which is exactly what happened while
+/// this test was being written.
+#[tokio::test]
+async fn every_settable_field_round_trips() {
+    let (sys, _db) = sysdb().await;
+    let written = NewWorkflow {
+        class_name: Some("Checkout".to_owned()),
+        config_name: Some("primary".to_owned()),
+        queue_name: Some("orders".to_owned()),
+        deduplication_id: Some("dedup-key".to_owned()),
+        priority: 7,
+        queue_partition_key: Some("eu-west".to_owned()),
+        delay: Some(std::time::Duration::from_secs(60)),
+        is_debounced: true,
+        debounce_deadline: Some(Timestamp::from_epoch_ms(1_700_000_020_000)),
+        timeout: Some(std::time::Duration::from_secs(30)),
+        deadline: Some(Timestamp::from_epoch_ms(1_700_000_030_000)),
+        application_id: Some("app-1".to_owned()),
+        authenticated_user: Some("alice".to_owned()),
+        authenticated_roles: Some(r#"["admin"]"#.to_owned()),
+        assumed_role: Some("admin".to_owned()),
+        parent_workflow_id: Some("wf-parent".to_owned()),
+        schedule_name: Some("nightly".to_owned()),
+        attributes: Some(r#"{"tenant": "acme"}"#.to_owned()),
+        ..workflow("wf-all-fields")
+    };
+    let before = Timestamp::now();
+    let init = sys
+        .init_workflow_status(InitWorkflowStatus::new(&written))
+        .await
+        .expect("insert failed");
+
+    // A queue plus a delay is DELAYED — derived here, not offered by the caller.
+    assert_eq!(init.status, WorkflowStatus::Delayed);
+    assert_eq!(init.deadline, written.deadline);
+
+    let read = sys
+        .get_workflow_status("wf-all-fields")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(read.workflow_id, "wf-all-fields");
+    assert_eq!(read.name, written.name);
+    assert_eq!(read.class_name, written.class_name);
+    assert_eq!(read.config_name, written.config_name);
+    assert_eq!(read.input, written.input);
+    assert_eq!(read.serialization, written.serialization);
+    assert_eq!(read.queue_name, written.queue_name);
+    assert_eq!(read.deduplication_id, written.deduplication_id);
+    assert_eq!(read.priority, written.priority);
+    assert_eq!(read.queue_partition_key, written.queue_partition_key);
+    assert!(read.is_debounced);
+    assert_eq!(read.debounce_deadline, written.debounce_deadline);
+    assert_eq!(read.timeout, written.timeout);
+    assert_eq!(read.deadline, written.deadline);
+    assert_eq!(read.executor_id, written.executor_id);
+    assert_eq!(read.application_version, written.application_version);
+    assert_eq!(read.application_id, written.application_id);
+    assert_eq!(read.authenticated_user, written.authenticated_user);
+    assert_eq!(read.authenticated_roles, written.authenticated_roles);
+    assert_eq!(read.assumed_role, written.assumed_role);
+    assert_eq!(read.parent_workflow_id, written.parent_workflow_id);
+    assert_eq!(read.schedule_name, written.schedule_name);
+    // `jsonb` normalises whitespace, so compare the parsed shape rather than the text.
+    assert!(
+        read.attributes
+            .as_deref()
+            .unwrap_or_default()
+            .contains("acme"),
+        "attributes should survive, got {:?}",
+        read.attributes,
+    );
+
+    // The delay is a duration in, an instant out, stamped against the database layer's clock.
+    let delay_until = read.delay_until.expect("a delay should have been stamped");
+    let offset = delay_until.as_epoch_ms() - before.as_epoch_ms();
+    assert!(
+        (60_000..70_000).contains(&offset),
+        "delay_until should be ~60s from now, was {offset}ms",
+    );
+
+    // Columns the caller cannot set, and which creation must therefore leave alone.
+    assert_eq!(read.output, None);
+    assert_eq!(read.error, None);
+    assert_eq!(read.started_at, None);
+    assert_eq!(read.completed_at, None);
+    assert_eq!(read.forked_from, None);
+    assert!(!read.was_forked_from);
+    assert!(!read.rate_limited);
+    assert!(
+        read.owner_xid.is_some(),
+        "an owner should have been stamped"
+    );
+    assert!(read.created_at.as_epoch_ms() >= before.as_epoch_ms());
+    assert_eq!(read.created_at, read.updated_at);
+}
+
 /// The first outcome wins; a later one is reported as lost rather than applied.
 ///
 /// Two executors can believe they own the same workflow, one having recovered it from the
@@ -328,7 +448,7 @@ async fn an_owner_is_generated_when_none_is_supplied() {
 #[tokio::test]
 async fn only_the_first_outcome_is_recorded() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(InitWorkflowStatus::new(&record("wf-race")))
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-race")))
         .await
         .unwrap();
 
@@ -372,7 +492,7 @@ async fn the_trait_is_object_safe() {
     let (sys, _db) = sysdb().await;
     let dynamic: &dyn SystemDatabase = &sys;
     dynamic
-        .init_workflow_status(InitWorkflowStatus::new(&record("wf-dyn")))
+        .init_workflow_status(InitWorkflowStatus::new(&workflow("wf-dyn")))
         .await
         .unwrap();
     assert!(

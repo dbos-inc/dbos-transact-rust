@@ -252,9 +252,10 @@ pub struct WorkflowRecord {
     pub deduplication_id: Option<String>,
     /// Dequeue priority; lower runs sooner.
     ///
-    /// `i32`, not `i64`: the column is `INT4` on both backends, and widening here would make
-    /// values round-trip through a type the column cannot hold.
-    pub priority: Option<i32>,
+    /// `i32` and not optional, mirroring `INT4 NOT NULL DEFAULT 0`. Widening to `i64` would let
+    /// values round-trip through a type the column cannot hold, and making it optional would
+    /// invite writing a NULL the column rejects.
+    pub priority: i32,
     /// Partition this workflow belongs to, on a partitioned queue.
     pub queue_partition_key: Option<String>,
     /// Whether a rate limiter is currently holding this workflow back.
@@ -283,6 +284,110 @@ pub struct WorkflowRecord {
     /// Opaque here like every other payload: this layer stores and returns the text and does
     /// not parse it, even though the column is `jsonb` and is queried by containment.
     pub attributes: Option<String>,
+}
+
+/// A workflow being created, as opposed to one being read back.
+///
+/// This is deliberately *not* [`WorkflowRecord`]. A row has 37 columns; a caller creating a
+/// workflow can meaningfully set 24 of them. The rest are the database's to write:
+///
+/// - `status` and `recovery_attempts` are **derived** from the queue and delay below, so a
+///   caller cannot enqueue a workflow and then label it `SUCCESS`.
+/// - `created_at`, `updated_at`, and `owner_xid` are stamped at insert.
+/// - `output`, `error`, `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and
+///   `rate_limited` belong to execution, forking, and the rate limiter. A workflow that has
+///   not started has no output to offer.
+///
+/// Java draws the same line with `WorkflowStatusInternal`. Python and Go pass their full row
+/// type instead, but Go's is a package-internal call taking a transaction, and Python's carries
+/// the same fields it then ignores.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewWorkflow {
+    /// The id, which is what makes a retried submission the same workflow.
+    pub workflow_id: String,
+    /// The registered function name.
+    pub name: Option<String>,
+    /// The class the function belongs to, for class-bound workflows.
+    pub class_name: Option<String>,
+    /// The configured instance name, for instance-bound workflows.
+    pub config_name: Option<String>,
+    /// Encoded arguments.
+    pub input: Option<String>,
+    /// How `input` and, later, the outcome are encoded.
+    pub serialization: Option<String>,
+
+    /// The queue to enqueue on. `None` runs the workflow directly.
+    ///
+    /// This decides the initial status: no queue means `PENDING`, a queue means `ENQUEUED`, and
+    /// a queue with a `delay` means `DELAYED`.
+    pub queue_name: Option<String>,
+    /// Deduplication key within the queue.
+    pub deduplication_id: Option<String>,
+    /// Dequeue priority; lower runs sooner.
+    pub priority: i32,
+    /// Partition within the queue.
+    pub queue_partition_key: Option<String>,
+    /// How long to hold the workflow before it becomes eligible to dequeue.
+    ///
+    /// A duration, not an instant: the wall-clock time is stamped by the database layer against
+    /// the same clock it writes `created_at` with. Letting the caller compute `now + delay`
+    /// would put its clock skew into the row.
+    pub delay: Option<Duration>,
+    /// Marks `deduplication_id` as a debounce key to clear on the `DELAYED` → `ENQUEUED` move.
+    pub is_debounced: bool,
+    /// Cap beyond which bounces may not extend `delay`.
+    pub debounce_deadline: Option<Timestamp>,
+
+    /// Wall-clock budget for the whole workflow.
+    pub timeout: Option<Duration>,
+    /// Absolute expiry, when the parent already fixed one.
+    ///
+    /// Distinct from `timeout` because a child inherits its parent's deadline rather than
+    /// restarting the clock.
+    pub deadline: Option<Timestamp>,
+
+    /// The executor claiming this workflow.
+    pub executor_id: Option<String>,
+    /// Application version, which recovery uses to avoid resuming under changed code.
+    pub application_version: Option<String>,
+    /// Application id, as assigned by the platform.
+    pub application_id: Option<String>,
+
+    /// Authenticated principal at submission.
+    pub authenticated_user: Option<String>,
+    /// Encoded JSON list of that principal's roles.
+    pub authenticated_roles: Option<String>,
+    /// The role actually assumed.
+    pub assumed_role: Option<String>,
+
+    /// The workflow that started this one.
+    pub parent_workflow_id: Option<String>,
+    /// The schedule that triggered this workflow. Set only by the scheduler.
+    pub schedule_name: Option<String>,
+    /// Caller-supplied JSON attributes, stored in a `jsonb` column.
+    pub attributes: Option<String>,
+}
+
+impl NewWorkflow {
+    /// A workflow with an id and nothing else set.
+    pub fn new(workflow_id: impl Into<String>) -> Self {
+        Self {
+            workflow_id: workflow_id.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The status this workflow starts in, which follows from the queue and the delay.
+    ///
+    /// Not a caller's choice in any implementation: a workflow is `PENDING` when it runs here,
+    /// `ENQUEUED` when it waits on a queue, and `DELAYED` when it waits on a queue and a clock.
+    pub fn initial_status(&self) -> WorkflowStatus {
+        match (&self.queue_name, &self.delay) {
+            (None, _) => WorkflowStatus::Pending,
+            (Some(_), None) => WorkflowStatus::Enqueued,
+            (Some(_), Some(_)) => WorkflowStatus::Delayed,
+        }
+    }
 }
 
 #[cfg(test)]

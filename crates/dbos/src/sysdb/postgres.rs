@@ -200,7 +200,9 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error>
             .map(Timestamp::from_epoch_ms),
         forked_from: row.try_get("forked_from")?,
         parent_workflow_id: row.try_get("parent_workflow_id")?,
-        was_forked_from: row.try_get::<Option<bool>, _>("was_forked_from")?.unwrap_or(false),
+        was_forked_from: row
+            .try_get::<Option<bool>, _>("was_forked_from")?
+            .unwrap_or(false),
 
         owner_xid: row.try_get("owner_xid")?,
         application_id: row.try_get("application_id")?,
@@ -210,9 +212,11 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error>
         request: row.try_get("request")?,
 
         deduplication_id: row.try_get("deduplication_id")?,
-        priority: row.try_get("priority")?,
+        priority: row.try_get::<Option<i32>, _>("priority")?.unwrap_or(0),
         queue_partition_key: row.try_get("queue_partition_key")?,
-        rate_limited: row.try_get::<Option<bool>, _>("rate_limited")?.unwrap_or(false),
+        rate_limited: row
+            .try_get::<Option<bool>, _>("rate_limited")?
+            .unwrap_or(false),
         schedule_name: row.try_get("schedule_name")?,
 
         // A duration, where the three below are instants — see `types`.
@@ -228,7 +232,9 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error>
         debounce_deadline: row
             .try_get::<Option<i64>, _>("debounce_deadline_epoch_ms")?
             .map(Timestamp::from_epoch_ms),
-        is_debounced: row.try_get::<Option<bool>, _>("is_debounced")?.unwrap_or(false),
+        is_debounced: row
+            .try_get::<Option<bool>, _>("is_debounced")?
+            .unwrap_or(false),
 
         // Cast to text in the query, so no JSON library is needed to move a payload this
         // layer never parses.
@@ -252,40 +258,51 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         input: InitWorkflowStatus<'_>,
     ) -> Result<WorkflowInitResult, Error> {
-        let record = input.record;
+        let wf = input.workflow;
         let table = self.table("workflow_status");
+        // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
+        let initial_status = wf.initial_status();
         // Queued workflows are not running, so neither the attempt counter nor the executor
         // stamp applies to them — both `CASE` expressions below turn on that distinction.
         let queued = matches!(
-            record.status,
+            initial_status,
             WorkflowStatus::Enqueued | WorkflowStatus::Delayed
         );
         let initial_attempts = i64::from(!queued);
         // A recovery or a dequeue is being told it owns this workflow; a fresh start is not.
         let claiming = input.is_recovery || input.is_dequeue;
         let increment = i64::from(claiming && !queued);
-        // Generated here when the caller supplies none, so the row always has an owner to
-        // compare against. A caller that retries must pass the same one both times.
-        let generated;
-        let owner_xid = match input.owner_xid {
-            Some(x) => x,
-            None => {
-                generated = uuid::Uuid::new_v4().to_string();
-                &generated
-            }
-        };
+        // Generated here, not taken from the caller, and generated *once* — before any retry.
+        // If a commit acknowledgement is lost, the retry must present the same identity or it
+        // will fail to recognise its own write and conclude someone else owns the row.
+        let owner_xid = uuid::Uuid::new_v4().to_string();
+        // One clock reading for every timestamp this row gets, so `delay_until` cannot disagree
+        // with `created_at`. This is also why `delay` crosses the API as a duration.
+        let now = Timestamp::now();
+        let delay_until = wf
+            .delay
+            .map(|d| Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64));
 
-        // A direct port of the other implementations' upsert, including the column order of
-        // the RETURNING list, so the three can be compared line by line.
+        // The column list is Java's INSERT, in its order, plus Python's two debounce columns.
+        // Columns absent from it are absent deliberately: `output`, `error`, `started_at`,
+        // `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited` are written by
+        // execution, forking, and the rate limiter — never at creation.
         let row = sqlx::query(AssertSqlSafe(format!(
-            "INSERT INTO {table} (workflow_uuid, status, name, class_name, config_name, inputs, \
-             serialization, executor_id, application_version, queue_name, owner_xid, \
-             created_at, updated_at, recovery_attempts) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+            "INSERT INTO {table} (workflow_uuid, status, inputs, \
+             name, class_name, config_name, \
+             queue_name, deduplication_id, priority, queue_partition_key, delay_until_epoch_ms, \
+             authenticated_user, assumed_role, authenticated_roles, \
+             executor_id, application_version, application_id, \
+             created_at, updated_at, recovery_attempts, \
+             workflow_timeout_ms, workflow_deadline_epoch_ms, \
+             parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
+             debounce_deadline_epoch_ms, is_debounced) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::jsonb, $27, $28, $29) \
              ON CONFLICT (workflow_uuid) DO UPDATE SET \
                recovery_attempts = CASE \
                    WHEN {table}.status != 'ENQUEUED' AND {table}.status != 'DELAYED' \
-                   THEN {table}.recovery_attempts + $15 \
+                   THEN {table}.recovery_attempts + $30 \
                    ELSE {table}.recovery_attempts \
                END, \
                updated_at = EXCLUDED.updated_at, \
@@ -295,22 +312,37 @@ impl SystemDatabase for PostgresSystemDatabase {
                    ELSE {table}.executor_id \
                END \
              RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
-             owner_xid, serialization"
+             workflow_deadline_epoch_ms, owner_xid, serialization"
         )))
-        .bind(&record.workflow_id)
-        .bind(record.status.as_str())
-        .bind(&record.name)
-        .bind(&record.class_name)
-        .bind(&record.config_name)
-        .bind(&record.input)
-        .bind(&record.serialization)
-        .bind(&record.executor_id)
-        .bind(&record.application_version)
-        .bind(&record.queue_name)
-        .bind(owner_xid)
-        .bind(record.created_at.as_epoch_ms())
-        .bind(record.updated_at.as_epoch_ms())
+        .bind(&wf.workflow_id)
+        .bind(initial_status.as_str())
+        .bind(&wf.input)
+        .bind(&wf.name)
+        .bind(&wf.class_name)
+        .bind(&wf.config_name)
+        .bind(&wf.queue_name)
+        .bind(&wf.deduplication_id)
+        .bind(wf.priority)
+        .bind(&wf.queue_partition_key)
+        .bind(delay_until.map(Timestamp::as_epoch_ms))
+        .bind(&wf.authenticated_user)
+        .bind(&wf.assumed_role)
+        .bind(&wf.authenticated_roles)
+        .bind(&wf.executor_id)
+        .bind(&wf.application_version)
+        .bind(&wf.application_id)
+        .bind(now.as_epoch_ms())
+        .bind(now.as_epoch_ms())
         .bind(initial_attempts)
+        .bind(wf.timeout.map(|d| d.as_millis() as i64))
+        .bind(wf.deadline.map(Timestamp::as_epoch_ms))
+        .bind(&wf.parent_workflow_id)
+        .bind(&owner_xid)
+        .bind(&wf.serialization)
+        .bind(&wf.attributes)
+        .bind(&wf.schedule_name)
+        .bind(wf.debounce_deadline.map(Timestamp::as_epoch_ms))
+        .bind(wf.is_debounced)
         .bind(increment)
         .fetch_one(&self.pool)
         .await?;
@@ -320,6 +352,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         let status = WorkflowStatus::parse(&status_text)
             .ok_or_else(|| Error::Malformed(format!("unknown workflow status {status_text:?}")))?;
         let stored_owner: Option<String> = row.try_get("owner_xid")?;
+        let deadline: Option<i64> = row.try_get("workflow_deadline_epoch_ms")?;
         let serialization: Option<String> = row.try_get("serialization")?;
 
         // Same id, different function: a programming error rather than a race, because the id
@@ -328,18 +361,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             (
                 "function name",
                 row.try_get::<Option<String>, _>("name")?,
-                &record.name,
+                &wf.name,
             ),
-            ("class name", row.try_get("class_name")?, &record.class_name),
-            (
-                "config name",
-                row.try_get("config_name")?,
-                &record.config_name,
-            ),
+            ("class name", row.try_get("class_name")?, &wf.class_name),
+            ("config name", row.try_get("config_name")?, &wf.config_name),
         ] {
             if stored.as_deref() != offered.as_deref() {
                 return Err(Error::ConflictingWorkflow {
-                    workflow_id: record.workflow_id.clone(),
+                    workflow_id: wf.workflow_id.clone(),
                     detail: format!("existing {field} is {stored:?}, but {offered:?} was provided"),
                 });
             }
@@ -347,18 +376,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         // A differing queue is only a warning: requeueing the same workflow elsewhere is
         // legitimate, and the stored queue wins.
         let stored_queue: Option<String> = row.try_get("queue_name")?;
-        if stored_queue.as_deref() != record.queue_name.as_deref() {
+        if stored_queue.as_deref() != wf.queue_name.as_deref() {
             tracing::warn!(
-                workflow_id = %record.workflow_id,
+                workflow_id = %wf.workflow_id,
                 stored = ?stored_queue,
-                provided = ?record.queue_name,
+                provided = ?wf.queue_name,
                 "workflow already exists on a different queue; the stored queue is kept"
             );
         }
 
         // Parked once it has been recovered more often than allowed — but only if some *other*
         // attempt is responsible, so a caller retrying its own attempt is not punished for it.
-        let owner_differs = stored_owner.as_deref() != Some(owner_xid);
+        let owner_differs = stored_owner.as_deref() != Some(owner_xid.as_str());
         if let Some(limit) = input.max_recovery_attempts
             && !status.is_terminal()
             && recovery_attempts > limit + 1
@@ -369,13 +398,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                  started_at_epoch_ms = NULL, queue_name = NULL \
                  WHERE workflow_uuid = $1 AND status = 'PENDING'"
             )))
-            .bind(&record.workflow_id)
+            .bind(&wf.workflow_id)
             .bind(WorkflowStatus::MaxRecoveryAttemptsExceeded.as_str())
             .execute(&self.pool)
             .await?;
 
             return Err(Error::MaxRecoveryAttemptsExceeded {
-                workflow_id: record.workflow_id.clone(),
+                workflow_id: wf.workflow_id.clone(),
                 limit,
             });
         }
@@ -383,6 +412,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         Ok(WorkflowInitResult {
             status,
             recovery_attempts,
+            deadline: deadline.map(Timestamp::from_epoch_ms),
             serialization,
             // Another owner holds the row and this is not a recovery, so recording it is right
             // but running it would be a second execution.

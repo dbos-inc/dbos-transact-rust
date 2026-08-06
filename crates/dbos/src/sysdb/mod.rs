@@ -21,7 +21,7 @@ pub mod types;
 
 use async_trait::async_trait;
 
-use types::{WorkflowRecord, WorkflowStatus};
+use types::{NewWorkflow, Timestamp, WorkflowRecord, WorkflowStatus};
 
 /// What went wrong talking to the system database.
 ///
@@ -90,19 +90,9 @@ pub enum OutcomeWrite {
 #[derive(Debug, Clone, Copy)]
 pub struct InitWorkflowStatus<'a> {
     /// The workflow to record.
-    pub record: &'a WorkflowRecord,
+    pub workflow: &'a NewWorkflow,
     /// Dead-letter threshold. `None` disables parking entirely.
     pub max_recovery_attempts: Option<i64>,
-    /// Identity of *this* attempt, for the single-execution guard.
-    ///
-    /// Two executors that both believe they own a workflow are distinguished by this, not by
-    /// `executor_id`, which defaults to `"local"` and so collides between processes on one
-    /// machine.
-    ///
-    /// `None` generates one. It must be generated **once per logical attempt**, outside any
-    /// retry: if a commit acknowledgement is lost, the retry has to present the same identity
-    /// or it will not recognise its own write and will conclude someone else owns the row.
-    pub owner_xid: Option<&'a str>,
     /// This attempt is recovering a workflow a dead executor left behind.
     pub is_recovery: bool,
     /// This attempt is dequeuing, which tells the caller it owns a workflow that was enqueued.
@@ -115,11 +105,10 @@ pub struct InitWorkflowStatus<'a> {
 
 impl<'a> InitWorkflowStatus<'a> {
     /// A first attempt at a workflow, with no dead-letter limit.
-    pub fn new(record: &'a WorkflowRecord) -> Self {
+    pub fn new(workflow: &'a NewWorkflow) -> Self {
         Self {
-            record,
+            workflow,
             max_recovery_attempts: None,
-            owner_xid: None,
             is_recovery: false,
             is_dequeue: false,
         }
@@ -133,6 +122,11 @@ pub struct WorkflowInitResult {
     pub status: WorkflowStatus,
     /// Recovery attempts recorded against the workflow, after this one.
     pub recovery_attempts: i64,
+    /// The workflow's absolute expiry, as the database now holds it.
+    ///
+    /// Reported back because it may not be the one offered: a timeout is turned into a deadline
+    /// against the database layer's clock, and an existing row keeps the deadline it already had.
+    pub deadline: Option<Timestamp>,
     /// The serialization format actually stored.
     ///
     /// May differ from what the caller offered: the first writer decides the format, and every
@@ -167,6 +161,11 @@ pub trait SystemDatabase: Send + Sync {
     ///   executor yet, and claiming one would be wrong.
     /// - **A different function under the same id is an error.** Name, class, and config must
     ///   match; a differing queue is only a warning, since requeueing elsewhere is legitimate.
+    ///
+    /// The owner identity behind the single-execution guard is generated in here rather than
+    /// passed in, and generated once per call — before any retry the implementation makes. A
+    /// retry that generated a fresh identity after a lost commit acknowledgement would fail to
+    /// recognise its own write and conclude another executor owned the row.
     async fn init_workflow_status(
         &self,
         input: InitWorkflowStatus<'_>,
