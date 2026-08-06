@@ -25,9 +25,9 @@ fn dialect_for(backend: Backend) -> Dialect {
 
 /// Applies a migration list in order, honouring guards.
 ///
-/// Deliberately minimal: no version tracking, no resumption, no locking. This is not the
-/// runner — it exists so the corpus can be executed before the runner is written, and it is
-/// what the real runner will replace.
+/// A stripped-down stand-in for `runner::run`, used where a test needs to apply an explicit
+/// slice of the corpus — the runner always applies everything from the recorded version. It
+/// deliberately keeps no version state.
 async fn apply_all(pool: &PgPool, schema: &str, migrations: &[Migration]) {
     for m in migrations {
         if m.sql.trim().is_empty() {
@@ -46,11 +46,9 @@ async fn apply_all(pool: &PgPool, schema: &str, migrations: &[Migration]) {
                 continue;
             }
         }
-        // Whole files, never split on `;` — five of them carry semicolons inside `$$` blocks.
-        //
-        // `AssertSqlSafe` because sqlx 0.9 requires a `&'static str` otherwise. The string is
-        // rendered from the embedded corpus, and the only interpolated value is the schema
-        // name, which `quote_identifier` has already escaped.
+        // Whole files, never split on `;` — several carry semicolons inside `$$` blocks.
+        // `AssertSqlSafe` because sqlx 0.9 wants a `&'static str` otherwise; the string is
+        // rendered from the embedded corpus with only the quoted schema interpolated.
         sqlx::raw_sql(sqlx::AssertSqlSafe(m.sql.clone()))
             .execute(pool)
             .await
@@ -84,18 +82,16 @@ async fn the_corpus_applies_to_a_real_database() {
     let pool = db.pool().await;
     let schema = "dbos";
 
-    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
-        .execute(&pool)
-        .await
-        .expect("failed to create the schema");
-
     let migrations = build_migrations(schema, dialect_for(db.backend()), true);
     assert_eq!(
         migrations.len(),
         dbos::sysdb::migrations::LOCAL_MIGRATIONS as usize,
         "one entry per locally-defined migration",
     );
-    apply_all(&pool, schema, &migrations).await;
+    // Through the real runner, so this covers the path production uses.
+    dbos::sysdb::runner::run(&pool, schema, true)
+        .await
+        .expect("migration failed");
 
     let tables = table_names(&pool, schema).await;
     for expected in [

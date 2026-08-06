@@ -454,6 +454,7 @@ dependencies = [
  "sqlx",
  "testcontainers",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

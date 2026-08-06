@@ -7,3 +7,4 @@
 //! (SQLite) a second implementation rather than a rewrite.
 
 pub mod migrations;
+pub mod runner;

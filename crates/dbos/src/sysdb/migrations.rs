@@ -254,19 +254,11 @@ pub fn source(name: &str) -> Option<&'static MigrationSource> {
     SOURCES.iter().find(|s| s.name == name)
 }
 
-/// The highest migration this implementation defines on its own.
+/// The highest migration defined here, and the version a fully migrated database records.
 ///
-/// Migrations from [`SHARED_MIGRATION_BASE`] up are defined identically by every DBOS
-/// implementation; everything below is each implementation's own history.
+/// Every implementation keeps its own history and its own count, so this number is not
+/// comparable with another implementation's.
 pub const LOCAL_MIGRATIONS: u32 = 47;
-
-/// The index from which every implementation defines the same migration at the same number.
-///
-/// Below it each implementation keeps its own history and its own count, so the version
-/// recorded in `dbos_migrations` only means the same thing across implementations at or above
-/// this point. Local histories are padded up to `SHARED_MIGRATION_BASE - 1` so the shared
-/// series always begins here.
-pub const SHARED_MIGRATION_BASE: u32 = 100;
 
 /// Which SQL dialect the system database speaks.
 ///

@@ -19,6 +19,17 @@ engine = []
 # feature is not a breaking change, so it waits until it re-exports something.
 
 [dependencies]
+# The system database layer talks to PostgreSQL directly. `AssertSqlSafe` in 0.9 means any
+# runtime-built SQL — every rendered migration — must be explicitly vouched for.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
+# Facade only: this crate emits spans and events and installs no subscriber.
+tracing = "0.1"
+# `time` only, for backoff between retries.
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 # Integration tests need a real database, and testcontainers is the only way they get one:
