@@ -20,7 +20,7 @@
 //! Applying the corpus to both backends is what verifies it; reading the SQL is not enough.
 
 /// Migrations whose index DDL uses `CONCURRENTLY` and so cannot run inside a transaction on
-/// PostgreSQL. Each takes the keyword as its first `%s` — render with [`RenderArgs::online`].
+/// PostgreSQL. Each carries a `{{concurrently}}` placeholder — see [`Placeholders`].
 ///
 /// Empty on CockroachDB, which applies schema changes online regardless.
 pub const ONLINE_MIGRATIONS: &[u32] = &[
@@ -32,11 +32,15 @@ pub fn is_online(version: u32) -> bool {
     ONLINE_MIGRATIONS.contains(&version)
 }
 
-/// Quotes a schema name for use as a SQL identifier.
+/// Quotes any SQL identifier — a schema, table, index, or database name.
 ///
-/// The migration files interpolate the schema *already quoted* — they contain
-/// `%s."workflow_status"`, not `"%s"."workflow_status"` — so the rendered value carries its
-/// own quotes. Embedded double quotes are doubled, per SQL's quoted-identifier rules.
+/// Callers interpolate the *result*, so it carries its own quotes: the migration files contain
+/// `{{schema}}.notifications`, not `"{{schema}}".notifications`, and the same holds for the
+/// table and database names built at runtime. Embedded double quotes are doubled, per SQL's
+/// quoted-identifier rules.
+///
+/// Quoting is what makes the surrounding SQL safe to assert, since a schema name is the one
+/// piece of these statements that comes from configuration.
 ///
 /// ```
 /// use dbos::sysdb::migrations::quote_identifier;
@@ -161,7 +165,7 @@ pub struct MigrationSource {
     pub version: u32,
     /// The filename, which is what distinguishes variants sharing a version.
     pub name: &'static str,
-    /// The file's verbatim contents, still carrying its `%s` slots.
+    /// The file's verbatim contents, still carrying its `{{name}}` placeholders.
     pub sql: &'static str,
 }
 

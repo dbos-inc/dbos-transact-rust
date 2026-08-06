@@ -28,6 +28,11 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 # Facade only: this crate emits spans and events and installs no subscriber.
 tracing = "0.1"
+# `async fn` in traits is stable but not dyn-compatible, and `SystemDatabase` has to be a
+# trait object so a second backend can be dropped in without the callers changing.
+async-trait = "0.1"
+# Owner identities for the single-execution guard, and workflow ids.
+uuid = { version = "1", features = ["v4"] }
 # `time` only, for backoff between retries.
 tokio = { version = "1", features = ["time"] }
 

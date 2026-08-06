@@ -15,4 +15,178 @@
 pub const DEFAULT_SCHEMA: &str = "dbos";
 
 pub mod migrations;
+pub mod postgres;
 pub mod runner;
+pub mod types;
+
+use async_trait::async_trait;
+
+use types::{WorkflowRecord, WorkflowStatus};
+
+/// What went wrong talking to the system database.
+///
+/// Deliberately not `sqlx::Error`: that type names a specific driver, and this trait has to be
+/// implementable by a backend that does not use one.
+#[derive(Debug)]
+pub enum Error {
+    /// The database rejected or could not serve the request.
+    Backend(String),
+    /// A stored value could not be understood — an unrecognised status, a missing column.
+    ///
+    /// Usually means the database was written by an implementation that knows something this
+    /// one does not.
+    Malformed(String),
+    /// A workflow with this id already exists, running a different function.
+    ///
+    /// Reusing an id for different work is a programming error, not a race: the id is how
+    /// every implementation decides two attempts are the same workflow.
+    ConflictingWorkflow {
+        /// The id submitted twice.
+        workflow_id: String,
+        /// Which part disagreed, and how.
+        detail: String,
+    },
+    /// The workflow has been recovered too many times and is now parked.
+    MaxRecoveryAttemptsExceeded {
+        /// The parked workflow.
+        workflow_id: String,
+        /// The limit it passed.
+        limit: i64,
+    },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Backend(m) => write!(f, "system database error: {m}"),
+            Error::Malformed(m) => write!(f, "unexpected value in the system database: {m}"),
+            Error::ConflictingWorkflow {
+                workflow_id,
+                detail,
+            } => write!(f, "workflow {workflow_id} already exists: {detail}"),
+            Error::MaxRecoveryAttemptsExceeded { workflow_id, limit } => write!(
+                f,
+                "workflow {workflow_id} exceeded {limit} recovery attempts"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// The result of trying to record a workflow's final outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeWrite {
+    /// This process recorded the outcome.
+    Recorded,
+    /// Another process got there first, and the row is already terminal.
+    ///
+    /// Not an error: the caller has lost a race it was allowed to lose, and should adopt the
+    /// recorded outcome rather than overwrite it.
+    AlreadyFinished,
+}
+
+/// What the caller is doing, which decides how an existing row is treated.
+#[derive(Debug, Clone, Copy)]
+pub struct InitWorkflowStatus<'a> {
+    /// The workflow to record.
+    pub record: &'a WorkflowRecord,
+    /// Dead-letter threshold. `None` disables parking entirely.
+    pub max_recovery_attempts: Option<i64>,
+    /// Identity of *this* attempt, for the single-execution guard.
+    ///
+    /// Two executors that both believe they own a workflow are distinguished by this, not by
+    /// `executor_id`, which defaults to `"local"` and so collides between processes on one
+    /// machine.
+    ///
+    /// `None` generates one. It must be generated **once per logical attempt**, outside any
+    /// retry: if a commit acknowledgement is lost, the retry has to present the same identity
+    /// or it will not recognise its own write and will conclude someone else owns the row.
+    pub owner_xid: Option<&'a str>,
+    /// This attempt is recovering a workflow a dead executor left behind.
+    pub is_recovery: bool,
+    /// This attempt is dequeuing, which tells the caller it owns a workflow that was enqueued.
+    ///
+    /// Kept apart from `is_recovery` because the references do, even though the two currently
+    /// have the same effect here: both count against the recovery budget and both may claim a
+    /// row another owner holds, which would be theft from a fresh start.
+    pub is_dequeue: bool,
+}
+
+impl<'a> InitWorkflowStatus<'a> {
+    /// A first attempt at a workflow, with no dead-letter limit.
+    pub fn new(record: &'a WorkflowRecord) -> Self {
+        Self {
+            record,
+            max_recovery_attempts: None,
+            owner_xid: None,
+            is_recovery: false,
+            is_dequeue: false,
+        }
+    }
+}
+
+/// What the database said about a workflow after initialising it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowInitResult {
+    /// The stored status, which is the existing one when the row was already there.
+    pub status: WorkflowStatus,
+    /// Recovery attempts recorded against the workflow, after this one.
+    pub recovery_attempts: i64,
+    /// The serialization format actually stored.
+    ///
+    /// May differ from what the caller offered: the first writer decides the format, and every
+    /// later attempt has to read the payloads that are actually there.
+    pub serialization: Option<String>,
+    /// Whether this caller should go on to run the workflow.
+    ///
+    /// `false` means another owner holds it and this attempt is not a recovery — so the row is
+    /// recorded, but running it would be a second execution.
+    pub should_execute: bool,
+}
+
+/// Everything the engine needs from the system database.
+///
+/// **No method mentions a driver type.** No pool, no row, no `sqlx::Postgres` — each
+/// implementation owns its connections privately. That is what keeps a second backend a second
+/// implementation rather than a rewrite, and what would let a host language call this across an
+/// FFI boundary.
+///
+/// Payloads cross as already-encoded strings; see [`types`].
+#[async_trait]
+pub trait SystemDatabase: Send + Sync {
+    /// Records a workflow, reconciling with any row already under that id.
+    ///
+    /// The same id submitted twice is one workflow, which is what makes a retried enqueue safe.
+    /// Reconciling is not a no-op, though — three things happen on conflict:
+    ///
+    /// - **Recovery attempts are counted**, but only when the existing row is not merely queued
+    ///   and only when the caller is recovering or dequeuing. Passing the limit parks the
+    ///   workflow as [`WorkflowStatus::MaxRecoveryAttemptsExceeded`] and errors.
+    /// - **The executor is re-stamped**, unless this is an enqueue — a queued workflow has no
+    ///   executor yet, and claiming one would be wrong.
+    /// - **A different function under the same id is an error.** Name, class, and config must
+    ///   match; a differing queue is only a warning, since requeueing elsewhere is legitimate.
+    async fn init_workflow_status(
+        &self,
+        input: InitWorkflowStatus<'_>,
+    ) -> Result<WorkflowInitResult, Error>;
+
+    /// Reads one workflow, or `None` if there is no such id.
+    async fn get_workflow_status(&self, workflow_id: &str)
+    -> Result<Option<WorkflowRecord>, Error>;
+
+    /// Records a terminal outcome, but only while the workflow is still running.
+    ///
+    /// The status gate is the point. Two executors can believe they own the same workflow — one
+    /// recovering after the other was presumed dead — and whichever finishes second must not
+    /// overwrite the first's result. Returning which happened lets the loser adopt the recorded
+    /// outcome instead of reporting its own.
+    async fn update_workflow_outcome(
+        &self,
+        workflow_id: &str,
+        status: WorkflowStatus,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<OutcomeWrite, Error>;
+}
