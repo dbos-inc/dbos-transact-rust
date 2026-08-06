@@ -80,7 +80,7 @@ async fn columns_of(pool: &PgPool, schema: &str, table: &str) -> Vec<String> {
 async fn the_corpus_applies_to_a_real_database() {
     let db = raw_database().await;
     let pool = db.pool().await;
-    let schema = "dbos";
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
 
     let migrations = build_migrations(schema, dialect_for(db.backend()), true);
     assert_eq!(
@@ -121,7 +121,7 @@ async fn the_corpus_applies_to_a_real_database() {
 async fn late_migrations_take_effect() {
     let db = raw_database().await;
     let pool = db.pool().await;
-    let schema = "dbos";
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
     sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
         .execute(&pool)
         .await
@@ -166,7 +166,7 @@ async fn only_the_notifications_trigger_survives() {
         return; // CockroachDB installs none of them.
     }
     let pool = db.pool().await;
-    let schema = "dbos";
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
     sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
         .execute(&pool)
         .await
@@ -212,7 +212,7 @@ async fn only_the_notifications_trigger_survives() {
 async fn migration_ten_is_a_no_op_on_a_schema_we_created() {
     let db = raw_database().await;
     let pool = db.pool().await;
-    let schema = "dbos";
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
     sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
         .execute(&pool)
         .await
@@ -290,7 +290,7 @@ async fn the_corpus_applies_without_listen_notify() {
         return; // CockroachDB never installs the triggers; the Postgres run covers this.
     }
     let pool = db.pool().await;
-    let schema = "dbos";
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
     sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
         .execute(&pool)
         .await

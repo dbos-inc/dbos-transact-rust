@@ -41,4 +41,4 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls",
     "postgres",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

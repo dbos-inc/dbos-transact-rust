@@ -13,7 +13,7 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use support::raw_database;
 
-const SCHEMA: &str = "dbos";
+use dbos::sysdb::DEFAULT_SCHEMA as SCHEMA;
 
 async fn version(pool: &PgPool) -> i64 {
     sqlx::query(AssertSqlSafe(format!(

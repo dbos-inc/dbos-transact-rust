@@ -8,6 +8,7 @@ mod support;
 
 use std::sync::Arc;
 
+use dbos::sysdb::DEFAULT_SCHEMA;
 use support::{Backend, SharedSlot, raw_database, test_database};
 
 /// The harness reaches a real server and can run SQL on a fresh database.
@@ -46,8 +47,10 @@ async fn connects_to_a_fresh_database() {
 /// rather than failing, so it is worth asserting directly.
 #[tokio::test]
 async fn overlapping_tests_share_one_container() {
-    let first = test_database().await;
-    let second = test_database().await;
+    // The raw lane, deliberately: this is about the container, not the schema, and leasing two
+    // migrated databases to prove it would pay for two migrations to learn nothing extra.
+    let first = raw_database().await;
+    let second = raw_database().await;
 
     assert_eq!(
         first.server().container_id(),
@@ -59,6 +62,57 @@ async fn overlapping_tests_share_one_container() {
         second.url(),
         "each test should get its own database",
     );
+}
+
+/// A leased database arrives migrated, which is what `test_database` promises.
+#[tokio::test]
+async fn a_leased_database_is_already_migrated() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = $1",
+    )
+    .bind(DEFAULT_SCHEMA)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to count tables");
+    assert!(
+        tables > 10,
+        "the DBOS schema should already exist, saw {tables}"
+    );
+}
+
+/// Resetting a leased database clears what a previous holder wrote.
+///
+/// This is what makes reuse safe. It is tested by calling `reset` directly rather than by
+/// leasing twice and expecting the same database back: tests in a binary run in parallel, so
+/// any given lease may come from the idle pool or be freshly migrated, and asserting which
+/// would be asserting that no other test is running.
+#[tokio::test]
+async fn resetting_clears_a_previous_holders_rows() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+
+    sqlx::query(
+        "INSERT INTO dbos.workflow_status (workflow_uuid, status, name) \
+         VALUES ($1, 'PENDING', 'leftover')",
+    )
+    .bind("wf-from-a-previous-test")
+    .execute(&pool)
+    .await
+    .expect("failed to write a row");
+
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM dbos.workflow_status")
+            .fetch_one(&pool)
+            .await
+            .expect("failed to count rows")
+    };
+    assert_eq!(count().await, 1, "the row should be there to begin with");
+
+    db.reset().await;
+    assert_eq!(count().await, 0, "reset should have cleared it");
 }
 
 /// The shared slot hands out one value and releases it once nobody holds it.

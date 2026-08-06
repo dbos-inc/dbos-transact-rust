@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use dbos::sysdb::DEFAULT_SCHEMA;
+use dbos::sysdb::migrations::quote_identifier;
 use sqlx::AssertSqlSafe;
 use sqlx::ConnectOptions;
 use sqlx::postgres::PgConnectOptions;
@@ -55,6 +57,13 @@ const COCKROACH_PORT: u16 = 26257;
 /// without this a `docker ps --filter` cleanup check would match nothing and pass
 /// whether or not anything leaked.
 const CONTAINER_LABEL: (&str, &str) = ("dev.dbos.test-harness", "true");
+
+/// The most migrated databases to keep, and so the widest a suite can run.
+///
+/// Four is enough that tests overlap usefully and small enough that CockroachDB's setup stays
+/// bounded: migrating four costs about 50s there against roughly 75s for twelve, and the
+/// difference buys parallelism a suite this size cannot use.
+pub const POOL_SIZE: usize = 4;
 
 /// How long to wait for the server to accept connections after the container starts.
 /// CockroachDB is the slow one; Postgres is usually ready in well under a second.
@@ -101,6 +110,19 @@ pub struct TestServer {
     backend: Backend,
     host: String,
     port: u16,
+    /// How many migrated databases may exist at once.
+    ///
+    /// Each one costs a full migration run, which is seconds on PostgreSQL and around 40 of
+    /// them on CockroachDB. Uncapped, the count would follow peak parallelism — twelve on a
+    /// twelve-core machine — so a lease past the cap waits for a database to come back rather
+    /// than paying to widen the pool.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Migrated databases not currently leased, by name.
+    ///
+    /// A `std::sync::Mutex` rather than an async one because it is only ever held long enough
+    /// to push or pop a name, never across an await — and returning one happens in `Drop`,
+    /// which cannot await at all.
+    idle: std::sync::Mutex<Vec<String>>,
     /// Held to keep the container alive; removal is tied to this field's `Drop`.
     _container: ContainerAsync<GenericImage>,
 }
@@ -168,7 +190,7 @@ pub async fn shared_server() -> Arc<TestServer> {
 /// Reach for this unless you specifically need one of the things the pool takes away: an
 /// unmigrated database, or the freedom to run your own DDL. Those are [`raw_database`].
 pub async fn test_database() -> TestDatabase {
-    shared_server().await.create_database().await
+    shared_server().await.lease_migrated().await
 }
 
 /// A fresh, unmigrated database of its own, never pooled and never reset.
@@ -227,6 +249,8 @@ impl TestServer {
             backend,
             host,
             port,
+            permits: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
+            idle: std::sync::Mutex::new(Vec::new()),
             _container: container,
         };
         server.await_ready().await;
@@ -309,7 +333,55 @@ impl TestServer {
             url: self.url_for(&name),
             options: self.admin_options(&name),
             server: Arc::clone(self),
+            name,
+            pooled: false,
+            permit: None,
         }
+    }
+
+    /// Leases a database with the DBOS schema applied, migrating one if the pool is empty.
+    ///
+    /// **Migrating once per database and reusing it is the point.** The corpus is 47
+    /// migrations and CockroachDB applies schema changes online, so a full run there takes
+    /// tens of seconds — paying that per test would make the CockroachDB leg unusable long
+    /// before the suite is finished.
+    ///
+    /// Cleaning happens here rather than on release: `Drop` cannot await, and a test that
+    /// panics would skip its own cleanup. Doing it on acquire means a database is always
+    /// clean when handed out, however the last holder ended.
+    pub async fn lease_migrated(self: &Arc<Self>) -> TestDatabase {
+        // Waits when the pool is full. Held by the returned handle and released on drop,
+        // after the name has gone back on the idle list — so whoever is waiting finds a
+        // database to recycle rather than migrating another.
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("the pool semaphore is never closed");
+        let recycled = self.idle.lock().ok().and_then(|mut idle| idle.pop());
+        let mut db = match recycled {
+            Some(name) => TestDatabase {
+                url: self.url_for(&name),
+                options: self.admin_options(&name),
+                server: Arc::clone(self),
+                name,
+                pooled: true,
+                permit: None,
+            },
+            None => {
+                // Only reachable POOL_SIZE times: past that a permit implies an idle database.
+                let fresh = self.create_database().await;
+                let pool = fresh.pool().await;
+                dbos::sysdb::runner::run(&pool, DEFAULT_SCHEMA, true)
+                    .await
+                    .expect("failed to migrate a pooled test database");
+                pool.close().await;
+                fresh
+            }
+        };
+        db.pooled = true;
+        db.permit = Some(permit);
+        db.reset().await;
+        db
     }
 
     fn url_for(&self, database: &str) -> String {
@@ -326,15 +398,74 @@ impl TestServer {
 
 /// A database on the shared server, for one test's exclusive use.
 ///
-/// Holding this keeps the server alive; there is no per-database teardown because the
-/// container goes away with the last handle. The pooled model will change that.
+/// Holding it keeps the server alive. A leased database returns to the pool when dropped; one
+/// from [`raw_database`] is simply abandoned, and goes away with the container.
 pub struct TestDatabase {
+    name: String,
     url: String,
     options: PgConnectOptions,
     server: Arc<TestServer>,
+    /// Whether to hand this back for reuse when dropped.
+    pooled: bool,
+    /// Pool slot, released when this handle drops.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        if !self.pooled {
+            return;
+        }
+        // Returning is just handing the name back; the *cleaning* happens when the next test
+        // takes it. Resetting here would need to await inside `Drop`, and a test that panics
+        // would skip it — this way a dirty database is always cleaned before it is used.
+        if let Ok(mut idle) = self.server.idle.lock() {
+            idle.push(std::mem::take(&mut self.name));
+        }
+    }
 }
 
 impl TestDatabase {
+    /// Empties every DBOS table, leaving the schema in place.
+    ///
+    /// Called automatically when a database is leased. Public so a test can exercise it
+    /// directly: which database a lease returns is not predictable while tests run in
+    /// parallel, so asserting on reuse is not a thing a test can do.
+    ///
+    /// `DELETE`, not `TRUNCATE`: CockroachDB implements `TRUNCATE` as a schema change, so it
+    /// prices like `CREATE INDEX` however few rows a table holds — measured around 3x slower
+    /// than the equivalent deletes on this schema. `TRUNCATE` would win only once a table is
+    /// big enough for row count to dominate, which no test fixture is.
+    ///
+    /// The table list comes from the catalogue rather than a hard-coded list, so a migration
+    /// that adds a table cannot silently leave it uncleaned. Deleting from all of them in any
+    /// order is safe — emptying everything cannot strand a foreign key.
+    pub async fn reset(&self) {
+        let pool = self.pool().await;
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = $1 AND table_name <> 'dbos_migrations' \
+             ORDER BY table_name",
+        )
+        .bind(DEFAULT_SCHEMA)
+        .fetch_all(&pool)
+        .await
+        .expect("failed to list tables to reset");
+
+        if !tables.is_empty() {
+            let schema = quote_identifier(DEFAULT_SCHEMA);
+            let stmts: String = tables
+                .iter()
+                .map(|t| format!("DELETE FROM {schema}.{};", quote_identifier(t)))
+                .collect();
+            sqlx::raw_sql(AssertSqlSafe(stmts))
+                .execute(&pool)
+                .await
+                .expect("failed to reset the leased database");
+        }
+        pool.close().await;
+    }
+
     /// Connection URL, for code that takes one as configuration.
     pub fn url(&self) -> &str {
         &self.url
