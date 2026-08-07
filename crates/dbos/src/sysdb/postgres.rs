@@ -79,20 +79,17 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     }
 }
 
-/// How to reach and set up the system database.
-#[derive(Debug, Clone)]
-pub struct Config<'a> {
-    /// Connection URL for the system database.
-    pub url: &'a str,
+/// How a handle behaves against a database it is already connected to.
+///
+/// Split from [`Config`] because the two constructors need different halves of it.
+/// [`PostgresSystemDatabase::connect`] has to be told how to *reach* the database;
+/// [`from_pool`](PostgresSystemDatabase::from_pool) is handed a live pool and only needs this.
+/// Sharing one type would leave `from_pool` ignoring a URL, and giving it setters instead would
+/// mean two ways to say the same thing that drift apart as fields are added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settings<'a> {
     /// Schema holding the DBOS tables. Defaults to [`DEFAULT_SCHEMA`].
     pub schema: &'a str,
-    /// Maximum pooled connections.
-    pub max_connections: u32,
-    /// Whether the schema uses LISTEN/NOTIFY triggers.
-    ///
-    /// Recorded in the schema itself, so it must match what other applications on the same
-    /// database expect.
-    pub use_listen_notify: bool,
     /// How failures that may pass are waited out.
     pub retry: RetryPolicy,
     /// Identifies this process among the executors sharing the database.
@@ -102,16 +99,44 @@ pub struct Config<'a> {
     pub executor_id: Option<&'a str>,
 }
 
+impl Default for Settings<'_> {
+    /// The defaults every implementation shares.
+    ///
+    /// Hand-written rather than derived because `<&str as Default>` is the empty string, and a
+    /// handle addressing schema `""` would fail on its first query rather than at construction.
+    fn default() -> Self {
+        Self {
+            schema: DEFAULT_SCHEMA,
+            retry: RetryPolicy::default(),
+            executor_id: None,
+        }
+    }
+}
+
+/// How to reach and set up the system database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config<'a> {
+    /// Connection URL for the system database.
+    pub url: &'a str,
+    /// Maximum pooled connections.
+    pub max_connections: u32,
+    /// Whether the schema uses LISTEN/NOTIFY triggers.
+    ///
+    /// Here rather than on [`Settings`] because it is a *migration* input: it decides which
+    /// variant of the schema is applied, and `from_pool` never migrates.
+    pub use_listen_notify: bool,
+    /// How the resulting handle behaves.
+    pub settings: Settings<'a>,
+}
+
 impl<'a> Config<'a> {
     /// A configuration with the defaults every implementation shares.
     pub fn new(url: &'a str) -> Self {
         Self {
             url,
-            schema: DEFAULT_SCHEMA,
             max_connections: 10,
             use_listen_notify: true,
-            retry: RetryPolicy::default(),
-            executor_id: None,
+            settings: Settings::default(),
         }
     }
 }
@@ -142,7 +167,7 @@ impl PostgresSystemDatabase {
             .connect(config.url)
             .await?;
 
-        migrations::runner::run(&pool, config.schema, config.use_listen_notify)
+        migrations::runner::run(&pool, config.settings.schema, config.use_listen_notify)
             .await
             // The runner has already retried what it could; whatever reaches here is settled.
             .map_err(|e| {
@@ -155,39 +180,26 @@ impl PostgresSystemDatabase {
 
         Ok(Self {
             pool,
-            tables: Tables::new(config.schema),
-            retry: config.retry,
+            tables: Tables::new(config.settings.schema),
+            retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
-            executor_id: config.executor_id.map(str::to_owned),
+            executor_id: config.settings.executor_id.map(str::to_owned),
         })
     }
 
     /// Wraps an existing pool, assuming the schema is already migrated.
     ///
     /// For callers that manage their own connections — and for tests, which migrate through the
-    /// harness.
-    pub fn from_pool(pool: PgPool, schema: impl Into<String>) -> Self {
+    /// harness. Takes the same [`Settings`] as [`connect`](Self::connect), so there is one way to
+    /// describe a handle rather than a constructor plus a set of chained overrides.
+    pub fn from_pool(pool: PgPool, settings: &Settings<'_>) -> Self {
         Self {
             pool,
-            tables: Tables::new(&schema.into()),
-            retry: RetryPolicy::default(),
-            executor_id: None,
+            tables: Tables::new(settings.schema),
+            retry: settings.retry,
+            // Copied out: the handle outlives the borrowed settings.
+            executor_id: settings.executor_id.map(str::to_owned),
         }
-    }
-
-    /// Names this process, so recording a step claims the workflow for it.
-    ///
-    /// Bare noun rather than `with_executor_id`: in Rust `with_` marks a constructor —
-    /// `Vec::with_capacity`, `HashMap::with_hasher` — not a setter on an existing value.
-    pub fn executor_id(mut self, executor_id: impl Into<String>) -> Self {
-        self.executor_id = Some(executor_id.into());
-        self
-    }
-
-    /// Replaces the retry policy, which otherwise comes from the configuration.
-    pub fn retry_policy(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
-        self
     }
 
     /// Closes the pool.
@@ -280,7 +292,60 @@ fn split_database(url: &str) -> Option<(String, String)> {
     Some((maintenance, database.to_owned()))
 }
 
-fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error> {
+/// Every column `workflow_from_row` reads, in one place so the queries cannot drift from it.
+const WORKFLOW_COLUMNS: &str = "workflow_uuid, status, name, class_name, config_name, \
+     serialization, executor_id, application_version, recovery_attempts, \
+     queue_name, created_at, updated_at, started_at_epoch_ms, completed_at, forked_from, \
+     parent_workflow_id, was_forked_from, owner_xid, application_id, authenticated_user, \
+     authenticated_roles, assumed_role, request, deduplication_id, priority, \
+     queue_partition_key, rate_limited, schedule_name, workflow_timeout_ms, \
+     workflow_deadline_epoch_ms, delay_until_epoch_ms, debounce_deadline_epoch_ms, \
+     is_debounced, attributes::text AS attributes";
+
+/// The payload columns, as typed `NULL`s when the caller declines them.
+///
+/// Held apart from [`WORKFLOW_COLUMNS`] and *appended* rather than substituted into it. Rewriting
+/// the list with `str::replace` would match substrings, so a column added later called
+/// `last_error` would silently become `last_NULL::text AS error` — valid-looking SQL that
+/// selects the wrong thing. The cast is required either way: a bare `NULL` has no type for the
+/// driver to decode.
+///
+/// Order does not matter, because [`workflow_from_row`] reads columns by name.
+fn workflow_payloads(load_input: bool, load_output: bool) -> &'static str {
+    match (load_input, load_output) {
+        (true, true) => "inputs, output, error",
+        (true, false) => "inputs, NULL::text AS output, NULL::text AS error",
+        (false, true) => "NULL::text AS inputs, output, error",
+        (false, false) => "NULL::text AS inputs, NULL::text AS output, NULL::text AS error",
+    }
+}
+
+/// Encodes the roles list for the column, which is `NULL` when there are none.
+///
+/// The column is always a JSON array of strings — unlike `input` and the outcome payloads, whose
+/// encoding is the caller's. Empty maps to `NULL` so "no roles" has one representation, matching
+/// the empty-string normalisation applied to `authenticated_user`.
+fn encode_roles(roles: &[&str]) -> Option<String> {
+    (!roles.is_empty()).then(|| serde_json::to_string(roles).expect("a list of strings is JSON"))
+}
+
+/// Decodes the roles column, treating `NULL` as no roles.
+///
+/// A value that is not a JSON array of strings is [`Error::Malformed`]: it means another
+/// implementation wrote something this one does not understand, which is exactly what that
+/// variant is for.
+fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
+    let Some(json) = stored else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&json).map_err(|e| {
+        Error::Malformed(format!(
+            "authenticated_roles is not a JSON array of strings: {e}"
+        ))
+    })
+}
+
+fn workflow_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error> {
     let status_text: String = row.try_get("status")?;
     let status = WorkflowStatus::parse(&status_text)
         .ok_or_else(|| Error::Malformed(format!("unknown workflow status {status_text:?}")))?;
@@ -319,7 +384,9 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error>
         owner_xid: row.try_get("owner_xid")?,
         application_id: row.try_get("application_id")?,
         authenticated_user: row.try_get("authenticated_user")?,
-        authenticated_roles: row.try_get("authenticated_roles")?,
+        authenticated_roles: decode_roles(
+            row.try_get::<Option<String>, _>("authenticated_roles")?,
+        )?,
         assumed_role: row.try_get("assumed_role")?,
         request: row.try_get("request")?,
 
@@ -353,17 +420,6 @@ fn record_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error>
         attributes: row.try_get("attributes")?,
     })
 }
-
-/// Every column `record_from_row` reads, in one place so the queries cannot drift from it.
-const RECORD_COLUMNS: &str = "workflow_uuid, status, name, class_name, config_name, inputs, \
-     output, error, serialization, executor_id, application_version, recovery_attempts, \
-     queue_name, created_at, updated_at, started_at_epoch_ms, completed_at, forked_from, \
-     parent_workflow_id, was_forked_from, owner_xid, application_id, authenticated_user, \
-     authenticated_roles, assumed_role, request, deduplication_id, priority, \
-     queue_partition_key, rate_limited, schedule_name, workflow_timeout_ms, \
-     workflow_deadline_epoch_ms, delay_until_epoch_ms, debounce_deadline_epoch_ms, \
-     is_debounced, attributes::text AS attributes";
-
 impl PostgresSystemDatabase {
     /// Cancels one batch, returning the ids that were still running.
     ///
@@ -380,11 +436,27 @@ impl PostgresSystemDatabase {
     {
         let table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
+        // TODO: revisit clearing `started_at_epoch_ms` here.
+        //
+        // All four implementations do it and none of them explain it. The column is read by the
+        // rate limiter, which counts rows with `queue_name = <queue>`, `rate_limited = TRUE`, a
+        // non-queued status, and `started_at_epoch_ms > now - period`. That justifies the same
+        // clearing in `clear_queue_assignment` and `resume_workflows`, which keep or set a queue
+        // name and so stay in the limiter's scope. **It does not justify it here**: this
+        // statement also sets `queue_name = NULL`, which drops the row from that count on its
+        // own.
+        //
+        // The cost is real — a workflow that was running when cancelled loses its start time, so
+        // `started_after`/`started_before` no longer find it and `completed_at` is left without a
+        // matching start. Kept for now because diverging from all four on a durable column is a
+        // worse trade than the inconsistency; worth raising upstream to find out whether it is
+        // intent or inheritance.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {table} SET status = 'CANCELLED', queue_name = NULL, \
              deduplication_id = NULL, started_at_epoch_ms = NULL, \
              updated_at = $2, completed_at = $2 \
-             WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
+             WHERE workflow_uuid = ANY($1) \
+               AND status NOT IN ('SUCCESS', 'ERROR', 'CANCELLED') \
              RETURNING workflow_uuid"
         )))
         .bind(ids)
@@ -420,15 +492,25 @@ impl PostgresSystemDatabase {
 /// The workflow id is left out because every caller already has it as a parameter, and because
 /// `check_step` joins this table against `workflow_status`, where selecting both tables'
 /// `workflow_uuid` would be ambiguous.
-const STEP_COLUMNS: &str = "function_id, function_name, output, error, \
+const STEP_COLUMNS: &str = "function_id, function_name, \
      child_workflow_id, serialization, started_at_epoch_ms, completed_at_epoch_ms";
+
+/// A step's payload columns, on the same terms as [`workflow_payloads`].
+fn step_payloads(load_output: bool) -> &'static str {
+    if load_output {
+        "output, error"
+    } else {
+        "NULL::text AS output, NULL::text AS error"
+    }
+}
 
 /// The same columns qualified for a join, derived from [`STEP_COLUMNS`] so the two cannot drift.
 ///
 /// `output`, `error`, and `started_at_epoch_ms` exist on *both* tables, so the qualification is
 /// required rather than tidiness.
 fn qualified_step_columns(alias: &str) -> String {
-    STEP_COLUMNS
+    // Payloads included: the replay check always loads them.
+    format!("{STEP_COLUMNS}, {}", step_payloads(true))
         .split(',')
         .map(|c| format!("{alias}.{}", c.trim()))
         .collect::<Vec<_>>()
@@ -455,17 +537,16 @@ fn step_from_row(row: &sqlx::postgres::PgRow, workflow_id: &str) -> Result<StepR
 
 #[async_trait]
 impl SystemDatabase for PostgresSystemDatabase {
-    async fn init_workflow_status(
+    async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
         submission: Submission,
     ) -> Result<WorkflowInitResult, Error> {
-        let wf = workflow;
-        wf.validate()?;
+        workflow.validate()?;
         let table = &self.tables.workflow_status;
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
-        let initial_status = wf.initial_status();
+        let initial_status = workflow.initial_status();
         // Queued workflows are not running, so neither the attempt counter nor the executor
         // stamp applies to them — both `CASE` expressions below turn on that distinction.
         let queued = matches!(
@@ -489,7 +570,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // with `created_at`, and a retry cannot push the delay further out each time. This is
         // also why `delay` crosses the API as a duration.
         let now = Timestamp::now();
-        let delay_until = wf
+        let delay_until = workflow
             .delay
             .map(|d| Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64));
 
@@ -497,7 +578,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // closure. See `with_retry`.
         let (table, pool, owner_xid) = (table.as_str(), &self.pool, owner_xid.as_str());
 
-        with_retry(&self.retry, "init_workflow_status", move || async move {
+        with_retry(&self.retry, "init_workflow", move || async move {
             // The column list is Java's INSERT, in its order, plus Python's two debounce columns.
             // Columns absent from it are absent deliberately: `output`, `error`, `started_at`,
             // `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited` are written by
@@ -529,41 +610,60 @@ impl SystemDatabase for PostgresSystemDatabase {
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
                  workflow_deadline_epoch_ms, owner_xid, serialization"
             )))
-            .bind(wf.workflow_id)
+            .bind(workflow.workflow_id)
             .bind(initial_status.as_str())
-            .bind(wf.input)
-            .bind(wf.name)
-            .bind(wf.class_name)
-            .bind(wf.config_name)
-            .bind(wf.queue_name)
-            .bind(wf.deduplication_id)
-            .bind(wf.priority)
-            .bind(wf.queue_partition_key)
+            .bind(workflow.input)
+            .bind(workflow.name)
+            .bind(workflow.class_name)
+            .bind(workflow.config_name)
+            .bind(workflow.queue_name)
+            .bind(workflow.deduplication_id)
+            .bind(workflow.priority)
+            .bind(workflow.queue_partition_key)
             .bind(delay_until.map(Timestamp::as_epoch_ms))
             // TypeScript and Go send `""` rather than null when there is no auth context, and
             // Java normalises it on the way in for that reason. Storing both spellings would
             // make an `authenticated_user IS NULL` filter miss rows another SDK wrote.
-            .bind(empty_to_none(wf.authenticated_user))
-            .bind(empty_to_none(wf.assumed_role))
-            .bind(wf.authenticated_roles)
-            .bind(wf.executor_id)
-            .bind(wf.application_version)
-            .bind(wf.application_id)
+            .bind(empty_to_none(workflow.authenticated_user))
+            .bind(empty_to_none(workflow.assumed_role))
+            .bind(encode_roles(&workflow.authenticated_roles))
+            .bind(workflow.executor_id)
+            .bind(workflow.application_version)
+            .bind(workflow.application_id)
             .bind(now.as_epoch_ms())
             .bind(now.as_epoch_ms())
             .bind(initial_attempts)
-            .bind(wf.timeout.map(|d| d.as_millis() as i64))
-            .bind(wf.deadline.map(Timestamp::as_epoch_ms))
-            .bind(wf.parent_workflow_id)
+            .bind(workflow.timeout.map(|d| d.as_millis() as i64))
+            .bind(workflow.deadline.map(Timestamp::as_epoch_ms))
+            .bind(workflow.parent_workflow_id)
             .bind(owner_xid)
-            .bind(wf.serialization)
-            .bind(wf.attributes)
-            .bind(wf.schedule_name)
-            .bind(wf.debounce_deadline.map(Timestamp::as_epoch_ms))
-            .bind(wf.is_debounced)
+            .bind(workflow.serialization)
+            .bind(workflow.attributes)
+            .bind(workflow.schedule_name)
+            .bind(workflow.debounce_deadline.map(Timestamp::as_epoch_ms))
+            .bind(workflow.is_debounced)
             .bind(increment)
             .fetch_one(pool)
-            .await?;
+            .await
+            // A unique violation here can only be the partial index on
+            // `(queue_name, deduplication_id)`: the primary-key conflict is absorbed by
+            // `ON CONFLICT (workflow_uuid)` above. Guarded on the caller having supplied a key
+            // rather than asserting it, as Python does, so an unexpected violation stays a
+            // backend error instead of being mislabelled.
+            .map_err(|e| match Error::from(e) {
+                Error::Backend(b)
+                    if b.sqlstate.as_deref() == Some("23505")
+                        && let Some(deduplication_id) = workflow.deduplication_id
+                        && let Some(queue_name) = workflow.queue_name =>
+                {
+                    Error::QueueDeduplicated {
+                        workflow_id: workflow.workflow_id.to_owned(),
+                        queue_name: queue_name.to_owned(),
+                        deduplication_id: deduplication_id.to_owned(),
+                    }
+                }
+                other => other,
+            })?;
 
             let recovery_attempts: i64 = row.try_get("recovery_attempts")?;
             let status_text: String = row.try_get("status")?;
@@ -580,14 +680,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                 (
                     "function name",
                     row.try_get::<Option<String>, _>("name")?,
-                    &wf.name,
+                    &workflow.name,
                 ),
-                ("class name", row.try_get("class_name")?, &wf.class_name),
-                ("config name", row.try_get("config_name")?, &wf.config_name),
+                ("class name", row.try_get("class_name")?, &workflow.class_name),
+                ("config name", row.try_get("config_name")?, &workflow.config_name),
             ] {
                 if stored.as_deref() != offered.as_deref() {
                     return Err(Error::ConflictingWorkflow {
-                        workflow_id: wf.workflow_id.to_owned(),
+                        workflow_id: workflow.workflow_id.to_owned(),
                         detail: format!(
                             "existing {field} is {stored:?}, but {offered:?} was provided"
                         ),
@@ -597,11 +697,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             // A differing queue is only a warning: requeueing the same workflow elsewhere is
             // legitimate, and the stored queue wins.
             let stored_queue: Option<String> = row.try_get("queue_name")?;
-            if stored_queue.as_deref() != wf.queue_name {
+            if stored_queue.as_deref() != workflow.queue_name {
                 tracing::warn!(
-                    workflow_id = %wf.workflow_id,
+                    workflow_id = %workflow.workflow_id,
                     stored = ?stored_queue,
-                    provided = ?wf.queue_name,
+                    provided = ?workflow.queue_name,
                     "workflow already exists on a different queue; the stored queue is kept"
                 );
             }
@@ -615,17 +715,17 @@ impl SystemDatabase for PostgresSystemDatabase {
                 && owner_differs
             {
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET status = $2, deduplication_id = NULL, \
-                     started_at_epoch_ms = NULL, queue_name = NULL \
+                    "UPDATE {table} \
+                     SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', deduplication_id = NULL, \
+                         started_at_epoch_ms = NULL, queue_name = NULL \
                      WHERE workflow_uuid = $1 AND status = 'PENDING'"
                 )))
-                .bind(wf.workflow_id)
-                .bind(WorkflowStatus::MaxRecoveryAttemptsExceeded.as_str())
+                .bind(workflow.workflow_id)
                 .execute(pool)
                 .await?;
 
                 return Err(Error::MaxRecoveryAttemptsExceeded {
-                    workflow_id: wf.workflow_id.to_owned(),
+                    workflow_id: workflow.workflow_id.to_owned(),
                     limit,
                 });
             }
@@ -651,13 +751,14 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(&self.retry, "get_workflow", move || async move {
             let row = sqlx::query(AssertSqlSafe(format!(
-                "SELECT {RECORD_COLUMNS} FROM {table} WHERE workflow_uuid = $1"
+                "SELECT {WORKFLOW_COLUMNS}, {} FROM {table} WHERE workflow_uuid = $1",
+                workflow_payloads(true, true)
             )))
             .bind(workflow_id)
             .fetch_optional(pool)
             .await?;
 
-            row.as_ref().map(record_from_row).transpose()
+            row.as_ref().map(workflow_from_row).transpose()
         })
         .await
     }
@@ -671,31 +772,35 @@ impl SystemDatabase for PostgresSystemDatabase {
             .copied()
             .map(WorkflowStatus::as_str)
             .collect();
-        let (table, pool, status) = (table.as_str(), &self.pool, status.as_slice());
+        // `LIKE ANY(...)` needs the wildcard appended to each pattern, and `%` and `_` in a
+        // caller's prefix would otherwise be wildcards themselves. Escaped out here because it
+        // allocates, and nothing about it depends on the attempt.
+        let prefixes: Vec<String> = filter
+            .workflow_id_prefixes
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}%",
+                    p.replace('\\', r"\\")
+                        .replace('%', r"\%")
+                        .replace('_', r"\_")
+                )
+            })
+            .collect();
+        let (table, pool) = (table.as_str(), &self.pool);
+        let (status, prefixes) = (status.as_slice(), prefixes.as_slice());
 
         with_retry(&self.retry, "list_workflows", move || async move {
-            // Rebuilt per attempt rather than hoisted: a `QueryBuilder` owns its arguments and
-            // is consumed by `build`, and rendering a few hundred bytes of SQL is not the cost
-            // worth optimising against a retry that has already waited a second.
+            // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
+            // a hoisted one would make each attempt's future borrow the closure — which
+            // `FnMut() -> Fut` cannot express. It costs nothing on the happy path, where there
+            // is one attempt either way.
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-            // One row reader for every query means the column list cannot vary, so the columns
-            // the caller declined are selected as NULL rather than dropped. The cast is needed:
-            // a bare NULL has no type, and the driver has to be told what it is decoding.
-            q.push(match (filter.load_input, filter.load_output) {
-                (true, true) => RECORD_COLUMNS.to_owned(),
-                (load_input, load_output) => {
-                    let mut columns = RECORD_COLUMNS.to_owned();
-                    if !load_input {
-                        columns = columns.replace("inputs,", "NULL::text AS inputs,");
-                    }
-                    if !load_output {
-                        columns = columns
-                            .replace("output,", "NULL::text AS output,")
-                            .replace("error,", "NULL::text AS error,");
-                    }
-                    columns
-                }
-            });
+            // One row reader serves every query, so a declined column is selected as a typed
+            // NULL rather than dropped.
+            q.push(WORKFLOW_COLUMNS)
+                .push(", ")
+                .push(workflow_payloads(filter.load_input, filter.load_output));
             q.push(" FROM ").push(table);
 
             // `separated(" AND ")` writes the separator only between clauses, so neither a
@@ -731,23 +836,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             any_of!(&filter.parent_workflow_ids[..], "parent_workflow_id");
             any_of!(&filter.forked_from[..], "forked_from");
 
-            if !filter.workflow_id_prefixes.is_empty() {
-                // `LIKE ANY(...)` needs the wildcard appended to each pattern, and `%` and `_`
-                // in a caller's prefix would otherwise be wildcards themselves.
-                let patterns: Vec<String> = filter
-                    .workflow_id_prefixes
-                    .iter()
-                    .map(|p| {
-                        format!(
-                            "{}%",
-                            p.replace('\\', r"\\")
-                                .replace('%', r"\%")
-                                .replace('_', r"\_")
-                        )
-                    })
-                    .collect();
+            if !prefixes.is_empty() {
                 clause(&mut q, "workflow_uuid LIKE ANY(");
-                q.push_bind(patterns).push(")");
+                q.push_bind(prefixes).push(")");
             }
 
             macro_rules! compare {
@@ -809,42 +900,49 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
 
             let rows = q.build().fetch_all(pool).await?;
-            rows.iter().map(record_from_row).collect()
+            rows.iter().map(workflow_from_row).collect()
         })
         .await
     }
 
     async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error> {
-        // `descendants` owns every id and the frontier is a *range* into it, because each level
-        // is appended in order — so an id is allocated twice, once by the driver and once for
-        // the dedup set, rather than three times. The root is excluded by comparison rather than
-        // by seeding `seen` with a copy of it, which also states the contract: a workflow is not
-        // its own descendant.
-        let mut seen = std::collections::HashSet::new();
-        let mut descendants: Vec<String> = Vec::new();
-        let mut absorb = |into: &mut Vec<String>, children: Vec<String>| {
-            for child in children {
-                if child != workflow_id && seen.insert(child.clone()) {
-                    into.push(child);
+        // The retry wraps the whole walk, and the accumulators sit inside it. Unlike the
+        // cascade in `cancel_workflows`, every statement here is a read, so restarting from the
+        // root reproduces the same answer — there is nothing a failed attempt did that a later
+        // one needs to know about.
+        with_retry(&self.retry, "get_workflow_children", move || async move {
+            // `descendants` owns every id and the frontier is a *range* into it, because each
+            // level is appended in order — so an id is allocated twice, once by the driver and
+            // once for the dedup set, rather than three times. The root is excluded by
+            // comparison rather than by seeding `seen` with a copy of it, which also states the
+            // contract: a workflow is not its own descendant.
+            let mut seen = std::collections::HashSet::new();
+            let mut descendants: Vec<String> = Vec::new();
+            let mut absorb = |into: &mut Vec<String>, children: Vec<String>| {
+                for child in children {
+                    if child != workflow_id && seen.insert(child.clone()) {
+                        into.push(child);
+                    }
                 }
+            };
+
+            absorb(
+                &mut descendants,
+                self.direct_children(&[workflow_id]).await?,
+            );
+
+            // Level by level, as all four do. Terminates because `seen` only grows, so a cycle —
+            // which the data should not contain — stops rather than looping.
+            let mut start = 0;
+            while start < descendants.len() {
+                let end = descendants.len();
+                let children = self.direct_children(&descendants[start..end]).await?;
+                start = end;
+                absorb(&mut descendants, children);
             }
-        };
-
-        absorb(
-            &mut descendants,
-            self.direct_children(&[workflow_id]).await?,
-        );
-
-        // Level by level, as all four do. Terminates because `seen` only grows, so a cycle —
-        // which the data should not contain — stops rather than looping.
-        let mut start = 0;
-        while start < descendants.len() {
-            let end = descendants.len();
-            let children = self.direct_children(&descendants[start..end]).await?;
-            start = end;
-            absorb(&mut descendants, children);
-        }
-        Ok(descendants)
+            Ok(descendants)
+        })
+        .await
     }
 
     async fn record_workflow_outcome(
@@ -1037,14 +1135,20 @@ impl SystemDatabase for PostgresSystemDatabase {
         // through leaves some of the tree cancelled, and restarting from the roots finishes the
         // job — where retrying one statement would return a half-walked tree as a success.
         //
-        // Every accumulator is therefore declared *inside*, and must be: a retry that appended
-        // to a `cancelled` list from the previous attempt would report workflows twice.
-        // Re-cancelling is otherwise harmless, since `CANCELLED` is not a terminal status the
-        // guard excludes and the row simply stays cancelled.
+        // `cancelled` survives across attempts, which is only sound because `cancel_batch`
+        // excludes rows that are already `CANCELLED`: a workflow can be returned once and never
+        // again, so a retry adds what the failed attempt did not reach and cannot double-report
+        // what it did. The walk itself restarts from the roots each attempt, since there is no
+        // way to know how far the last one got.
         //
         // `now` is read once for the whole cascade, so every workflow cancelled by one call
         // shares a `completed_at` however deep the tree goes.
         let now = Timestamp::now().as_epoch_ms();
+        // Not for concurrency — nothing else touches this. It is how an accumulator outlives a
+        // retry while the closure stays `FnMut` returning a `Send` future, which is what
+        // `with_retry` requires. A plain `&mut Vec` would make the future borrow the closure.
+        let cancelled = std::sync::Mutex::new(Vec::new());
+        let collected = &cancelled;
         with_retry(&self.retry, "cancel_workflows", move || async move {
             // One statement per *level*, not per workflow: `cancel_batch` takes the whole
             // frontier and matches it with `= ANY($1)`, so the round trips scale with the depth
@@ -1053,9 +1157,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             //
             // The roots are used borrowed; only the levels below are owned, because those come
             // back from the database already allocated.
-            let mut cancelled = self.cancel_batch(workflow_ids, now).await?;
+            // Awaited before locking: a guard held across an await would make this future
+            // non-`Send`, which `with_retry` requires.
+            let roots = self.cancel_batch(workflow_ids, now).await?;
+            collected.lock().expect("cancelled ids").extend(roots);
             if !cancel_children {
-                return Ok(cancelled);
+                return Ok(());
             }
             // Owned, because the levels below arrive owned from the database and the set has to
             // hold both.
@@ -1066,16 +1173,18 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // Terminates because `seen` only grows and a workflow enters a frontier at most once.
             while !frontier.is_empty() {
-                cancelled.extend(self.cancel_batch(&frontier, now).await?);
+                let level = self.cancel_batch(&frontier, now).await?;
+                collected.lock().expect("cancelled ids").extend(level);
                 let children = self.direct_children(&frontier).await?;
                 frontier = children
                     .into_iter()
                     .filter(|c| seen.insert(c.clone()))
                     .collect();
             }
-            Ok(cancelled)
+            Ok(())
         })
-        .await
+        .await?;
+        Ok(cancelled.into_inner().expect("cancelled ids"))
     }
 
     async fn resume_workflows(
@@ -1184,14 +1293,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         let (workflow_table, steps_table, pool) =
             (workflow_table.as_str(), steps_table.as_str(), &self.pool);
 
-        // One statement, so the status and the step come from a single snapshot. Two queries
-        // could straddle a cancellation — read PENDING, get cancelled, then replay a step of a
-        // cancelled workflow. Python avoids that by wrapping both in a transaction; the join
-        // gets the same consistency, and one round trip instead of two.
         let step_columns = qualified_step_columns("o");
         let step_columns = step_columns.as_str();
 
         with_retry(&self.retry, "check_step", move || async move {
+            // One statement, so the status and the step come from a single snapshot. Two queries
+            // could straddle a cancellation — read PENDING, get cancelled, then replay a step of
+            // a cancelled workflow. Python avoids that by wrapping both in a transaction; the
+            // join gets the same consistency, and one round trip instead of two.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "SELECT s.status, {step_columns} \
                  FROM {workflow_table} s \
@@ -1275,6 +1384,17 @@ impl SystemDatabase for PostgresSystemDatabase {
             // reverse order — claim, then record — leaves a workflow attributed to an executor
             // with no step to show for it, and nothing later fixes that.
             //
+            // And it is why this is not a transaction, which the ordering makes unnecessary. The
+            // references split on exactly this line: Python claims before inserting and so wraps
+            // both in `engine.begin()`; Java and TypeScript claim after winning and use a plain
+            // connection, as here. A transaction would only hold a `workflow_status` row lock
+            // across two round trips.
+            //
+            // The gap it would close is already covered. A *retryable* failure on the second
+            // statement re-runs this closure, the insert returns our own completion time, and
+            // the claim runs again. A *permanent* one returns an error with the step recorded —
+            // and a caller retrying with the same `StepTiming` is recognised as its own write.
+            //
             // `DO UPDATE` setting a column to itself rather than `DO NOTHING`: the point is to
             // make `RETURNING` fire on conflict, so the stored completion comes back and can be
             // compared. `DO NOTHING` returns no row, which cannot tell a rival execution from
@@ -1347,15 +1467,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         let (table, pool) = (table.as_str(), &self.pool);
 
         with_retry(&self.retry, "list_workflow_steps", move || async move {
-            let columns = if load_output {
-                STEP_COLUMNS.to_owned()
-            } else {
-                STEP_COLUMNS
-                    .replace("output,", "NULL::text AS output,")
-                    .replace("error,", "NULL::text AS error,")
-            };
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-            q.push(columns)
+            q.push(STEP_COLUMNS)
+                .push(", ")
+                .push(step_payloads(load_output))
                 .push(" FROM ")
                 .push(table)
                 // `function_id` is the step order, so ordering by it replays the workflow.

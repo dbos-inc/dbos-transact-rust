@@ -37,6 +37,26 @@ pub enum Error {
         /// What was wrong with it.
         detail: String,
     },
+    /// A queued workflow already holds this deduplication key.
+    ///
+    /// Raised only by workflow creation, and only when the caller supplied a deduplication id:
+    /// the primary-key conflict is absorbed by `ON CONFLICT (workflow_uuid)`, so the sole unique
+    /// violation left is the partial index on `(queue_name, deduplication_id)`. Python asserts
+    /// exactly that at its own raise site.
+    ///
+    /// An answer rather than a failure — the caller asked to enqueue work that is already
+    /// enqueued — so it is never retried.
+    QueueDeduplicated {
+        /// The workflow that could not be enqueued.
+        workflow_id: String,
+        /// The queue it was destined for.
+        ///
+        /// Not optional: the index is plain `UNIQUE`, so its NULLs are distinct and two rows
+        /// with no queue never collide. A violation therefore proves both rows had one.
+        queue_name: String,
+        /// The key already held.
+        deduplication_id: String,
+    },
     /// The workflow has been cancelled, so its steps must not run.
     ///
     /// Raised by the step-replay check rather than by cancellation itself: cancelling only sets
@@ -93,6 +113,15 @@ impl std::fmt::Display for Error {
                 detail,
             } => write!(f, "workflow {workflow_id} already exists: {detail}"),
             Error::InvalidInput { field, detail } => write!(f, "invalid {field}: {detail}"),
+            Error::QueueDeduplicated {
+                workflow_id,
+                queue_name,
+                deduplication_id,
+            } => write!(
+                f,
+                "workflow {workflow_id} (queue: {queue_name}, \
+                 deduplication id: {deduplication_id}) is already enqueued"
+            ),
             Error::WorkflowCancelled { workflow_id } => {
                 write!(f, "workflow {workflow_id} is cancelled")
             }

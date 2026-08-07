@@ -241,8 +241,11 @@ pub struct WorkflowRecord {
     pub application_id: Option<String>,
     /// User on whose behalf the workflow runs.
     pub authenticated_user: Option<String>,
-    /// Roles that user holds, encoded as the references encode them.
-    pub authenticated_roles: Option<String>,
+    /// Roles that user holds.
+    ///
+    /// Decoded from the column's JSON array, which this layer owns — see
+    /// [`NewWorkflow::authenticated_roles`]. A NULL column reads as empty.
+    pub authenticated_roles: Vec<String>,
     /// Role actually assumed for this execution.
     pub assumed_role: Option<String>,
     /// Request context captured at creation.
@@ -356,8 +359,16 @@ pub struct NewWorkflow<'a> {
 
     /// Authenticated principal at submission.
     pub authenticated_user: Option<&'a str>,
-    /// Encoded JSON list of that principal's roles.
-    pub authenticated_roles: Option<&'a str>,
+    /// The roles that principal held.
+    ///
+    /// A list rather than an encoded string, unlike `input` and the outcome payloads: those are
+    /// opaque to this layer and cross as whatever the caller encoded, but the column is *always*
+    /// a JSON array of strings, so the encoding belongs here. Java calls
+    /// `JsonUtility.toJson(List<String>)` and Python's field comment reads "JSON list of roles".
+    ///
+    /// Empty is stored as NULL, on the same reasoning as the empty-string normalisation for
+    /// `authenticated_user`: "no roles" should have one representation in the column.
+    pub authenticated_roles: Vec<&'a str>,
     /// The role actually assumed.
     pub assumed_role: Option<&'a str>,
 

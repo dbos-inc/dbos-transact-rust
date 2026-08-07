@@ -67,7 +67,7 @@ pub trait SystemDatabase: Send + Sync {
     /// passed in, and generated once per call — before any retry the implementation makes. A
     /// retry that generated a fresh identity after a lost commit acknowledgement would fail to
     /// recognise its own write and conclude another executor owned the row.
-    async fn init_workflow_status(
+    async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
@@ -210,6 +210,19 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
     /// Go have it, and this follows them.
+    ///
+    /// **No status guard, deliberately.** A running workflow is deleted like any other — Go's
+    /// comment on the same statement reads "Delete all matching workflows regardless of their
+    /// state", and all four behave that way. Naming an id is an operator saying *this one, now*,
+    /// and refusing would leave no way to clear a workflow that is wedged.
+    ///
+    /// The guard belongs to garbage collection instead, which sweeps by age rather than by id
+    /// and so must never take out live work: all four exclude `PENDING`, `ENQUEUED`, and
+    /// `DELAYED` there. That method is task 3.8 and is not built yet.
+    ///
+    /// The consequence for a caller: an executor running a deleted workflow finds its row gone
+    /// at the next step boundary and fails with [`Error::NonExistentWorkflow`], rather than
+    /// being stopped cleanly. [`cancel_workflows`](Self::cancel_workflows) is the graceful form.
     ///
     /// Takes `&[&str]` rather than `&[String]`, as the other bulk methods do: a caller holding
     /// owned ids converts by copying pointers, where the reverse would allocate.

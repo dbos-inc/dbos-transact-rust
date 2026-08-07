@@ -2,13 +2,13 @@
 
 mod support;
 
-use dbos::sysdb::postgres::PostgresSystemDatabase;
+use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission, Timestamp, WorkflowDelay,
     WorkflowStatus,
 };
-use dbos::sysdb::{BackendErrorKind, DEFAULT_SCHEMA, Error, SystemDatabase};
+use dbos::sysdb::{BackendErrorKind, Error, SystemDatabase};
 
 use support::test_database;
 
@@ -26,7 +26,10 @@ fn workflow(id: &str) -> NewWorkflow<'_> {
 async fn sysdb() -> (PostgresSystemDatabase, support::TestDatabase) {
     let db = test_database().await;
     let pool = db.pool().await;
-    (PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA), db)
+    (
+        PostgresSystemDatabase::from_pool(pool, &Settings::default()),
+        db,
+    )
 }
 
 /// A workflow round-trips through the database unchanged.
@@ -34,7 +37,7 @@ async fn sysdb() -> (PostgresSystemDatabase, support::TestDatabase) {
 async fn a_workflow_round_trips() {
     let (sys, _db) = sysdb().await;
     let written = sys
-        .init_workflow_status(&workflow("wf-1"), None, Submission::Fresh)
+        .init_workflow(&workflow("wf-1"), None, Submission::Fresh)
         .await
         .expect("insert failed");
     assert_eq!(written.status, WorkflowStatus::Pending);
@@ -65,7 +68,7 @@ async fn payloads_are_stored_verbatim() {
     let mut r = workflow("wf-opaque");
     // Deliberately not valid JSON, to show nothing here parses it.
     r.input = Some("not json at all \u{1F600} '\"; --");
-    sys.init_workflow_status(&r, None, Submission::Fresh)
+    sys.init_workflow(&r, None, Submission::Fresh)
         .await
         .expect("insert failed");
 
@@ -87,7 +90,7 @@ async fn a_missing_workflow_reads_as_none() {
 #[tokio::test]
 async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-dup"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-dup"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -95,7 +98,7 @@ async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
     let mut different = workflow("wf-dup");
     different.name = Some("a-different-function");
     let err = sys
-        .init_workflow_status(&different, None, Submission::Fresh)
+        .init_workflow(&different, None, Submission::Fresh)
         .await
         .expect_err("a different function under the same id should be rejected");
     assert!(
@@ -105,7 +108,7 @@ async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
 
     // Re-submitting the same workflow is fine, and the original row stands.
     let again = sys
-        .init_workflow_status(&workflow("wf-dup"), None, Submission::Fresh)
+        .init_workflow(&workflow("wf-dup"), None, Submission::Fresh)
         .await
         .expect("re-submitting the same workflow should succeed");
     assert_eq!(again.status, WorkflowStatus::Pending);
@@ -123,13 +126,13 @@ async fn only_recoveries_and_dequeues_count_as_attempts() {
     let r = workflow("wf-attempts");
 
     let first = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert_eq!(first.recovery_attempts, 1);
 
     let plain = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert_eq!(
@@ -138,7 +141,7 @@ async fn only_recoveries_and_dequeues_count_as_attempts() {
     );
 
     let recovered = sys
-        .init_workflow_status(&r, None, Submission::Recovery)
+        .init_workflow(&r, None, Submission::Recovery)
         .await
         .unwrap();
     assert_eq!(recovered.recovery_attempts, 2, "a recovery is an attempt");
@@ -180,7 +183,7 @@ async fn the_initial_status_is_derived_from_the_queue_and_delay() {
             "case {index} derived wrongly"
         );
         let init = sys
-            .init_workflow_status(&wf, None, Submission::Fresh)
+            .init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
         assert_eq!(init.status, expected, "case {index} stored wrongly");
@@ -195,13 +198,13 @@ async fn queued_workflows_do_not_accrue_attempts() {
     r.queue_name = Some("orders");
 
     let first = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert_eq!(first.recovery_attempts, 0, "enqueueing is not an attempt");
 
     let again = sys
-        .init_workflow_status(&r, None, Submission::Recovery)
+        .init_workflow(&r, None, Submission::Recovery)
         .await
         .unwrap();
     assert_eq!(
@@ -219,7 +222,7 @@ async fn queued_workflows_do_not_accrue_attempts() {
 async fn exceeding_the_recovery_limit_parks_the_workflow() {
     let (sys, _db) = sysdb().await;
     let r = workflow("wf-dlq");
-    sys.init_workflow_status(&r, None, Submission::Fresh)
+    sys.init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -227,7 +230,7 @@ async fn exceeding_the_recovery_limit_parks_the_workflow() {
     let mut last = Ok(());
     for _ in 0..5 {
         last = sys
-            .init_workflow_status(&r, Some(2), Submission::Recovery)
+            .init_workflow(&r, Some(2), Submission::Recovery)
             .await
             .map(|_| ());
         if last.is_err() {
@@ -257,13 +260,13 @@ async fn a_second_owner_records_but_does_not_execute() {
     let r = workflow("wf-owned");
 
     let first = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert!(first.should_execute);
 
     let second = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert!(
@@ -273,7 +276,7 @@ async fn a_second_owner_records_but_does_not_execute() {
 
     // Recovery is exactly the case where taking it over is correct.
     let recovering = sys
-        .init_workflow_status(&r, None, Submission::Recovery)
+        .init_workflow(&r, None, Submission::Recovery)
         .await
         .unwrap();
     assert!(recovering.should_execute, "a recovery may claim the row");
@@ -283,14 +286,14 @@ async fn a_second_owner_records_but_does_not_execute() {
 #[tokio::test]
 async fn the_stored_serialization_is_reported_back() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-fmt"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-fmt"), None, Submission::Fresh)
         .await
         .unwrap();
 
     let mut later = workflow("wf-fmt");
     later.serialization = Some("rust_serde");
     let outcome = sys
-        .init_workflow_status(&later, None, Submission::Fresh)
+        .init_workflow(&later, None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -312,14 +315,14 @@ async fn an_owner_is_generated_when_none_is_supplied() {
     let r = workflow("wf-auto-owner");
 
     let first = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert!(first.should_execute, "the creator owns what it created");
 
     // A second attempt generates a different identity, so it must not execute.
     let second = sys
-        .init_workflow_status(&r, None, Submission::Fresh)
+        .init_workflow(&r, None, Submission::Fresh)
         .await
         .unwrap();
     assert!(
@@ -350,7 +353,7 @@ async fn every_settable_field_round_trips() {
         deadline: Some(Timestamp::from_epoch_ms(1_700_000_030_000)),
         application_id: Some("app-1"),
         authenticated_user: Some("alice"),
-        authenticated_roles: Some(r#"["admin"]"#),
+        authenticated_roles: vec!["admin", "auditor"],
         assumed_role: Some("admin"),
         parent_workflow_id: Some("wf-parent"),
         schedule_name: Some("nightly"),
@@ -359,7 +362,7 @@ async fn every_settable_field_round_trips() {
     };
     let before = Timestamp::now();
     let init = sys
-        .init_workflow_status(&written, None, Submission::Fresh)
+        .init_workflow(&written, None, Submission::Fresh)
         .await
         .expect("insert failed");
 
@@ -396,10 +399,8 @@ async fn every_settable_field_round_trips() {
         read.authenticated_user.as_deref(),
         written.authenticated_user
     );
-    assert_eq!(
-        read.authenticated_roles.as_deref(),
-        written.authenticated_roles
-    );
+    // The roles round-trip as a list: the JSON encoding is this layer's, not the caller's.
+    assert_eq!(read.authenticated_roles, written.authenticated_roles);
     assert_eq!(read.assumed_role.as_deref(), written.assumed_role);
     assert_eq!(
         read.parent_workflow_id.as_deref(),
@@ -447,7 +448,7 @@ async fn every_settable_field_round_trips() {
 #[tokio::test]
 async fn only_the_first_outcome_is_recorded() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-race"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-race"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -491,7 +492,7 @@ async fn the_trait_is_object_safe() {
     let (sys, _db) = sysdb().await;
     let dynamic: &dyn SystemDatabase = &sys;
     dynamic
-        .init_workflow_status(&workflow("wf-dyn"), None, Submission::Fresh)
+        .init_workflow(&workflow("wf-dyn"), None, Submission::Fresh)
         .await
         .unwrap();
     assert!(dynamic.get_workflow("wf-dyn").await.unwrap().is_some());
@@ -507,7 +508,13 @@ async fn a_rejected_statement_is_not_retried() {
     let db = test_database().await;
     let pool = db.pool().await;
     // Nothing has migrated this schema, so the table genuinely is not there.
-    let sys = PostgresSystemDatabase::from_pool(pool, "no_such_schema");
+    let sys = PostgresSystemDatabase::from_pool(
+        pool,
+        &Settings {
+            schema: "no_such_schema",
+            ..Settings::default()
+        },
+    );
 
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(500),
@@ -538,11 +545,16 @@ async fn a_rejected_statement_is_not_retried() {
 async fn an_unreachable_database_is_a_connection_failure() {
     let db = test_database().await;
     let pool = db.pool().await;
-    let sys =
-        PostgresSystemDatabase::from_pool(pool.clone(), DEFAULT_SCHEMA).retry_policy(RetryPolicy {
-            retry_connection_errors: false,
-            ..RetryPolicy::default()
-        });
+    let sys = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            retry: RetryPolicy {
+                retry_connection_errors: false,
+                ..RetryPolicy::default()
+            },
+            ..Settings::default()
+        },
+    );
     pool.close().await;
 
     let result = tokio::time::timeout(
@@ -582,13 +594,19 @@ async fn a_killed_connection_is_waited_out() {
         .connect_with(db.options().application_name(TAG))
         .await
         .expect("failed to connect");
-    let sys = PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).retry_policy(RetryPolicy {
-        initial_backoff: std::time::Duration::from_millis(50),
-        ..RetryPolicy::default()
-    });
+    let sys = PostgresSystemDatabase::from_pool(
+        pool,
+        &Settings {
+            retry: RetryPolicy {
+                initial_backoff: std::time::Duration::from_millis(50),
+                ..RetryPolicy::default()
+            },
+            ..Settings::default()
+        },
+    );
 
     let wf = workflow("wf-chaos");
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .expect("insert failed");
 
@@ -625,13 +643,19 @@ async fn the_opt_out_surfaces_a_killed_connection() {
         .connect_with(db.options().application_name(TAG))
         .await
         .expect("failed to connect");
-    let sys = PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).retry_policy(RetryPolicy {
-        retry_connection_errors: false,
-        ..RetryPolicy::default()
-    });
+    let sys = PostgresSystemDatabase::from_pool(
+        pool,
+        &Settings {
+            retry: RetryPolicy {
+                retry_connection_errors: false,
+                ..RetryPolicy::default()
+            },
+            ..Settings::default()
+        },
+    );
 
     let wf = workflow("wf-chaos-optout");
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .expect("insert failed");
 
@@ -700,7 +724,7 @@ async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
         },
     ];
     for wf in &seeds {
-        sys.init_workflow_status(wf, None, Submission::Fresh)
+        sys.init_workflow(wf, None, Submission::Fresh)
             .await
             .expect("seed insert failed");
     }
@@ -1046,7 +1070,7 @@ async fn payloads_can_be_left_unloaded() {
         input: Some(r#"{"positionalArgs":[1]}"#),
         ..NewWorkflow::new("wf-payload")
     };
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
     sys.record_workflow_outcome("wf-payload", Outcome::Output(Some("42")))
@@ -1085,7 +1109,7 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
         deduplication_id: Some("dedup-1"),
         ..NewWorkflow::new("wf-cancel")
     };
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1118,11 +1142,57 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
     );
 }
 
+/// Cancelling an already-cancelled workflow changes nothing and reports nothing.
+///
+/// Go excludes `CANCELLED` from the guard; Java, Python and TypeScript exclude only `SUCCESS`
+/// and `ERROR`, so a second call there rewrites `completed_at` and moves the moment of
+/// cancellation. That matters more here than in any of them: this is the only implementation
+/// whose return value is *the ids that actually moved*, so re-reporting one would be a lie.
+#[tokio::test]
+async fn cancelling_twice_does_not_move_the_cancellation() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-twice-cancelled"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let first = sys
+        .cancel_workflows(&["wf-twice-cancelled"], false)
+        .await
+        .unwrap();
+    assert_eq!(first, ["wf-twice-cancelled"]);
+    let after_first = sys
+        .get_workflow("wf-twice-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let second = sys
+        .cancel_workflows(&["wf-twice-cancelled"], false)
+        .await
+        .unwrap();
+    assert!(
+        second.is_empty(),
+        "nothing moved the second time, and the caller is told so",
+    );
+
+    let after_second = sys
+        .get_workflow("wf-twice-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_second.completed_at, after_first.completed_at,
+        "the moment of cancellation must not drift on a repeat call",
+    );
+    assert_eq!(after_second.updated_at, after_first.updated_at);
+    assert_eq!(after_second.status, WorkflowStatus::Cancelled);
+}
+
 /// A finished workflow keeps its result; cancelling it is a no-op rather than an error.
 #[tokio::test]
 async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-done"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-done"), None, Submission::Fresh)
         .await
         .unwrap();
     sys.record_workflow_outcome("wf-done", Outcome::Output(Some("42")))
@@ -1157,7 +1227,7 @@ async fn cancelling_children_descends_the_whole_tree() {
             parent_workflow_id: parent,
             ..NewWorkflow::new(id)
         };
-        sys.init_workflow_status(&wf, None, Submission::Fresh)
+        sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -1174,14 +1244,14 @@ async fn cancelling_children_descends_the_whole_tree() {
     );
 
     // Without the flag, only the root moves.
-    sys.init_workflow_status(&workflow("wf-root2"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-root2"), None, Submission::Fresh)
         .await
         .unwrap();
     let child = NewWorkflow {
         parent_workflow_id: Some("wf-root2"),
         ..NewWorkflow::new("wf-child2")
     };
-    sys.init_workflow_status(&child, None, Submission::Fresh)
+    sys.init_workflow(&child, None, Submission::Fresh)
         .await
         .unwrap();
     let shallow = sys.cancel_workflows(&["wf-root2"], false).await.unwrap();
@@ -1198,7 +1268,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     };
     // Two recoveries, so there is a count to clear.
     for _ in 0..2 {
-        sys.init_workflow_status(&wf, None, Submission::Recovery)
+        sys.init_workflow(&wf, None, Submission::Recovery)
             .await
             .unwrap();
     }
@@ -1221,7 +1291,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     assert_eq!(read.completed_at, None);
 
     // A named queue is honoured.
-    sys.init_workflow_status(&workflow("wf-resume2"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-resume2"), None, Submission::Fresh)
         .await
         .unwrap();
     sys.resume_workflows(&["wf-resume2"], Some("orders"))
@@ -1238,7 +1308,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
 #[tokio::test]
 async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-real"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-real"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1270,7 +1340,7 @@ async fn attributes_are_replaced_not_merged() {
         attributes: Some(r#"{"tenant": "acme", "tier": "gold"}"#),
         ..NewWorkflow::new("wf-attrs")
     };
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1340,7 +1410,7 @@ async fn empty_and_zero_values_are_rejected() {
     ];
 
     for (expected_field, wf) in cases {
-        match sys.init_workflow_status(&wf, None, Submission::Fresh).await {
+        match sys.init_workflow(&wf, None, Submission::Fresh).await {
             Err(Error::InvalidInput { field, .. }) => assert_eq!(
                 field, expected_field,
                 "the wrong field was blamed for {expected_field}",
@@ -1370,7 +1440,7 @@ async fn empty_auth_fields_are_normalised_to_null() {
         assumed_role: Some(""),
         ..NewWorkflow::new("wf-auth")
     };
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .expect("empty auth fields are normalised, not rejected");
 
@@ -1383,7 +1453,7 @@ async fn empty_auth_fields_are_normalised_to_null() {
 #[tokio::test]
 async fn a_step_result_round_trips() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-steps"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-steps"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1432,7 +1502,7 @@ async fn a_step_result_round_trips() {
 #[tokio::test]
 async fn a_step_recorded_twice_distinguishes_a_retry_from_a_rival() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-twice"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-twice"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1484,7 +1554,7 @@ async fn a_step_recorded_twice_distinguishes_a_retry_from_a_rival() {
 #[tokio::test]
 async fn a_step_recorded_under_another_name_is_rejected() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-drift"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-drift"), None, Submission::Fresh)
         .await
         .unwrap();
     sys.record_step("wf-drift", 0, "charge", Outcome::Output(None), None, None)
@@ -1506,7 +1576,7 @@ async fn a_step_recorded_under_another_name_is_rejected() {
 #[tokio::test]
 async fn a_cancelled_workflow_refuses_to_replay_steps() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-stopped"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-stopped"), None, Submission::Fresh)
         .await
         .unwrap();
     sys.cancel_workflows(&["wf-stopped"], false).await.unwrap();
@@ -1527,7 +1597,7 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
 #[tokio::test]
 async fn steps_are_listed_in_execution_order() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-list"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-list"), None, Submission::Fresh)
         .await
         .unwrap();
     // Recorded out of order, to prove the ordering comes from `step_id` and not insertion.
@@ -1576,7 +1646,7 @@ async fn steps_are_listed_in_execution_order() {
 async fn a_child_workflow_is_recorded_against_its_step() {
     let (sys, _db) = sysdb().await;
     for id in ["wf-parent", "wf-kid"] {
-        sys.init_workflow_status(&workflow(id), None, Submission::Fresh)
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -1644,19 +1714,24 @@ async fn a_child_workflow_is_recorded_against_its_step() {
 async fn recording_a_step_restamps_the_executor() {
     let db = test_database().await;
     let pool = db.pool().await;
-    let original = PostgresSystemDatabase::from_pool(pool.clone(), DEFAULT_SCHEMA);
+    let original = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
     let wf = NewWorkflow {
         executor_id: Some("executor-a"),
         ..workflow("wf-takeover")
     };
     original
-        .init_workflow_status(&wf, None, Submission::Fresh)
+        .init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
 
     // A second process recovers the workflow and runs a step.
-    let recovering =
-        PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).executor_id("executor-b");
+    let recovering = PostgresSystemDatabase::from_pool(
+        pool,
+        &Settings {
+            executor_id: Some("executor-b"),
+            ..Settings::default()
+        },
+    );
     recovering
         .record_step(
             "wf-takeover",
@@ -1688,7 +1763,7 @@ async fn recording_a_step_restamps_the_executor() {
 #[tokio::test]
 async fn a_step_may_be_recorded_without_timings() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-timing"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-timing"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1735,7 +1810,7 @@ async fn a_step_may_be_recorded_without_timings() {
 #[tokio::test]
 async fn an_untimed_step_cannot_detect_a_rival() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-untimed"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-untimed"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1769,7 +1844,7 @@ async fn an_untimed_step_cannot_detect_a_rival() {
 #[tokio::test]
 async fn a_step_records_either_an_output_or_an_error() {
     let (sys, _db) = sysdb().await;
-    sys.init_workflow_status(&workflow("wf-outcome"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-outcome"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1807,12 +1882,23 @@ async fn a_step_records_either_an_output_or_an_error() {
 async fn losing_the_checkpoint_does_not_claim_the_workflow() {
     let db = test_database().await;
     let pool = db.pool().await;
-    let winner =
-        PostgresSystemDatabase::from_pool(pool.clone(), DEFAULT_SCHEMA).executor_id("executor-a");
-    let loser = PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).executor_id("executor-b");
+    let winner = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            executor_id: Some("executor-a"),
+            ..Settings::default()
+        },
+    );
+    let loser = PostgresSystemDatabase::from_pool(
+        pool,
+        &Settings {
+            executor_id: Some("executor-b"),
+            ..Settings::default()
+        },
+    );
 
     winner
-        .init_workflow_status(&workflow("wf-race-step"), None, Submission::Fresh)
+        .init_workflow(&workflow("wf-race-step"), None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -1876,7 +1962,7 @@ async fn workflow_children_reach_the_whole_tree() {
             parent_workflow_id: parent,
             ..NewWorkflow::new(id)
         };
-        sys.init_workflow_status(&wf, None, Submission::Fresh)
+        sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -1901,7 +1987,7 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
             parent_workflow_id: parent,
             ..NewWorkflow::new(id)
         };
-        sys.init_workflow_status(&wf, None, Submission::Fresh)
+        sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -1932,7 +2018,7 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
             parent_workflow_id: parent,
             ..NewWorkflow::new(id)
         };
-        sys.init_workflow_status(&wf, None, Submission::Fresh)
+        sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -1954,7 +2040,7 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
             application_version: Some(version),
             ..NewWorkflow::new(id)
         };
-        sys.init_workflow_status(&wf, None, Submission::Fresh)
+        sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -1964,7 +2050,7 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
         application_version: Some("v1"),
         ..NewWorkflow::new("wf-finished")
     };
-    sys.init_workflow_status(&done, None, Submission::Fresh)
+    sys.init_workflow(&done, None, Submission::Fresh)
         .await
         .unwrap();
     sys.record_workflow_outcome("wf-finished", Outcome::Output(None))
@@ -1988,7 +2074,7 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
         delay: Some(std::time::Duration::from_secs(3600)),
         ..NewWorkflow::new("wf-delayed")
     };
-    sys.init_workflow_status(&wf, None, Submission::Fresh)
+    sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
     assert_eq!(
@@ -2025,7 +2111,7 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
     );
 
     // A workflow that is not DELAYED is left alone: pushing its delay out cannot recall it.
-    sys.init_workflow_status(&workflow("wf-running"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-running"), None, Submission::Fresh)
         .await
         .unwrap();
     sys.set_workflow_delay(
@@ -2056,7 +2142,7 @@ async fn releasing_a_delayed_workflow_clears_only_the_debounce_key() {
             is_debounced: debounced,
             ..NewWorkflow::new(id)
         };
-        sys.init_workflow_status(&wf, None, Submission::Fresh)
+        sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
     }
@@ -2066,7 +2152,7 @@ async fn releasing_a_delayed_workflow_clears_only_the_debounce_key() {
         delay: Some(std::time::Duration::from_secs(3600)),
         ..NewWorkflow::new("wf-still-held")
     };
-    sys.init_workflow_status(&held, None, Submission::Fresh)
+    sys.init_workflow(&held, None, Submission::Fresh)
         .await
         .unwrap();
 
@@ -2110,13 +2196,13 @@ async fn a_queued_workflow_can_be_returned_to_its_queue() {
         queue_name: Some("orders"),
         ..NewWorkflow::new("wf-claimed")
     };
-    sys.init_workflow_status(&queued, None, Submission::Fresh)
+    sys.init_workflow(&queued, None, Submission::Fresh)
         .await
         .unwrap();
 
     // Claim it as a dequeue would. Done in SQL because the ENQUEUED -> PENDING transition
     // belongs to `start_queued_workflows`, which is task 3.6 and does not exist yet —
-    // `init_workflow_status` derives the status from the queue and so leaves it ENQUEUED.
+    // `init_workflow` derives the status from the queue and so leaves it ENQUEUED.
     let mut conn = db.admin_connection().await;
     sqlx::query(sqlx::AssertSqlSafe(
         "UPDATE dbos.workflow_status SET status = 'PENDING', started_at_epoch_ms = 1000 \
@@ -2132,8 +2218,115 @@ async fn a_queued_workflow_can_be_returned_to_its_queue() {
     assert_eq!(read.started_at, None, "the claim's start time is cleared");
 
     // A workflow that never came from a queue has none to go back to.
-    sys.init_workflow_status(&workflow("wf-direct"), None, Submission::Fresh)
+    sys.init_workflow(&workflow("wf-direct"), None, Submission::Fresh)
         .await
         .unwrap();
     assert!(!sys.clear_queue_assignment("wf-direct").await.unwrap());
+}
+
+/// A second workflow cannot take a deduplication key another already holds on the same queue.
+///
+/// Java raises `DBOSQueueDuplicatedException` here and Python `DBOSQueueDeduplicatedError`; both
+/// translate SQLSTATE 23505 rather than letting it surface as a generic database failure. The
+/// only unique index this insert can violate is migration 27's partial one on
+/// `(queue_name, deduplication_id)`, since `ON CONFLICT (workflow_uuid)` absorbs the other.
+#[tokio::test]
+async fn a_held_deduplication_key_is_reported_as_such() {
+    let (sys, _db) = sysdb().await;
+    let holder = NewWorkflow {
+        queue_name: Some("orders"),
+        deduplication_id: Some("only-once"),
+        ..NewWorkflow::new("wf-holder")
+    };
+    sys.init_workflow(&holder, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let rival = NewWorkflow {
+        queue_name: Some("orders"),
+        deduplication_id: Some("only-once"),
+        ..NewWorkflow::new("wf-rival")
+    };
+    match sys.init_workflow(&rival, None, Submission::Fresh).await {
+        Err(Error::QueueDeduplicated {
+            workflow_id,
+            queue_name,
+            deduplication_id,
+        }) => {
+            assert_eq!(workflow_id, "wf-rival");
+            assert_eq!(queue_name, "orders");
+            assert_eq!(deduplication_id, "only-once");
+        }
+        other => panic!("expected a deduplication error, got {other:?}"),
+    }
+
+    // The same key on a different queue is a different key: the index is on the pair.
+    let elsewhere = NewWorkflow {
+        queue_name: Some("reports"),
+        deduplication_id: Some("only-once"),
+        ..NewWorkflow::new("wf-elsewhere")
+    };
+    sys.init_workflow(&elsewhere, None, Submission::Fresh)
+        .await
+        .expect("a deduplication key is scoped to its queue");
+
+    // Re-submitting the *holder* is not a collision — `ON CONFLICT (workflow_uuid)` absorbs it.
+    sys.init_workflow(&holder, None, Submission::Fresh)
+        .await
+        .expect("the holder may re-submit itself");
+}
+
+/// Roles cross as a list and are stored as JSON, which is this layer's encoding rather than the
+/// caller's.
+///
+/// Unlike `input` and the outcome payloads — opaque bytes whose format the caller chooses — the
+/// column is always a JSON array of strings in every implementation, so the sysdb owns it.
+#[tokio::test]
+async fn authenticated_roles_are_encoded_by_this_layer() {
+    let (sys, db) = sysdb().await;
+    let wf = NewWorkflow {
+        authenticated_roles: vec!["admin", "auditor \"quoted\""],
+        ..NewWorkflow::new("wf-roles")
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let read = sys.get_workflow("wf-roles").await.unwrap().unwrap();
+    assert_eq!(read.authenticated_roles, ["admin", "auditor \"quoted\""]);
+
+    // The stored form is JSON, so another SDK reading this column sees what it expects.
+    let mut conn = db.admin_connection().await;
+    let stored: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        "SELECT authenticated_roles FROM dbos.workflow_status WHERE workflow_uuid = 'wf-roles'",
+    ))
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(r#"["admin","auditor \"quoted\""]"#),
+        "quotes must be escaped, which is why this is not string concatenation",
+    );
+
+    // No roles is NULL, not `[]`, so "none" has one representation in the column.
+    sys.init_workflow(&NewWorkflow::new("wf-no-roles"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    let stored: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(
+        "SELECT authenticated_roles FROM dbos.workflow_status WHERE workflow_uuid = 'wf-no-roles'",
+    ))
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(stored, None);
+    assert!(
+        sys.get_workflow("wf-no-roles")
+            .await
+            .unwrap()
+            .unwrap()
+            .authenticated_roles
+            .is_empty(),
+        "a NULL column reads back as no roles",
+    );
 }
