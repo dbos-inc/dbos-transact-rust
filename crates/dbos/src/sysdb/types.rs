@@ -689,3 +689,110 @@ impl Default for WorkflowFilter {
         }
     }
 }
+
+/// A step's recorded result, as `operation_outputs` holds it.
+///
+/// One row per `(workflow_id, step_id)` — that pair is the primary key, and is what makes a
+/// replayed workflow skip work it has already done.
+///
+/// **The field names do not match the column names.** `step_id` and `step_name` are stored in
+/// `function_id` and `function_name`, which is what the schema has called them since migration 1
+/// and what every implementation's SQL still says. Java's `StepResult` draws the same
+/// distinction, and the reason is that "function" is what these were called before steps had a
+/// name of their own — the columns cannot be renamed without a migration every SDK must agree
+/// on, but the Rust API need not inherit the old word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRecord {
+    /// The workflow the step belongs to.
+    pub workflow_id: String,
+    /// The step's position in the workflow, counted from zero. Column `function_id`.
+    ///
+    /// `i32`, matching `INT4`. The count is per workflow execution, not global.
+    pub step_id: i32,
+    /// The registered step name, checked on replay. Column `function_name`.
+    pub step_name: String,
+    /// Encoded return value, if the step returned one.
+    pub output: Option<String>,
+    /// Encoded error, if the step raised one. Never set alongside `output`.
+    pub error: Option<String>,
+    /// The workflow this step started, for steps that are child-workflow calls.
+    pub child_workflow_id: Option<String>,
+    /// How `output` and `error` are encoded.
+    pub serialization: Option<String>,
+    /// When the step began.
+    pub started_at: Option<Timestamp>,
+    /// When the step finished.
+    ///
+    /// Also the tie-breaker on a duplicate record: a second write carrying a *different*
+    /// completion time is another executor, while one carrying the same is this caller's own
+    /// retry. See [`SystemDatabase::record_step`](crate::sysdb::SystemDatabase::record_step).
+    pub completed_at: Option<Timestamp>,
+}
+
+/// How a step or a workflow ended: with a value, or with an error.
+///
+/// One type for both, because they end the same way and are stored the same way — an `output`
+/// column and an `error` column, on `operation_outputs` and `workflow_status` respectively. The
+/// variants are named after those columns.
+///
+/// Those two columns are independently nullable, so a row could carry both — which would make
+/// the work simultaneously successful and failed, and leave a replay believing whichever the
+/// reader happened to check first. Every implementation forbids it; Python asserts
+/// `error is None or output is None`. A sum type means there is nothing to assert.
+///
+/// For a workflow this also settles the status, which is why
+/// [`record_workflow_outcome`](crate::sysdb::SystemDatabase::record_workflow_outcome) does not
+/// take one. No implementation treats it as a free choice: Go computes
+/// `status := Success; if err != nil { status = Error }`, and Java splits the call into
+/// `recordWorkflowOutput` and `recordWorkflowError`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The work returned.
+    ///
+    /// `None` is a void return, which is a *success* and not an absent result. Whether a step ran
+    /// at all is answered by the presence of its row, never by this being empty.
+    Output(Option<String>),
+    /// The work raised, carrying the encoded error.
+    Error(String),
+}
+
+impl Outcome {
+    /// The terminal status this outcome puts a workflow in.
+    pub fn status(&self) -> WorkflowStatus {
+        match self {
+            Outcome::Output(_) => WorkflowStatus::Success,
+            Outcome::Error(_) => WorkflowStatus::Error,
+        }
+    }
+
+    /// The pair of column values, in the order the tables hold them.
+    pub(crate) fn columns(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            Outcome::Output(value) => (value.as_deref(), None),
+            Outcome::Error(message) => (None, Some(message.as_str())),
+        }
+    }
+}
+
+/// When a step ran, start and finish together.
+///
+/// A pair rather than two fields because the database records completed steps: a start with no
+/// finish is not a state this table has, and half a pair yields a duration nobody can compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepTiming {
+    /// When the step began.
+    pub started_at: Timestamp,
+    /// When the step finished, and the token that makes recording it idempotent.
+    ///
+    /// Fixed before the write and **it must not move between retries of the same logical
+    /// record**. On a duplicate insert the stored value is compared against this one: equal means
+    /// this caller's own write whose acknowledgement was lost, different means another execution
+    /// recorded the step first. Re-stamping the clock per attempt would turn every lost
+    /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
+    /// than building it at the call site inside a retry loop.
+    ///
+    /// Omitting the timing altogether gives up that detection: with no recorded completion there
+    /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
+    /// behaves the same way, guarding its comparison with `if (endTimeEpochMs != null)`.
+    pub completed_at: Timestamp,
+}

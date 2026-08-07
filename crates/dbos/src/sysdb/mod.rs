@@ -28,7 +28,10 @@ pub mod types;
 
 use async_trait::async_trait;
 
-use types::{NewWorkflow, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus};
+use types::{
+    NewWorkflow, Outcome, StepRecord, StepTiming, Timestamp, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus,
+};
 
 /// What went wrong talking to the system database.
 ///
@@ -63,6 +66,38 @@ pub enum Error {
         /// What was wrong with it.
         detail: String,
     },
+    /// The workflow has been cancelled, so its steps must not run.
+    ///
+    /// Raised by the step-replay check rather than by cancellation itself: cancelling only sets
+    /// a status, and a workflow already in flight learns about it the next time it asks.
+    WorkflowCancelled {
+        /// The cancelled workflow.
+        workflow_id: String,
+    },
+    /// A step at this position was recorded under a different name.
+    ///
+    /// Means the workflow's code changed between the original run and this replay, so the
+    /// recorded results no longer line up with the steps asking for them.
+    UnexpectedStep {
+        /// The workflow being replayed.
+        workflow_id: String,
+        /// The position that disagreed.
+        step_id: i32,
+        /// The step asking.
+        expected: String,
+        /// The step recorded there.
+        recorded: String,
+    },
+    /// Another execution recorded this step first.
+    ///
+    /// Two executors believed they owned one workflow. Distinguished from this caller's own
+    /// retry by the completion timestamp, which a retry repeats and a rival does not.
+    StepAlreadyRecorded {
+        /// The workflow whose step was taken.
+        workflow_id: String,
+        /// The position that was already filled.
+        step_id: i32,
+    },
     /// One or more of the named workflows do not exist.
     NonExistentWorkflow {
         /// The ids with no row behind them.
@@ -87,6 +122,26 @@ impl std::fmt::Display for Error {
                 detail,
             } => write!(f, "workflow {workflow_id} already exists: {detail}"),
             Error::InvalidInput { field, detail } => write!(f, "invalid {field}: {detail}"),
+            Error::WorkflowCancelled { workflow_id } => {
+                write!(f, "workflow {workflow_id} is cancelled")
+            }
+            Error::UnexpectedStep {
+                workflow_id,
+                step_id,
+                expected,
+                recorded,
+            } => write!(
+                f,
+                "workflow {workflow_id} step {step_id} was recorded as {recorded:?}, \
+                 but {expected:?} was expected"
+            ),
+            Error::StepAlreadyRecorded {
+                workflow_id,
+                step_id,
+            } => write!(
+                f,
+                "workflow {workflow_id} step {step_id} was already recorded by another execution"
+            ),
             Error::NonExistentWorkflow { workflow_ids } => {
                 write!(f, "no such workflow: {}", workflow_ids.join(", "))
             }
@@ -240,8 +295,7 @@ pub trait SystemDatabase: Send + Sync {
     ) -> Result<WorkflowInitResult, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.
-    async fn get_workflow_status(&self, workflow_id: &str)
-    -> Result<Option<WorkflowRecord>, Error>;
+    async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error>;
 
     /// Reads the workflows matching a filter, oldest first unless told otherwise.
     ///
@@ -292,6 +346,97 @@ pub trait SystemDatabase: Send + Sync {
         queue_name: Option<&str>,
     ) -> Result<Vec<String>, Error>;
 
+    /// Reads a recorded step, or `None` if it has not run.
+    ///
+    /// `check` rather than `get`, following all three references, because this is a replay gate
+    /// and not a lookup: unlike [`get_workflow`](Self::get_workflow), it can reject
+    /// the caller outright. A `get_` that raises [`Error::WorkflowCancelled`] would be a
+    /// surprise in exactly the place a caller can least afford one.
+    ///
+    /// This is the whole of durable execution in one call: on replay, a step that returns
+    /// `Some` is skipped and its recorded result used instead of running it again.
+    ///
+    /// Two checks happen first, and both are the point rather than defensive noise:
+    ///
+    /// - **A cancelled workflow raises [`Error::WorkflowCancelled`].** Cancelling only sets a
+    ///   status; a workflow already in flight finds out here, at its next step boundary.
+    /// - **A step recorded under a different name raises [`Error::UnexpectedStep`].** The
+    ///   `step_id` is just a counter, so if the workflow's code changed between runs, step 3
+    ///   of the replay is not step 3 of the original — and using its result would be silently
+    ///   wrong rather than merely stale.
+    async fn check_step(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+    ) -> Result<Option<StepRecord>, Error>;
+
+    /// Records a step's result, which no later execution may overwrite.
+    ///
+    /// [`StepTiming::completed_at`] is the concurrency control, not merely a timestamp. The
+    /// insert conflicts if the step is already recorded, and when both sides carry a completion
+    /// time it is what separates the two reasons that might be:
+    ///
+    /// - **the same time** — this caller's own write, acknowledged but not observed. Retrying it
+    ///   is correct and the call succeeds.
+    /// - **a different time** — another execution got there first, which is
+    ///   [`Error::StepAlreadyRecorded`].
+    ///
+    /// So a caller that retries must pass the same `timing` both times — hold it in a variable
+    /// rather than building it at the call site inside a retry loop. Python spells the rule out
+    /// where it does the same thing: *"Outside the retry: the conflict check compares the stored
+    /// completion to ours."*
+    ///
+    /// A step recorded with no `timing` gets no such detection — there is nothing to compare, so
+    /// a duplicate write is accepted rather than reported. That is the trade for omitting it, and
+    /// it is Java's behaviour whenever its end time is null.
+    ///
+    /// Recording also **re-stamps the workflow's executor id**, because an executor that runs a
+    /// step is by definition the one running the workflow.
+    async fn record_step(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        outcome: &Outcome,
+        serialization: Option<&str>,
+        timing: Option<StepTiming>,
+    ) -> Result<(), Error>;
+
+    /// Reads a workflow's steps in execution order.
+    ///
+    /// `load_output` off leaves `output` and `error` `None`, as on
+    /// [`WorkflowFilter`] and with the same caveat: absent and
+    /// not-asked-for look identical.
+    async fn list_workflow_steps(
+        &self,
+        workflow_id: &str,
+        load_output: bool,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<StepRecord>, Error>;
+
+    /// Records that a step started a child workflow.
+    ///
+    /// A step row with a `child_workflow_id` and no result: the child's outcome lives on the
+    /// child's own row, and duplicating it here would give a replay two places to disagree.
+    ///
+    /// **Not a call through [`record_step`](Self::record_step)**, because the two
+    /// resolve a duplicate write differently. That one compares the completion time; this one
+    /// compares the **child id**, since the timestamp here spans only the launch and a retry
+    /// would stamp a new one — while the child id it is recording is necessarily the same. A
+    /// *different* child at the same position is nondeterminism in the parent, and is reported
+    /// as [`Error::StepAlreadyRecorded`]. Python splits the two for exactly this reason; Java
+    /// reaches it by passing null timestamps and skipping the comparison.
+    async fn record_child_workflow(
+        &self,
+        parent_workflow_id: &str,
+        child_workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        started_at: Option<Timestamp>,
+    ) -> Result<(), Error>;
+
     /// Replaces a workflow's attributes. `None` clears them.
     ///
     /// A replacement rather than a merge, matching every implementation.
@@ -307,11 +452,19 @@ pub trait SystemDatabase: Send + Sync {
     /// recovering after the other was presumed dead — and whichever finishes second must not
     /// overwrite the first's result. Returning which happened lets the loser adopt the recorded
     /// outcome instead of reporting its own.
-    async fn update_workflow_outcome(
+    ///
+    /// The terminal status comes from the [`Outcome`] rather than being passed separately, so a
+    /// success carrying an error is unrepresentable. No implementation treats the two as
+    /// independent — see [`Outcome`].
+    ///
+    /// **Losing here is a value; losing in [`record_step`](Self::record_step) is an error.** The two look parallel and deliberately are not. A workflow whose outcome was
+    /// recorded by someone else has simply been superseded, and the right move is to adopt what
+    /// is stored — routine enough to be a return value. A step recorded by someone else means
+    /// two executions of one workflow are live at the same moment, which every implementation
+    /// raises on.
+    async fn record_workflow_outcome(
         &self,
         workflow_id: &str,
-        status: WorkflowStatus,
-        output: Option<&str>,
-        error: Option<&str>,
+        outcome: &Outcome,
     ) -> Result<OutcomeWrite, Error>;
 }

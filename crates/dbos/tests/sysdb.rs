@@ -4,7 +4,7 @@ mod support;
 
 use dbos::sysdb::postgres::PostgresSystemDatabase;
 use dbos::sysdb::retry::RetryPolicy;
-use dbos::sysdb::types::{NewWorkflow, Timestamp, WorkflowStatus};
+use dbos::sysdb::types::{NewWorkflow, Outcome, StepTiming, Timestamp, WorkflowStatus};
 use dbos::sysdb::{
     BackendErrorKind, DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite, SystemDatabase,
 };
@@ -44,7 +44,7 @@ async fn a_workflow_round_trips() {
     assert!(written.should_execute);
 
     let read = sys
-        .get_workflow_status("wf-1")
+        .get_workflow("wf-1")
         .await
         .expect("read failed")
         .expect("the workflow should exist");
@@ -68,7 +68,7 @@ async fn payloads_are_stored_verbatim() {
         .await
         .expect("insert failed");
 
-    let read = sys.get_workflow_status("wf-opaque").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-opaque").await.unwrap().unwrap();
     assert_eq!(read.input, r.input);
 }
 
@@ -76,12 +76,7 @@ async fn payloads_are_stored_verbatim() {
 #[tokio::test]
 async fn a_missing_workflow_reads_as_none() {
     let (sys, _db) = sysdb().await;
-    assert!(
-        sys.get_workflow_status("nobody-here")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(sys.get_workflow("nobody-here").await.unwrap().is_none());
 }
 
 /// Inserting the same id twice leaves the first row alone.
@@ -113,7 +108,7 @@ async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
         .await
         .expect("re-submitting the same workflow should succeed");
     assert_eq!(again.status, WorkflowStatus::Pending);
-    let read = sys.get_workflow_status("wf-dup").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-dup").await.unwrap().unwrap();
     assert_eq!(read.application_version.as_deref(), Some("v1"));
 }
 
@@ -253,7 +248,7 @@ async fn exceeding_the_recovery_limit_parks_the_workflow() {
         "expected a dead-letter error, got {err:?}",
     );
 
-    let read = sys.get_workflow_status("wf-dlq").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-dlq").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::MaxRecoveryAttemptsExceeded);
     assert_eq!(read.queue_name, None, "parking clears the queue assignment");
 }
@@ -382,11 +377,7 @@ async fn every_settable_field_round_trips() {
     assert_eq!(init.status, WorkflowStatus::Delayed);
     assert_eq!(init.deadline, written.deadline);
 
-    let read = sys
-        .get_workflow_status("wf-all-fields")
-        .await
-        .unwrap()
-        .unwrap();
+    let read = sys.get_workflow("wf-all-fields").await.unwrap().unwrap();
 
     assert_eq!(read.workflow_id, "wf-all-fields");
     assert_eq!(read.name, written.name);
@@ -456,13 +447,13 @@ async fn only_the_first_outcome_is_recorded() {
         .unwrap();
 
     let first = sys
-        .update_workflow_outcome("wf-race", WorkflowStatus::Success, Some("\"winner\""), None)
+        .record_workflow_outcome("wf-race", &Outcome::Output(Some("\"winner\"".to_owned())))
         .await
         .expect("the first write should succeed");
     assert_eq!(first, OutcomeWrite::Recorded);
 
     let second = sys
-        .update_workflow_outcome("wf-race", WorkflowStatus::Error, None, Some("\"loser\""))
+        .record_workflow_outcome("wf-race", &Outcome::Error("\"loser\"".to_owned()))
         .await
         .expect("the second write should not error");
     assert_eq!(
@@ -471,7 +462,7 @@ async fn only_the_first_outcome_is_recorded() {
         "the loser should learn it lost",
     );
 
-    let read = sys.get_workflow_status("wf-race").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-race").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::Success);
     assert_eq!(read.output.as_deref(), Some("\"winner\""));
     assert_eq!(read.error, None, "the loser's error must not have landed");
@@ -483,7 +474,7 @@ async fn only_the_first_outcome_is_recorded() {
 async fn recording_an_outcome_for_a_missing_workflow_is_not_an_error() {
     let (sys, _db) = sysdb().await;
     let result = sys
-        .update_workflow_outcome("never-existed", WorkflowStatus::Success, None, None)
+        .record_workflow_outcome("never-existed", &Outcome::Output(None))
         .await
         .expect("a missing row should not be an error");
     assert_eq!(result, OutcomeWrite::AlreadyFinished);
@@ -498,13 +489,7 @@ async fn the_trait_is_object_safe() {
         .init_workflow_status(InitWorkflowStatus::new(&workflow("wf-dyn")))
         .await
         .unwrap();
-    assert!(
-        dynamic
-            .get_workflow_status("wf-dyn")
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(dynamic.get_workflow("wf-dyn").await.unwrap().is_some());
 }
 
 /// A rejected statement comes back at once, with the SQLSTATE the database gave.
@@ -521,7 +506,7 @@ async fn a_rejected_statement_is_not_retried() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        sys.get_workflow_status("wf-1"),
+        sys.get_workflow("wf-1"),
     )
     .await
     .expect("a permanent failure was retried instead of being returned");
@@ -558,7 +543,7 @@ async fn an_unreachable_database_is_a_connection_failure() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        sys.get_workflow_status("wf-1"),
+        sys.get_workflow("wf-1"),
     )
     .await
     .expect("the opt-out should have returned rather than retried");
@@ -609,7 +594,7 @@ async fn a_killed_connection_is_waited_out() {
 
     let read = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        sys.get_workflow_status("wf-chaos"),
+        sys.get_workflow("wf-chaos"),
     )
     .await
     .expect("the retry never recovered")
@@ -650,7 +635,7 @@ async fn the_opt_out_surfaces_a_killed_connection() {
 
     db.kill_connections(TAG).await;
 
-    match sys.get_workflow_status("wf-chaos-optout").await {
+    match sys.get_workflow("wf-chaos-optout").await {
         Err(Error::Backend(e)) => assert_eq!(
             e.kind,
             BackendErrorKind::Connection,
@@ -1062,7 +1047,7 @@ async fn payloads_can_be_left_unloaded() {
     sys.init_workflow_status(InitWorkflowStatus::new(&wf))
         .await
         .unwrap();
-    sys.update_workflow_outcome("wf-payload", WorkflowStatus::Success, Some("42"), None)
+    sys.record_workflow_outcome("wf-payload", &Outcome::Output(Some("42".to_owned())))
         .await
         .unwrap();
     drop(db);
@@ -1108,7 +1093,7 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
         .unwrap();
     assert_eq!(cancelled, ["wf-cancel"]);
 
-    let read = sys.get_workflow_status("wf-cancel").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-cancel").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::Cancelled);
     assert_eq!(
         read.queue_name, None,
@@ -1141,7 +1126,7 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
     sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-done")))
         .await
         .unwrap();
-    sys.update_workflow_outcome("wf-done", WorkflowStatus::Success, Some("42"), None)
+    sys.record_workflow_outcome("wf-done", &Outcome::Output(Some("42".to_owned())))
         .await
         .unwrap();
 
@@ -1154,7 +1139,7 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
         "nothing moved, and the caller is told so",
     );
 
-    let read = sys.get_workflow_status("wf-done").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-done").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::Success);
     assert_eq!(read.output.as_deref(), Some("42"), "the result survives");
 }
@@ -1188,11 +1173,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     cancelled.sort();
     assert_eq!(cancelled, ["wf-child", "wf-grandchild", "wf-root"]);
 
-    let untouched = sys
-        .get_workflow_status("wf-unrelated")
-        .await
-        .unwrap()
-        .unwrap();
+    let untouched = sys.get_workflow("wf-unrelated").await.unwrap().unwrap();
     assert_eq!(
         untouched.status,
         WorkflowStatus::Pending,
@@ -1241,7 +1222,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
         .unwrap();
     assert_eq!(resumed, ["wf-resume"]);
 
-    let read = sys.get_workflow_status("wf-resume").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-resume").await.unwrap().unwrap();
     assert_eq!(read.status, WorkflowStatus::Enqueued);
     assert_eq!(
         read.queue_name.as_deref(),
@@ -1262,11 +1243,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     sys.resume_workflows(&["wf-resume2".to_owned()], Some("orders"))
         .await
         .unwrap();
-    let read = sys
-        .get_workflow_status("wf-resume2")
-        .await
-        .unwrap()
-        .unwrap();
+    let read = sys.get_workflow("wf-resume2").await.unwrap().unwrap();
     assert_eq!(read.queue_name.as_deref(), Some("orders"));
 }
 
@@ -1290,7 +1267,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
         }
         other => panic!("expected a non-existent-workflow error, got {other:?}"),
     }
-    let read = sys.get_workflow_status("wf-real").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-real").await.unwrap().unwrap();
     assert_eq!(
         read.status,
         WorkflowStatus::Pending,
@@ -1319,7 +1296,7 @@ async fn attributes_are_replaced_not_merged() {
     sys.update_workflow_attributes("wf-attrs", Some(r#"{"tier": "silver"}"#))
         .await
         .unwrap();
-    let read = sys.get_workflow_status("wf-attrs").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-attrs").await.unwrap().unwrap();
     let attributes = read.attributes.unwrap();
     assert!(attributes.contains("silver"));
     assert!(
@@ -1330,7 +1307,7 @@ async fn attributes_are_replaced_not_merged() {
     sys.update_workflow_attributes("wf-attrs", None)
         .await
         .unwrap();
-    let read = sys.get_workflow_status("wf-attrs").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-attrs").await.unwrap().unwrap();
     assert_eq!(read.attributes, None);
 }
 
@@ -1416,7 +1393,498 @@ async fn empty_auth_fields_are_normalised_to_null() {
         .await
         .expect("empty auth fields are normalised, not rejected");
 
-    let read = sys.get_workflow_status("wf-auth").await.unwrap().unwrap();
+    let read = sys.get_workflow("wf-auth").await.unwrap().unwrap();
     assert_eq!(read.authenticated_user, None);
     assert_eq!(read.assumed_role, None);
+}
+
+/// A step's result survives and is found again by position — the whole of durable execution.
+#[tokio::test]
+async fn a_step_result_round_trips() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-steps")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.check_step("wf-steps", 0, "charge").await.unwrap(),
+        None,
+        "a step that has not run has no result",
+    );
+
+    let timing = StepTiming {
+        started_at: Timestamp::from_epoch_ms(1_000),
+        completed_at: Timestamp::from_epoch_ms(2_000),
+    };
+    sys.record_step(
+        "wf-steps",
+        0,
+        "charge",
+        &Outcome::Output(Some(r#"{"ok":true}"#.to_owned())),
+        Some("portable_json"),
+        Some(timing),
+    )
+    .await
+    .unwrap();
+
+    let read = sys
+        .check_step("wf-steps", 0, "charge")
+        .await
+        .unwrap()
+        .expect("the step should be recorded");
+    assert_eq!(read.output.as_deref(), Some(r#"{"ok":true}"#));
+    assert_eq!(read.error, None);
+    assert_eq!(read.serialization.as_deref(), Some("portable_json"));
+    assert_eq!(read.started_at, Some(Timestamp::from_epoch_ms(1_000)));
+    assert_eq!(read.completed_at, Some(Timestamp::from_epoch_ms(2_000)));
+
+    // A position with no row of its own reads as absent even though the workflow has steps.
+    // The join is against `function_id`, so it must not fall back to any recorded step.
+    assert_eq!(sys.check_step("wf-steps", 1, "refund").await.unwrap(), None,);
+}
+
+/// Re-recording with the same completion is this caller's own retry; a different one is a rival.
+///
+/// This is the reason `completed_at` is a parameter rather than read inside the call. Python
+/// says so at its call site: "Outside the retry: the conflict check compares the stored
+/// completion to ours."
+#[tokio::test]
+async fn a_step_recorded_twice_distinguishes_a_retry_from_a_rival() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-twice")))
+        .await
+        .unwrap();
+
+    // Held in a variable, which is exactly what makes the retry below idempotent.
+    let timing = StepTiming {
+        started_at: Timestamp::from_epoch_ms(4_000),
+        completed_at: Timestamp::from_epoch_ms(5_000),
+    };
+    let first = Outcome::Output(Some("first".to_owned()));
+    sys.record_step("wf-twice", 0, "charge", &first, None, Some(timing))
+        .await
+        .unwrap();
+
+    // The same timing again: an acknowledgement was lost and the caller asked again.
+    sys.record_step("wf-twice", 0, "charge", &first, None, Some(timing))
+        .await
+        .expect("a caller's own retry must succeed");
+
+    // A different completion is a second execution, which must not take the step.
+    let rival_timing = StepTiming {
+        started_at: Timestamp::from_epoch_ms(4_000),
+        completed_at: Timestamp::from_epoch_ms(6_000),
+    };
+    match sys
+        .record_step(
+            "wf-twice",
+            0,
+            "charge",
+            &Outcome::Output(Some("second".to_owned())),
+            None,
+            Some(rival_timing),
+        )
+        .await
+    {
+        Err(Error::StepAlreadyRecorded { step_id, .. }) => assert_eq!(step_id, 0),
+        other => panic!("expected the rival to be rejected, got {other:?}"),
+    }
+
+    // The first result stands.
+    let read = sys
+        .check_step("wf-twice", 0, "charge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.output.as_deref(), Some("first"));
+}
+
+/// A replay whose code changed finds the wrong step at a position, and says so.
+#[tokio::test]
+async fn a_step_recorded_under_another_name_is_rejected() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-drift")))
+        .await
+        .unwrap();
+    sys.record_step("wf-drift", 0, "charge", &Outcome::Output(None), None, None)
+        .await
+        .unwrap();
+
+    match sys.check_step("wf-drift", 0, "refund").await {
+        Err(Error::UnexpectedStep {
+            expected, recorded, ..
+        }) => {
+            assert_eq!(expected, "refund");
+            assert_eq!(recorded, "charge");
+        }
+        other => panic!("expected a step-drift error, got {other:?}"),
+    }
+}
+
+/// A cancelled workflow stops at its next step boundary rather than replaying.
+#[tokio::test]
+async fn a_cancelled_workflow_refuses_to_replay_steps() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-stopped")))
+        .await
+        .unwrap();
+    sys.cancel_workflows(&["wf-stopped".to_owned()], false)
+        .await
+        .unwrap();
+
+    match sys.check_step("wf-stopped", 0, "charge").await {
+        Err(Error::WorkflowCancelled { workflow_id }) => assert_eq!(workflow_id, "wf-stopped"),
+        other => panic!("expected a cancellation error, got {other:?}"),
+    }
+
+    // A workflow that never existed is a different error, not the same one.
+    match sys.check_step("wf-ghost", 0, "charge").await {
+        Err(Error::NonExistentWorkflow { workflow_ids }) => assert_eq!(workflow_ids, ["wf-ghost"]),
+        other => panic!("expected a non-existent-workflow error, got {other:?}"),
+    }
+}
+
+/// Steps come back in execution order, and payloads can be declined.
+#[tokio::test]
+async fn steps_are_listed_in_execution_order() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-list")))
+        .await
+        .unwrap();
+    // Recorded out of order, to prove the ordering comes from `step_id` and not insertion.
+    for id in [2, 0, 1] {
+        sys.record_step(
+            "wf-list",
+            id,
+            &format!("step-{id}"),
+            &Outcome::Output(Some(format!("out-{id}"))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let steps = sys
+        .list_workflow_steps("wf-list", true, None, None)
+        .await
+        .unwrap();
+    let ids: Vec<i32> = steps.iter().map(|s| s.step_id).collect();
+    assert_eq!(ids, [0, 1, 2], "ordered by position, not by when recorded");
+    assert_eq!(steps[1].step_name, "step-1");
+    assert_eq!(steps[1].output.as_deref(), Some("out-1"));
+
+    let bare = sys
+        .list_workflow_steps("wf-list", false, None, None)
+        .await
+        .unwrap();
+    assert_eq!(bare.len(), 3, "declining payloads returns the same rows");
+    assert_eq!(bare[1].output, None);
+    assert_eq!(bare[1].step_name, "step-1", "other columns still load");
+
+    let page = sys
+        .list_workflow_steps("wf-list", true, Some(1), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].step_id, 1);
+}
+
+/// A child workflow is found by the position that started it, even before it finishes.
+#[tokio::test]
+async fn a_child_workflow_is_recorded_against_its_step() {
+    let (sys, _db) = sysdb().await;
+    for id in ["wf-parent", "wf-kid"] {
+        sys.init_workflow_status(InitWorkflowStatus::new(&workflow(id)))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        sys.check_step("wf-parent", 0, "run_child").await.unwrap(),
+        None,
+        "nothing has started a child at this position",
+    );
+    sys.record_child_workflow("wf-parent", "wf-kid", 0, "run_child", None)
+        .await
+        .unwrap();
+    // Read back through the ordinary replay check, which is the path Python uses: the child id
+    // is a field of the recorded step, not a separate lookup.
+    let step = sys
+        .check_step("wf-parent", 0, "run_child")
+        .await
+        .unwrap()
+        .expect("the launch is recorded as a step");
+    assert_eq!(step.child_workflow_id.as_deref(), Some("wf-kid"));
+    assert_eq!(step.output, None);
+    assert_eq!(
+        step.error, None,
+        "the launch carries no result; the child's outcome lives on the child's row",
+    );
+
+    // Recording the same child again is a retry, and must succeed however much later it is —
+    // the completion time will differ, and the child id is what decides.
+    sys.record_child_workflow("wf-parent", "wf-kid", 0, "run_child", None)
+        .await
+        .expect("re-recording the same child is idempotent");
+
+    // A different child at the same position is nondeterminism in the parent.
+    match sys
+        .record_child_workflow("wf-parent", "wf-other", 0, "run_child", None)
+        .await
+    {
+        Err(Error::StepAlreadyRecorded { step_id, .. }) => assert_eq!(step_id, 0),
+        other => panic!("expected a conflicting child to be rejected, got {other:?}"),
+    }
+
+    // An empty child id would wedge the parent on replay, so it is refused.
+    match sys
+        .record_child_workflow("wf-parent", "", 2, "run_child", None)
+        .await
+    {
+        Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "child_workflow_id"),
+        other => panic!("expected an empty child id to be rejected, got {other:?}"),
+    }
+
+    // A plain step at another position started no workflow.
+    sys.record_step("wf-parent", 1, "charge", &Outcome::Output(None), None, None)
+        .await
+        .unwrap();
+    let step = sys
+        .check_step("wf-parent", 1, "charge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(step.child_workflow_id, None);
+}
+
+/// Recording a step claims the workflow for the executor that ran it.
+#[tokio::test]
+async fn recording_a_step_restamps_the_executor() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let original = PostgresSystemDatabase::from_pool(pool.clone(), DEFAULT_SCHEMA);
+    let wf = NewWorkflow {
+        executor_id: Some("executor-a".to_owned()),
+        ..workflow("wf-takeover")
+    };
+    original
+        .init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .unwrap();
+
+    // A second process recovers the workflow and runs a step.
+    let recovering =
+        PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).with_executor_id("executor-b");
+    recovering
+        .record_step(
+            "wf-takeover",
+            0,
+            "charge",
+            &Outcome::Output(None),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let read = recovering
+        .get_workflow("wf-takeover")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read.executor_id.as_deref(),
+        Some("executor-b"),
+        "running a step is what makes an executor the owner",
+    );
+}
+/// A step may be recorded with no timings at all.
+///
+/// A host calling across an FFI boundary may have no timings to offer, and inventing them here
+/// would record a duration this layer never measured. Half a pair needs no test: `timing` is an
+/// `Option<StepTiming>`, so a start without a finish does not compile.
+#[tokio::test]
+async fn a_step_may_be_recorded_without_timings() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-timing")))
+        .await
+        .unwrap();
+
+    sys.record_step("wf-timing", 0, "charge", &Outcome::Output(None), None, None)
+        .await
+        .expect("a step without timings is legal");
+
+    let read = sys
+        .check_step("wf-timing", 0, "charge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.started_at, None);
+    assert_eq!(read.completed_at, None);
+
+    // And a timed step keeps both halves.
+    let timing = StepTiming {
+        started_at: Timestamp::from_epoch_ms(1_000),
+        completed_at: Timestamp::from_epoch_ms(2_000),
+    };
+    sys.record_step(
+        "wf-timing",
+        1,
+        "refund",
+        &Outcome::Output(None),
+        None,
+        Some(timing),
+    )
+    .await
+    .unwrap();
+    let read = sys
+        .check_step("wf-timing", 1, "refund")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.started_at, Some(Timestamp::from_epoch_ms(1_000)));
+    assert_eq!(read.completed_at, Some(Timestamp::from_epoch_ms(2_000)));
+}
+
+/// Without a completion time there is nothing to compare, so a duplicate is accepted.
+///
+/// This is the cost of recording a step with no timings, and it is worth pinning rather than
+/// discovering: the retry-versus-rival detection is *bought* with the timestamp, not free.
+#[tokio::test]
+async fn an_untimed_step_cannot_detect_a_rival() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-untimed")))
+        .await
+        .unwrap();
+
+    let first = Outcome::Output(Some("first".to_owned()));
+    sys.record_step("wf-untimed", 0, "charge", &first, None, None)
+        .await
+        .unwrap();
+
+    let rival = Outcome::Output(Some("second".to_owned()));
+    sys.record_step("wf-untimed", 0, "charge", &rival, None, None)
+        .await
+        .expect("with no completion time there is nothing to compare against");
+
+    // The first result still stands: the insert conflicted and changed nothing.
+    let read = sys
+        .check_step("wf-untimed", 0, "charge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read.output.as_deref(),
+        Some("first"),
+        "the duplicate is ignored, not applied",
+    );
+}
+
+/// A step that raised is recorded as an error, and a void one as an empty success.
+///
+/// The two are different `StepOutcome` variants and land in different columns, so a replay can
+/// tell "returned nothing" from "threw" — which a single nullable payload could not.
+#[tokio::test]
+async fn a_step_records_either_an_output_or_an_error() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-outcome")))
+        .await
+        .unwrap();
+
+    let failed = Outcome::Error(r#"{"type":"ValueError"}"#.to_owned());
+    sys.record_step("wf-outcome", 0, "charge", &failed, None, None)
+        .await
+        .unwrap();
+    let read = sys
+        .check_step("wf-outcome", 0, "charge")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.output, None);
+    assert_eq!(read.error.as_deref(), Some(r#"{"type":"ValueError"}"#));
+
+    // The default outcome is a void success, which is not the same as a failure.
+    sys.record_step(
+        "wf-outcome",
+        1,
+        "notify",
+        &Outcome::Output(None),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let read = sys
+        .check_step("wf-outcome", 1, "notify")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.output, None);
+    assert_eq!(read.error, None, "a void return is a success, not an error");
+}
+
+/// An executor that loses the checkpoint does not claim the workflow.
+///
+/// Winning the step is what proves an executor is advancing the workflow. Claiming regardless
+/// would leave the row attributed to a process that is not running it — which is what an
+/// unconditional re-stamp does, and why the claim follows the insert rather than preceding it.
+#[tokio::test]
+async fn losing_the_checkpoint_does_not_claim_the_workflow() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let winner = PostgresSystemDatabase::from_pool(pool.clone(), DEFAULT_SCHEMA)
+        .with_executor_id("executor-a");
+    let loser =
+        PostgresSystemDatabase::from_pool(pool, DEFAULT_SCHEMA).with_executor_id("executor-b");
+
+    winner
+        .init_workflow_status(InitWorkflowStatus::new(&workflow("wf-race-step")))
+        .await
+        .unwrap();
+
+    let winning = StepTiming {
+        started_at: Timestamp::from_epoch_ms(1_000),
+        completed_at: Timestamp::from_epoch_ms(2_000),
+    };
+    winner
+        .record_step(
+            "wf-race-step",
+            0,
+            "charge",
+            &Outcome::Output(Some("first".to_owned())),
+            None,
+            Some(winning),
+        )
+        .await
+        .unwrap();
+    let read = winner.get_workflow("wf-race-step").await.unwrap().unwrap();
+    assert_eq!(read.executor_id.as_deref(), Some("executor-a"));
+
+    // A second executor records the same position with its own completion time, and loses.
+    let losing = StepTiming {
+        started_at: Timestamp::from_epoch_ms(1_000),
+        completed_at: Timestamp::from_epoch_ms(3_000),
+    };
+    let result = loser
+        .record_step(
+            "wf-race-step",
+            0,
+            "charge",
+            &Outcome::Output(Some("second".to_owned())),
+            None,
+            Some(losing),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::StepAlreadyRecorded { .. })),
+        "expected the loser to be rejected, got {result:?}",
+    );
+
+    let read = winner.get_workflow("wf-race-step").await.unwrap().unwrap();
+    assert_eq!(
+        read.executor_id.as_deref(),
+        Some("executor-a"),
+        "the loser must not take ownership of a workflow it is not advancing",
+    );
 }
