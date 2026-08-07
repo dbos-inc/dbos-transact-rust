@@ -796,3 +796,31 @@ pub struct StepTiming {
     /// behaves the same way, guarding its comparison with `if (endTimeEpochMs != null)`.
     pub completed_at: Timestamp,
 }
+
+/// When a delayed workflow should become eligible to run.
+///
+/// A sum type because the two forms are alternatives, not options: Python takes
+/// `delay_seconds` and `delay_until_epoch_ms` as separate keyword arguments and raises when both
+/// are given, and Java models it as a sealed interface. Both resolve to the same column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowDelay {
+    /// Wait this long from now.
+    ///
+    /// Resolved against the database layer's clock, for the same reason
+    /// [`NewWorkflow::delay`] is: the caller's skew should not reach the row.
+    For(Duration),
+    /// Wait until this instant.
+    Until(Timestamp),
+}
+
+impl WorkflowDelay {
+    /// The instant this delay expires, resolved against `now` if it is relative.
+    pub(crate) fn resolve(self, now: Timestamp) -> Timestamp {
+        match self {
+            WorkflowDelay::For(d) => {
+                Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64)
+            }
+            WorkflowDelay::Until(t) => t,
+        }
+    }
+}

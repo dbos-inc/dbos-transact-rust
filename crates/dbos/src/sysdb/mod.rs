@@ -29,8 +29,8 @@ pub mod types;
 use async_trait::async_trait;
 
 use types::{
-    NewWorkflow, Outcome, StepRecord, StepTiming, Timestamp, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus,
+    NewWorkflow, Outcome, StepRecord, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus,
 };
 
 /// What went wrong talking to the system database.
@@ -325,7 +325,7 @@ pub trait SystemDatabase: Send + Sync {
     /// and this follows them.
     async fn cancel_workflows(
         &self,
-        workflow_ids: &[String],
+        workflow_ids: &[&str],
         cancel_children: bool,
     ) -> Result<Vec<String>, Error>;
 
@@ -342,7 +342,7 @@ pub trait SystemDatabase: Send + Sync {
     /// line, and for the same reason.
     async fn resume_workflows(
         &self,
-        workflow_ids: &[String],
+        workflow_ids: &[&str],
         queue_name: Option<&str>,
     ) -> Result<Vec<String>, Error>;
 
@@ -436,6 +436,68 @@ pub trait SystemDatabase: Send + Sync {
         step_name: &str,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error>;
+
+    /// Every workflow descended from this one, at any depth.
+    ///
+    /// Excludes the workflow itself. Walks level by level rather than recursing in SQL, which is
+    /// what all four implementations do.
+    async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error>;
+
+    /// Deletes workflows and everything hanging off them.
+    ///
+    /// Steps, notifications, events, and streams go with the row: the schema declares
+    /// `ON DELETE CASCADE` on every child table, so one `DELETE` is the whole operation.
+    ///
+    /// Unlike [`cancel_workflows`](Self::cancel_workflows), the descendants are collected first
+    /// and deleted in one statement rather than level by level. Cancelling interleaves so a
+    /// parent cannot spawn behind the walk; a deleted parent cannot spawn at all.
+    ///
+    /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
+    /// Go have it, and this follows them.
+    ///
+    /// Takes `&[&str]` rather than `&[String]`, as the other bulk methods do: a caller holding
+    /// owned ids converts by copying pointers, where the reverse would allocate.
+    async fn delete_workflows(
+        &self,
+        workflow_ids: &[&str],
+        delete_children: bool,
+    ) -> Result<u64, Error>;
+
+    /// Workflows this executor left `PENDING`, which recovery picks up.
+    ///
+    /// Scoped by application version as well as executor: a workflow started under different code
+    /// must not be resumed by an executor running this version, because its recorded steps may no
+    /// longer line up.
+    async fn get_pending_workflows(
+        &self,
+        executor_id: &str,
+        application_version: &str,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Moves a delayed workflow's release time.
+    ///
+    /// Only touches a `DELAYED` row. A workflow that has already been released is running or
+    /// queued, and pushing its delay out would not recall it.
+    async fn set_workflow_delay(
+        &self,
+        workflow_id: &str,
+        delay: WorkflowDelay,
+    ) -> Result<(), Error>;
+
+    /// Releases delayed workflows whose time has come, returning how many moved.
+    ///
+    /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
+    /// debounce key held only while the workflow is `DELAYED`; once released the workflow is
+    /// committed to running, and a later debounce with the same key must start a fresh workflow
+    /// rather than bounce this one. Python does this and explains it; **Java does not**, and its
+    /// version predates the column.
+    async fn transition_delayed_workflows(&self) -> Result<u64, Error>;
+
+    /// Puts a running workflow back on its queue, reporting whether it moved.
+    ///
+    /// For an executor that claimed a queued workflow and then could not run it. Only applies to
+    /// a `PENDING` row that has a queue to return to.
+    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error>;
 
     /// Replaces a workflow's attributes. `None` clears them.
     ///

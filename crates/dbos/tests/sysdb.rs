@@ -4,7 +4,9 @@ mod support;
 
 use dbos::sysdb::postgres::PostgresSystemDatabase;
 use dbos::sysdb::retry::RetryPolicy;
-use dbos::sysdb::types::{NewWorkflow, Outcome, StepTiming, Timestamp, WorkflowStatus};
+use dbos::sysdb::types::{
+    NewWorkflow, Outcome, StepTiming, Timestamp, WorkflowDelay, WorkflowStatus,
+};
 use dbos::sysdb::{
     BackendErrorKind, DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite, SystemDatabase,
 };
@@ -1088,7 +1090,7 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
         .unwrap();
 
     let cancelled = sys
-        .cancel_workflows(&["wf-cancel".to_owned()], false)
+        .cancel_workflows(&["wf-cancel"], false)
         .await
         .unwrap();
     assert_eq!(cancelled, ["wf-cancel"]);
@@ -1131,7 +1133,7 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
         .unwrap();
 
     let cancelled = sys
-        .cancel_workflows(&["wf-done".to_owned()], false)
+        .cancel_workflows(&["wf-done"], false)
         .await
         .unwrap();
     assert!(
@@ -1167,7 +1169,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     }
 
     let mut cancelled = sys
-        .cancel_workflows(&["wf-root".to_owned()], true)
+        .cancel_workflows(&["wf-root"], true)
         .await
         .unwrap();
     cancelled.sort();
@@ -1192,7 +1194,7 @@ async fn cancelling_children_descends_the_whole_tree() {
         .await
         .unwrap();
     let shallow = sys
-        .cancel_workflows(&["wf-root2".to_owned()], false)
+        .cancel_workflows(&["wf-root2"], false)
         .await
         .unwrap();
     assert_eq!(shallow, ["wf-root2"]);
@@ -1217,7 +1219,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     }
 
     let resumed = sys
-        .resume_workflows(&["wf-resume".to_owned()], None)
+        .resume_workflows(&["wf-resume"], None)
         .await
         .unwrap();
     assert_eq!(resumed, ["wf-resume"]);
@@ -1240,7 +1242,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-resume2")))
         .await
         .unwrap();
-    sys.resume_workflows(&["wf-resume2".to_owned()], Some("orders"))
+    sys.resume_workflows(&["wf-resume2"], Some("orders"))
         .await
         .unwrap();
     let read = sys.get_workflow("wf-resume2").await.unwrap().unwrap();
@@ -1259,7 +1261,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
         .unwrap();
 
     match sys
-        .resume_workflows(&["wf-real".to_owned(), "wf-ghost".to_owned()], None)
+        .resume_workflows(&["wf-real", "wf-ghost"], None)
         .await
     {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
@@ -1275,7 +1277,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     );
 
     let cancelled = sys
-        .cancel_workflows(&["wf-ghost".to_owned()], false)
+        .cancel_workflows(&["wf-ghost"], false)
         .await
         .expect("cancelling a missing workflow is a no-op, not an error");
     assert!(cancelled.is_empty());
@@ -1528,7 +1530,7 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
     sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-stopped")))
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-stopped".to_owned()], false)
+    sys.cancel_workflows(&["wf-stopped"], false)
         .await
         .unwrap();
 
@@ -1887,4 +1889,285 @@ async fn losing_the_checkpoint_does_not_claim_the_workflow() {
         Some("executor-a"),
         "the loser must not take ownership of a workflow it is not advancing",
     );
+}
+
+/// Descendants come back at every depth, and the root is not one of them.
+#[tokio::test]
+async fn workflow_children_reach_the_whole_tree() {
+    let (sys, _db) = sysdb().await;
+    for (id, parent) in [
+        ("wf-root", None),
+        ("wf-child", Some("wf-root")),
+        ("wf-grandchild", Some("wf-child")),
+        ("wf-stranger", None),
+    ] {
+        let wf = NewWorkflow {
+            parent_workflow_id: parent.map(str::to_owned),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+    }
+
+    let mut children = sys.get_workflow_children("wf-root").await.unwrap();
+    children.sort();
+    assert_eq!(children, ["wf-child", "wf-grandchild"]);
+    assert!(
+        sys.get_workflow_children("wf-stranger")
+            .await
+            .unwrap()
+            .is_empty(),
+    );
+}
+
+/// Deleting a workflow takes its steps with it, and optionally its descendants.
+#[tokio::test]
+async fn deleting_a_workflow_cascades_to_its_rows() {
+    let (sys, _db) = sysdb().await;
+    for (id, parent) in [("wf-gone", None), ("wf-gone-kid", Some("wf-gone"))] {
+        let wf = NewWorkflow {
+            parent_workflow_id: parent.map(str::to_owned),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+    }
+    sys.record_step("wf-gone", 0, "charge", &Outcome::Output(None), None, None)
+        .await
+        .unwrap();
+
+    // Without the flag the child survives, so the cascade is opt-in rather than implied.
+    let deleted = sys
+        .delete_workflows(&["wf-gone"], false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(sys.get_workflow("wf-gone").await.unwrap().is_none());
+    assert!(sys.get_workflow("wf-gone-kid").await.unwrap().is_some());
+
+    // The step went with the row: the foreign key cascades, so no second delete is needed.
+    let steps = sys
+        .list_workflow_steps("wf-gone", true, None, None)
+        .await
+        .unwrap();
+    assert!(steps.is_empty(), "operation_outputs should cascade");
+
+    // With the flag, descendants go too.
+    for (id, parent) in [
+        ("wf-p", None),
+        ("wf-c", Some("wf-p")),
+        ("wf-g", Some("wf-c")),
+    ] {
+        let wf = NewWorkflow {
+            parent_workflow_id: parent.map(str::to_owned),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+    }
+    let deleted = sys
+        .delete_workflows(&["wf-p"], true)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 3, "the whole tree, at every depth");
+}
+
+/// Recovery finds this executor's abandoned work, scoped by application version.
+#[tokio::test]
+async fn pending_workflows_are_scoped_by_executor_and_version() {
+    let (sys, _db) = sysdb().await;
+    for (id, executor, version) in [
+        ("wf-mine", "alpha", "v1"),
+        ("wf-theirs", "beta", "v1"),
+        ("wf-old-code", "alpha", "v0"),
+    ] {
+        let wf = NewWorkflow {
+            executor_id: Some(executor.to_owned()),
+            application_version: Some(version.to_owned()),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+    }
+    // A finished workflow is not pending, whoever ran it.
+    let done = NewWorkflow {
+        executor_id: Some("alpha".to_owned()),
+        application_version: Some("v1".to_owned()),
+        ..NewWorkflow::new("wf-finished")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&done))
+        .await
+        .unwrap();
+    sys.record_workflow_outcome("wf-finished", &Outcome::Output(None))
+        .await
+        .unwrap();
+
+    let pending = sys.get_pending_workflows("alpha", "v1").await.unwrap();
+    assert_eq!(
+        pending,
+        ["wf-mine"],
+        "another executor's work, another version's work, and finished work are all excluded",
+    );
+}
+
+/// A delay can be moved while the workflow is held, and not after it is released.
+#[tokio::test]
+async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        queue_name: Some("orders".to_owned()),
+        delay: Some(std::time::Duration::from_secs(3600)),
+        ..NewWorkflow::new("wf-delayed")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_workflow("wf-delayed")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Delayed,
+    );
+
+    sys.set_workflow_delay(
+        "wf-delayed",
+        WorkflowDelay::Until(Timestamp::from_epoch_ms(9_000_000)),
+    )
+    .await
+    .unwrap();
+    let read = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
+    assert_eq!(read.delay_until, Some(Timestamp::from_epoch_ms(9_000_000)));
+
+    // A relative delay resolves against the database layer's clock.
+    let before = Timestamp::now();
+    sys.set_workflow_delay(
+        "wf-delayed",
+        WorkflowDelay::For(std::time::Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
+    let read = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
+    let offset = read.delay_until.unwrap().as_epoch_ms() - before.as_epoch_ms();
+    assert!(
+        (60_000..70_000).contains(&offset),
+        "expected ~60s from now, got {offset}ms",
+    );
+
+    // A workflow that is not DELAYED is left alone: pushing its delay out cannot recall it.
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-running")))
+        .await
+        .unwrap();
+    sys.set_workflow_delay(
+        "wf-running",
+        WorkflowDelay::Until(Timestamp::from_epoch_ms(9_000_000)),
+    )
+    .await
+    .unwrap();
+    let read = sys.get_workflow("wf-running").await.unwrap().unwrap();
+    assert_eq!(read.delay_until, None, "a PENDING workflow is untouched");
+    assert_eq!(read.status, WorkflowStatus::Pending);
+}
+
+/// Releasing a delayed workflow clears its debounce key, and only its debounce key.
+///
+/// The key is held only while the workflow is DELAYED. Once released the workflow is committed
+/// to running, so a later debounce with the same key must start a fresh workflow rather than
+/// bounce this one. Python does this in the same statement and explains it; Java does not.
+#[tokio::test]
+async fn releasing_a_delayed_workflow_clears_only_the_debounce_key() {
+    let (sys, db) = sysdb().await;
+    for (id, debounced) in [("wf-debounced", true), ("wf-plain-dedup", false)] {
+        let wf = NewWorkflow {
+            queue_name: Some("orders".to_owned()),
+            delay: Some(std::time::Duration::from_secs(3600)),
+            deduplication_id: Some(format!("key-{id}")),
+            is_debounced: debounced,
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+    }
+    // A workflow whose delay has not expired must not move.
+    let held = NewWorkflow {
+        queue_name: Some("orders".to_owned()),
+        delay: Some(std::time::Duration::from_secs(3600)),
+        ..NewWorkflow::new("wf-still-held")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&held))
+        .await
+        .unwrap();
+
+    // Bring the first two due without waiting an hour.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_status SET delay_until_epoch_ms = 1 \
+         WHERE workflow_uuid IN ('wf-debounced', 'wf-plain-dedup')",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let moved = sys.transition_delayed_workflows().await.unwrap();
+    assert_eq!(moved, 2, "only the two whose delay expired");
+
+    let debounced = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    assert_eq!(debounced.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        debounced.deduplication_id, None,
+        "a debounce key is released with the workflow",
+    );
+
+    let plain = sys.get_workflow("wf-plain-dedup").await.unwrap().unwrap();
+    assert_eq!(plain.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        plain.deduplication_id.as_deref(),
+        Some("key-wf-plain-dedup"),
+        "an ordinary deduplication id is not a debounce key and must survive",
+    );
+
+    let held = sys.get_workflow("wf-still-held").await.unwrap().unwrap();
+    assert_eq!(held.status, WorkflowStatus::Delayed);
+}
+
+/// A claimed workflow can be handed back to its queue, but only if it came from one.
+#[tokio::test]
+async fn a_queued_workflow_can_be_returned_to_its_queue() {
+    let (sys, db) = sysdb().await;
+    let queued = NewWorkflow {
+        queue_name: Some("orders".to_owned()),
+        ..NewWorkflow::new("wf-claimed")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&queued))
+        .await
+        .unwrap();
+
+    // Claim it as a dequeue would. Done in SQL because the ENQUEUED -> PENDING transition
+    // belongs to `start_queued_workflows`, which is task 3.6 and does not exist yet —
+    // `init_workflow_status` derives the status from the queue and so leaves it ENQUEUED.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_status SET status = 'PENDING', started_at_epoch_ms = 1000 \
+         WHERE workflow_uuid = 'wf-claimed'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    assert!(sys.clear_queue_assignment("wf-claimed").await.unwrap());
+    let read = sys.get_workflow("wf-claimed").await.unwrap().unwrap();
+    assert_eq!(read.status, WorkflowStatus::Enqueued);
+    assert_eq!(read.started_at, None, "the claim's start time is cleared");
+
+    // A workflow that never came from a queue has none to go back to.
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-direct")))
+        .await
+        .unwrap();
+    assert!(!sys.clear_queue_assignment("wf-direct").await.unwrap());
 }
