@@ -1089,10 +1089,7 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
         .await
         .unwrap();
 
-    let cancelled = sys
-        .cancel_workflows(&["wf-cancel"], false)
-        .await
-        .unwrap();
+    let cancelled = sys.cancel_workflows(&["wf-cancel"], false).await.unwrap();
     assert_eq!(cancelled, ["wf-cancel"]);
 
     let read = sys.get_workflow("wf-cancel").await.unwrap().unwrap();
@@ -1132,10 +1129,7 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
         .await
         .unwrap();
 
-    let cancelled = sys
-        .cancel_workflows(&["wf-done"], false)
-        .await
-        .unwrap();
+    let cancelled = sys.cancel_workflows(&["wf-done"], false).await.unwrap();
     assert!(
         cancelled.is_empty(),
         "nothing moved, and the caller is told so",
@@ -1168,10 +1162,7 @@ async fn cancelling_children_descends_the_whole_tree() {
             .unwrap();
     }
 
-    let mut cancelled = sys
-        .cancel_workflows(&["wf-root"], true)
-        .await
-        .unwrap();
+    let mut cancelled = sys.cancel_workflows(&["wf-root"], true).await.unwrap();
     cancelled.sort();
     assert_eq!(cancelled, ["wf-child", "wf-grandchild", "wf-root"]);
 
@@ -1193,10 +1184,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     sys.init_workflow_status(InitWorkflowStatus::new(&child))
         .await
         .unwrap();
-    let shallow = sys
-        .cancel_workflows(&["wf-root2"], false)
-        .await
-        .unwrap();
+    let shallow = sys.cancel_workflows(&["wf-root2"], false).await.unwrap();
     assert_eq!(shallow, ["wf-root2"]);
 }
 
@@ -1218,10 +1206,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
         .unwrap();
     }
 
-    let resumed = sys
-        .resume_workflows(&["wf-resume"], None)
-        .await
-        .unwrap();
+    let resumed = sys.resume_workflows(&["wf-resume"], None).await.unwrap();
     assert_eq!(resumed, ["wf-resume"]);
 
     let read = sys.get_workflow("wf-resume").await.unwrap().unwrap();
@@ -1260,10 +1245,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
         .await
         .unwrap();
 
-    match sys
-        .resume_workflows(&["wf-real", "wf-ghost"], None)
-        .await
-    {
+    match sys.resume_workflows(&["wf-real", "wf-ghost"], None).await {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
             assert_eq!(workflow_ids, ["wf-ghost"], "only the missing id is named");
         }
@@ -1530,9 +1512,7 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
     sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-stopped")))
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-stopped"], false)
-        .await
-        .unwrap();
+    sys.cancel_workflows(&["wf-stopped"], false).await.unwrap();
 
     match sys.check_step("wf-stopped", 0, "charge").await {
         Err(Error::WorkflowCancelled { workflow_id }) => assert_eq!(workflow_id, "wf-stopped"),
@@ -1939,10 +1919,7 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
         .unwrap();
 
     // Without the flag the child survives, so the cascade is opt-in rather than implied.
-    let deleted = sys
-        .delete_workflows(&["wf-gone"], false)
-        .await
-        .unwrap();
+    let deleted = sys.delete_workflows(&["wf-gone"], false).await.unwrap();
     assert_eq!(deleted, 1);
     assert!(sys.get_workflow("wf-gone").await.unwrap().is_none());
     assert!(sys.get_workflow("wf-gone-kid").await.unwrap().is_some());
@@ -1968,10 +1945,7 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
             .await
             .unwrap();
     }
-    let deleted = sys
-        .delete_workflows(&["wf-p"], true)
-        .await
-        .unwrap();
+    let deleted = sys.delete_workflows(&["wf-p"], true).await.unwrap();
     assert_eq!(deleted, 3, "the whole tree, at every depth");
 }
 
