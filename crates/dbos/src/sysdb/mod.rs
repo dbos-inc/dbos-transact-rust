@@ -24,7 +24,6 @@ pub mod error;
 pub mod migrations;
 pub mod postgres;
 pub mod retry;
-pub mod runner;
 pub mod types;
 
 use async_trait::async_trait;
@@ -34,74 +33,9 @@ use async_trait::async_trait;
 pub use error::{BackendError, BackendErrorKind, Error};
 
 use types::{
-    NewWorkflow, Outcome, StepRecord, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus,
+    NewWorkflow, Outcome, OutcomeWrite, StepRecord, StepTiming, Submission, Timestamp,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
 };
-
-/// The result of trying to record a workflow's final outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutcomeWrite {
-    /// This process recorded the outcome.
-    Recorded,
-    /// Another process got there first, and the row is already terminal.
-    ///
-    /// Not an error: the caller has lost a race it was allowed to lose, and should adopt the
-    /// recorded outcome rather than overwrite it.
-    AlreadyFinished,
-}
-
-/// What the caller is doing, which decides how an existing row is treated.
-#[derive(Debug, Clone, Copy)]
-pub struct InitWorkflowStatus<'a> {
-    /// The workflow to record.
-    pub workflow: &'a NewWorkflow,
-    /// Dead-letter threshold. `None` disables parking entirely.
-    pub max_recovery_attempts: Option<i64>,
-    /// This attempt is recovering a workflow a dead executor left behind.
-    pub is_recovery: bool,
-    /// This attempt is dequeuing, which tells the caller it owns a workflow that was enqueued.
-    ///
-    /// Kept apart from `is_recovery` because the references do, even though the two currently
-    /// have the same effect here: both count against the recovery budget and both may claim a
-    /// row another owner holds, which would be theft from a fresh start.
-    pub is_dequeue: bool,
-}
-
-impl<'a> InitWorkflowStatus<'a> {
-    /// A first attempt at a workflow, with no dead-letter limit.
-    pub fn new(workflow: &'a NewWorkflow) -> Self {
-        Self {
-            workflow,
-            max_recovery_attempts: None,
-            is_recovery: false,
-            is_dequeue: false,
-        }
-    }
-}
-
-/// What the database said about a workflow after initialising it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowInitResult {
-    /// The stored status, which is the existing one when the row was already there.
-    pub status: WorkflowStatus,
-    /// Recovery attempts recorded against the workflow, after this one.
-    pub recovery_attempts: i64,
-    /// The workflow's absolute expiry, as the database now holds it.
-    ///
-    /// Reported back because it may not be the one offered: a timeout is turned into a deadline
-    /// against the database layer's clock, and an existing row keeps the deadline it already had.
-    pub deadline: Option<Timestamp>,
-    /// The serialization format actually stored.
-    ///
-    /// May differ from what the caller offered: the first writer decides the format, and every
-    /// later attempt has to read the payloads that are actually there.
-    pub serialization: Option<String>,
-    /// Whether this caller should go on to run the workflow.
-    ///
-    /// `false` means another owner holds it and this attempt is not a recovery — so the row is
-    /// recorded, but running it would be a second execution.
-    pub should_execute: bool,
-}
 
 /// Everything the engine needs from the system database.
 ///
@@ -120,11 +54,14 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// - **Recovery attempts are counted**, but only when the existing row is not merely queued
     ///   and only when the caller is recovering or dequeuing. Passing the limit parks the
-    ///   workflow as [`WorkflowStatus::MaxRecoveryAttemptsExceeded`] and errors.
+    ///   workflow as [`types::WorkflowStatus::MaxRecoveryAttemptsExceeded`] and errors.
     /// - **The executor is re-stamped**, unless this is an enqueue — a queued workflow has no
     ///   executor yet, and claiming one would be wrong.
     /// - **A different function under the same id is an error.** Name, class, and config must
     ///   match; a differing queue is only a warning, since requeueing elsewhere is legitimate.
+    ///
+    /// `max_recovery_attempts` of `None` disables parking entirely. [`Submission`] says why the
+    /// workflow is being submitted, and so whether it may claim a row another owner holds.
     ///
     /// The owner identity behind the single-execution guard is generated in here rather than
     /// passed in, and generated once per call — before any retry the implementation makes. A
@@ -132,7 +69,9 @@ pub trait SystemDatabase: Send + Sync {
     /// recognise its own write and conclude another executor owned the row.
     async fn init_workflow_status(
         &self,
-        input: InitWorkflowStatus<'_>,
+        workflow: &NewWorkflow,
+        max_recovery_attempts: Option<i64>,
+        submission: Submission,
     ) -> Result<WorkflowInitResult, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.
@@ -144,6 +83,79 @@ pub trait SystemDatabase: Send + Sync {
     /// narrows. `WorkflowFilter::default()` therefore returns the whole table, and callers that
     /// mean to page should say so with [`WorkflowFilter::limit`].
     async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error>;
+
+    /// Every workflow descended from this one, at any depth.
+    ///
+    /// Excludes the workflow itself. Walks level by level rather than recursing in SQL, which is
+    /// what all four implementations do.
+    async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error>;
+
+    /// Records a terminal outcome, but only while the workflow is still running.
+    ///
+    /// The status gate is the point. Two executors can believe they own the same workflow — one
+    /// recovering after the other was presumed dead — and whichever finishes second must not
+    /// overwrite the first's result. Returning which happened lets the loser adopt the recorded
+    /// outcome instead of reporting its own.
+    ///
+    /// The terminal status comes from the [`Outcome`] rather than being passed separately, so a
+    /// success carrying an error is unrepresentable. No implementation treats the two as
+    /// independent — see [`Outcome`].
+    ///
+    /// **Losing here is a value; losing in [`record_step`](Self::record_step) is an error.** The two look parallel and deliberately are not. A workflow whose outcome was
+    /// recorded by someone else has simply been superseded, and the right move is to adopt what
+    /// is stored — routine enough to be a return value. A step recorded by someone else means
+    /// two executions of one workflow are live at the same moment, which every implementation
+    /// raises on.
+    async fn record_workflow_outcome(
+        &self,
+        workflow_id: &str,
+        outcome: Outcome<'_>,
+    ) -> Result<OutcomeWrite, Error>;
+
+    /// Moves a delayed workflow's release time.
+    ///
+    /// Only touches a `DELAYED` row. A workflow that has already been released is running or
+    /// queued, and pushing its delay out would not recall it.
+    async fn set_workflow_delay(
+        &self,
+        workflow_id: &str,
+        delay: WorkflowDelay,
+    ) -> Result<(), Error>;
+
+    /// Puts a running workflow back on its queue, reporting whether it moved.
+    ///
+    /// For an executor that claimed a queued workflow and then could not run it. Only applies to
+    /// a `PENDING` row that has a queue to return to.
+    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error>;
+
+    /// Replaces a workflow's attributes. `None` clears them.
+    ///
+    /// A replacement rather than a merge, matching every implementation.
+    async fn update_workflow_attributes(
+        &self,
+        workflow_id: &str,
+        attributes: Option<&str>,
+    ) -> Result<(), Error>;
+
+    /// Workflows this executor left `PENDING`, which recovery picks up.
+    ///
+    /// Scoped by application version as well as executor: a workflow started under different code
+    /// must not be resumed by an executor running this version, because its recorded steps may no
+    /// longer line up.
+    async fn get_pending_workflows(
+        &self,
+        executor_id: &str,
+        application_version: &str,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Releases delayed workflows whose time has come, returning how many moved.
+    ///
+    /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
+    /// debounce key held only while the workflow is `DELAYED`; once released the workflow is
+    /// committed to running, and a later debounce with the same key must start a fresh workflow
+    /// rather than bounce this one. Python does this and explains it; **Java does not**, and its
+    /// version predates the column.
+    async fn transition_delayed_workflows(&self) -> Result<u64, Error>;
 
     /// Cancels workflows, returning the ids that actually moved.
     ///
@@ -186,6 +198,26 @@ pub trait SystemDatabase: Send + Sync {
         workflow_ids: &[&str],
         queue_name: Option<&str>,
     ) -> Result<Vec<String>, Error>;
+
+    /// Deletes workflows and everything hanging off them.
+    ///
+    /// Steps, notifications, events, and streams go with the row: the schema declares
+    /// `ON DELETE CASCADE` on every child table, so one `DELETE` is the whole operation.
+    ///
+    /// Unlike [`cancel_workflows`](Self::cancel_workflows), the descendants are collected first
+    /// and deleted in one statement rather than level by level. Cancelling interleaves so a
+    /// parent cannot spawn behind the walk; a deleted parent cannot spawn at all.
+    ///
+    /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
+    /// Go have it, and this follows them.
+    ///
+    /// Takes `&[&str]` rather than `&[String]`, as the other bulk methods do: a caller holding
+    /// owned ids converts by copying pointers, where the reverse would allocate.
+    async fn delete_workflows(
+        &self,
+        workflow_ids: &[&str],
+        delete_children: bool,
+    ) -> Result<u64, Error>;
 
     /// Reads a recorded step, or `None` if it has not run.
     ///
@@ -239,7 +271,7 @@ pub trait SystemDatabase: Send + Sync {
         workflow_id: &str,
         step_id: i32,
         step_name: &str,
-        outcome: &Outcome,
+        outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
     ) -> Result<(), Error>;
@@ -277,97 +309,4 @@ pub trait SystemDatabase: Send + Sync {
         step_name: &str,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error>;
-
-    /// Every workflow descended from this one, at any depth.
-    ///
-    /// Excludes the workflow itself. Walks level by level rather than recursing in SQL, which is
-    /// what all four implementations do.
-    async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error>;
-
-    /// Deletes workflows and everything hanging off them.
-    ///
-    /// Steps, notifications, events, and streams go with the row: the schema declares
-    /// `ON DELETE CASCADE` on every child table, so one `DELETE` is the whole operation.
-    ///
-    /// Unlike [`cancel_workflows`](Self::cancel_workflows), the descendants are collected first
-    /// and deleted in one statement rather than level by level. Cancelling interleaves so a
-    /// parent cannot spawn behind the walk; a deleted parent cannot spawn at all.
-    ///
-    /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
-    /// Go have it, and this follows them.
-    ///
-    /// Takes `&[&str]` rather than `&[String]`, as the other bulk methods do: a caller holding
-    /// owned ids converts by copying pointers, where the reverse would allocate.
-    async fn delete_workflows(
-        &self,
-        workflow_ids: &[&str],
-        delete_children: bool,
-    ) -> Result<u64, Error>;
-
-    /// Workflows this executor left `PENDING`, which recovery picks up.
-    ///
-    /// Scoped by application version as well as executor: a workflow started under different code
-    /// must not be resumed by an executor running this version, because its recorded steps may no
-    /// longer line up.
-    async fn get_pending_workflows(
-        &self,
-        executor_id: &str,
-        application_version: &str,
-    ) -> Result<Vec<String>, Error>;
-
-    /// Moves a delayed workflow's release time.
-    ///
-    /// Only touches a `DELAYED` row. A workflow that has already been released is running or
-    /// queued, and pushing its delay out would not recall it.
-    async fn set_workflow_delay(
-        &self,
-        workflow_id: &str,
-        delay: WorkflowDelay,
-    ) -> Result<(), Error>;
-
-    /// Releases delayed workflows whose time has come, returning how many moved.
-    ///
-    /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
-    /// debounce key held only while the workflow is `DELAYED`; once released the workflow is
-    /// committed to running, and a later debounce with the same key must start a fresh workflow
-    /// rather than bounce this one. Python does this and explains it; **Java does not**, and its
-    /// version predates the column.
-    async fn transition_delayed_workflows(&self) -> Result<u64, Error>;
-
-    /// Puts a running workflow back on its queue, reporting whether it moved.
-    ///
-    /// For an executor that claimed a queued workflow and then could not run it. Only applies to
-    /// a `PENDING` row that has a queue to return to.
-    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error>;
-
-    /// Replaces a workflow's attributes. `None` clears them.
-    ///
-    /// A replacement rather than a merge, matching every implementation.
-    async fn update_workflow_attributes(
-        &self,
-        workflow_id: &str,
-        attributes: Option<&str>,
-    ) -> Result<(), Error>;
-
-    /// Records a terminal outcome, but only while the workflow is still running.
-    ///
-    /// The status gate is the point. Two executors can believe they own the same workflow — one
-    /// recovering after the other was presumed dead — and whichever finishes second must not
-    /// overwrite the first's result. Returning which happened lets the loser adopt the recorded
-    /// outcome instead of reporting its own.
-    ///
-    /// The terminal status comes from the [`Outcome`] rather than being passed separately, so a
-    /// success carrying an error is unrepresentable. No implementation treats the two as
-    /// independent — see [`Outcome`].
-    ///
-    /// **Losing here is a value; losing in [`record_step`](Self::record_step) is an error.** The two look parallel and deliberately are not. A workflow whose outcome was
-    /// recorded by someone else has simply been superseded, and the right move is to adopt what
-    /// is stored — routine enough to be a return value. A step recorded by someone else means
-    /// two executions of one workflow are live at the same moment, which every implementation
-    /// raises on.
-    async fn record_workflow_outcome(
-        &self,
-        workflow_id: &str,
-        outcome: &Outcome,
-    ) -> Result<OutcomeWrite, Error>;
 }

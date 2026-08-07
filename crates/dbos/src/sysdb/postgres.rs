@@ -7,15 +7,15 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-use super::migrations::quote_identifier;
+use super::migrations::{self, quote_identifier};
 use super::retry::{RetryPolicy, with_retry};
 use super::types::{
-    Outcome, StepRecord, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, duration_from_ms,
+    NewWorkflow, Outcome, StepRecord, StepTiming, Submission, Timestamp, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms,
 };
 use super::{
-    BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, InitWorkflowStatus,
-    OutcomeWrite, SystemDatabase, WorkflowInitResult, runner,
+    BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, OutcomeWrite,
+    SystemDatabase, WorkflowInitResult,
 };
 
 impl From<sqlx::Error> for Error {
@@ -36,8 +36,8 @@ impl From<sqlx::Error> for Error {
 ///
 /// Only for the fields where another SDK legitimately writes `""`; everywhere else an empty
 /// string is a caller error and [`NewWorkflow::validate`] rejects it.
-fn empty_to_none(value: &Option<String>) -> Option<&str> {
-    value.as_deref().filter(|v| !v.is_empty())
+fn empty_to_none(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.is_empty())
 }
 
 /// Whether a driver failure is worth asking again about.
@@ -81,11 +81,11 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
 
 /// How to reach and set up the system database.
 #[derive(Debug, Clone)]
-pub struct Config {
+pub struct Config<'a> {
     /// Connection URL for the system database.
-    pub url: String,
+    pub url: &'a str,
     /// Schema holding the DBOS tables. Defaults to [`DEFAULT_SCHEMA`].
-    pub schema: String,
+    pub schema: &'a str,
     /// Maximum pooled connections.
     pub max_connections: u32,
     /// Whether the schema uses LISTEN/NOTIFY triggers.
@@ -99,15 +99,15 @@ pub struct Config {
     ///
     /// `None` leaves the executor column alone entirely, which is Python's behaviour when it has
     /// no id to stamp.
-    pub executor_id: Option<String>,
+    pub executor_id: Option<&'a str>,
 }
 
-impl Config {
+impl<'a> Config<'a> {
     /// A configuration with the defaults every implementation shares.
-    pub fn new(url: impl Into<String>) -> Self {
+    pub fn new(url: &'a str) -> Self {
         Self {
-            url: url.into(),
-            schema: DEFAULT_SCHEMA.to_owned(),
+            url,
+            schema: DEFAULT_SCHEMA,
             max_connections: 10,
             use_listen_notify: true,
             retry: RetryPolicy::default(),
@@ -119,7 +119,11 @@ impl Config {
 /// A system database backed by PostgreSQL or CockroachDB.
 pub struct PostgresSystemDatabase {
     pool: PgPool,
-    schema: String,
+    /// Schema-qualified, quoted table names, built once.
+    ///
+    /// The schema is fixed at construction, so rendering these per query would allocate three
+    /// strings on every database operation to produce a value that never changes.
+    tables: Tables,
     retry: RetryPolicy,
     executor_id: Option<String>,
 }
@@ -130,15 +134,15 @@ impl PostgresSystemDatabase {
     /// Creating the database is part of connecting rather than part of migrating: you cannot
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
-    pub async fn connect(config: &Config) -> Result<Self, Error> {
-        ensure_database_exists(&config.url).await?;
+    pub async fn connect(config: &Config<'_>) -> Result<Self, Error> {
+        ensure_database_exists(config.url).await?;
 
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
-            .connect(&config.url)
+            .connect(config.url)
             .await?;
 
-        runner::run(&pool, &config.schema, config.use_listen_notify)
+        migrations::runner::run(&pool, config.schema, config.use_listen_notify)
             .await
             // The runner has already retried what it could; whatever reaches here is settled.
             .map_err(|e| {
@@ -151,9 +155,10 @@ impl PostgresSystemDatabase {
 
         Ok(Self {
             pool,
-            schema: config.schema.clone(),
+            tables: Tables::new(config.schema),
             retry: config.retry,
-            executor_id: config.executor_id.clone(),
+            // Copied out: the handle outlives the borrowed configuration.
+            executor_id: config.executor_id.map(str::to_owned),
         })
     }
 
@@ -164,20 +169,23 @@ impl PostgresSystemDatabase {
     pub fn from_pool(pool: PgPool, schema: impl Into<String>) -> Self {
         Self {
             pool,
-            schema: schema.into(),
+            tables: Tables::new(&schema.into()),
             retry: RetryPolicy::default(),
             executor_id: None,
         }
     }
 
     /// Names this process, so recording a step claims the workflow for it.
-    pub fn with_executor_id(mut self, executor_id: impl Into<String>) -> Self {
+    ///
+    /// Bare noun rather than `with_executor_id`: in Rust `with_` marks a constructor —
+    /// `Vec::with_capacity`, `HashMap::with_hasher` — not a setter on an existing value.
+    pub fn executor_id(mut self, executor_id: impl Into<String>) -> Self {
         self.executor_id = Some(executor_id.into());
         self
     }
 
     /// Replaces the retry policy, which otherwise comes from the configuration.
-    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+    pub fn retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
     }
@@ -186,13 +194,24 @@ impl PostgresSystemDatabase {
     pub async fn close(&self) {
         self.pool.close().await;
     }
+}
 
-    fn table(&self, name: &str) -> String {
-        format!(
-            "{}.{}",
-            quote_identifier(&self.schema),
-            quote_identifier(name)
-        )
+/// The tables this backend addresses, quoted and schema-qualified.
+///
+/// One field per table rather than a map: every lookup is a literal in this file, so a missing
+/// table should be a compile error rather than a runtime `None`.
+struct Tables {
+    workflow_status: String,
+    operation_outputs: String,
+}
+
+impl Tables {
+    fn new(schema: &str) -> Self {
+        let schema = quote_identifier(schema);
+        Self {
+            workflow_status: format!("{schema}.{}", quote_identifier("workflow_status")),
+            operation_outputs: format!("{schema}.{}", quote_identifier("operation_outputs")),
+        }
     }
 }
 
@@ -359,7 +378,7 @@ impl PostgresSystemDatabase {
     where
         S: AsRef<str> + Sync,
     {
-        let table = self.table("workflow_status");
+        let table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {table} SET status = 'CANCELLED', queue_name = NULL, \
@@ -384,7 +403,7 @@ impl PostgresSystemDatabase {
     where
         S: AsRef<str> + Sync,
     {
-        let table = self.table("workflow_status");
+        let table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
         let children: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT workflow_uuid FROM {table} WHERE parent_workflow_id = ANY($1)"
@@ -438,11 +457,13 @@ fn step_from_row(row: &sqlx::postgres::PgRow, workflow_id: &str) -> Result<StepR
 impl SystemDatabase for PostgresSystemDatabase {
     async fn init_workflow_status(
         &self,
-        input: InitWorkflowStatus<'_>,
+        workflow: &NewWorkflow,
+        max_recovery_attempts: Option<i64>,
+        submission: Submission,
     ) -> Result<WorkflowInitResult, Error> {
-        let wf = input.workflow;
+        let wf = workflow;
         wf.validate()?;
-        let table = self.table("workflow_status");
+        let table = &self.tables.workflow_status;
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
         let initial_status = wf.initial_status();
         // Queued workflows are not running, so neither the attempt counter nor the executor
@@ -453,7 +474,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         );
         let initial_attempts = i64::from(!queued);
         // A recovery or a dequeue is being told it owns this workflow; a fresh start is not.
-        let claiming = input.is_recovery || input.is_dequeue;
+        let claiming = submission.claims_ownership();
         let increment = i64::from(claiming && !queued);
         // Everything below is generated **outside** the retry, and that is the whole reason the
         // retry is a wrapper rather than a loop around the statement.
@@ -508,36 +529,36 @@ impl SystemDatabase for PostgresSystemDatabase {
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
                  workflow_deadline_epoch_ms, owner_xid, serialization"
             )))
-            .bind(&wf.workflow_id)
+            .bind(wf.workflow_id)
             .bind(initial_status.as_str())
-            .bind(&wf.input)
-            .bind(&wf.name)
-            .bind(&wf.class_name)
-            .bind(&wf.config_name)
-            .bind(&wf.queue_name)
-            .bind(&wf.deduplication_id)
+            .bind(wf.input)
+            .bind(wf.name)
+            .bind(wf.class_name)
+            .bind(wf.config_name)
+            .bind(wf.queue_name)
+            .bind(wf.deduplication_id)
             .bind(wf.priority)
-            .bind(&wf.queue_partition_key)
+            .bind(wf.queue_partition_key)
             .bind(delay_until.map(Timestamp::as_epoch_ms))
             // TypeScript and Go send `""` rather than null when there is no auth context, and
             // Java normalises it on the way in for that reason. Storing both spellings would
             // make an `authenticated_user IS NULL` filter miss rows another SDK wrote.
-            .bind(empty_to_none(&wf.authenticated_user))
-            .bind(empty_to_none(&wf.assumed_role))
-            .bind(&wf.authenticated_roles)
-            .bind(&wf.executor_id)
-            .bind(&wf.application_version)
-            .bind(&wf.application_id)
+            .bind(empty_to_none(wf.authenticated_user))
+            .bind(empty_to_none(wf.assumed_role))
+            .bind(wf.authenticated_roles)
+            .bind(wf.executor_id)
+            .bind(wf.application_version)
+            .bind(wf.application_id)
             .bind(now.as_epoch_ms())
             .bind(now.as_epoch_ms())
             .bind(initial_attempts)
             .bind(wf.timeout.map(|d| d.as_millis() as i64))
             .bind(wf.deadline.map(Timestamp::as_epoch_ms))
-            .bind(&wf.parent_workflow_id)
+            .bind(wf.parent_workflow_id)
             .bind(owner_xid)
-            .bind(&wf.serialization)
-            .bind(&wf.attributes)
-            .bind(&wf.schedule_name)
+            .bind(wf.serialization)
+            .bind(wf.attributes)
+            .bind(wf.schedule_name)
             .bind(wf.debounce_deadline.map(Timestamp::as_epoch_ms))
             .bind(wf.is_debounced)
             .bind(increment)
@@ -566,7 +587,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             ] {
                 if stored.as_deref() != offered.as_deref() {
                     return Err(Error::ConflictingWorkflow {
-                        workflow_id: wf.workflow_id.clone(),
+                        workflow_id: wf.workflow_id.to_owned(),
                         detail: format!(
                             "existing {field} is {stored:?}, but {offered:?} was provided"
                         ),
@@ -576,7 +597,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // A differing queue is only a warning: requeueing the same workflow elsewhere is
             // legitimate, and the stored queue wins.
             let stored_queue: Option<String> = row.try_get("queue_name")?;
-            if stored_queue.as_deref() != wf.queue_name.as_deref() {
+            if stored_queue.as_deref() != wf.queue_name {
                 tracing::warn!(
                     workflow_id = %wf.workflow_id,
                     stored = ?stored_queue,
@@ -588,7 +609,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Parked once it has been recovered more often than allowed — but only if some *other*
             // attempt is responsible, so a caller retrying its own attempt is not punished for it.
             let owner_differs = stored_owner.as_deref() != Some(owner_xid);
-            if let Some(limit) = input.max_recovery_attempts
+            if let Some(limit) = max_recovery_attempts
                 && !status.is_terminal()
                 && recovery_attempts > limit + 1
                 && owner_differs
@@ -598,13 +619,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                      started_at_epoch_ms = NULL, queue_name = NULL \
                      WHERE workflow_uuid = $1 AND status = 'PENDING'"
                 )))
-                .bind(&wf.workflow_id)
+                .bind(wf.workflow_id)
                 .bind(WorkflowStatus::MaxRecoveryAttemptsExceeded.as_str())
                 .execute(pool)
                 .await?;
 
                 return Err(Error::MaxRecoveryAttemptsExceeded {
-                    workflow_id: wf.workflow_id.clone(),
+                    workflow_id: wf.workflow_id.to_owned(),
                     limit,
                 });
             }
@@ -623,7 +644,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error> {
-        let table = self.table("workflow_status");
+        let table = &self.tables.workflow_status;
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
         let (table, pool) = (table.as_str(), &self.pool);
@@ -642,7 +663,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error> {
-        let table = self.table("workflow_status");
+        let table = &self.tables.workflow_status;
         // `status` is the one filter whose values are not already strings.
         let status: Vec<&str> = filter
             .status
@@ -793,6 +814,216 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error> {
+        // `descendants` owns every id and the frontier is a *range* into it, because each level
+        // is appended in order — so an id is allocated twice, once by the driver and once for
+        // the dedup set, rather than three times. The root is excluded by comparison rather than
+        // by seeding `seen` with a copy of it, which also states the contract: a workflow is not
+        // its own descendant.
+        let mut seen = std::collections::HashSet::new();
+        let mut descendants: Vec<String> = Vec::new();
+        let mut absorb = |into: &mut Vec<String>, children: Vec<String>| {
+            for child in children {
+                if child != workflow_id && seen.insert(child.clone()) {
+                    into.push(child);
+                }
+            }
+        };
+
+        absorb(
+            &mut descendants,
+            self.direct_children(&[workflow_id]).await?,
+        );
+
+        // Level by level, as all four do. Terminates because `seen` only grows, so a cycle —
+        // which the data should not contain — stops rather than looping.
+        let mut start = 0;
+        while start < descendants.len() {
+            let end = descendants.len();
+            let children = self.direct_children(&descendants[start..end]).await?;
+            start = end;
+            absorb(&mut descendants, children);
+        }
+        Ok(descendants)
+    }
+
+    async fn record_workflow_outcome(
+        &self,
+        workflow_id: &str,
+        outcome: Outcome<'_>,
+    ) -> Result<OutcomeWrite, Error> {
+        let table = &self.tables.workflow_status;
+        // Stamped once, outside the retry: a retried attempt is recording the outcome it
+        // already had, and re-reading the clock would move `completed_at` forward each time.
+        let now = Timestamp::now().as_epoch_ms();
+        let (table, pool) = (table.as_str(), &self.pool);
+        let (output, error) = outcome.columns();
+
+        with_retry(&self.retry, "record_workflow_outcome", move || async move {
+            // The `status = 'PENDING'` predicate is the whole mechanism: an executor that has
+            // been presumed dead and superseded finds zero rows updated, and learns it lost
+            // rather than clobbering the winner's result. It also makes this retry-safe — a
+            // retry after a lost acknowledgement finds its own write and reports
+            // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
+            let updated = sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET status = $2, output = $3, error = $4, \
+                 updated_at = $5, completed_at = $5 \
+                 WHERE workflow_uuid = $1 AND status = 'PENDING'"
+            )))
+            .bind(workflow_id)
+            .bind(outcome.status().as_str())
+            .bind(output)
+            .bind(error)
+            .bind(now)
+            .execute(pool)
+            .await?
+            .rows_affected();
+
+            Ok(if updated > 0 {
+                OutcomeWrite::Recorded
+            } else {
+                OutcomeWrite::AlreadyFinished
+            })
+        })
+        .await
+    }
+
+    async fn set_workflow_delay(
+        &self,
+        workflow_id: &str,
+        delay: WorkflowDelay,
+    ) -> Result<(), Error> {
+        let table = &self.tables.workflow_status;
+        // Resolved once, outside the retry, so a relative delay does not creep further out with
+        // each attempt.
+        let now = Timestamp::now();
+        let delay_until = delay.resolve(now).as_epoch_ms();
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "set_workflow_delay", move || async move {
+            // `status = 'DELAYED'` is the guard: a released workflow is running or queued, and
+            // pushing its delay out would not recall it.
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET delay_until_epoch_ms = $2, updated_at = $3 \
+                 WHERE workflow_uuid = $1 AND status = 'DELAYED'"
+            )))
+            .bind(workflow_id)
+            .bind(delay_until)
+            .bind(now.as_epoch_ms())
+            .execute(pool)
+            .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error> {
+        let table = &self.tables.workflow_status;
+        let now = Timestamp::now().as_epoch_ms();
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "clear_queue_assignment", move || async move {
+            // `queue_name IS NOT NULL` is what makes this a *return* rather than an enqueue: a
+            // workflow that never came from a queue has none to go back to.
+            let updated = sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
+                 updated_at = $2 \
+                 WHERE workflow_uuid = $1 AND queue_name IS NOT NULL AND status = 'PENDING'"
+            )))
+            .bind(workflow_id)
+            .bind(now)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            Ok(updated > 0)
+        })
+        .await
+    }
+
+    async fn update_workflow_attributes(
+        &self,
+        workflow_id: &str,
+        attributes: Option<&str>,
+    ) -> Result<(), Error> {
+        let table = &self.tables.workflow_status;
+        // Read once, outside the retry: a second attempt is the same write, and re-reading the
+        // clock would date the row to whenever the connection came back.
+        let now = Timestamp::now().as_epoch_ms();
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(
+            &self.retry,
+            "update_workflow_attributes",
+            move || async move {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET attributes = $2::jsonb, updated_at = $3 \
+                     WHERE workflow_uuid = $1"
+                )))
+                .bind(workflow_id)
+                .bind(attributes)
+                .bind(now)
+                .execute(pool)
+                .await?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn get_pending_workflows(
+        &self,
+        executor_id: &str,
+        application_version: &str,
+    ) -> Result<Vec<String>, Error> {
+        let table = &self.tables.workflow_status;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "get_pending_workflows", move || async move {
+            let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT workflow_uuid FROM {table} \
+                 WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2"
+            )))
+            .bind(executor_id)
+            .bind(application_version)
+            .fetch_all(pool)
+            .await?;
+            Ok(ids)
+        })
+        .await
+    }
+
+    async fn transition_delayed_workflows(&self) -> Result<u64, Error> {
+        let table = &self.tables.workflow_status;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(
+            &self.retry,
+            "transition_delayed_workflows",
+            move || async move {
+                // The clock is read per attempt on purpose: this is a sweep, not a write a caller
+                // is holding an identity for, and a retry should release whatever has since come
+                // due rather than replay a stale cutoff.
+                let now = Timestamp::now().as_epoch_ms();
+                // Clearing the debounce key belongs in this statement, not a second one. The id
+                // is held only while the workflow is DELAYED; once released the workflow is
+                // committed to running, and a later debounce with the same key must start a
+                // fresh workflow rather than bounce this one.
+                let moved = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET status = 'ENQUEUED', updated_at = $1, \
+                     deduplication_id = CASE WHEN is_debounced THEN NULL \
+                                             ELSE deduplication_id END \
+                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1"
+                )))
+                .bind(now)
+                .execute(pool)
+                .await?
+                .rows_affected();
+                Ok(moved)
+            },
+        )
+        .await
+    }
+
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
@@ -855,7 +1086,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         if workflow_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let table = self.table("workflow_status");
+        let table = &self.tables.workflow_status;
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
         // Read once, outside the retry, so a second attempt writes the same `updated_at`.
         let now = Timestamp::now().as_epoch_ms();
@@ -902,14 +1133,54 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn delete_workflows(
+        &self,
+        workflow_ids: &[&str],
+        delete_children: bool,
+    ) -> Result<u64, Error> {
+        if workflow_ids.is_empty() {
+            return Ok(0);
+        }
+        // Descendants arrive owned from the database and are kept alive here; the roots stay
+        // borrowed, so `targets` copies pointers rather than strings.
+        let mut children: Vec<String> = Vec::new();
+        if delete_children {
+            // Collected before the delete rather than interleaved: a deleted parent cannot spawn,
+            // so there is no race to close, and one statement is cheaper than one per level.
+            for id in workflow_ids {
+                children.extend(self.get_workflow_children(id).await?);
+            }
+        }
+        let mut targets: Vec<&str> = workflow_ids.to_vec();
+        targets.extend(children.iter().map(String::as_str));
+        targets.sort_unstable();
+        targets.dedup();
+        let table = &self.tables.workflow_status;
+        let (table, pool, targets) = (table.as_str(), &self.pool, targets.as_slice());
+
+        with_retry(&self.retry, "delete_workflows", move || async move {
+            // Steps, notifications, events, and streams go with the row: every child table
+            // declares `ON DELETE CASCADE` on this foreign key, from migration 1 onward.
+            let deleted = sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE workflow_uuid = ANY($1)"
+            )))
+            .bind(targets)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            Ok(deleted)
+        })
+        .await
+    }
+
     async fn check_step(
         &self,
         workflow_id: &str,
         step_id: i32,
         step_name: &str,
     ) -> Result<Option<StepRecord>, Error> {
-        let workflow_table = self.table("workflow_status");
-        let steps_table = self.table("operation_outputs");
+        let workflow_table = &self.tables.workflow_status;
+        let steps_table = &self.tables.operation_outputs;
         let (workflow_table, steps_table, pool) =
             (workflow_table.as_str(), steps_table.as_str(), &self.pool);
 
@@ -973,7 +1244,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         step_id: i32,
         step_name: &str,
-        outcome: &Outcome,
+        outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
     ) -> Result<(), Error> {
@@ -989,8 +1260,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 detail: "must not be negative".to_owned(),
             });
         }
-        let workflow_table = self.table("workflow_status");
-        let steps_table = self.table("operation_outputs");
+        let workflow_table = &self.tables.workflow_status;
+        let steps_table = &self.tables.operation_outputs;
         let (workflow_table, steps_table, pool) =
             (workflow_table.as_str(), steps_table.as_str(), &self.pool);
         let executor_id = self.executor_id.as_deref();
@@ -1072,7 +1343,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<StepRecord>, Error> {
-        let table = self.table("operation_outputs");
+        let table = &self.tables.operation_outputs;
         let (table, pool) = (table.as_str(), &self.pool);
 
         with_retry(&self.retry, "list_workflow_steps", move || async move {
@@ -1119,7 +1390,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 detail: "must not be empty".to_owned(),
             });
         }
-        let table = self.table("operation_outputs");
+        let table = &self.tables.operation_outputs;
         // Spans the launch only — the parent does not wait for the child here, so the step is
         // complete as soon as the child exists. Stamped only when the caller offered a start,
         // since half a pair measures nothing. Java passes both null here.
@@ -1158,256 +1429,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 });
             }
             Ok(())
-        })
-        .await
-    }
-
-    async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error> {
-        // `descendants` owns every id and the frontier is a *range* into it, because each level
-        // is appended in order — so an id is allocated twice, once by the driver and once for
-        // the dedup set, rather than three times. The root is excluded by comparison rather than
-        // by seeding `seen` with a copy of it, which also states the contract: a workflow is not
-        // its own descendant.
-        let mut seen = std::collections::HashSet::new();
-        let mut descendants: Vec<String> = Vec::new();
-        let mut absorb = |into: &mut Vec<String>, children: Vec<String>| {
-            for child in children {
-                if child != workflow_id && seen.insert(child.clone()) {
-                    into.push(child);
-                }
-            }
-        };
-
-        absorb(
-            &mut descendants,
-            self.direct_children(&[workflow_id]).await?,
-        );
-
-        // Level by level, as all four do. Terminates because `seen` only grows, so a cycle —
-        // which the data should not contain — stops rather than looping.
-        let mut start = 0;
-        while start < descendants.len() {
-            let end = descendants.len();
-            let children = self.direct_children(&descendants[start..end]).await?;
-            start = end;
-            absorb(&mut descendants, children);
-        }
-        Ok(descendants)
-    }
-
-    async fn delete_workflows(
-        &self,
-        workflow_ids: &[&str],
-        delete_children: bool,
-    ) -> Result<u64, Error> {
-        if workflow_ids.is_empty() {
-            return Ok(0);
-        }
-        // Descendants arrive owned from the database and are kept alive here; the roots stay
-        // borrowed, so `targets` copies pointers rather than strings.
-        let mut children: Vec<String> = Vec::new();
-        if delete_children {
-            // Collected before the delete rather than interleaved: a deleted parent cannot spawn,
-            // so there is no race to close, and one statement is cheaper than one per level.
-            for id in workflow_ids {
-                children.extend(self.get_workflow_children(id).await?);
-            }
-        }
-        let mut targets: Vec<&str> = workflow_ids.to_vec();
-        targets.extend(children.iter().map(String::as_str));
-        targets.sort_unstable();
-        targets.dedup();
-        let table = self.table("workflow_status");
-        let (table, pool, targets) = (table.as_str(), &self.pool, targets.as_slice());
-
-        with_retry(&self.retry, "delete_workflows", move || async move {
-            // Steps, notifications, events, and streams go with the row: every child table
-            // declares `ON DELETE CASCADE` on this foreign key, from migration 1 onward.
-            let deleted = sqlx::query(AssertSqlSafe(format!(
-                "DELETE FROM {table} WHERE workflow_uuid = ANY($1)"
-            )))
-            .bind(targets)
-            .execute(pool)
-            .await?
-            .rows_affected();
-            Ok(deleted)
-        })
-        .await
-    }
-
-    async fn get_pending_workflows(
-        &self,
-        executor_id: &str,
-        application_version: &str,
-    ) -> Result<Vec<String>, Error> {
-        let table = self.table("workflow_status");
-        let (table, pool) = (table.as_str(), &self.pool);
-
-        with_retry(&self.retry, "get_pending_workflows", move || async move {
-            let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT workflow_uuid FROM {table} \
-                 WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2"
-            )))
-            .bind(executor_id)
-            .bind(application_version)
-            .fetch_all(pool)
-            .await?;
-            Ok(ids)
-        })
-        .await
-    }
-
-    async fn set_workflow_delay(
-        &self,
-        workflow_id: &str,
-        delay: WorkflowDelay,
-    ) -> Result<(), Error> {
-        let table = self.table("workflow_status");
-        // Resolved once, outside the retry, so a relative delay does not creep further out with
-        // each attempt.
-        let now = Timestamp::now();
-        let delay_until = delay.resolve(now).as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
-
-        with_retry(&self.retry, "set_workflow_delay", move || async move {
-            // `status = 'DELAYED'` is the guard: a released workflow is running or queued, and
-            // pushing its delay out would not recall it.
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET delay_until_epoch_ms = $2, updated_at = $3 \
-                 WHERE workflow_uuid = $1 AND status = 'DELAYED'"
-            )))
-            .bind(workflow_id)
-            .bind(delay_until)
-            .bind(now.as_epoch_ms())
-            .execute(pool)
-            .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn transition_delayed_workflows(&self) -> Result<u64, Error> {
-        let table = self.table("workflow_status");
-        let (table, pool) = (table.as_str(), &self.pool);
-
-        with_retry(
-            &self.retry,
-            "transition_delayed_workflows",
-            move || async move {
-                // The clock is read per attempt on purpose: this is a sweep, not a write a caller
-                // is holding an identity for, and a retry should release whatever has since come
-                // due rather than replay a stale cutoff.
-                let now = Timestamp::now().as_epoch_ms();
-                // Clearing the debounce key belongs in this statement, not a second one. The id
-                // is held only while the workflow is DELAYED; once released the workflow is
-                // committed to running, and a later debounce with the same key must start a
-                // fresh workflow rather than bounce this one.
-                let moved = sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET status = 'ENQUEUED', updated_at = $1, \
-                     deduplication_id = CASE WHEN is_debounced THEN NULL \
-                                             ELSE deduplication_id END \
-                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1"
-                )))
-                .bind(now)
-                .execute(pool)
-                .await?
-                .rows_affected();
-                Ok(moved)
-            },
-        )
-        .await
-    }
-
-    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error> {
-        let table = self.table("workflow_status");
-        let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
-
-        with_retry(&self.retry, "clear_queue_assignment", move || async move {
-            // `queue_name IS NOT NULL` is what makes this a *return* rather than an enqueue: a
-            // workflow that never came from a queue has none to go back to.
-            let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
-                 updated_at = $2 \
-                 WHERE workflow_uuid = $1 AND queue_name IS NOT NULL AND status = 'PENDING'"
-            )))
-            .bind(workflow_id)
-            .bind(now)
-            .execute(pool)
-            .await?
-            .rows_affected();
-            Ok(updated > 0)
-        })
-        .await
-    }
-
-    async fn update_workflow_attributes(
-        &self,
-        workflow_id: &str,
-        attributes: Option<&str>,
-    ) -> Result<(), Error> {
-        let table = self.table("workflow_status");
-        // Read once, outside the retry: a second attempt is the same write, and re-reading the
-        // clock would date the row to whenever the connection came back.
-        let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
-
-        with_retry(
-            &self.retry,
-            "update_workflow_attributes",
-            move || async move {
-                sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET attributes = $2::jsonb, updated_at = $3 \
-                     WHERE workflow_uuid = $1"
-                )))
-                .bind(workflow_id)
-                .bind(attributes)
-                .bind(now)
-                .execute(pool)
-                .await?;
-                Ok(())
-            },
-        )
-        .await
-    }
-
-    async fn record_workflow_outcome(
-        &self,
-        workflow_id: &str,
-        outcome: &Outcome,
-    ) -> Result<OutcomeWrite, Error> {
-        let table = self.table("workflow_status");
-        // Stamped once, outside the retry: a retried attempt is recording the outcome it
-        // already had, and re-reading the clock would move `completed_at` forward each time.
-        let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
-        let (output, error) = outcome.columns();
-
-        with_retry(&self.retry, "record_workflow_outcome", move || async move {
-            // The `status = 'PENDING'` predicate is the whole mechanism: an executor that has
-            // been presumed dead and superseded finds zero rows updated, and learns it lost
-            // rather than clobbering the winner's result. It also makes this retry-safe — a
-            // retry after a lost acknowledgement finds its own write and reports
-            // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
-            let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET status = $2, output = $3, error = $4, \
-                 updated_at = $5, completed_at = $5 \
-                 WHERE workflow_uuid = $1 AND status = 'PENDING'"
-            )))
-            .bind(workflow_id)
-            .bind(outcome.status().as_str())
-            .bind(output)
-            .bind(error)
-            .bind(now)
-            .execute(pool)
-            .await?
-            .rows_affected();
-
-            Ok(if updated > 0 {
-                OutcomeWrite::Recorded
-            } else {
-                OutcomeWrite::AlreadyFinished
-            })
         })
         .await
     }

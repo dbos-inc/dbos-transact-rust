@@ -303,31 +303,31 @@ pub struct WorkflowRecord {
 /// type instead, but Go's is a package-internal call taking a transaction, and Python's carries
 /// the same fields it then ignores.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NewWorkflow {
+pub struct NewWorkflow<'a> {
     /// The id, which is what makes a retried submission the same workflow.
-    pub workflow_id: String,
+    pub workflow_id: &'a str,
     /// The registered function name.
-    pub name: Option<String>,
+    pub name: Option<&'a str>,
     /// The class the function belongs to, for class-bound workflows.
-    pub class_name: Option<String>,
+    pub class_name: Option<&'a str>,
     /// The configured instance name, for instance-bound workflows.
-    pub config_name: Option<String>,
+    pub config_name: Option<&'a str>,
     /// Encoded arguments.
-    pub input: Option<String>,
+    pub input: Option<&'a str>,
     /// How `input` and, later, the outcome are encoded.
-    pub serialization: Option<String>,
+    pub serialization: Option<&'a str>,
 
     /// The queue to enqueue on. `None` runs the workflow directly.
     ///
     /// This decides the initial status: no queue means `PENDING`, a queue means `ENQUEUED`, and
     /// a queue with a `delay` means `DELAYED`.
-    pub queue_name: Option<String>,
+    pub queue_name: Option<&'a str>,
     /// Deduplication key within the queue.
-    pub deduplication_id: Option<String>,
+    pub deduplication_id: Option<&'a str>,
     /// Dequeue priority; lower runs sooner.
     pub priority: i32,
     /// Partition within the queue.
-    pub queue_partition_key: Option<String>,
+    pub queue_partition_key: Option<&'a str>,
     /// How long to hold the workflow before it becomes eligible to dequeue.
     ///
     /// A duration, not an instant: the wall-clock time is stamped by the database layer against
@@ -348,32 +348,32 @@ pub struct NewWorkflow {
     pub deadline: Option<Timestamp>,
 
     /// The executor claiming this workflow.
-    pub executor_id: Option<String>,
+    pub executor_id: Option<&'a str>,
     /// Application version, which recovery uses to avoid resuming under changed code.
-    pub application_version: Option<String>,
+    pub application_version: Option<&'a str>,
     /// Application id, as assigned by the platform.
-    pub application_id: Option<String>,
+    pub application_id: Option<&'a str>,
 
     /// Authenticated principal at submission.
-    pub authenticated_user: Option<String>,
+    pub authenticated_user: Option<&'a str>,
     /// Encoded JSON list of that principal's roles.
-    pub authenticated_roles: Option<String>,
+    pub authenticated_roles: Option<&'a str>,
     /// The role actually assumed.
-    pub assumed_role: Option<String>,
+    pub assumed_role: Option<&'a str>,
 
     /// The workflow that started this one.
-    pub parent_workflow_id: Option<String>,
+    pub parent_workflow_id: Option<&'a str>,
     /// The schedule that triggered this workflow. Set only by the scheduler.
-    pub schedule_name: Option<String>,
+    pub schedule_name: Option<&'a str>,
     /// Caller-supplied JSON attributes, stored in a `jsonb` column.
-    pub attributes: Option<String>,
+    pub attributes: Option<&'a str>,
 }
 
-impl NewWorkflow {
+impl<'a> NewWorkflow<'a> {
     /// A workflow with an id and nothing else set.
-    pub fn new(workflow_id: impl Into<String>) -> Self {
+    pub fn new(workflow_id: &'a str) -> Self {
         Self {
-            workflow_id: workflow_id.into(),
+            workflow_id,
             ..Self::default()
         }
     }
@@ -410,7 +410,7 @@ impl NewWorkflow {
             ("serialization", &self.serialization),
             ("application_version", &self.application_version),
         ] {
-            if value.as_deref() == Some("") {
+            if *value == Some("") {
                 return Err(Error::InvalidInput {
                     field,
                     detail: "must be absent rather than empty".to_owned(),
@@ -562,45 +562,45 @@ mod tests {
 /// filters, Python 26, Java adds two Go lacks. Where they diverge it is noted on the field, so a
 /// missing filter reads as a decision rather than an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowFilter {
+pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
-    pub workflow_ids: Vec<String>,
+    pub workflow_ids: Vec<&'a str>,
     /// Workflow ids starting with any of these.
-    pub workflow_id_prefixes: Vec<String>,
+    pub workflow_id_prefixes: Vec<&'a str>,
 
     /// Registered function names.
-    pub names: Vec<String>,
+    pub names: Vec<&'a str>,
     /// Class names, for class-bound workflows. **Java only.**
-    pub class_names: Vec<String>,
+    pub class_names: Vec<&'a str>,
     /// Configured instance names. **Java only**, where it is `instanceName`.
-    pub config_names: Vec<String>,
+    pub config_names: Vec<&'a str>,
     /// Statuses to include.
     pub status: Vec<WorkflowStatus>,
 
     /// Application versions.
-    pub application_versions: Vec<String>,
+    pub application_versions: Vec<&'a str>,
     /// Executors that claimed the workflow.
-    pub executor_ids: Vec<String>,
+    pub executor_ids: Vec<&'a str>,
     /// Authenticated principals at submission.
-    pub authenticated_users: Vec<String>,
+    pub authenticated_users: Vec<&'a str>,
 
     /// Queues the workflow was submitted to.
-    pub queue_names: Vec<String>,
+    pub queue_names: Vec<&'a str>,
     /// Only workflows that went through a queue at all.
     pub queues_only: bool,
     /// Schedules that triggered the workflow.
-    pub schedule_names: Vec<String>,
+    pub schedule_names: Vec<&'a str>,
     /// Deduplication keys. **Go only.**
-    pub deduplication_ids: Vec<String>,
+    pub deduplication_ids: Vec<&'a str>,
     /// Whether the deduplication key is a debounce key. **Go only.**
     pub is_debounced: Option<bool>,
 
     /// Workflows started by any of these.
-    pub parent_workflow_ids: Vec<String>,
+    pub parent_workflow_ids: Vec<&'a str>,
     /// Whether the workflow has a parent at all.
     pub has_parent: Option<bool>,
     /// Workflows forked from any of these.
-    pub forked_from: Vec<String>,
+    pub forked_from: Vec<&'a str>,
     /// Whether this workflow was itself forked from another.
     pub was_forked_from: Option<bool>,
 
@@ -630,7 +630,7 @@ pub struct WorkflowFilter {
     ///
     /// Containment, not equality: `{"tenant": "acme"}` matches a workflow with that key among
     /// others. Served by the GIN index on the column.
-    pub attributes: Option<String>,
+    pub attributes: Option<&'a str>,
 
     /// Most rows to return.
     pub limit: Option<i64>,
@@ -648,7 +648,7 @@ pub struct WorkflowFilter {
     pub load_output: bool,
 }
 
-impl Default for WorkflowFilter {
+impl Default for WorkflowFilter<'_> {
     /// Narrows nothing, and loads everything.
     ///
     /// `load_input` and `load_output` default *on*, following Python, so a caller that does not
@@ -745,20 +745,20 @@ pub struct StepRecord {
 /// take one. No implementation treats it as a free choice: Go computes
 /// `status := Success; if err != nil { status = Error }`, and Java splits the call into
 /// `recordWorkflowOutput` and `recordWorkflowError`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome<'a> {
     /// The work returned.
     ///
     /// `None` is a void return, which is a *success* and not an absent result. Whether a step ran
     /// at all is answered by the presence of its row, never by this being empty.
-    Output(Option<String>),
+    Output(Option<&'a str>),
     /// The work raised, carrying the encoded error.
-    Error(String),
+    Error(&'a str),
 }
 
-impl Outcome {
+impl<'a> Outcome<'a> {
     /// The terminal status this outcome puts a workflow in.
-    pub fn status(&self) -> WorkflowStatus {
+    pub fn status(self) -> WorkflowStatus {
         match self {
             Outcome::Output(_) => WorkflowStatus::Success,
             Outcome::Error(_) => WorkflowStatus::Error,
@@ -766,10 +766,10 @@ impl Outcome {
     }
 
     /// The pair of column values, in the order the tables hold them.
-    pub(crate) fn columns(&self) -> (Option<&str>, Option<&str>) {
+    pub(crate) fn columns(self) -> (Option<&'a str>, Option<&'a str>) {
         match self {
-            Outcome::Output(value) => (value.as_deref(), None),
-            Outcome::Error(message) => (None, Some(message.as_str())),
+            Outcome::Output(value) => (value, None),
+            Outcome::Error(message) => (None, Some(message)),
         }
     }
 }
@@ -823,4 +823,69 @@ impl WorkflowDelay {
             WorkflowDelay::Until(t) => t,
         }
     }
+}
+
+/// Why a workflow is being submitted, which decides whether it may claim a row someone holds.
+///
+/// The references model this as two booleans, `is_recovery_request` and `is_dequeued_request`,
+/// but **no call site in any of them sets both** — Python's dispatchers pass exactly
+/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. A
+/// three-way choice is what it has always been, and naming it removes an unreadable pair of
+/// adjacent `bool` arguments that would compile just as happily swapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Submission {
+    /// A first attempt, which does not claim a workflow another owner already holds.
+    #[default]
+    Fresh,
+    /// Recovering a workflow a dead executor left behind.
+    Recovery,
+    /// Dequeuing, which claims a workflow that was enqueued.
+    Dequeue,
+}
+
+impl Submission {
+    /// Whether this submission is being told it owns the workflow.
+    ///
+    /// Recovery and dequeue are kept apart because the references keep them apart, even though
+    /// both answer this the same way: both count against the recovery budget, and both may claim
+    /// a row another owner holds, which from a fresh start would be theft.
+    pub(crate) fn claims_ownership(self) -> bool {
+        matches!(self, Submission::Recovery | Submission::Dequeue)
+    }
+}
+
+/// The result of trying to record a workflow's final outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeWrite {
+    /// This process recorded the outcome.
+    Recorded,
+    /// Another process got there first, and the row is already terminal.
+    ///
+    /// Not an error: the caller has lost a race it was allowed to lose, and should adopt the
+    /// recorded outcome rather than overwrite it.
+    AlreadyFinished,
+}
+
+/// What the database said about a workflow after initialising it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowInitResult {
+    /// The stored status, which is the existing one when the row was already there.
+    pub status: WorkflowStatus,
+    /// Recovery attempts recorded against the workflow, after this one.
+    pub recovery_attempts: i64,
+    /// The workflow's absolute expiry, as the database now holds it.
+    ///
+    /// Reported back because it may not be the one offered: a timeout is turned into a deadline
+    /// against the database layer's clock, and an existing row keeps the deadline it already had.
+    pub deadline: Option<Timestamp>,
+    /// The serialization format actually stored.
+    ///
+    /// May differ from what the caller offered: the first writer decides the format, and every
+    /// later attempt has to read the payloads that are actually there.
+    pub serialization: Option<String>,
+    /// Whether this caller should go on to run the workflow.
+    ///
+    /// `false` means another owner holds it and this attempt is not a recovery — so the row is
+    /// recorded, but running it would be a second execution.
+    pub should_execute: bool,
 }

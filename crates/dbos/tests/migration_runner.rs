@@ -7,8 +7,8 @@
 
 mod support;
 
+use dbos::sysdb::migrations::runner;
 use dbos::sysdb::migrations::{Dialect, LOCAL_MIGRATIONS, quote_identifier};
-use dbos::sysdb::runner;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use support::raw_database;

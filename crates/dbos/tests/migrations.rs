@@ -89,7 +89,7 @@ async fn the_corpus_applies_to_a_real_database() {
         "one entry per locally-defined migration",
     );
     // Through the real runner, so this covers the path production uses.
-    dbos::sysdb::runner::run(&pool, schema, true)
+    dbos::sysdb::migrations::runner::run(&pool, schema, true)
         .await
         .expect("migration failed");
 

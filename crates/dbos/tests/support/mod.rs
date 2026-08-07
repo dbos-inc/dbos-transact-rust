@@ -371,7 +371,7 @@ impl TestServer {
                 // Only reachable POOL_SIZE times: past that a permit implies an idle database.
                 let fresh = self.create_database().await;
                 let pool = fresh.pool().await;
-                dbos::sysdb::runner::run(&pool, DEFAULT_SCHEMA, true)
+                dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
                     .await
                     .expect("failed to migrate a pooled test database");
                 pool.close().await;

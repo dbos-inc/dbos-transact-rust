@@ -6,7 +6,7 @@
 
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-use super::migrations::{Dialect, Migration, RenderError, build_migrations, quote_identifier};
+use super::{Dialect, Migration, RenderError, build_migrations, quote_identifier};
 
 /// How many times a migration is retried before giving up.
 ///

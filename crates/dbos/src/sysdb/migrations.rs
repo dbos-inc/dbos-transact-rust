@@ -19,6 +19,9 @@
 //!
 //! Applying the corpus to both backends is what verifies it; reading the SQL is not enough.
 
+/// Applying the corpus above to a database.
+pub mod runner;
+
 /// Migrations whose index DDL uses `CONCURRENTLY` and so cannot run inside a transaction on
 /// PostgreSQL. Each carries a `{{concurrently}}` placeholder — see [`Placeholders`].
 ///
