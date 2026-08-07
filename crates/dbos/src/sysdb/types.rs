@@ -439,6 +439,7 @@ impl<'a> NewWorkflow<'a> {
                 });
             }
         }
+        validate_attributes(self.attributes)?;
         Ok(())
     }
 
@@ -806,6 +807,29 @@ pub struct StepTiming {
     /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
     /// behaves the same way, guarding its comparison with `if (endTimeEpochMs != null)`.
     pub completed_at: Timestamp,
+}
+
+/// Rejects attributes that are not a JSON *object*.
+///
+/// The contract is an object, not arbitrary JSON: every other implementation takes a map — Java
+/// `Map<String, Object>`, Python `Dict[str, Any]`, Go `map[string]any` — and TypeScript rejects
+/// arrays outright with *"must be a key-value object"*. Since this layer takes the encoded form,
+/// so a host across an FFI boundary can hand over bytes it already has, the same check has to
+/// happen here rather than falling out of the type.
+///
+/// It matters beyond tidiness: `attributes @> …` in [`WorkflowFilter`] is containment against an
+/// object, so a stored array or scalar would silently never match.
+pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error> {
+    let Some(json) = attributes else {
+        return Ok(());
+    };
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json).map_err(|e| {
+        Error::InvalidInput {
+            field: "attributes",
+            detail: format!("must be a JSON object: {e}"),
+        }
+    })?;
+    Ok(())
 }
 
 /// When a delayed workflow should become eligible to run.

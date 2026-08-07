@@ -11,7 +11,7 @@ use super::migrations::{self, quote_identifier};
 use super::retry::{RetryPolicy, with_retry};
 use super::types::{
     NewWorkflow, Outcome, StepRecord, StepTiming, Submission, Timestamp, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, OutcomeWrite,
@@ -579,10 +579,37 @@ impl SystemDatabase for PostgresSystemDatabase {
         let (table, pool, owner_xid) = (table.as_str(), &self.pool, owner_xid.as_str());
 
         with_retry(&self.retry, "init_workflow", move || async move {
-            // The column list is Java's INSERT, in its order, plus Python's two debounce columns.
-            // Columns absent from it are absent deliberately: `output`, `error`, `started_at`,
-            // `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited` are written by
-            // execution, forking, and the rate limiter — never at creation.
+            // The column list is Java's INSERT, in its order, plus Python's two debounce
+            // columns. Columns absent from it are absent deliberately: `output`, `error`,
+            // `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited`
+            // are written by execution, forking, and the rate limiter — never at creation.
+            //
+            // The executor re-stamp is guarded on ownership, which is a deliberate divergence.
+            // On conflict the upsert would otherwise hand `executor_id` to whoever submitted
+            // last — including a duplicate `Fresh` submission of a workflow another executor is
+            // running. That misdirects recovery: `get_pending_workflows` keys on `executor_id`,
+            // so the real owner's sweep stops finding the workflow and the submitter's starts,
+            // and the second execution is only caught later, at its first step.
+            //
+            // Java and TypeScript prevent it by letting the write land and rolling the
+            // transaction back for a non-owner; Python and Go let it stand. The `CASE` reaches
+            // Java's and TypeScript's outcome without their transaction — the row simply keeps
+            // its executor.
+            //
+            // Its middle arm is the lost-acknowledgement case: `owner_xid` is generated once per
+            // logical attempt, so it matches an existing row only when this *is* that attempt
+            // asking again. Ownership is compared on `owner_xid` and not `executor_id` for the
+            // reason migration 7 exists — `executor_id` defaults to `"local"` and collides
+            // between processes on one machine.
+            //
+            // TODO: raise this divergence with the DBOS team before v1. No implementation does
+            // exactly what the `CASE` does, and the 2–2 split is weaker than it looks: Java and
+            // TypeScript are the same code (identical `shouldCommit` flag, identical comment),
+            // and Go's commit is entangled with its enqueue path, which must commit regardless.
+            // Python is the only unambiguous vote for leaving the re-stamp in place, and it may
+            // be inheritance rather than intent — the same open question as
+            // `started_at_epoch_ms` in `cancel_batch`. Worth confirming, and worth proposing
+            // upstream rather than carrying as a Rust-only difference.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {table} (workflow_uuid, status, inputs, \
                  name, class_name, config_name, \
@@ -603,7 +630,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                    END, \
                    updated_at = EXCLUDED.updated_at, \
                    executor_id = CASE \
-                       WHEN EXCLUDED.status != 'ENQUEUED' AND EXCLUDED.status != 'DELAYED' \
+                       WHEN EXCLUDED.status = 'ENQUEUED' OR EXCLUDED.status = 'DELAYED' \
+                       THEN {table}.executor_id \
+                       WHEN {table}.owner_xid IS NULL \
+                         OR {table}.owner_xid = EXCLUDED.owner_xid \
+                         OR $31 \
                        THEN EXCLUDED.executor_id \
                        ELSE {table}.executor_id \
                    END \
@@ -643,6 +674,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.debounce_deadline.map(Timestamp::as_epoch_ms))
             .bind(workflow.is_debounced)
             .bind(increment)
+            .bind(claiming)
             .fetch_one(pool)
             .await
             // A unique violation here can only be the partial index on
@@ -1043,6 +1075,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         attributes: Option<&str>,
     ) -> Result<(), Error> {
+        validate_attributes(attributes)?;
         let table = &self.tables.workflow_status;
         // Read once, outside the retry: a second attempt is the same write, and re-reading the
         // clock would date the row to whenever the connection came back.

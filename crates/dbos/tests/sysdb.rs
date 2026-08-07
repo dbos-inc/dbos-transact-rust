@@ -2330,3 +2330,122 @@ async fn authenticated_roles_are_encoded_by_this_layer() {
         "a NULL column reads back as no roles",
     );
 }
+
+/// A duplicate submission does not take the executor stamp from the executor that owns the work.
+///
+/// The upsert would otherwise hand `executor_id` to whoever submitted last. That misdirects
+/// recovery: `get_pending_workflows` keys on `executor_id`, so the owner's sweep would stop
+/// finding the workflow and the submitter's would start.
+///
+/// A deliberate divergence — Java and TypeScript reach this outcome by rolling their transaction
+/// back, Python and Go leave the re-stamp in place.
+#[tokio::test]
+async fn a_duplicate_submission_does_not_steal_the_executor_stamp() {
+    let (sys, _db) = sysdb().await;
+    let running = NewWorkflow {
+        executor_id: Some("executor-a"),
+        ..workflow("wf-owned-elsewhere")
+    };
+    sys.init_workflow(&running, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // A second process submits the same id. It does not own the workflow, and is told so.
+    let duplicate = NewWorkflow {
+        executor_id: Some("executor-b"),
+        ..workflow("wf-owned-elsewhere")
+    };
+    let result = sys
+        .init_workflow(&duplicate, None, Submission::Fresh)
+        .await
+        .unwrap();
+    assert!(
+        !result.should_execute,
+        "another owner holds this workflow, so running it would be a second execution",
+    );
+
+    let read = sys
+        .get_workflow("wf-owned-elsewhere")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read.executor_id.as_deref(),
+        Some("executor-a"),
+        "the stamp must stay with the executor that is actually running it",
+    );
+    // Which is what keeps recovery pointed at the right executor.
+    assert_eq!(
+        sys.get_pending_workflows("executor-a", "v1").await.unwrap(),
+        ["wf-owned-elsewhere"],
+    );
+    assert!(
+        sys.get_pending_workflows("executor-b", "v1")
+            .await
+            .unwrap()
+            .is_empty(),
+    );
+
+    // Recovery and dequeue *are* being told they own it, so they claim the stamp.
+    let recovering = NewWorkflow {
+        executor_id: Some("executor-b"),
+        ..workflow("wf-owned-elsewhere")
+    };
+    let result = sys
+        .init_workflow(&recovering, None, Submission::Recovery)
+        .await
+        .unwrap();
+    assert!(result.should_execute);
+    let read = sys
+        .get_workflow("wf-owned-elsewhere")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.executor_id.as_deref(), Some("executor-b"));
+}
+
+/// Attributes must be a JSON object, on both the paths that can set them.
+///
+/// Every other implementation takes a map, and TypeScript rejects arrays explicitly. Since this
+/// layer takes the encoded form, the check has to be made rather than inherited from a type —
+/// and it is not cosmetic: `attributes @> …` is containment against an object, so a stored array
+/// or scalar would silently never match any filter.
+#[tokio::test]
+async fn attributes_must_be_a_json_object() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-attr-ok"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    for bad in [r#"[1,2,3]"#, "42", r#""a string""#, "not json at all"] {
+        // At creation.
+        let wf = NewWorkflow {
+            attributes: Some(bad),
+            ..NewWorkflow::new("wf-attr-bad")
+        };
+        match sys.init_workflow(&wf, None, Submission::Fresh).await {
+            Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "attributes"),
+            other => panic!("expected {bad} to be rejected at creation, got {other:?}"),
+        }
+
+        // And on update.
+        match sys
+            .update_workflow_attributes("wf-attr-ok", Some(bad))
+            .await
+        {
+            Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "attributes"),
+            other => panic!("expected {bad} to be rejected on update, got {other:?}"),
+        }
+    }
+
+    // An object is fine, and so is clearing.
+    sys.update_workflow_attributes("wf-attr-ok", Some(r#"{"tenant":"acme"}"#))
+        .await
+        .unwrap();
+    sys.update_workflow_attributes("wf-attr-ok", None)
+        .await
+        .unwrap();
+
+    // Nothing was written on the way to any of those errors.
+    assert!(sys.get_workflow("wf-attr-bad").await.unwrap().is_none());
+}
