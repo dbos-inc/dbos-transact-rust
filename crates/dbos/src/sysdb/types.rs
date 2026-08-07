@@ -20,6 +20,7 @@
 //! wrapper over the epoch milliseconds actually stored, so it converts exactly rather than
 //! through someone's calendar. Callers wanting a calendar type convert at their own edge.
 
+use super::Error;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -375,6 +376,59 @@ impl NewWorkflow {
             workflow_id: workflow_id.into(),
             ..Self::default()
         }
+    }
+
+    /// Rejects values the system database will not store.
+    ///
+    /// Java validates the same list in `WorkflowStatusInternal`'s constructor, so a bad value
+    /// cannot be built at all. `NewWorkflow` has public fields and so has no construction hook;
+    /// this runs at the point of use instead, which catches the same mistakes one step later.
+    ///
+    /// **An empty string is not a missing value — `None` is.** A `Some("")` queue name would
+    /// enqueue a workflow onto a queue called `""`, and an empty `workflow_id` would create a
+    /// row no caller can ever name again. Both are caller bugs worth reporting rather than
+    /// storing.
+    ///
+    /// The two auth fields are exempt: TypeScript and Go send `""` rather than null when there
+    /// is no auth context, so those are normalised at write time instead of rejected.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.workflow_id.is_empty() {
+            return Err(Error::InvalidInput {
+                field: "workflow_id",
+                detail: "must not be empty".to_owned(),
+            });
+        }
+        for (field, value) in [
+            ("name", &self.name),
+            ("class_name", &self.class_name),
+            ("config_name", &self.config_name),
+            ("queue_name", &self.queue_name),
+            ("deduplication_id", &self.deduplication_id),
+            ("queue_partition_key", &self.queue_partition_key),
+            ("schedule_name", &self.schedule_name),
+            ("input", &self.input),
+            ("serialization", &self.serialization),
+            ("application_version", &self.application_version),
+        ] {
+            if value.as_deref() == Some("") {
+                return Err(Error::InvalidInput {
+                    field,
+                    detail: "must be absent rather than empty".to_owned(),
+                });
+            }
+        }
+        // Java rejects a zero or negative duration outright; `Duration` already rules out
+        // negatives, so only zero is left to catch. A zero delay is a caller that meant `None`,
+        // and a zero timeout would expire the workflow before it ran.
+        for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
+            if value == Some(Duration::ZERO) {
+                return Err(Error::InvalidInput {
+                    field,
+                    detail: "must be a positive, non-zero duration".to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The status this workflow starts in, which follows from the queue and the delay.

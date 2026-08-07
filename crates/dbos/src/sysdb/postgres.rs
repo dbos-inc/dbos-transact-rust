@@ -11,8 +11,8 @@ use super::migrations::quote_identifier;
 use super::retry::{RetryPolicy, with_retry};
 use super::types::{Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms};
 use super::{
-    BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, InitWorkflowStatus, OutcomeWrite,
-    SystemDatabase, WorkflowInitResult, runner,
+    BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, InitWorkflowStatus,
+    OutcomeWrite, SystemDatabase, WorkflowInitResult, runner,
 };
 
 impl From<sqlx::Error> for Error {
@@ -27,6 +27,14 @@ impl From<sqlx::Error> for Error {
             sqlstate,
         })
     }
+}
+
+/// Treats an empty string as an absent value.
+///
+/// Only for the fields where another SDK legitimately writes `""`; everywhere else an empty
+/// string is a caller error and [`NewWorkflow::validate`] rejects it.
+fn empty_to_none(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.is_empty())
 }
 
 /// Whether a driver failure is worth asking again about.
@@ -319,6 +327,45 @@ const RECORD_COLUMNS: &str = "workflow_uuid, status, name, class_name, config_na
      workflow_deadline_epoch_ms, delay_until_epoch_ms, debounce_deadline_epoch_ms, \
      is_debounced, attributes::text AS attributes";
 
+impl PostgresSystemDatabase {
+    /// Cancels one batch, returning the ids that were still running.
+    ///
+    /// Not retried in here, and not reading its own clock. Both belong to the trait method that
+    /// owns the whole operation: a retry that restarted only this statement would leave the
+    /// cascade around it half-walked, and a per-level clock would give one cancellation as many
+    /// `completed_at` values as the tree has depth.
+    ///
+    /// The terminal-status guard is what makes cancellation safe to repeat: a workflow that has
+    /// already succeeded keeps its result rather than being overwritten with `CANCELLED`.
+    async fn cancel_batch(&self, workflow_ids: &[String], now: i64) -> Result<Vec<String>, Error> {
+        let table = self.table("workflow_status");
+        let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "UPDATE {table} SET status = 'CANCELLED', queue_name = NULL, \
+             deduplication_id = NULL, started_at_epoch_ms = NULL, \
+             updated_at = $2, completed_at = $2 \
+             WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
+             RETURNING workflow_uuid"
+        )))
+        .bind(workflow_ids)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(cancelled)
+    }
+
+    /// The workflows whose parent is one of these.
+    async fn direct_children(&self, workflow_ids: &[String]) -> Result<Vec<String>, Error> {
+        let table = self.table("workflow_status");
+        let children: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT workflow_uuid FROM {table} WHERE parent_workflow_id = ANY($1)"
+        )))
+        .bind(workflow_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(children)
+    }
+}
+
 #[async_trait]
 impl SystemDatabase for PostgresSystemDatabase {
     async fn init_workflow_status(
@@ -326,6 +373,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         input: InitWorkflowStatus<'_>,
     ) -> Result<WorkflowInitResult, Error> {
         let wf = input.workflow;
+        wf.validate()?;
         let table = self.table("workflow_status");
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
         let initial_status = wf.initial_status();
@@ -403,8 +451,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(wf.priority)
             .bind(&wf.queue_partition_key)
             .bind(delay_until.map(Timestamp::as_epoch_ms))
-            .bind(&wf.authenticated_user)
-            .bind(&wf.assumed_role)
+            // TypeScript and Go send `""` rather than null when there is no auth context, and
+            // Java normalises it on the way in for that reason. Storing both spellings would
+            // make an `authenticated_user IS NULL` filter miss rows another SDK wrote.
+            .bind(empty_to_none(&wf.authenticated_user))
+            .bind(empty_to_none(&wf.assumed_role))
             .bind(&wf.authenticated_roles)
             .bind(&wf.executor_id)
             .bind(&wf.application_version)
@@ -674,6 +725,142 @@ impl SystemDatabase for PostgresSystemDatabase {
             let rows = q.build().fetch_all(pool).await?;
             rows.iter().map(record_from_row).collect()
         })
+        .await
+    }
+
+    async fn cancel_workflows(
+        &self,
+        workflow_ids: &[String],
+        cancel_children: bool,
+    ) -> Result<Vec<String>, Error> {
+        if workflow_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The retry wraps the whole cascade, not each statement inside it. A failure partway
+        // through leaves some of the tree cancelled, and restarting from the roots finishes the
+        // job — where retrying one statement would return a half-walked tree as a success.
+        //
+        // Every accumulator is therefore declared *inside*, and must be: a retry that appended
+        // to a `cancelled` list from the previous attempt would report workflows twice.
+        // Re-cancelling is otherwise harmless, since `CANCELLED` is not a terminal status the
+        // guard excludes and the row simply stays cancelled.
+        //
+        // `now` is read once for the whole cascade, so every workflow cancelled by one call
+        // shares a `completed_at` however deep the tree goes.
+        let now = Timestamp::now().as_epoch_ms();
+        with_retry(&self.retry, "cancel_workflows", move || async move {
+            let mut cancelled = Vec::new();
+            let mut seen: std::collections::HashSet<String> =
+                workflow_ids.iter().cloned().collect();
+            let mut frontier: Vec<String> = workflow_ids.to_vec();
+
+            // One statement per *level*, not per workflow: `cancel_batch` takes the whole
+            // frontier and matches it with `= ANY($1)`, so the round trips scale with the depth
+            // of the tree rather than its size. Cancelling the level before asking for its
+            // children is the ordering that stops a parent spawning behind the walk. The loop
+            // terminates because `seen` only grows and a workflow enters a frontier at most once.
+            loop {
+                cancelled.extend(self.cancel_batch(&frontier, now).await?);
+                if !cancel_children {
+                    break;
+                }
+                let children = self.direct_children(&frontier).await?;
+                frontier = children
+                    .into_iter()
+                    .filter(|c| seen.insert(c.clone()))
+                    .collect();
+                if frontier.is_empty() {
+                    break;
+                }
+            }
+            Ok(cancelled)
+        })
+        .await
+    }
+
+    async fn resume_workflows(
+        &self,
+        workflow_ids: &[String],
+        queue_name: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        if workflow_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self.table("workflow_status");
+        let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
+        // Read once, outside the retry, so a second attempt writes the same `updated_at`.
+        let now = Timestamp::now().as_epoch_ms();
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "resume_workflows", move || async move {
+            // Existence is asked separately because a zero-row update conflates "already
+            // finished" — which is legal — with "no such workflow", which is not.
+            let existing: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT workflow_uuid FROM {table} WHERE workflow_uuid = ANY($1)"
+            )))
+            .bind(workflow_ids)
+            .fetch_all(pool)
+            .await?;
+            let missing: Vec<String> = workflow_ids
+                .iter()
+                .filter(|id| !existing.contains(id))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::NonExistentWorkflow {
+                    workflow_ids: missing,
+                });
+            }
+
+            // `completed_at` and `started_at_epoch_ms` are cleared as well as the counters: the
+            // workflow is going to run again, and leaving them set would date it to its last
+            // attempt.
+            let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "UPDATE {table} SET status = 'ENQUEUED', queue_name = $2, \
+                 recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
+                 deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
+                 updated_at = $3 \
+                 WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
+                 RETURNING workflow_uuid"
+            )))
+            .bind(workflow_ids)
+            .bind(queue)
+            .bind(now)
+            .fetch_all(pool)
+            .await?;
+            Ok(resumed)
+        })
+        .await
+    }
+
+    async fn update_workflow_attributes(
+        &self,
+        workflow_id: &str,
+        attributes: Option<&str>,
+    ) -> Result<(), Error> {
+        let table = self.table("workflow_status");
+        // Read once, outside the retry: a second attempt is the same write, and re-reading the
+        // clock would date the row to whenever the connection came back.
+        let now = Timestamp::now().as_epoch_ms();
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(
+            &self.retry,
+            "update_workflow_attributes",
+            move || async move {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET attributes = $2::jsonb, updated_at = $3 \
+                     WHERE workflow_uuid = $1"
+                )))
+                .bind(workflow_id)
+                .bind(attributes)
+                .bind(now)
+                .execute(pool)
+                .await?;
+                Ok(())
+            },
+        )
         .await
     }
 

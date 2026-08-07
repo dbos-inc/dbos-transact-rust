@@ -1088,3 +1088,335 @@ async fn payloads_can_be_left_unloaded() {
         "declining payloads must not affect any other column",
     );
 }
+
+/// Cancelling stops a workflow and clears what would let it be picked up again.
+#[tokio::test]
+async fn cancelling_clears_the_queue_and_the_deduplication_key() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        queue_name: Some("orders".to_owned()),
+        deduplication_id: Some("dedup-1".to_owned()),
+        ..NewWorkflow::new("wf-cancel")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .unwrap();
+
+    let cancelled = sys
+        .cancel_workflows(&["wf-cancel".to_owned()], false)
+        .await
+        .unwrap();
+    assert_eq!(cancelled, ["wf-cancel"]);
+
+    let read = sys.get_workflow_status("wf-cancel").await.unwrap().unwrap();
+    assert_eq!(read.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        read.queue_name, None,
+        "a cancelled workflow must not dequeue"
+    );
+    assert_eq!(
+        read.deduplication_id, None,
+        "the key must be released, or it blocks a later workflow forever",
+    );
+    assert!(read.completed_at.is_some());
+
+    // The key is genuinely free again, and not merely absent from the row this test read.
+    let holders = sys
+        .list_workflows(&dbos::sysdb::types::WorkflowFilter {
+            deduplication_ids: vec!["dedup-1".to_owned()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        holders.is_empty(),
+        "the deduplication key should be held by nobody",
+    );
+}
+
+/// A finished workflow keeps its result; cancelling it is a no-op rather than an error.
+#[tokio::test]
+async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-done")))
+        .await
+        .unwrap();
+    sys.update_workflow_outcome("wf-done", WorkflowStatus::Success, Some("42"), None)
+        .await
+        .unwrap();
+
+    let cancelled = sys
+        .cancel_workflows(&["wf-done".to_owned()], false)
+        .await
+        .unwrap();
+    assert!(
+        cancelled.is_empty(),
+        "nothing moved, and the caller is told so",
+    );
+
+    let read = sys.get_workflow_status("wf-done").await.unwrap().unwrap();
+    assert_eq!(read.status, WorkflowStatus::Success);
+    assert_eq!(read.output.as_deref(), Some("42"), "the result survives");
+}
+
+/// The cascade reaches grandchildren, not just direct children.
+///
+/// A three-generation tree, because a two-generation one passes under any of the three
+/// implementations' strategies and so proves nothing about depth.
+#[tokio::test]
+async fn cancelling_children_descends_the_whole_tree() {
+    let (sys, _db) = sysdb().await;
+    for (id, parent) in [
+        ("wf-root", None),
+        ("wf-child", Some("wf-root")),
+        ("wf-grandchild", Some("wf-child")),
+        ("wf-unrelated", None),
+    ] {
+        let wf = NewWorkflow {
+            parent_workflow_id: parent.map(str::to_owned),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+            .await
+            .unwrap();
+    }
+
+    let mut cancelled = sys
+        .cancel_workflows(&["wf-root".to_owned()], true)
+        .await
+        .unwrap();
+    cancelled.sort();
+    assert_eq!(cancelled, ["wf-child", "wf-grandchild", "wf-root"]);
+
+    let untouched = sys
+        .get_workflow_status("wf-unrelated")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        untouched.status,
+        WorkflowStatus::Pending,
+        "the cascade must follow parentage, not cancel everything",
+    );
+
+    // Without the flag, only the root moves.
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-root2")))
+        .await
+        .unwrap();
+    let child = NewWorkflow {
+        parent_workflow_id: Some("wf-root2".to_owned()),
+        ..NewWorkflow::new("wf-child2")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&child))
+        .await
+        .unwrap();
+    let shallow = sys
+        .cancel_workflows(&["wf-root2".to_owned()], false)
+        .await
+        .unwrap();
+    assert_eq!(shallow, ["wf-root2"]);
+}
+
+/// Resuming re-enqueues and clears the counters that would sink the next attempt.
+#[tokio::test]
+async fn resuming_clears_the_attempt_count_and_the_deadline() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        deadline: Some(Timestamp::from_epoch_ms(1_000)),
+        ..workflow("wf-resume")
+    };
+    // Two recoveries, so there is a count to clear.
+    for _ in 0..2 {
+        sys.init_workflow_status(InitWorkflowStatus {
+            is_recovery: true,
+            ..InitWorkflowStatus::new(&wf)
+        })
+        .await
+        .unwrap();
+    }
+
+    let resumed = sys
+        .resume_workflows(&["wf-resume".to_owned()], None)
+        .await
+        .unwrap();
+    assert_eq!(resumed, ["wf-resume"]);
+
+    let read = sys.get_workflow_status("wf-resume").await.unwrap().unwrap();
+    assert_eq!(read.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        read.queue_name.as_deref(),
+        Some(dbos::sysdb::INTERNAL_QUEUE),
+        "no queue named means the internal one",
+    );
+    assert_eq!(read.recovery_attempts, 0);
+    assert_eq!(
+        read.deadline, None,
+        "a deadline set before parking would fail the fresh attempt at once",
+    );
+    assert_eq!(read.completed_at, None);
+
+    // A named queue is honoured.
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-resume2")))
+        .await
+        .unwrap();
+    sys.resume_workflows(&["wf-resume2".to_owned()], Some("orders"))
+        .await
+        .unwrap();
+    let read = sys
+        .get_workflow_status("wf-resume2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.queue_name.as_deref(), Some("orders"));
+}
+
+/// Resuming an id that does not exist says so; cancelling one does not.
+///
+/// The asymmetry is deliberate and is Python's. A zero-row update cannot tell "already finished"
+/// from "never existed", and only one of the two operations cares about the difference.
+#[tokio::test]
+async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow_status(InitWorkflowStatus::new(&workflow("wf-real")))
+        .await
+        .unwrap();
+
+    match sys
+        .resume_workflows(&["wf-real".to_owned(), "wf-ghost".to_owned()], None)
+        .await
+    {
+        Err(Error::NonExistentWorkflow { workflow_ids }) => {
+            assert_eq!(workflow_ids, ["wf-ghost"], "only the missing id is named");
+        }
+        other => panic!("expected a non-existent-workflow error, got {other:?}"),
+    }
+    let read = sys.get_workflow_status("wf-real").await.unwrap().unwrap();
+    assert_eq!(
+        read.status,
+        WorkflowStatus::Pending,
+        "the batch is rejected before anything moves",
+    );
+
+    let cancelled = sys
+        .cancel_workflows(&["wf-ghost".to_owned()], false)
+        .await
+        .expect("cancelling a missing workflow is a no-op, not an error");
+    assert!(cancelled.is_empty());
+}
+
+/// Attributes are replaced wholesale, and `None` clears them.
+#[tokio::test]
+async fn attributes_are_replaced_not_merged() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        attributes: Some(r#"{"tenant": "acme", "tier": "gold"}"#.to_owned()),
+        ..NewWorkflow::new("wf-attrs")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .unwrap();
+
+    sys.update_workflow_attributes("wf-attrs", Some(r#"{"tier": "silver"}"#))
+        .await
+        .unwrap();
+    let read = sys.get_workflow_status("wf-attrs").await.unwrap().unwrap();
+    let attributes = read.attributes.unwrap();
+    assert!(attributes.contains("silver"));
+    assert!(
+        !attributes.contains("acme"),
+        "a replacement drops keys the new value omits, got {attributes}",
+    );
+
+    sys.update_workflow_attributes("wf-attrs", None)
+        .await
+        .unwrap();
+    let read = sys.get_workflow_status("wf-attrs").await.unwrap().unwrap();
+    assert_eq!(read.attributes, None);
+}
+
+/// Values the database would accept but no caller meant are rejected before they are written.
+///
+/// Java validates the same list in its constructor. The cases here are the ones that would
+/// otherwise create a row nobody can act on: a workflow with no id, a queue named `""`, or a
+/// timeout that expires before the workflow starts.
+#[tokio::test]
+async fn empty_and_zero_values_are_rejected() {
+    let (sys, _db) = sysdb().await;
+    let cases: Vec<(&str, NewWorkflow)> = vec![
+        ("workflow_id", NewWorkflow::new("")),
+        (
+            "queue_name",
+            NewWorkflow {
+                queue_name: Some(String::new()),
+                ..NewWorkflow::new("wf-bad")
+            },
+        ),
+        (
+            "name",
+            NewWorkflow {
+                name: Some(String::new()),
+                ..NewWorkflow::new("wf-bad")
+            },
+        ),
+        (
+            "deduplication_id",
+            NewWorkflow {
+                deduplication_id: Some(String::new()),
+                ..NewWorkflow::new("wf-bad")
+            },
+        ),
+        (
+            "delay",
+            NewWorkflow {
+                delay: Some(std::time::Duration::ZERO),
+                ..NewWorkflow::new("wf-bad")
+            },
+        ),
+        (
+            "timeout",
+            NewWorkflow {
+                timeout: Some(std::time::Duration::ZERO),
+                ..NewWorkflow::new("wf-bad")
+            },
+        ),
+    ];
+
+    for (expected_field, wf) in cases {
+        match sys.init_workflow_status(InitWorkflowStatus::new(&wf)).await {
+            Err(Error::InvalidInput { field, .. }) => assert_eq!(
+                field, expected_field,
+                "the wrong field was blamed for {expected_field}",
+            ),
+            other => panic!("expected {expected_field} to be rejected, got {other:?}"),
+        }
+    }
+
+    // Nothing was written on the way to any of those errors.
+    let all = sys
+        .list_workflows(&dbos::sysdb::types::WorkflowFilter::default())
+        .await
+        .unwrap();
+    assert!(all.is_empty(), "a rejected workflow must leave no row");
+}
+
+/// An absent auth context is stored as NULL however the caller spelled it.
+///
+/// TypeScript and Go send `""` rather than null. Storing both spellings would make an
+/// `authenticated_user` filter miss rows another SDK wrote — so the empty string is normalised
+/// rather than rejected, which is the one place empty is not an error.
+#[tokio::test]
+async fn empty_auth_fields_are_normalised_to_null() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        authenticated_user: Some(String::new()),
+        assumed_role: Some(String::new()),
+        ..NewWorkflow::new("wf-auth")
+    };
+    sys.init_workflow_status(InitWorkflowStatus::new(&wf))
+        .await
+        .expect("empty auth fields are normalised, not rejected");
+
+    let read = sys.get_workflow_status("wf-auth").await.unwrap().unwrap();
+    assert_eq!(read.authenticated_user, None);
+    assert_eq!(read.assumed_role, None);
+}

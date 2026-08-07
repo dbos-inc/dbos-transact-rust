@@ -14,6 +14,12 @@
 /// application sharing the database has to agree.
 pub const DEFAULT_SCHEMA: &str = "dbos";
 
+/// The queue a workflow is resumed onto when the caller names none.
+///
+/// Every implementation uses this exact string, and a resumed workflow must land on a queue that
+/// another SDK's dequeuer also polls.
+pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
+
 pub mod migrations;
 pub mod postgres;
 pub mod retry;
@@ -47,6 +53,21 @@ pub enum Error {
         /// Which part disagreed, and how.
         detail: String,
     },
+    /// A caller supplied a value the layer will not store.
+    ///
+    /// Distinct from [`Error::Malformed`], which is about values already *in* the database.
+    /// This one never reaches the database at all.
+    InvalidInput {
+        /// The field at fault.
+        field: &'static str,
+        /// What was wrong with it.
+        detail: String,
+    },
+    /// One or more of the named workflows do not exist.
+    NonExistentWorkflow {
+        /// The ids with no row behind them.
+        workflow_ids: Vec<String>,
+    },
     /// The workflow has been recovered too many times and is now parked.
     MaxRecoveryAttemptsExceeded {
         /// The parked workflow.
@@ -65,6 +86,10 @@ impl std::fmt::Display for Error {
                 workflow_id,
                 detail,
             } => write!(f, "workflow {workflow_id} already exists: {detail}"),
+            Error::InvalidInput { field, detail } => write!(f, "invalid {field}: {detail}"),
+            Error::NonExistentWorkflow { workflow_ids } => {
+                write!(f, "no such workflow: {}", workflow_ids.join(", "))
+            }
             Error::MaxRecoveryAttemptsExceeded { workflow_id, limit } => write!(
                 f,
                 "workflow {workflow_id} exceeded {limit} recovery attempts"
@@ -224,6 +249,57 @@ pub trait SystemDatabase: Send + Sync {
     /// narrows. `WorkflowFilter::default()` therefore returns the whole table, and callers that
     /// mean to page should say so with [`WorkflowFilter::limit`].
     async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error>;
+
+    /// Cancels workflows, returning the ids that actually moved.
+    ///
+    /// A workflow that has already finished is left alone rather than reported as an error —
+    /// cancelling something that is already over is a no-op, not a mistake. The returned ids are
+    /// those that were still running, so a caller that needs to know can compare.
+    ///
+    /// Cancelling also clears the queue assignment, the deduplication key, and the start time,
+    /// so a cancelled workflow cannot be dequeued and cannot hold a deduplication key against a
+    /// later workflow that wants it.
+    ///
+    /// With `cancel_children`, the cascade **cancels each level before discovering the next**,
+    /// and repeats until it finds nothing new. Cancelling a parent first is what stops it
+    /// spawning more children behind the walk — Java's comment on the same loop reads "cancel
+    /// level-by-level so newly-spawned children are also caught".
+    ///
+    /// Go instead collects the whole subtree and cancels it in one statement. That is one round
+    /// trip rather than one per level, but it walks the tree while every workflow in it is still
+    /// running, so a child spawned during the walk is missed. Python and Java both interleave,
+    /// and this follows them.
+    async fn cancel_workflows(
+        &self,
+        workflow_ids: &[String],
+        cancel_children: bool,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Re-enqueues workflows, returning the ids that actually moved.
+    ///
+    /// Resuming clears the recovery-attempt count and the deadline: the workflow is being given
+    /// a fresh start, and holding it to a deadline set before it was parked would fail it
+    /// immediately. `queue_name` defaults to [`INTERNAL_QUEUE`].
+    ///
+    /// Unlike [`cancel_workflows`](Self::cancel_workflows), an id with no row behind it is an
+    /// [`Error::NonExistentWorkflow`]. The two differ because a zero-row update cannot tell
+    /// "already finished" from "never existed", and here the distinction matters: resuming an id
+    /// that was mistyped should say so rather than silently do nothing. Python draws the same
+    /// line, and for the same reason.
+    async fn resume_workflows(
+        &self,
+        workflow_ids: &[String],
+        queue_name: Option<&str>,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Replaces a workflow's attributes. `None` clears them.
+    ///
+    /// A replacement rather than a merge, matching every implementation.
+    async fn update_workflow_attributes(
+        &self,
+        workflow_id: &str,
+        attributes: Option<&str>,
+    ) -> Result<(), Error>;
 
     /// Records a terminal outcome, but only while the workflow is still running.
     ///
