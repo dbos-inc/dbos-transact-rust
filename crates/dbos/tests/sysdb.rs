@@ -2599,3 +2599,84 @@ async fn the_bulk_readers_return_notifications_events_and_streams() {
             .is_empty()
     );
 }
+
+/// Publishing a key writes the current value, a history row, and the step — or none of them.
+#[tokio::test]
+async fn set_event_publishes_a_value_and_its_history() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    sys.set_event("wf-publisher", 0, "progress", "50", Some("portable_json"))
+        .await
+        .unwrap();
+
+    let events = sys.get_all_events("wf-publisher").await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].key, "progress");
+    assert_eq!(events[0].value, "50");
+    assert_eq!(events[0].serialization.as_deref(), Some("portable_json"));
+
+    // The step is recorded under the name every implementation uses, so a workflow replayed by
+    // another SDK finds what it expects rather than an `UnexpectedStep`.
+    let step = sys
+        .check_step("wf-publisher", 0, "DBOS.setEvent")
+        .await
+        .unwrap()
+        .expect("setting an event is a step");
+    assert_eq!(step.step_name, "DBOS.setEvent");
+
+    // Setting the same key again from a later step replaces the value and adds history.
+    sys.set_event("wf-publisher", 1, "progress", "100", None)
+        .await
+        .unwrap();
+    let events = sys.get_all_events("wf-publisher").await.unwrap();
+    assert_eq!(events.len(), 1, "the current value is one row per key");
+    assert_eq!(events[0].value, "100");
+
+    let mut conn = db.admin_connection().await;
+    let history: Vec<(i32, String)> = sqlx::query_as(sqlx::AssertSqlSafe(
+        "SELECT function_id, value FROM dbos.workflow_events_history \
+         WHERE workflow_uuid = 'wf-publisher' AND key = 'progress' ORDER BY function_id",
+    ))
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        history,
+        [(0, "50".to_owned()), (1, "100".to_owned())],
+        "history keeps a row per step, which is what a fork copies forward",
+    );
+}
+
+/// A replayed publish is skipped, not repeated and not reported as a failure.
+#[tokio::test]
+async fn replaying_set_event_does_not_republish() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-replay"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.set_event("wf-replay", 0, "answer", "42", None)
+        .await
+        .unwrap();
+
+    // The same step id again — what a replay does. The recorded step short-circuits it, so the
+    // second value never lands.
+    sys.set_event("wf-replay", 0, "answer", "99", None)
+        .await
+        .expect("a replay is skipped, not an error");
+
+    let events = sys.get_all_events("wf-replay").await.unwrap();
+    assert_eq!(events[0].value, "42", "the replay must not overwrite");
+
+    // And the step check and the write are one commit: nothing partial is left behind.
+    let mut conn = db.admin_connection().await;
+    let rows: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(
+        "SELECT count(*) FROM dbos.workflow_events_history WHERE workflow_uuid = 'wf-replay'",
+    ))
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(rows.0, 1, "the replay added no history row either");
+}

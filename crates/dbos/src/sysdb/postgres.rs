@@ -219,6 +219,7 @@ struct Tables {
     application_versions: String,
     notifications: String,
     workflow_events: String,
+    workflow_events_history: String,
     streams: String,
 }
 
@@ -231,6 +232,10 @@ impl Tables {
             application_versions: format!("{schema}.{}", quote_identifier("application_versions")),
             notifications: format!("{schema}.{}", quote_identifier("notifications")),
             workflow_events: format!("{schema}.{}", quote_identifier("workflow_events")),
+            workflow_events_history: format!(
+                "{schema}.{}",
+                quote_identifier("workflow_events_history")
+            ),
             streams: format!("{schema}.{}", quote_identifier("streams")),
         }
     }
@@ -354,6 +359,12 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
     })
 }
 
+/// The step name `set_event` records, which a replay compares against.
+///
+/// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
+/// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
+const SET_EVENT_STEP: &str = "DBOS.setEvent";
+
 /// Every column `version_from_row` reads.
 const VERSION_COLUMNS: &str = "version_id, version_name, version_timestamp, created_at";
 
@@ -442,6 +453,191 @@ fn workflow_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Erro
     })
 }
 impl PostgresSystemDatabase {
+    /// [`check_step`](SystemDatabase::check_step) against a caller's connection.
+    ///
+    /// Split out so a transaction can drive it: `set_event` has to check the step and write its
+    /// event in one commit, and a step record landing without the write would make a replay skip
+    /// the write and lose the event.
+    ///
+    /// Takes `&mut PgConnection` rather than a generic `PgExecutor` because that trait is
+    /// consumed by value — `record_step_on` issues two statements and needs to reborrow. A
+    /// transaction derefs to one, and the pool path acquires.
+    async fn check_step_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+    ) -> Result<Option<StepRecord>, Error> {
+        let workflow_table = &self.tables.workflow_status;
+        let steps_table = &self.tables.operation_outputs;
+        let (workflow_table, steps_table) = (workflow_table.as_str(), steps_table.as_str());
+        let step_columns = qualified_step_columns("o");
+        {
+            // One statement, so the status and the step come from a single snapshot. Two queries
+            // could straddle a cancellation — read PENDING, get cancelled, then replay a step of
+            // a cancelled workflow. Python avoids that by wrapping both in a transaction; the
+            // join gets the same consistency, and one round trip instead of two.
+            let row = sqlx::query(AssertSqlSafe(format!(
+                "SELECT s.status, {step_columns} \
+                 FROM {workflow_table} s \
+                 LEFT JOIN {steps_table} o \
+                   ON o.workflow_uuid = s.workflow_uuid AND o.function_id = $2 \
+                 WHERE s.workflow_uuid = $1"
+            )))
+            .bind(workflow_id)
+            .bind(step_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+
+            // No row at all means no such workflow — the outer table drives the join.
+            let Some(row) = row else {
+                return Err(Error::NonExistentWorkflow {
+                    workflow_ids: vec![workflow_id.to_owned()],
+                });
+            };
+            let status: String = row.try_get("status")?;
+            if status == WorkflowStatus::Cancelled.as_str() {
+                return Err(Error::WorkflowCancelled {
+                    workflow_id: workflow_id.to_owned(),
+                });
+            }
+
+            // `function_id` is `INT4 NOT NULL` in the table, so a NULL here can only mean the
+            // join found nothing: the step has not run.
+            if row.try_get::<Option<i32>, _>("function_id")?.is_none() {
+                return Ok(None);
+            }
+            let step = step_from_row(&row, workflow_id)?;
+
+            // The recorded name disagreeing means the workflow's code changed between runs, so
+            // this position no longer holds the step that is asking for it.
+            if step.step_name != step_name {
+                return Err(Error::UnexpectedStep {
+                    workflow_id: workflow_id.to_owned(),
+                    step_id,
+                    expected: step_name.to_owned(),
+                    recorded: step.step_name,
+                });
+            }
+            Ok(Some(step))
+        }
+    }
+
+    /// [`record_step`](SystemDatabase::record_step) against a caller's connection.
+    ///
+    /// One argument over clippy's threshold, and deliberately: it is the trait method's own
+    /// parameter list plus the connection. Grouping them into a struct here would mean either a
+    /// type used in one place or changing the public signature to match, and that signature was
+    /// chosen so a caller does not allocate.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_step_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        outcome: Outcome<'_>,
+        serialization: Option<&str>,
+        timing: Option<StepTiming>,
+    ) -> Result<(), Error> {
+        if workflow_id.is_empty() {
+            return Err(Error::InvalidInput {
+                field: "workflow_id",
+                detail: "must not be empty".to_owned(),
+            });
+        }
+        if step_id < 0 {
+            return Err(Error::InvalidInput {
+                field: "step_id",
+                detail: "must not be negative".to_owned(),
+            });
+        }
+        let workflow_table = &self.tables.workflow_status;
+        let steps_table = &self.tables.operation_outputs;
+        let (workflow_table, steps_table) = (workflow_table.as_str(), steps_table.as_str());
+        let executor_id = self.executor_id.as_deref();
+        // The sum type collapses to the two nullable columns only here, at the edge.
+        let (output, error) = outcome.columns();
+
+        {
+            // The step goes in first, and the executor claim follows only if this caller won.
+            // Order is what makes two statements safe here: a crash between them leaves a
+            // recorded step under a stale executor marker, which the next step corrects. The
+            // reverse order — claim, then record — leaves a workflow attributed to an executor
+            // with no step to show for it, and nothing later fixes that.
+            //
+            // And it is why this is not a transaction, which the ordering makes unnecessary. The
+            // references split on exactly this line: Python claims before inserting and so wraps
+            // both in `engine.begin()`; Java and TypeScript claim after winning and use a plain
+            // connection, as here. A transaction would only hold a `workflow_status` row lock
+            // across two round trips.
+            //
+            // The gap it would close is already covered. A *retryable* failure on the second
+            // statement re-runs this closure, the insert returns our own completion time, and
+            // the claim runs again. A *permanent* one returns an error with the step recorded —
+            // and a caller retrying with the same `StepTiming` is recognised as its own write.
+            //
+            // `DO UPDATE` setting a column to itself rather than `DO NOTHING`: the point is to
+            // make `RETURNING` fire on conflict, so the stored completion comes back and can be
+            // compared. `DO NOTHING` returns no row, which cannot tell a rival execution from
+            // this caller's own retry. Python and TypeScript use the same trick; Java uses
+            // `DO NOTHING` and so silently accepts a duplicate.
+            //
+            // `Option<Option<i64>>`: the outer is "was there a row", the inner is the column,
+            // which is nullable because a caller may record a step without timings.
+            let stored: Option<Option<i64>> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, output, \
+                 error, serialization, started_at_epoch_ms, completed_at_epoch_ms) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
+                 SET completed_at_epoch_ms = {steps_table}.completed_at_epoch_ms \
+                 RETURNING completed_at_epoch_ms"
+            )))
+            .bind(workflow_id)
+            .bind(step_id)
+            .bind(step_name)
+            .bind(output)
+            .bind(error)
+            .bind(serialization)
+            .bind(timing.map(|t| t.started_at.as_epoch_ms()))
+            .bind(timing.map(|t| t.completed_at.as_epoch_ms()))
+            .fetch_optional(&mut *conn)
+            .await?;
+
+            // The stored completion is ours when it matches, and when neither side has one:
+            // without timings we already accept the duplicate as ours, so the claim below has to
+            // follow the same reading. A value that differs is another execution's.
+            let ours = stored.flatten() == timing.map(|t| t.completed_at.as_epoch_ms());
+            if !ours {
+                return Err(Error::StepAlreadyRecorded {
+                    workflow_id: workflow_id.to_owned(),
+                    step_id,
+                });
+            }
+
+            // Winning the checkpoint is what proves this executor is advancing the workflow, so
+            // the claim is conditional on it — an executor that recovered a workflow from a dead
+            // peer takes ownership here, and one that lost the race does not. Java guards the
+            // same write with `if (won)`; TypeScript's comment reads "Winning the checkpoint
+            // proves this executor is advancing the workflow". Python re-stamps unconditionally
+            // and beforehand, which claims workflows it has just lost.
+            //
+            // Skipped when this process has no id, as Python does.
+            if let Some(executor_id) = executor_id {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {workflow_table} SET executor_id = $2 \
+                     WHERE workflow_uuid = $1 AND executor_id IS DISTINCT FROM $2"
+                )))
+                .bind(workflow_id)
+                .bind(executor_id)
+                .execute(&mut *conn)
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Cancels one batch, returning the ids that were still running.
     ///
     /// Not retried in here, and not reading its own clock. Both belong to the trait method that
@@ -1342,62 +1538,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         step_name: &str,
     ) -> Result<Option<StepRecord>, Error> {
-        let workflow_table = &self.tables.workflow_status;
-        let steps_table = &self.tables.operation_outputs;
-        let (workflow_table, steps_table, pool) =
-            (workflow_table.as_str(), steps_table.as_str(), &self.pool);
-
-        let step_columns = qualified_step_columns("o");
-        let step_columns = step_columns.as_str();
-
+        let pool = &self.pool;
         with_retry(&self.retry, "check_step", move || async move {
-            // One statement, so the status and the step come from a single snapshot. Two queries
-            // could straddle a cancellation — read PENDING, get cancelled, then replay a step of
-            // a cancelled workflow. Python avoids that by wrapping both in a transaction; the
-            // join gets the same consistency, and one round trip instead of two.
-            let row = sqlx::query(AssertSqlSafe(format!(
-                "SELECT s.status, {step_columns} \
-                 FROM {workflow_table} s \
-                 LEFT JOIN {steps_table} o \
-                   ON o.workflow_uuid = s.workflow_uuid AND o.function_id = $2 \
-                 WHERE s.workflow_uuid = $1"
-            )))
-            .bind(workflow_id)
-            .bind(step_id)
-            .fetch_optional(pool)
-            .await?;
-
-            // No row at all means no such workflow — the outer table drives the join.
-            let Some(row) = row else {
-                return Err(Error::NonExistentWorkflow {
-                    workflow_ids: vec![workflow_id.to_owned()],
-                });
-            };
-            let status: String = row.try_get("status")?;
-            if status == WorkflowStatus::Cancelled.as_str() {
-                return Err(Error::WorkflowCancelled {
-                    workflow_id: workflow_id.to_owned(),
-                });
-            }
-
-            // `function_id` is `INT4 NOT NULL` in the table, so a NULL here can only mean the
-            // join found nothing: the step has not run.
-            if row.try_get::<Option<i32>, _>("function_id")?.is_none() {
-                return Ok(None);
-            }
-            let step = step_from_row(&row, workflow_id)?;
-
-            // The recorded name disagreeing means the workflow's code changed between runs, so
-            // this position no longer holds the step that is asking for it.
-            if step.step_name != step_name {
-                return Err(Error::UnexpectedStep {
-                    workflow_id: workflow_id.to_owned(),
-                    step_id,
-                    expected: step_name.to_owned(),
-                    recorded: step.step_name,
-                });
-            }
-            Ok(Some(step))
+            let mut conn = pool.acquire().await?;
+            self.check_step_on(&mut conn, workflow_id, step_id, step_name)
+                .await
         })
         .await
     }
@@ -1411,101 +1556,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         serialization: Option<&str>,
         timing: Option<StepTiming>,
     ) -> Result<(), Error> {
-        if workflow_id.is_empty() {
-            return Err(Error::InvalidInput {
-                field: "workflow_id",
-                detail: "must not be empty".to_owned(),
-            });
-        }
-        if step_id < 0 {
-            return Err(Error::InvalidInput {
-                field: "step_id",
-                detail: "must not be negative".to_owned(),
-            });
-        }
-        let workflow_table = &self.tables.workflow_status;
-        let steps_table = &self.tables.operation_outputs;
-        let (workflow_table, steps_table, pool) =
-            (workflow_table.as_str(), steps_table.as_str(), &self.pool);
-        let executor_id = self.executor_id.as_deref();
-        // The sum type collapses to the two nullable columns only here, at the edge.
-        let (output, error) = outcome.columns();
-
+        let pool = &self.pool;
         with_retry(&self.retry, "record_step", move || async move {
-            // The step goes in first, and the executor claim follows only if this caller won.
-            // Order is what makes two statements safe here: a crash between them leaves a
-            // recorded step under a stale executor marker, which the next step corrects. The
-            // reverse order — claim, then record — leaves a workflow attributed to an executor
-            // with no step to show for it, and nothing later fixes that.
-            //
-            // And it is why this is not a transaction, which the ordering makes unnecessary. The
-            // references split on exactly this line: Python claims before inserting and so wraps
-            // both in `engine.begin()`; Java and TypeScript claim after winning and use a plain
-            // connection, as here. A transaction would only hold a `workflow_status` row lock
-            // across two round trips.
-            //
-            // The gap it would close is already covered. A *retryable* failure on the second
-            // statement re-runs this closure, the insert returns our own completion time, and
-            // the claim runs again. A *permanent* one returns an error with the step recorded —
-            // and a caller retrying with the same `StepTiming` is recognised as its own write.
-            //
-            // `DO UPDATE` setting a column to itself rather than `DO NOTHING`: the point is to
-            // make `RETURNING` fire on conflict, so the stored completion comes back and can be
-            // compared. `DO NOTHING` returns no row, which cannot tell a rival execution from
-            // this caller's own retry. Python and TypeScript use the same trick; Java uses
-            // `DO NOTHING` and so silently accepts a duplicate.
-            //
-            // `Option<Option<i64>>`: the outer is "was there a row", the inner is the column,
-            // which is nullable because a caller may record a step without timings.
-            let stored: Option<Option<i64>> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, output, \
-                 error, serialization, started_at_epoch_ms, completed_at_epoch_ms) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
-                 SET completed_at_epoch_ms = {steps_table}.completed_at_epoch_ms \
-                 RETURNING completed_at_epoch_ms"
-            )))
-            .bind(workflow_id)
-            .bind(step_id)
-            .bind(step_name)
-            .bind(output)
-            .bind(error)
-            .bind(serialization)
-            .bind(timing.map(|t| t.started_at.as_epoch_ms()))
-            .bind(timing.map(|t| t.completed_at.as_epoch_ms()))
-            .fetch_optional(pool)
-            .await?;
-
-            // The stored completion is ours when it matches, and when neither side has one:
-            // without timings we already accept the duplicate as ours, so the claim below has to
-            // follow the same reading. A value that differs is another execution's.
-            let ours = stored.flatten() == timing.map(|t| t.completed_at.as_epoch_ms());
-            if !ours {
-                return Err(Error::StepAlreadyRecorded {
-                    workflow_id: workflow_id.to_owned(),
-                    step_id,
-                });
-            }
-
-            // Winning the checkpoint is what proves this executor is advancing the workflow, so
-            // the claim is conditional on it — an executor that recovered a workflow from a dead
-            // peer takes ownership here, and one that lost the race does not. Java guards the
-            // same write with `if (won)`; TypeScript's comment reads "Winning the checkpoint
-            // proves this executor is advancing the workflow". Python re-stamps unconditionally
-            // and beforehand, which claims workflows it has just lost.
-            //
-            // Skipped when this process has no id, as Python does.
-            if let Some(executor_id) = executor_id {
-                sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} SET executor_id = $2 \
-                     WHERE workflow_uuid = $1 AND executor_id IS DISTINCT FROM $2"
-                )))
-                .bind(workflow_id)
-                .bind(executor_id)
-                .execute(pool)
-                .await?;
-            }
-            Ok(())
+            let mut conn = pool.acquire().await?;
+            self.record_step_on(
+                &mut conn,
+                workflow_id,
+                step_id,
+                step_name,
+                outcome,
+                serialization,
+                timing,
+            )
+            .await
         })
         .await
     }
@@ -1539,6 +1602,83 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
             let rows = q.build().fetch_all(pool).await?;
             rows.iter().map(|r| step_from_row(r, workflow_id)).collect()
+        })
+        .await
+    }
+
+    async fn set_event(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        key: &str,
+        value: &str,
+        serialization: Option<&str>,
+    ) -> Result<(), Error> {
+        let events = &self.tables.workflow_events;
+        let history = &self.tables.workflow_events_history;
+        let (events, history, pool) = (events.as_str(), history.as_str(), &self.pool);
+        // Fixed before the retry, like every other step token: a second attempt is recording the
+        // same step, and a fresh clock reading would look like a rival execution.
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "set_event", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // A replay that already published this key must not publish it again — and must not
+            // be told it failed either.
+            if self
+                .check_step_on(&mut tx, workflow_id, step_id, SET_EVENT_STEP)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+
+            // The current value, which is what a reader sees.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {events} (workflow_uuid, key, value, serialization) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (workflow_uuid, key) DO UPDATE \
+                 SET value = EXCLUDED.value, serialization = EXCLUDED.serialization"
+            )))
+            .bind(workflow_id)
+            .bind(key)
+            .bind(value)
+            .bind(serialization)
+            .execute(&mut *tx)
+            .await?;
+
+            // The per-step history, which is what a fork copies forward.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {history} (workflow_uuid, function_id, key, value, serialization) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (workflow_uuid, key, function_id) DO UPDATE \
+                 SET value = EXCLUDED.value, serialization = EXCLUDED.serialization"
+            )))
+            .bind(workflow_id)
+            .bind(step_id)
+            .bind(key)
+            .bind(value)
+            .bind(serialization)
+            .execute(&mut *tx)
+            .await?;
+
+            self.record_step_on(
+                &mut tx,
+                workflow_id,
+                step_id,
+                SET_EVENT_STEP,
+                Outcome::Output(None),
+                None,
+                Some(timing),
+            )
+            .await?;
+
+            tx.commit().await?;
+            Ok(())
         })
         .await
     }

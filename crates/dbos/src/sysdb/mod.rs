@@ -303,6 +303,29 @@ pub trait SystemDatabase: Send + Sync {
         offset: Option<i64>,
     ) -> Result<Vec<StepRecord>, Error>;
 
+    /// Publishes a key/value on a workflow, for another workflow to read.
+    ///
+    /// Writes **three** rows in one transaction: the current value in `workflow_events`, a
+    /// per-step row in `workflow_events_history`, and the step record. The transaction is not
+    /// optional — if the step record committed without the event write, a replay would find the
+    /// step already done, skip the write, and lose the value permanently.
+    ///
+    /// `step_id` is required rather than optional because `workflow_events_history` keys on it:
+    /// `(workflow_uuid, key, function_id)` is its primary key and the column is `NOT NULL`, so
+    /// there is no history row to write without one. TypeScript reaches the same place by
+    /// rejecting `DBOS.setEvent` outside a workflow.
+    ///
+    /// Setting the same key twice replaces the current value and adds a history row, so the
+    /// history is what a fork copies forward and the current value is what a reader sees.
+    async fn set_event(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        key: &str,
+        value: &str,
+        serialization: Option<&str>,
+    ) -> Result<(), Error>;
+
     /// Every message sent to a workflow, oldest first, consumed or not.
     ///
     /// Receiving marks `consumed` rather than deleting, so this reports what a workflow was sent
