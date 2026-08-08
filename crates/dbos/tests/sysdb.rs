@@ -598,7 +598,13 @@ async fn a_killed_connection_is_waited_out() {
         pool,
         &Settings {
             retry: RetryPolicy {
+                // Capped, not just shortened. With the default 60s ceiling the delays double
+                // past the deadline below — 50ms, 100ms, … 12.8s, 25.6s — which passes alone and
+                // fails under the parallel Cockroach run, where more attempts miss before the
+                // pool settles. Backoff *growth* is unit-tested in `retry`; this test is about
+                // recovering at all.
                 initial_backoff: std::time::Duration::from_millis(50),
+                max_backoff: std::time::Duration::from_millis(200),
                 ..RetryPolicy::default()
             },
             ..Settings::default()
@@ -2501,4 +2507,95 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
         "re-registering must not mint a new id or reset the promotion",
     );
     assert_eq!(again.version_timestamp, promoted);
+}
+
+/// The bulk readers report everything a workflow was sent, published, and streamed.
+///
+/// Written with raw SQL because nothing yet *writes* these tables — `send`, `set_event`, and
+/// `write_stream` are the rest of 3.5 — so this pins the read shape ahead of them rather than
+/// waiting.
+#[tokio::test]
+async fn the_bulk_readers_return_notifications_events_and_streams() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-bulk"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    let mut conn = db.admin_connection().await;
+
+    for sql in [
+        "INSERT INTO dbos.notifications (message_uuid, destination_uuid, topic, message, \
+         serialization, created_at_epoch_ms, consumed) \
+         VALUES ('msg-2', 'wf-bulk', 'orders', '\"second\"', 'portable_json', 2000, false), \
+                ('msg-1', 'wf-bulk', NULL, '\"first\"', NULL, 1000, true)",
+        "INSERT INTO dbos.workflow_events (workflow_uuid, key, value, serialization) \
+         VALUES ('wf-bulk', 'progress', '50', 'portable_json'), ('wf-bulk', 'answer', '42', NULL)",
+        "INSERT INTO dbos.streams (workflow_uuid, key, \"offset\", value, serialization, \
+         function_id) \
+         VALUES ('wf-bulk', 'log', 1, '\"b\"', NULL, 7), \
+                ('wf-bulk', 'log', 0, '\"a\"', 'portable_json', 3), \
+                ('wf-bulk', 'audit', 0, '\"x\"', NULL, 3)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Oldest first, and a consumed message is still reported.
+    let notifications = sys.get_all_notifications("wf-bulk").await.unwrap();
+    assert_eq!(notifications.len(), 2);
+    assert_eq!(notifications[0].message_uuid, "msg-1");
+    assert_eq!(notifications[0].message, "\"first\"");
+    assert_eq!(notifications[0].topic, None, "the default topic is NULL");
+    assert!(
+        notifications[0].consumed,
+        "receiving marks rather than deletes, so this must still be visible",
+    );
+    assert_eq!(notifications[1].topic.as_deref(), Some("orders"));
+    assert_eq!(
+        notifications[1].serialization.as_deref(),
+        Some("portable_json")
+    );
+
+    let events = sys.get_all_events("wf-bulk").await.unwrap();
+    assert_eq!(
+        events.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+        ["answer", "progress"],
+    );
+    assert_eq!(events[0].value, "42");
+    assert_eq!(events[0].serialization, None);
+
+    // Grouped by key, then in stream order — which the insertion order deliberately is not.
+    let entries = sys.get_all_stream_entries("wf-bulk").await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.key.as_str(), e.offset))
+            .collect::<Vec<_>>(),
+        [("audit", 0), ("log", 0), ("log", 1)],
+    );
+    assert_eq!(entries[1].value, "\"a\"");
+    // The step that wrote each entry, which a fork uses to decide what to carry forward.
+    assert_eq!(
+        entries.iter().map(|e| e.step_id).collect::<Vec<_>>(),
+        [3, 3, 7],
+    );
+
+    // A workflow with none of any reads as empty rather than failing.
+    sys.init_workflow(&workflow("wf-quiet"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    assert!(
+        sys.get_all_notifications("wf-quiet")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(sys.get_all_events("wf-quiet").await.unwrap().is_empty());
+    assert!(
+        sys.get_all_stream_entries("wf-quiet")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

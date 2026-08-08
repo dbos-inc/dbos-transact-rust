@@ -33,8 +33,9 @@ use async_trait::async_trait;
 pub use error::{BackendError, BackendErrorKind, Error};
 
 use types::{
-    NewWorkflow, Outcome, OutcomeWrite, StepRecord, StepTiming, Submission, Timestamp, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
+    EventRecord, NewWorkflow, NotificationRecord, Outcome, OutcomeWrite, StepRecord, StepTiming,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowInitResult, WorkflowRecord,
 };
 
 /// Everything the engine needs from the system database.
@@ -301,6 +302,24 @@ pub trait SystemDatabase: Send + Sync {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<StepRecord>, Error>;
+
+    /// Every message sent to a workflow, oldest first, consumed or not.
+    ///
+    /// Receiving marks `consumed` rather than deleting, so this reports what a workflow was sent
+    /// and not merely what is still waiting. Export and audit want the former.
+    async fn get_all_notifications(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<NotificationRecord>, Error>;
+
+    /// Every key a workflow has published, with its current value.
+    ///
+    /// The *current* value: `set_event` upserts, so a key set twice appears once. The per-step
+    /// history lives in `workflow_events_history`, which this does not read.
+    async fn get_all_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>, Error>;
+
+    /// Every stream entry a workflow has written, grouped by key and in stream order.
+    async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error>;
 
     /// Registers an application version, or leaves an existing one alone.
     ///

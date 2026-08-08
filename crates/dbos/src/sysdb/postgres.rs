@@ -10,9 +10,9 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 use super::migrations::{self, quote_identifier};
 use super::retry::{RetryPolicy, with_retry};
 use super::types::{
-    NewWorkflow, Outcome, StepRecord, StepTiming, Submission, Timestamp, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms,
-    validate_attributes,
+    EventRecord, NewWorkflow, NotificationRecord, Outcome, StepRecord, StepTiming, StreamRecord,
+    Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus, duration_from_ms, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, OutcomeWrite,
@@ -217,6 +217,9 @@ struct Tables {
     workflow_status: String,
     operation_outputs: String,
     application_versions: String,
+    notifications: String,
+    workflow_events: String,
+    streams: String,
 }
 
 impl Tables {
@@ -226,6 +229,9 @@ impl Tables {
             workflow_status: format!("{schema}.{}", quote_identifier("workflow_status")),
             operation_outputs: format!("{schema}.{}", quote_identifier("operation_outputs")),
             application_versions: format!("{schema}.{}", quote_identifier("application_versions")),
+            notifications: format!("{schema}.{}", quote_identifier("notifications")),
+            workflow_events: format!("{schema}.{}", quote_identifier("workflow_events")),
+            streams: format!("{schema}.{}", quote_identifier("streams")),
         }
     }
 }
@@ -1533,6 +1539,100 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
             let rows = q.build().fetch_all(pool).await?;
             rows.iter().map(|r| step_from_row(r, workflow_id)).collect()
+        })
+        .await
+    }
+
+    async fn get_all_notifications(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<NotificationRecord>, Error> {
+        let table = &self.tables.notifications;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "get_all_notifications", move || async move {
+            // `consumed` rather than a delete on receive, so this reports everything the workflow
+            // was sent and not merely what is still waiting.
+            let rows = sqlx::query(AssertSqlSafe(format!(
+                "SELECT message_uuid, topic, message, serialization, created_at_epoch_ms, \
+                 consumed \
+                 FROM {table} WHERE destination_uuid = $1 ORDER BY created_at_epoch_ms"
+            )))
+            .bind(workflow_id)
+            .fetch_all(pool)
+            .await?;
+
+            rows.iter()
+                .map(|row| {
+                    Ok(NotificationRecord {
+                        message_uuid: row.try_get("message_uuid")?,
+                        topic: row.try_get("topic")?,
+                        message: row.try_get("message")?,
+                        serialization: row.try_get("serialization")?,
+                        created_at: Timestamp::from_epoch_ms(row.try_get("created_at_epoch_ms")?),
+                        consumed: row.try_get("consumed")?,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    async fn get_all_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>, Error> {
+        let table = &self.tables.workflow_events;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "get_all_events", move || async move {
+            // Ordered by key, which the table does not do for us: its primary key is
+            // `(workflow_uuid, key)`, so this is a range scan that happens to be sorted, but
+            // saying so keeps the result stable if that ever changes.
+            let rows = sqlx::query(AssertSqlSafe(format!(
+                "SELECT key, value, serialization FROM {table} \
+                 WHERE workflow_uuid = $1 ORDER BY key"
+            )))
+            .bind(workflow_id)
+            .fetch_all(pool)
+            .await?;
+
+            rows.iter()
+                .map(|row| {
+                    Ok(EventRecord {
+                        key: row.try_get("key")?,
+                        value: row.try_get("value")?,
+                        serialization: row.try_get("serialization")?,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+
+    async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error> {
+        let table = &self.tables.streams;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "get_all_stream_entries", move || async move {
+            // `"offset"` is quoted because it is a reserved word, and ordering by it is what
+            // makes the result a stream rather than a bag.
+            let rows = sqlx::query(AssertSqlSafe(format!(
+                "SELECT key, \"offset\", value, serialization, function_id FROM {table} \
+                 WHERE workflow_uuid = $1 ORDER BY key, \"offset\""
+            )))
+            .bind(workflow_id)
+            .fetch_all(pool)
+            .await?;
+
+            rows.iter()
+                .map(|row| {
+                    Ok(StreamRecord {
+                        key: row.try_get("key")?,
+                        offset: row.try_get("offset")?,
+                        value: row.try_get("value")?,
+                        serialization: row.try_get("serialization")?,
+                        step_id: row.try_get("function_id")?,
+                    })
+                })
+                .collect()
         })
         .await
     }

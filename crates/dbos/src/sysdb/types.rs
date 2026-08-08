@@ -941,3 +941,57 @@ pub struct VersionInfo {
     /// When the row was first written.
     pub created_at: Timestamp,
 }
+
+/// A message sent to a workflow, as `notifications` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRecord {
+    /// The message's identity, and the table's primary key.
+    ///
+    /// Defaulted by the database with `gen_random_uuid()`, so a sender never supplies one. It is
+    /// what a `recv` marks consumed, and the only thing distinguishing two identical messages on
+    /// the same topic.
+    pub message_uuid: String,
+    /// The topic it was sent on, or `None` for the default topic.
+    pub topic: Option<String>,
+    /// Encoded payload.
+    pub message: String,
+    /// How `message` is encoded.
+    pub serialization: Option<String>,
+    /// When it was sent.
+    pub created_at: Timestamp,
+    /// Whether a `recv` has taken it.
+    ///
+    /// Receiving marks rather than deletes, so a consumed message stays visible to export and to
+    /// anyone auditing what a workflow was sent.
+    pub consumed: bool,
+}
+
+/// A key/value a workflow published, as `workflow_events` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord {
+    /// The key it was published under.
+    pub key: String,
+    /// Encoded value.
+    pub value: String,
+    /// How `value` is encoded.
+    pub serialization: Option<String>,
+}
+
+/// One entry of a workflow's stream, as `streams` holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRecord {
+    /// The stream this entry belongs to.
+    pub key: String,
+    /// Position within that stream, counted from zero.
+    pub offset: i32,
+    /// Encoded value.
+    pub value: String,
+    /// How `value` is encoded.
+    pub serialization: Option<String>,
+    /// The step that wrote the entry. Column `function_id`.
+    ///
+    /// Added by migration 6 alongside `workflow_events_history`, "to enable tracking event
+    /// history by step ID and copying events during workflow forking" — so a fork can carry the
+    /// entries written before its start step and leave the rest behind.
+    pub step_id: i32,
+}
