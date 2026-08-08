@@ -10,8 +10,9 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 use super::migrations::{self, quote_identifier};
 use super::retry::{RetryPolicy, with_retry};
 use super::types::{
-    NewWorkflow, Outcome, StepRecord, StepTiming, Submission, Timestamp, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms, validate_attributes,
+    NewWorkflow, Outcome, StepRecord, StepTiming, Submission, Timestamp, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, OutcomeWrite,
@@ -215,6 +216,7 @@ impl PostgresSystemDatabase {
 struct Tables {
     workflow_status: String,
     operation_outputs: String,
+    application_versions: String,
 }
 
 impl Tables {
@@ -223,6 +225,7 @@ impl Tables {
         Self {
             workflow_status: format!("{schema}.{}", quote_identifier("workflow_status")),
             operation_outputs: format!("{schema}.{}", quote_identifier("operation_outputs")),
+            application_versions: format!("{schema}.{}", quote_identifier("application_versions")),
         }
     }
 }
@@ -342,6 +345,18 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
         Error::Malformed(format!(
             "authenticated_roles is not a JSON array of strings: {e}"
         ))
+    })
+}
+
+/// Every column `version_from_row` reads.
+const VERSION_COLUMNS: &str = "version_id, version_name, version_timestamp, created_at";
+
+fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
+    Ok(VersionInfo {
+        version_id: row.try_get("version_id")?,
+        version_name: row.try_get("version_name")?,
+        version_timestamp: Timestamp::from_epoch_ms(row.try_get("version_timestamp")?),
+        created_at: Timestamp::from_epoch_ms(row.try_get("created_at")?),
     })
 }
 
@@ -1519,6 +1534,99 @@ impl SystemDatabase for PostgresSystemDatabase {
             let rows = q.build().fetch_all(pool).await?;
             rows.iter().map(|r| step_from_row(r, workflow_id)).collect()
         })
+        .await
+    }
+
+    async fn create_application_version(&self, version_name: &str) -> Result<(), Error> {
+        let table = &self.tables.application_versions;
+        // Generated outside the retry, like every other identity here. It matters less than
+        // `owner_xid` does — the conflict is on `version_name`, so a retry with a fresh id is
+        // still a no-op — but the rule is worth keeping uniform.
+        let version_id = uuid::Uuid::new_v4().to_string();
+        let (table, pool, version_id) = (table.as_str(), &self.pool, version_id.as_str());
+
+        with_retry(
+            &self.retry,
+            "create_application_version",
+            move || async move {
+                // `DO NOTHING` on the name, not the id: launching the same version twice must
+                // register it once, and must not disturb the timestamp that decides which
+                // version is current.
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {table} (version_id, version_name) VALUES ($1, $2) \
+                     ON CONFLICT (version_name) DO NOTHING"
+                )))
+                .bind(version_id)
+                .bind(version_name)
+                .execute(pool)
+                .await?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error> {
+        let table = &self.tables.application_versions;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(
+            &self.retry,
+            "list_application_versions",
+            move || async move {
+                let rows = sqlx::query(AssertSqlSafe(format!(
+                    "SELECT {VERSION_COLUMNS} FROM {table} ORDER BY version_timestamp DESC"
+                )))
+                .fetch_all(pool)
+                .await?;
+                rows.iter().map(version_from_row).collect()
+            },
+        )
+        .await
+    }
+
+    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>, Error> {
+        let table = &self.tables.application_versions;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(
+            &self.retry,
+            "get_latest_application_version",
+            move || async move {
+                let row = sqlx::query(AssertSqlSafe(format!(
+                    "SELECT {VERSION_COLUMNS} FROM {table} \
+                     ORDER BY version_timestamp DESC LIMIT 1"
+                )))
+                .fetch_optional(pool)
+                .await?;
+                row.as_ref().map(version_from_row).transpose()
+            },
+        )
+        .await
+    }
+
+    async fn update_application_version_timestamp(
+        &self,
+        version_name: &str,
+        timestamp: Timestamp,
+    ) -> Result<(), Error> {
+        let table = &self.tables.application_versions;
+        let (table, pool) = (table.as_str(), &self.pool);
+
+        with_retry(
+            &self.retry,
+            "update_application_version_timestamp",
+            move || async move {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET version_timestamp = $2 WHERE version_name = $1"
+                )))
+                .bind(version_name)
+                .bind(timestamp.as_epoch_ms())
+                .execute(pool)
+                .await?;
+                Ok(())
+            },
+        )
         .await
     }
 

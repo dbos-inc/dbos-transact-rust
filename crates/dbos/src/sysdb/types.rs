@@ -924,3 +924,20 @@ pub struct WorkflowInitResult {
     /// recorded, but running it would be a second execution.
     pub should_execute: bool,
 }
+
+/// A registered version of the application.
+///
+/// The registry is what lets a firing schedule stamp the *latest* version, so only executors
+/// running that code dequeue it, and what `application_version` on a workflow row refers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionInfo {
+    /// Generated identity, distinct from the name.
+    pub version_id: String,
+    /// The version as the application names it — the value stored on workflow rows.
+    pub version_name: String,
+    /// Orders the registry: the latest version is the one with the highest value here, not the
+    /// one created most recently.
+    pub version_timestamp: Timestamp,
+    /// When the row was first written.
+    pub created_at: Timestamp,
+}

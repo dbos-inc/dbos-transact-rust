@@ -33,7 +33,7 @@ use async_trait::async_trait;
 pub use error::{BackendError, BackendErrorKind, Error};
 
 use types::{
-    NewWorkflow, Outcome, OutcomeWrite, StepRecord, StepTiming, Submission, Timestamp,
+    NewWorkflow, Outcome, OutcomeWrite, StepRecord, StepTiming, Submission, Timestamp, VersionInfo,
     WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
 };
 
@@ -301,6 +301,36 @@ pub trait SystemDatabase: Send + Sync {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<StepRecord>, Error>;
+
+    /// Registers an application version, or leaves an existing one alone.
+    ///
+    /// Idempotent on the name: launching the same version twice registers it once. The generated
+    /// `version_id` is not the identity callers use — `version_name` is, and it is what workflow
+    /// rows store.
+    async fn create_application_version(&self, version_name: &str) -> Result<(), Error>;
+
+    /// Every registered version, latest first.
+    async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error>;
+
+    /// The version with the highest timestamp, or `None` if none are registered.
+    ///
+    /// **Latest by `version_timestamp`, not by creation.** Moving a version's timestamp is how a
+    /// deployment is promoted or rolled back, which is what
+    /// [`update_application_version_timestamp`](Self::update_application_version_timestamp) is
+    /// for — so the newest row is not necessarily the current one.
+    ///
+    /// `None` rather than an error: an empty registry is what a database looks like before any
+    /// application has launched. Java also returns null here; Python and Go raise, because their
+    /// callers ask only where a version must already exist. That is a caller's invariant, not
+    /// this layer's, and it matches [`get_workflow`](Self::get_workflow) returning `None`.
+    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>, Error>;
+
+    /// Moves a version's timestamp, which is how the latest version is chosen.
+    async fn update_application_version_timestamp(
+        &self,
+        version_name: &str,
+        timestamp: Timestamp,
+    ) -> Result<(), Error>;
 
     /// Records that a step started a child workflow.
     ///

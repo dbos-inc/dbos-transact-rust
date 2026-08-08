@@ -2449,3 +2449,56 @@ async fn attributes_must_be_a_json_object() {
     // Nothing was written on the way to any of those errors.
     assert!(sys.get_workflow("wf-attr-bad").await.unwrap().is_none());
 }
+
+/// The version registry is idempotent on the name and ordered by timestamp, not by creation.
+#[tokio::test]
+async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
+    let (sys, _db) = sysdb().await;
+    assert_eq!(
+        sys.get_latest_application_version().await.unwrap(),
+        None,
+        "an empty registry is what a fresh database looks like, not an error",
+    );
+
+    sys.create_application_version("v1").await.unwrap();
+    sys.create_application_version("v2").await.unwrap();
+
+    // Registering the same name again is a no-op, not a second row.
+    sys.create_application_version("v1").await.unwrap();
+    let all = sys.list_application_versions().await.unwrap();
+    assert_eq!(all.len(), 2);
+
+    let latest = sys.get_latest_application_version().await.unwrap().unwrap();
+    assert_eq!(latest.version_name, "v2", "highest timestamp wins");
+
+    // Promoting v1 makes it current even though v2 was created later — which is the whole point
+    // of ordering on `version_timestamp` rather than `created_at`.
+    let promoted = Timestamp::from_epoch_ms(latest.version_timestamp.as_epoch_ms() + 60_000);
+    sys.update_application_version_timestamp("v1", promoted)
+        .await
+        .unwrap();
+
+    let latest = sys.get_latest_application_version().await.unwrap().unwrap();
+    assert_eq!(latest.version_name, "v1");
+    assert_eq!(latest.version_timestamp, promoted);
+
+    let all = sys.list_application_versions().await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|v| v.version_name.as_str())
+            .collect::<Vec<_>>(),
+        ["v1", "v2"],
+        "the list is latest-first, on the same ordering",
+    );
+
+    // The generated id is distinct from the name, and stable across a repeat registration.
+    let v1 = &all[0];
+    assert_ne!(v1.version_id, v1.version_name);
+    sys.create_application_version("v1").await.unwrap();
+    let again = sys.get_latest_application_version().await.unwrap().unwrap();
+    assert_eq!(
+        again.version_id, v1.version_id,
+        "re-registering must not mint a new id or reset the promotion",
+    );
+    assert_eq!(again.version_timestamp, promoted);
+}
