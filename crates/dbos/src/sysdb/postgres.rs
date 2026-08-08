@@ -2,6 +2,32 @@
 //!
 //! The pool lives here and is never exposed: the whole point of the trait is that callers
 //! cannot depend on which driver is underneath.
+//!
+//! # Logging
+//!
+//! Events go through `tracing` with structured fields rather than interpolated messages, and the
+//! crate installs no subscriber — a host chooses what to do with them.
+//!
+//! What gets logged is taken from the four references, which agree on the shape:
+//!
+//! - **`debug!` on a replay-or-run decision**, for any operation gated by a recorded step. Java
+//!   logs `"Replaying setEvent, workflow: {}, step: {}, key: {}"` against `"Running setEvent…"`,
+//!   Python the same pair, on `set_event`, `get_event`, `recv`, `sleep`, `send_bulk`, and
+//!   `write_stream`. It is the single most useful line when a workflow behaves oddly on recovery,
+//!   because it says which side of the replay the caller is on.
+//! - **`debug!` with a count** on anything that sweeps or acts in bulk — Go, Python and
+//!   TypeScript all log dequeue counts this way. A caller that asked for five and moved three
+//!   wants to know without a second query.
+//! - **`debug!` on a non-error outcome that changes what the caller should do**: a workflow
+//!   recorded but not claimed, an outcome another run already wrote.
+//! - **`warn!` before returning a conflict.** Java and TypeScript both warn that a step "was
+//!   already recorded" before throwing, because the error alone does not say which execution
+//!   lost.
+//!
+//! Two things deliberately absent. **No `error!`** — errors are returned, and Go and TypeScript
+//! logging them before returning double-reports every failure the caller then handles. And **no
+//! per-method entry logging**, which Java has (`debug("initWorkflowStatus workflowId {}")`) and
+//! nothing else does; a span belongs to the caller, not to every statement.
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
@@ -610,6 +636,12 @@ impl PostgresSystemDatabase {
             // follow the same reading. A value that differs is another execution's.
             let ours = stored.flatten() == timing.map(|t| t.completed_at.as_epoch_ms());
             if !ours {
+                tracing::warn!(
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    "step was already recorded by another execution"
+                );
                 return Err(Error::StepAlreadyRecorded {
                     workflow_id: workflow_id.to_owned(),
                     step_id,
@@ -979,14 +1011,22 @@ impl SystemDatabase for PostgresSystemDatabase {
                 });
             }
 
+            // Another owner holds the row and this is not a recovery, so recording it is right
+            // but running it would be a second execution.
+            let should_execute = !(owner_differs && !claiming && stored_owner.is_some());
+            if !should_execute {
+                tracing::debug!(
+                    workflow_id = workflow.workflow_id,
+                    "another owner holds this workflow; recorded but not claimed"
+                );
+            }
+
             Ok(WorkflowInitResult {
                 status,
                 recovery_attempts,
                 deadline: deadline.map(Timestamp::from_epoch_ms),
                 serialization,
-                // Another owner holds the row and this is not a recovery, so recording it is right
-                // but running it would be a second execution.
-                should_execute: !(owner_differs && !claiming && stored_owner.is_some()),
+                should_execute,
             })
         })
         .await
@@ -1229,6 +1269,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             Ok(if updated > 0 {
                 OutcomeWrite::Recorded
             } else {
+                tracing::debug!(
+                    workflow_id,
+                    "outcome not recorded; the workflow is no longer this run's to finish"
+                );
                 OutcomeWrite::AlreadyFinished
             })
         })
@@ -1366,6 +1410,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .execute(pool)
                 .await?
                 .rows_affected();
+                if moved > 0 {
+                    tracing::debug!(moved, "released delayed workflows");
+                }
                 Ok(moved)
             },
         )
@@ -1434,7 +1481,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             Ok(())
         })
         .await?;
-        Ok(cancelled.into_inner().expect("cancelled ids"))
+        let cancelled = cancelled.into_inner().expect("cancelled ids");
+        tracing::debug!(
+            requested = workflow_ids.len(),
+            cancelled = cancelled.len(),
+            cancel_children,
+            "cancelled workflows"
+        );
+        Ok(cancelled)
     }
 
     async fn resume_workflows(
@@ -1487,6 +1541,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(now)
             .fetch_all(pool)
             .await?;
+            tracing::debug!(
+                requested = workflow_ids.len(),
+                resumed = resumed.len(),
+                queue,
+                "resumed workflows"
+            );
             Ok(resumed)
         })
         .await
@@ -1527,6 +1587,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .execute(pool)
             .await?
             .rows_affected();
+            tracing::debug!(deleted, targets = targets.len(), "deleted workflows");
             Ok(deleted)
         })
         .await
@@ -1634,8 +1695,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?
                 .is_some()
             {
+                tracing::debug!(workflow_id, step_id, key, "replaying set_event");
                 return Ok(());
             }
+            tracing::debug!(workflow_id, step_id, key, "running set_event");
 
             // The current value, which is what a reader sees.
             sqlx::query(AssertSqlSafe(format!(
