@@ -38,9 +38,9 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    EventRecord, NewWorkflow, NotificationRecord, Outcome, StepRecord, StepTiming, StreamRecord,
-    Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, duration_from_ms, validate_attributes,
+    EventRecord, Fork, ForkOptions, NewWorkflow, NotificationRecord, Outcome, StepRecord,
+    StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, duration_from_ms, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, OutcomeWrite,
@@ -1645,6 +1645,229 @@ impl SystemDatabase for PostgresSystemDatabase {
             .rows_affected();
             tracing::debug!(deleted, targets = targets.len(), "deleted workflows");
             Ok(deleted)
+        })
+        .await
+    }
+
+    async fn fork_workflows(
+        &self,
+        forks: &[Fork<'_>],
+        options: &ForkOptions<'_>,
+    ) -> Result<Vec<String>, Error> {
+        if forks.is_empty() {
+            return Ok(Vec::new());
+        }
+        options.validate()?;
+        for fork in forks {
+            fork.validate()?;
+        }
+
+        // Generated **outside** the retry, like `init_workflow`'s owner identity and for the same
+        // reason: a fresh id on the second attempt would not recognise the first attempt's write,
+        // so a lost commit acknowledgement would fork every workflow twice.
+        let forked_ids: Vec<String> = forks
+            .iter()
+            .map(|f| {
+                f.forked_id
+                    .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned)
+            })
+            .collect();
+
+        // The batch is passed as three parallel arrays and reassembled server-side by `unnest`,
+        // so the SQL text is the same whatever the caller passes: the server can reuse a plan,
+        // and a large batch cannot grow a statement without bound.
+        //
+        // **A deliberate divergence.** None of the references map the batch this way — Python
+        // unions a `SELECT literal(...)` per fork, Go does the same with casts, and TypeScript
+        // builds a `VALUES` CTE, all three emitting SQL that grows a row per workflow. The
+        // construct is not exotic, though: Python and TypeScript both `unnest` a `text[]` to
+        // batch `pg_notify`. What is new is unnesting three arrays in parallel, which is why it
+        // is checked against CockroachDB as well as PostgreSQL rather than assumed portable.
+        //
+        // Mismatched lengths would pad with `NULL` rather than fail, so the three are built from
+        // one iteration of `forks` and cannot disagree — which is also why [`Fork`] is a struct
+        // per workflow and not three slices.
+        let source_ids: Vec<&str> = forks.iter().map(|f| f.source_id).collect();
+        let start_steps: Vec<i32> = forks.iter().map(|f| f.start_step).collect();
+        // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's
+        // guard, not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`,
+        // and with steps_table numbered from zero the latter drops step 0 from every fork that resumes
+        // at step 1 — the fork then re-runs a step it was given the result of.
+        let copies_anything = start_steps.iter().any(|&step| step > 0);
+
+        let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
+        // Reported rather than saturated, following `Timestamp::checked_add` and the rule stated
+        // on `to_system_time`: a value this layer cannot store is the caller's to hear about, not
+        // one to quietly replace with a different timeout.
+        let timeout_ms = match options.timeout.map(|t| i64::try_from(t.as_millis())) {
+            None => None,
+            Some(Ok(ms)) => Some(ms),
+            Some(Err(_)) => {
+                return Err(Error::InvalidInput {
+                    field: "timeout",
+                    detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
+                });
+            }
+        };
+        let (replace_from, replace_to): (Vec<&str>, Vec<&str>) =
+            options.replacement_children.iter().copied().unzip();
+
+        let workflow_table = &self.tables.workflow_status;
+        let steps_table = &self.tables.operation_outputs;
+        let events_table = &self.tables.workflow_events;
+        let history_table = &self.tables.workflow_events_history;
+        let streams_table = &self.tables.streams;
+        let (workflow_table, steps_table, events_table, history_table, streams_table) = (
+            workflow_table.as_str(),
+            steps_table.as_str(),
+            events_table.as_str(),
+            history_table.as_str(),
+            streams_table.as_str(),
+        );
+        let pool = &self.pool;
+        let (source_ids, forked_ids, start_steps) = (&source_ids, &forked_ids, &start_steps);
+        let (replace_from, replace_to) = (&replace_from, &replace_to);
+
+        with_retry(&self.retry, "fork_workflows", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // Every source must exist before anything is written. A batch that forked the
+            // workflows it could find would leave a caller holding ids for forks that are not
+            // there, with nothing to say which.
+            let found: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
+            )))
+            .bind(source_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            let missing: Vec<String> = source_ids
+                .iter()
+                .filter(|id| !found.iter().any(|f| f == *id))
+                .map(|id| (*id).to_owned())
+                .collect();
+            if !missing.is_empty() {
+                return Err(Error::NonExistentWorkflow {
+                    workflow_ids: missing,
+                });
+            }
+
+            // The fork inherits its source's identity and starts enqueued. `application_version`
+            // falls back to the source's, matching Go and TypeScript: a fork stamped with no
+            // version would be invisible to the recovery that scopes by it.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {workflow_table} (workflow_uuid, status, name, class_name, config_name, \
+                    application_version, application_id, authenticated_user, authenticated_roles, \
+                    assumed_role, inputs, serialization, request, queue_name, \
+                    queue_partition_key, forked_from, attributes, workflow_timeout_ms) \
+                 SELECT m.fork_id, 'ENQUEUED', w.name, w.class_name, w.config_name, \
+                    COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
+                    w.authenticated_roles, w.assumed_role, w.inputs, w.serialization, w.request, \
+                    $5, $6, w.workflow_uuid, w.attributes, $7 \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 JOIN {workflow_table} w ON w.workflow_uuid = m.source_id"
+            )))
+            .bind(source_ids)
+            .bind(forked_ids)
+            .bind(start_steps)
+            .bind(options.application_version)
+            .bind(queue_name)
+            .bind(options.queue_partition_key)
+            .bind(timeout_ms)
+            .execute(&mut *tx)
+            .await?;
+
+            // What makes a source discoverable as a fork point afterwards.
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {workflow_table} SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)"
+            )))
+            .bind(source_ids)
+            .execute(&mut *tx)
+            .await?;
+
+            if copies_anything {
+                // The recorded steps_table, which are what the fork replays instead of running. The
+                // `CASE` rewrites recorded children when the caller is forking a whole tree;
+                // with no replacements it collapses to the original column.
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {steps_table} (workflow_uuid, function_id, output, error, \
+                        serialization, function_name, child_workflow_id, started_at_epoch_ms, \
+                        completed_at_epoch_ms) \
+                     SELECT m.fork_id, o.function_id, o.output, o.error, o.serialization, \
+                        o.function_name, \
+                        COALESCE(r.replacement, o.child_workflow_id), \
+                        o.started_at_epoch_ms, o.completed_at_epoch_ms \
+                     FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                     JOIN {steps_table} o \
+                       ON o.workflow_uuid = m.source_id AND o.function_id < m.start_step \
+                     LEFT JOIN unnest($4::text[], $5::text[]) AS r(original, replacement) \
+                       ON r.original = o.child_workflow_id"
+                )))
+                .bind(source_ids)
+                .bind(forked_ids)
+                .bind(start_steps)
+                .bind(replace_from)
+                .bind(replace_to)
+                .execute(&mut *tx)
+                .await?;
+
+                // The per-step event history_table, bounded the same way.
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {history_table} (workflow_uuid, function_id, key, value, serialization) \
+                     SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization \
+                     FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                     JOIN {history_table} h \
+                       ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step"
+                )))
+                .bind(source_ids)
+                .bind(forked_ids)
+                .bind(start_steps)
+                .execute(&mut *tx)
+                .await?;
+
+                // The current value of each key, rebuilt from the history_table rather than copied
+                // from the source's `workflow_events`. The source's current value may have been
+                // set *after* the fork point, and a fork must not see the future.
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {events_table} (workflow_uuid, key, value, serialization) \
+                     SELECT fork_id, key, value, serialization FROM ( \
+                       SELECT m.fork_id, h.key, h.value, h.serialization, \
+                              row_number() OVER (PARTITION BY m.fork_id, h.key \
+                                                 ORDER BY h.function_id DESC) AS rn \
+                       FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                       JOIN {history_table} h \
+                         ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step \
+                     ) latest WHERE rn = 1"
+                )))
+                .bind(source_ids)
+                .bind(forked_ids)
+                .bind(start_steps)
+                .execute(&mut *tx)
+                .await?;
+
+                // Stream entries written before the fork point, so a reader replaying the fork
+                // sees the same stream the original had produced by then.
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {streams_table} (workflow_uuid, function_id, key, value, \
+                        serialization, \"offset\") \
+                     SELECT m.fork_id, s.function_id, s.key, s.value, s.serialization, s.\"offset\" \
+                     FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                     JOIN {streams_table} s \
+                       ON s.workflow_uuid = m.source_id AND s.function_id < m.start_step"
+                )))
+                .bind(source_ids)
+                .bind(forked_ids)
+                .bind(start_steps)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            tracing::info!(
+                count = forks.len(),
+                queue_name,
+                "forked workflows onto the queue"
+            );
+            Ok(forked_ids.clone())
         })
         .await
     }

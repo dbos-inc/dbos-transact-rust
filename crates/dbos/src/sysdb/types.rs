@@ -42,6 +42,15 @@ impl Timestamp {
     }
 
     /// The current time, truncated to milliseconds.
+    ///
+    /// The `as` cast is safe by construction rather than by luck: it narrows a `u128` of
+    /// milliseconds since 1970, which does not reach `i64::MAX` until the year 292{,}277{,}024.
+    /// Elsewhere a caller supplies the duration and the conversion has to report — see
+    /// [`checked_add`](Self::checked_add) — but here the clock supplies it.
+    ///
+    /// A clock set before 1970 gives the epoch rather than panicking. That is the lesser wrong:
+    /// the timestamps this layer writes are for ordering and display, and a machine with a broken
+    /// clock should record misleading times rather than fail every workflow it touches.
     pub fn now() -> Self {
         Self(
             SystemTime::now()
@@ -61,11 +70,21 @@ impl Timestamp {
             .map(|ms| UNIX_EPOCH + Duration::from_millis(ms))
     }
 
-    /// Converts from a `SystemTime`, or `None` if it precedes the epoch.
+    /// Converts from a `SystemTime`, or `None` if it cannot be stored.
+    ///
+    /// Two ways it cannot: an instant before the epoch, and one so far after it that the
+    /// milliseconds overflow `i64`. Both report rather than saturate, for the reason given on
+    /// [`to_system_time`](Self::to_system_time) — a value this layer cannot hold is the caller's
+    /// to hear about, not one to replace with a different instant.
+    ///
+    /// The second case is reachable where [`now`](Self::now)'s is not: the instant comes from the
+    /// caller, and a `SystemTime` can hold seconds that do not survive being multiplied by a
+    /// thousand.
     pub fn from_system_time(time: SystemTime) -> Option<Self> {
         time.duration_since(UNIX_EPOCH)
             .ok()
-            .map(|d| Self(d.as_millis() as i64))
+            .and_then(|d| i64::try_from(d.as_millis()).ok())
+            .map(Self)
     }
 
     /// This instant plus a duration — a deadline from a start and a timeout.
@@ -478,6 +497,21 @@ mod tests {
         let t = Timestamp::from_epoch_ms(1_700_000_000_123);
         let round_tripped = Timestamp::from_system_time(t.to_system_time().unwrap()).unwrap();
         assert_eq!(round_tripped, t);
+    }
+
+    /// An instant this layer cannot store is reported, whichever side of the epoch it falls.
+    #[test]
+    fn an_unstorable_system_time_is_not_a_timestamp() {
+        assert_eq!(
+            Timestamp::from_system_time(UNIX_EPOCH - Duration::from_secs(1)),
+            None,
+            "before the epoch"
+        );
+        // Representable as a `SystemTime`, but not as milliseconds in an `i64`.
+        let far = UNIX_EPOCH
+            .checked_add(Duration::from_secs(i64::MAX as u64 / 100))
+            .expect("a SystemTime that far out is constructible");
+        assert_eq!(Timestamp::from_system_time(far), None, "too far after it");
     }
 
     /// A negative instant is reported rather than silently becoming 1970.
@@ -994,4 +1028,150 @@ pub struct StreamRecord {
     /// history by step ID and copying events during workflow forking" — so a fork can carry the
     /// entries written before its start step and leave the rest behind.
     pub step_id: i32,
+}
+
+/// One workflow to fork, and where its fork picks up.
+///
+/// A struct per fork rather than three parallel lists. Python takes `original_workflow_ids`,
+/// `forked_workflow_ids` and `start_steps` and raises when their lengths disagree; pairing them
+/// here means they cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fork<'a> {
+    /// The workflow to fork from. It is not modified beyond being marked as forked from.
+    pub source_id: &'a str,
+    /// The id the fork gets, or `None` to have one generated.
+    ///
+    /// Optional because Go and TypeScript both generate one when the caller does not care, and
+    /// the generated ids come back from [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    pub forked_id: Option<&'a str>,
+    /// The first step the fork will run.
+    ///
+    /// Every step *below* this is copied to the fork, so it replays them instead of running them.
+    /// Steps are numbered from zero, so `0` copies nothing and restarts the workflow from the
+    /// beginning, and `1` carries step 0 across.
+    ///
+    /// That last case is where the references disagree: TypeScript copies for any
+    /// `start_step > 0` and Python only for `step > 1`, so a Python fork from step 1 re-runs the
+    /// step it was given the result of. This follows TypeScript.
+    pub start_step: i32,
+}
+
+impl<'a> Fork<'a> {
+    /// A fork of `source_id` restarting from the beginning, with a generated id.
+    pub fn new(source_id: &'a str) -> Self {
+        Self {
+            source_id,
+            forked_id: None,
+            start_step: 0,
+        }
+    }
+
+    /// Rejects ids the schema cannot key on, matching [`NewWorkflow::validate`].
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        if self.source_id.is_empty() {
+            return Err(Error::InvalidInput {
+                field: "source_id",
+                detail: "must not be empty".to_owned(),
+            });
+        }
+        // `None` asks for one to be generated; `Some("")` is an id that cannot be looked up.
+        if self.forked_id == Some("") {
+            return Err(Error::InvalidInput {
+                field: "forked_id",
+                detail: "must be absent rather than empty".to_owned(),
+            });
+        }
+        if self.start_step < 0 {
+            return Err(Error::InvalidInput {
+                field: "start_step",
+                detail: "must not be negative".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// How forked workflows are created.
+///
+/// The defaults are what every implementation does when the caller says nothing: the fork is
+/// enqueued on the internal queue, inherits its source's version, and carries no timeout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForkOptions<'a> {
+    /// The version the fork runs under. `None` inherits the source's.
+    ///
+    /// Forking onto a *new* version is the point of the parameter: a workflow that failed on a
+    /// broken deployment is forked onto the fixed one.
+    pub application_version: Option<&'a str>,
+    /// The queue the fork is enqueued on. `None` means [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    ///
+    /// A fork is always enqueued rather than started: it is created by whoever asked for the
+    /// fork, and run by whichever executor picks it up.
+    pub queue_name: Option<&'a str>,
+    /// The partition of that queue.
+    pub queue_partition_key: Option<&'a str>,
+    /// How long the fork may run before it is cancelled.
+    ///
+    /// Java and TypeScript both carry this on their fork options; Python and Go do not.
+    pub timeout: Option<Duration>,
+    /// Child workflow ids to rewrite as the fork's steps are copied.
+    ///
+    /// When a tree of workflows is forked together, the parent's recorded children are the
+    /// *original* children — replaying them would make the fork adopt the originals rather than
+    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy. Python
+    /// and TypeScript both take this map; Go and Java do not.
+    pub replacement_children: &'a [(&'a str, &'a str)],
+}
+
+impl ForkOptions<'_> {
+    /// Applies the same rules [`NewWorkflow::validate`] applies to the same columns.
+    ///
+    /// Worth stating why an empty string is not simply treated as absent: the columns here are
+    /// `COALESCE`d against the source's, so `Some("")` would win over the value it was meant to
+    /// leave alone — a fork stamped with an empty version rather than its source's, and so
+    /// invisible to the recovery that scopes by version.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        for (field, value) in [
+            ("application_version", &self.application_version),
+            ("queue_name", &self.queue_name),
+            ("queue_partition_key", &self.queue_partition_key),
+        ] {
+            if *value == Some("") {
+                return Err(Error::InvalidInput {
+                    field,
+                    detail: "must be absent rather than empty".to_owned(),
+                });
+            }
+        }
+        // As on `NewWorkflow`: a zero timeout would expire the fork before it ran.
+        if self.timeout == Some(Duration::ZERO) {
+            return Err(Error::InvalidInput {
+                field: "timeout",
+                detail: "must be absent rather than zero".to_owned(),
+            });
+        }
+        // The replacements are applied by joining against them, so one child named twice would
+        // match a copied step twice and duplicate it. The primary key would catch that as a
+        // constraint violation, which says nothing about the map that caused it. Python and
+        // TypeScript build a `CASE` instead, which silently takes the first match — but two
+        // replacements for one child is a caller that does not know which it wants, and picking
+        // for them is worse than saying so.
+        for (index, (original, _)) in self.replacement_children.iter().enumerate() {
+            if original.is_empty() {
+                return Err(Error::InvalidInput {
+                    field: "replacement_children",
+                    detail: "a replaced child id must not be empty".to_owned(),
+                });
+            }
+            if self.replacement_children[..index]
+                .iter()
+                .any(|(earlier, _)| earlier == original)
+            {
+                return Err(Error::InvalidInput {
+                    field: "replacement_children",
+                    detail: format!("{original} is replaced more than once"),
+                });
+            }
+        }
+        Ok(())
+    }
 }

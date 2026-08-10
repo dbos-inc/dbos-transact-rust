@@ -5,10 +5,10 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission, Timestamp, WorkflowDelay,
-    WorkflowStatus,
+    Fork, ForkOptions, NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission, Timestamp,
+    WorkflowDelay, WorkflowStatus,
 };
-use dbos::sysdb::{BackendErrorKind, Error, SystemDatabase};
+use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
 use support::test_database;
 
@@ -2839,4 +2839,356 @@ async fn connecting_without_migrating_refuses_a_schema_that_is_not_ready() {
         PostgresSystemDatabase::connect(&config).await.is_ok(),
         "a migrated schema should connect without migrating"
     );
+}
+
+/// A fork inherits its source's identity, replays the steps below its start step, and is enqueued.
+#[tokio::test]
+async fn a_fork_carries_the_steps_below_its_start_step() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-src"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for step_id in 0..4 {
+        sys.record_step(
+            "wf-src",
+            step_id,
+            &format!("step_{step_id}"),
+            Outcome::Output(Some(&format!("\"out{step_id}\""))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let forks = [Fork {
+        source_id: "wf-src",
+        forked_id: Some("wf-fork"),
+        start_step: 2,
+    }];
+    let ids = sys
+        .fork_workflows(&forks, &ForkOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(ids, ["wf-fork"]);
+
+    // Enqueued rather than started, on the internal queue, pointing back at its source.
+    let fork = sys.get_workflow("wf-fork").await.unwrap().unwrap();
+    assert_eq!(fork.status, WorkflowStatus::Enqueued);
+    assert_eq!(fork.queue_name.as_deref(), Some(INTERNAL_QUEUE));
+    assert_eq!(fork.forked_from.as_deref(), Some("wf-src"));
+    // Identity is inherited, so the fork runs the same function on the same input.
+    let source = sys.get_workflow("wf-src").await.unwrap().unwrap();
+    assert_eq!(fork.name, source.name);
+    assert_eq!(fork.input, source.input);
+    assert_eq!(fork.application_version, source.application_version);
+    assert!(
+        source.was_forked_from,
+        "the source is marked as forked from"
+    );
+
+    // Steps 0 and 1 came across; 2 and 3 did not — those are the ones the fork will run.
+    let steps = sys
+        .list_workflow_steps("wf-fork", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.step_id, s.step_name.as_str(), s.output.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            (0, "step_0", Some("\"out0\"")),
+            (1, "step_1", Some("\"out1\"")),
+        ],
+    );
+}
+
+/// A fork's events are rebuilt from the history, so it does not see a value set after its start.
+///
+/// The source's `workflow_events` row holds whatever was published *last*. Copying that would
+/// hand the fork a value from its own future — the point it is being forked to redo.
+#[tokio::test]
+async fn a_fork_sees_the_event_values_as_of_its_start_step() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-events"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    // The same key set three times, at steps 0, 1 and 2.
+    for (step_id, value) in [(0, "\"first\""), (1, "\"second\""), (2, "\"third\"")] {
+        sys.set_event("wf-events", step_id, "progress", value, None)
+            .await
+            .unwrap();
+    }
+
+    let forks = [Fork {
+        source_id: "wf-events",
+        forked_id: Some("wf-events-fork"),
+        start_step: 2,
+    }];
+    sys.fork_workflows(&forks, &ForkOptions::default())
+        .await
+        .unwrap();
+
+    let events = sys.get_all_events("wf-events-fork").await.unwrap();
+    assert_eq!(events.len(), 1, "one key, at its value as of step 2");
+    assert_eq!(events[0].key, "progress");
+    assert_eq!(
+        events[0].value, "\"second\"",
+        "the value set at step 2 is the fork's future, not its past"
+    );
+
+    // The source keeps the value it actually reached.
+    let source_events = sys.get_all_events("wf-events").await.unwrap();
+    assert_eq!(source_events[0].value, "\"third\"");
+}
+
+/// Forking is all-or-nothing: one missing source leaves nothing written.
+#[tokio::test]
+async fn forking_a_missing_workflow_writes_nothing() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-present"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let forks = [
+        Fork {
+            source_id: "wf-present",
+            forked_id: Some("wf-would-be"),
+            start_step: 1,
+        },
+        Fork {
+            source_id: "wf-absent",
+            forked_id: Some("wf-never"),
+            start_step: 1,
+        },
+    ];
+    match sys.fork_workflows(&forks, &ForkOptions::default()).await {
+        Err(Error::NonExistentWorkflow { workflow_ids }) => {
+            assert_eq!(workflow_ids, ["wf-absent"], "names which one is missing")
+        }
+        other => panic!("expected a missing-workflow error, got {other:?}"),
+    }
+    assert!(
+        sys.get_workflow("wf-would-be").await.unwrap().is_none(),
+        "the fork that could have been made must not have been"
+    );
+}
+
+/// A fork with no id supplied gets one, and the options land on the row.
+#[tokio::test]
+async fn a_fork_can_have_its_id_generated_and_its_placement_chosen() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-opts"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let ids = sys
+        .fork_workflows(
+            &[Fork::new("wf-opts")],
+            &ForkOptions {
+                application_version: Some("v2"),
+                queue_name: Some("reprocess"),
+                queue_partition_key: Some("eu"),
+                timeout: Some(std::time::Duration::from_secs(30)),
+                replacement_children: &[],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert!(!ids[0].is_empty(), "an id should have been generated");
+
+    let fork = sys.get_workflow(&ids[0]).await.unwrap().unwrap();
+    assert_eq!(fork.application_version.as_deref(), Some("v2"));
+    assert_eq!(fork.queue_name.as_deref(), Some("reprocess"));
+    assert_eq!(fork.queue_partition_key.as_deref(), Some("eu"));
+    assert_eq!(fork.timeout, Some(std::time::Duration::from_secs(30)));
+}
+
+/// An empty option is refused rather than overwriting what it was meant to leave alone.
+///
+/// `application_version` is `COALESCE`d against the source's, so an empty string would *win* over
+/// the inheritance it was supposed to trigger — stamping the fork with no version and hiding it
+/// from version-scoped recovery.
+#[tokio::test]
+async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-blank"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    for (field, options) in [
+        (
+            "application_version",
+            ForkOptions {
+                application_version: Some(""),
+                ..ForkOptions::default()
+            },
+        ),
+        (
+            "queue_name",
+            ForkOptions {
+                queue_name: Some(""),
+                ..ForkOptions::default()
+            },
+        ),
+        (
+            "timeout",
+            ForkOptions {
+                timeout: Some(std::time::Duration::ZERO),
+                ..ForkOptions::default()
+            },
+        ),
+    ] {
+        let result = sys.fork_workflows(&[Fork::new("wf-blank")], &options).await;
+        match result {
+            Err(Error::InvalidInput { field: f, .. }) => assert_eq!(f, field),
+            other => panic!("expected {field} to be refused, got {other:?}"),
+        }
+    }
+
+    // An empty id is refused too: it is one nothing could look up.
+    let result = sys
+        .fork_workflows(
+            &[Fork {
+                source_id: "wf-blank",
+                forked_id: Some(""),
+                start_step: 0,
+            }],
+            &ForkOptions::default(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::InvalidInput {
+            field: "forked_id",
+            ..
+        })
+    ));
+}
+
+/// One child replaced twice is refused, rather than duplicating the step that names it.
+///
+/// The replacements are applied by joining against them, so a child named twice matches a copied
+/// step twice. Without this the primary key on `(workflow_uuid, function_id)` would report it as
+/// a constraint violation, which says nothing about the map that caused it.
+#[tokio::test]
+async fn replacing_one_child_twice_is_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-dup"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_child_workflow("wf-dup", "child", 0, "spawn", None)
+        .await
+        .unwrap();
+
+    let result = sys
+        .fork_workflows(
+            &[Fork {
+                source_id: "wf-dup",
+                forked_id: Some("wf-dup-fork"),
+                start_step: 1,
+            }],
+            &ForkOptions {
+                replacement_children: &[("child", "fork-a"), ("child", "fork-b")],
+                ..ForkOptions::default()
+            },
+        )
+        .await;
+    match result {
+        Err(Error::InvalidInput { field, detail }) => {
+            assert_eq!(field, "replacement_children");
+            assert!(detail.contains("child"), "should name it, got: {detail}");
+        }
+        other => panic!("expected the duplicate to be refused, got {other:?}"),
+    }
+    assert!(sys.get_workflow("wf-dup-fork").await.unwrap().is_none());
+}
+
+/// A timeout too large to store is reported rather than quietly becoming a different one.
+#[tokio::test]
+async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-huge"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let result = sys
+        .fork_workflows(
+            &[Fork::new("wf-huge")],
+            &ForkOptions {
+                timeout: Some(std::time::Duration::MAX),
+                ..ForkOptions::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput {
+                field: "timeout",
+                ..
+            })
+        ),
+        "expected the timeout to be refused, got {result:?}"
+    );
+}
+
+/// Forking a parent rewrites the children it recorded, so it adopts the forked ones.
+///
+/// Also the guard for the `start_step > 0` boundary: forking from step 1 must carry step 0. It is
+/// where TypeScript and Python disagree — Python's `step > 1` filter drops it — so the assertion
+/// that one step came across is load-bearing.
+#[tokio::test]
+async fn a_fork_can_rewrite_the_children_it_replays() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-parent"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_child_workflow("wf-parent", "child-original", 0, "spawn", None)
+        .await
+        .unwrap();
+    // An ordinary step beside it: with a non-empty map, `r.original = NULL` matches nothing, so
+    // this must come across with its `child_workflow_id` still null rather than picking one up.
+    sys.record_step(
+        "wf-parent",
+        1,
+        "charge",
+        Outcome::Output(Some("\"ok\"")),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    sys.fork_workflows(
+        &[Fork {
+            source_id: "wf-parent",
+            forked_id: Some("wf-parent-fork"),
+            start_step: 2,
+        }],
+        &ForkOptions {
+            replacement_children: &[("child-original", "child-forked")],
+            ..ForkOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let steps = sys
+        .list_workflow_steps("wf-parent-fork", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 2, "both steps came across");
+    assert_eq!(
+        steps[0].child_workflow_id.as_deref(),
+        Some("child-forked"),
+        "the replayed step should point at the fork's own child"
+    );
+    assert_eq!(
+        steps[1].child_workflow_id, None,
+        "a step that spawned nothing must not acquire a child from the map"
+    );
+    assert_eq!(steps[1].output.as_deref(), Some("\"ok\""));
 }

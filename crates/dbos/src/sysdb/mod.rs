@@ -35,9 +35,9 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    EventRecord, NewWorkflow, NotificationRecord, Outcome, OutcomeWrite, StepRecord, StepTiming,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowInitResult, WorkflowRecord,
+    EventRecord, Fork, ForkOptions, NewWorkflow, NotificationRecord, Outcome, OutcomeWrite,
+    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowInitResult, WorkflowRecord,
 };
 
 /// Everything the engine needs from the system database.
@@ -234,6 +234,41 @@ pub trait SystemDatabase: Send + Sync {
         workflow_ids: &[&str],
         delete_children: bool,
     ) -> Result<u64, Error>;
+
+    /// Forks workflows, each resuming from its own start step.
+    ///
+    /// A fork is a *new* workflow that inherits its source's identity — name, inputs, roles,
+    /// attributes — and the recorded results of every step below
+    /// [`Fork::start_step`]. Those steps replay instead of running, so the fork reaches the start
+    /// step in the state the original was in when it got there, and runs on from a point that
+    /// already happened. Re-running a failed workflow against fixed code is what this is for.
+    ///
+    /// Returns the forked ids in the order given, including any that were generated.
+    ///
+    /// **The fork is enqueued, not started.** Its status is `ENQUEUED` on
+    /// [`INTERNAL_QUEUE`] unless [`ForkOptions::queue_name`] says otherwise, so whichever
+    /// executor next polls that queue runs it. All four references do this: the process asking
+    /// for a fork is usually an operator's tool, not a host that can run the workflow.
+    ///
+    /// **Four tables are copied, not one.** Steps come from `operation_outputs`; a workflow that
+    /// published events or wrote streams before its start step must find them again, so
+    /// `workflow_events_history`, `workflow_events`, and `streams` are copied too. All are
+    /// bounded by `function_id < start_step`, and the events *current* value is rebuilt from the
+    /// history rather than copied from the source — copying it would carry forward a value set
+    /// after the fork point.
+    ///
+    /// Batch because the callers are batch: forking from failure takes a list, and forking a
+    /// tree of workflows has to write the whole tree at once for
+    /// [`ForkOptions::replacement_children`] to name ids that exist. Go and Python take the batch
+    /// form directly; Java and TypeScript expose a single-workflow wrapper over one.
+    ///
+    /// Fails with [`Error::NonExistentWorkflow`] if any source is missing, and writes nothing —
+    /// a partially applied batch would leave forks whose siblings never existed.
+    async fn fork_workflows(
+        &self,
+        forks: &[Fork<'_>],
+        options: &ForkOptions<'_>,
+    ) -> Result<Vec<String>, Error>;
 
     /// Releases the connections this backend holds.
     ///
