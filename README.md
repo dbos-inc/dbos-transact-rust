@@ -19,7 +19,7 @@ In practice, this makes it easier to build reliable systems for use cases like A
 Rather than bolting on ad-hoc retry logic and database checkpoints, DBOS workflows give you one consistent model for ensuring your programs can recover from any failure from exactly where they left off.
 
 This library contains all you need to add durable workflows to your program: there's no separate service or orchestrator or any external dependencies except Postgres.
-Because it's just a library, you can incrementally add it to your projects, and it works out of the box with frameworks like Spring.
+Because it's just a library, you can incrementally add it to your projects.
 And because it's built on Postgres, it natively supports all the tooling you're familiar with (backups, GUIs, CLI tools) and works with any Postgres provider.
 
 ## Community
