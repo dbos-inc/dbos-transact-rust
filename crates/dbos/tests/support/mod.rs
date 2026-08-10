@@ -227,7 +227,21 @@ impl TestServer {
             Backend::Cockroach => {
                 GenericImage::new(COCKROACH_IMAGE.0, COCKROACH_IMAGE.1)
                     .with_exposed_port(COCKROACH_PORT.tcp())
-                    .with_cmd(["start-single-node", "--insecure"])
+                    // An in-memory store, because nothing here outlives the container and
+                    // CockroachDB's cost is dominated by DDL: the corpus is 47 migrations, each
+                    // an online schema change, and the suite applies it once per pooled database
+                    // plus once per migration test. Measured over the whole CockroachDB leg it
+                    // is worth more than half the wall clock — 4m09s to 1m53s locally — and two
+                    // seconds off container startup besides.
+                    //
+                    // The size is a ceiling rather than a reservation. The suite's data is a few
+                    // thousand rows; the headroom is for CockroachDB's own system ranges and the
+                    // MVCC garbage a run leaves behind.
+                    .with_cmd([
+                        "start-single-node",
+                        "--insecure",
+                        "--store=type=mem,size=2GiB",
+                    ])
                     .with_labels([CONTAINER_LABEL])
                     .start()
                     .await
