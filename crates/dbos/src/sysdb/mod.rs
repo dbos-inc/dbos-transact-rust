@@ -32,6 +32,8 @@ use async_trait::async_trait;
 // the definition to a file should not move the path.
 pub use error::{BackendError, BackendErrorKind, Error};
 
+use std::time::Duration;
+
 use types::{
     EventRecord, NewWorkflow, NotificationRecord, Outcome, OutcomeWrite, StepRecord, StepTiming,
     StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
@@ -302,6 +304,41 @@ pub trait SystemDatabase: Send + Sync {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<StepRecord>, Error>;
+
+    /// Checkpoints a durable sleep, returning the instant to wake at.
+    ///
+    /// This layer records the wake time; **it does not wait.** The caller sleeps until the
+    /// returned instant, and a replay gets the *original* wake time back rather than starting the
+    /// clock again — which is the whole point. A workflow that slept an hour and crashed after
+    /// fifty minutes has ten left, not sixty.
+    ///
+    /// The wake time is the step's recorded output, stored as epoch milliseconds in portable
+    /// JSON. That combination is deliberate and matches neither reference exactly: Java stores
+    /// milliseconds through the *workflow's* serializer, Python stores epoch *seconds* through
+    /// the portable one. Milliseconds because every other instant in this schema is
+    /// milliseconds; portable because the value is a plain number this layer both writes and
+    /// reads, so nothing is served by making it legible only to Rust.
+    ///
+    /// The step's `completed_at` is stamped at the **wake time**, which is in the future when
+    /// the row is written — so a timeline shows an hour's sleep as an hour rather than as an
+    /// instant. Nothing in execution or recovery reads that column; it is for step aggregates,
+    /// metrics, and Conductor.
+    ///
+    /// Java does the same unconditionally. Go never projects, so its sleeps look instantaneous.
+    /// Python alone distinguishes the two with a `project_completion_time` flag, leaving it off
+    /// for `recv` and `get_event`, which register a deadline they may abandon early and would
+    /// otherwise be recorded as having waited the whole timeout.
+    ///
+    /// TODO: revisit when `recv` and `get_event` land. They are the only callers that would ever
+    /// want the other behaviour, and both are blocked on Stage 4's notifier. A first pass modelled
+    /// Python's flag as a `SleepKind` enum and dropped it: a 1-of-4 divergence, over a column
+    /// nothing executes on, decided before either caller existed. Decide it with them.
+    async fn record_sleep(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        duration: Duration,
+    ) -> Result<Timestamp, Error>;
 
     /// Publishes a key/value on a workflow, for another workflow to read.
     ///

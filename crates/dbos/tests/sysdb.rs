@@ -2680,3 +2680,85 @@ async fn replaying_set_event_does_not_republish() {
     .unwrap();
     assert_eq!(rows.0, 1, "the replay added no history row either");
 }
+
+/// A replayed sleep wakes at the original instant, not a fresh one.
+///
+/// This is the whole point of checkpointing it: a workflow that slept an hour and crashed fifty
+/// minutes in has ten minutes left, not sixty.
+#[tokio::test]
+async fn a_replayed_sleep_keeps_its_original_wake_time() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-sleeper"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let before = Timestamp::now();
+    let wake = sys
+        .record_sleep("wf-sleeper", 0, std::time::Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let offset = wake.as_epoch_ms() - before.as_epoch_ms();
+    assert!(
+        (3_600_000..3_610_000).contains(&offset),
+        "expected ~1h from now, got {offset}ms",
+    );
+
+    // The replay asks for the same duration again and must get the same instant back.
+    let replayed = sys
+        .record_sleep("wf-sleeper", 0, std::time::Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(replayed, wake, "a replay must not restart the clock");
+
+    // Stored as epoch milliseconds in portable JSON, so anything can read it.
+    let mut conn = db.admin_connection().await;
+    let (output, serialization): (Option<String>, Option<String>) =
+        sqlx::query_as(sqlx::AssertSqlSafe(
+            "SELECT output, serialization FROM dbos.operation_outputs \
+             WHERE workflow_uuid = 'wf-sleeper' AND function_id = 0",
+        ))
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        output.as_deref(),
+        Some(wake.as_epoch_ms().to_string().as_str())
+    );
+    assert_eq!(serialization.as_deref(), Some("portable_json"));
+}
+
+/// A sleep's step is stamped complete at the wake time, so its recorded duration is the sleep.
+///
+/// That timestamp is in the future when the row is written. Deliberate: nothing in execution or
+/// recovery reads it, and a timeline should show an hour's sleep as an hour. Java does the same.
+#[tokio::test]
+async fn a_sleep_records_its_duration_as_the_sleep() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-waiter"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let before = Timestamp::now();
+    let wake = sys
+        .record_sleep("wf-waiter", 0, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let step = sys
+        .check_step("wf-waiter", 0, "DBOS.sleep")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(step.completed_at, Some(wake));
+    assert!(
+        step.completed_at.unwrap().as_epoch_ms() > before.as_epoch_ms(),
+        "the completion is stamped ahead of now, which is the point",
+    );
+    let started = step.started_at.expect("a sleep records when it began");
+    assert!(started.as_epoch_ms() >= before.as_epoch_ms());
+    assert_eq!(
+        wake.as_epoch_ms() - started.as_epoch_ms(),
+        60_000,
+        "the recorded span is exactly the sleep",
+    );
+}

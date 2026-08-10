@@ -35,6 +35,8 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use super::migrations::{self, quote_identifier};
 use super::retry::{RetryPolicy, with_retry};
+use std::time::Duration;
+
 use super::types::{
     EventRecord, NewWorkflow, NotificationRecord, Outcome, StepRecord, StepTiming, StreamRecord,
     Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
@@ -385,14 +387,50 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
     })
 }
 
+/// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`].
+const SLEEP_STEP_NAME: &str = "DBOS.sleep";
+
+/// The encoding this layer uses for values it produces itself.
+///
+/// Distinct from the workflow's own format: a sleep's wake time is a plain number written and
+/// read by the system database, so it is stored legibly rather than in whatever the workflow
+/// chose. Python does the same for the same value; Java uses the workflow's serializer.
+const PORTABLE_JSON: &str = "portable_json";
+
 /// The step name `set_event` records, which a replay compares against.
 ///
 /// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
 /// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
-const SET_EVENT_STEP: &str = "DBOS.setEvent";
+const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 
 /// Every column `version_from_row` reads.
 const VERSION_COLUMNS: &str = "version_id, version_name, version_timestamp, created_at";
+
+/// Reads a sleep step's recorded wake time.
+///
+/// Stored as epoch milliseconds in portable JSON — a bare number, so parsing is the whole of
+/// decoding it. A value that is not one means another implementation wrote something this one
+/// does not understand, which is what [`Error::Malformed`] is for.
+fn decode_wake_time(
+    output: Option<&str>,
+    workflow_id: &str,
+    step_id: i32,
+) -> Result<Timestamp, Error> {
+    let recorded = output.ok_or_else(|| {
+        Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} is a sleep with no recorded wake time"
+        ))
+    })?;
+    recorded
+        .trim()
+        .parse::<i64>()
+        .map(Timestamp::from_epoch_ms)
+        .map_err(|e| {
+            Error::Malformed(format!(
+                "workflow {workflow_id} step {step_id} wake time {recorded:?} is not epoch milliseconds: {e}"
+            ))
+        })
+}
 
 fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
     Ok(VersionInfo {
@@ -1667,6 +1705,82 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn record_sleep(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        duration: Duration,
+    ) -> Result<Timestamp, Error> {
+        let pool = &self.pool;
+        // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
+        // the clock per attempt would push it further out each time.
+        let started_at = Timestamp::now();
+        let wake_at =
+            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
+
+        with_retry(&self.retry, "record_sleep", move || async move {
+            // No transaction, unlike `set_event`: there is no separate write to orphan here —
+            // the step record *is* the write, and the wake time is its output. The check-then-
+            // record race is caught by the insert's `ON CONFLICT` below, and the insert and the
+            // executor claim inside `record_step_on` are safe by their ordering.
+            let mut conn = pool.acquire().await?;
+
+            // A replay wakes at the *original* instant. Starting the clock again would make a
+            // workflow that crashed fifty minutes into an hour sleep another full hour.
+            if let Some(step) = self
+                .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                .await?
+            {
+                tracing::debug!(workflow_id, step_id, "replaying sleep");
+                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
+            }
+            tracing::debug!(
+                workflow_id,
+                step_id,
+                duration_ms = duration.as_millis() as u64,
+                "running sleep"
+            );
+
+            let recorded = wake_at.as_epoch_ms().to_string();
+            let timing = StepTiming {
+                started_at,
+                // The wake time, which is in the future — so the step's recorded duration is the
+                // sleep. Java does the same; nothing in execution or recovery reads the column.
+                completed_at: wake_at,
+            };
+            match self
+                .record_step_on(
+                    &mut conn,
+                    workflow_id,
+                    step_id,
+                    SLEEP_STEP_NAME,
+                    Outcome::Output(Some(&recorded)),
+                    Some(PORTABLE_JSON),
+                    Some(timing),
+                )
+                .await
+            {
+                Ok(()) => Ok(wake_at),
+                // A rival recorded the sleep between our check and our write. Its wake time is
+                // the one every execution must agree on, so adopt it rather than returning ours.
+                // Python swallows this and returns its own, which two runs would disagree about.
+                Err(Error::StepAlreadyRecorded { .. }) => {
+                    let step = self
+                        .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Malformed(
+                                "sleep reported as recorded but cannot be read back".to_owned(),
+                            )
+                        })?;
+                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+    }
+
     async fn set_event(
         &self,
         workflow_id: &str,
@@ -1691,7 +1805,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // A replay that already published this key must not publish it again — and must not
             // be told it failed either.
             if self
-                .check_step_on(&mut tx, workflow_id, step_id, SET_EVENT_STEP)
+                .check_step_on(&mut tx, workflow_id, step_id, SET_EVENT_STEP_NAME)
                 .await?
                 .is_some()
             {
@@ -1733,7 +1847,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 &mut tx,
                 workflow_id,
                 step_id,
-                SET_EVENT_STEP,
+                SET_EVENT_STEP_NAME,
                 Outcome::Output(None),
                 None,
                 Some(timing),
