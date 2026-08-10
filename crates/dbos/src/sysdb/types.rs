@@ -1091,6 +1091,31 @@ impl<'a> Fork<'a> {
     }
 }
 
+/// Which step a fork restarts from, when the caller wants it worked out rather than stated.
+///
+/// A sum type because the four are alternatives, not options: Python and TypeScript both take
+/// them as four independent flags and raise unless exactly one is set. The resolved value is a
+/// [`Fork::start_step`], so the named step *re-runs* and everything below it replays — forking
+/// "from the failure" means running the failed step again, not skipping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkPoint<'a> {
+    /// The step that failed, or the last recorded step if none did.
+    ///
+    /// The fallback matters: a workflow can be left unfinished without any step recording an
+    /// error — a process killed mid-step records nothing at all — and forking it should still
+    /// resume where it stopped.
+    LastFailure,
+    /// The last recorded step, failed or not.
+    LastStep,
+    /// A step chosen by the caller, with no lookup.
+    Step(i32),
+    /// The last step recorded under this name.
+    ///
+    /// For a workflow whose shape is known: fork every one of them from `charge_card`, whatever
+    /// position it happens to occupy in each.
+    StepNamed(&'a str),
+}
+
 /// How forked workflows are created.
 ///
 /// The defaults are what every implementation does when the caller says nothing: the fork is

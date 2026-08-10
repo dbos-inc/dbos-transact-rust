@@ -29,6 +29,8 @@
 //! per-method entry logging**, which Java has (`debug("initWorkflowStatus workflowId {}")`) and
 //! nothing else does; a span belongs to the caller, not to every statement.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
@@ -38,9 +40,9 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    EventRecord, Fork, ForkOptions, NewWorkflow, NotificationRecord, Outcome, StepRecord,
-    StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, duration_from_ms, validate_attributes,
+    EventRecord, Fork, ForkOptions, ForkPoint, NewWorkflow, NotificationRecord, Outcome,
+    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, OutcomeWrite,
@@ -838,6 +840,70 @@ fn step_from_row(row: &sqlx::postgres::PgRow, workflow_id: &str) -> Result<StepR
             .try_get::<Option<i64>, _>("completed_at_epoch_ms")?
             .map(Timestamp::from_epoch_ms),
     })
+}
+
+impl PostgresSystemDatabase {
+    /// Works out each workflow's start step from its own recorded history.
+    ///
+    /// One query for the batch, grouped by workflow. Every workflow must contribute a row: a
+    /// workflow with no steps produces none, and forking it from "the last step" would silently
+    /// mean "from the beginning" — a different request from the one made.
+    ///
+    /// `aggregate` is the SQL that picks the step, and `named` narrows to one step name. Both
+    /// come from the caller's match on [`ForkPoint`], which is where [`ForkPoint::Step`] is
+    /// answered — it supplies the step id outright, so there is nothing to look up.
+    async fn resolve_fork_points(
+        &self,
+        workflow_ids: &[&str],
+        aggregate: &str,
+        named: Option<&str>,
+    ) -> Result<Vec<i32>, Error> {
+        let steps_table = self.tables.operation_outputs.as_str();
+        let pool = &self.pool;
+
+        let filter = if named.is_some() {
+            " AND function_name = $2"
+        } else {
+            ""
+        };
+
+        let rows: Vec<(String, i32)> = with_retry(&self.retry, "resolve_fork_points", move || {
+            let sql = format!(
+                "SELECT workflow_uuid, {aggregate} AS start_step FROM {steps_table} \
+                 WHERE workflow_uuid = ANY($1){filter} GROUP BY workflow_uuid"
+            );
+            async move {
+                let mut query = sqlx::query_as(AssertSqlSafe(sql)).bind(workflow_ids);
+                if let Some(name) = named {
+                    query = query.bind(name);
+                }
+                Ok(query.fetch_all(pool).await?)
+            }
+        })
+        .await?;
+
+        // Back into the caller's order, which `GROUP BY` does not preserve, reporting anything
+        // that produced no row. One pass over the ids, so a workflow is either a start step or a
+        // complaint and there is no third case to assert about.
+        let resolved: HashMap<&str, i32> =
+            rows.iter().map(|(id, step)| (id.as_str(), *step)).collect();
+        let mut start_steps = Vec::with_capacity(workflow_ids.len());
+        let mut missing = Vec::new();
+        for id in workflow_ids {
+            match resolved.get(id) {
+                Some(&step) => start_steps.push(step),
+                None => missing.push((*id).to_owned()),
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::NoForkPoint {
+                workflow_ids: missing,
+                step_name: named.map(str::to_owned),
+            });
+        }
+
+        Ok(start_steps)
+    }
 }
 
 #[async_trait]
@@ -1870,6 +1936,64 @@ impl SystemDatabase for PostgresSystemDatabase {
             Ok(forked_ids.clone())
         })
         .await
+    }
+
+    async fn fork_from(
+        &self,
+        workflow_ids: &[&str],
+        point: ForkPoint<'_>,
+        options: &ForkOptions<'_>,
+    ) -> Result<Vec<String>, Error> {
+        if workflow_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // **No `with_retry` here, and it must not gain one.** Both halves already retry —
+        // `resolve_fork_points` wraps its query, `fork_workflows` wraps its transaction — so
+        // every statement is covered. Wrapping the pair would re-enter `fork_workflows`, which
+        // generates the fork ids *before* its own retry so that a lost commit acknowledgement
+        // cannot fork twice. An outer retry would hand it fresh ids and do exactly that.
+        //
+        // Retrying piecewise is sound because the first half only reads: repeating it is free,
+        // and it commits nothing that the second half could duplicate.
+
+        // `MAX(function_id)` is the step itself, not the one after it, so the resolved step
+        // *re-runs* — forking from a failure means running the failed step again.
+        const LAST_STEP: &str = "MAX(function_id)";
+        // A workflow can stop without any step recording an error: a process killed mid-step
+        // records nothing. Falling back to the last step resumes it where it stopped, rather
+        // than reporting that it has no failure to fork from.
+        const LAST_FAILURE: &str =
+            "COALESCE(MAX(function_id) FILTER (WHERE error IS NOT NULL), MAX(function_id))";
+
+        let start_steps = match point {
+            // Nothing to look up: the caller supplied the step id.
+            ForkPoint::Step(step) => vec![step; workflow_ids.len()],
+            ForkPoint::LastFailure => {
+                self.resolve_fork_points(workflow_ids, LAST_FAILURE, None)
+                    .await?
+            }
+            ForkPoint::LastStep => {
+                self.resolve_fork_points(workflow_ids, LAST_STEP, None)
+                    .await?
+            }
+            ForkPoint::StepNamed(name) => {
+                self.resolve_fork_points(workflow_ids, LAST_STEP, Some(name))
+                    .await?
+            }
+        };
+
+        // Ids are always generated. A caller who is not choosing the step is not choosing the id.
+        let forks: Vec<Fork<'_>> = workflow_ids
+            .iter()
+            .zip(&start_steps)
+            .map(|(source_id, &start_step)| Fork {
+                source_id,
+                forked_id: None,
+                start_step,
+            })
+            .collect();
+        self.fork_workflows(&forks, options).await
     }
 
     async fn close(&self) {

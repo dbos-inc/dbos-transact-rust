@@ -35,9 +35,9 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    EventRecord, Fork, ForkOptions, NewWorkflow, NotificationRecord, Outcome, OutcomeWrite,
-    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowInitResult, WorkflowRecord,
+    EventRecord, Fork, ForkOptions, ForkPoint, NewWorkflow, NotificationRecord, Outcome,
+    OutcomeWrite, StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
 };
 
 /// Everything the engine needs from the system database.
@@ -267,6 +267,28 @@ pub trait SystemDatabase: Send + Sync {
     async fn fork_workflows(
         &self,
         forks: &[Fork<'_>],
+        options: &ForkOptions<'_>,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Forks workflows from a step this works out for each of them.
+    ///
+    /// Named for what it does rather than what it was first for: Python, Java and TypeScript all
+    /// call this `fork_from_failure`, from when the failed step was the only place it could
+    /// start. Three of [`ForkPoint`]'s four cases have nothing to do with failure. Go reached the
+    /// same conclusion and calls it `ForkFrom`.
+    ///
+    /// [`fork_workflows`](Self::fork_workflows) with the start step computed rather than given:
+    /// the caller says *from the failure* or *from the step called `charge_card`*, and each
+    /// workflow's own history decides where that is. Ids are always generated, since a caller
+    /// who is not choosing the step is not choosing the id either.
+    ///
+    /// Fails with [`Error::NoForkPoint`] if any workflow has nothing at the point asked for, and
+    /// writes nothing. [`ForkPoint::Step`] is exempt: it names a position directly, so there is
+    /// nothing to look up and nothing to be missing.
+    async fn fork_from(
+        &self,
+        workflow_ids: &[&str],
+        point: ForkPoint<'_>,
         options: &ForkOptions<'_>,
     ) -> Result<Vec<String>, Error>;
 

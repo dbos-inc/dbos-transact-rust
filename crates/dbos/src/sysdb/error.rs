@@ -89,6 +89,17 @@ pub enum Error {
         /// The position that was already filled.
         step_id: i32,
     },
+    /// A workflow has no step to fork from.
+    ///
+    /// It exists, but nothing is recorded at the point asked for: no steps at all, or none under
+    /// the name given. Forking anyway would restart it from the beginning, which is a different
+    /// request from the one made.
+    NoForkPoint {
+        /// The workflows with nothing to fork from.
+        workflow_ids: Vec<String>,
+        /// The step name that matched nothing, when one was named.
+        step_name: Option<String>,
+    },
     /// One or more of the named workflows do not exist.
     NonExistentWorkflow {
         /// The ids with no row behind them.
@@ -142,6 +153,17 @@ impl std::fmt::Display for Error {
                 f,
                 "workflow {workflow_id} step {step_id} was already recorded by another execution"
             ),
+            Error::NoForkPoint {
+                workflow_ids,
+                step_name,
+            } => match step_name {
+                Some(name) => write!(
+                    f,
+                    "no step named {name} in workflows {}",
+                    workflow_ids.join(", ")
+                ),
+                None => write!(f, "no steps in workflows {}", workflow_ids.join(", ")),
+            },
             Error::NonExistentWorkflow { workflow_ids } => {
                 write!(f, "no such workflow: {}", workflow_ids.join(", "))
             }

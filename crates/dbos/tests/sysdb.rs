@@ -5,8 +5,8 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Fork, ForkOptions, NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission, Timestamp,
-    WorkflowDelay, WorkflowStatus,
+    Fork, ForkOptions, ForkPoint, NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission,
+    Timestamp, WorkflowDelay, WorkflowStatus,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -3191,4 +3191,257 @@ async fn a_fork_can_rewrite_the_children_it_replays() {
         "a step that spawned nothing must not acquire a child from the map"
     );
     assert_eq!(steps[1].output.as_deref(), Some("\"ok\""));
+}
+
+/// Sets up a workflow whose step 1 failed and whose step 2 succeeded afterwards.
+async fn workflow_with_a_failure(sys: &PostgresSystemDatabase, id: &str) {
+    sys.init_workflow(&workflow(id), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_step(
+        id,
+        0,
+        "validate",
+        Outcome::Output(Some("\"ok\"")),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    sys.record_step(id, 1, "charge", Outcome::Error("card declined"), None, None)
+        .await
+        .unwrap();
+    sys.record_step(
+        id,
+        2,
+        "notify",
+        Outcome::Output(Some("\"sent\"")),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// Forking from the failure restarts at the step that failed, not the last one recorded.
+#[tokio::test]
+async fn forking_from_the_failure_restarts_at_the_failed_step() {
+    let (sys, _db) = sysdb().await;
+    workflow_with_a_failure(&sys, "wf-failed").await;
+
+    let ids = sys
+        .fork_from(
+            &["wf-failed"],
+            ForkPoint::LastFailure,
+            &ForkOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    // Step 1 failed, so the fork starts there: only step 0 comes across, and the fork will run
+    // the failing step again.
+    let steps = sys
+        .list_workflow_steps(&ids[0], true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.step_id, s.step_name.as_str()))
+            .collect::<Vec<_>>(),
+        [(0, "validate")],
+    );
+}
+
+/// With no failure recorded, forking from the failure falls back to the last step.
+///
+/// The fallback is what makes it useful on a workflow killed mid-step: nothing recorded an error,
+/// but there is still a place to resume from.
+#[tokio::test]
+async fn forking_from_the_failure_of_a_workflow_that_never_failed_uses_its_last_step() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-clean"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for (step_id, name) in [(0, "one"), (1, "two")] {
+        sys.record_step(
+            "wf-clean",
+            step_id,
+            name,
+            Outcome::Output(Some("\"ok\"")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let ids = sys
+        .fork_from(
+            &["wf-clean"],
+            ForkPoint::LastFailure,
+            &ForkOptions::default(),
+        )
+        .await
+        .unwrap();
+    let steps = sys
+        .list_workflow_steps(&ids[0], true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "resumes at step 1, so only step 0 replays");
+    assert_eq!(steps[0].step_name, "one");
+}
+
+/// Each fork point picks a different step, and a named step is found by name.
+#[tokio::test]
+async fn each_fork_point_resolves_to_its_own_step() {
+    let (sys, _db) = sysdb().await;
+    workflow_with_a_failure(&sys, "wf-points").await;
+
+    for (point, expected_replayed) in [
+        (ForkPoint::LastStep, 2),            // step 2 re-runs, 0 and 1 replay
+        (ForkPoint::StepNamed("charge"), 1), // step 1 re-runs, 0 replays
+        (ForkPoint::Step(0), 0),             // nothing replays
+    ] {
+        let ids = sys
+            .fork_from(&["wf-points"], point, &ForkOptions::default())
+            .await
+            .unwrap();
+        let steps = sys
+            .list_workflow_steps(&ids[0], true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            steps.len(),
+            expected_replayed,
+            "{point:?} should leave {expected_replayed} steps to replay"
+        );
+    }
+}
+
+/// A workflow with nothing at the requested point is reported, and nothing is forked.
+#[tokio::test]
+async fn forking_from_a_point_that_does_not_exist_is_refused() {
+    let (sys, _db) = sysdb().await;
+    workflow_with_a_failure(&sys, "wf-has-steps").await;
+    sys.init_workflow(&workflow("wf-no-steps"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // No steps at all.
+    match sys
+        .fork_from(
+            &["wf-has-steps", "wf-no-steps"],
+            ForkPoint::LastStep,
+            &ForkOptions::default(),
+        )
+        .await
+    {
+        Err(Error::NoForkPoint {
+            workflow_ids,
+            step_name,
+        }) => {
+            assert_eq!(workflow_ids, ["wf-no-steps"]);
+            assert_eq!(step_name, None);
+        }
+        other => panic!("expected a missing fork point, got {other:?}"),
+    }
+
+    // A step name nothing matches, which reports the name so the caller can see the typo.
+    match sys
+        .fork_from(
+            &["wf-has-steps"],
+            ForkPoint::StepNamed("refund"),
+            &ForkOptions::default(),
+        )
+        .await
+    {
+        Err(Error::NoForkPoint {
+            workflow_ids,
+            step_name,
+        }) => {
+            assert_eq!(workflow_ids, ["wf-has-steps"]);
+            assert_eq!(step_name.as_deref(), Some("refund"));
+        }
+        other => panic!("expected a missing step name, got {other:?}"),
+    }
+
+    // The workflow that did have a fork point was not forked either.
+    let forks = sys
+        .list_workflows(&dbos::sysdb::types::WorkflowFilter {
+            forked_from: vec!["wf-has-steps"],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(forks.is_empty(), "a refused batch forks nothing");
+}
+
+/// A batch resolves each workflow against its own history, and answers in the caller's order.
+///
+/// The reason to fork a batch at all: two workflows that failed at different steps must each
+/// resume at their own. `GROUP BY` does not preserve the order the ids were given in, so the
+/// returned ids lining up with the inputs is a property of the mapping, not of the query.
+#[tokio::test]
+async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
+    let (sys, _db) = sysdb().await;
+
+    // Fails at step 1 of 3.
+    sys.init_workflow(&workflow("wf-alpha"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for (step_id, outcome) in [
+        (0, Outcome::Output(Some("\"ok\""))),
+        (1, Outcome::Error("boom")),
+        (2, Outcome::Output(Some("\"ok\""))),
+    ] {
+        sys.record_step("wf-alpha", step_id, "s", outcome, None, None)
+            .await
+            .unwrap();
+    }
+
+    // Fails at step 3 of 4, so it must resolve to a different step than wf-alpha.
+    sys.init_workflow(&workflow("wf-beta"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for (step_id, outcome) in [
+        (0, Outcome::Output(Some("\"ok\""))),
+        (1, Outcome::Output(Some("\"ok\""))),
+        (2, Outcome::Output(Some("\"ok\""))),
+        (3, Outcome::Error("boom")),
+    ] {
+        sys.record_step("wf-beta", step_id, "s", outcome, None, None)
+            .await
+            .unwrap();
+    }
+
+    let ids = sys
+        .fork_from(
+            &["wf-alpha", "wf-beta"],
+            ForkPoint::LastFailure,
+            &ForkOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+
+    // Position 0 answers for wf-alpha, position 1 for wf-beta. Were the mapping to transpose
+    // them, the step counts below would swap too — which is what makes this an assertion and
+    // not a restatement of the call.
+    let alpha = sys.get_workflow(&ids[0]).await.unwrap().unwrap();
+    let beta = sys.get_workflow(&ids[1]).await.unwrap().unwrap();
+    assert_eq!(alpha.forked_from.as_deref(), Some("wf-alpha"));
+    assert_eq!(beta.forked_from.as_deref(), Some("wf-beta"));
+
+    // wf-alpha failed at step 1, so only step 0 replays; wf-beta failed at 3, so 0..=2 do.
+    let alpha_steps = sys
+        .list_workflow_steps(&ids[0], true, None, None)
+        .await
+        .unwrap();
+    let beta_steps = sys
+        .list_workflow_steps(&ids[1], true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(alpha_steps.len(), 1, "wf-alpha resumes at its own step 1");
+    assert_eq!(beta_steps.len(), 3, "wf-beta resumes at its own step 3");
 }
