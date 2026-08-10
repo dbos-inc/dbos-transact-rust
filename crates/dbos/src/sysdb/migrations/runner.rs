@@ -6,7 +6,9 @@
 
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-use super::{Dialect, Migration, RenderError, build_migrations, quote_identifier};
+use super::{
+    Dialect, LOCAL_MIGRATIONS, Migration, RenderError, build_migrations, quote_identifier,
+};
 
 /// How many times a migration is retried before giving up.
 ///
@@ -51,6 +53,12 @@ const ALREADY_EXISTS: &[&str] = &[
     "42P04", // duplicate_database
     "42P06", // duplicate_schema
     "42P07", // duplicate_table
+];
+
+/// The database saying the DBOS schema is not there at all.
+const NOT_MIGRATED: &[&str] = &[
+    "42P01", // undefined_table — the schema exists but `dbos_migrations` does not
+    "3F000", // invalid_schema_name — not even the schema
 ];
 
 /// Transient failures that resolve on their own.
@@ -113,6 +121,13 @@ pub enum MigrateError {
         /// The last error it produced.
         source: sqlx::Error,
     },
+    /// The schema is older than this build needs, and migrating was not asked for.
+    Outdated {
+        /// The version the database records. `0` means nothing has ever migrated it.
+        recorded: i64,
+        /// The version this build's queries are written against.
+        required: i64,
+    },
 }
 
 impl std::fmt::Display for MigrateError {
@@ -123,6 +138,11 @@ impl std::fmt::Display for MigrateError {
             MigrateError::Migration { version, source } => {
                 write!(f, "migration {version} failed: {source}")
             }
+            MigrateError::Outdated { recorded, required } => write!(
+                f,
+                "the system database is at migration {recorded}, but this build needs \
+                 {required}. Migrate it, or launch with migration enabled."
+            ),
         }
     }
 }
@@ -132,6 +152,8 @@ impl std::error::Error for MigrateError {
         match self {
             MigrateError::Database(e) | MigrateError::Migration { source: e, .. } => Some(e),
             MigrateError::Render(e) => Some(e),
+            // Nothing failed underneath: the database answered, and its answer was too low.
+            MigrateError::Outdated { .. } => None,
         }
     }
 }
@@ -293,6 +315,45 @@ pub async fn run(
     let dialect = detect_dialect(pool).await?;
     let migrations = build_migrations(schema, dialect, use_listen_notify);
     apply(pool, schema, &migrations).await
+}
+
+/// Checks the schema is new enough for this build, without changing anything.
+///
+/// The counterpart to [`run`] for a caller that has opted out of migrating. Opting out says the
+/// database is someone else's to prepare — a deployment step, or another executor that got there
+/// first — and it is worth knowing whether they actually did. The alternative to checking is
+/// discovering it one query at a time, as a missing column on whichever statement happens to
+/// touch it first, long after launch reported success.
+///
+/// Nothing here creates anything, including the bookkeeping table: a database with no
+/// `dbos_migrations` has never been migrated, and quietly adding the table would turn that into
+/// version 0 rather than reporting it.
+///
+/// A database *ahead* of this build passes. That is the same rule [`apply`] follows, and it is
+/// what lets implementations at different versions share one database: the schema only ever
+/// gains, so a newer one still has everything these queries name.
+pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
+    let required = i64::from(LOCAL_MIGRATIONS);
+    let recorded = match recorded_version(pool, schema).await {
+        Ok(version) => version,
+        // No table, or no schema at all. Both mean nothing has migrated this database, which is
+        // the case worth naming clearly rather than reporting as a query that failed.
+        Err(MigrateError::Database(e)) if has_code(&e, NOT_MIGRATED) => 0,
+        Err(e) => return Err(e),
+    };
+
+    if recorded < required {
+        return Err(MigrateError::Outdated { recorded, required });
+    }
+    if recorded > required {
+        tracing::info!(
+            recorded,
+            known = required,
+            "system database is ahead of this build; another implementation has migrated it \
+             further"
+        );
+    }
+    Ok(())
 }
 
 /// Applies a prepared migration list, which is what [`run`] does once it has built one.

@@ -2,7 +2,7 @@
 
 mod support;
 
-use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
+use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission, Timestamp, WorkflowDelay,
@@ -541,12 +541,22 @@ async fn a_rejected_statement_is_not_retried() {
 /// With the default policy this call would block until the database came back, which is the
 /// trade the retry layer exists to make. The opt-out is what makes the classification testable
 /// without waiting for it.
+///
+/// A real unreachable address rather than a closed pool: the two look alike but are not alike. A
+/// database on a port that stops answering may answer again, and waiting is the right thing; a
+/// closed pool never reopens, so waiting is forever. See
+/// [`operations_after_close_fail_rather_than_hang`].
 #[tokio::test]
 async fn an_unreachable_database_is_a_connection_failure() {
     let db = test_database().await;
-    let pool = db.pool().await;
+    // Port 1 is reserved and nothing listens there.
+    let unreachable = sqlx::pool::PoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect_lazy_with(db.options().port(1));
+
     let sys = PostgresSystemDatabase::from_pool(
-        pool.clone(),
+        unreachable,
         &Settings {
             retry: RetryPolicy {
                 retry_connection_errors: false,
@@ -555,20 +565,16 @@ async fn an_unreachable_database_is_a_connection_failure() {
             ..Settings::default()
         },
     );
-    pool.close().await;
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(500),
-        sys.get_workflow("wf-1"),
-    )
-    .await
-    .expect("the opt-out should have returned rather than retried");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), sys.get_workflow("wf-1"))
+        .await
+        .expect("the opt-out should have returned rather than retried");
 
     match result {
         Err(Error::Backend(e)) => assert_eq!(
             e.kind,
             BackendErrorKind::Connection,
-            "a closed pool is a connection failure, got {e:?}",
+            "an unreachable database may yet answer, so it is worth waiting for, got {e:?}",
         ),
         other => panic!("expected a connection error, got {other:?}"),
     }
@@ -2760,5 +2766,77 @@ async fn a_sleep_records_its_duration_as_the_sleep() {
         wake.as_epoch_ms() - started.as_epoch_ms(),
         60_000,
         "the recorded span is exactly the sleep",
+    );
+}
+
+/// An operation issued after the handle is closed reports a failure instead of waiting for one.
+///
+/// A closed pool looks like every other connection failure, and the retry layer is built to wait
+/// connection failures out — deliberately, since a database that is briefly unreachable comes
+/// back. A closed pool never does. Classifying it as merely unreachable makes anything issued
+/// after shutdown hang forever, which is the one outcome the retry layer must never produce.
+#[tokio::test]
+async fn operations_after_close_fail_rather_than_hang() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-closed"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.close().await;
+
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sys.get_workflow("wf-closed"),
+    )
+    .await
+    .expect("a closed pool must answer, not block");
+
+    match answered {
+        Err(Error::Backend(e)) => assert_eq!(
+            e.kind,
+            BackendErrorKind::Permanent,
+            "a closed pool cannot reopen, so waiting for it is waiting forever"
+        ),
+        other => panic!("expected a backend failure, got {other:?}"),
+    }
+}
+
+/// Connecting without migrating checks that someone else did.
+///
+/// Opting out of migration says the database is someone else's to prepare. Trusting that blindly
+/// turns a deployment mistake into a missing column on whichever statement happens to touch it
+/// first — long after launch reported success, and with nothing pointing at the cause.
+#[tokio::test]
+async fn connecting_without_migrating_refuses_a_schema_that_is_not_ready() {
+    let db = test_database().await;
+
+    // A schema nothing has ever migrated.
+    let config = Config {
+        url: db.url(),
+        migrate: false,
+        settings: Settings {
+            schema: "never_migrated",
+            ..Settings::default()
+        },
+        ..Config::new(db.url())
+    };
+    let message = match PostgresSystemDatabase::connect(&config).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("an unmigrated schema should not connect"),
+    };
+    // Not the version number itself, which moves with every migration added — only that the
+    // message names where the database is and what to do about it.
+    assert!(
+        message.contains("migration 0") && message.contains("Migrate it"),
+        "the message should say how far the database got and what to do, got: {message}"
+    );
+
+    // And the schema the harness did migrate is accepted without being touched.
+    let config = Config {
+        migrate: false,
+        ..Config::new(db.url())
+    };
+    assert!(
+        PostgresSystemDatabase::connect(&config).await.is_ok(),
+        "a migrated schema should connect without migrating"
     );
 }

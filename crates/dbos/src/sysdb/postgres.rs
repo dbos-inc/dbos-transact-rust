@@ -102,8 +102,12 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
         sqlx::Error::Io(_)
         | sqlx::Error::Tls(_)
         | sqlx::Error::PoolTimedOut
-        | sqlx::Error::PoolClosed
         | sqlx::Error::WorkerCrashed => BackendErrorKind::Connection,
+        // Terminal, despite looking like every other connection failure. A closed pool is closed
+        // for good — sqlx has no way to reopen one — so waiting for it to come back never ends.
+        // Calling it a connection error makes any operation issued after shutdown hang instead of
+        // returning, which is the one outcome the retry layer must never produce.
+        sqlx::Error::PoolClosed => BackendErrorKind::Permanent,
         _ => BackendErrorKind::Permanent,
     }
 }
@@ -154,6 +158,12 @@ pub struct Config<'a> {
     /// Here rather than on [`Settings`] because it is a *migration* input: it decides which
     /// variant of the schema is applied, and `from_pool` never migrates.
     pub use_listen_notify: bool,
+    /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
+    ///
+    /// On by default. Turning it off suits an application whose database is migrated by something
+    /// else — a deployment step, or another executor that got there first — and it then connects
+    /// to whatever is already there. Java gates the same step on `DBOSConfig.migrate`.
+    pub migrate: bool,
     /// How the resulting handle behaves.
     pub settings: Settings<'a>,
 }
@@ -165,6 +175,7 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
+            migrate: true,
             settings: Settings::default(),
         }
     }
@@ -189,23 +200,35 @@ impl PostgresSystemDatabase {
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
     pub async fn connect(config: &Config<'_>) -> Result<Self, Error> {
-        ensure_database_exists(config.url).await?;
+        // Only when migrating. A caller that has opted out is saying the database is someone
+        // else's to set up, and creating one here would hide the fact that it is missing.
+        if config.migrate {
+            ensure_database_exists(config.url).await?;
+        }
 
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(config.url)
             .await?;
 
-        migrations::runner::run(&pool, config.settings.schema, config.use_listen_notify)
-            .await
-            // The runner has already retried what it could; whatever reaches here is settled.
-            .map_err(|e| {
-                Error::Backend(BackendError {
-                    message: e.to_string(),
-                    sqlstate: None,
-                    kind: BackendErrorKind::Permanent,
-                })
-            })?;
+        // Either bring the schema up, or check that whoever was supposed to has. Connecting to a
+        // schema this build's queries do not fit is a failure either way; the only question is
+        // whether it is reported now or as a missing column on some later statement.
+        let prepared = if config.migrate {
+            migrations::runner::run(&pool, config.settings.schema, config.use_listen_notify)
+                .await
+                .map(|_| ())
+        } else {
+            migrations::runner::verify(&pool, config.settings.schema).await
+        };
+        // The runner has already retried what it could; whatever reaches here is settled.
+        prepared.map_err(|e| {
+            Error::Backend(BackendError {
+                message: e.to_string(),
+                sqlstate: None,
+                kind: BackendErrorKind::Permanent,
+            })
+        })?;
 
         Ok(Self {
             pool,
@@ -229,11 +252,6 @@ impl PostgresSystemDatabase {
             // Copied out: the handle outlives the borrowed settings.
             executor_id: settings.executor_id.map(str::to_owned),
         }
-    }
-
-    /// Closes the pool.
-    pub async fn close(&self) {
-        self.pool.close().await;
     }
 }
 
@@ -1629,6 +1647,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             Ok(deleted)
         })
         .await
+    }
+
+    async fn close(&self) {
+        self.pool.close().await;
     }
 
     async fn check_step(

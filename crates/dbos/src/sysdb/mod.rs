@@ -235,6 +235,13 @@ pub trait SystemDatabase: Send + Sync {
         delete_children: bool,
     ) -> Result<u64, Error>;
 
+    /// Releases the connections this backend holds.
+    ///
+    /// Idempotent, and on the trait rather than the concrete type because shutdown reaches the
+    /// system database only through a trait object. Java's `SystemDatabase` and Go's `SysDB`
+    /// both expose the same.
+    async fn close(&self);
+
     /// Reads a recorded step, or `None` if it has not run.
     ///
     /// `check` rather than `get`, following all three references, because this is a replay gate
