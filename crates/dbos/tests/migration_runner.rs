@@ -8,7 +8,7 @@
 mod support;
 
 use dbos::sysdb::migrations::runner;
-use dbos::sysdb::migrations::{Dialect, LOCAL_MIGRATIONS, quote_identifier};
+use dbos::sysdb::migrations::{Dialect, SHARED_MIGRATIONS, quote_identifier};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use support::raw_database;
@@ -50,9 +50,9 @@ async fn migrates_a_fresh_database() {
         .expect("migration failed");
 
     assert_eq!(outcome.from_version, 0, "a fresh database records nothing");
-    assert_eq!(outcome.to_version, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(outcome.to_version, i64::from(SHARED_MIGRATIONS));
     assert!(!outcome.was_current);
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
     assert!(table_count(&pool).await >= 10, "the schema should exist");
 }
 
@@ -76,7 +76,7 @@ async fn a_second_run_is_a_no_op() {
         "nothing should have been applied"
     );
     assert_eq!(second.from_version, second.to_version);
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }
 
 /// An interrupted run resumes from where it stopped rather than starting over.
@@ -101,7 +101,7 @@ async fn resumes_from_a_partial_run() {
         .await
         .expect("resume failed");
     assert_eq!(outcome.from_version, 30);
-    assert_eq!(outcome.to_version, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(outcome.to_version, i64::from(SHARED_MIGRATIONS));
     assert!(
         outcome.applied.iter().all(|v| *v > 30),
         "only migrations after 30 should have been applied, got {:?}",
@@ -153,12 +153,12 @@ async fn empty_migrations_still_advance_the_version() {
         .await
         .expect("migration failed");
 
-    assert_eq!(outcome.to_version, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(outcome.to_version, i64::from(SHARED_MIGRATIONS));
     assert!(
         !outcome.applied.contains(&39),
         "39 has no statements with notifications off, so it should not be listed as applied",
     );
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }
 
 /// A non-default schema name works end to end.
@@ -261,7 +261,7 @@ async fn sweeps_invalid_indexes_left_by_an_interrupted_build() {
         0,
         "the runner should have dropped the invalid index before its online migrations",
     );
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }
 
 /// Migration 10 backfills the primary key when a database genuinely lacks it.
@@ -355,7 +355,7 @@ async fn migration_ten_backfills_a_missing_primary_key() {
         "migration 10 should report as applied, got {:?}",
         outcome.applied,
     );
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }
 
 /// A failing migration leaves the recorded version where it was.
@@ -392,7 +392,7 @@ async fn a_failed_migration_does_not_advance_the_version() {
         .await
         .expect("recovery failed");
     assert_eq!(outcome.from_version, (broken_at - 1) as i64);
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }
 
 /// Re-running the online migrations is safe.
@@ -425,7 +425,7 @@ async fn online_migrations_are_idempotent() {
         "the online migrations should have re-run, got {:?}",
         outcome.applied,
     );
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }
 
 /// Concurrent migrators converge instead of one of them failing.
@@ -444,5 +444,5 @@ async fn concurrent_migrators_converge() {
     a.expect("first migrator failed");
     b.expect("second migrator failed");
 
-    assert_eq!(version(&pool).await, i64::from(LOCAL_MIGRATIONS));
+    assert_eq!(version(&pool).await, i64::from(SHARED_MIGRATIONS));
 }

@@ -85,8 +85,8 @@ async fn the_corpus_applies_to_a_real_database() {
     let migrations = build_migrations(schema, dialect_for(db.backend()), true);
     assert_eq!(
         migrations.len(),
-        dbos::sysdb::migrations::LOCAL_MIGRATIONS as usize,
-        "one entry per locally-defined migration",
+        dbos::sysdb::migrations::SHARED_MIGRATIONS as usize,
+        "one entry per migration, including the padding to the shared base",
     );
     // Through the real runner, so this covers the path production uses.
     dbos::sysdb::migrations::runner::run(&pool, schema, true)
@@ -150,6 +150,44 @@ async fn late_migrations_take_effect() {
         assert!(
             cols.iter().any(|c| c == expected),
             "workflow_status is missing {expected}; got {cols:?}",
+        );
+    }
+}
+
+/// The shared series lands on every table it names.
+///
+/// Separate from the check above because these migrations are not this implementation's own:
+/// versions from 100 up mean the same DDL in Python and TypeScript, and the whole point of the
+/// padding is that they arrive at those numbers. A database migrated by Rust and then opened by
+/// another implementation must find the columns already there rather than try to add them again.
+#[tokio::test]
+async fn the_shared_series_adds_application_name_everywhere() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    apply_all(
+        &pool,
+        schema,
+        &build_migrations(schema, dialect_for(db.backend()), true),
+    )
+    .await;
+
+    for table in [
+        "workflow_status",      // 100
+        "queues",               // 101
+        "workflow_schedules",   // 102
+        "application_versions", // 103
+        "operation_outputs",    // 104
+    ] {
+        let cols = columns_of(&pool, schema, table).await;
+        assert!(
+            cols.iter().any(|c| c == "application_name"),
+            "{table} is missing application_name; got {cols:?}",
         );
     }
 }
@@ -274,7 +312,9 @@ async fn dialects_agree_on_the_number_of_versions() {
     assert!(crdb.iter().all(|m| !m.online));
     assert_eq!(
         pg.iter().filter(|m| m.online).count(),
-        dbos::sysdb::migrations::ONLINE_MIGRATIONS.len(),
+        pg.iter()
+            .filter(|m| dbos::sysdb::migrations::is_online(m.version))
+            .count(),
     );
 }
 

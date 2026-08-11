@@ -22,17 +22,19 @@
 /// Applying the corpus above to a database.
 pub mod runner;
 
-/// Migrations whose index DDL uses `CONCURRENTLY` and so cannot run inside a transaction on
-/// PostgreSQL. Each carries a `{{concurrently}}` placeholder — see [`Placeholders`].
+/// Whether a migration's index DDL uses `CONCURRENTLY`, and so cannot run inside a transaction
+/// on PostgreSQL.
 ///
-/// Empty on CockroachDB, which applies schema changes online regardless.
-pub const ONLINE_MIGRATIONS: &[u32] = &[
-    22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47,
-];
-
-/// Returns whether `version` is an online migration — see [`ONLINE_MIGRATIONS`].
+/// Read from the file rather than from a list beside it. A migration is online exactly when it
+/// carries a `{{concurrently}}` placeholder — see [`Placeholders`] — so a list would be a second
+/// copy of a fact the file already states, and the two could disagree. They cannot now.
+///
+/// Never true on CockroachDB, which applies schema changes online regardless and does not take
+/// the keyword; the placeholder renders empty there.
 pub fn is_online(version: u32) -> bool {
-    ONLINE_MIGRATIONS.contains(&version)
+    SOURCES
+        .iter()
+        .any(|s| s.version == version && s.sql.contains("{{concurrently}}"))
 }
 
 /// Quotes any SQL identifier — a schema, table, index, or database name.
@@ -157,10 +159,43 @@ pub fn render(sql: &str, values: Placeholders<'_>) -> Result<String, RenderError
     Ok(out)
 }
 
-/// A migration file as copied from upstream: its number, its filename, and its contents.
+/// When a migration file applies.
+///
+/// Declared with the file rather than decided by the assembler. Upstream expresses the same
+/// conditions as `if` statements inside one function per migration; ours are files, so the
+/// condition has to live somewhere — and next to the file it governs is where it can be read
+/// without cross-referencing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applies {
+    /// On every dialect and configuration.
+    Always,
+    /// Only where LISTEN/NOTIFY is in use — enabled by the caller *and* supported by the
+    /// dialect, which CockroachDB is not.
+    WhenNotify,
+    /// Only on PostgreSQL.
+    Postgres,
+    /// Only on CockroachDB, which is how a dialect ships a different form of one migration.
+    Cockroach,
+}
+
+impl Applies {
+    /// Whether this file belongs in the list being assembled.
+    fn matches(self, dialect: Dialect, notify: bool) -> bool {
+        match self {
+            Applies::Always => true,
+            Applies::WhenNotify => notify,
+            Applies::Postgres => !dialect.is_cockroach(),
+            Applies::Cockroach => dialect.is_cockroach(),
+        }
+    }
+}
+
+/// A migration file as copied from upstream: its number, its filename, its contents, and when it
+/// applies.
 ///
 /// Numbers are not unique across the corpus — several migrations ship variant files for
-/// CockroachDB or for LISTEN/NOTIFY, and those share the number of the migration they vary.
+/// CockroachDB or for LISTEN/NOTIFY, and those share the number of the migration they vary. A
+/// version's SQL is every applicable file for that version, concatenated in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MigrationSource {
     /// The migration number, taken from the filename. **Never from the header comment**,
@@ -170,76 +205,142 @@ pub struct MigrationSource {
     pub name: &'static str,
     /// The file's verbatim contents, still carrying its `{{name}}` placeholders.
     pub sql: &'static str,
+    /// The condition under which it is applied.
+    pub applies: Applies,
 }
 
 macro_rules! sources {
-    ($(($version:expr, $file:literal)),* $(,)?) => {
+    ($(($version:expr, $file:literal, $applies:expr)),* $(,)?) => {
         /// Every migration file in the corpus, in filename order.
         ///
-        /// Assembling these into the ordered list a runner applies — including the variant
-        /// selection and the padding to the shared numbering base — is a separate concern.
+        /// Assembling these into the ordered list a runner applies — the padding to the shared
+        /// numbering base, and migration 10's probe — is a separate concern. Variant selection
+        /// is not: each file says when it applies.
         pub const SOURCES: &[MigrationSource] = &[
             $(MigrationSource {
                 version: $version,
                 name: $file,
                 sql: include_str!(concat!("../../migrations/", $file)),
+                applies: $applies,
             }),*
         ];
     };
 }
 
 sources![
-    (1, "1_initial_dbos_schema.sql"),
-    (1, "1_initial_dbos_schema_listen_notify.sql"),
-    (2, "2_add_queue_partition_key.sql"),
-    (3, "3_add_workflow_status_index.sql"),
-    (4, "4_add_forked_from.sql"),
-    (5, "5_add_step_timestamps.sql"),
-    (6, "6_add_workflow_events_history.sql"),
-    (7, "7_add_owner_xid.sql"),
-    (8, "8_add_parent_workflow_id.sql"),
-    (9, "9_add_workflow_schedules.sql"),
-    (10, "10_add_notifications_pkey.sql"),
-    (11, "11_add_serialization_columns.sql"),
-    (12, "12_add_notifications_consumed.sql"),
-    (13, "13_add_application_versions.sql"),
-    (14, "14_add_pgsql_client_functions.sql"),
-    (15, "15_add_workflow_schedule_columns.sql"),
-    (16, "16_add_delay_until.sql"),
-    (17, "17_add_workflow_schedule_queue_name.sql"),
-    (18, "18_add_was_forked_from.sql"),
-    (19, "19_add_operation_outputs_completed_at_index.sql"),
-    (20, "20_set_function_search_path.sql"),
-    (20, "20_set_notify_function_search_path.sql"),
-    (21, "21_create_queues_table.sql"),
-    (22, "22_drop_forked_from_index.sql"),
-    (23, "23_create_partial_forked_from_index.sql"),
-    (24, "24_drop_parent_workflow_id_index.sql"),
-    (25, "25_create_partial_parent_workflow_id_index.sql"),
-    (26, "26_drop_executor_id_index.sql"),
-    (27, "27_create_partial_dedup_id_index.sql"),
-    (28, "28_drop_dedup_id_constraint.sql"),
-    (28, "28_drop_dedup_id_constraint_cockroach.sql"),
-    (29, "29_create_pending_index.sql"),
-    (30, "30_create_failed_index.sql"),
-    (31, "31_drop_status_index.sql"),
-    (32, "32_create_in_flight_index.sql"),
-    (33, "33_add_rate_limited.sql"),
-    (34, "34_create_rate_limited_index.sql"),
-    (35, "35_drop_queue_status_started_index.sql"),
-    (36, "36_add_completed_at.sql"),
-    (37, "37_create_started_at_index.sql"),
-    (38, "38_update_enqueue_workflow.sql"),
-    (38, "38_set_enqueue_workflow_search_path.sql"),
-    (39, "39_create_streams_trigger.sql"),
-    (40, "40_add_attributes.sql"),
-    (41, "41_add_schedule_name.sql"),
-    (42, "42_add_debounce_columns.sql"),
-    (43, "43_drop_streams_trigger.sql"),
-    (44, "44_drop_workflow_events_trigger.sql"),
-    (45, "45_add_partition_dequeue_index.sql"),
-    (46, "46_add_partition_dequeue_index_v2.sql"),
-    (47, "47_drop_partition_dequeue_index.sql"),
+    (1, "1_initial_dbos_schema.sql", Applies::Always),
+    (
+        1,
+        "1_initial_dbos_schema_listen_notify.sql",
+        Applies::WhenNotify
+    ),
+    (2, "2_add_queue_partition_key.sql", Applies::Always),
+    (3, "3_add_workflow_status_index.sql", Applies::Always),
+    (4, "4_add_forked_from.sql", Applies::Always),
+    (5, "5_add_step_timestamps.sql", Applies::Always),
+    (6, "6_add_workflow_events_history.sql", Applies::Always),
+    (7, "7_add_owner_xid.sql", Applies::Always),
+    (8, "8_add_parent_workflow_id.sql", Applies::Always),
+    (9, "9_add_workflow_schedules.sql", Applies::Always),
+    (10, "10_add_notifications_pkey.sql", Applies::Always),
+    (11, "11_add_serialization_columns.sql", Applies::Always),
+    (12, "12_add_notifications_consumed.sql", Applies::Always),
+    (13, "13_add_application_versions.sql", Applies::Always),
+    (14, "14_add_pgsql_client_functions.sql", Applies::Always),
+    (15, "15_add_workflow_schedule_columns.sql", Applies::Always),
+    (16, "16_add_delay_until.sql", Applies::Always),
+    (
+        17,
+        "17_add_workflow_schedule_queue_name.sql",
+        Applies::Always
+    ),
+    (18, "18_add_was_forked_from.sql", Applies::Always),
+    (
+        19,
+        "19_add_operation_outputs_completed_at_index.sql",
+        Applies::Always
+    ),
+    (20, "20_set_function_search_path.sql", Applies::Postgres),
+    (
+        20,
+        "20_set_notify_function_search_path.sql",
+        Applies::WhenNotify
+    ),
+    (21, "21_create_queues_table.sql", Applies::Always),
+    (22, "22_drop_forked_from_index.sql", Applies::Always),
+    (
+        23,
+        "23_create_partial_forked_from_index.sql",
+        Applies::Always
+    ),
+    (24, "24_drop_parent_workflow_id_index.sql", Applies::Always),
+    (
+        25,
+        "25_create_partial_parent_workflow_id_index.sql",
+        Applies::Always
+    ),
+    (26, "26_drop_executor_id_index.sql", Applies::Always),
+    (27, "27_create_partial_dedup_id_index.sql", Applies::Always),
+    (28, "28_drop_dedup_id_constraint.sql", Applies::Postgres),
+    (
+        28,
+        "28_drop_dedup_id_constraint_cockroach.sql",
+        Applies::Cockroach
+    ),
+    (29, "29_create_pending_index.sql", Applies::Always),
+    (30, "30_create_failed_index.sql", Applies::Always),
+    (31, "31_drop_status_index.sql", Applies::Always),
+    (32, "32_create_in_flight_index.sql", Applies::Always),
+    (33, "33_add_rate_limited.sql", Applies::Always),
+    (34, "34_create_rate_limited_index.sql", Applies::Always),
+    (
+        35,
+        "35_drop_queue_status_started_index.sql",
+        Applies::Always
+    ),
+    (36, "36_add_completed_at.sql", Applies::Always),
+    (37, "37_create_started_at_index.sql", Applies::Always),
+    (38, "38_update_enqueue_workflow.sql", Applies::Always),
+    (
+        38,
+        "38_set_enqueue_workflow_search_path.sql",
+        Applies::Postgres
+    ),
+    (39, "39_create_streams_trigger.sql", Applies::WhenNotify),
+    (40, "40_add_attributes.sql", Applies::Always),
+    (41, "41_add_schedule_name.sql", Applies::Always),
+    (42, "42_add_debounce_columns.sql", Applies::Always),
+    (43, "43_drop_streams_trigger.sql", Applies::WhenNotify),
+    (
+        44,
+        "44_drop_workflow_events_trigger.sql",
+        Applies::WhenNotify
+    ),
+    (45, "45_add_partition_dequeue_index.sql", Applies::Always),
+    (46, "46_add_partition_dequeue_index_v2.sql", Applies::Always),
+    (47, "47_drop_partition_dequeue_index.sql", Applies::Always),
+    // The shared series. Numbers from 100 up mean the same DDL in every implementation.
+    (
+        100,
+        "100_workflow_status_application_name.sql",
+        Applies::Always
+    ),
+    (101, "101_queues_application_name.sql", Applies::Always),
+    (
+        102,
+        "102_workflow_schedules_application_name.sql",
+        Applies::Always
+    ),
+    (
+        103,
+        "103_application_versions_application_name.sql",
+        Applies::Always
+    ),
+    (
+        104,
+        "104_operation_outputs_application_name.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -254,6 +355,8 @@ pub const MIGRATION_10_PK_PROBE: MigrationSource = MigrationSource {
     version: 10,
     name: "10_check_notifications_pkey.sql",
     sql: include_str!("../../migrations/10_check_notifications_pkey.sql"),
+    // Carried for the shape only. A probe is run, not applied, so nothing consults this.
+    applies: Applies::Always,
 };
 
 /// Looks up a migration file by name.
@@ -261,11 +364,33 @@ pub fn source(name: &str) -> Option<&'static MigrationSource> {
     SOURCES.iter().find(|s| s.name == name)
 }
 
-/// The highest migration defined here, and the version a fully migrated database records.
+/// The highest migration in this implementation's own history.
 ///
-/// Every implementation keeps its own history and its own count, so this number is not
-/// comparable with another implementation's.
+/// **Below the shared base the numbering still mirrors upstream's, and must.** A version number
+/// under 100 is a claim about schema state, so a database left half-migrated by one
+/// implementation is picked up correctly by another only if their version *n* describes the same
+/// schema. Our 45, 46 and 47 are Python's `fortyfive`, `fortysix` and `fortyseven` down to the
+/// index names. PLAN.md §4.14 records the decision: keep the Go/Python/Java numbering below 100,
+/// then jump to 100.
+///
+/// What the shared base changes is only what happens *above* it — see
+/// [`SHARED_MIGRATION_BASE`]. It does not make the numbers below it free.
 pub const LOCAL_MIGRATIONS: u32 = 47;
+
+/// Where the numbering stops being per-implementation and starts being shared.
+///
+/// From here up, a version number is a cross-SDK agreement *by construction*: 100 means the same
+/// DDL in Rust, Python and TypeScript because all three define it identically. Below it, the
+/// numbering agrees by porting rather than by agreement — see [`LOCAL_MIGRATIONS`] — which is why
+/// a new shared migration is written once and copied, while an old local one is never renumbered.
+///
+/// Versions between [`LOCAL_MIGRATIONS`] and here are padding — empty migrations that consume a
+/// number and do nothing. They exist so the shared series lands on its agreed numbers whatever
+/// length a given implementation's own history happens to be.
+pub const SHARED_MIGRATION_BASE: u32 = 100;
+
+/// The highest migration defined here, and the version a fully migrated database records.
+pub const SHARED_MIGRATIONS: u32 = 104;
 
 /// Which SQL dialect the system database speaks.
 ///
@@ -312,12 +437,6 @@ pub struct Migration {
     pub guard: Option<&'static str>,
 }
 
-fn file(name: &str) -> &'static str {
-    source(name)
-        .unwrap_or_else(|| panic!("migration file {name} is missing from the corpus"))
-        .sql
-}
-
 /// Assembles the ordered migration list for a dialect and configuration.
 ///
 /// Six migrations vary, and the variance lives here rather than in the files:
@@ -335,64 +454,39 @@ fn file(name: &str) -> &'static str {
 /// positional, so removing one would renumber everything after it.
 pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool) -> Vec<Migration> {
     let quoted = quote_identifier(schema);
+    // CockroachDB has no LISTEN/NOTIFY, so asking for it there is asking for nothing.
     let notify = use_listen_notify && !dialect.is_cockroach();
     let values = Placeholders {
         schema: &quoted,
         concurrently: dialect.concurrently(),
     };
-    let sql_of = |name: &str| render(file(name), values).expect("corpus renders");
 
-    (1..=LOCAL_MIGRATIONS)
+    // Own history, then the padding, then the shared series. The padding is not separable from
+    // what follows it: on its own it would put a fresh database at version 99 while 47
+    // migrations had run, claiming progress that has not happened.
+    (1..=SHARED_MIGRATIONS)
         .map(|version| {
-            let mut guard = None;
-            let sql = match version {
-                1 => {
-                    let mut sql = sql_of("1_initial_dbos_schema.sql");
-                    if notify {
-                        sql.push('\n');
-                        sql.push_str(&sql_of("1_initial_dbos_schema_listen_notify.sql"));
-                    }
-                    sql
-                }
-                10 => {
-                    guard = Some(MIGRATION_10_PK_PROBE.sql);
-                    sql_of("10_add_notifications_pkey.sql")
-                }
-                20 if dialect.is_cockroach() => String::new(),
-                20 => {
-                    let mut sql = sql_of("20_set_function_search_path.sql");
-                    if notify {
-                        sql.push('\n');
-                        sql.push_str(&sql_of("20_set_notify_function_search_path.sql"));
-                    }
-                    sql
-                }
-                28 if dialect.is_cockroach() => sql_of("28_drop_dedup_id_constraint_cockroach.sql"),
-                38 => {
-                    let mut sql = sql_of("38_update_enqueue_workflow.sql");
-                    if !dialect.is_cockroach() {
-                        sql.push('\n');
-                        sql.push_str(&sql_of("38_set_enqueue_workflow_search_path.sql"));
-                    }
-                    sql
-                }
-                // 39 installs a trigger; 43 and 44 drop triggers that exist only when
-                // notifications are on. All three are no-ops otherwise.
-                39 | 43 | 44 if !notify => String::new(),
-                v => {
-                    let name = SOURCES
-                        .iter()
-                        .find(|s| s.version == v && !s.name.contains("cockroach"))
-                        .unwrap_or_else(|| panic!("no file for migration {v}"))
-                        .name;
-                    sql_of(name)
-                }
-            };
+            // A version's SQL is every file that applies to it, in declaration order. Most
+            // versions have one file; a few have a second that applies only under LISTEN/NOTIFY
+            // or on one dialect, and a version whose files all decline renders empty.
+            let sql = SOURCES
+                .iter()
+                .filter(|s| s.version == version && s.applies.matches(dialect, notify))
+                .map(|s| render(s.sql, values).expect("corpus renders"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
             Migration {
                 version,
-                sql,
+                // Declared in `ONLINE_MIGRATIONS`, not inferred from the rendered SQL. Never on
+                // CockroachDB, which applies schema changes online regardless and does not take
+                // the keyword.
                 online: is_online(version) && !dialect.is_cockroach(),
-                guard,
+                // Migration 10 alone runs a probe first, because its work is a backfill that
+                // must not repeat: the probe asks whether the key is already there. It is a
+                // query, not SQL to apply, so it cannot be another source file.
+                guard: (version == 10).then_some(MIGRATION_10_PK_PROBE.sql),
+                sql,
             }
         })
         .collect()
@@ -408,19 +502,116 @@ mod tests {
         concurrently: "CONCURRENTLY",
     };
 
+    /// Each version is assembled from the files that apply to it, and no others.
+    ///
+    /// The cases that used to be `match` arms in the assembler, now declared on the files
+    /// themselves. Asserted against the built output rather than against `Applies`, so the rules
+    /// are pinned by what they produce rather than by how they are spelled.
+    #[test]
+    fn a_version_is_the_files_that_apply_to_it() {
+        let built = |dialect, notify| {
+            build_migrations("dbos", dialect, notify)
+                .into_iter()
+                .map(|m| (m.version, m.sql))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let pg_notify = built(Dialect::Postgres, true);
+        let pg_plain = built(Dialect::Postgres, false);
+        let crdb = built(Dialect::Cockroach, true);
+
+        // 1 gains its trigger half only under LISTEN/NOTIFY — including on CockroachDB, which
+        // has none however the caller asks.
+        assert!(pg_notify[&1].contains("TRIGGER"));
+        assert!(!pg_plain[&1].contains("TRIGGER"));
+        assert!(!crdb[&1].contains("TRIGGER"));
+
+        // 20 sets a function's search_path, which CockroachDB does not take: empty there, and
+        // its notify half follows the same rule as 1's.
+        assert!(crdb[&20].is_empty());
+        assert!(pg_notify[&20].len() > pg_plain[&20].len());
+
+        // 28 ships one form per dialect, not a common form plus an extra.
+        assert!(pg_notify[&28].contains("DROP CONSTRAINT"));
+        assert_ne!(pg_notify[&28], crdb[&28]);
+        assert!(!crdb[&28].is_empty());
+
+        // 39, 43 and 44 install and drop triggers that exist only under LISTEN/NOTIFY.
+        for version in [39, 43, 44] {
+            assert!(
+                !pg_notify[&version].is_empty(),
+                "{version} applies with notify"
+            );
+            assert!(
+                pg_plain[&version].is_empty(),
+                "{version} is a no-op without"
+            );
+        }
+
+        // Migration 10 is the only one carrying a probe, and it is a query rather than a file
+        // that could have been given an `Applies`.
+        let migrations = build_migrations("dbos", Dialect::Postgres, true);
+        let guarded: Vec<u32> = migrations
+            .iter()
+            .filter(|m| m.guard.is_some())
+            .map(|m| m.version)
+            .collect();
+        assert_eq!(guarded, [10]);
+    }
+
+    /// The list runs to the shared series, with the gap consuming its numbers and doing nothing.
+    ///
+    /// The padding is what makes a version number mean the same thing across implementations:
+    /// the shared series has to land on 100 whatever length this implementation's own history
+    /// happens to be. Its emptiness is the point, so it is asserted rather than assumed.
+    #[test]
+    fn the_gap_to_the_shared_base_is_padding() {
+        let migrations = build_migrations("dbos", Dialect::Postgres, true);
+
+        assert_eq!(migrations.len() as u32, SHARED_MIGRATIONS);
+        assert_eq!(
+            migrations.last().expect("non-empty").version,
+            SHARED_MIGRATIONS
+        );
+
+        for m in &migrations {
+            let padding = m.version > LOCAL_MIGRATIONS && m.version < SHARED_MIGRATION_BASE;
+            if padding {
+                assert!(
+                    m.sql.is_empty(),
+                    "migration {} is padding and must do nothing",
+                    m.version
+                );
+            }
+        }
+
+        // And the shared series is not padding: each of its migrations carries SQL.
+        for version in SHARED_MIGRATION_BASE..=SHARED_MIGRATIONS {
+            let m = &migrations[version as usize - 1];
+            assert_eq!(m.version, version);
+            assert!(
+                m.sql.contains("application_name"),
+                "migration {version} should add the shared column",
+            );
+        }
+    }
+
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 52 files: 51 the runner applies, plus the migration-10 probe, which is bound
+        // 57 files: 56 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 51);
+        assert_eq!(SOURCES.len(), 56);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
         versions.dedup();
+        // This implementation's own history, then the shared series — with the padding between
+        // them contributing no files, which is what makes it padding.
+        let expected: Vec<u32> = (1..=LOCAL_MIGRATIONS)
+            .chain(SHARED_MIGRATION_BASE..=SHARED_MIGRATIONS)
+            .collect();
         assert_eq!(
-            versions,
-            (1..=LOCAL_MIGRATIONS).collect::<Vec<_>>(),
-            "the corpus should cover every migration up to LOCAL_MIGRATIONS with no gaps",
+            versions, expected,
+            "the corpus should cover its own history and the shared series, and nothing between",
         );
 
         // Four files share a version with another: the LISTEN/NOTIFY halves of migrations 1
@@ -482,36 +673,53 @@ mod tests {
             );
             checked += 1;
         }
-        // 47 files, less migration 1's two, which open with a description rather than a
+        // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 50, "expected 50 files to carry a numbered header");
+        assert_eq!(checked, 55, "expected 55 files to carry a numbered header");
     }
 
     #[test]
     fn online_migrations_match_the_reference_set() {
-        assert_eq!(ONLINE_MIGRATIONS.len(), 16);
-        assert!(is_online(22) && is_online(37));
+        // Derived from the files, so this is a snapshot rather than a definition: a synced file
+        // that gained or lost a `{{concurrently}}` placeholder changes what the runner does with
+        // it, and should have to say so here.
+        let online: Vec<u32> = (1..=SHARED_MIGRATIONS).filter(|v| is_online(*v)).collect();
+        assert_eq!(
+            online,
+            [
+                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47
+            ],
+        );
         // The gaps are real: 28, 33, and 36 are not online.
         assert!(!is_online(28) && !is_online(33) && !is_online(36));
     }
 
-    /// Only the online migrations carry a `{{concurrently}}` placeholder.
+    /// `CONCURRENTLY` only ever reaches a migration through the placeholder.
     ///
-    /// If a synced file gained or lost one, its index DDL would render without the keyword on
-    /// PostgreSQL and quietly take a table lock.
+    /// Hardcoding the keyword would render it on CockroachDB, which does not take it, and would
+    /// leave the migration unmarked as online — so PostgreSQL would try to run it inside a
+    /// transaction, which it also does not take. Both failures come from the same slip.
     #[test]
-    fn only_online_migrations_carry_a_concurrently_slot() {
+    fn concurrently_arrives_only_through_the_placeholder() {
         for s in SOURCES {
-            assert_eq!(
-                s.sql.contains("{{concurrently}}"),
-                is_online(s.version),
-                "{}: concurrently placeholder disagrees with the online set",
+            // Comments discuss the keyword freely — several explain why a migration does *not*
+            // need it — so only the SQL is examined.
+            let statements: String = s
+                .sql
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !statements
+                    .replace("{{concurrently}}", "")
+                    .contains("CONCURRENTLY"),
+                "{}: CONCURRENTLY is hardcoded; it must come from the placeholder",
                 s.name,
             );
         }
     }
 
-    /// Every file renders with no placeholder left behind.
     #[test]
     fn every_file_renders_completely() {
         for s in SOURCES
