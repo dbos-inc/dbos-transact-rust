@@ -4032,3 +4032,210 @@ async fn writing_a_stream_for_a_missing_workflow_is_refused() {
         .await;
     assert!(matches!(result, Err(Error::NonExistentWorkflow { .. })));
 }
+
+/// A handle that names its application stamps that name on everything it writes.
+///
+/// The column is what makes a row *owned*, and nothing else can supply it: a row's owner is
+/// decided by whoever wrote it, not by a later caller. Every table in the shared series that
+/// this layer writes is checked, because a table left unstamped is a table an ownership
+/// predicate silently excludes.
+#[tokio::test]
+async fn a_named_handle_stamps_its_application_on_what_it_writes() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    for (sys, id) in [(&alpha, "wf-alpha"), (&anonymous, "wf-nobody")] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+        sys.record_step(
+            id,
+            0,
+            "a_step",
+            Outcome::Output(Some("\"out\"")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        sys.record_child_workflow(id, &format!("{id}-child"), 1, "a_child", None)
+            .await
+            .unwrap();
+    }
+
+    for (id, expected) in [("wf-alpha", Some("alpha")), ("wf-nobody", None)] {
+        let owner: Option<String> = sqlx::query_scalar(
+            r#"SELECT "application_name" FROM "dbos"."workflow_status" WHERE "workflow_uuid" = $1"#,
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owner.as_deref(), expected, "{id}: workflow owner");
+
+        // Both steps, in one query: a step and a child launch take different insert paths.
+        let owners: Vec<Option<String>> = sqlx::query_scalar(
+            r#"SELECT "application_name" FROM "dbos"."operation_outputs"
+               WHERE "workflow_uuid" = $1 ORDER BY "function_id""#,
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owners.iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
+            [expected, expected],
+            "{id}: step owners",
+        );
+    }
+}
+
+/// A second submission of a running workflow does not take it over.
+///
+/// The insert is the only place ownership is decided, so `application_name` is deliberately
+/// absent from the conflict update — the same reasoning that keeps `executor_id` from being
+/// handed to whoever submitted last. A workflow that changed hands mid-run would have its
+/// remaining steps recorded under one application and its earlier ones under another.
+#[tokio::test]
+async fn a_resubmission_does_not_re_own_a_claimed_workflow() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let beta = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("beta"),
+            ..Settings::default()
+        },
+    );
+
+    alpha
+        .init_workflow(&workflow("wf-contested"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    beta.init_workflow(&workflow("wf-contested"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let owner: Option<String> = sqlx::query_scalar(
+        r#"SELECT "application_name" FROM "dbos"."workflow_status" WHERE "workflow_uuid" = $1"#,
+    )
+    .bind("wf-contested")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.as_deref(),
+        Some("alpha"),
+        "the first writer keeps the workflow",
+    );
+}
+
+/// A fork runs on its source's application, and claims a source nobody owns.
+///
+/// It has to: a fork replays the steps its source recorded, so the application that recorded
+/// them is the one that can interpret them. Claiming an unclaimed source is what a dequeue would
+/// do anyway, and leaving it unclaimed would let every application coalesce onto the one fork.
+#[tokio::test]
+async fn a_fork_inherits_its_sources_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let beta = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("beta"),
+            ..Settings::default()
+        },
+    );
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    // One source owned by alpha, one owned by nobody, each with a step to copy across.
+    for (sys, id) in [(&alpha, "wf-owned"), (&anonymous, "wf-unowned")] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+        sys.record_step(
+            id,
+            0,
+            "a_step",
+            Outcome::Output(Some("\"out\"")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Beta does the forking in both cases, and gets a different answer each time.
+    beta.fork_workflows(
+        &[
+            Fork {
+                source_id: "wf-owned",
+                forked_id: Some("fork-of-owned"),
+                start_step: 1,
+            },
+            Fork {
+                source_id: "wf-unowned",
+                forked_id: Some("fork-of-unowned"),
+                start_step: 1,
+            },
+        ],
+        &ForkOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    for (fork_id, expected) in [
+        ("fork-of-owned", "alpha"),  // the source's owner wins
+        ("fork-of-unowned", "beta"), // nobody owned it, so the forker claims it
+    ] {
+        let owner: Option<String> = sqlx::query_scalar(
+            r#"SELECT "application_name" FROM "dbos"."workflow_status" WHERE "workflow_uuid" = $1"#,
+        )
+        .bind(fork_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owner.as_deref(),
+            Some(expected),
+            "{fork_id}: workflow owner"
+        );
+
+        // The copied steps take the same owner as the status row — one owner per fork.
+        let step_owner: Option<String> = sqlx::query_scalar(
+            r#"SELECT "application_name" FROM "dbos"."operation_outputs"
+               WHERE "workflow_uuid" = $1"#,
+        )
+        .bind(fork_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            step_owner.as_deref(),
+            Some(expected),
+            "{fork_id}: step owner"
+        );
+    }
+}

@@ -155,6 +155,16 @@ pub struct Settings<'a> {
     /// `None` leaves the executor column alone entirely, which is Python's behaviour when it has
     /// no id to stamp.
     pub executor_id: Option<&'a str>,
+    /// Names the application this handle acts for, among the applications sharing the database.
+    ///
+    /// Rows this handle writes are stamped with it, which is what makes them *owned*. `None` is
+    /// the pre-existing world: an anonymous handle writes unclaimed rows, and unclaimed rows
+    /// belong to every application. That is why the column is nullable and why nothing requires
+    /// a name — a database written by an older SDK contains nothing but unclaimed rows.
+    ///
+    /// Not an identity of the process, which is [`executor_id`](Self::executor_id): several
+    /// executors of one application share a name, and that is the point of having one.
+    pub application_name: Option<&'a str>,
 }
 
 impl Default for Settings<'_> {
@@ -167,6 +177,7 @@ impl Default for Settings<'_> {
             schema: DEFAULT_SCHEMA,
             retry: RetryPolicy::default(),
             executor_id: None,
+            application_name: None,
         }
     }
 }
@@ -216,6 +227,9 @@ pub struct PostgresSystemDatabase {
     tables: Tables,
     retry: RetryPolicy,
     executor_id: Option<String>,
+    /// The application every row this handle writes is stamped with. See
+    /// [`Settings::application_name`].
+    application_name: Option<String>,
 }
 
 impl PostgresSystemDatabase {
@@ -261,6 +275,7 @@ impl PostgresSystemDatabase {
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
+            application_name: config.settings.application_name.map(str::to_owned),
         })
     }
 
@@ -276,6 +291,7 @@ impl PostgresSystemDatabase {
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
             executor_id: settings.executor_id.map(str::to_owned),
+            application_name: settings.application_name.map(str::to_owned),
         }
     }
 }
@@ -699,6 +715,7 @@ impl PostgresSystemDatabase {
         let steps_table = &self.tables.operation_outputs;
         let (workflow_table, steps_table) = (workflow_table.as_str(), steps_table.as_str());
         let executor_id = self.executor_id.as_deref();
+        let application_name = self.application_name.as_deref();
         // The sum type collapses to the two nullable columns only here, at the edge.
         let (output, error) = outcome.columns();
 
@@ -730,8 +747,9 @@ impl PostgresSystemDatabase {
             // which is nullable because a caller may record a step without timings.
             let stored: Option<Option<i64>> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, output, \
-                 error, serialization, started_at_epoch_ms, completed_at_epoch_ms) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 error, serialization, started_at_epoch_ms, completed_at_epoch_ms, \
+                 application_name) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
                  ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
                  SET completed_at_epoch_ms = {steps_table}.completed_at_epoch_ms \
                  RETURNING completed_at_epoch_ms"
@@ -744,6 +762,10 @@ impl PostgresSystemDatabase {
             .bind(serialization)
             .bind(timing.map(|t| t.started_at.as_epoch_ms()))
             .bind(timing.map(|t| t.completed_at.as_epoch_ms()))
+            // Mirrors the workflow: only the application actually running it records its steps,
+            // and the conflict update leaves an existing row's owner alone for the same reason
+            // the completion timestamp is left alone.
+            .bind(application_name)
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1125,13 +1147,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                  created_at, updated_at, recovery_attempts, \
                  workflow_timeout_ms, workflow_deadline_epoch_ms, \
                  parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
-                 debounce_deadline_epoch_ms, is_debounced) \
+                 debounce_deadline_epoch_ms, is_debounced, application_name) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::jsonb, $27, $28, $29) \
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::jsonb, $27, $28, $29, $30) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    recovery_attempts = CASE \
                        WHEN {table}.status != 'ENQUEUED' AND {table}.status != 'DELAYED' \
-                       THEN {table}.recovery_attempts + $30 \
+                       THEN {table}.recovery_attempts + $31 \
                        ELSE {table}.recovery_attempts \
                    END, \
                    updated_at = EXCLUDED.updated_at, \
@@ -1140,7 +1162,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                        THEN {table}.executor_id \
                        WHEN {table}.owner_xid IS NULL \
                          OR {table}.owner_xid = EXCLUDED.owner_xid \
-                         OR $31 \
+                         OR $32 \
                        THEN EXCLUDED.executor_id \
                        ELSE {table}.executor_id \
                    END \
@@ -1179,6 +1201,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.schedule_name)
             .bind(workflow.debounce_deadline.map(Timestamp::as_epoch_ms))
             .bind(workflow.is_debounced)
+            // Absent from the conflict update above, deliberately: a re-submission must not
+            // re-own a row another application already claimed. The insert is the only place a
+            // workflow's owner is decided.
+            .bind(self.application_name.as_deref())
             .bind(increment)
             .bind(claiming)
             .fetch_one(pool)
@@ -1928,6 +1954,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         let pool = &self.pool;
         let (source_ids, forked_ids, start_steps) = (&source_ids, &forked_ids, &start_steps);
         let (replace_from, replace_to) = (&replace_from, &replace_to);
+        let application_name = self.application_name.as_deref();
 
         with_retry(&self.retry, "fork_workflows", move || async move {
             let mut tx = pool.begin().await?;
@@ -1955,15 +1982,22 @@ impl SystemDatabase for PostgresSystemDatabase {
             // The fork inherits its source's identity and starts enqueued. `application_version`
             // falls back to the source's, matching Go and TypeScript: a fork stamped with no
             // version would be invisible to the recovery that scopes by it.
+            //
+            // `application_name` falls back the other way — the source's owner wins, and this
+            // application's name is used only to claim a source nobody owns, which is what a
+            // dequeue would do anyway. A fork has to run on the same application as its source:
+            // it replays that application's recorded steps.
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {workflow_table} (workflow_uuid, status, name, class_name, config_name, \
                     application_version, application_id, authenticated_user, authenticated_roles, \
                     assumed_role, inputs, serialization, request, queue_name, \
-                    queue_partition_key, forked_from, attributes, workflow_timeout_ms) \
+                    queue_partition_key, forked_from, attributes, workflow_timeout_ms, \
+                    application_name) \
                  SELECT m.fork_id, 'ENQUEUED', w.name, w.class_name, w.config_name, \
                     COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
                     w.authenticated_roles, w.assumed_role, w.inputs, w.serialization, w.request, \
-                    $5, $6, w.workflow_uuid, w.attributes, $7 \
+                    $5, $6, w.workflow_uuid, w.attributes, $7, \
+                    COALESCE(w.application_name, $8) \
                  FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
                  JOIN {workflow_table} w ON w.workflow_uuid = m.source_id"
             )))
@@ -1974,6 +2008,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(queue_name)
             .bind(options.queue_partition_key)
             .bind(timeout_ms)
+            .bind(application_name)
             .execute(&mut *tx)
             .await?;
 
@@ -1992,14 +2027,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                 sqlx::query(AssertSqlSafe(format!(
                     "INSERT INTO {steps_table} (workflow_uuid, function_id, output, error, \
                         serialization, function_name, child_workflow_id, started_at_epoch_ms, \
-                        completed_at_epoch_ms) \
+                        completed_at_epoch_ms, application_name) \
                      SELECT m.fork_id, o.function_id, o.output, o.error, o.serialization, \
                         o.function_name, \
                         COALESCE(r.replacement, o.child_workflow_id), \
-                        o.started_at_epoch_ms, o.completed_at_epoch_ms \
+                        o.started_at_epoch_ms, o.completed_at_epoch_ms, \
+                        COALESCE(w.application_name, $6) \
                      FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
                      JOIN {steps_table} o \
                        ON o.workflow_uuid = m.source_id AND o.function_id < m.start_step \
+                     JOIN {workflow_table} w ON w.workflow_uuid = m.source_id \
                      LEFT JOIN unnest($4::text[], $5::text[]) AS r(original, replacement) \
                        ON r.original = o.child_workflow_id"
                 )))
@@ -2008,6 +2045,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(start_steps)
                 .bind(replace_from)
                 .bind(replace_to)
+                // The same owner the fork's status row just took, computed the same way — one
+                // owner per fork, shared by its status row and its copied steps. Read from the
+                // source workflow rather than from the copied step, whose own `application_name`
+                // records only who ran it and may be a third application entirely.
+                .bind(application_name)
                 .execute(&mut *tx)
                 .await?;
 
@@ -2886,6 +2928,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // since half a pair measures nothing. Java passes both null here.
         let completed_at = started_at.map(|_| Timestamp::now());
         let (table, pool) = (table.as_str(), &self.pool);
+        let application_name = self.application_name.as_deref();
 
         with_retry(&self.retry, "record_child_workflow", move || async move {
             // Same `DO UPDATE`-to-itself trick as `record_step`, but the returned value
@@ -2895,8 +2938,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             // means an idempotent db_retry; a different child means nondeterminism."
             let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "INSERT INTO {table} (workflow_uuid, function_id, function_name, \
-                 child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
+                 application_name) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
                  SET child_workflow_id = {table}.child_workflow_id \
                  RETURNING child_workflow_id"
@@ -2907,6 +2951,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(child_workflow_id)
             .bind(started_at.map(Timestamp::as_epoch_ms))
             .bind(completed_at.map(Timestamp::as_epoch_ms))
+            // The launch is the parent's step, so it is stamped with the parent's application —
+            // the child's own rows carry whatever application ends up running it.
+            .bind(application_name)
             .fetch_optional(pool)
             .await?;
 
