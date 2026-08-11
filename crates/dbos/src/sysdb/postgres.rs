@@ -28,6 +28,35 @@
 //! logging them before returning double-reports every failure the caller then handles. And **no
 //! per-method entry logging**, which Java has (`debug("initWorkflowStatus workflowId {}")`) and
 //! nothing else does; a span belongs to the caller, not to every statement.
+//!
+//! # Application scoping
+//!
+//! Statements that search or sweep are scoped to the rows this handle may act on, written the
+//! same way each time so the shape is recognisable:
+//!
+//! ```sql
+//! ($3::text IS NULL OR application_name = $3 OR application_name IS NULL)
+//! ```
+//!
+//! bound to `self.application_name`. Three parts, each load-bearing:
+//!
+//! - **`$n IS NULL`** — a handle with no application of its own is not scoped to anything, so it
+//!   matches every row. The cast is what lets the driver infer the parameter's type when the
+//!   value is `None`.
+//! - **`application_name = $n`** — this application's own rows.
+//! - **`application_name IS NULL`** — unclaimed rows, which belong to every application. They come
+//!   from writers that had no name: an older SDK, or a client acting for nobody in particular.
+//!
+//! Written as one clause with the name bound rather than as conditional SQL text, so a statement
+//! is the same string whether or not the handle has an application — the parameter numbering
+//! cannot drift out of step with the binds, and the backend sees one prepared statement instead
+//! of two. It is spelled out at each site rather than built by a helper, so the numbering is
+//! visible beside the binds it has to match.
+//!
+//! **Only searches and sweeps carry it.** Anything addressed by workflow id — cancel, resume,
+//! delete, fork, the messaging verbs — does not: an id is a global address, so asking for one by
+//! id is an identity read, and answering "no such workflow" for one that plainly exists would be
+//! a lie. See [`Applications`] for how a caller overrides the default.
 
 use std::collections::{HashMap, HashSet};
 
@@ -296,22 +325,6 @@ impl PostgresSystemDatabase {
     }
 }
 
-/// A predicate scoping a statement to the rows this handle may act on.
-///
-/// Written as one clause with the name bound rather than as conditional SQL text, so the
-/// statement is the same string whether or not this handle has an application. Two reasons that
-/// matters: the parameter numbering cannot drift out of step with the binds, and the backend sees
-/// one prepared statement instead of two.
-///
-/// `$n IS NULL` is the nameless case — a handle with no application of its own is not scoped to
-/// anything, and matches every row. The cast is what lets the driver infer the parameter's type
-/// when the value is `None`.
-///
-/// Always paired with a `.bind(self.application_name.as_deref())` in caller order.
-fn own_scope(column: &str, param: usize) -> String {
-    format!("(${param}::text IS NULL OR {column} = ${param} OR {column} IS NULL)",)
-}
-
 /// The tables this backend addresses, quoted and schema-qualified.
 ///
 /// One field per table rather than a map: every lookup is a literal in this file, so a missing
@@ -514,7 +527,61 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 
 /// Every column `version_from_row` reads.
-const VERSION_COLUMNS: &str = "version_id, version_name, version_timestamp, created_at";
+const VERSION_COLUMNS: &str =
+    "version_id, version_name, version_timestamp, created_at, application_name";
+
+/// The application a row keyed by name should end up owned by, having read which holds it now.
+///
+/// Not to be confused with `owner_xid`, the other ownership in this schema: that names an
+/// execution attempt, this names an application.
+///
+/// A nameless writer leaves an existing owner intact; one whose name already matches proceeds;
+/// one with a *different* name is refused, because taking the row would redirect the holder's
+/// work here. `None` back means the row is unclaimed and this writer has no name to claim it
+/// with.
+///
+/// **Diagnostic, not a guard.** The writes it precedes match only a row that is unclaimed or
+/// already this application's, and that is what keeps a peer's row safe. Inside a transaction it
+/// still races at READ COMMITTED, where every statement takes a fresh snapshot: a registrar
+/// claiming the row in between costs a following write that silently matches nothing.
+/// `SELECT … FOR UPDATE` would close that, and neither reference does it — both lock rows only on
+/// the dequeue path — so it is a change to raise with them rather than make alone.
+///
+/// **Exact only while a name is globally unique**, which migrations 9, 13 and 21 guarantee today.
+/// When the shared series drops 13's in favour of 106 and 107, a version name may exist once per
+/// application and this would return an arbitrary one, so it needs an `application_name` scope at
+/// that point — as do Python's and TypeScript's, which also read by name alone. Queue and
+/// schedule names have no such replacement.
+async fn resolve_owning_application(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    key_column: &str,
+    name: &str,
+    claimant: Option<&str>,
+    kind: &'static str,
+) -> Result<Option<String>, Error> {
+    let holder: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT application_name FROM {table} WHERE {key_column} = $1"
+    )))
+    .bind(name)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    // No row, or a row nobody owns: this writer's name stands, whatever it is.
+    let Some(Some(holder)) = holder else {
+        return Ok(claimant.map(str::to_owned));
+    };
+    match claimant {
+        None => Ok(Some(holder)),
+        Some(claimant) if claimant == holder => Ok(Some(holder)),
+        Some(claimant) => Err(Error::RegisteredByAnother {
+            kind,
+            name: name.to_owned(),
+            holder,
+            claimant: Some(claimant.to_owned()),
+        }),
+    }
+}
 
 /// Reads a sleep step's recorded wake time.
 ///
@@ -548,6 +615,7 @@ fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
         version_name: row.try_get("version_name")?,
         version_timestamp: Timestamp::from_epoch_ms(row.try_get("version_timestamp")?),
         created_at: Timestamp::from_epoch_ms(row.try_get("created_at")?),
+        application_name: row.try_get("application_name")?,
     })
 }
 
@@ -1218,10 +1286,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.schedule_name)
             .bind(workflow.debounce_deadline.map(Timestamp::as_epoch_ms))
             .bind(workflow.is_debounced)
-            // Absent from the conflict update above, deliberately: a re-submission must not
-            // re-own a row another application already claimed. The insert is the only place a
-            // workflow's owner is decided.
-            .bind(self.application_name.as_deref())
+            // Both Python and TypeScript apply the application name fallback a layer up, in the
+            // executor and the client. It is here so that this layer can stand alone.
+            .bind(
+                workflow
+                    .application_name
+                    .or(self.application_name.as_deref()),
+            )
             .bind(increment)
             .bind(claiming)
             .fetch_one(pool)
@@ -1703,15 +1774,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         // they are its own to restart, and run functions it has never heard of. Migration 7's
         // `owner_xid` does not help, because a recovery sweep is looking for workflows whose
         // owner is *gone*.
-        let scope = own_scope("application_name", 3);
-        // Borrowed, not moved: the retry closure is `FnMut` and may run the statement again.
-        let scope = scope.as_str();
 
         with_retry(&self.retry, "get_pending_workflows", move || async move {
             let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT workflow_uuid FROM {table} \
                  WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2 \
-                 AND {scope}"
+                   AND ($3::text IS NULL \
+                        OR application_name = $3 \
+                        OR application_name IS NULL)"
             )))
             .bind(executor_id)
             .bind(application_version)
@@ -1730,9 +1800,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         // A sweep, so it is scoped: releasing a peer's delayed workflow would enqueue it against
         // that peer's schedule rather than its own. Unclaimed rows are still released, which is
         // what lets an application take over work an unnamed client enqueued.
-        let scope = own_scope("application_name", 2);
-        // Borrowed, not moved: the retry closure is `FnMut` and may run the statement again.
-        let scope = scope.as_str();
 
         with_retry(
             &self.retry,
@@ -1750,7 +1817,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "UPDATE {table} SET status = 'ENQUEUED', updated_at = $1, \
                      deduplication_id = CASE WHEN is_debounced THEN NULL \
                                              ELSE deduplication_id END \
-                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1 AND {scope}"
+                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1 \
+                       AND ($2::text IS NULL \
+                            OR application_name = $2 \
+                            OR application_name IS NULL)"
                 )))
                 .bind(now)
                 .bind(application_name)
@@ -2877,29 +2947,85 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn create_application_version(&self, version_name: &str) -> Result<(), Error> {
+    async fn create_application_version(
+        &self,
+        version_name: &str,
+        application_name: Option<&str>,
+    ) -> Result<(), Error> {
         let table = &self.tables.application_versions;
         // Generated outside the retry, like every other identity here. It matters less than
-        // `owner_xid` does — the conflict is on `version_name`, so a retry with a fresh id is
-        // still a no-op — but the rule is worth keeping uniform.
+        // `owner_xid` does — a retry finds the row already there and claims nothing — but the
+        // rule is worth keeping uniform.
         let version_id = uuid::Uuid::new_v4().to_string();
         let (table, pool, version_id) = (table.as_str(), &self.pool, version_id.as_str());
+        let application_name = application_name.or(self.application_name.as_deref());
 
         with_retry(
             &self.retry,
             "create_application_version",
             move || async move {
-                // `DO NOTHING` on the name, not the id: launching the same version twice must
-                // register it once, and must not disturb the timestamp that decides which
-                // version is current.
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {table} (version_id, version_name) VALUES ($1, $2) \
-                     ON CONFLICT (version_name) DO NOTHING"
+                let mut tx = pool.begin().await?;
+
+                // Claim a pre-ownership row where it stands, rather than inserting a second one.
+                //
+                // Today it could not insert one anyway: migration 13's global unique on
+                // `version_name` swallows it, and the row would stay unclaimed forever. So this
+                // is what adopts a version registered before ownership existed.
+                //
+                // 106 and 107's per-application keys are already in place beside it, and are
+                // strictly weaker — the global unique implies both, so they reject nothing extra
+                // today. They exist so that unique can be dropped later without a window where
+                // nothing enforces uniqueness; that drop is a future shared migration, blocked
+                // until every SDK reaching a database is past 107.
+                //
+                // Once it lands, a second row does become possible — and it would carry a fresh
+                // `version_timestamp`, which is what `ORDER BY version_timestamp DESC LIMIT 1`
+                // reads as latest. An operator who had pinned an older version by promoting it
+                // would find the pin silently undone, and schedules enqueueing against the
+                // version they rolled back from.
+                //
+                // Guarded on `IS NULL` so it can only ever claim what nobody holds.
+                let claimed = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET application_name = $1 \
+                     WHERE version_name = $2 AND application_name IS NULL"
                 )))
-                .bind(version_id)
+                .bind(application_name)
                 .bind(version_name)
-                .execute(pool)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+
+                if claimed == 0 {
+                    // Targetless `DO NOTHING`, deliberately: naming `(version_name)` as the
+                    // arbiter would stop working the moment migration 13's global uniqueness is
+                    // dropped in favour of 106 and 107's per-application keys. Without a target
+                    // it absorbs whichever unique index happens to fire, which is what a
+                    // concurrent registrar trips.
+                    sqlx::query(AssertSqlSafe(format!(
+                        "INSERT INTO {table} (version_id, version_name, application_name) \
+                         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+                    )))
+                    .bind(version_id)
+                    .bind(version_name)
+                    .bind(application_name)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                // Read back, because both writes above decline silently: the `UPDATE` matches
+                // nothing and the `INSERT` does nothing whether the row is this application's
+                // own or a peer's, and only one of those is acceptable.
+                resolve_owning_application(
+                    &mut tx,
+                    table,
+                    "version_name",
+                    version_name,
+                    application_name,
+                    "Application version",
+                )
                 .await?;
+
+                tx.commit().await?;
                 Ok(())
             },
         )
@@ -2909,14 +3035,20 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error> {
         let table = &self.tables.application_versions;
         let (table, pool) = (table.as_str(), &self.pool);
+        let application_name = self.application_name.as_deref();
 
         with_retry(
             &self.retry,
             "list_application_versions",
             move || async move {
                 let rows = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT {VERSION_COLUMNS} FROM {table} ORDER BY version_timestamp DESC"
+                    "SELECT {VERSION_COLUMNS} FROM {table} \
+                     WHERE ($1::text IS NULL \
+                            OR application_name = $1 \
+                            OR application_name IS NULL) \
+                     ORDER BY version_timestamp DESC"
                 )))
+                .bind(application_name)
                 .fetch_all(pool)
                 .await?;
                 rows.iter().map(version_from_row).collect()
@@ -2925,9 +3057,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>, Error> {
+    async fn get_latest_application_version(
+        &self,
+        application_name: Option<&str>,
+    ) -> Result<Option<VersionInfo>, Error> {
         let table = &self.tables.application_versions;
         let (table, pool) = (table.as_str(), &self.pool);
+        let application_name = application_name.or(self.application_name.as_deref());
 
         with_retry(
             &self.retry,
@@ -2935,8 +3071,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             move || async move {
                 let row = sqlx::query(AssertSqlSafe(format!(
                     "SELECT {VERSION_COLUMNS} FROM {table} \
+                     WHERE ($1::text IS NULL \
+                            OR application_name = $1 \
+                            OR application_name IS NULL) \
                      ORDER BY version_timestamp DESC LIMIT 1"
                 )))
+                .bind(application_name)
                 .fetch_optional(pool)
                 .await?;
                 row.as_ref().map(version_from_row).transpose()
@@ -2949,21 +3089,44 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         version_name: &str,
         timestamp: Timestamp,
+        application_name: Option<&str>,
     ) -> Result<(), Error> {
         let table = &self.tables.application_versions;
         let (table, pool) = (table.as_str(), &self.pool);
+        let application_name = application_name.or(self.application_name.as_deref());
 
         with_retry(
             &self.retry,
             "update_application_version_timestamp",
             move || async move {
+                let mut tx = pool.begin().await?;
+
+                let owner = resolve_owning_application(
+                    &mut tx,
+                    table,
+                    "version_name",
+                    version_name,
+                    application_name,
+                    "Application version",
+                )
+                .await?;
+
+                // Scoped to the resolved row, not to the name alone: once 106 and 107's
+                // per-application keys replace migration 13's, one `version_name` may exist per
+                // application and a bare name match would retime every copy. The `SET` also
+                // claims an unclaimed row, which would otherwise stay every peer's latest.
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET version_timestamp = $2 WHERE version_name = $1"
+                    "UPDATE {table} SET version_timestamp = $2, application_name = $3 \
+                     WHERE version_name = $1 \
+                       AND (application_name IS NULL OR application_name = $3)"
                 )))
                 .bind(version_name)
                 .bind(timestamp.as_epoch_ms())
-                .execute(pool)
+                .bind(owner.as_deref())
+                .execute(&mut *tx)
                 .await?;
+
+                tx.commit().await?;
                 Ok(())
             },
         )

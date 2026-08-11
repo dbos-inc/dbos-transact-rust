@@ -112,6 +112,25 @@ pub enum Error {
         /// The limit it passed.
         limit: i64,
     },
+    /// A named thing in the system database is already registered by another application.
+    ///
+    /// Queue, schedule and version names address a row across every application sharing the
+    /// database, so two applications cannot hold the same one. This is not the library's to
+    /// resolve: taking the row would redirect a peer's work, and ignoring the write would leave
+    /// this application pointing at a row it does not own.
+    ///
+    /// The usual causes are a genuine collision between two applications, and an application that
+    /// was renamed without its rows being moved — which is what `rename_application` is for.
+    RegisteredByAnother {
+        /// What kind of thing it is, capitalised for a message: `"Queue"`, `"Application version"`.
+        kind: &'static str,
+        /// The contested name.
+        name: String,
+        /// The application that holds it.
+        holder: String,
+        /// The application that tried to take it, if it had a name.
+        claimant: Option<String>,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -171,6 +190,30 @@ impl std::fmt::Display for Error {
                 f,
                 "workflow {workflow_id} exceeded {limit} recovery attempts"
             ),
+            // The remedy is in the message because there is no way to act on this from code:
+            // whichever cause it is, a person has to choose a name or move the rows.
+            Error::RegisteredByAnother {
+                kind,
+                name,
+                holder,
+                claimant,
+            } => {
+                let lower = kind.to_lowercase();
+                write!(
+                    f,
+                    "{kind} {name:?} is already registered by application {holder:?} in this \
+                     system database, and {lower} names must be unique across the applications \
+                     sharing one"
+                )?;
+                if let Some(claimant) = claimant {
+                    write!(
+                        f,
+                        ": either give {claimant:?} a different {lower} name, or, if \
+                         {holder:?} was renamed to {claimant:?}, move its rows first"
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }

@@ -2468,30 +2468,38 @@ async fn attributes_must_be_a_json_object() {
 async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
     let (sys, _db) = sysdb().await;
     assert_eq!(
-        sys.get_latest_application_version().await.unwrap(),
+        sys.get_latest_application_version(None).await.unwrap(),
         None,
         "an empty registry is what a fresh database looks like, not an error",
     );
 
-    sys.create_application_version("v1").await.unwrap();
-    sys.create_application_version("v2").await.unwrap();
+    sys.create_application_version("v1", None).await.unwrap();
+    sys.create_application_version("v2", None).await.unwrap();
 
     // Registering the same name again is a no-op, not a second row.
-    sys.create_application_version("v1").await.unwrap();
+    sys.create_application_version("v1", None).await.unwrap();
     let all = sys.list_application_versions().await.unwrap();
     assert_eq!(all.len(), 2);
 
-    let latest = sys.get_latest_application_version().await.unwrap().unwrap();
+    let latest = sys
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.version_name, "v2", "highest timestamp wins");
 
     // Promoting v1 makes it current even though v2 was created later — which is the whole point
     // of ordering on `version_timestamp` rather than `created_at`.
     let promoted = Timestamp::from_epoch_ms(latest.version_timestamp.as_epoch_ms() + 60_000);
-    sys.update_application_version_timestamp("v1", promoted)
+    sys.update_application_version_timestamp("v1", promoted, None)
         .await
         .unwrap();
 
-    let latest = sys.get_latest_application_version().await.unwrap().unwrap();
+    let latest = sys
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.version_name, "v1");
     assert_eq!(latest.version_timestamp, promoted);
 
@@ -2507,8 +2515,12 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
     // The generated id is distinct from the name, and stable across a repeat registration.
     let v1 = &all[0];
     assert_ne!(v1.version_id, v1.version_name);
-    sys.create_application_version("v1").await.unwrap();
-    let again = sys.get_latest_application_version().await.unwrap().unwrap();
+    sys.create_application_version("v1", None).await.unwrap();
+    let again = sys
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         again.version_id, v1.version_id,
         "re-registering must not mint a new id or reset the promotion",
@@ -4470,4 +4482,385 @@ async fn releasing_delayed_workflows_stays_within_an_application() {
         "beta's workflow is untouched",
     );
     assert_eq!(beta.transition_delayed_workflows().await.unwrap(), 1);
+}
+
+/// Each application sees its own latest version, and a peer's deploy cannot demote it.
+///
+/// "Latest" is what a dequeue compares a workflow's recorded version against, so this is not a
+/// display concern: if a peer's newer registration counted as this application's latest, every
+/// workflow this application had already enqueued would stop matching and stay stranded.
+#[tokio::test]
+async fn a_peers_deploy_does_not_become_this_applications_latest() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+
+    alpha
+        .create_application_version("alpha-v1", None)
+        .await
+        .unwrap();
+    beta.create_application_version("beta-v1", None)
+        .await
+        .unwrap();
+    // Registered last, so an unscoped "latest" would return it to both.
+    beta.create_application_version("beta-v2", None)
+        .await
+        .unwrap();
+
+    let latest = alpha
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .expect("alpha has a version");
+    assert_eq!(latest.version_name, "alpha-v1");
+    assert_eq!(latest.application_name.as_deref(), Some("alpha"));
+
+    // And the listing is scoped the same way.
+    let names: Vec<String> = alpha
+        .list_application_versions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| v.version_name)
+        .collect();
+    assert_eq!(names, ["alpha-v1"]);
+}
+
+/// A version registered by another application is refused rather than taken.
+///
+/// Version names address a row across every application sharing the database, so this is not the
+/// library's to resolve: taking it would retime a peer's deploy, and ignoring the write would
+/// leave this application pointing at a version it does not own.
+#[tokio::test]
+async fn registering_a_peers_version_name_is_refused() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+
+    alpha
+        .create_application_version("v1.0.0", None)
+        .await
+        .unwrap();
+
+    let result = beta.create_application_version("v1.0.0", None).await;
+    match result {
+        Err(Error::RegisteredByAnother {
+            kind,
+            ref name,
+            ref holder,
+            ref claimant,
+        }) => {
+            assert_eq!(kind, "Application version");
+            assert_eq!(name, "v1.0.0");
+            assert_eq!(holder, "alpha");
+            assert_eq!(claimant.as_deref(), Some("beta"));
+            // The message has to carry the remedy: nothing here can be acted on from code.
+            let text = result.as_ref().unwrap_err().to_string();
+            assert!(text.contains("already registered"), "got {text}");
+            assert!(text.contains("was renamed"), "got {text}");
+        }
+        other => panic!("expected a registration conflict, got {other:?}"),
+    }
+
+    // Promotion is refused for the same reason, and alpha's timestamp is untouched.
+    let before = alpha
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap()
+        .version_timestamp;
+    let promote = beta
+        .update_application_version_timestamp("v1.0.0", Timestamp::from_epoch_ms(9_000_000), None)
+        .await;
+    assert!(matches!(promote, Err(Error::RegisteredByAnother { .. })));
+    assert_eq!(
+        alpha
+            .get_latest_application_version(None)
+            .await
+            .unwrap()
+            .unwrap()
+            .version_timestamp,
+        before,
+    );
+
+    // Re-registering under the same name is not a conflict; it is the ordinary restart path.
+    alpha
+        .create_application_version("v1.0.0", None)
+        .await
+        .unwrap();
+}
+
+/// An unclaimed version is claimed in place, keeping the timestamp that decides which is current.
+///
+/// The row an older SDK left behind is the case: recreating the version would reset the timestamp
+/// and silently promote it, so the claim is an `UPDATE` guarded on the row being unowned.
+#[tokio::test]
+async fn an_unclaimed_version_is_claimed_where_it_stands() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+
+    // Stands in for a row written before any implementation had application names.
+    anonymous
+        .create_application_version("v1", None)
+        .await
+        .unwrap();
+    anonymous
+        .update_application_version_timestamp("v1", Timestamp::from_epoch_ms(5_000_000), None)
+        .await
+        .unwrap();
+    let unclaimed = anonymous
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unclaimed.application_name, None);
+
+    alpha.create_application_version("v1", None).await.unwrap();
+
+    let claimed = alpha
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.application_name.as_deref(), Some("alpha"));
+    assert_eq!(
+        claimed.version_id, unclaimed.version_id,
+        "claimed in place rather than recreated",
+    );
+    assert_eq!(
+        claimed.version_timestamp, unclaimed.version_timestamp,
+        "the timestamp that decides which version is current is untouched",
+    );
+
+    // A nameless writer leaves the owner alone rather than clearing it.
+    anonymous
+        .create_application_version("v1", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        alpha
+            .get_latest_application_version(None)
+            .await
+            .unwrap()
+            .unwrap()
+            .application_name
+            .as_deref(),
+        Some("alpha"),
+    );
+}
+
+/// A handle can act for an application other than its own, on every method that takes a target.
+///
+/// This is the client's case: a tool with no application of its own — or one acting on behalf of
+/// another — names the target per call rather than being configured as it. The handle's name is
+/// only the default, which is what `applicationName ?? this.appName` means in both references.
+#[tokio::test]
+async fn a_named_target_overrides_the_handles_own_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let client = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    // A nameless client registers a version *for* beta.
+    client
+        .create_application_version("beta-v1", Some("beta"))
+        .await
+        .unwrap();
+    // And alpha, which has its own name, registers one for beta too — the target wins over it.
+    alpha
+        .create_application_version("beta-v2", Some("beta"))
+        .await
+        .unwrap();
+
+    // Neither landed on alpha: its own view is empty.
+    assert!(
+        alpha
+            .get_latest_application_version(None)
+            .await
+            .unwrap()
+            .is_none(),
+        "alpha registered nothing for itself",
+    );
+
+    // Read back by naming beta, from a handle that is not beta.
+    let latest = alpha
+        .get_latest_application_version(Some("beta"))
+        .await
+        .unwrap()
+        .expect("beta has versions");
+    assert_eq!(latest.application_name.as_deref(), Some("beta"));
+
+    // Promotion is targeted the same way: pin beta-v1 past beta-v2 from alpha's handle. The
+    // timestamp has to be genuinely later than beta-v2's, which migration 13 defaults to `now()`.
+    alpha
+        .update_application_version_timestamp(
+            "beta-v1",
+            Timestamp::from_epoch_ms(99_000_000_000_000),
+            Some("beta"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        alpha
+            .get_latest_application_version(Some("beta"))
+            .await
+            .unwrap()
+            .unwrap()
+            .version_name,
+        "beta-v1",
+        "an older version promoted past a newer one is what a rollback looks like",
+    );
+
+    // Naming a peer does not let a handle take a version another application holds.
+    alpha
+        .create_application_version("shared", None)
+        .await
+        .unwrap();
+    let stolen = client
+        .create_application_version("shared", Some("beta"))
+        .await;
+    assert!(matches!(stolen, Err(Error::RegisteredByAnother { .. })));
+}
+
+/// A workflow can be enqueued for an application other than the writing handle's.
+///
+/// The client enqueue: the target is on the creation input, not the handle, because only the
+/// insert decides a workflow's owner and a client may write for several applications in turn.
+#[tokio::test]
+async fn a_workflow_can_be_enqueued_for_another_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+
+    // Named on the input, so it overrides alpha.
+    let mut for_beta = workflow("wf-for-beta");
+    for_beta.application_name = Some("beta");
+    alpha
+        .init_workflow(&for_beta, None, Submission::Fresh)
+        .await
+        .unwrap();
+    // Unnamed on the input, so it falls back to the handle.
+    alpha
+        .init_workflow(&workflow("wf-for-alpha"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    for (id, expected) in [("wf-for-beta", "beta"), ("wf-for-alpha", "alpha")] {
+        assert_eq!(
+            alpha
+                .get_workflow(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .application_name
+                .as_deref(),
+            Some(expected),
+        );
+    }
+
+    // And alpha's recovery sweep leaves beta's workflow alone, even though alpha wrote it.
+    let pending = alpha.get_pending_workflows("local", "v1").await.unwrap();
+    assert_eq!(pending, ["wf-for-alpha"]);
+}
+
+/// Two applications racing to claim one unclaimed version: exactly one gets it.
+///
+/// The claim is `UPDATE … WHERE version_name = $2 AND application_name IS NULL`, and that guard is
+/// the whole of the safety here — not the surrounding transaction, which at READ COMMITTED does
+/// not stop the row changing under it. What does is Postgres re-evaluating the `WHERE` after the
+/// blocked writer unblocks: it re-reads the committed row, finds `application_name` no longer
+/// null, and matches nothing.
+///
+/// Drop the `IS NULL` guard and both writes land, the later one silently overwriting the earlier —
+/// which every serial test would still pass. This is what notices.
+#[tokio::test]
+async fn two_applications_cannot_both_claim_one_version() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    // An unclaimed version, as a pre-ownership SDK would have left it.
+    anonymous
+        .create_application_version("contested", None)
+        .await
+        .unwrap();
+
+    let (a, b) = tokio::join!(
+        alpha.create_application_version("contested", None),
+        beta.create_application_version("contested", None),
+    );
+
+    assert_eq!(
+        [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one application may hold a version name; got alpha={a:?} beta={b:?}",
+    );
+
+    // The loser is refused rather than silently ignored.
+    let loser = if a.is_err() { &a } else { &b };
+    assert!(
+        matches!(loser, Err(Error::RegisteredByAnother { .. })),
+        "the loser should be told why, got {loser:?}",
+    );
+
+    // And the row belongs to whichever won, not to whoever wrote last.
+    let owner: Option<String> = sqlx::query_scalar(
+        r#"SELECT "application_name" FROM "dbos"."application_versions" WHERE "version_name" = $1"#,
+    )
+    .bind("contested")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.as_deref(),
+        Some(if a.is_ok() { "alpha" } else { "beta" })
+    );
 }

@@ -532,9 +532,21 @@ pub trait SystemDatabase: Send + Sync {
     /// Idempotent on the name: launching the same version twice registers it once. The generated
     /// `version_id` is not the identity callers use — `version_name` is, and it is what workflow
     /// rows store.
-    async fn create_application_version(&self, version_name: &str) -> Result<(), Error>;
+    ///
+    /// `application_name` names the application the version belongs to; `None` means this
+    /// handle's own. A version already held by a *different* application is
+    /// [`Error::RegisteredByAnother`] rather than a silent takeover.
+    async fn create_application_version(
+        &self,
+        version_name: &str,
+        application_name: Option<&str>,
+    ) -> Result<(), Error>;
 
-    /// Every registered version, latest first.
+    /// Every registered version this handle's application can see, latest first.
+    ///
+    /// Takes no target, unlike the three around it: a listing is what *this* application has
+    /// registered plus the unclaimed, and a caller wanting a peer's asks for the peer's latest.
+    /// Python and TypeScript draw the line in the same place.
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error>;
 
     /// The version with the highest timestamp, or `None` if none are registered.
@@ -548,13 +560,26 @@ pub trait SystemDatabase: Send + Sync {
     /// application has launched. Java also returns null here; Python and Go raise, because their
     /// callers ask only where a version must already exist. That is a caller's invariant, not
     /// this layer's, and it matches [`get_workflow`](Self::get_workflow) returning `None`.
-    async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>, Error>;
+    ///
+    /// `application_name` names whose latest to read; `None` means this handle's own. Naming a
+    /// peer is what a schedule fire needs: a schedule carries its owner, and its runs are enqueued
+    /// against *that* application's latest version, whichever handle happens to fire it.
+    async fn get_latest_application_version(
+        &self,
+        application_name: Option<&str>,
+    ) -> Result<Option<VersionInfo>, Error>;
 
     /// Moves a version's timestamp, which is how the latest version is chosen.
+    ///
+    /// `application_name` names whose version to promote; `None` means this handle's own.
+    /// Promoting a *different* application's is [`Error::RegisteredByAnother`]: moving a timestamp
+    /// is how a deployment is rolled forward or back, so it must not move one a peer is running
+    /// on.
     async fn update_application_version_timestamp(
         &self,
         version_name: &str,
         timestamp: Timestamp,
+        application_name: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Records that a step started a child workflow.

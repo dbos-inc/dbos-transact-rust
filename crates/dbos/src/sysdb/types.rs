@@ -377,6 +377,15 @@ pub struct NewWorkflow<'a> {
 
     /// The executor claiming this workflow.
     pub executor_id: Option<&'a str>,
+
+    /// The application this workflow belongs to; `None` means the writing handle's own.
+    ///
+    /// On the input rather than taken from the handle for the same reason
+    /// [`executor_id`](Self::executor_id) is: a client enqueueing *for* another application names
+    /// it here, and only the insert decides a workflow's owner — nothing re-owns it afterwards.
+    /// Leaving both this and the handle's name unset writes an unclaimed workflow, which every
+    /// application may run and the first to dequeue claims.
+    pub application_name: Option<&'a str>,
     /// Application version, which recovery uses to avoid resuming under changed code.
     pub application_version: Option<&'a str>,
     /// Application id, as assigned by the platform.
@@ -1015,6 +1024,8 @@ pub struct WorkflowInitResult {
 /// running that code dequeue it, and what `application_version` on a workflow row refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
+    /// The application that registered this version, or `None` if it is unclaimed.
+    pub application_name: Option<String>,
     /// Generated identity, distinct from the name.
     pub version_id: String,
     /// The version as the application names it — the value stored on workflow rows.
