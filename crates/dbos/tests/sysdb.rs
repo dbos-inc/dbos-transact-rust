@@ -5,8 +5,8 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Fork, ForkOptions, ForkPoint, NewWorkflow, Outcome, OutcomeWrite, StepTiming, Submission,
-    Timestamp, WorkflowDelay, WorkflowStatus,
+    Fork, ForkOptions, ForkPoint, Message, NewWorkflow, Outcome, OutcomeWrite, StepTiming,
+    Submission, Timestamp, WorkflowDelay, WorkflowStatus,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -3444,4 +3444,444 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
         .unwrap();
     assert_eq!(alpha_steps.len(), 1, "wf-alpha resumes at its own step 1");
     assert_eq!(beta_steps.len(), 3, "wf-beta resumes at its own step 3");
+}
+
+/// A message reaches its destination, under the sentinel topic when none is given.
+#[tokio::test]
+async fn a_message_is_delivered_to_its_destination() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-dest"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    sys.send_messages(
+        &[
+            Message {
+                destination_id: "wf-dest",
+                topic: Some("approvals"),
+                message: "\"yes\"",
+                idempotency_key: None,
+            },
+            Message {
+                destination_id: "wf-dest",
+                topic: None,
+                message: "\"untopicked\"",
+                idempotency_key: None,
+            },
+        ],
+        Some("portable_json"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let sent = sys.get_all_notifications("wf-dest").await.unwrap();
+    assert_eq!(sent.len(), 2);
+    let topic_of = |message: &str| {
+        sent.iter()
+            .find(|n| n.message == message)
+            .unwrap_or_else(|| panic!("{message} was not delivered"))
+            .topic
+            .clone()
+    };
+    assert_eq!(topic_of("\"yes\"").as_deref(), Some("approvals"));
+    // The untopicked message is filed under the sentinel, not NULL — a receiver selects on
+    // equality, and nothing equals NULL.
+    assert_eq!(
+        topic_of("\"untopicked\"").as_deref(),
+        Some(dbos::sysdb::NULL_TOPIC)
+    );
+}
+
+/// An idempotency key makes a repeated send a no-op.
+#[tokio::test]
+async fn a_keyed_message_is_delivered_once_however_often_it_is_sent() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-once"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let message = Message {
+        destination_id: "wf-once",
+        topic: Some("t"),
+        message: "\"payload\"",
+        idempotency_key: Some("order-42"),
+    };
+    for _ in 0..3 {
+        sys.send_messages(&[message], None, None, false)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(sys.get_all_notifications("wf-once").await.unwrap().len(), 1);
+}
+
+/// One key used by two messages is refused rather than silently dropping one.
+#[tokio::test]
+async fn two_messages_under_one_key_are_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-clash"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let result = sys
+        .send_messages(
+            &[
+                Message {
+                    destination_id: "wf-clash",
+                    topic: None,
+                    message: "\"a\"",
+                    idempotency_key: Some("same"),
+                },
+                Message {
+                    destination_id: "wf-clash",
+                    topic: None,
+                    message: "\"b\"",
+                    idempotency_key: Some("same"),
+                },
+            ],
+            None,
+            None,
+            false,
+        )
+        .await;
+    match result {
+        Err(Error::InvalidInput { field, detail }) => {
+            assert_eq!(field, "idempotency_key");
+            assert!(detail.contains("same"), "should name it, got: {detail}");
+        }
+        other => panic!("expected the clash to be refused, got {other:?}"),
+    }
+    assert!(
+        sys.get_all_notifications("wf-clash")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Sending from a workflow records a step, and a replay sends nothing more.
+#[tokio::test]
+async fn a_replayed_send_does_not_send_again() {
+    let (sys, _db) = sysdb().await;
+    for id in ["wf-sender", "wf-receiver"] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+
+    let caller = ("wf-sender", 0);
+    let message = Message {
+        destination_id: "wf-receiver",
+        topic: None,
+        // No idempotency key: the step is the only thing preventing a second delivery, which is
+        // what this test is about.
+        message: "\"hello\"",
+        idempotency_key: None,
+    };
+
+    sys.send_messages(&[message], None, Some(caller), false)
+        .await
+        .unwrap();
+    sys.send_messages(&[message], None, Some(caller), false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.get_all_notifications("wf-receiver")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the replay should have found the step recorded and sent nothing"
+    );
+    let steps = sys
+        .list_workflow_steps("wf-sender", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1);
+    // The name every implementation records for a single send, so a workflow replayed by another
+    // finds what it expects.
+    assert_eq!(steps[0].step_name, "DBOS.send");
+}
+
+/// Sending to a workflow that does not exist is refused, and delivers nothing.
+#[tokio::test]
+async fn sending_to_a_missing_workflow_is_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-real"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let result = sys
+        .send_messages(
+            &[
+                Message {
+                    destination_id: "wf-real",
+                    topic: None,
+                    message: "\"a\"",
+                    idempotency_key: None,
+                },
+                Message {
+                    destination_id: "wf-ghost",
+                    topic: None,
+                    message: "\"b\"",
+                    idempotency_key: None,
+                },
+            ],
+            None,
+            None,
+            false,
+        )
+        .await;
+    assert!(matches!(result, Err(Error::NonExistentWorkflow { .. })));
+    assert!(
+        sys.get_all_notifications("wf-real")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the deliverable message must not have been delivered either"
+    );
+}
+
+/// With `send_to_forks`, a message reaches every workflow forked from its destination.
+#[tokio::test]
+async fn a_message_can_follow_a_workflow_to_its_forks() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-root"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // A fork, and a fork of that fork: the walk must reach both.
+    let child = sys
+        .fork_workflows(&[Fork::new("wf-root")], &ForkOptions::default())
+        .await
+        .unwrap()
+        .remove(0);
+    let grandchild = sys
+        .fork_workflows(&[Fork::new(&child)], &ForkOptions::default())
+        .await
+        .unwrap()
+        .remove(0);
+
+    sys.send_messages(
+        &[Message {
+            destination_id: "wf-root",
+            topic: Some("t"),
+            message: "\"broadcast\"",
+            idempotency_key: Some("key"),
+        }],
+        None,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+
+    for id in ["wf-root", &child, &grandchild] {
+        assert_eq!(
+            sys.get_all_notifications(id).await.unwrap().len(),
+            1,
+            "{id} should have received the broadcast"
+        );
+    }
+
+    // Without the flag, only the destination hears it.
+    sys.send_messages(
+        &[Message {
+            destination_id: "wf-root",
+            topic: Some("t"),
+            message: "\"direct\"",
+            idempotency_key: Some("key2"),
+        }],
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sys.get_all_notifications("wf-root").await.unwrap().len(), 2);
+    assert_eq!(sys.get_all_notifications(&child).await.unwrap().len(), 1);
+}
+
+/// An empty batch still records its step, so a replay stays a replay.
+///
+/// The workflow spent a step id on the call. Leaving it unoccupied would make the replay re-run
+/// the send — and a message list that came out empty once and non-empty the next time would then
+/// be delivered for real, which is the one thing the step is there to prevent.
+#[tokio::test]
+async fn sending_no_messages_still_records_the_step() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-empty"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    sys.send_messages(&[], None, Some(("wf-empty", 0)), false)
+        .await
+        .unwrap();
+
+    let steps = sys
+        .list_workflow_steps("wf-empty", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "the step id must not be left unoccupied");
+    assert_eq!(steps[0].step_id, 0);
+    // A single send carries exactly one message, so an empty batch came from the bulk API.
+    assert_eq!(steps[0].step_name, "DBOS.sendBulk");
+
+    // And it replays: a second call finds the step and does not record a second one.
+    sys.send_messages(&[], None, Some(("wf-empty", 0)), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.list_workflow_steps("wf-empty", true, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // With no step to record either, there is nothing to do and nothing is written.
+    sys.send_messages(&[], None, None, false).await.unwrap();
+    assert_eq!(
+        sys.list_workflow_steps("wf-empty", true, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A batch records the bulk step name, a single message the plain one.
+///
+/// One system-database method serves both API surfaces, so the count is what distinguishes them.
+/// `DBOS.send` is unanimous across the references; the bulk name follows Java's spelling, since
+/// Python's `DBOS.send_bulk` would be the only snake_case name in a camelCase family.
+#[tokio::test]
+async fn the_recorded_step_name_follows_the_batch_size() {
+    let (sys, _db) = sysdb().await;
+    for id in ["wf-namer", "wf-a", "wf-b"] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    let to = |destination_id| Message {
+        destination_id,
+        topic: None,
+        message: "\"m\"",
+        idempotency_key: None,
+    };
+
+    sys.send_messages(&[to("wf-a")], None, Some(("wf-namer", 0)), false)
+        .await
+        .unwrap();
+    sys.send_messages(
+        &[to("wf-a"), to("wf-b")],
+        None,
+        Some(("wf-namer", 1)),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let steps = sys
+        .list_workflow_steps("wf-namer", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.step_id, s.step_name.as_str()))
+            .collect::<Vec<_>>(),
+        [(0, "DBOS.send"), (1, "DBOS.sendBulk")],
+    );
+}
+
+/// Outside a workflow with no key, nothing makes a repeated send idempotent — and that is the
+/// point of the other two mechanisms.
+///
+/// The contrast worth pinning: the same call that delivers once inside a workflow, or once with
+/// an idempotency key, delivers every time without either.
+#[tokio::test]
+async fn an_unprotected_send_outside_a_workflow_delivers_every_time() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-unprotected"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let message = Message {
+        destination_id: "wf-unprotected",
+        topic: None,
+        message: "\"again\"",
+        idempotency_key: None,
+    };
+    for _ in 0..3 {
+        sys.send_messages(&[message], None, None, false)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        sys.get_all_notifications("wf-unprotected")
+            .await
+            .unwrap()
+            .len(),
+        3,
+        "no step and no key means no idempotency"
+    );
+}
+
+/// A replay whose batch size changed is caught, rather than sending a second time.
+///
+/// The step name is derived from the message count, so a workflow that sent one message and then
+/// replays sending two is asking for a step that does not match what it recorded. That is
+/// nondeterminism in the workflow, and being told about it is better than the alternative — a
+/// replay that silently delivers again because it looked like a different step.
+#[tokio::test]
+async fn a_replay_that_changed_its_batch_size_is_refused() {
+    let (sys, _db) = sysdb().await;
+    for id in ["wf-varying", "wf-x", "wf-y"] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    let to = |destination_id| Message {
+        destination_id,
+        topic: None,
+        message: "\"m\"",
+        idempotency_key: None,
+    };
+
+    // The original run sends one message, recording `DBOS.send`.
+    sys.send_messages(&[to("wf-x")], None, Some(("wf-varying", 0)), false)
+        .await
+        .unwrap();
+
+    // The replay sends two, which would record `DBOS.sendBulk` at the same step id.
+    let result = sys
+        .send_messages(
+            &[to("wf-x"), to("wf-y")],
+            None,
+            Some(("wf-varying", 0)),
+            false,
+        )
+        .await;
+    match result {
+        Err(Error::UnexpectedStep {
+            step_id,
+            expected,
+            recorded,
+            ..
+        }) => {
+            assert_eq!(step_id, 0);
+            assert_eq!(expected, "DBOS.sendBulk");
+            assert_eq!(recorded, "DBOS.send");
+        }
+        other => panic!("expected the changed batch to be caught, got {other:?}"),
+    }
+
+    // And nothing extra was delivered.
+    assert_eq!(sys.get_all_notifications("wf-x").await.unwrap().len(), 1);
+    assert!(sys.get_all_notifications("wf-y").await.unwrap().is_empty());
 }

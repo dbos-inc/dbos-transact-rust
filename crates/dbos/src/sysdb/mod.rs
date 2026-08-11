@@ -20,6 +20,13 @@ pub const DEFAULT_SCHEMA: &str = "dbos";
 /// another SDK's dequeuer also polls.
 pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
 
+/// The topic a message with no topic is filed under.
+///
+/// A sentinel rather than `NULL`, because a receiver selects on `topic = $1` and nothing equals
+/// `NULL`. All four implementations write this exact string, so a message sent by one is found by
+/// another — it is a cross-SDK constant, not an encoding this layer is free to change.
+pub const NULL_TOPIC: &str = "__null__topic__";
+
 pub mod error;
 pub mod migrations;
 pub mod postgres;
@@ -35,7 +42,7 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    EventRecord, Fork, ForkOptions, ForkPoint, NewWorkflow, NotificationRecord, Outcome,
+    EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, NotificationRecord, Outcome,
     OutcomeWrite, StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo,
     WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
 };
@@ -291,6 +298,39 @@ pub trait SystemDatabase: Send + Sync {
         point: ForkPoint<'_>,
         options: &ForkOptions<'_>,
     ) -> Result<Vec<String>, Error>;
+
+    /// Delivers messages to workflows, in one transaction.
+    ///
+    /// One method rather than the `send`/`send_bulk` pair the plan lists, because the batch form
+    /// is the primitive and the single form is a caller with one message. Python says so in its
+    /// own docstring — its `send_bulk` "is the single implementation underlying both `DBOS.send`
+    /// and `send_bulk`, inside and outside a workflow" — and Java exposes only `sendBulk` too.
+    ///
+    /// `caller` is the sending workflow and the step id to record against. The step *name* is
+    /// derived from the batch size rather than passed in — `"DBOS.send"` for a single message,
+    /// `"DBOS.sendBulk"` for any other count — because that is what distinguishes the two API
+    /// surfaces the references record it under.
+    ///
+    /// **Two independent kinds of idempotency, for two different callers.** `caller` makes a
+    /// whole batch idempotent for a *workflow*: a replay finds the step recorded and sends
+    /// nothing.
+    /// [`Message::idempotency_key`] makes one message idempotent for *anyone*, by deriving the
+    /// row's primary key from it so a duplicate is discarded by the database. A sender outside a
+    /// workflow has no step, and the key is all it has.
+    ///
+    /// With `send_to_forks`, each message also reaches every workflow recursively forked from its
+    /// destination. The fork set is resolved inside the same transaction as the insert, so it
+    /// cannot be made stale by a fork created while the send is in flight.
+    ///
+    /// Fails with [`Error::NonExistentWorkflow`] if a destination does not exist — the foreign
+    /// key catches it, so a message can never be left addressed to nothing.
+    async fn send_messages(
+        &self,
+        messages: &[Message<'_>],
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        send_to_forks: bool,
+    ) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
     ///

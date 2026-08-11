@@ -1200,3 +1200,23 @@ impl ForkOptions<'_> {
         Ok(())
     }
 }
+
+/// One message to deliver to a workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Message<'a> {
+    /// The workflow it is for.
+    pub destination_id: &'a str,
+    /// The topic it is filed under, or `None` for the untopicked default.
+    ///
+    /// `None` is stored as a sentinel string rather than `NULL`, because a receiver selects on
+    /// equality and `topic = NULL` matches nothing. Every implementation uses the same sentinel,
+    /// so it is part of the cross-SDK contract rather than an encoding choice.
+    pub topic: Option<&'a str>,
+    /// The payload, already encoded by the caller.
+    pub message: &'a str,
+    /// A key that makes re-sending this message a no-op.
+    ///
+    /// Absent, each send is a distinct message. Present, it becomes the row's primary key, so a
+    /// second send with the same key is discarded by the database rather than delivered twice.
+    pub idempotency_key: Option<&'a str>,
+}
