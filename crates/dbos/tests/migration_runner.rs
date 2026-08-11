@@ -119,8 +119,11 @@ async fn tolerates_a_database_ahead_of_this_build() {
     let pool = db.pool().await;
     runner::run(&pool, SCHEMA, true).await.unwrap();
 
+    // One past whatever this build knows, so the test keeps meaning what it says as the shared
+    // series grows.
+    let ahead = i64::from(SHARED_MIGRATIONS) + 1;
     sqlx::raw_sql(AssertSqlSafe(format!(
-        "UPDATE {}.dbos_migrations SET version = 106",
+        "UPDATE {}.dbos_migrations SET version = {ahead}",
         quote_identifier(SCHEMA)
     )))
     .execute(&pool)
@@ -133,10 +136,10 @@ async fn tolerates_a_database_ahead_of_this_build() {
     assert!(outcome.was_current);
     assert!(outcome.applied.is_empty());
     assert_eq!(
-        outcome.to_version, 106,
+        outcome.to_version, ahead,
         "the recorded version is left alone"
     );
-    assert_eq!(version(&pool).await, 106);
+    assert_eq!(version(&pool).await, ahead);
 }
 
 /// Empty migrations consume their version numbers.

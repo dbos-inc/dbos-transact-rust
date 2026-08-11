@@ -15,7 +15,7 @@
 //!   render with [`render`]. Single braces are literal, so `'{}'::JSON` and plpgsql's own
 //!   `%s` format strings need no escaping.
 //! - Give whole files to the driver. Splitting statements on `;` breaks the `$$`-quoted blocks
-//!   in migrations 1, 14, 38, and 39.
+//!   in migrations 1, 14, 38, 39, and 105.
 //!
 //! Applying the corpus to both backends is what verifies it; reading the SQL is not enough.
 
@@ -341,6 +341,26 @@ sources![
         "104_operation_outputs_application_name.sql",
         Applies::Always
     ),
+    (
+        105,
+        "105_enqueue_workflow_application_name.sql",
+        Applies::Always
+    ),
+    (
+        105,
+        "105_set_enqueue_workflow_search_path.sql",
+        Applies::Postgres
+    ),
+    (
+        106,
+        "106_application_versions_owner_key.sql",
+        Applies::Always
+    ),
+    (
+        107,
+        "107_application_versions_unclaimed_key.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -390,7 +410,7 @@ pub const LOCAL_MIGRATIONS: u32 = 47;
 pub const SHARED_MIGRATION_BASE: u32 = 100;
 
 /// The highest migration defined here, and the version a fully migrated database records.
-pub const SHARED_MIGRATIONS: u32 = 104;
+pub const SHARED_MIGRATIONS: u32 = 107;
 
 /// Which SQL dialect the system database speaks.
 ///
@@ -439,7 +459,7 @@ pub struct Migration {
 
 /// Assembles the ordered migration list for a dialect and configuration.
 ///
-/// Six migrations vary, and the variance lives here rather than in the files:
+/// Seven migrations vary, and the variance lives here rather than in the files:
 ///
 /// - **1** gains its LISTEN/NOTIFY half only when notifications are on and supported.
 /// - **10** carries a guard ([`MIGRATION_10_PK_PROBE`]) instead of being conditional.
@@ -449,6 +469,7 @@ pub struct Migration {
 /// - **28** drops a constraint PostgreSQL exposes as a constraint and CockroachDB as an index.
 /// - **38** appends a PostgreSQL-only `search_path` tail.
 /// - **39** installs a trigger, so it follows the same gate as 1's notify half.
+/// - **105** replaces the function 38 defined, and appends the same `search_path` tail.
 ///
 /// A migration that does not apply renders empty rather than being dropped: versions are
 /// positional, so removing one would renumber everything after it.
@@ -478,9 +499,9 @@ pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool)
 
             Migration {
                 version,
-                // Declared in `ONLINE_MIGRATIONS`, not inferred from the rendered SQL. Never on
-                // CockroachDB, which applies schema changes online regardless and does not take
-                // the keyword.
+                // Read from the file's placeholder rather than from the rendered SQL, which no
+                // longer carries the keyword on CockroachDB. Never online there anyway: it
+                // applies schema changes online regardless and does not take the keyword.
                 online: is_online(version) && !dialect.is_cockroach(),
                 // Migration 10 alone runs a probe first, because its work is a backfill that
                 // must not repeat: the probe asks whether the key is already there. It is a
@@ -535,6 +556,17 @@ mod tests {
         assert_ne!(pg_notify[&28], crdb[&28]);
         assert!(!crdb[&28].is_empty());
 
+        // 38 and 105 each define enqueue_workflow and then pin its search_path, a tail
+        // CockroachDB does not take — so the function is still defined there, unhardened.
+        for version in [38, 105] {
+            assert!(pg_plain[&version].contains("ALTER FUNCTION"));
+            assert!(!crdb[&version].contains("ALTER FUNCTION"));
+            assert!(
+                crdb[&version].contains("CREATE OR REPLACE FUNCTION"),
+                "{version} still defines the function on CockroachDB",
+            );
+        }
+
         // 39, 43 and 44 install and drop triggers that exist only under LISTEN/NOTIFY.
         for version in [39, 43, 44] {
             assert!(
@@ -584,22 +616,23 @@ mod tests {
             }
         }
 
-        // And the shared series is not padding: each of its migrations carries SQL.
+        // And the shared series is not padding: each of its migrations carries SQL, and every
+        // one of them so far is about the column the series was opened to add.
         for version in SHARED_MIGRATION_BASE..=SHARED_MIGRATIONS {
             let m = &migrations[version as usize - 1];
             assert_eq!(m.version, version);
             assert!(
                 m.sql.contains("application_name"),
-                "migration {version} should add the shared column",
+                "migration {version} should carry the shared series' work",
             );
         }
     }
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 57 files: 56 the runner applies, plus the migration-10 probe, which is bound
+        // 61 files: 60 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 56);
+        assert_eq!(SOURCES.len(), 60);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -614,12 +647,12 @@ mod tests {
             "the corpus should cover its own history and the shared series, and nothing between",
         );
 
-        // Four files share a version with another: the LISTEN/NOTIFY halves of migrations 1
-        // and 20, the CockroachDB form of 28, and the search-path half of 38.
+        // Five files share a version with another: the LISTEN/NOTIFY halves of migrations 1
+        // and 20, the CockroachDB form of 28, and the search-path halves of 38 and 105.
         assert_eq!(
             SOURCES.len() - versions.len(),
-            4,
-            "expected 4 variant files"
+            5,
+            "expected 5 variant files"
         );
     }
 
@@ -675,7 +708,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 55, "expected 55 files to carry a numbered header");
+        assert_eq!(checked, 59, "expected 59 files to carry a numbered header");
     }
 
     #[test]
@@ -687,9 +720,12 @@ mod tests {
         assert_eq!(
             online,
             [
-                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47
+                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47, 107
             ],
         );
+        // 106 is the counterexample in the shared series: an index whose predicate matches
+        // nothing on an existing database needs no online build, while 107's matches every row.
+        assert!(!is_online(106) && is_online(107));
         // The gaps are real: 28, 33, and 36 are not online.
         assert!(!is_online(28) && !is_online(33) && !is_online(36));
     }
@@ -738,13 +774,14 @@ mod tests {
 
     /// plpgsql's own `%s` format strings survive untouched.
     ///
-    /// Migrations 14 and 38 raise errors through `format('Workflow %s ...')`. Because `%` has
-    /// no meaning to this renderer, they need no escaping and cannot be consumed by it.
+    /// Migrations 14, 38 and 105 raise errors through `format('Workflow %s ...')`. Because `%`
+    /// has no meaning to this renderer, they need no escaping and cannot be consumed by it.
     #[test]
     fn plpgsql_format_strings_pass_through() {
         for name in [
             "14_add_pgsql_client_functions.sql",
             "38_update_enqueue_workflow.sql",
+            "105_enqueue_workflow_application_name.sql",
         ] {
             let s = source(name).unwrap();
             assert!(
@@ -761,7 +798,7 @@ mod tests {
 
     /// Single braces are literal, so JSON defaults survive.
     ///
-    /// Migrations 14 and 38 declare `named_args JSON DEFAULT '{}'::JSON`.
+    /// Migrations 14, 38 and 105 declare `named_args JSON DEFAULT '{}'::JSON`.
     #[test]
     fn single_braces_are_literal() {
         assert_eq!(
@@ -771,6 +808,7 @@ mod tests {
         for name in [
             "14_add_pgsql_client_functions.sql",
             "38_update_enqueue_workflow.sql",
+            "105_enqueue_workflow_application_name.sql",
         ] {
             let rendered = render(source(name).unwrap().sql, VALUES).unwrap();
             assert!(
@@ -914,6 +952,7 @@ mod tests {
             "14_add_pgsql_client_functions.sql",
             "38_update_enqueue_workflow.sql",
             "39_create_streams_trigger.sql",
+            "105_enqueue_workflow_application_name.sql",
         ];
         let found: Vec<&str> = SOURCES
             .iter()

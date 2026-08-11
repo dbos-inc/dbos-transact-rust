@@ -192,6 +192,111 @@ async fn the_shared_series_adds_application_name_everywhere() {
     }
 }
 
+/// An enqueue can name the application it belongs to, and can still decline to.
+///
+/// Migration 105's parameter is last and optional, which is what lets an older SDK — or a client
+/// with no application name to claim — keep calling the function it already knows. Both halves
+/// are exercised: naming an application stores it, omitting the argument leaves the row
+/// unclaimed rather than failing.
+#[tokio::test]
+async fn an_enqueue_may_claim_an_application_or_leave_it_unclaimed() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    apply_all(
+        &pool,
+        schema,
+        &build_migrations(schema, dialect_for(db.backend()), true),
+    )
+    .await;
+
+    // Sixteen arguments is the pre-105 call, and it must still resolve against the new function.
+    let unclaimed: String = sqlx::query_scalar(
+        r#"SELECT "dbos".enqueue_workflow($1::TEXT, $2::TEXT, ARRAY[]::JSON[], '{}'::JSON,
+             NULL, NULL, $3::TEXT, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"#,
+    )
+    .bind("a-workflow")
+    .bind("a-queue")
+    .bind("unclaimed-id")
+    .fetch_one(&pool)
+    .await
+    .expect("the sixteen-argument call should still resolve");
+
+    let claimed: String = sqlx::query_scalar(
+        r#"SELECT "dbos".enqueue_workflow($1::TEXT, $2::TEXT, ARRAY[]::JSON[], '{}'::JSON,
+             NULL, NULL, $3::TEXT, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, $4::TEXT)"#,
+    )
+    .bind("a-workflow")
+    .bind("a-queue")
+    .bind("claimed-id")
+    .bind("alpha")
+    .fetch_one(&pool)
+    .await
+    .expect("the seventeen-argument call should enqueue");
+
+    for (id, expected) in [(unclaimed, None), (claimed, Some("alpha".to_string()))] {
+        let stored: Option<String> = sqlx::query_scalar(
+            r#"SELECT "application_name" FROM "dbos"."workflow_status" WHERE "workflow_uuid" = $1"#,
+        )
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .expect("the enqueued workflow should exist");
+        assert_eq!(stored, expected, "{id} recorded the wrong application");
+    }
+}
+
+/// Migrations 106 and 107 both land, splitting version-name uniqueness by owner.
+///
+/// The two are separate migrations because they build differently: 106's predicate matches no
+/// existing row and goes in with the version write, while 107's matches every one of them and has
+/// to build online. Applying the corpus is what proves the second half actually completed —
+/// PostgreSQL leaves a failed concurrent build in place, marked invalid.
+#[tokio::test]
+async fn version_uniqueness_is_split_by_owner() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    apply_all(
+        &pool,
+        schema,
+        &build_migrations(schema, dialect_for(db.backend()), true),
+    )
+    .await;
+
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT i.relname FROM pg_index ix \
+         JOIN pg_class i ON i.oid = ix.indexrelid \
+         JOIN pg_class t ON t.oid = ix.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = $1 AND t.relname = 'application_versions' AND ix.indisvalid",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list indexes");
+
+    for expected in [
+        "uq_application_versions_owner_version",     // 106
+        "uq_application_versions_unclaimed_version", // 107
+    ] {
+        assert!(
+            indexes.iter().any(|i| i == expected),
+            "{expected} is missing or invalid; got {indexes:?}",
+        );
+    }
+}
+
 /// Migrations 43 and 44 leave only the notifications trigger behind.
 ///
 /// Migration 1 installs notification and workflow-events triggers and 39 adds the streams
