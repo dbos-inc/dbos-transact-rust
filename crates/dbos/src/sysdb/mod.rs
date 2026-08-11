@@ -27,6 +27,13 @@ pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
 /// another — it is a cross-SDK constant, not an encoding this layer is free to change.
 pub const NULL_TOPIC: &str = "__null__topic__";
 
+/// The value written to a stream to mark it closed.
+///
+/// A sentinel entry rather than a column, so closing is an ordinary append and a reader learns
+/// of it in the same pass that reads the values. Python, Java and Go all write exactly this
+/// string, so it is a cross-SDK constant.
+pub const STREAM_CLOSED: &str = "__DBOS_STREAM_CLOSED__";
+
 pub mod error;
 pub mod migrations;
 pub mod postgres;
@@ -44,7 +51,7 @@ use std::time::Duration;
 use types::{
     EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, NotificationRecord, Outcome,
     OutcomeWrite, StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -331,6 +338,41 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
     ) -> Result<(), Error>;
+
+    /// Appends a value to a workflow's stream.
+    ///
+    /// The offset is allocated by the insert itself, as `MAX(offset) + 1` for the key — so two
+    /// writers racing produce a primary-key collision rather than two entries at one offset, and
+    /// the loser retries onto the next offset.
+    ///
+    /// **Computing it inside the insert narrows that race but does not close it.** Under `READ
+    /// COMMITTED` two concurrent statements can evaluate `MAX(offset)` to the same value and one
+    /// still loses the key, so the retry is what makes this correct and the single statement only
+    /// makes it rarer. Python and Go compose it this way; Java and TypeScript read the offset in
+    /// a separate round trip first, holding the window open for longer.
+    ///
+    /// `written_by` decides whether the write is itself a durable step; see [`WrittenBy`].
+    ///
+    /// **Writing to a closed stream is allowed here.** Go rejects it, alone among the four, at
+    /// the cost of a query per write. A reader stops at the sentinel, so an entry appended after
+    /// it is invisible rather than corrupting — and a workflow that writes after closing has a
+    /// bug this layer cannot fix by refusing one of the two writes.
+    async fn write_stream(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        key: &str,
+        value: &str,
+        serialization: Option<&str>,
+        written_by: WrittenBy,
+    ) -> Result<(), Error>;
+
+    /// Marks a stream closed, so a reader knows no more values are coming.
+    ///
+    /// An ordinary append of [`STREAM_CLOSED`], which is why closing is durable and replayable
+    /// on the same terms as any other write. Always a workflow-level step: a stream is closed by
+    /// the workflow that owns it.
+    async fn close_stream(&self, workflow_id: &str, step_id: i32, key: &str) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
     ///

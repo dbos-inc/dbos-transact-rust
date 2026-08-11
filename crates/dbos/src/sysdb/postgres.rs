@@ -42,11 +42,12 @@ use std::time::Duration;
 use super::types::{
     EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, NotificationRecord, Outcome,
     StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, duration_from_ms, validate_attributes,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
-    OutcomeWrite, SystemDatabase, WorkflowInitResult,
+    OutcomeWrite, STREAM_CLOSED, SystemDatabase, WorkflowInitResult,
 };
 
 impl From<sqlx::Error> for Error {
@@ -61,6 +62,17 @@ impl From<sqlx::Error> for Error {
             sqlstate,
         })
     }
+}
+
+/// Whether a failure is a primary-key or unique-index collision.
+///
+/// `23505 unique_violation`. For streams this means another writer claimed the offset this one
+/// computed, which is contention rather than an error.
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == "23505")
 }
 
 /// Whether a failure is the destination foreign key rejecting an address that does not exist.
@@ -447,6 +459,21 @@ const PORTABLE_JSON: &str = "portable_json";
 /// point of recording the name at all.
 const SEND_STEP_NAME: &str = "DBOS.send";
 const SEND_BULK_STEP_NAME: &str = "DBOS.sendBulk";
+
+/// The step names a stream write records, chosen by whether the value is the closing sentinel.
+///
+/// Python and Java both derive them the same way, from the same two strings. Deriving rather
+/// than passing means a close is always recorded as a close, whichever entry point reached it.
+const WRITE_STREAM_STEP_NAME: &str = "DBOS.writeStream";
+const CLOSE_STREAM_STEP_NAME: &str = "DBOS.closeStream";
+
+/// How many times a stream write retries onto a fresh offset before giving up.
+///
+/// A collision means another writer took the offset this one computed, and the retry recomputes
+/// it — so each attempt is lost to a *different* rival, and the loop converges as long as writers
+/// are finite. Python loops forever with a 100ms sleep; a bound turns a pathological case into an
+/// error a caller can see rather than a call that never returns.
+const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 
 /// The step name `set_event` records, which a replay compares against.
 ///
@@ -2294,6 +2321,126 @@ impl SystemDatabase for PostgresSystemDatabase {
             tx.commit().await?;
             Ok(())
         })
+        .await
+    }
+
+    async fn write_stream(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        key: &str,
+        value: &str,
+        serialization: Option<&str>,
+        written_by: WrittenBy,
+    ) -> Result<(), Error> {
+        // Derived, not passed: a close is recorded as a close whichever entry point reached it.
+        let step_name = if value == STREAM_CLOSED {
+            CLOSE_STREAM_STEP_NAME
+        } else {
+            WRITE_STREAM_STEP_NAME
+        };
+        // Fixed before the retry, as every step token is.
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        let streams_table = self.tables.streams.as_str();
+        let pool = &self.pool;
+
+        // The offset is computed by the insert, so two writers can pick the same one and collide
+        // on the primary key. The loser recomputes against the winner's row and appends after it.
+        let insert = format!(
+            "INSERT INTO {streams_table} \
+                (workflow_uuid, function_id, key, value, serialization, \"offset\") \
+             SELECT $1, $2, $3, $4, $5, COALESCE( \
+                (SELECT MAX(\"offset\") FROM {streams_table} \
+                 WHERE workflow_uuid = $1 AND key = $3), -1) + 1"
+        );
+        let insert = &insert;
+
+        with_retry(&self.retry, "write_stream", move || async move {
+            for attempt in 0..STREAM_OFFSET_ATTEMPTS {
+                let mut tx = pool.begin().await?;
+
+                // A replay must not append a second entry. Only a workflow-level write records a
+                // step to find: one made inside a step is replayed by its step being replayed.
+                if written_by == WrittenBy::Workflow
+                    && self
+                        .check_step_on(&mut tx, workflow_id, step_id, step_name)
+                        .await?
+                        .is_some()
+                {
+                    tracing::debug!(workflow_id, step_id, key, "replaying stream write");
+                    return Ok(());
+                }
+
+                match sqlx::query(AssertSqlSafe(insert.clone()))
+                    .bind(workflow_id)
+                    .bind(step_id)
+                    .bind(key)
+                    .bind(value)
+                    .bind(serialization)
+                    .execute(&mut *tx)
+                    .await
+                {
+                    Ok(_) => {}
+                    // Another writer took the offset. Start again, against its row.
+                    Err(e) if is_unique_violation(&e) => {
+                        tracing::debug!(
+                            workflow_id,
+                            key,
+                            attempt,
+                            "stream offset taken; recomputing"
+                        );
+                        continue;
+                    }
+                    Err(e) if is_foreign_key_violation(&e) => {
+                        return Err(Error::NonExistentWorkflow {
+                            workflow_ids: vec![workflow_id.to_owned()],
+                        });
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+
+                if written_by == WrittenBy::Workflow {
+                    self.record_step_on(
+                        &mut tx,
+                        workflow_id,
+                        step_id,
+                        step_name,
+                        Outcome::Output(None),
+                        None,
+                        Some(timing),
+                    )
+                    .await?;
+                }
+
+                tx.commit().await?;
+                return Ok(());
+            }
+
+            Err(Error::Backend(BackendError {
+                message: format!(
+                    "stream {key} on workflow {workflow_id} lost \
+                     {STREAM_OFFSET_ATTEMPTS} offset races"
+                ),
+                sqlstate: None,
+                kind: BackendErrorKind::Transient,
+            }))
+        })
+        .await
+    }
+
+    async fn close_stream(&self, workflow_id: &str, step_id: i32, key: &str) -> Result<(), Error> {
+        self.write_stream(
+            workflow_id,
+            step_id,
+            key,
+            STREAM_CLOSED,
+            Some(PORTABLE_JSON),
+            WrittenBy::Workflow,
+        )
         .await
     }
 

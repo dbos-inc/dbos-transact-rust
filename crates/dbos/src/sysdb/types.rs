@@ -1220,3 +1220,21 @@ pub struct Message<'a> {
     /// second send with the same key is discarded by the database rather than delivered twice.
     pub idempotency_key: Option<&'a str>,
 }
+
+/// Who wrote to a stream, which decides whether the write is itself a durable step.
+///
+/// Python, Java and TypeScript encode this in the method name — `write_stream_from_workflow`
+/// versus `write_stream_from_step` — and differ in nothing else. Go takes one method and no
+/// distinction. Naming the difference instead of duplicating the method is the same choice made
+/// for [`send_messages`](crate::sysdb::SystemDatabase::send_messages): the split is in the
+/// behaviour, not the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrittenBy {
+    /// The workflow body itself. The write *is* a step: it is recorded, and a replay finds it
+    /// and writes nothing rather than appending a second entry.
+    Workflow,
+    /// Code running inside a step. The enclosing step is already the durable unit, so this
+    /// records nothing of its own — a step that reruns rewrites its stream entries, which is
+    /// what makes the step the thing being replayed.
+    Step,
+}

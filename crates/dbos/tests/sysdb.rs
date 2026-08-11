@@ -6,7 +6,7 @@ use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Fork, ForkOptions, ForkPoint, Message, NewWorkflow, Outcome, OutcomeWrite, StepTiming,
-    Submission, Timestamp, WorkflowDelay, WorkflowStatus,
+    Submission, Timestamp, WorkflowDelay, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -3884,4 +3884,151 @@ async fn a_replay_that_changed_its_batch_size_is_refused() {
     // And nothing extra was delivered.
     assert_eq!(sys.get_all_notifications("wf-x").await.unwrap().len(), 1);
     assert!(sys.get_all_notifications("wf-y").await.unwrap().is_empty());
+}
+
+/// Stream entries land at consecutive offsets, in the order they were written.
+#[tokio::test]
+async fn stream_writes_are_appended_in_order() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    for (step_id, value) in [(0, "\"a\""), (1, "\"b\""), (2, "\"c\"")] {
+        sys.write_stream(
+            "wf-stream",
+            step_id,
+            "progress",
+            value,
+            Some("portable_json"),
+            WrittenBy::Workflow,
+        )
+        .await
+        .unwrap();
+    }
+
+    let entries = sys.get_all_stream_entries("wf-stream").await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.offset, e.value.as_str()))
+            .collect::<Vec<_>>(),
+        [(0, "\"a\""), (1, "\"b\""), (2, "\"c\"")],
+    );
+    // Two keys are independent streams, each numbered from zero.
+    sys.write_stream("wf-stream", 3, "other", "\"z\"", None, WrittenBy::Workflow)
+        .await
+        .unwrap();
+    let other = sys.get_all_stream_entries("wf-stream").await.unwrap();
+    let zero_offsets = other.iter().filter(|e| e.offset == 0).count();
+    assert_eq!(zero_offsets, 2, "each key numbers its own entries");
+}
+
+/// A workflow-level write is a step, so a replay appends nothing.
+#[tokio::test]
+async fn a_replayed_stream_write_does_not_append_again() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-replay"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        sys.write_stream("wf-replay", 0, "k", "\"once\"", None, WrittenBy::Workflow)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        sys.get_all_stream_entries("wf-replay").await.unwrap().len(),
+        1
+    );
+    let steps = sys
+        .list_workflow_steps("wf-replay", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step_name, "DBOS.writeStream");
+}
+
+/// A write from inside a step records no step of its own, so it appends every time.
+///
+/// That is the difference between the two writers, and it is deliberate: the enclosing step is
+/// the durable unit, so a step that reruns rewrites its entries rather than replaying them.
+#[tokio::test]
+async fn a_write_from_inside_a_step_records_nothing_of_its_own() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-instep"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        sys.write_stream("wf-instep", 0, "k", "\"each\"", None, WrittenBy::Step)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        sys.get_all_stream_entries("wf-instep").await.unwrap().len(),
+        3
+    );
+    assert!(
+        sys.list_workflow_steps("wf-instep", true, None, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the enclosing step is the durable unit, not this write"
+    );
+}
+
+/// Closing appends the sentinel, and records itself as a close rather than a write.
+#[tokio::test]
+async fn closing_a_stream_appends_the_sentinel() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-close"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    sys.write_stream("wf-close", 0, "k", "\"value\"", None, WrittenBy::Workflow)
+        .await
+        .unwrap();
+    sys.close_stream("wf-close", 1, "k").await.unwrap();
+
+    let entries = sys.get_all_stream_entries("wf-close").await.unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[1].offset, 1);
+    assert_eq!(
+        entries[1].value,
+        dbos::sysdb::STREAM_CLOSED,
+        "closing is an ordinary append of the sentinel"
+    );
+
+    // Recorded as a close, which is what tells a replay it was closing rather than writing.
+    let steps = sys
+        .list_workflow_steps("wf-close", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| s.step_name.as_str())
+            .collect::<Vec<_>>(),
+        ["DBOS.writeStream", "DBOS.closeStream"],
+    );
+
+    // And closing twice is a replay, not a second sentinel.
+    sys.close_stream("wf-close", 1, "k").await.unwrap();
+    assert_eq!(
+        sys.get_all_stream_entries("wf-close").await.unwrap().len(),
+        2
+    );
+}
+
+/// Writing to a workflow that does not exist is refused.
+#[tokio::test]
+async fn writing_a_stream_for_a_missing_workflow_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let result = sys
+        .write_stream("wf-nowhere", 0, "k", "\"v\"", None, WrittenBy::Step)
+        .await;
+    assert!(matches!(result, Err(Error::NonExistentWorkflow { .. })));
 }
