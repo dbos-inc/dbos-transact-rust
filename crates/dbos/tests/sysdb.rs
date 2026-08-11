@@ -5,8 +5,9 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Fork, ForkOptions, ForkPoint, Message, NewWorkflow, Outcome, OutcomeWrite, StepTiming,
-    Submission, Timestamp, WorkflowDelay, WorkflowStatus, WrittenBy,
+    Applications, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, Outcome, OutcomeWrite,
+    StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -4238,4 +4239,235 @@ async fn a_fork_inherits_its_sources_application() {
             "{fork_id}: step owner"
         );
     }
+}
+
+/// Recovery finds only this application's workflows, and the unclaimed ones.
+///
+/// The sharpest case in the feature, and it is correctness rather than filtering: `executor_id`
+/// defaults to `"local"`, so two applications on one machine present the same executor to this
+/// query. Unscoped, each would find the other's PENDING workflows, decide they were its own to
+/// restart, and run functions it has never heard of.
+#[tokio::test]
+async fn recovery_does_not_reach_across_applications() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    // The same executor id and version throughout — that is the collision being guarded against.
+    for (sys, id) in [
+        (&alpha, "wf-alpha"),
+        (&beta, "wf-beta"),
+        (&anonymous, "wf-nobody"),
+    ] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+
+    let mut found = alpha.get_pending_workflows("local", "v1").await.unwrap();
+    found.sort();
+    assert_eq!(
+        found,
+        ["wf-alpha", "wf-nobody"],
+        "alpha recovers its own and the unclaimed, never beta's",
+    );
+
+    // A handle with no application of its own is not scoped to anything, so it sees all three.
+    let mut all = anonymous
+        .get_pending_workflows("local", "v1")
+        .await
+        .unwrap();
+    all.sort();
+    assert_eq!(all, ["wf-alpha", "wf-beta", "wf-nobody"]);
+}
+
+/// Listing defaults to the caller's own application; naming an id is an identity read.
+///
+/// The two halves of the same field. A search that has not said whose workflows it wants means
+/// its own — otherwise an unfiltered dashboard shows a peer's work. But a workflow id is a global
+/// address, so a lookup by id answers about that exact workflow whoever owns it, and
+/// `Applications::Any` says "every application" out loud.
+#[tokio::test]
+async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    for (sys, id) in [
+        (&alpha, "wf-alpha"),
+        (&beta, "wf-beta"),
+        (&anonymous, "wf-nobody"),
+    ] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+
+    let ids = |found: Vec<WorkflowRecord>| {
+        let mut ids: Vec<String> = found.into_iter().map(|w| w.workflow_id).collect();
+        ids.sort();
+        ids
+    };
+
+    // A search: alpha's own, plus the unclaimed.
+    assert_eq!(
+        ids(alpha
+            .list_workflows(&WorkflowFilter::default())
+            .await
+            .unwrap()),
+        ["wf-alpha", "wf-nobody"],
+    );
+
+    // Said out loud: everyone's.
+    assert_eq!(
+        ids(alpha
+            .list_workflows(&WorkflowFilter {
+                applications: Applications::Any,
+                ..WorkflowFilter::default()
+            })
+            .await
+            .unwrap()),
+        ["wf-alpha", "wf-beta", "wf-nobody"],
+    );
+
+    // Named: that application's, plus the unclaimed.
+    assert_eq!(
+        ids(alpha
+            .list_workflows(&WorkflowFilter {
+                applications: Applications::Named(vec!["beta"]),
+                ..WorkflowFilter::default()
+            })
+            .await
+            .unwrap()),
+        ["wf-beta", "wf-nobody"],
+    );
+
+    // An id is an address: alpha asks for beta's workflow by id and gets it.
+    assert_eq!(
+        ids(alpha
+            .list_workflows(&WorkflowFilter {
+                workflow_ids: vec!["wf-beta"],
+                ..WorkflowFilter::default()
+            })
+            .await
+            .unwrap()),
+        ["wf-beta"],
+    );
+
+    // A prefix is a search, not an address, so it stays scoped.
+    assert_eq!(
+        ids(alpha
+            .list_workflows(&WorkflowFilter {
+                workflow_id_prefixes: vec!["wf-"],
+                ..WorkflowFilter::default()
+            })
+            .await
+            .unwrap()),
+        ["wf-alpha", "wf-nobody"],
+    );
+
+    // And a nameless handle has nothing to scope to, so its default search sees everything.
+    assert_eq!(
+        ids(anonymous
+            .list_workflows(&WorkflowFilter::default())
+            .await
+            .unwrap()),
+        ["wf-alpha", "wf-beta", "wf-nobody"],
+    );
+}
+
+/// The owner is readable through the surface, not just through the column.
+#[tokio::test]
+async fn a_workflow_reports_the_application_that_owns_it() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    alpha
+        .init_workflow(&workflow("wf-owned"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    anonymous
+        .init_workflow(&workflow("wf-unowned"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let owned = alpha.get_workflow("wf-owned").await.unwrap().unwrap();
+    assert_eq!(owned.application_name.as_deref(), Some("alpha"));
+    let unowned = alpha.get_workflow("wf-unowned").await.unwrap().unwrap();
+    assert_eq!(
+        unowned.application_name, None,
+        "unclaimed reads back as unclaimed rather than as this handle's own",
+    );
+}
+
+/// A delayed workflow is released by its own application, never by a peer.
+#[tokio::test]
+async fn releasing_delayed_workflows_stays_within_an_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+
+    // Both delayed, then both moved into the past, so only the scope decides which is released.
+    for (sys, id) in [(&alpha, "wf-alpha"), (&beta, "wf-beta")] {
+        let wf = NewWorkflow {
+            queue_name: Some("orders"),
+            delay: Some(std::time::Duration::from_secs(3600)),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None, Submission::Fresh)
+            .await
+            .unwrap();
+        sys.set_workflow_delay(id, WorkflowDelay::Until(Timestamp::from_epoch_ms(1)))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        alpha.transition_delayed_workflows().await.unwrap(),
+        1,
+        "alpha releases only its own",
+    );
+    assert_eq!(
+        beta.get_workflow("wf-beta").await.unwrap().unwrap().status,
+        WorkflowStatus::Delayed,
+        "beta's workflow is untouched",
+    );
+    assert_eq!(beta.transition_delayed_workflows().await.unwrap(), 1);
 }

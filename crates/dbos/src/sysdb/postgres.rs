@@ -40,10 +40,10 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, NotificationRecord, Outcome,
-    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
-    validate_attributes,
+    Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow,
+    NotificationRecord, Outcome, StepRecord, StepTiming, StreamRecord, Submission, Timestamp,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
+    duration_from_ms, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -296,6 +296,22 @@ impl PostgresSystemDatabase {
     }
 }
 
+/// A predicate scoping a statement to the rows this handle may act on.
+///
+/// Written as one clause with the name bound rather than as conditional SQL text, so the
+/// statement is the same string whether or not this handle has an application. Two reasons that
+/// matters: the parameter numbering cannot drift out of step with the binds, and the backend sees
+/// one prepared statement instead of two.
+///
+/// `$n IS NULL` is the nameless case — a handle with no application of its own is not scoped to
+/// anything, and matches every row. The cast is what lets the driver infer the parameter's type
+/// when the value is `None`.
+///
+/// Always paired with a `.bind(self.application_name.as_deref())` in caller order.
+fn own_scope(column: &str, param: usize) -> String {
+    format!("(${param}::text IS NULL OR {column} = ${param} OR {column} IS NULL)",)
+}
+
 /// The tables this backend addresses, quoted and schema-qualified.
 ///
 /// One field per table rather than a map: every lookup is a literal in this file, so a missing
@@ -401,7 +417,7 @@ const WORKFLOW_COLUMNS: &str = "workflow_uuid, status, name, class_name, config_
      authenticated_roles, assumed_role, request, deduplication_id, priority, \
      queue_partition_key, rate_limited, schedule_name, workflow_timeout_ms, \
      workflow_deadline_epoch_ms, delay_until_epoch_ms, debounce_deadline_epoch_ms, \
-     is_debounced, attributes::text AS attributes";
+     is_debounced, application_name, attributes::text AS attributes";
 
 /// The payload columns, as typed `NULL`s when the caller declines them.
 ///
@@ -572,6 +588,7 @@ fn workflow_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Erro
             .unwrap_or(false),
 
         owner_xid: row.try_get("owner_xid")?,
+        application_name: row.try_get("application_name")?,
         application_id: row.try_get("application_id")?,
         authenticated_user: row.try_get("authenticated_user")?,
         authenticated_roles: decode_roles(
@@ -1361,6 +1378,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .collect();
         let (table, pool) = (table.as_str(), &self.pool);
         let (status, prefixes) = (status.as_slice(), prefixes.as_slice());
+        let application_name = self.application_name.as_deref();
 
         with_retry(&self.retry, "list_workflows", move || async move {
             // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
@@ -1395,6 +1413,32 @@ impl SystemDatabase for PostgresSystemDatabase {
                 };
             }
             any_of!(&filter.workflow_ids[..], "workflow_uuid");
+
+            // Whose rows this covers. `Unset` reads differently depending on the rest of the
+            // filter: a workflow id is a global address, so asking for one by id is an identity
+            // read and answering "no such workflow" for one that plainly exists would be a lie.
+            // Any other query is a search, and a search that has not said whose workflows it
+            // wants means its own. Prefixes are searches, so they do not count as id-keyed.
+            match &filter.applications {
+                Applications::Any => {}
+                Applications::Named(names) if names.is_empty() => {}
+                Applications::Named(names) => {
+                    clause(&mut q, "(application_name = ANY(");
+                    q.push_bind(&names[..])
+                        .push(") OR application_name IS NULL)");
+                }
+                Applications::Unset if !filter.workflow_ids.is_empty() => {}
+                // A handle with no application of its own has nothing to scope to, so it sees
+                // every application's rows rather than only the unclaimed ones — which is what
+                // `application_name = NULL` would have matched.
+                Applications::Unset => {
+                    if let Some(name) = application_name {
+                        clause(&mut q, "(application_name = ");
+                        q.push_bind(name).push(" OR application_name IS NULL)");
+                    }
+                }
+            }
+
             any_of!(&filter.names[..], "name");
             any_of!(&filter.class_names[..], "class_name");
             any_of!(&filter.config_names[..], "config_name");
@@ -1652,14 +1696,26 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<Vec<String>, Error> {
         let table = &self.tables.workflow_status;
         let (table, pool) = (table.as_str(), &self.pool);
+        let application_name = self.application_name.as_deref();
+        // Correctness, not tidiness. `executor_id` defaults to `"local"` — Rust follows Go here —
+        // so two applications running on one machine present the same executor to this query.
+        // Without the scope each would recover the other's workflows: it would find them, decide
+        // they are its own to restart, and run functions it has never heard of. Migration 7's
+        // `owner_xid` does not help, because a recovery sweep is looking for workflows whose
+        // owner is *gone*.
+        let scope = own_scope("application_name", 3);
+        // Borrowed, not moved: the retry closure is `FnMut` and may run the statement again.
+        let scope = scope.as_str();
 
         with_retry(&self.retry, "get_pending_workflows", move || async move {
             let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT workflow_uuid FROM {table} \
-                 WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2"
+                 WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2 \
+                 AND {scope}"
             )))
             .bind(executor_id)
             .bind(application_version)
+            .bind(application_name)
             .fetch_all(pool)
             .await?;
             Ok(ids)
@@ -1670,6 +1726,13 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn transition_delayed_workflows(&self) -> Result<u64, Error> {
         let table = &self.tables.workflow_status;
         let (table, pool) = (table.as_str(), &self.pool);
+        let application_name = self.application_name.as_deref();
+        // A sweep, so it is scoped: releasing a peer's delayed workflow would enqueue it against
+        // that peer's schedule rather than its own. Unclaimed rows are still released, which is
+        // what lets an application take over work an unnamed client enqueued.
+        let scope = own_scope("application_name", 2);
+        // Borrowed, not moved: the retry closure is `FnMut` and may run the statement again.
+        let scope = scope.as_str();
 
         with_retry(
             &self.retry,
@@ -1687,9 +1750,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "UPDATE {table} SET status = 'ENQUEUED', updated_at = $1, \
                      deduplication_id = CASE WHEN is_debounced THEN NULL \
                                              ELSE deduplication_id END \
-                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1"
+                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1 AND {scope}"
                 )))
                 .bind(now)
+                .bind(application_name)
                 .execute(pool)
                 .await?
                 .rows_affected();

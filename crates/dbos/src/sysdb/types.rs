@@ -269,6 +269,12 @@ pub struct WorkflowRecord {
     pub assumed_role: Option<String>,
     /// Request context captured at creation.
     pub request: Option<String>,
+    /// The application that owns this workflow, or `None` if it is unclaimed.
+    ///
+    /// Unclaimed means no application has taken it — a row written before any implementation
+    /// supported ownership, or by a handle with no application of its own. Every application may
+    /// run it, and the first to dequeue it claims it.
+    pub application_name: Option<String>,
 
     // ── Queueing ───────────────────────────────────────────────────────────────
     /// Deduplication key within the queue. At most one live workflow may hold a given key.
@@ -598,11 +604,45 @@ mod tests {
     }
 }
 
+/// Which applications' rows a query covers.
+///
+/// Three cases rather than a list, because "no applications named" is genuinely ambiguous and the
+/// two readings are opposites. Python and TypeScript encode the same three states as
+/// `Optional[List[str]]`, where an *empty* list means every application and an *absent* one means
+/// this handle's own — a distinction they reach through `if not value` and `??` respectively,
+/// state in no comment, and cover with no test. Spelled out here so it cannot be collapsed by a
+/// later tidy-up that sees an empty list and a missing one as the same thing.
+///
+/// Unclaimed rows are matched in every case: they belong to no application, so they belong to all
+/// of them. See [`Applications::Named`] for the one exception that is not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Applications<'a> {
+    /// Let the query decide, which is what a caller who has not thought about it wants.
+    ///
+    /// A **search** scopes to the handle's own application: listing workflows without saying whose
+    /// should not return a peer's. An **id-keyed read** matches every application instead, because
+    /// a workflow id is a global address — asking for one by id is an identity read, not a search,
+    /// and answering "no such workflow" for one that plainly exists would be a lie.
+    #[default]
+    Unset,
+    /// Every application, said deliberately. What an operator's cross-application view asks for.
+    Any,
+    /// These applications, plus the unclaimed rows.
+    ///
+    /// An empty list is [`Applications::Any`] rather than "no applications": there is no useful
+    /// query for rows belonging to none of the applications you named, and reading it as a
+    /// narrowing would make an unfiltered UI silently show nothing.
+    Named(Vec<&'a str>),
+}
+
 /// Which workflows to list, and how much of each to load.
 ///
 /// Every field is a narrowing, and the default narrows nothing — so
 /// `WorkflowFilter::default()` lists everything. List fields match any of their entries and are
 /// ignored when empty; `Option<bool>` fields are three-valued, where `None` does not filter.
+///
+/// [`applications`](Self::applications) is the exception, and deliberately so: its default scopes
+/// to the caller's own application rather than to everything.
 ///
 /// The set is the union of all four implementations, which do not agree on it. Go has 28
 /// filters, Python 26, Java adds two Go lacks. Where they diverge it is noted on the field, so a
@@ -610,9 +650,18 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
+    ///
+    /// Supplying any makes this an id-keyed read, which changes what
+    /// [`applications`](Self::applications) defaults to — see [`Applications::Unset`].
     pub workflow_ids: Vec<&'a str>,
     /// Workflow ids starting with any of these.
+    ///
+    /// A prefix is a search, not an address, so unlike [`workflow_ids`](Self::workflow_ids) it
+    /// does not make this an id-keyed read.
     pub workflow_id_prefixes: Vec<&'a str>,
+
+    /// Whose workflows to list. Defaults to the caller's own application plus unclaimed ones.
+    pub applications: Applications<'a>,
 
     /// Registered function names.
     pub names: Vec<&'a str>,
@@ -704,6 +753,7 @@ impl Default for WorkflowFilter<'_> {
         Self {
             workflow_ids: Vec::new(),
             workflow_id_prefixes: Vec::new(),
+            applications: Applications::Unset,
             names: Vec::new(),
             class_names: Vec::new(),
             config_names: Vec::new(),
