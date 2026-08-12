@@ -5,10 +5,10 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow, OnExistingQueue,
-    Outcome, OutcomeWrite, QueueRecord, RateLimit, RenameBatching, RenameFrom, StepTiming,
-    Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus,
-    WrittenBy,
+    Applications, Change, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow,
+    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit, RenameBatching,
+    RenameFrom, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -5962,4 +5962,140 @@ async fn a_sweep_stays_within_an_application() {
         alpha.get_workflow("wf-beta").await.unwrap().unwrap().status,
         WorkflowStatus::Enqueued,
     );
+}
+
+/// An update changes the fields it names and leaves the rest, including clearing to NULL.
+#[tokio::test]
+async fn an_update_changes_only_what_it_names() {
+    let (sys, _db) = sysdb().await;
+    let queue = NewQueue {
+        concurrency: Some(4),
+        worker_concurrency: Some(2),
+        rate_limit: Some(RateLimit {
+            limit: 10,
+            period: std::time::Duration::from_secs(1),
+        }),
+        priority_enabled: true,
+        polling_interval: std::time::Duration::from_millis(500),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    // Set one field, clear another, leave the rest alone.
+    sys.update_queue(
+        "orders",
+        &QueueUpdate {
+            concurrency: Change::Set(Some(9)),
+            worker_concurrency: Change::Set(None),
+            ..QueueUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let read = sys.get_queue("orders").await.unwrap().unwrap();
+    assert_eq!(read.concurrency, Some(9), "named and set");
+    assert_eq!(read.worker_concurrency, None, "named and cleared");
+    assert_eq!(
+        read.rate_limit,
+        Some(RateLimit {
+            limit: 10,
+            period: std::time::Duration::from_secs(1),
+        }),
+        "not named, so untouched",
+    );
+    assert!(read.priority_enabled, "not named, so untouched");
+    assert_eq!(read.polling_interval, std::time::Duration::from_millis(500));
+}
+
+/// A rate limit moves as one value: both columns or neither.
+#[tokio::test]
+async fn an_update_moves_a_rate_limit_whole() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    let queue = NewQueue {
+        rate_limit: Some(RateLimit {
+            limit: 10,
+            period: std::time::Duration::from_secs(1),
+        }),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    sys.update_queue(
+        "orders",
+        &QueueUpdate {
+            rate_limit: Change::Set(Some(RateLimit {
+                limit: 3,
+                period: std::time::Duration::from_millis(250),
+            })),
+            ..QueueUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sys.get_queue("orders").await.unwrap().unwrap().rate_limit,
+        Some(RateLimit {
+            limit: 3,
+            period: std::time::Duration::from_millis(250),
+        }),
+    );
+
+    // Clearing takes both columns, so no half-limit can be left behind.
+    sys.update_queue(
+        "orders",
+        &QueueUpdate {
+            rate_limit: Change::Set(None),
+            ..QueueUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sys.get_queue("orders").await.unwrap().unwrap().rate_limit,
+        None
+    );
+    let columns: (Option<i32>, Option<f64>) = sqlx::query_as(
+        r#"SELECT "rate_limit_max", "rate_limit_period_sec" FROM "dbos"."queues" WHERE "name" = $1"#,
+    )
+    .bind("orders")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, (None, None), "both columns cleared, not one");
+}
+
+/// An update naming nothing touches the row at all, including its `updated_at`.
+#[tokio::test]
+async fn an_empty_update_is_a_no_op() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    let before: i64 =
+        sqlx::query_scalar(r#"SELECT "updated_at" FROM "dbos"."queues" WHERE "name" = $1"#)
+            .bind("orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    sys.update_queue("orders", &QueueUpdate::default())
+        .await
+        .unwrap();
+
+    let after: i64 =
+        sqlx::query_scalar(r#"SELECT "updated_at" FROM "dbos"."queues" WHERE "name" = $1"#)
+            .bind("orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "an empty update records no write");
 }

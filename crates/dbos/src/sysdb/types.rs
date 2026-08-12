@@ -1125,6 +1125,95 @@ pub struct RateLimit {
     pub period: Duration,
 }
 
+/// Whether a partial update touches a field.
+///
+/// The third state a plain `Option` cannot carry: for a nullable column, "leave it alone" and
+/// "set it to NULL" are different requests, and `Option<T>` has one spelling for both.
+///
+/// Python and TypeScript pass a dictionary of columns to values, and the three states fall out of
+/// it: a key that is absent leaves the column alone, and a key that is present sets it — including
+/// to null. `Change` is that, typed. [`Change::Leave`] is the absent key, [`Change::Set`] the
+/// present one, and the inner value is what the key held.
+///
+/// Typing it also closes a gap their dictionaries leave open: nothing stops a caller passing a key
+/// whose value is missing rather than null, and the two are indistinguishable by the time the
+/// `SET` clause is built. Here they are separate constructors, so there is no third thing to
+/// write.
+///
+/// Clearability lives in the *inner* type rather than in a third variant, so it mirrors the
+/// column: `Change<Option<i32>>` can leave, clear or set, while `Change<bool>` can only leave or
+/// set, because the column behind it is `NOT NULL`. Java splits the same line with two
+/// mechanisms — `Field<Integer>` for nullable columns, `Optional<Boolean>` for the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change<T> {
+    /// Leave whatever is stored.
+    Leave,
+    /// Store this instead.
+    Set(T),
+}
+
+impl<T> Default for Change<T> {
+    /// Leaves the field alone, so `..Default::default()` narrows an update rather than widening
+    /// it. Hand-written because deriving would demand `T: Default`, which says nothing here.
+    fn default() -> Self {
+        Change::Leave
+    }
+}
+
+impl<T> Change<T> {
+    /// The value to store, if this changes anything.
+    pub fn set(self) -> Option<T> {
+        match self {
+            Change::Set(value) => Some(value),
+            Change::Leave => None,
+        }
+    }
+
+    /// Whether this leaves the field alone.
+    pub fn is_leave(&self) -> bool {
+        matches!(self, Change::Leave)
+    }
+}
+
+/// The fields of a registered queue that a partial update may change.
+///
+/// Separate from [`NewQueue`] because they answer different questions: registering describes a
+/// whole queue, updating names only what moves. Java uses one type for both and its documentation
+/// has to say that an absent field means "no limit **on creation** or leave unchanged **on
+/// update**" — the same value meaning two things depending on which call it is passed to.
+///
+/// **Ownership is not here.** A queue changes hands only through
+/// [`SystemDatabase::rename_application`](crate::sysdb::SystemDatabase::rename_application);
+/// letting an update reassign it would be a silent takeover of a peer's queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueUpdate {
+    /// See [`QueueRecord::concurrency`].
+    pub concurrency: Change<Option<i32>>,
+    /// See [`QueueRecord::worker_concurrency`].
+    pub worker_concurrency: Change<Option<i32>>,
+    /// See [`QueueRecord::rate_limit`]. One field for both columns, so an update cannot leave
+    /// half a limit behind.
+    pub rate_limit: Change<Option<RateLimit>>,
+    /// See [`QueueRecord::priority_enabled`].
+    pub priority_enabled: Change<bool>,
+    /// See [`QueueRecord::partition_queue`].
+    pub partition_queue: Change<bool>,
+    /// See [`QueueRecord::polling_interval`].
+    pub polling_interval: Change<Duration>,
+}
+
+impl QueueUpdate {
+    /// Whether this would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.concurrency.is_leave()
+            && self.worker_concurrency.is_leave()
+            && self.rate_limit.is_leave()
+            && self.priority_enabled.is_leave()
+            && self.partition_queue.is_leave()
+            && self.polling_interval.is_leave()
+    }
+}
+
 /// A queue as the registry holds it.
 ///
 /// The registry exists so a queue's limits can be read and changed without the executor that

@@ -58,8 +58,9 @@ use std::time::Duration;
 use types::{
     ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
     NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
-    RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission, Timestamp,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    QueueUpdate, RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission,
+    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
+    WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -683,6 +684,16 @@ pub trait SystemDatabase: Send + Sync {
     /// the unclaimed ones — see [`types::Applications`].
     async fn list_queues(&self, applications: &Applications<'_>)
     -> Result<Vec<QueueRecord>, Error>;
+
+    /// Changes the fields of a registered queue that an update names, leaving the rest.
+    ///
+    /// A no-op when the update names nothing, which is what both references do rather than
+    /// treating it as an error — a caller assembling an update from optional inputs should not
+    /// have to check whether any survived.
+    ///
+    /// Unscoped, like the other reads and writes addressed by queue name. Ownership is not
+    /// updatable: see [`QueueUpdate`].
+    async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error>;
 
     /// Removes a queue from the registry.
     ///

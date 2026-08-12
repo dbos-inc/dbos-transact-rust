@@ -71,10 +71,11 @@ use std::time::Duration;
 
 use super::types::{
     ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
-    NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, RateLimit,
-    RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission, Timestamp,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
-    duration_from_ms, duration_from_secs, is_valid_application_name, validate_attributes,
+    NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate,
+    RateLimit, RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission,
+    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus,
+    WrittenBy, duration_from_ms, duration_from_secs, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -3973,6 +3974,56 @@ impl SystemDatabase for PostgresSystemDatabase {
             q.push(" ORDER BY name");
             let rows = q.build().fetch_all(pool).await?;
             rows.iter().map(queue_from_row).collect()
+        })
+        .await
+    }
+
+    async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error> {
+        // Nothing to change is not an error: an update assembled from optional inputs may name
+        // no field, and both references return without touching the row — including its
+        // `updated_at`, which would otherwise record a write that changed nothing.
+        if update.is_empty() {
+            return Ok(());
+        }
+
+        let queues_table = self.tables.queues.as_str();
+        let pool = &self.pool;
+
+        with_retry(&self.retry, "update_queue", move || async move {
+            let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE ");
+            q.push(queues_table).push(" SET ");
+            let mut set = q.separated(", ");
+
+            macro_rules! assign {
+                ($field:expr, $column:literal) => {
+                    if let Some(value) = $field {
+                        set.push(concat!($column, " = "));
+                        set.push_bind_unseparated(value);
+                    }
+                };
+            }
+            assign!(update.concurrency.set(), "concurrency");
+            assign!(update.worker_concurrency.set(), "worker_concurrency");
+            assign!(update.priority_enabled.set(), "priority_enabled");
+            assign!(update.partition_queue.set(), "partition_queue");
+            assign!(
+                update.polling_interval.set().map(|d| d.as_secs_f64()),
+                "polling_interval_sec"
+            );
+            // One field, two columns — which is the point of pairing them: an update can set both
+            // or clear both, and cannot leave half a limit behind.
+            if let Some(limit) = update.rate_limit.set() {
+                set.push("rate_limit_max = ");
+                set.push_bind_unseparated(limit.map(|l| l.limit));
+                set.push("rate_limit_period_sec = ");
+                set.push_bind_unseparated(limit.map(|l| l.period.as_secs_f64()));
+            }
+            set.push("updated_at = ");
+            set.push_bind_unseparated(Timestamp::now().as_epoch_ms());
+
+            q.push(" WHERE name = ").push_bind(name);
+            q.build().execute(pool).await?;
+            Ok(())
         })
         .await
     }
