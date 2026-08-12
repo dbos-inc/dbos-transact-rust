@@ -598,6 +598,43 @@ pub trait SystemDatabase: Send + Sync {
         on_existing: OnExistingQueue,
     ) -> Result<bool, Error>;
 
+    /// Claims up to a queue's worth of enqueued workflows for this executor, returning what it got.
+    ///
+    /// The whole of dequeueing, in one transaction: rate limit, concurrency, version eligibility,
+    /// selection and claim. Callers poll this; an empty result means nothing was available *this
+    /// tick*, which is the ordinary case rather than an error.
+    ///
+    /// **Only this application's workflows, plus unclaimed ones**, and claiming is part of the
+    /// same statement that starts them — see [`types::Applications`]. An unclaimed workflow is
+    /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
+    /// client finds a runner.
+    ///
+    /// Three limits narrow what is taken, in this order:
+    ///
+    /// - **Rate limit.** Starts in the window are counted first, and a queue already at its limit
+    ///   returns nothing without selecting anything.
+    /// - **Worker concurrency**, against `local_running_count` — what this process is already
+    ///   running, which it knows without asking the database.
+    /// - **Global concurrency**, against the `PENDING` count across every executor.
+    ///
+    /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
+    /// `NOWAIT`, so every executor sees a consistent count rather than a partial one; without
+    /// them it stays at `READ COMMITTED` and uses `SKIP LOCKED`. A `NOWAIT` conflict therefore
+    /// surfaces as a backend error rather than an empty result — a peer is mid-dequeue, and the
+    /// caller's next poll is the retry. Both references do the same.
+    ///
+    /// `application_version` is this executor's. A workflow with no version recorded is eligible
+    /// only when this executor is running the *latest* registered version, so a rolling deploy
+    /// does not hand unversioned work to the code being replaced.
+    async fn start_queued_workflows(
+        &self,
+        queue: &QueueRecord,
+        executor_id: &str,
+        application_version: &str,
+        partition_key: Option<&str>,
+        local_running_count: i64,
+    ) -> Result<Vec<String>, Error>;
+
     /// Reads one queue by name, or `None` if it is not registered.
     ///
     /// Unscoped, like every read addressed by name: the caller has asked about that queue, and a

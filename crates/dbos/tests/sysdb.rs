@@ -5388,3 +5388,384 @@ async fn half_a_rate_limit_reads_as_none() {
     let queue = sys.get_queue("half-limit").await.unwrap().expect("exists");
     assert_eq!(queue.rate_limit, None);
 }
+
+/// Enqueues a workflow on `queue`, optionally with a priority and a timeout.
+async fn enqueue(
+    sys: &PostgresSystemDatabase,
+    id: &str,
+    queue: &str,
+    priority: i32,
+    timeout: Option<std::time::Duration>,
+) {
+    let wf = NewWorkflow {
+        queue_name: Some(queue),
+        priority,
+        timeout,
+        application_version: Some("v1"),
+        ..NewWorkflow::new(id)
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+}
+
+/// A dequeue takes enqueued workflows in priority then age order, and starts them.
+#[tokio::test]
+async fn a_dequeue_starts_workflows_in_order() {
+    let (sys, _db) = sysdb().await;
+    let queue = NewQueue::new("orders");
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    // Enqueued oldest first, but the priorities invert that for two of them.
+    enqueue(&sys, "wf-low", "orders", 10, None).await;
+    enqueue(&sys, "wf-high", "orders", 1, None).await;
+    enqueue(&sys, "wf-also-high", "orders", 1, None).await;
+
+    let started = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        started,
+        ["wf-high", "wf-also-high", "wf-low"],
+        "priority first, then age within a priority",
+    );
+
+    let read = sys.get_workflow("wf-high").await.unwrap().unwrap();
+    assert_eq!(read.status, WorkflowStatus::Pending);
+    assert_eq!(read.executor_id.as_deref(), Some("exec-1"));
+    assert!(read.started_at.is_some());
+
+    // Nothing is left to take.
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A dequeue sets a deadline from the workflow's timeout, and leaves one already set alone.
+#[tokio::test]
+async fn a_dequeue_sets_the_deadline_from_the_timeout() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    enqueue(
+        &sys,
+        "wf-timed",
+        "orders",
+        0,
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .await;
+    enqueue(&sys, "wf-untimed", "orders", 0, None).await;
+
+    let before = Timestamp::now();
+    sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        .await
+        .unwrap();
+
+    let timed = sys.get_workflow("wf-timed").await.unwrap().unwrap();
+    let deadline = timed
+        .deadline
+        .expect("a timeout becomes a deadline on dequeue");
+    let offset = deadline.as_epoch_ms() - before.as_epoch_ms();
+    assert!(
+        (60_000..=65_000).contains(&offset),
+        "the deadline is the start plus the timeout, got {offset}ms",
+    );
+    assert_eq!(
+        sys.get_workflow("wf-untimed")
+            .await
+            .unwrap()
+            .unwrap()
+            .deadline,
+        None,
+        "a workflow with no timeout gets no deadline",
+    );
+}
+
+/// Worker concurrency bounds a dequeue by what this process is already running.
+#[tokio::test]
+async fn worker_concurrency_bounds_a_dequeue() {
+    let (sys, _db) = sysdb().await;
+    let queue = NewQueue {
+        worker_concurrency: Some(2),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    for i in 0..5 {
+        enqueue(&sys, &format!("wf-{i}"), "orders", 0, None).await;
+    }
+
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "a free worker takes its whole allowance",
+    );
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 1)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "one already running leaves room for one",
+    );
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 2)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a full worker takes nothing",
+    );
+}
+
+/// Global concurrency counts what every executor has running, not just this one.
+#[tokio::test]
+async fn global_concurrency_counts_across_executors() {
+    let (sys, _db) = sysdb().await;
+    let queue = NewQueue {
+        concurrency: Some(2),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    for i in 0..4 {
+        enqueue(&sys, &format!("wf-{i}"), "orders", 0, None).await;
+    }
+
+    // A different executor takes the first two, and they are still PENDING.
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-other", "v1", None, 0)
+            .await
+            .unwrap()
+            .len(),
+        2,
+    );
+    // This one is told nothing is available, even with nothing running locally.
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the limit is global, so a second executor sees none free",
+    );
+}
+
+/// A rate limit stops a dequeue once the window is full, and refills once it passes.
+#[tokio::test]
+async fn a_rate_limit_bounds_starts_per_window() {
+    let (sys, _db) = sysdb().await;
+    let queue = NewQueue {
+        rate_limit: Some(RateLimit {
+            limit: 2,
+            period: std::time::Duration::from_millis(400),
+        }),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    for i in 0..5 {
+        enqueue(&sys, &format!("wf-{i}"), "orders", 0, None).await;
+    }
+
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the window allows two",
+    );
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "and no more until it passes",
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "a fresh window allows two more",
+    );
+}
+
+/// A dequeue takes only this application's workflows, and claims the unclaimed ones.
+///
+/// This is 5.2: the claim rides on the same statement that starts the workflow, so an unclaimed
+/// workflow belongs to whichever application dequeued it and nothing can take it back.
+#[tokio::test]
+async fn a_dequeue_claims_what_it_starts() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    alpha
+        .upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = alpha.get_queue("orders").await.unwrap().unwrap();
+
+    enqueue(&alpha, "wf-alpha", "orders", 0, None).await;
+    enqueue(&beta, "wf-beta", "orders", 0, None).await;
+    enqueue(&anonymous, "wf-nobody", "orders", 0, None).await;
+
+    let mut started = alpha
+        .start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        .await
+        .unwrap();
+    started.sort();
+    assert_eq!(
+        started,
+        ["wf-alpha", "wf-nobody"],
+        "alpha takes its own and the unclaimed, never beta's",
+    );
+
+    assert_eq!(
+        alpha
+            .get_workflow("wf-nobody")
+            .await
+            .unwrap()
+            .unwrap()
+            .application_name
+            .as_deref(),
+        Some("alpha"),
+        "starting an unclaimed workflow claims it",
+    );
+    assert_eq!(
+        alpha.get_workflow("wf-beta").await.unwrap().unwrap().status,
+        WorkflowStatus::Enqueued,
+        "beta's workflow is untouched",
+    );
+}
+
+/// An unversioned workflow is taken only by an executor running the latest version.
+#[tokio::test]
+async fn unversioned_work_goes_to_the_latest_version() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+    sys.create_application_version("v2", None).await.unwrap();
+
+    let unversioned = NewWorkflow {
+        queue_name: Some("orders"),
+        ..NewWorkflow::new("wf-unversioned")
+    };
+    sys.init_workflow(&unversioned, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // An executor on a superseded version leaves it alone.
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-old", "v1", None, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "only the latest version adopts unversioned work",
+    );
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-new", "v2", None, 0)
+            .await
+            .unwrap(),
+        ["wf-unversioned"],
+    );
+}
+
+/// An empty partition key is refused rather than matching nothing.
+///
+/// `NewWorkflow` and `ForkOptions` both reject one on the way in, so no row can hold it. A
+/// dequeue that accepted it would select nothing and look like an idle partition.
+#[tokio::test]
+async fn an_empty_partition_key_is_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    let result = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some(""), 0)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput {
+                field: "partition_key",
+                ..
+            })
+        ),
+        "got {result:?}",
+    );
+
+    // And absent still means every partition.
+    enqueue(&sys, "wf-1", "orders", 0, None).await;
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap(),
+        ["wf-1"],
+    );
+}
+
+/// A period too large for a `Duration` is reported, not a panic.
+///
+/// `rate_limit_period_sec` and `polling_interval_sec` are `DOUBLE PRECISION`, so a row can hold a
+/// value no `Duration` can represent. Reading one used to panic inside `Duration::from_secs_f64`,
+/// which a library must never do on stored data.
+#[tokio::test]
+async fn an_unrepresentable_period_is_malformed() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+
+    sqlx::query(
+        r#"INSERT INTO "dbos"."queues" ("name", "polling_interval_sec") VALUES ('huge', 1e300)"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    match sys.get_queue("huge").await {
+        Err(Error::Malformed(message)) => {
+            assert!(message.contains("polling_interval_sec"), "got {message}");
+        }
+        other => panic!("expected a malformed row, got {other:?}"),
+    }
+}

@@ -123,8 +123,13 @@ pub fn duration_from_ms(ms: i64) -> Option<Duration> {
 /// Reads a duration stored as fractional seconds, such as `polling_interval_sec`.
 ///
 /// The other unit durations are stored in — see the module documentation.
+///
+/// `None` for anything that is not one: negative, NaN, infinite, or larger than [`Duration`] can
+/// hold. The last is not hypothetical — the columns are `DOUBLE PRECISION`, so a row can carry
+/// `1e300`, and `Duration::from_secs_f64` **panics** on it. Checking `is_finite()` does not cover
+/// it; `try_from_secs_f64` covers all four.
 pub fn duration_from_secs(secs: f64) -> Option<Duration> {
-    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+    Duration::try_from_secs_f64(secs).ok()
 }
 
 /// Where a workflow is in its lifecycle.
@@ -545,6 +550,9 @@ mod tests {
         assert_eq!(duration_from_secs(-1.0), None);
         assert_eq!(duration_from_secs(f64::NAN), None);
         assert_eq!(duration_from_secs(f64::INFINITY), None);
+        // Finite and non-negative, and still not a duration: the guard this replaced let it
+        // through to a panic, and the columns it reads are wide enough to hold it.
+        assert_eq!(duration_from_secs(1e300), None);
     }
 
     /// Both readers accept zero, and for the same reason.

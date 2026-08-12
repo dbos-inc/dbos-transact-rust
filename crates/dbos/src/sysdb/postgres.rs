@@ -3422,6 +3422,222 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn start_queued_workflows(
+        &self,
+        queue: &QueueRecord,
+        executor_id: &str,
+        application_version: &str,
+        partition_key: Option<&str>,
+        local_running_count: i64,
+    ) -> Result<Vec<String>, Error> {
+        // Refused rather than matched, because no row can hold it: `NewWorkflow` and
+        // `ForkOptions` both reject an empty partition key on the way in. Accepting it here would
+        // select nothing and report an empty partition, which reads as "no work" rather than as
+        // the mistake it is.
+        //
+        // TODO: settle this with the whole DBOS team — all four implementations differ, and no
+        // two arrived at their answer the same way. Go guards every partition clause with
+        // `len(input.QueuePartitionKey) > 0`, so empty *is* its absent value. Java normalises it
+        // (`QueuesDAO.java:36`, `if (partitionKey != null && partitionKey.isEmpty())
+        // partitionKey = null`). Python tests `is not None` and TypeScript `!== undefined`, so
+        // both let an empty key through to match rows that cannot exist — the silently-empty
+        // result nobody would choose deliberately. Rust refuses it, which is the only answer
+        // consistent with rejecting the same value on the way in; whether the others should
+        // reject it too, or Rust should normalise like Go and Java, is a cross-SDK decision
+        // rather than one to take here.
+        if partition_key == Some("") {
+            return Err(Error::InvalidInput {
+                field: "partition_key",
+                detail: "must be absent rather than empty".to_owned(),
+            });
+        }
+
+        let workflow_table = self.tables.workflow_status.as_str();
+        let versions_table = self.tables.application_versions.as_str();
+        let pool = &self.pool;
+        let application_name = self.application_name.as_deref();
+
+        // Every count below has to match what the selection would take, or a limit is enforced
+        // against a population this executor cannot dequeue from.
+        let scope = "($1::text IS NULL OR application_name = $1 OR application_name IS NULL)";
+        // No partition asked for means every partition, so a null parameter drops the clause
+        // rather than matching rows whose key is null.
+        let partition = "($2::text IS NULL OR queue_partition_key = $2)";
+        // Fixed for the run, unlike the window it is subtracted from, which is read per attempt.
+        // Saturating: a period longer than `i64` milliseconds can hold opens the window before
+        // the epoch, which counts every start there has ever been — the right answer for a limit
+        // whose window never closes.
+        let rate_limit_period_ms = queue.rate_limit.map_or(0, |limit| {
+            i64::try_from(limit.period.as_millis()).unwrap_or(i64::MAX)
+        });
+
+        with_retry(&self.retry, "start_queued_workflows", move || async move {
+            // Per attempt: a retry after a serialization failure is a fresh sweep, and it should
+            // measure its rate-limit window from now rather than replay a stale one.
+            let now = Timestamp::now();
+            let mut tx = pool.begin().await?;
+
+            // Both limits are counts that must not move underneath this transaction. Without
+            // either, nothing here reads a total, so the weaker isolation costs nothing.
+            if queue.concurrency.is_some() || queue.rate_limit.is_some() {
+                sqlx::raw_sql(AssertSqlSafe(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Starts already made in this window, counted before anything is selected so a queue
+            // at its limit does no work at all. `rate_limited` marks the rows a limited queue
+            // started, which is why cancelling clears it.
+            let mut recent_starts = 0i64;
+            if let Some(limit) = queue.rate_limit {
+                let window_opened = now.as_epoch_ms() - rate_limit_period_ms;
+                recent_starts = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {workflow_table} \
+                     WHERE queue_name = $3 AND rate_limited = TRUE \
+                       AND status NOT IN ('ENQUEUED', 'DELAYED') \
+                       AND started_at_epoch_ms > $4 \
+                       AND {scope} AND {partition}"
+                )))
+                .bind(application_name)
+                .bind(partition_key)
+                .bind(&queue.name)
+                .bind(window_opened)
+                .fetch_one(&mut *tx)
+                .await?;
+                if recent_starts >= i64::from(limit.limit) {
+                    tx.commit().await?;
+                    return Ok(Vec::new());
+                }
+            }
+
+            // How many this executor may take. `None` is unlimited, which is what a queue with
+            // neither concurrency limit allows.
+            let mut max_tasks: Option<i64> = None;
+            if let Some(worker_concurrency) = queue.worker_concurrency {
+                // Answered from what this process is already running rather than from the
+                // database, which cannot see a running workflow that has not written a step yet.
+                max_tasks = Some((i64::from(worker_concurrency) - local_running_count).max(0));
+            }
+            if let Some(concurrency) = queue.concurrency {
+                let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {workflow_table} \
+                     WHERE queue_name = $3 AND status = 'PENDING' AND {scope} AND {partition}"
+                )))
+                .bind(application_name)
+                .bind(partition_key)
+                .bind(&queue.name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if running > i64::from(concurrency) {
+                    // Reported rather than corrected: the excess is already running, and the
+                    // limit can only govern what has yet to start.
+                    tracing::warn!(
+                        queue = %queue.name,
+                        running,
+                        concurrency,
+                        "pending workflows exceed the queue's global concurrency limit"
+                    );
+                }
+                let available = (i64::from(concurrency) - running).max(0);
+                max_tasks = Some(max_tasks.map_or(available, |t| t.min(available)));
+            }
+
+            // A workflow with no version recorded is only this executor's to run if it is
+            // running the latest registered version; otherwise a rolling deploy would hand
+            // unversioned work to the code being replaced. Own plus unclaimed, so a peer's
+            // deploy cannot decide this.
+            let latest: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT version_name FROM {versions_table} WHERE {scope} \
+                 ORDER BY version_timestamp DESC LIMIT 1"
+            )))
+            .bind(application_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let is_latest = latest.is_none_or(|name| name == application_version);
+            let version_predicate = if is_latest {
+                "(application_version = $3 OR application_version IS NULL)"
+            } else {
+                "application_version = $3"
+            };
+
+            // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
+            // unlimited queue scale across executors. `NOWAIT` instead when a total matters:
+            // stepping over locked rows would count a population this executor cannot see, so
+            // failing the poll and retrying on the next tick is the honest outcome.
+            let lock = if queue.concurrency.is_some() {
+                "FOR UPDATE NOWAIT"
+            } else {
+                "FOR UPDATE SKIP LOCKED"
+            };
+            let limit = match max_tasks {
+                Some(n) => format!(" LIMIT {n}"),
+                None => String::new(),
+            };
+            let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT workflow_uuid FROM {workflow_table} \
+                 WHERE queue_name = $4 AND status = 'ENQUEUED' \
+                   AND {version_predicate} AND {scope} AND {partition} \
+                 ORDER BY priority ASC, created_at ASC{limit} {lock}"
+            )))
+            .bind(application_name)
+            .bind(partition_key)
+            .bind(application_version)
+            .bind(&queue.name)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            // One statement per workflow rather than one for the batch, because the rate limit
+            // has to stop mid-way: the window fills as these start.
+            let mut started = Vec::with_capacity(candidates.len());
+            for id in &candidates {
+                if let Some(limit) = queue.rate_limit
+                    && recent_starts + started.len() as i64 >= i64::from(limit.limit)
+                {
+                    break;
+                }
+                // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
+                // already moved the row, and re-dispatching it would run the workflow twice.
+                // `COALESCE` claims an unclaimed row, which is what drains work a nameless
+                // client enqueued; a nameless dequeuer leaves ownership untouched.
+                let claimed = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {workflow_table} \
+                     SET status = 'PENDING', executor_id = $3, application_version = $4, \
+                         started_at_epoch_ms = $5, rate_limited = $6, \
+                         application_name = COALESCE(application_name, $1), \
+                         workflow_deadline_epoch_ms = CASE \
+                             WHEN workflow_timeout_ms IS NOT NULL \
+                              AND workflow_deadline_epoch_ms IS NULL \
+                             THEN $5 + workflow_timeout_ms \
+                             ELSE workflow_deadline_epoch_ms \
+                         END \
+                     WHERE workflow_uuid = $7 AND status = 'ENQUEUED' AND {scope}"
+                )))
+                .bind(application_name)
+                .bind(partition_key)
+                .bind(executor_id)
+                .bind(application_version)
+                .bind(now.as_epoch_ms())
+                .bind(queue.rate_limit.is_some())
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if claimed > 0 {
+                    started.push(id.clone());
+                }
+            }
+
+            tx.commit().await?;
+            if !started.is_empty() {
+                tracing::debug!(queue = %queue.name, started = started.len(), "dequeued");
+            }
+            Ok(started)
+        })
+        .await
+    }
+
     async fn get_queue(&self, name: &str) -> Result<Option<QueueRecord>, Error> {
         let table = self.tables.queues.as_str();
         let pool = &self.pool;
