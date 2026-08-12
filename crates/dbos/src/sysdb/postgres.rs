@@ -344,124 +344,6 @@ fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
     }
 }
 
-/// Re-owns a table's rows in half-open key ranges, returning how many moved.
-///
-/// **Ranges, not `LIMIT`.** A `LIMIT` walks past every row already moved on each pass, turning a
-/// long history into quadratic work, and collecting the keys into an `IN` list plans as a
-/// whole-table hash join. A watermark on the key column reads each row once.
-///
-/// Two details carry the correctness. The bound is the `batch_size`-th **distinct** key, so a
-/// workflow's steps are never split across two batches. And the final pass — the one that finds
-/// no bound because fewer than a batch remains — **applies no bounds at all**, so rows that
-/// appeared below the watermark while the rename ran still move.
-///
-/// Every statement is an idempotent re-own, so a run that fails partway can simply be repeated.
-async fn rename_application_in_batches(
-    db: &PostgresSystemDatabase,
-    table: &str,
-    source: RenameFrom<'_>,
-    new_name: &str,
-    batching: RenameBatching,
-) -> Result<u64, Error> {
-    // Both `workflow_status` and `operation_outputs` tables range over `workflow_uuid`.
-    let key_column = "workflow_uuid";
-    // `$1` is the new name in the updates, so the source lands on `$2`; the bare `SELECT` below
-    // has no new name to bind and starts at `$1`.
-    let update_predicate = rename_source_predicate(source, 2);
-    let select_predicate = rename_source_predicate(source, 1);
-    let update_predicate = update_predicate.as_str();
-    let select_predicate = select_predicate.as_str();
-    let renamed_from = source.application();
-    let pool = &db.pool;
-
-    let RenameBatching::Batched(batch_size) = batching else {
-        return with_retry(&db.retry, "rename_rows", move || async move {
-            let moved = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET application_name = $1 WHERE {update_predicate}"
-            )))
-            .bind(new_name)
-            .bind(renamed_from)
-            .execute(pool)
-            .await?
-            .rows_affected();
-            Ok(moved)
-        })
-        .await;
-    };
-
-    // Python and TypeScript omit each bound until it has a value, so their select comes in two
-    // shapes and their update in three, with parameters pushed alongside whichever clauses were
-    // appended. `COALESCE($n, '')` collapses the missing-lower-bound case, leaving one select
-    // shape and two update shapes here — each with a fixed parameter count, so the bind list
-    // cannot drift out of step with the SQL.
-    //
-    // The `batch_size`-th distinct key bounds each range, inclusively. The offset is one less
-    // because `OFFSET` counts from zero, and `DISTINCT` is what keeps one workflow's steps inside a
-    // single batch. It is interpolated rather than bound, alone among the values here: a `u32`
-    // renders as digits and nothing else, and a literal offset is one the planner can see.
-    let select_bound = format!(
-        "SELECT DISTINCT {key_column} FROM {table} \
-         WHERE {select_predicate} AND {key_column} > COALESCE($2, '') \
-         ORDER BY {key_column} LIMIT 1 OFFSET {}",
-        batch_size - 1
-    );
-    // Two update shapes rather than one with nullable bounds, because an upper bound the planner
-    // cannot resolve costs as much as a missing lower one: with both bounds bare this is an index
-    // range, with either wrapped in a null test it degrades to a scan. Each carries exactly the
-    // parameters it names.
-    let update_range = format!(
-        "UPDATE {table} SET application_name = $1 \
-         WHERE {update_predicate} \
-           AND {key_column} > COALESCE($3, '') AND {key_column} <= $4"
-    );
-    // The last pass applies no bounds at all, so rows written below the watermark since the
-    // rename began are picked up rather than skipped.
-    let update_rest = format!("UPDATE {table} SET application_name = $1 WHERE {update_predicate}");
-    let select_bound = select_bound.as_str();
-    let update_range = update_range.as_str();
-    let update_rest = update_rest.as_str();
-
-    let mut total = 0;
-    let mut watermark: Option<String> = None;
-    loop {
-        let above = watermark.clone();
-        let (moved, upper) = with_retry(&db.retry, "rename_row_batch", || {
-            let above = above.clone();
-            async move {
-                let upper: Option<String> = sqlx::query_scalar(AssertSqlSafe(select_bound))
-                    .bind(renamed_from)
-                    .bind(above.as_deref())
-                    .fetch_optional(pool)
-                    .await?
-                    .flatten();
-
-                let moved = match &upper {
-                    Some(upper) => sqlx::query(AssertSqlSafe(update_range))
-                        .bind(new_name)
-                        .bind(renamed_from)
-                        .bind(above.as_deref())
-                        .bind(upper.as_str()),
-                    None => sqlx::query(AssertSqlSafe(update_rest))
-                        .bind(new_name)
-                        .bind(renamed_from),
-                }
-                .execute(pool)
-                .await?
-                .rows_affected();
-                Ok((moved, upper))
-            }
-        })
-        .await?;
-
-        total += moved;
-        match upper {
-            // Fewer than a full batch remained, so that statement took the rest.
-            None => return Ok(total),
-            Some(upper) => watermark = Some(upper),
-        }
-    }
-}
-
 /// The tables this backend addresses, quoted and schema-qualified.
 ///
 /// One field per table rather than a map: every lookup is a literal in this file, so a missing
@@ -1343,6 +1225,127 @@ impl PostgresSystemDatabase {
             descendants.insert((*root).to_owned(), found);
         }
         Ok(descendants)
+    }
+}
+
+impl PostgresSystemDatabase {
+    /// Re-owns a table's rows in half-open key ranges, returning how many moved.
+    ///
+    /// **Ranges, not `LIMIT`.** A `LIMIT` walks past every row already moved on each pass, turning a
+    /// long history into quadratic work, and collecting the keys into an `IN` list plans as a
+    /// whole-table hash join. A watermark on the key column reads each row once.
+    ///
+    /// Two details carry the correctness. The bound is the `batch_size`-th **distinct** key, so a
+    /// workflow's steps are never split across two batches. And the final pass — the one that finds
+    /// no bound because fewer than a batch remains — **applies no bounds at all**, so rows that
+    /// appeared below the watermark while the rename ran still move.
+    ///
+    /// Every statement is an idempotent re-own, so a run that fails partway can simply be repeated.
+    async fn rename_application_in_batches(
+        &self,
+        table: &str,
+        source: RenameFrom<'_>,
+        new_name: &str,
+        batching: RenameBatching,
+    ) -> Result<u64, Error> {
+        // Both `workflow_status` and `operation_outputs` tables range over `workflow_uuid`.
+        let key_column = "workflow_uuid";
+        // `$1` is the new name in the updates, so the source lands on `$2`; the bare `SELECT` below
+        // has no new name to bind and starts at `$1`.
+        let update_predicate = rename_source_predicate(source, 2);
+        let select_predicate = rename_source_predicate(source, 1);
+        let update_predicate = update_predicate.as_str();
+        let select_predicate = select_predicate.as_str();
+        let renamed_from = source.application();
+        let pool = &self.pool;
+
+        let RenameBatching::Batched(batch_size) = batching else {
+            return with_retry(&self.retry, "rename_rows", move || async move {
+                let moved = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET application_name = $1 WHERE {update_predicate}"
+                )))
+                .bind(new_name)
+                .bind(renamed_from)
+                .execute(pool)
+                .await?
+                .rows_affected();
+                Ok(moved)
+            })
+            .await;
+        };
+
+        // Python and TypeScript omit each bound until it has a value, so their select comes in two
+        // shapes and their update in three, with parameters pushed alongside whichever clauses were
+        // appended. `COALESCE($n, '')` collapses the missing-lower-bound case, leaving one select
+        // shape and two update shapes here — each with a fixed parameter count, so the bind list
+        // cannot drift out of step with the SQL.
+        //
+        // The `batch_size`-th distinct key bounds each range, inclusively. The offset is one less
+        // because `OFFSET` counts from zero, and `DISTINCT` is what keeps one workflow's steps inside a
+        // single batch. It is interpolated rather than bound, alone among the values here: a `u32`
+        // renders as digits and nothing else, and a literal offset is one the planner can see.
+        let select_bound = format!(
+            "SELECT DISTINCT {key_column} FROM {table} \
+             WHERE {select_predicate} AND {key_column} > COALESCE($2, '') \
+             ORDER BY {key_column} LIMIT 1 OFFSET {}",
+            batch_size - 1
+        );
+        // Two update shapes rather than one with nullable bounds, because an upper bound the planner
+        // cannot resolve costs as much as a missing lower one: with both bounds bare this is an index
+        // range, with either wrapped in a null test it degrades to a scan. Each carries exactly the
+        // parameters it names.
+        let update_range = format!(
+            "UPDATE {table} SET application_name = $1 \
+             WHERE {update_predicate} \
+               AND {key_column} > COALESCE($3, '') AND {key_column} <= $4"
+        );
+        // The last pass applies no bounds at all, so rows written below the watermark since the
+        // rename began are picked up rather than skipped.
+        let update_rest =
+            format!("UPDATE {table} SET application_name = $1 WHERE {update_predicate}");
+        let select_bound = select_bound.as_str();
+        let update_range = update_range.as_str();
+        let update_rest = update_rest.as_str();
+
+        let mut total = 0;
+        let mut watermark: Option<String> = None;
+        loop {
+            let above = watermark.clone();
+            let (moved, upper) = with_retry(&self.retry, "rename_row_batch", || {
+                let above = above.clone();
+                async move {
+                    let upper: Option<String> = sqlx::query_scalar(AssertSqlSafe(select_bound))
+                        .bind(renamed_from)
+                        .bind(above.as_deref())
+                        .fetch_optional(pool)
+                        .await?
+                        .flatten();
+
+                    let moved = match &upper {
+                        Some(upper) => sqlx::query(AssertSqlSafe(update_range))
+                            .bind(new_name)
+                            .bind(renamed_from)
+                            .bind(above.as_deref())
+                            .bind(upper.as_str()),
+                        None => sqlx::query(AssertSqlSafe(update_rest))
+                            .bind(new_name)
+                            .bind(renamed_from),
+                    }
+                    .execute(pool)
+                    .await?
+                    .rows_affected();
+                    Ok((moved, upper))
+                }
+            })
+            .await?;
+
+            total += moved;
+            match upper {
+                // Fewer than a full batch remained, so that statement took the rest.
+                None => return Ok(total),
+                Some(upper) => watermark = Some(upper),
+            }
+        }
     }
 }
 
@@ -3784,10 +3787,12 @@ impl SystemDatabase for PostgresSystemDatabase {
         // The long tail, which runs outside that transaction and may take several of its own.
         // Terminal workflows and their steps scope only observability and garbage collection, so
         // nothing misreads a database in which they have not yet caught up.
-        let terminal =
-            rename_application_in_batches(self, workflow_table, source, new_name, batching).await?;
-        let step_rows =
-            rename_application_in_batches(self, steps_table, source, new_name, batching).await?;
+        let terminal = self
+            .rename_application_in_batches(workflow_table, source, new_name, batching)
+            .await?;
+        let step_rows = self
+            .rename_application_in_batches(steps_table, source, new_name, batching)
+            .await?;
 
         let counts = ApplicationRowCounts {
             queues: counts[0],
