@@ -1104,7 +1104,7 @@ impl PostgresSystemDatabase {
     where
         S: AsRef<str> + Sync,
     {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
         // TODO: revisit clearing `started_at_epoch_ms` here.
         //
@@ -1122,7 +1122,7 @@ impl PostgresSystemDatabase {
         // worse trade than the inconsistency; worth raising upstream to find out whether it is
         // intent or inheritance.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "UPDATE {table} SET status = 'CANCELLED', queue_name = NULL, \
+            "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
              deduplication_id = NULL, started_at_epoch_ms = NULL, \
              updated_at = $2, completed_at = $2 \
              WHERE workflow_uuid = ANY($1) \
@@ -1145,10 +1145,10 @@ impl PostgresSystemDatabase {
     where
         S: AsRef<str> + Sync,
     {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
         let children: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT workflow_uuid FROM {table} WHERE parent_workflow_id = ANY($1)"
+            "SELECT workflow_uuid FROM {workflow_table} WHERE parent_workflow_id = ANY($1)"
         )))
         .bind(ids)
         .fetch_all(&self.pool)
@@ -1355,7 +1355,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         submission: Submission,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
         let initial_status = workflow.initial_status();
         // Queued workflows are not running, so neither the attempt counter nor the executor
@@ -1387,7 +1387,8 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
-        let (table, pool, owner_xid) = (table.as_str(), &self.pool, owner_xid.as_str());
+        let (workflow_table, pool, owner_xid) =
+            (workflow_table.as_str(), &self.pool, owner_xid.as_str());
 
         with_retry(&self.retry, "init_workflow", move || async move {
             // The column list is Java's INSERT, in its order, plus Python's two debounce
@@ -1422,7 +1423,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // `started_at_epoch_ms` in `cancel_batch`. Worth confirming, and worth proposing
             // upstream rather than carrying as a Rust-only difference.
             let row = sqlx::query(AssertSqlSafe(format!(
-                "INSERT INTO {table} (workflow_uuid, status, inputs, \
+                "INSERT INTO {workflow_table} (workflow_uuid, status, inputs, \
                  name, class_name, config_name, \
                  queue_name, deduplication_id, priority, queue_partition_key, delay_until_epoch_ms, \
                  authenticated_user, assumed_role, authenticated_roles, \
@@ -1435,19 +1436,19 @@ impl SystemDatabase for PostgresSystemDatabase {
                  $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::jsonb, $27, $28, $29, $30) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    recovery_attempts = CASE \
-                       WHEN {table}.status != 'ENQUEUED' AND {table}.status != 'DELAYED' \
-                       THEN {table}.recovery_attempts + $31 \
-                       ELSE {table}.recovery_attempts \
+                       WHEN {workflow_table}.status != 'ENQUEUED' AND {workflow_table}.status != 'DELAYED' \
+                       THEN {workflow_table}.recovery_attempts + $31 \
+                       ELSE {workflow_table}.recovery_attempts \
                    END, \
                    updated_at = EXCLUDED.updated_at, \
                    executor_id = CASE \
                        WHEN EXCLUDED.status = 'ENQUEUED' OR EXCLUDED.status = 'DELAYED' \
-                       THEN {table}.executor_id \
-                       WHEN {table}.owner_xid IS NULL \
-                         OR {table}.owner_xid = EXCLUDED.owner_xid \
+                       THEN {workflow_table}.executor_id \
+                       WHEN {workflow_table}.owner_xid IS NULL \
+                         OR {workflow_table}.owner_xid = EXCLUDED.owner_xid \
                          OR $32 \
                        THEN EXCLUDED.executor_id \
-                       ELSE {table}.executor_id \
+                       ELSE {workflow_table}.executor_id \
                    END \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
                  workflow_deadline_epoch_ms, owner_xid, serialization"
@@ -1565,7 +1566,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 && owner_differs
             {
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} \
+                    "UPDATE {workflow_table} \
                      SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', deduplication_id = NULL, \
                          started_at_epoch_ms = NULL, queue_name = NULL \
                      WHERE workflow_uuid = $1 AND status = 'PENDING'"
@@ -1602,14 +1603,14 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error> {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "get_workflow", move || async move {
             let row = sqlx::query(AssertSqlSafe(format!(
-                "SELECT {WORKFLOW_COLUMNS}, {} FROM {table} WHERE workflow_uuid = $1",
+                "SELECT {WORKFLOW_COLUMNS}, {} FROM {workflow_table} WHERE workflow_uuid = $1",
                 workflow_payloads(true, true)
             )))
             .bind(workflow_id)
@@ -1622,7 +1623,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error> {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         // `status` is the one filter whose values are not already strings.
         let status: Vec<&str> = filter
             .status
@@ -1645,7 +1646,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 )
             })
             .collect();
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         let (status, prefixes) = (status.as_slice(), prefixes.as_slice());
         let application_name = self.application_name.as_deref();
 
@@ -1660,7 +1661,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             q.push(WORKFLOW_COLUMNS)
                 .push(", ")
                 .push(workflow_payloads(filter.load_input, filter.load_output));
-            q.push(" FROM ").push(table);
+            q.push(" FROM ").push(workflow_table);
 
             // `separated(" AND ")` writes the separator only between clauses, so neither a
             // leading `WHERE` with no filters nor a trailing `AND` is possible by construction.
@@ -1835,11 +1836,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         outcome: Outcome<'_>,
     ) -> Result<OutcomeWrite, Error> {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         // Stamped once, outside the retry: a retried attempt is recording the outcome it
         // already had, and re-reading the clock would move `completed_at` forward each time.
         let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         let (output, error) = outcome.columns();
 
         with_retry(&self.retry, "record_workflow_outcome", move || async move {
@@ -1849,7 +1850,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // retry after a lost acknowledgement finds its own write and reports
             // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
             let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET status = $2, output = $3, error = $4, \
+                "UPDATE {workflow_table} SET status = $2, output = $3, error = $4, \
                  updated_at = $5, completed_at = $5 \
                  WHERE workflow_uuid = $1 AND status = 'PENDING'"
             )))
@@ -1880,18 +1881,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         delay: WorkflowDelay,
     ) -> Result<(), Error> {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         // Resolved once, outside the retry, so a relative delay does not creep further out with
         // each attempt.
         let now = Timestamp::now();
         let delay_until = delay.resolve(now).as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "set_workflow_delay", move || async move {
             // `status = 'DELAYED'` is the guard: a released workflow is running or queued, and
             // pushing its delay out would not recall it.
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET delay_until_epoch_ms = $2, updated_at = $3 \
+                "UPDATE {workflow_table} SET delay_until_epoch_ms = $2, updated_at = $3 \
                  WHERE workflow_uuid = $1 AND status = 'DELAYED'"
             )))
             .bind(workflow_id)
@@ -1905,15 +1906,15 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error> {
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "clear_queue_assignment", move || async move {
             // `queue_name IS NOT NULL` is what makes this a *return* rather than an enqueue: a
             // workflow that never came from a queue has none to go back to.
             let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
+                "UPDATE {workflow_table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
                  updated_at = $2 \
                  WHERE workflow_uuid = $1 AND queue_name IS NOT NULL AND status = 'PENDING'"
             )))
@@ -1933,18 +1934,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         attributes: Option<&str>,
     ) -> Result<(), Error> {
         validate_attributes(attributes)?;
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         // Read once, outside the retry: a second attempt is the same write, and re-reading the
         // clock would date the row to whenever the connection came back.
         let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(
             &self.retry,
             "update_workflow_attributes",
             move || async move {
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET attributes = $2::jsonb, updated_at = $3 \
+                    "UPDATE {workflow_table} SET attributes = $2::jsonb, updated_at = $3 \
                      WHERE workflow_uuid = $1"
                 )))
                 .bind(workflow_id)
@@ -1963,8 +1964,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         executor_id: &str,
         application_version: &str,
     ) -> Result<Vec<String>, Error> {
-        let table = &self.tables.workflow_status;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         let application_name = self.application_name.as_deref();
         // Correctness, not tidiness. `executor_id` defaults to `"local"` — Rust follows Go here —
         // so two applications running on one machine present the same executor to this query.
@@ -1975,7 +1976,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(&self.retry, "get_pending_workflows", move || async move {
             let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT workflow_uuid FROM {table} \
+                "SELECT workflow_uuid FROM {workflow_table} \
                  WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2 \
                    AND ($3::text IS NULL \
                         OR application_name = $3 \
@@ -1992,8 +1993,8 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn transition_delayed_workflows(&self) -> Result<u64, Error> {
-        let table = &self.tables.workflow_status;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         let application_name = self.application_name.as_deref();
         // A sweep, so it is scoped: releasing a peer's delayed workflow would enqueue it against
         // that peer's schedule rather than its own. Unclaimed rows are still released, which is
@@ -2012,7 +2013,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // committed to running, and a later debounce with the same key must start a
                 // fresh workflow rather than bounce this one.
                 let moved = sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET status = 'ENQUEUED', updated_at = $1, \
+                    "UPDATE {workflow_table} SET status = 'ENQUEUED', updated_at = $1, \
                      deduplication_id = CASE WHEN is_debounced THEN NULL \
                                              ELSE deduplication_id END \
                      WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1 \
@@ -2114,17 +2115,17 @@ impl SystemDatabase for PostgresSystemDatabase {
         if workflow_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let table = &self.tables.workflow_status;
+        let workflow_table = &self.tables.workflow_status;
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
         // Read once, outside the retry, so a second attempt writes the same `updated_at`.
         let now = Timestamp::now().as_epoch_ms();
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "resume_workflows", move || async move {
             // Existence is asked separately because a zero-row update conflates "already
             // finished" — which is legal — with "no such workflow", which is not.
             let existing: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT workflow_uuid FROM {table} WHERE workflow_uuid = ANY($1)"
+                "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
             )))
             .bind(workflow_ids)
             .fetch_all(pool)
@@ -2144,7 +2145,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // workflow is going to run again, and leaving them set would date it to its last
             // attempt.
             let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "UPDATE {table} SET status = 'ENQUEUED', queue_name = $2, \
+                "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
                  recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
                  deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
                  updated_at = $3 \
@@ -2189,14 +2190,15 @@ impl SystemDatabase for PostgresSystemDatabase {
         targets.extend(children.iter().map(String::as_str));
         targets.sort_unstable();
         targets.dedup();
-        let table = &self.tables.workflow_status;
-        let (table, pool, targets) = (table.as_str(), &self.pool, targets.as_slice());
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool, targets) =
+            (workflow_table.as_str(), &self.pool, targets.as_slice());
 
         with_retry(&self.retry, "delete_workflows", move || async move {
             // Steps, notifications, events, and streams go with the row: every child table
             // declares `ON DELETE CASCADE` on this foreign key, from migration 1 onward.
             let deleted = sqlx::query(AssertSqlSafe(format!(
-                "DELETE FROM {table} WHERE workflow_uuid = ANY($1)"
+                "DELETE FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
             )))
             .bind(targets)
             .execute(pool)
@@ -2870,8 +2872,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<StepRecord>, Error> {
-        let table = &self.tables.operation_outputs;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let steps_table = &self.tables.operation_outputs;
+        let (steps_table, pool) = (steps_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "list_workflow_steps", move || async move {
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
@@ -2879,7 +2881,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .push(", ")
                 .push(step_payloads(load_output))
                 .push(" FROM ")
-                .push(table)
+                .push(steps_table)
                 // `function_id` is the step order, so ordering by it replays the workflow.
                 .push(" WHERE workflow_uuid = ")
                 .push_bind(workflow_id)
@@ -3055,8 +3057,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<NotificationRecord>, Error> {
-        let table = &self.tables.notifications;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let notifications_table = &self.tables.notifications;
+        let (notifications_table, pool) = (notifications_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "get_all_notifications", move || async move {
             // `consumed` rather than a delete on receive, so this reports everything the workflow
@@ -3064,7 +3066,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             let rows = sqlx::query(AssertSqlSafe(format!(
                 "SELECT message_uuid, topic, message, serialization, created_at_epoch_ms, \
                  consumed \
-                 FROM {table} WHERE destination_uuid = $1 ORDER BY created_at_epoch_ms"
+                 FROM {notifications_table} WHERE destination_uuid = $1 ORDER BY created_at_epoch_ms"
             )))
             .bind(workflow_id)
             .fetch_all(pool)
@@ -3087,15 +3089,15 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn get_all_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>, Error> {
-        let table = &self.tables.workflow_events;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let events_table = &self.tables.workflow_events;
+        let (events_table, pool) = (events_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "get_all_events", move || async move {
             // Ordered by key, which the table does not do for us: its primary key is
             // `(workflow_uuid, key)`, so this is a range scan that happens to be sorted, but
             // saying so keeps the result stable if that ever changes.
             let rows = sqlx::query(AssertSqlSafe(format!(
-                "SELECT key, value, serialization FROM {table} \
+                "SELECT key, value, serialization FROM {events_table} \
                  WHERE workflow_uuid = $1 ORDER BY key"
             )))
             .bind(workflow_id)
@@ -3116,14 +3118,14 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error> {
-        let table = &self.tables.streams;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let streams_table = &self.tables.streams;
+        let (streams_table, pool) = (streams_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "get_all_stream_entries", move || async move {
             // `"offset"` is quoted because it is a reserved word, and ordering by it is what
             // makes the result a stream rather than a bag.
             let rows = sqlx::query(AssertSqlSafe(format!(
-                "SELECT key, \"offset\", value, serialization, function_id FROM {table} \
+                "SELECT key, \"offset\", value, serialization, function_id FROM {streams_table} \
                  WHERE workflow_uuid = $1 ORDER BY key, \"offset\""
             )))
             .bind(workflow_id)
@@ -3150,12 +3152,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         version_name: &str,
         application_name: Option<&str>,
     ) -> Result<(), Error> {
-        let table = &self.tables.application_versions;
+        let versions_table = &self.tables.application_versions;
         // Generated outside the retry, like every other identity here. It matters less than
         // `owner_xid` does — a retry finds the row already there and claims nothing — but the
         // rule is worth keeping uniform.
         let version_id = uuid::Uuid::new_v4().to_string();
-        let (table, pool, version_id) = (table.as_str(), &self.pool, version_id.as_str());
+        let (versions_table, pool, version_id) =
+            (versions_table.as_str(), &self.pool, version_id.as_str());
         let application_name = application_name.or(self.application_name.as_deref());
 
         with_retry(
@@ -3184,7 +3187,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 //
                 // Guarded on `IS NULL` so it can only ever claim what nobody holds.
                 let claimed = sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET application_name = $1 \
+                    "UPDATE {versions_table} SET application_name = $1 \
                      WHERE version_name = $2 AND application_name IS NULL"
                 )))
                 .bind(application_name)
@@ -3200,7 +3203,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // it absorbs whichever unique index happens to fire, which is what a
                     // concurrent registrar trips.
                     sqlx::query(AssertSqlSafe(format!(
-                        "INSERT INTO {table} (version_id, version_name, application_name) \
+                        "INSERT INTO {versions_table} (version_id, version_name, application_name) \
                          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
                     )))
                     .bind(version_id)
@@ -3215,7 +3218,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // own or a peer's, and only one of those is acceptable.
                 resolve_owning_application(
                     &mut tx,
-                    table,
+                    versions_table,
                     "version_name",
                     version_name,
                     application_name,
@@ -3231,8 +3234,8 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error> {
-        let table = &self.tables.application_versions;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let versions_table = &self.tables.application_versions;
+        let (versions_table, pool) = (versions_table.as_str(), &self.pool);
         let application_name = self.application_name.as_deref();
 
         with_retry(
@@ -3240,7 +3243,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             "list_application_versions",
             move || async move {
                 let rows = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT {VERSION_COLUMNS} FROM {table} \
+                    "SELECT {VERSION_COLUMNS} FROM {versions_table} \
                      WHERE ($1::text IS NULL \
                             OR application_name = $1 \
                             OR application_name IS NULL) \
@@ -3259,8 +3262,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         application_name: Option<&str>,
     ) -> Result<Option<VersionInfo>, Error> {
-        let table = &self.tables.application_versions;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let versions_table = &self.tables.application_versions;
+        let (versions_table, pool) = (versions_table.as_str(), &self.pool);
         let application_name = application_name.or(self.application_name.as_deref());
 
         with_retry(
@@ -3268,7 +3271,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             "get_latest_application_version",
             move || async move {
                 let row = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT {VERSION_COLUMNS} FROM {table} \
+                    "SELECT {VERSION_COLUMNS} FROM {versions_table} \
                      WHERE ($1::text IS NULL \
                             OR application_name = $1 \
                             OR application_name IS NULL) \
@@ -3289,8 +3292,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error> {
-        let table = &self.tables.application_versions;
-        let (table, pool) = (table.as_str(), &self.pool);
+        let versions_table = &self.tables.application_versions;
+        let (versions_table, pool) = (versions_table.as_str(), &self.pool);
         let application_name = application_name.or(self.application_name.as_deref());
 
         with_retry(
@@ -3301,7 +3304,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                 let owner = resolve_owning_application(
                     &mut tx,
-                    table,
+                    versions_table,
                     "version_name",
                     version_name,
                     application_name,
@@ -3314,7 +3317,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // application and a bare name match would retime every copy. The `SET` also
                 // claims an unclaimed row, which would otherwise stay every peer's latest.
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {table} SET version_timestamp = $2, application_name = $3 \
+                    "UPDATE {versions_table} SET version_timestamp = $2, application_name = $3 \
                      WHERE version_name = $1 \
                        AND (application_name IS NULL OR application_name = $3)"
                 )))
@@ -3336,7 +3339,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         queue: &NewQueue<'_>,
         on_existing: OnExistingQueue,
     ) -> Result<bool, Error> {
-        let table = self.tables.queues.as_str();
+        let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
         let application_name = queue.application_name.or(self.application_name.as_deref());
         // Ownership is claimed, never taken: `COALESCE` leaves a row that already has an owner
@@ -3354,7 +3357,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                    partition_queue = EXCLUDED.partition_queue, \
                    polling_interval_sec = EXCLUDED.polling_interval_sec, \
                    updated_at = EXCLUDED.updated_at, \
-                   application_name = COALESCE({table}.application_name, EXCLUDED.application_name)"
+                   application_name = COALESCE({queues_table}.application_name, EXCLUDED.application_name)"
             ),
             OnExistingQueue::Leave => "ON CONFLICT (name) DO NOTHING".to_owned(),
         };
@@ -3366,7 +3369,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Asked before the write, because afterwards there is no way to tell a row this call
             // created from one it found — both leave a row behind.
             let existed: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT name FROM {table} WHERE name = $1"
+                "SELECT name FROM {queues_table} WHERE name = $1"
             )))
             .bind(queue.name)
             .fetch_optional(&mut *tx)
@@ -3376,7 +3379,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // so registering over it would point this application at a peer's work.
             let owner = resolve_owning_application(
                 &mut tx,
-                table,
+                queues_table,
                 "name",
                 queue.name,
                 application_name,
@@ -3385,7 +3388,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await?;
 
             sqlx::query(AssertSqlSafe(format!(
-                "INSERT INTO {table} \
+                "INSERT INTO {queues_table} \
                  (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, \
                   priority_enabled, partition_queue, polling_interval_sec, updated_at, \
                   application_name) \
@@ -3408,7 +3411,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // row it found belongs to this application or to a peer that registered in between.
             resolve_owning_application(
                 &mut tx,
-                table,
+                queues_table,
                 "name",
                 queue.name,
                 application_name,
@@ -3639,12 +3642,12 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn get_queue(&self, name: &str) -> Result<Option<QueueRecord>, Error> {
-        let table = self.tables.queues.as_str();
+        let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
 
         with_retry(&self.retry, "get_queue", move || async move {
             let row = sqlx::query(AssertSqlSafe(format!(
-                "SELECT {QUEUE_COLUMNS} FROM {table} WHERE name = $1"
+                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1"
             )))
             .bind(name)
             .fetch_optional(pool)
@@ -3658,13 +3661,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         applications: &Applications<'_>,
     ) -> Result<Vec<QueueRecord>, Error> {
-        let table = self.tables.queues.as_str();
+        let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
         let application_name = self.application_name.as_deref();
 
         with_retry(&self.retry, "list_queues", move || async move {
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-            q.push(QUEUE_COLUMNS).push(" FROM ").push(table);
+            q.push(QUEUE_COLUMNS).push(" FROM ").push(queues_table);
             // A search, so an unset scope means this application's own plus the unclaimed.
             match applications {
                 Applications::Any => {}
@@ -3690,12 +3693,12 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn delete_queue(&self, name: &str) -> Result<(), Error> {
-        let table = self.tables.queues.as_str();
+        let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
 
         with_retry(&self.retry, "delete_queue", move || async move {
             sqlx::query(AssertSqlSafe(format!(
-                "DELETE FROM {table} WHERE name = $1"
+                "DELETE FROM {queues_table} WHERE name = $1"
             )))
             .bind(name)
             .execute(pool)
@@ -3820,12 +3823,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 detail: "must not be empty".to_owned(),
             });
         }
-        let table = &self.tables.operation_outputs;
+        let steps_table = &self.tables.operation_outputs;
         // Spans the launch only — the parent does not wait for the child here, so the step is
         // complete as soon as the child exists. Stamped only when the caller offered a start,
         // since half a pair measures nothing. Java passes both null here.
         let completed_at = started_at.map(|_| Timestamp::now());
-        let (table, pool) = (table.as_str(), &self.pool);
+        let (steps_table, pool) = (steps_table.as_str(), &self.pool);
         let application_name = self.application_name.as_deref();
 
         with_retry(&self.retry, "record_child_workflow", move || async move {
@@ -3835,12 +3838,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             // record is by definition the same one. Python states the rule exactly: "Same child
             // means an idempotent db_retry; a different child means nondeterminism."
             let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "INSERT INTO {table} (workflow_uuid, function_id, function_name, \
+                "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, \
                  child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
                  application_name) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
-                 SET child_workflow_id = {table}.child_workflow_id \
+                 SET child_workflow_id = {steps_table}.child_workflow_id \
                  RETURNING child_workflow_id"
             )))
             .bind(parent_workflow_id)
