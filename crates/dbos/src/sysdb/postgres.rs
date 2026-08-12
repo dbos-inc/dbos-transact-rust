@@ -344,6 +344,47 @@ fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
     }
 }
 
+impl PostgresSystemDatabase {
+    /// Whether `application_version` is the newest this application has registered.
+    ///
+    /// **True when nothing is registered**, which is what lets a database that has never seen a
+    /// deploy dequeue anything at all. Own plus unclaimed: a named peer's registration must not
+    /// decide what this application considers current.
+    ///
+    /// Takes a connection rather than using the pool because a dequeue asks inside its own
+    /// transaction — the answer has to be consistent with the rows that transaction goes on to
+    /// select.
+    async fn is_latest_application_version(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        application_version: &str,
+    ) -> Result<bool, Error> {
+        let versions_table = self.tables.application_versions.as_str();
+        let latest: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT version_name FROM {versions_table} \
+             WHERE ($1::text IS NULL OR application_name = $1 OR application_name IS NULL) \
+             ORDER BY version_timestamp DESC LIMIT 1"
+        )))
+        .bind(self.application_name.as_deref())
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(latest.is_none_or(|name| name == application_version))
+    }
+}
+
+/// Which workflows a dequeue on this executor's version may take, with the version at `$param`.
+///
+/// A workflow that records no version is only eligible for an executor running the latest one, so
+/// a rolling deploy stops handing unversioned work to the code being replaced. One recorded on a
+/// *different* version is never eligible either way.
+fn version_predicate(is_latest: bool, param: usize) -> String {
+    if is_latest {
+        format!("(application_version = ${param} OR application_version IS NULL)")
+    } else {
+        format!("application_version = ${param}")
+    }
+}
+
 /// The tables this backend addresses, quoted and schema-qualified.
 ///
 /// One field per table rather than a map: every lookup is a literal in this file, so a missing
@@ -3459,16 +3500,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
 
         let workflow_table = self.tables.workflow_status.as_str();
-        let versions_table = self.tables.application_versions.as_str();
         let pool = &self.pool;
         let application_name = self.application_name.as_deref();
 
         // Every count below has to match what the selection would take, or a limit is enforced
         // against a population this executor cannot dequeue from.
-        let scope = "($1::text IS NULL OR application_name = $1 OR application_name IS NULL)";
+        let owner_predicate =
+            "($1::text IS NULL OR application_name = $1 OR application_name IS NULL)";
         // No partition asked for means every partition, so a null parameter drops the clause
         // rather than matching rows whose key is null.
-        let partition = "($2::text IS NULL OR queue_partition_key = $2)";
+        let partition_predicate = "($2::text IS NULL OR queue_partition_key = $2)";
         // Fixed for the run, unlike the window it is subtracted from, which is read per attempt.
         // Saturating: a period longer than `i64` milliseconds can hold opens the window before
         // the epoch, which counts every start there has ever been — the right answer for a limit
@@ -3504,7 +3545,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                      WHERE queue_name = $3 AND rate_limited = TRUE \
                        AND status NOT IN ('ENQUEUED', 'DELAYED') \
                        AND started_at_epoch_ms > $4 \
-                       AND {scope} AND {partition}"
+                       AND {owner_predicate} AND {partition_predicate}"
                 )))
                 .bind(application_name)
                 .bind(partition_key)
@@ -3529,7 +3570,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             if let Some(concurrency) = queue.concurrency {
                 let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT count(*) FROM {workflow_table} \
-                     WHERE queue_name = $3 AND status = 'PENDING' AND {scope} AND {partition}"
+                     WHERE queue_name = $3 AND status = 'PENDING' AND {owner_predicate} AND {partition_predicate}"
                 )))
                 .bind(application_name)
                 .bind(partition_key)
@@ -3550,23 +3591,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 max_tasks = Some(max_tasks.map_or(available, |t| t.min(available)));
             }
 
-            // A workflow with no version recorded is only this executor's to run if it is
-            // running the latest registered version; otherwise a rolling deploy would hand
-            // unversioned work to the code being replaced. Own plus unclaimed, so a peer's
-            // deploy cannot decide this.
-            let latest: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT version_name FROM {versions_table} WHERE {scope} \
-                 ORDER BY version_timestamp DESC LIMIT 1"
-            )))
-            .bind(application_name)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let is_latest = latest.is_none_or(|name| name == application_version);
-            let version_predicate = if is_latest {
-                "(application_version = $3 OR application_version IS NULL)"
-            } else {
-                "application_version = $3"
-            };
+            let is_latest = self
+                .is_latest_application_version(&mut tx, application_version)
+                .await?;
+            let version_predicate = version_predicate(is_latest, 3);
 
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
             // unlimited queue scale across executors. `NOWAIT` instead when a total matters:
@@ -3584,7 +3612,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT workflow_uuid FROM {workflow_table} \
                  WHERE queue_name = $4 AND status = 'ENQUEUED' \
-                   AND {version_predicate} AND {scope} AND {partition} \
+                   AND {version_predicate} AND {owner_predicate} AND {partition_predicate} \
                  ORDER BY priority ASC, created_at ASC{limit} {lock}"
             )))
             .bind(application_name)
@@ -3618,7 +3646,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                              THEN $5 + workflow_timeout_ms \
                              ELSE workflow_deadline_epoch_ms \
                          END \
-                     WHERE workflow_uuid = $7 AND status = 'ENQUEUED' AND {scope}"
+                     WHERE workflow_uuid = $7 AND status = 'ENQUEUED' AND {owner_predicate}"
                 )))
                 .bind(application_name)
                 .bind(partition_key)
