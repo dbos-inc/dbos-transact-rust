@@ -1030,21 +1030,37 @@ impl PostgresSystemDatabase {
     {
         let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
-        // TODO: revisit clearing `started_at_epoch_ms` here.
+        // TODO: revisit clearing `started_at_epoch_ms` here — raise upstream, since all four
+        // implementations do it identically (`system_database.go:1910`, `system_database.ts:1536`,
+        // `_sys_db.py:1062`) and none of them explain it.
         //
-        // All four implementations do it and none of them explain it. The column is read by the
-        // rate limiter, which counts rows with `queue_name = <queue>`, `rate_limited = TRUE`, a
-        // non-queued status, and `started_at_epoch_ms > now - period`. That justifies the same
-        // clearing in `clear_queue_assignment` and `resume_workflows`, which keep or set a queue
-        // name and so stay in the limiter's scope. **It does not justify it here**: this
-        // statement also sets `queue_name = NULL`, which drops the row from that count on its
-        // own.
+        // When this was raised with other members of the DBOS team, the explanation was that
+        // clearing the start time was needed for rate limiting.
         //
-        // The cost is real — a workflow that was running when cancelled loses its start time, so
-        // `started_after`/`started_before` no longer find it and `completed_at` is left without a
-        // matching start. Kept for now because diverging from all four on a durable column is a
-        // worse trade than the inconsistency; worth raising upstream to find out whether it is
-        // intent or inheritance.
+        // While this explanation is coherent, it does not apply here. The limiter counts starts,
+        // not running work: its status filter excludes only `ENQUEUED` and `DELAYED` — the
+        // not-yet-started states — so `CANCELLED`, `SUCCESS`, `ERROR` and `PENDING` all count,
+        // and a workflow keeps its slot for the rest of the window however it ended. That is
+        // deliberate: a workflow that started and then failed still consumed a start, and
+        // probably still reached whatever the limiter exists to protect. So a `CANCELLED` row with
+        // a recent start really would hold a slot.
+        //
+        // **But this statement also sets `queue_name = NULL` on the same line, and the count is
+        // scoped `WHERE queue_name = $1`.** The row leaves the limiter through the queue name, not
+        // through the start time. Clearing the start time buys nothing here.
+        //
+        // Where the clearing *is* motivated is the paths that put a workflow back on a queue and
+        // keep its name — `clear_queue_assignment` and `resume_workflows`. Even there the limiter
+        // is not the reason, since those rows land in `ENQUEUED`, which the filter already
+        // excludes. The reason is what the column means: "when the current execution started",
+        // and a workflow sitting in a queue has not started. Leaving a stale value would also
+        // make it ambiguous whether the next dequeue's stamp was the first start.
+        //
+        // That reasoning looks inherited here, and it runs backwards: a workflow that was running
+        // when it was cancelled *did* start, so clearing the column discards true information.
+        // The cost is that `started_after`/`started_before` no longer find it, and it ends up
+        // with a `completed_at` and no matching start. Kept anyway — diverging from four
+        // implementations on a durable column is the worse trade.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
              deduplication_id = NULL, started_at_epoch_ms = NULL, \
