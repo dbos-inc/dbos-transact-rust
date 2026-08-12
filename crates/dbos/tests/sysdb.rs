@@ -6,8 +6,9 @@ use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Applications, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow, OnExistingQueue,
-    Outcome, OutcomeWrite, RateLimit, RenameBatching, RenameFrom, StepTiming, Submission,
-    Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
+    Outcome, OutcomeWrite, QueueRecord, RateLimit, RenameBatching, RenameFrom, StepTiming,
+    Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus,
+    WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -5768,4 +5769,181 @@ async fn an_unrepresentable_period_is_malformed() {
         }
         other => panic!("expected a malformed row, got {other:?}"),
     }
+}
+
+/// Registers a partitioned queue that a sweep will accept.
+async fn partitioned_queue(sys: &PostgresSystemDatabase, name: &'static str) -> QueueRecord {
+    let queue = NewQueue {
+        concurrency: Some(1),
+        partition_queue: true,
+        ..NewQueue::new(name)
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    sys.get_queue(name).await.unwrap().unwrap()
+}
+
+/// Enqueues into a partition.
+async fn enqueue_partitioned(sys: &PostgresSystemDatabase, id: &str, queue: &str, partition: &str) {
+    let wf = NewWorkflow {
+        queue_name: Some(queue),
+        queue_partition_key: Some(partition),
+        application_version: Some("v1"),
+        ..NewWorkflow::new(id)
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+}
+
+/// The partitions of a queue are the distinct keys with work waiting, each once.
+#[tokio::test]
+async fn queue_partitions_are_the_keys_with_work() {
+    let (sys, _db) = sysdb().await;
+    partitioned_queue(&sys, "orders").await;
+
+    enqueue_partitioned(&sys, "wf-a1", "orders", "alpha").await;
+    enqueue_partitioned(&sys, "wf-a2", "orders", "alpha").await;
+    enqueue_partitioned(&sys, "wf-b1", "orders", "beta").await;
+    // Unpartitioned work on the same queue is not a partition.
+    enqueue(&sys, "wf-none", "orders", 0, None).await;
+
+    assert_eq!(
+        sys.get_queue_partitions("orders").await.unwrap(),
+        ["alpha", "beta"],
+        "each key once, in order, and no null key",
+    );
+    assert!(sys.get_queue_partitions("other").await.unwrap().is_empty());
+}
+
+/// A sweep takes one workflow per partition, and will not take a second while the first runs.
+#[tokio::test]
+async fn a_sweep_takes_one_head_per_partition() {
+    let (sys, _db) = sysdb().await;
+    let queue = partitioned_queue(&sys, "orders").await;
+
+    for partition in ["alpha", "beta"] {
+        for n in 0..2 {
+            enqueue_partitioned(&sys, &format!("wf-{partition}-{n}"), "orders", partition).await;
+        }
+    }
+
+    let mut started = sys
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+        .await
+        .unwrap();
+    started.sort();
+    assert_eq!(
+        started,
+        ["wf-alpha-0", "wf-beta-0"],
+        "the head of each partition, never two from one",
+    );
+
+    // The PENDING head gates its partition, so a second sweep takes nothing.
+    assert!(
+        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+            .await
+            .unwrap()
+            .is_empty(),
+        "a partition whose head is running is not eligible",
+    );
+
+    // Once the head finishes, the next one becomes available.
+    sys.record_workflow_outcome("wf-alpha-0", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+            .await
+            .unwrap(),
+        ["wf-alpha-1"],
+    );
+}
+
+/// A sweep refuses a queue whose settings make its admission control unsound.
+#[tokio::test]
+async fn a_sweep_refuses_an_unsuitable_queue() {
+    let (sys, _db) = sysdb().await;
+
+    let unsuitable = [
+        // Not partitioned at all.
+        NewQueue {
+            concurrency: Some(1),
+            ..NewQueue::new("plain")
+        },
+        // Partitioned, but admitting more than one per partition.
+        NewQueue {
+            concurrency: Some(2),
+            partition_queue: true,
+            ..NewQueue::new("wide")
+        },
+        // Partitioned and single, but rate limited — which needs the counting a sweep omits.
+        NewQueue {
+            concurrency: Some(1),
+            partition_queue: true,
+            rate_limit: Some(RateLimit {
+                limit: 5,
+                period: std::time::Duration::from_secs(1),
+            }),
+            ..NewQueue::new("limited")
+        },
+    ];
+
+    for queue in unsuitable {
+        sys.upsert_queue(&queue, OnExistingQueue::Update)
+            .await
+            .unwrap();
+        let registered = sys.get_queue(queue.name).await.unwrap().unwrap();
+        let result = sys
+            .start_queued_partitioned_workflows(&registered, "exec-1", "v1")
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidInput { field: "queue", .. })),
+            "{} should be refused, got {result:?}",
+            queue.name,
+        );
+    }
+}
+
+/// A sweep takes only this application's partitions, and claims what it starts.
+#[tokio::test]
+async fn a_sweep_stays_within_an_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let beta = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("beta"),
+            ..Settings::default()
+        },
+    );
+    let queue = partitioned_queue(&alpha, "orders").await;
+
+    enqueue_partitioned(&alpha, "wf-alpha", "orders", "p1").await;
+    enqueue_partitioned(&beta, "wf-beta", "orders", "p2").await;
+
+    assert_eq!(
+        alpha.get_queue_partitions("orders").await.unwrap(),
+        ["p1"],
+        "beta's partition is not alpha's to poll",
+    );
+    assert_eq!(
+        alpha
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+            .await
+            .unwrap(),
+        ["wf-alpha"],
+    );
+    assert_eq!(
+        alpha.get_workflow("wf-beta").await.unwrap().unwrap().status,
+        WorkflowStatus::Enqueued,
+    );
 }

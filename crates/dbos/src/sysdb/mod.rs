@@ -34,6 +34,13 @@ pub const NULL_TOPIC: &str = "__null__topic__";
 /// string, so it is a cross-SDK constant.
 pub const STREAM_CLOSED: &str = "__DBOS_STREAM_CLOSED__";
 
+/// Partitions a single partitioned sweep will look at.
+///
+/// A bound on the work one transaction does, not on what is eventually dequeued: partitions past
+/// the cap are picked up by the next poll, because the `PENDING` gate keeps a partition ineligible
+/// only while its head is running. Every implementation uses this number.
+pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
+
 pub mod error;
 pub mod migrations;
 pub mod postgres;
@@ -633,6 +640,35 @@ pub trait SystemDatabase: Send + Sync {
         application_version: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
+    ) -> Result<Vec<String>, Error>;
+
+    /// The partitions of a queue that currently have work waiting.
+    ///
+    /// Only partitions this application could dequeue from — a peer's are not this caller's to
+    /// poll. Ordered, and each key appears once.
+    async fn get_queue_partitions(&self, queue_name: &str) -> Result<Vec<String>, Error>;
+
+    /// Claims the head-of-line workflow of every partition at once, returning what it got.
+    ///
+    /// The partitioned counterpart to
+    /// [`start_queued_workflows`](Self::start_queued_workflows), and a different shape rather
+    /// than a variation: instead of taking *n* workflows from one queue, it takes *one* from each
+    /// partition in a single transaction, so a queue with a thousand partitions costs one sweep
+    /// rather than a thousand polls.
+    ///
+    /// **Only valid for a partitioned queue with concurrency 1 and no rate limit**, which is
+    /// [`Error::InvalidInput`] otherwise. That restriction is what makes the sweep safe without
+    /// per-partition counting: every worker ranks each partition's head identically, and the
+    /// `PENDING` gate admits at most one row per partition, so concurrency 1 is enforced by the
+    /// data rather than by a count.
+    ///
+    /// At most [`PARTITIONED_DEQUEUE_SWEEP_CAP`]
+    /// partitions per sweep; the rest arrive on later polls.
+    async fn start_queued_partitioned_workflows(
+        &self,
+        queue: &QueueRecord,
+        executor_id: &str,
+        application_version: &str,
     ) -> Result<Vec<String>, Error>;
 
     /// Reads one queue by name, or `None` if it is not registered.

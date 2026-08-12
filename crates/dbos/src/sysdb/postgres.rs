@@ -64,6 +64,7 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
+use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
 use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
@@ -3669,6 +3670,221 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
             Ok(started)
         })
+        .await
+    }
+
+    async fn get_queue_partitions(&self, queue_name: &str) -> Result<Vec<String>, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let application_name = self.application_name.as_deref();
+        // The rows this application could dequeue from this queue. Shared by both halves of the
+        // recursion below, which have to agree: an anchor that started from a different
+        // population than the step continued through would skip or repeat partitions silently.
+        let eligible_predicate = "queue_name = $1 AND status = 'ENQUEUED' \
+                        AND ($2::text IS NULL OR application_name = $2 \
+                             OR application_name IS NULL)";
+
+        with_retry(&self.retry, "get_queue_partitions", move || async move {
+            // A loose index scan, not `SELECT DISTINCT`. Neither backend can skip to the next
+            // distinct value inside a plain distinct, so it degenerates into reading every
+            // enqueued row; each step of this recursion is one seek on
+            // `idx_workflow_status_partition_dequeue_v2`, so the cost follows the number of
+            // partitions rather than the depth of the backlog.
+            let partitions: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "WITH RECURSIVE partitions AS ( \
+                   (SELECT MIN(queue_partition_key) AS pk FROM {workflow_table} \
+                     WHERE {eligible_predicate} AND queue_partition_key IS NOT NULL) \
+                   UNION ALL \
+                   (SELECT (SELECT MIN(queue_partition_key) FROM {workflow_table} \
+                             WHERE {eligible_predicate} AND queue_partition_key > partitions.pk) \
+                    FROM partitions WHERE partitions.pk IS NOT NULL) \
+                 ) \
+                 SELECT pk FROM partitions WHERE pk IS NOT NULL"
+            )))
+            .bind(queue_name)
+            .bind(application_name)
+            .fetch_all(pool)
+            .await?;
+            Ok(partitions)
+        })
+        .await
+    }
+
+    async fn start_queued_partitioned_workflows(
+        &self,
+        queue: &QueueRecord,
+        executor_id: &str,
+        application_version: &str,
+    ) -> Result<Vec<String>, Error> {
+        // The sweep admits one row per partition and counts nothing, so it is only correct where
+        // "one at a time" is what the queue means. A rate limit would need the counting this
+        // deliberately does without.
+        if !queue.partition_queue || queue.concurrency != Some(1) || queue.rate_limit.is_some() {
+            return Err(Error::InvalidInput {
+                field: "queue",
+                detail: format!(
+                    "a partitioned sweep needs a partitioned queue with concurrency 1 and no \
+                     rate limit, but {:?} is partitioned={} concurrency={:?} rate_limited={}",
+                    queue.name,
+                    queue.partition_queue,
+                    queue.concurrency,
+                    queue.rate_limit.is_some(),
+                ),
+            });
+        }
+
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let application_name = self.application_name.as_deref();
+
+        with_retry(
+            &self.retry,
+            "start_queued_partitioned_workflows",
+            move || async move {
+                let now = Timestamp::now();
+                let mut tx = pool.begin().await?;
+
+                let is_latest = self
+                    .is_latest_application_version(&mut tx, application_version)
+                    .await?;
+                // Both statements below place the version at `$3`.
+                let version_predicate = version_predicate(is_latest, 3);
+
+                // Candidate query: $1 queue, $2 application, $3 version. `eligible` is the
+                // shared predicate all three of its uses must agree on — see
+                // `get_queue_partitions`.
+                let eligible_predicate = "queue_name = $1 AND status = 'ENQUEUED' \
+                                AND ($2::text IS NULL OR application_name = $2 \
+                                     OR application_name IS NULL)";
+
+                // The same loose index scan `get_queue_partitions` uses, then one head per
+                // partition. `workflow_uuid` breaks ties in the head order so every worker ranks
+                // a partition identically — which is what lets the guarded flip below admit at
+                // most one row per partition without anyone counting.
+                //
+                // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
+                // loop instead of a slower per-row subplan. `workflow_uuid` totalizes the head
+                // order, so every worker picks the same head under a `created_at` tie, and the
+                // index's trailing `workflow_uuid` keeps the probe a pure top-1. The `NOT EXISTS`
+                // on `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
+                // owner's row.
+                //
+                // **No `--` comments inside this string.** The `\` continuations strip the
+                // newlines that would end them, so a `--` comments out the whole rest of the
+                // statement — including the `) head ON TRUE` alias, which fails as a missing
+                // FROM-clause entry rather than as a syntax error.
+                let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "WITH RECURSIVE partitions AS ( \
+                       (SELECT MIN(queue_partition_key) AS pk FROM {workflow_table} \
+                         WHERE {eligible_predicate} AND queue_partition_key IS NOT NULL) \
+                       UNION ALL \
+                       (SELECT (SELECT MIN(queue_partition_key) FROM {workflow_table} \
+                                 WHERE {eligible_predicate} AND queue_partition_key > partitions.pk) \
+                        FROM partitions WHERE partitions.pk IS NOT NULL) \
+                     ) \
+                     SELECT head.workflow_uuid FROM partitions \
+                     JOIN LATERAL ( \
+                       SELECT workflow_uuid FROM {workflow_table} \
+                        WHERE {eligible_predicate} AND queue_partition_key = partitions.pk \
+                          AND {version_predicate} \
+                        ORDER BY priority ASC, created_at ASC, workflow_uuid ASC LIMIT 1 \
+                     ) head ON TRUE \
+                     WHERE partitions.pk IS NOT NULL \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {workflow_table} \
+                          WHERE queue_name = $1 AND status = 'PENDING' \
+                            AND queue_partition_key IS NOT NULL \
+                            AND queue_partition_key = partitions.pk \
+                       ) \
+                     ORDER BY partitions.pk ASC LIMIT {PARTITIONED_DEQUEUE_SWEEP_CAP}"
+                )))
+                .bind(&queue.name)
+                .bind(application_name)
+                .bind(application_version)
+                .fetch_all(&mut *tx)
+                .await?;
+                if candidates.is_empty() {
+                    tx.commit().await?;
+                    return Ok(Vec::new());
+                }
+
+                // Re-checks queue, partition and version alongside status, so a row that
+                // `resume_workflows` moved to another queue mid-sweep is dropped rather than
+                // hijacked. $1 ids, $2 queue, $3 version, $4 application.
+                let claim_predicate = format!(
+                    "workflow_uuid = ANY($1::text[]) AND status = 'ENQUEUED' \
+                       AND queue_name = $2 AND queue_partition_key IS NOT NULL \
+                       AND {version_predicate} \
+                       AND ($4::text IS NULL OR application_name = $4 \
+                            OR application_name IS NULL)"
+                );
+
+                // Locks the fixed candidate set rather than re-selecting with a `LIMIT`, whose
+                // `SKIP LOCKED` could slide past a locked head and admit a partition's second
+                // row ahead of its first.
+                let locked: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT workflow_uuid FROM {workflow_table} WHERE {claim_predicate} \
+                     FOR UPDATE SKIP LOCKED"
+                )))
+                .bind(&candidates)
+                .bind(&queue.name)
+                .bind(application_version)
+                .bind(application_name)
+                .fetch_all(&mut *tx)
+                .await?;
+                let locked: HashSet<&str> = locked.iter().map(String::as_str).collect();
+                // Partition order, so submission follows the sweep rather than the lock order.
+                let claiming: Vec<&str> = candidates
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| locked.contains(id))
+                    .collect();
+                if claiming.is_empty() {
+                    tx.commit().await?;
+                    return Ok(Vec::new());
+                }
+
+                // `RETURNING` reports exactly the rows this statement flipped, which is what
+                // makes the guard the admission control rather than a check before one.
+                let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "UPDATE {workflow_table} \
+                     SET status = 'PENDING', executor_id = $5, application_version = $3, \
+                         started_at_epoch_ms = $6, rate_limited = FALSE, \
+                         application_name = COALESCE(application_name, $4), \
+                         workflow_deadline_epoch_ms = CASE \
+                             WHEN workflow_timeout_ms IS NOT NULL \
+                              AND workflow_deadline_epoch_ms IS NULL \
+                             THEN $6 + workflow_timeout_ms \
+                             ELSE workflow_deadline_epoch_ms \
+                         END \
+                     WHERE {claim_predicate} RETURNING workflow_uuid"
+                )))
+                .bind(&claiming)
+                .bind(&queue.name)
+                .bind(application_version)
+                .bind(application_name)
+                .bind(executor_id)
+                .bind(now.as_epoch_ms())
+                .fetch_all(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                let flipped: HashSet<&str> = flipped.iter().map(String::as_str).collect();
+                let started: Vec<String> = claiming
+                    .into_iter()
+                    .filter(|id| flipped.contains(id))
+                    .map(str::to_owned)
+                    .collect();
+                if !started.is_empty() {
+                    tracing::debug!(
+                        queue = %queue.name,
+                        started = started.len(),
+                        "dequeued a partition sweep"
+                    );
+                }
+                Ok(started)
+            },
+        )
         .await
     }
 
