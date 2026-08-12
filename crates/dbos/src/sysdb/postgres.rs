@@ -3613,6 +3613,28 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
             let version_predicate = version_predicate(is_latest, 3);
 
+            // TODO: raise `SKIP LOCKED` on CockroachDB with the wider DBOS team.
+            //
+            // CockroachDB resolves write intents *asynchronously* after a commit, and
+            // `SKIP LOCKED` skips a row whose intent is still unresolved rather than waiting for
+            // it. A workflow enqueued moments ago therefore looks locked, so a dequeue comes back
+            // short and the row waits for the next poll. Measured on a single-node CockroachDB:
+            // **13 of 40** enqueue-then-dequeue rounds returned fewer rows than were enqueued,
+            // and the skipped rows always appeared in the following round. A 250ms pause, or any
+            // read of the rows, drops that to zero — a plain read resolves the intent.
+            //
+            // Not Rust-specific. Python passes `skip_locked` unconditionally, Java's `QueuesDAO`
+            // has the same `SKIP LOCKED`/`NOWAIT` split with no CockroachDB branch, and Go has no
+            // CockroachDB dialect at all. Java's suite runs on CockroachDB and does not see it
+            // because its assertions have slack — `StaticQueuesTest` enqueues four and asserts
+            // two, so a skipped row still satisfies the count.
+            //
+            // The cost is a polling interval of latency and an under-filled concurrency
+            // allowance, not lost work. Left as is because the alternative — plain `FOR UPDATE`
+            // on CockroachDB — serialises dequeues across executors there, and that trade is the
+            // team's to make rather than this port's. The tests read rows back before asserting
+            // an exact dequeue; see `settle` in the integration tests.
+            //
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
             // unlimited queue scale across executors. `NOWAIT` instead when a total matters:
             // stepping over locked rows would count a population this executor cannot see, so

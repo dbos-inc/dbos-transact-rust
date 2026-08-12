@@ -5390,6 +5390,20 @@ async fn half_a_rate_limit_reads_as_none() {
     assert_eq!(queue.rate_limit, None);
 }
 
+/// Reads an enqueued row back, so a dequeue in the same test sees it.
+///
+/// Not idle: **CockroachDB resolves write intents asynchronously after a commit, and
+/// `FOR UPDATE SKIP LOCKED` skips a row whose intent is still unresolved.** A dequeue issued
+/// immediately after an enqueue therefore comes back short, and a test asserting an exact result
+/// flakes — 13 of 40 rounds were short in a stress run. Reading the row resolves its intent.
+///
+/// The behaviour underneath is real rather than a test artefact, and is not Rust-specific: see the
+/// `TODO` on `start_queued_workflows`. What this buys is a test that measures dequeue logic instead
+/// of intent-resolution timing.
+async fn settle(sys: &PostgresSystemDatabase, id: &str) {
+    sys.get_workflow(id).await.unwrap().expect("just enqueued");
+}
+
 /// Enqueues a workflow on `queue`, optionally with a priority and a timeout.
 async fn enqueue(
     sys: &PostgresSystemDatabase,
@@ -5408,6 +5422,7 @@ async fn enqueue(
     sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
+    settle(sys, id).await;
 }
 
 /// A dequeue takes enqueued workflows in priority then age order, and starts them.
@@ -5795,6 +5810,7 @@ async fn enqueue_partitioned(sys: &PostgresSystemDatabase, id: &str, queue: &str
     sys.init_workflow(&wf, None, Submission::Fresh)
         .await
         .unwrap();
+    settle(sys, id).await;
 }
 
 /// The partitions of a queue are the distinct keys with work waiting, each once.
