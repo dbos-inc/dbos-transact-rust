@@ -3636,6 +3636,41 @@ impl SystemDatabase for PostgresSystemDatabase {
             // team's to make rather than this port's. The tests read rows back before asserting
             // an exact dequeue; see `settle` in the integration tests.
             //
+            // TODO: `SKIP LOCKED` under-delivers on CockroachDB — settle with the wider DBOS
+            // team before changing it.
+            //
+            // CockroachDB resolves write intents asynchronously after a commit, and `SKIP LOCKED`
+            // skips a row whose intent is still unresolved rather than waiting. A workflow
+            // enqueued moments ago is passed over, so the dequeue comes back short and that work
+            // waits for the next poll. Measured on a single node, 15 rounds of three workflows:
+            //
+            //   FOR UPDATE SKIP LOCKED                     11/15 rounds short
+            //   ... with a point read of each row first     5/15
+            //   ... with a locking read over the queue      1/15
+            //   FOR UPDATE                                  0/15
+            //
+            // **Recommendation: use a plain `FOR UPDATE` on CockroachDB**, keeping `SKIP LOCKED`
+            // on PostgreSQL, in this statement and in the partitioned sweep's lock step. It waits
+            // for the intent instead of skipping it, and measured clean. The cost is that
+            // concurrent dequeues on one queue serialise on CockroachDB — the trade this needs
+            // agreement on, because nothing else recovers the missing rows.
+            //
+            // No barrier outside this statement works: a row is readable while still being
+            // skippable, so reading it first only narrows the window. A point-read barrier was
+            // tried in the tests and CI kept failing, at a lower rate.
+            //
+            // Not Rust-specific, and nobody else varies the SQL. Python passes `skip_locked`
+            // unconditionally; TypeScript picks the mode from `queue.concurrency` alone; Java
+            // concatenates the literal in `QueuesDAO` and keeps its CockroachDB handling in
+            // `MigrationManager`. Go alone has the seam — `type CockroachDialect struct{
+            // PostgresDialect }` overrides only `Name` and `SupportsListenNotify`, inheriting
+            // `LockSkipLocked`, so its fix is one line. Java's suite runs on CockroachDB and does
+            // not catch this: all fifteen of its dequeue assertions check a limit being enforced
+            // (`assertEquals(0, ...)` or `assertEquals(2, ...)` against four enqueued) rather
+            // than a count being complete. See `UPSTREAM.md`.
+            //
+            // Until then the affected integration tests are skipped on CockroachDB.
+            //
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
             // unlimited queue scale across executors. `NOWAIT` instead when a total matters:
             // stepping over locked rows would count a population this executor cannot see, so
@@ -3858,6 +3893,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                             OR application_name IS NULL)"
                 );
 
+                // TODO: this `SKIP LOCKED` under-delivers on CockroachDB for the reason given
+                // on `start_queued_workflows` — a head enqueued moments ago is skipped and its
+                // partition idles until the next sweep. **Recommendation: plain `FOR UPDATE` on
+                // CockroachDB**, applied here as well as there. Settle with the wider DBOS team
+                // first; see `UPSTREAM.md`.
+                //
                 // Locks the fixed candidate set rather than re-selecting with a `LIMIT`, whose
                 // `SKIP LOCKED` could slide past a locked head and admit a partition's second
                 // row ahead of its first.
