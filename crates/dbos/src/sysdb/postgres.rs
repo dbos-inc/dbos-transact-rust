@@ -69,10 +69,11 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow,
-    NotificationRecord, Outcome, StepRecord, StepTiming, StreamRecord, Submission, Timestamp,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
-    duration_from_ms, validate_attributes,
+    ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
+    NewWorkflow, NotificationRecord, Outcome, RenameBatching, RenameFrom, StepRecord, StepTiming,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -325,6 +326,142 @@ impl PostgresSystemDatabase {
     }
 }
 
+/// The `WHERE` selecting the rows a rename moves.
+///
+/// Unclaimed rows are matched only when the source asks for them — the one place in this feature
+/// where `IS NULL` does not ride along, because taking a row from every application is a decision.
+///
+/// Always consumes exactly one parameter, bound to `source.application()`, so a caller's numbering
+/// does not depend on which variant it was handed. That is why [`RenameFrom::Unclaimed`] tests the
+/// parameter it does not otherwise need: with `NULL` bound, `$n::text IS NULL` is simply true.
+fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
+    match source {
+        RenameFrom::Application(_) => format!("application_name = ${param}"),
+        RenameFrom::ApplicationAndUnclaimed(_) => {
+            format!("(application_name = ${param} OR application_name IS NULL)")
+        }
+        RenameFrom::Unclaimed => format!("(${param}::text IS NULL AND application_name IS NULL)"),
+    }
+}
+
+/// Re-owns a table's rows in half-open key ranges, returning how many moved.
+///
+/// **Ranges, not `LIMIT`.** A `LIMIT` walks past every row already moved on each pass, turning a
+/// long history into quadratic work, and collecting the keys into an `IN` list plans as a
+/// whole-table hash join. A watermark on the key column reads each row once.
+///
+/// Two details carry the correctness. The bound is the `batch_size`-th **distinct** key, so a
+/// workflow's steps are never split across two batches. And the final pass — the one that finds no
+/// bound because fewer than a batch remains — **applies no bounds at all**, so rows that appeared
+/// below the watermark while the rename ran still move.
+///
+/// Every statement is an idempotent re-own, so a run that fails partway can simply be repeated.
+async fn rename_application_in_batches(
+    db: &PostgresSystemDatabase,
+    table: &str,
+    source: RenameFrom<'_>,
+    new_name: &str,
+    batching: RenameBatching,
+) -> Result<u64, Error> {
+    // Both `workflow_status` and `operation_outputs` tables range over `workflow_uuid`.
+    let key_column = "workflow_uuid";
+    // `$1` is the new name in the updates, so the source lands on `$2`; the bare `SELECT` below
+    // has no new name to bind and starts at `$1`.
+    let update_predicate = rename_source_predicate(source, 2);
+    let select_predicate = rename_source_predicate(source, 1);
+    let update_predicate = update_predicate.as_str();
+    let select_predicate = select_predicate.as_str();
+    let renamed_from = source.application();
+    let pool = &db.pool;
+
+    let RenameBatching::Batched(batch_size) = batching else {
+        return with_retry(&db.retry, "rename_rows", move || async move {
+            let moved = sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET application_name = $1 WHERE {update_predicate}"
+            )))
+            .bind(new_name)
+            .bind(renamed_from)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            Ok(moved)
+        })
+        .await;
+    };
+
+    // Python and TypeScript omit each bound until it has a value, so their select comes in two
+    // shapes and their update in three, with parameters pushed alongside whichever clauses were
+    // appended. `COALESCE($n, '')` collapses the missing-lower-bound case, leaving one select
+    // shape and two update shapes here — each with a fixed parameter count, so the bind list
+    // cannot drift out of step with the SQL.
+    //
+    // The `batch_size`-th distinct key bounds each range, inclusively. The offset is one less
+    // because `OFFSET` counts from zero, and `DISTINCT` is what keeps one workflow's steps inside a
+    // single batch. It is interpolated rather than bound, alone among the values here: a `u32`
+    // renders as digits and nothing else, and a literal offset is one the planner can see.
+    let select_bound = format!(
+        "SELECT DISTINCT {key_column} FROM {table} \
+         WHERE {select_predicate} AND {key_column} > COALESCE($2, '') \
+         ORDER BY {key_column} LIMIT 1 OFFSET {}",
+        batch_size - 1
+    );
+    // Two update shapes rather than one with nullable bounds, because an upper bound the planner
+    // cannot resolve costs as much as a missing lower one: with both bounds bare this is an index
+    // range, with either wrapped in a null test it degrades to a scan. Each carries exactly the
+    // parameters it names.
+    let update_range = format!(
+        "UPDATE {table} SET application_name = $1 \
+         WHERE {update_predicate} \
+           AND {key_column} > COALESCE($3, '') AND {key_column} <= $4"
+    );
+    // The last pass applies no bounds at all, so rows written below the watermark since the
+    // rename began are picked up rather than skipped.
+    let update_rest = format!("UPDATE {table} SET application_name = $1 WHERE {update_predicate}");
+    let select_bound = select_bound.as_str();
+    let update_range = update_range.as_str();
+    let update_rest = update_rest.as_str();
+
+    let mut total = 0;
+    let mut watermark: Option<String> = None;
+    loop {
+        let above = watermark.clone();
+        let (moved, upper) = with_retry(&db.retry, "rename_row_batch", || {
+            let above = above.clone();
+            async move {
+                let upper: Option<String> = sqlx::query_scalar(AssertSqlSafe(select_bound))
+                    .bind(renamed_from)
+                    .bind(above.as_deref())
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten();
+
+                let moved = match &upper {
+                    Some(upper) => sqlx::query(AssertSqlSafe(update_range))
+                        .bind(new_name)
+                        .bind(renamed_from)
+                        .bind(above.as_deref())
+                        .bind(upper.as_str()),
+                    None => sqlx::query(AssertSqlSafe(update_rest))
+                        .bind(new_name)
+                        .bind(renamed_from),
+                }
+                .execute(pool)
+                .await?
+                .rows_affected();
+                Ok((moved, upper))
+            }
+        })
+        .await?;
+
+        total += moved;
+        match upper {
+            // Fewer than a full batch remained, so that statement took the rest.
+            None => return Ok(total),
+            Some(upper) => watermark = Some(upper),
+        }
+    }
+}
+
 /// The tables this backend addresses, quoted and schema-qualified.
 ///
 /// One field per table rather than a map: every lookup is a literal in this file, so a missing
@@ -337,6 +474,8 @@ struct Tables {
     workflow_events: String,
     workflow_events_history: String,
     streams: String,
+    queues: String,
+    workflow_schedules: String,
 }
 
 impl Tables {
@@ -353,6 +492,8 @@ impl Tables {
                 quote_identifier("workflow_events_history")
             ),
             streams: format!("{schema}.{}", quote_identifier("streams")),
+            queues: format!("{schema}.{}", quote_identifier("queues")),
+            workflow_schedules: format!("{schema}.{}", quote_identifier("workflow_schedules")),
         }
     }
 }
@@ -3131,6 +3272,105 @@ impl SystemDatabase for PostgresSystemDatabase {
             },
         )
         .await
+    }
+
+    async fn rename_application(
+        &self,
+        source: RenameFrom<'_>,
+        new_name: &str,
+        batching: RenameBatching,
+    ) -> Result<ApplicationRowCounts, Error> {
+        if !is_valid_application_name(new_name) {
+            return Err(Error::InvalidInput {
+                field: "new_name",
+                detail: "must be 3 to 30 characters of lowercase letters, digits, dashes and \
+                         underscores"
+                    .to_owned(),
+            });
+        }
+        if source.application() == Some(new_name) {
+            return Err(Error::InvalidInput {
+                field: "new_name",
+                detail: format!("{new_name:?} already holds that name"),
+            });
+        }
+        if let RenameBatching::Batched(0) = batching {
+            return Err(Error::InvalidInput {
+                field: "batching",
+                detail: "a batch must hold at least one workflow".to_owned(),
+            });
+        }
+
+        let workflow_table = self.tables.workflow_status.as_str();
+        let steps_table = self.tables.operation_outputs.as_str();
+        let queues_table = self.tables.queues.as_str();
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let versions_table = self.tables.application_versions.as_str();
+        let pool = &self.pool;
+        // `$1` is the new name, so the source lands on `$2`.
+        let predicate = rename_source_predicate(source, 2);
+        let (predicate, renamed_from) = (predicate.as_str(), source.application());
+
+        // The atomic half. A rename that committed the queue but not the version registry would
+        // leave the application dequeuing work whose version row it can no longer see, so these
+        // four move together or not at all. In-flight means the statuses a dequeue or a sweep can
+        // still act on; everything terminal is only read about.
+        let counts = with_retry(&self.retry, "rename_application", move || async move {
+            let mut tx = pool.begin().await?;
+            let mut moved = [0u64; 4];
+            for (i, table) in [
+                queues_table,
+                schedules_table,
+                versions_table,
+                workflow_table,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // Only the workflow table needs narrowing; the other three have no status.
+                let in_flight = if table == workflow_table {
+                    " AND status IN ('PENDING', 'ENQUEUED', 'DELAYED')"
+                } else {
+                    ""
+                };
+                moved[i] = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {table} SET application_name = $1 WHERE {predicate}{in_flight}"
+                )))
+                .bind(new_name)
+                .bind(renamed_from)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            }
+            tx.commit().await?;
+            Ok(moved)
+        })
+        .await?;
+
+        // The long tail, which runs outside that transaction and may take several of its own.
+        // Terminal workflows and their steps scope only observability and garbage collection, so
+        // nothing misreads a database in which they have not yet caught up.
+        let terminal =
+            rename_application_in_batches(self, workflow_table, source, new_name, batching).await?;
+        let step_rows =
+            rename_application_in_batches(self, steps_table, source, new_name, batching).await?;
+
+        let counts = ApplicationRowCounts {
+            queues: counts[0],
+            schedules: counts[1],
+            versions: counts[2],
+            workflows: counts[3] + terminal,
+            steps: step_rows,
+        };
+        tracing::debug!(
+            queues = counts.queues,
+            schedules = counts.schedules,
+            versions = counts.versions,
+            workflows = counts.workflows,
+            steps = counts.steps,
+            "renamed application"
+        );
+        Ok(counts)
     }
 
     async fn record_child_workflow(

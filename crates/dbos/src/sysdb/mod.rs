@@ -49,9 +49,10 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, NotificationRecord, Outcome,
-    OutcomeWrite, StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow,
+    NotificationRecord, Outcome, OutcomeWrite, RenameBatching, RenameFrom, StepRecord, StepTiming,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -581,6 +582,30 @@ pub trait SystemDatabase: Send + Sync {
         timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error>;
+
+    /// Gives `new_name` ownership of the rows a [`RenameFrom`] selects.
+    ///
+    /// **The application being renamed must be stopped**, or its own dequeues race this and
+    /// re-claim rows behind it. Nothing here can enforce that.
+    ///
+    /// Two phases, and the split is the design. Queues, schedules, versions and **in-flight**
+    /// workflows (`PENDING`, `ENQUEUED`, `DELAYED`) move in one transaction, because a half-renamed
+    /// application dequeues work whose version row it can no longer see. Terminal workflows and
+    /// their steps then move in batches: they can be an entire history, and they scope only
+    /// observability and garbage collection, so they may lag without anything observing a
+    /// half-renamed state.
+    ///
+    /// Re-running after a failure resumes rather than restarting — every statement is an idempotent
+    /// re-own, and the batches are key ranges rather than offsets.
+    ///
+    /// `new_name` must satisfy [`types::is_valid_application_name`], and must differ from the name
+    /// being renamed.
+    async fn rename_application(
+        &self,
+        source: RenameFrom<'_>,
+        new_name: &str,
+        batching: RenameBatching,
+    ) -> Result<ApplicationRowCounts, Error>;
 
     /// Records that a step started a child workflow.
     ///

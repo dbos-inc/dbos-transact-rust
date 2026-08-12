@@ -6,8 +6,8 @@ use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Applications, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, Outcome, OutcomeWrite,
-    StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, WrittenBy,
+    RenameBatching, RenameFrom, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -4863,4 +4863,281 @@ async fn two_applications_cannot_both_claim_one_version() {
         owner.as_deref(),
         Some(if a.is_ok() { "alpha" } else { "beta" })
     );
+}
+
+/// Inserts a queue and a schedule directly, since 3.6 has not built their methods yet.
+async fn register_queue_and_schedule(pool: &sqlx::PgPool, suffix: &str, owner: Option<&str>) {
+    sqlx::query(r#"INSERT INTO "dbos"."queues" ("name", "application_name") VALUES ($1, $2)"#)
+        .bind(format!("queue-{suffix}"))
+        .bind(owner)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_schedules"
+           ("schedule_id", "schedule_name", "workflow_name", "schedule", "context", "application_name")
+           VALUES ($1, $2, 'nightly', '0 0 * * *', '{}', $3)"#,
+    )
+    .bind(format!("sched-id-{suffix}"))
+    .bind(format!("sched-{suffix}"))
+    .bind(owner)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn owner_of(pool: &sqlx::PgPool, table: &str, key_column: &str, key: &str) -> Option<String> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT "application_name" FROM "dbos"."{table}" WHERE "{key_column}" = $1"#
+    )))
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A rename re-owns every kind of row an application holds.
+#[tokio::test]
+async fn a_rename_moves_every_kind_of_row() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+
+    register_queue_and_schedule(&pool, "a", Some("alpha")).await;
+    alpha.create_application_version("v1", None).await.unwrap();
+
+    // One workflow still in flight and one finished, so both halves of the rename are exercised.
+    alpha
+        .init_workflow(&workflow("wf-running"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    alpha
+        .init_workflow(&workflow("wf-done"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    alpha
+        .record_step(
+            "wf-done",
+            0,
+            "a_step",
+            Outcome::Output(Some("\"x\"")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    alpha
+        .record_workflow_outcome("wf-done", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+
+    let counts = alpha
+        .rename_application(
+            RenameFrom::Application("alpha"),
+            "alpha-renamed",
+            RenameBatching::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        counts,
+        dbos::sysdb::types::ApplicationRowCounts {
+            queues: 1,
+            schedules: 1,
+            versions: 1,
+            workflows: 2, // one in-flight, one terminal
+            steps: 1,
+        },
+    );
+
+    for (table, key_column, key) in [
+        ("queues", "name", "queue-a"),
+        ("workflow_schedules", "schedule_name", "sched-a"),
+        ("application_versions", "version_name", "v1"),
+        ("workflow_status", "workflow_uuid", "wf-running"),
+        ("workflow_status", "workflow_uuid", "wf-done"),
+        ("operation_outputs", "workflow_uuid", "wf-done"),
+    ] {
+        assert_eq!(
+            owner_of(&pool, table, key_column, key).await.as_deref(),
+            Some("alpha-renamed"),
+            "{table}.{key} did not move",
+        );
+    }
+}
+
+/// Unclaimed rows move only when the source asks for them.
+///
+/// The one place in this feature where `IS NULL` does not ride along with an ownership predicate:
+/// an unclaimed row belongs to every application, so taking it from all of them is a decision.
+#[tokio::test]
+async fn a_rename_takes_unclaimed_rows_only_when_asked() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let alpha = named("alpha");
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    alpha
+        .init_workflow(&workflow("wf-alpha"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    anonymous
+        .init_workflow(&workflow("wf-nobody"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // Naming the application alone leaves the unclaimed workflow where it is.
+    let counts = alpha
+        .rename_application(
+            RenameFrom::Application("alpha"),
+            "alpha-two",
+            RenameBatching::Unbatched,
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.workflows, 1);
+    assert_eq!(
+        owner_of(&pool, "workflow_status", "workflow_uuid", "wf-nobody").await,
+        None,
+        "an unclaimed row is not swept up by a plain rename",
+    );
+
+    // Asking for them adopts it.
+    let counts = alpha
+        .rename_application(
+            RenameFrom::Unclaimed,
+            "alpha-two",
+            RenameBatching::Unbatched,
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.workflows, 1);
+    assert_eq!(
+        owner_of(&pool, "workflow_status", "workflow_uuid", "wf-nobody")
+            .await
+            .as_deref(),
+        Some("alpha-two"),
+    );
+}
+
+/// Batching moves every row, including the ones a watermark would otherwise skip.
+///
+/// The batch size is deliberately smaller than the workflow count, so the loop runs several
+/// passes and the half-open ranges have to tile the key space exactly. A gap loses rows silently.
+#[tokio::test]
+async fn a_batched_rename_loses_no_rows() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+
+    // Seven terminal workflows, each with two steps: enough for four passes at a batch of two,
+    // and enough steps per key to catch a batch that splits one workflow across two ranges.
+    for i in 0..7 {
+        let id = format!("wf-{i:02}");
+        alpha
+            .init_workflow(&workflow(&id), None, Submission::Fresh)
+            .await
+            .unwrap();
+        for step in 0..2 {
+            alpha
+                .record_step(
+                    &id,
+                    step,
+                    "a_step",
+                    Outcome::Output(Some("\"x\"")),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        alpha
+            .record_workflow_outcome(&id, Outcome::Output(Some("\"done\"")))
+            .await
+            .unwrap();
+    }
+
+    let counts = alpha
+        .rename_application(
+            RenameFrom::Application("alpha"),
+            "alpha-batched",
+            RenameBatching::Batched(2),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(counts.workflows, 7, "every workflow moved");
+    assert_eq!(counts.steps, 14, "every step moved");
+
+    let stragglers: i64 = sqlx::query_scalar(
+        r#"SELECT count(*) FROM "dbos"."workflow_status" WHERE "application_name" = 'alpha'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stragglers, 0, "no workflow was left behind by the batching");
+}
+
+/// A rename validates its target name and refuses a no-op.
+#[tokio::test]
+async fn a_rename_refuses_a_bad_target_name() {
+    let (sys, _db) = sysdb().await;
+
+    for bad in ["ab", "Has-Capitals", "has spaces", &"x".repeat(31)] {
+        let result = sys
+            .rename_application(
+                RenameFrom::Application("alpha"),
+                bad,
+                RenameBatching::Unbatched,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidInput {
+                    field: "new_name",
+                    ..
+                })
+            ),
+            "{bad:?} should be rejected, got {result:?}",
+        );
+    }
+
+    // Renaming an application to the name it already holds is a no-op worth refusing.
+    let result = sys
+        .rename_application(
+            RenameFrom::Application("alpha"),
+            "alpha",
+            RenameBatching::Unbatched,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::InvalidInput {
+            field: "new_name",
+            ..
+        })
+    ));
 }

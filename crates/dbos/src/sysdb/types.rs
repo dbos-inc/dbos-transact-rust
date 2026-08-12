@@ -1018,6 +1018,89 @@ pub struct WorkflowInitResult {
     pub should_execute: bool,
 }
 
+/// Whether a name is usable as an application name.
+///
+/// Three to thirty characters of lowercase letters, digits, dashes and underscores — the rule
+/// every implementation enforces, so a name registered by one is accepted by the others. The
+/// length is in bytes, which is the same as characters here because nothing outside ASCII passes.
+pub fn is_valid_application_name(name: &str) -> bool {
+    (3..=30).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Which rows a rename moves.
+///
+/// A sum type rather than a name plus an `adopt_unclaimed` flag. That pair admits four states and
+/// only three are valid requests: naming no application and not adopting unclaimed selects no rows
+/// at all. Python and TypeScript both reject that combination at runtime with
+/// *"Nothing to re-own"*.
+///
+/// **Unclaimed rows are never implied**, unlike everywhere else in this feature, where
+/// `IS NULL` rides along with every ownership predicate. An unclaimed row belongs to every
+/// application, so taking it away from all of them is a decision rather than a consequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameFrom<'a> {
+    /// Only what this application already holds.
+    Application(&'a str),
+    /// What this application holds, and the unclaimed rows with it.
+    ApplicationAndUnclaimed(&'a str),
+    /// Only the unclaimed rows — adopting work that no application owns.
+    Unclaimed,
+}
+
+impl<'a> RenameFrom<'a> {
+    /// The application being renamed, if the source names one.
+    pub fn application(self) -> Option<&'a str> {
+        match self {
+            RenameFrom::Application(name) | RenameFrom::ApplicationAndUnclaimed(name) => Some(name),
+            RenameFrom::Unclaimed => None,
+        }
+    }
+}
+
+/// The batch size every implementation defaults to.
+pub const DEFAULT_RENAME_BATCH_SIZE: u32 = 10_000;
+
+/// How a rename moves the rows that do not have to move atomically.
+///
+/// Only the terminal workflows and their steps are batched. Those can be an application's whole
+/// history, and they scope observability and garbage collection alone, so they may lag the rest of
+/// the rename without anything reading a half-renamed state.
+///
+/// The references say this with a nullable integer, where `None` reads as *unbatched* rather
+/// than as "unset": Python takes its default from the parameter's default value, and TypeScript
+/// separates `null` (unbatched) from `undefined` (absent, so the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameBatching {
+    /// One statement per table, however many rows match. Simplest, and fine for a short history.
+    Unbatched,
+    /// At most this many distinct workflow ids per statement.
+    Batched(u32),
+}
+
+impl Default for RenameBatching {
+    fn default() -> Self {
+        RenameBatching::Batched(DEFAULT_RENAME_BATCH_SIZE)
+    }
+}
+
+/// What a rename moved, by table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApplicationRowCounts {
+    /// Queue registrations.
+    pub queues: u64,
+    /// Schedule registrations.
+    pub schedules: u64,
+    /// Registered application versions.
+    pub versions: u64,
+    /// Workflows, in-flight and terminal together.
+    pub workflows: u64,
+    /// Recorded steps.
+    pub steps: u64,
+}
+
 /// A registered version of the application.
 ///
 /// The registry is what lets a firing schedule stamp the *latest* version, so only executors
