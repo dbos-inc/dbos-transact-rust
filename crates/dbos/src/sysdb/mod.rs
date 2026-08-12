@@ -49,10 +49,10 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    ApplicationRowCounts, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewWorkflow,
-    NotificationRecord, Outcome, OutcomeWrite, RenameBatching, RenameFrom, StepRecord, StepTiming,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
+    NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
+    RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission, Timestamp,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -582,6 +582,41 @@ pub trait SystemDatabase: Send + Sync {
         timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error>;
+
+    /// Registers a queue, reporting whether this call created it.
+    ///
+    /// `false` means the row was already there, whether or not [`OnExistingQueue`] changed it.
+    /// Callers use that to tell a first registration from a restart.
+    ///
+    /// **A name already held by another application is [`Error::RegisteredByAnother`] in either
+    /// mode.** A queue name addresses one row across every application sharing the database, so
+    /// taking it would redirect a peer's work; ownership moves only by
+    /// [`rename_application`](Self::rename_application).
+    async fn upsert_queue(
+        &self,
+        queue: &NewQueue<'_>,
+        on_existing: OnExistingQueue,
+    ) -> Result<bool, Error>;
+
+    /// Reads one queue by name, or `None` if it is not registered.
+    ///
+    /// Unscoped, like every read addressed by name: the caller has asked about that queue, and a
+    /// peer's is still the answer to the question.
+    async fn get_queue(&self, name: &str) -> Result<Option<QueueRecord>, Error>;
+
+    /// Reads the registered queues, scoped to the applications asked for.
+    ///
+    /// A search rather than an address, so [`Applications::Unset`] means this handle's own plus
+    /// the unclaimed ones — see [`types::Applications`].
+    async fn list_queues(&self, applications: &Applications<'_>)
+    -> Result<Vec<QueueRecord>, Error>;
+
+    /// Removes a queue from the registry.
+    ///
+    /// Only the registration. Workflows already enqueued keep their `queue_name` and are still
+    /// dequeued by an executor that knows the queue, because a queue is a declaration in code
+    /// first and a row second.
+    async fn delete_queue(&self, name: &str) -> Result<(), Error>;
 
     /// Gives `new_name` ownership of the rows a [`RenameFrom`] selects.
     ///

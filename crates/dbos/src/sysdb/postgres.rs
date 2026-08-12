@@ -70,10 +70,10 @@ use std::time::Duration;
 
 use super::types::{
     ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
-    NewWorkflow, NotificationRecord, Outcome, RenameBatching, RenameFrom, StepRecord, StepTiming,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, is_valid_application_name,
-    validate_attributes,
+    NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, RateLimit,
+    RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission, Timestamp,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
+    duration_from_ms, duration_from_secs, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -351,9 +351,9 @@ fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
 /// whole-table hash join. A watermark on the key column reads each row once.
 ///
 /// Two details carry the correctness. The bound is the `batch_size`-th **distinct** key, so a
-/// workflow's steps are never split across two batches. And the final pass — the one that finds no
-/// bound because fewer than a batch remains — **applies no bounds at all**, so rows that appeared
-/// below the watermark while the rename ran still move.
+/// workflow's steps are never split across two batches. And the final pass — the one that finds
+/// no bound because fewer than a batch remains — **applies no bounds at all**, so rows that
+/// appeared below the watermark while the rename ran still move.
 ///
 /// Every statement is an idempotent re-own, so a run that fails partway can simply be repeated.
 async fn rename_application_in_batches(
@@ -668,6 +668,53 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 
 /// Every column `version_from_row` reads.
+/// Every column of `queues` [`queue_from_row`] reads.
+const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
+     rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, \
+     application_name";
+
+fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
+    // The two periods are `DOUBLE PRECISION` seconds, not the integer milliseconds used
+    // elsewhere. A stored value that is negative, infinite or NaN is not a duration any caller
+    // can act on, so it is reported rather than clamped.
+    let period = |column: &str, value: Option<f64>| match value {
+        None => Ok(None),
+        Some(secs) => duration_from_secs(secs)
+            .map(Some)
+            .ok_or_else(|| Error::Malformed(format!("{column} is not a duration: {secs}"))),
+    };
+    Ok(QueueRecord {
+        name: row.try_get("name")?,
+        concurrency: row.try_get("concurrency")?,
+        worker_concurrency: row.try_get("worker_concurrency")?,
+        // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist,
+        // and no SDK can write it — all four reject an unpaired limit at their public surface.
+        // Read as *no limit* rather than reported, matching TypeScript
+        // (`wfqueue.ts:118`), so a hand-edited row does not make a peer and this
+        // implementation disagree about what the same queue is.
+        //
+        // TODO: raise with the DBOS team. Reading it away means a queue whose limit was half
+        // written runs unthrottled and says nothing, which is a silent safety failure rather
+        // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
+        // NULL))` in a future shared migration would make the question moot for everyone.
+        rate_limit: match (
+            row.try_get::<Option<i32>, _>("rate_limit_max")?,
+            period(
+                "rate_limit_period_sec",
+                row.try_get("rate_limit_period_sec")?,
+            )?,
+        ) {
+            (Some(limit), Some(period)) => Some(RateLimit { limit, period }),
+            _ => None,
+        },
+        priority_enabled: row.try_get("priority_enabled")?,
+        partition_queue: row.try_get("partition_queue")?,
+        polling_interval: period("polling_interval_sec", row.try_get("polling_interval_sec")?)?
+            .ok_or_else(|| Error::Malformed("polling_interval_sec is null".to_owned()))?,
+        application_name: row.try_get("application_name")?,
+    })
+}
+
 const VERSION_COLUMNS: &str =
     "version_id, version_name, version_timestamp, created_at, application_name";
 
@@ -693,6 +740,16 @@ const VERSION_COLUMNS: &str =
 /// application and this would return an arbitrary one, so it needs an `application_name` scope at
 /// that point — as do Python's and TypeScript's, which also read by name alone. Queue and
 /// schedule names have no such replacement.
+///
+/// TODO: raise per-application queue and schedule names with the DBOS team. Their global
+/// uniqueness means two applications sharing a system database cannot both register `orders`, so
+/// anyone sharing one needs an application prefix by convention because the schema will not
+/// disambiguate. Routing is not the obstacle — a dequeue is already scoped by `application_name`,
+/// so each would pick up only its own workflows — it is that the registry row *is* the shared
+/// configuration: one set of concurrency, rate and polling values per name. A
+/// `(application_name, name)` key mirroring 106 and 107 would settle it, but it is a larger change
+/// than the version one, because `workflow_status.queue_name` stores a bare string that would then
+/// no longer identify a queue on its own.
 async fn resolve_owning_application(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
@@ -3271,6 +3328,164 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Ok(())
             },
         )
+        .await
+    }
+
+    async fn upsert_queue(
+        &self,
+        queue: &NewQueue<'_>,
+        on_existing: OnExistingQueue,
+    ) -> Result<bool, Error> {
+        let table = self.tables.queues.as_str();
+        let pool = &self.pool;
+        let application_name = queue.application_name.or(self.application_name.as_deref());
+        // Ownership is claimed, never taken: `COALESCE` leaves a row that already has an owner
+        // alone, so a registration landing between the resolve below and this write keeps the
+        // name it took. The stored limits are a different matter — those the caller asked to
+        // replace.
+        let on_conflict = match on_existing {
+            OnExistingQueue::Update => format!(
+                "ON CONFLICT (name) DO UPDATE SET \
+                   concurrency = EXCLUDED.concurrency, \
+                   worker_concurrency = EXCLUDED.worker_concurrency, \
+                   rate_limit_max = EXCLUDED.rate_limit_max, \
+                   rate_limit_period_sec = EXCLUDED.rate_limit_period_sec, \
+                   priority_enabled = EXCLUDED.priority_enabled, \
+                   partition_queue = EXCLUDED.partition_queue, \
+                   polling_interval_sec = EXCLUDED.polling_interval_sec, \
+                   updated_at = EXCLUDED.updated_at, \
+                   application_name = COALESCE({table}.application_name, EXCLUDED.application_name)"
+            ),
+            OnExistingQueue::Leave => "ON CONFLICT (name) DO NOTHING".to_owned(),
+        };
+        let on_conflict = on_conflict.as_str();
+
+        with_retry(&self.retry, "upsert_queue", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // Asked before the write, because afterwards there is no way to tell a row this call
+            // created from one it found — both leave a row behind.
+            let existed: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT name FROM {table} WHERE name = $1"
+            )))
+            .bind(queue.name)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            // A peer holding the name is refused in either mode: the name is the queue's address,
+            // so registering over it would point this application at a peer's work.
+            let owner = resolve_owning_application(
+                &mut tx,
+                table,
+                "name",
+                queue.name,
+                application_name,
+                "Queue",
+            )
+            .await?;
+
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {table} \
+                 (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, \
+                  priority_enabled, partition_queue, polling_interval_sec, updated_at, \
+                  application_name) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) {on_conflict}"
+            )))
+            .bind(queue.name)
+            .bind(queue.concurrency)
+            .bind(queue.worker_concurrency)
+            .bind(queue.rate_limit.map(|r| r.limit))
+            .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
+            .bind(queue.priority_enabled)
+            .bind(queue.partition_queue)
+            .bind(queue.polling_interval.as_secs_f64())
+            .bind(Timestamp::now().as_epoch_ms())
+            .bind(owner.as_deref())
+            .execute(&mut *tx)
+            .await?;
+
+            // Read back, because both conflict clauses decline silently: neither says whether the
+            // row it found belongs to this application or to a peer that registered in between.
+            resolve_owning_application(
+                &mut tx,
+                table,
+                "name",
+                queue.name,
+                application_name,
+                "Queue",
+            )
+            .await?;
+
+            tx.commit().await?;
+            Ok(existed.is_none())
+        })
+        .await
+    }
+
+    async fn get_queue(&self, name: &str) -> Result<Option<QueueRecord>, Error> {
+        let table = self.tables.queues.as_str();
+        let pool = &self.pool;
+
+        with_retry(&self.retry, "get_queue", move || async move {
+            let row = sqlx::query(AssertSqlSafe(format!(
+                "SELECT {QUEUE_COLUMNS} FROM {table} WHERE name = $1"
+            )))
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+            row.as_ref().map(queue_from_row).transpose()
+        })
+        .await
+    }
+
+    async fn list_queues(
+        &self,
+        applications: &Applications<'_>,
+    ) -> Result<Vec<QueueRecord>, Error> {
+        let table = self.tables.queues.as_str();
+        let pool = &self.pool;
+        let application_name = self.application_name.as_deref();
+
+        with_retry(&self.retry, "list_queues", move || async move {
+            let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+            q.push(QUEUE_COLUMNS).push(" FROM ").push(table);
+            // A search, so an unset scope means this application's own plus the unclaimed.
+            match applications {
+                Applications::Any => {}
+                Applications::Named(names) if names.is_empty() => {}
+                Applications::Named(names) => {
+                    q.push(" WHERE (application_name = ANY(")
+                        .push_bind(&names[..])
+                        .push(") OR application_name IS NULL)");
+                }
+                Applications::Unset => {
+                    if let Some(name) = application_name {
+                        q.push(" WHERE (application_name = ")
+                            .push_bind(name)
+                            .push(" OR application_name IS NULL)");
+                    }
+                }
+            }
+            q.push(" ORDER BY name");
+            let rows = q.build().fetch_all(pool).await?;
+            rows.iter().map(queue_from_row).collect()
+        })
+        .await
+    }
+
+    async fn delete_queue(&self, name: &str) -> Result<(), Error> {
+        let table = self.tables.queues.as_str();
+        let pool = &self.pool;
+
+        with_retry(&self.retry, "delete_queue", move || async move {
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE name = $1"
+            )))
+            .bind(name)
+            .execute(pool)
+            .await?;
+            Ok(())
+        })
         .await
     }
 

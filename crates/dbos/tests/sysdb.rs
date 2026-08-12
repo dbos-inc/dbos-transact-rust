@@ -5,9 +5,9 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, Fork, ForkOptions, ForkPoint, Message, NewWorkflow, Outcome, OutcomeWrite,
-    RenameBatching, RenameFrom, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy,
+    Applications, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow, OnExistingQueue,
+    Outcome, OutcomeWrite, RateLimit, RenameBatching, RenameFrom, StepTiming, Submission,
+    Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -5140,4 +5140,251 @@ async fn a_rename_refuses_a_bad_target_name() {
             ..
         })
     ));
+}
+
+/// A queue round-trips through the registry, including both of its fractional-second periods.
+///
+/// `rate_limit_period_sec` and `polling_interval_sec` are `DOUBLE PRECISION` seconds where every
+/// other duration in the schema is integer milliseconds, so this checks the unit as much as the
+/// storage — a value that survived as `1` rather than `1.5` would pass a coarser assertion.
+#[tokio::test]
+async fn a_queue_round_trips_through_the_registry() {
+    let (sys, _db) = sysdb().await;
+
+    let queue = NewQueue {
+        concurrency: Some(8),
+        worker_concurrency: Some(2),
+        rate_limit: Some(RateLimit {
+            limit: 100,
+            period: std::time::Duration::from_millis(1_500),
+        }),
+        priority_enabled: true,
+        partition_queue: true,
+        polling_interval: std::time::Duration::from_millis(250),
+        ..NewQueue::new("orders")
+    };
+    assert!(
+        sys.upsert_queue(&queue, OnExistingQueue::Update)
+            .await
+            .unwrap(),
+        "the first registration creates the row",
+    );
+
+    let read = sys.get_queue("orders").await.unwrap().expect("registered");
+    assert_eq!(read.name, "orders");
+    assert_eq!(read.concurrency, Some(8));
+    assert_eq!(read.worker_concurrency, Some(2));
+    assert_eq!(
+        read.rate_limit,
+        Some(RateLimit {
+            limit: 100,
+            period: std::time::Duration::from_millis(1_500),
+        }),
+    );
+    assert!(read.priority_enabled);
+    assert!(read.partition_queue);
+    assert_eq!(read.polling_interval, std::time::Duration::from_millis(250));
+
+    assert!(sys.get_queue("no-such-queue").await.unwrap().is_none());
+}
+
+/// Re-registering reports that the queue already existed, and honours what to do with it.
+#[tokio::test]
+async fn re_registering_a_queue_reports_it_existed() {
+    let (sys, _db) = sysdb().await;
+
+    let first = NewQueue {
+        concurrency: Some(1),
+        ..NewQueue::new("orders")
+    };
+    assert!(
+        sys.upsert_queue(&first, OnExistingQueue::Update)
+            .await
+            .unwrap()
+    );
+
+    let second = NewQueue {
+        concurrency: Some(9),
+        ..NewQueue::new("orders")
+    };
+    assert!(
+        !sys.upsert_queue(&second, OnExistingQueue::Update)
+            .await
+            .unwrap(),
+        "the second registration finds the row already there",
+    );
+    assert_eq!(
+        sys.get_queue("orders").await.unwrap().unwrap().concurrency,
+        Some(9),
+        "Update overwrites the stored limits",
+    );
+
+    let third = NewQueue {
+        concurrency: Some(3),
+        ..NewQueue::new("orders")
+    };
+    assert!(
+        !sys.upsert_queue(&third, OnExistingQueue::Leave)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sys.get_queue("orders").await.unwrap().unwrap().concurrency,
+        Some(9),
+        "Leave keeps what is stored",
+    );
+}
+
+/// A queue name held by another application is refused, in either mode.
+///
+/// The name addresses one row across every application sharing the database, so registering over
+/// it would point this application at a peer's work. Ownership moves only by rename.
+#[tokio::test]
+async fn a_peers_queue_name_is_refused() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+
+    alpha
+        .upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    for mode in [OnExistingQueue::Update, OnExistingQueue::Leave] {
+        let result = beta.upsert_queue(&NewQueue::new("orders"), mode).await;
+        match result {
+            Err(Error::RegisteredByAnother {
+                kind,
+                ref holder,
+                ref claimant,
+                ..
+            }) => {
+                assert_eq!(kind, "Queue");
+                assert_eq!(holder, "alpha");
+                assert_eq!(claimant.as_deref(), Some("beta"));
+            }
+            other => panic!("{mode:?} should be refused, got {other:?}"),
+        }
+    }
+
+    // Alpha's own row is untouched, and alpha may still re-register it.
+    assert_eq!(
+        sys_owner(&pool, "orders").await.as_deref(),
+        Some("alpha"),
+        "a refused registration changes nothing",
+    );
+    alpha
+        .upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    // A nameless writer leaves the owner alone rather than clearing it.
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+    anonymous
+        .upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    assert_eq!(sys_owner(&pool, "orders").await.as_deref(), Some("alpha"));
+}
+
+async fn sys_owner(pool: &sqlx::PgPool, queue: &str) -> Option<String> {
+    sqlx::query_scalar(r#"SELECT "application_name" FROM "dbos"."queues" WHERE "name" = $1"#)
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Listing scopes to the caller's application; reading one by name does not.
+#[tokio::test]
+async fn listing_queues_scopes_but_reading_one_does_not() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    for (sys, name) in [
+        (&alpha, "alpha-queue"),
+        (&beta, "beta-queue"),
+        (&anonymous, "nobodys-queue"),
+    ] {
+        sys.upsert_queue(&NewQueue::new(name), OnExistingQueue::Update)
+            .await
+            .unwrap();
+    }
+
+    let names = |queues: Vec<dbos::sysdb::types::QueueRecord>| {
+        queues.into_iter().map(|q| q.name).collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        names(alpha.list_queues(&Applications::Unset).await.unwrap()),
+        ["alpha-queue", "nobodys-queue"],
+        "a search defaults to this application's own plus the unclaimed",
+    );
+    assert_eq!(
+        names(alpha.list_queues(&Applications::Any).await.unwrap()),
+        ["alpha-queue", "beta-queue", "nobodys-queue"],
+    );
+    assert_eq!(
+        names(
+            alpha
+                .list_queues(&Applications::Named(vec!["beta"]))
+                .await
+                .unwrap()
+        ),
+        ["beta-queue", "nobodys-queue"],
+    );
+
+    // Addressed by name, so alpha reads beta's queue rather than being told it does not exist.
+    assert_eq!(
+        alpha.get_queue("beta-queue").await.unwrap().unwrap().name,
+        "beta-queue",
+    );
+
+    // Deleting removes only the registration.
+    alpha.delete_queue("alpha-queue").await.unwrap();
+    assert!(alpha.get_queue("alpha-queue").await.unwrap().is_none());
+    // Deleting one that is not there is not an error.
+    alpha.delete_queue("alpha-queue").await.unwrap();
+}
+
+/// A queue carrying half a rate limit reads as having none, as TypeScript does.
+///
+/// The two columns are only meaningful together and no SDK can write one alone, so reaching this
+/// state takes direct SQL. Matching TypeScript matters more than reporting it: a peer reading the
+/// same row must not see a different queue. The safety cost — an unthrottled queue that says
+/// nothing — is recorded as a `TODO` on the reader.
+#[tokio::test]
+async fn half_a_rate_limit_reads_as_none() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+
+    sqlx::query(
+        r#"INSERT INTO "dbos"."queues" ("name", "rate_limit_max") VALUES ('half-limit', 10)"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let queue = sys.get_queue("half-limit").await.unwrap().expect("exists");
+    assert_eq!(queue.rate_limit, None);
 }

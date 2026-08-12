@@ -1101,6 +1101,102 @@ pub struct ApplicationRowCounts {
     pub steps: u64,
 }
 
+/// How many workflows a queue may start per window.
+///
+/// One value rather than two `Option`s, because the two columns behind it are only meaningful
+/// together: a limit with no window and a window with no limit are both unenforceable. Java draws
+/// the line in the same place, as `record RateLimit(int limit, Duration period)`.
+///
+/// The schema stores the pair as two nullable columns and cannot enforce that, so a row with one
+/// set and not the other is [`Error::Malformed`] on read — a state this type says cannot exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    /// Workflows that may start in each window.
+    pub limit: i32,
+    /// The window the starts are counted over.
+    pub period: Duration,
+}
+
+/// A queue as the registry holds it.
+///
+/// The registry exists so a queue's limits can be read and changed without the executor that
+/// declared it — a running deployment is not the only thing that knows what a queue is.
+///
+/// Both periods are `DOUBLE PRECISION` seconds in the schema rather than the integer
+/// milliseconds used elsewhere, which is the divergence the module documentation warns about;
+/// they are read through [`duration_from_secs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRecord {
+    /// The queue's name, which is its address across every application sharing the database.
+    pub name: String,
+    /// Workflows this queue may have running at once, across all executors. `None` is unlimited.
+    pub concurrency: Option<i32>,
+    /// Workflows one executor may have running at once. `None` is unlimited.
+    pub worker_concurrency: Option<i32>,
+    /// How fast workflows may start, or `None` for unthrottled.
+    pub rate_limit: Option<RateLimit>,
+    /// Whether dequeue order honours a workflow's priority.
+    pub priority_enabled: bool,
+    /// Whether the queue is partitioned, so a dequeue names the partition it wants.
+    pub partition_queue: bool,
+    /// How often an idle executor asks this queue for work.
+    pub polling_interval: Duration,
+    /// The application that owns the queue, or `None` if it is unclaimed.
+    pub application_name: Option<String>,
+}
+
+/// A queue to register, as the caller supplies it.
+///
+/// Borrowed and separate from [`QueueRecord`] for the reason [`NewWorkflow`] is separate from
+/// [`WorkflowRecord`]: registering does not require an owner, and the record always reports one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewQueue<'a> {
+    /// The queue's name.
+    pub name: &'a str,
+    /// See [`QueueRecord::concurrency`].
+    pub concurrency: Option<i32>,
+    /// See [`QueueRecord::worker_concurrency`].
+    pub worker_concurrency: Option<i32>,
+    /// See [`QueueRecord::rate_limit`].
+    pub rate_limit: Option<RateLimit>,
+    /// See [`QueueRecord::priority_enabled`].
+    pub priority_enabled: bool,
+    /// See [`QueueRecord::partition_queue`].
+    pub partition_queue: bool,
+    /// See [`QueueRecord::polling_interval`].
+    pub polling_interval: Duration,
+    /// The application to register the queue for; `None` means the writing handle's own.
+    pub application_name: Option<&'a str>,
+}
+
+impl<'a> NewQueue<'a> {
+    /// A queue with no limits, polling once a second — the defaults every implementation shares.
+    pub fn new(name: &'a str) -> Self {
+        Self {
+            name,
+            concurrency: None,
+            worker_concurrency: None,
+            rate_limit: None,
+            priority_enabled: false,
+            partition_queue: false,
+            polling_interval: Duration::from_secs(1),
+            application_name: None,
+        }
+    }
+}
+
+/// What registering a queue that already exists should do to it.
+///
+/// Never to its owner, which moves only by rename: a name already held by another application is
+/// [`Error::RegisteredByAnother`] in both cases, because the name is the queue's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnExistingQueue {
+    /// Overwrite the stored limits with the ones supplied.
+    Update,
+    /// Leave the stored row exactly as it is.
+    Leave,
+}
+
 /// A registered version of the application.
 ///
 /// The registry is what lets a firing schedule stamp the *latest* version, so only executors
