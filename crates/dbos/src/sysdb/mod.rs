@@ -57,10 +57,11 @@ use std::time::Duration;
 
 use types::{
     ApplicationRowCounts, Applications, Debounce, DebounceRequest, EventRecord, Fork, ForkOptions,
-    ForkPoint, Message, NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, StepRecord, StepTiming,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue,
+    Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRecord,
+    Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult,
+    WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -71,6 +72,15 @@ use types::{
 /// FFI boundary.
 ///
 /// Payloads cross as already-encoded strings; see [`types`].
+///
+/// The methods that must be atomic with the step recording them take a `caller: Option<(&str,
+/// i32)>` — a workflow id and step id — and own the transaction internally, rather than taking a
+/// caller's connection the way Python and TypeScript do.
+///
+/// TODO(dbos-team): UPSTREAM item 13, the shape itself. Threading a `PoolClient` or `sa.Connection` through the
+/// system database makes atomicity the call site's job to remember, and is the part that would not
+/// survive a language-neutral core — a host can pass two strings and an integer, not a connection.
+/// Nothing is broken either way; worth the team having seen it.
 #[async_trait]
 pub trait SystemDatabase: Send + Sync {
     /// Records a workflow, reconciling with any row already under that id.
@@ -708,7 +718,7 @@ pub trait SystemDatabase: Send + Sync {
     /// through to [`Debounce::Held`] instead, which describes the holder well enough for a caller
     /// to tell a collision from a coincidence.
     ///
-    /// TODO(dbos-team): no implementation matches all three. TypeScript matches the name and
+    /// TODO(dbos-team): UPSTREAM item 11. No implementation matches all three. TypeScript matches the name and
     /// class, Python the name alone, so a bounce for one configured instance can extend another's
     /// workflow and replace its inputs — even though Go's registry key is already
     /// `instanceQualifiedName(name, config_name)`. Propose adding the instance everywhere, and the
@@ -760,6 +770,208 @@ pub trait SystemDatabase: Send + Sync {
     /// dequeued by an executor that knows the queue, because a queue is a declaration in code
     /// first and a row second.
     async fn delete_queue(&self, name: &str) -> Result<(), Error>;
+
+    /// Registers a schedule, failing if the name is taken.
+    ///
+    /// [`Error::AlreadyRegistered`] when this application already holds the name, and
+    /// [`Error::RegisteredByAnother`] when a peer does — the same distinction queues draw, since
+    /// `schedule_name` is unique across every application sharing the database.
+    ///
+    /// The cron expression is stored, not parsed. Java validates it here and the other three do
+    /// not; validating belongs with the scheduler that has to interpret it, not with the layer
+    /// that only persists it.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together**, and a replay returns what the first run
+    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
+    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
+    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
+    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    async fn create_schedule(
+        &self,
+        schedule: &NewSchedule<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error>;
+
+    /// Registers a schedule, updating its definition if the name is already registered.
+    ///
+    /// What a redeployment calls. **Only the definition moves**; `schedule_id`, `status` and
+    /// `last_fired_at` are kept from the existing row, so re-applying an unchanged schedule is a
+    /// no-op and re-applying a changed one does not resume a schedule the operator paused or
+    /// forget where it had got to.
+    ///
+    /// An unclaimed row is claimed in the same statement, and a peer's is
+    /// [`Error::RegisteredByAnother`].
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it, with the same
+    /// meaning it has on [`create_schedule`](Self::create_schedule) — but on weaker precedent.
+    /// **No reference runs this as a step.** TypeScript has no counterpart at all: its upsert is
+    /// inlined in `applySchedules`, which takes no connection. Python's `upsert_schedule`
+    /// (`_sys_db.py:5761`) does take one, but only ever from `apply_schedules`, which is a plain
+    /// transaction rather than a step. The parameter is here because the signature is Python's and
+    /// a schedule registered from inside a workflow wants the same atomicity its siblings get, not
+    /// because a reference does it.
+    async fn upsert_schedule(
+        &self,
+        schedule: &NewSchedule<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error>;
+
+    /// Registers a whole set of schedules in one transaction.
+    ///
+    /// What a process calls at startup with everything it declares: either the registry matches
+    /// the deployment or none of it moved. Each entry is an [`upsert_schedule`](Self::upsert_schedule),
+    /// so the definitions land and the runtime state survives.
+    ///
+    /// **Runtime state is taken at face value**, not refused and not normalised: a `status` or
+    /// `last_fired_at` seeds a fresh row and is dropped by the conflict clause on an existing one,
+    /// so re-applying cannot resume a schedule an operator paused. Whether a *declaration* should
+    /// carry either is a question for whoever builds one — the references never ask it here,
+    /// because their public `applySchedules` takes a type with no such fields and the layer above
+    /// hardcodes both. Java normalises at this layer instead, forcing `ACTIVE` and a null
+    /// `lastFiredAt` onto every entry.
+    ///
+    /// **No step, unlike its siblings.** This is a startup call, made before the process runs any
+    /// workflow, and TypeScript's takes no connection and is not step-wrapped either. Python has
+    /// no method here at all — its `apply_schedules` is a loop over
+    /// [`upsert_schedule`](Self::upsert_schedule) one layer up (`_dbos.py:3119`).
+    async fn apply_schedules(&self, schedules: &[NewSchedule<'_>]) -> Result<(), Error>;
+
+    /// Reads one schedule, or `None` if there is no such name.
+    ///
+    /// Unscoped: a schedule name addresses a row across every application sharing the database,
+    /// so this is an identity read.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together**, and a replay returns what the first run
+    /// decided rather than reading again. TypeScript and Python get that atomicity by passing a
+    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
+    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
+    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    ///
+    /// A workflow that branches on a schedule must see the same schedule on replay, whatever an
+    /// operator changed in between, which is why a read records a step at all.
+    async fn get_schedule(
+        &self,
+        name: &str,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Option<ScheduleRecord>, Error>;
+
+    /// Reads the schedules matching a filter.
+    ///
+    /// A search, so [`ScheduleFilter::applications`] defaults to this handle's own plus the
+    /// unclaimed rather than to every application's.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together**, and a replay returns what the first run
+    /// decided rather than reading again. TypeScript and Python get that atomicity by passing a
+    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
+    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
+    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    async fn list_schedules(
+        &self,
+        filter: &ScheduleFilter<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Vec<ScheduleRecord>, Error>;
+
+    /// Changes a registered schedule's definition.
+    ///
+    /// [`Error::NotRegistered`] if the name matches nothing, including when the update itself is
+    /// empty — a typo should not read as success. TypeScript is explicit about both; the other
+    /// three have no such method.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together**, and a replay returns what the first run
+    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
+    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
+    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
+    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    async fn update_schedule(
+        &self,
+        name: &str,
+        update: &ScheduleUpdate<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error>;
+
+    /// Pauses or resumes a schedule.
+    ///
+    /// One method rather than the pair Python and Java expose, which are their two calls to
+    /// exactly this — TypeScript already collapses it the same way.
+    ///
+    /// [`Error::NotRegistered`] if the name matches nothing. **All four implementations are
+    /// silent here**, so pausing a schedule that does not exist reads as success in every one of
+    /// them. Raising is the recoverable direction: a layer above can swallow an error it does not
+    /// want, and no layer above can manufacture one this layer never raised.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 12. Propose checking the row count on the operator-facing
+    /// schedule writes everywhere, and leaving the loop-driven ones silent. TypeScript's `updateSchedule` is the
+    /// only method in any implementation that checks; the rest report a misspelled name as
+    /// success, which an operator cannot tell from a schedule that is now paused.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together**, and a replay returns what the first run
+    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
+    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
+    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
+    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    ///
+    /// Pausing and resuming record **different step names**, as they are different calls in the
+    /// references, so a replay of one is never mistaken for the other.
+    async fn set_schedule_status(
+        &self,
+        name: &str,
+        status: ScheduleStatus,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error>;
+
+    /// Records when a schedule last fired.
+    ///
+    /// Written by the scheduler after each firing, and read back to decide where a backfill
+    /// resumes. **Silent when the name matches nothing**, unlike the writes above: the scheduler
+    /// races an operator's delete, and a schedule removed between firing and this write is a
+    /// benign outcome rather than an error the loop has to absorb.
+    ///
+    /// The column is **text, not epoch milliseconds** — the one time column in the schema that
+    /// is — so this takes an instant and formats it, rather than taking a string and trusting the
+    /// caller to have picked a spelling the others read. Each implementation picked a different
+    /// one: Python `datetime.isoformat()`, TypeScript `Date.toISOString()`, Go `RFC3339Nano`,
+    /// Java `Instant.toString()`. [`Timestamp::to_iso8601`](types::Timestamp::to_iso8601) writes
+    /// TypeScript's, the only fixed-width one of the four.
+    ///
+    /// [`ScheduleRecord::last_fired_at`](types::ScheduleRecord::last_fired_at) is an instant too,
+    /// read through [`Timestamp::parse_iso8601`](types::Timestamp::parse_iso8601), which accepts
+    /// all four spellings. A stored value that is not an instant at all is
+    /// [`Error::Malformed`] rather than silently a schedule that never fired — the same treatment
+    /// an unrecognised status gets, since both mean the row holds something this build cannot
+    /// read.
+    ///
+    /// **No step, unlike its siblings**, and for the same reason it is silent about a missing row:
+    /// the scheduler loop writes this after every firing, and a loop is not a workflow step.
+    /// Neither TypeScript nor Python takes a connection here.
+    async fn update_schedule_last_fired_at(
+        &self,
+        name: &str,
+        last_fired_at: Timestamp,
+    ) -> Result<(), Error>;
+
+    /// Removes a schedule from the registry.
+    ///
+    /// Silent if the name matches nothing, as all four implementations are. Workflows the
+    /// schedule already fired are ordinary workflows and are untouched.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together**, and a replay returns what the first run
+    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
+    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
+    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
+    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error>;
 
     /// Gives `new_name` ownership of the rows a [`RenameFrom`] selects.
     ///

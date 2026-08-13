@@ -452,9 +452,11 @@ name = "dbos"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "serde",
  "serde_json",
  "sqlx",
  "testcontainers",
+ "time",
  "tokio",
  "tracing",
  "uuid",

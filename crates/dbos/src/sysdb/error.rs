@@ -112,6 +112,24 @@ pub enum Error {
         /// The limit it passed.
         limit: i64,
     },
+    /// A name is already registered by this same application.
+    ///
+    /// Distinct from [`Error::RegisteredByAnother`], which is a collision *between* applications
+    /// and cannot be resolved here. This one the caller can resolve: update the registration, or
+    /// register under a different name.
+    AlreadyRegistered {
+        /// What kind of thing it is, capitalised for a message: `"Schedule"`.
+        kind: &'static str,
+        /// The name already taken.
+        name: String,
+    },
+    /// A write addressed a name with no row behind it.
+    NotRegistered {
+        /// What kind of thing it is, capitalised for a message: `"Schedule"`.
+        kind: &'static str,
+        /// The name that matched nothing.
+        name: String,
+    },
     /// A named thing in the system database is already registered by another application.
     ///
     /// Queue, schedule and version names address a row across every application sharing the
@@ -192,6 +210,12 @@ impl std::fmt::Display for Error {
             ),
             // The remedy is in the message because there is no way to act on this from code:
             // whichever cause it is, a person has to choose a name or move the rows.
+            Error::AlreadyRegistered { kind, name } => {
+                write!(f, "{kind} {name:?} is already registered")
+            }
+            Error::NotRegistered { kind, name } => {
+                write!(f, "{kind} {name:?} is not registered")
+            }
             Error::RegisteredByAnother {
                 kind,
                 name,

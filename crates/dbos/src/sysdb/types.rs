@@ -16,18 +16,26 @@
 //! float in seconds. `workflow_deadline_epoch_ms` and `workflow_timeout_ms` sit next to each
 //! other, which is precisely the pair that gets swapped.
 //!
-//! Nothing here depends on a date library. `Duration` is in `std`, and [`Timestamp`] is a thin
-//! wrapper over the epoch milliseconds actually stored, so it converts exactly rather than
-//! through someone's calendar. Callers wanting a calendar type convert at their own edge.
+//! [`Timestamp`] is a thin wrapper over the epoch milliseconds actually stored, so it converts
+//! exactly rather than through someone's calendar, and `Duration` is in `std`. Callers wanting a
+//! calendar type convert at their own edge.
+//!
+//! One exception, and it is the schema's rather than a preference: `workflow_schedules.last_fired_at`
+//! holds ISO-8601 text, so a calendar is unavoidable for that column. `std` has none, so
+//! [`Timestamp::to_iso8601`] and [`Timestamp::parse_iso8601`] go through `time` — parsing and
+//! formatting only, with no timezone database, since the column is always UTC.
 
 use super::Error;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// An instant, as epoch milliseconds.
 ///
 /// Exactly what the columns hold, so reading and writing are lossless.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
@@ -104,6 +112,48 @@ impl Timestamp {
             .checked_sub(earlier.0)
             .and_then(|ms| u64::try_from(ms).ok())
             .map(Duration::from_millis)
+    }
+
+    /// Reads an ISO-8601 instant, or `None` if the text is not one.
+    ///
+    /// The inverse of [`to_iso8601`](Self::to_iso8601), and it has to read what the other four
+    /// implementations wrote: Python's `+00:00` offset, TypeScript's `.000Z`, Go's `RFC3339Nano`
+    /// and Java's bare `Z` all parse to the same instant, as does Conductor's explicit numeric
+    /// offset — which it writes rather than `Z` because `datetime.fromisoformat` rejects `Z`
+    /// before Python 3.11.
+    ///
+    /// Strict RFC 3339 otherwise: an offset is required and must carry its colon. That is
+    /// stricter than a hand-written reader would be tempted to make it, and it turns away nothing
+    /// any writer produces — Conductor's own reader is Go's `time.RFC3339`, which draws the line
+    /// in the same place.
+    ///
+    /// **Sub-millisecond precision is truncated**, since that is all [`Timestamp`] holds. Go
+    /// writes nanoseconds, so a schedule it fired can carry them; cron granularity is seconds, so
+    /// the digits being dropped cannot change a firing decision.
+    pub fn parse_iso8601(text: &str) -> Option<Self> {
+        let parsed = OffsetDateTime::parse(text, &Rfc3339).ok()?;
+        // Nanoseconds to milliseconds, flooring, so an instant before the epoch truncates towards
+        // the earlier millisecond rather than towards zero.
+        i64::try_from(parsed.unix_timestamp_nanos().div_euclid(1_000_000))
+            .ok()
+            .map(Self)
+    }
+
+    /// Formats as ISO-8601 in UTC: `2026-08-12T14:30:00.123Z`, or `2026-08-12T14:30:00Z` on a
+    /// whole second.
+    ///
+    /// For [`workflow_schedules.last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at),
+    /// the one column in the schema holding a formatted instant rather than epoch milliseconds.
+    /// This is Go's and Java's spelling of the four; every implementation's reader accepts it.
+    ///
+    /// Infallible in practice and `String` rather than `Result` because of it: the only way
+    /// `time` refuses to format is a year outside its range, which is four orders of magnitude
+    /// further out than any millisecond an `i64` can hold.
+    pub fn to_iso8601(self) -> String {
+        OffsetDateTime::from_unix_timestamp_nanos(i128::from(self.0) * 1_000_000)
+            .ok()
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -498,6 +548,93 @@ impl<'a> NewWorkflow<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The millisecond conversion either side of `time`, which is the part this crate owns.
+    #[test]
+    fn an_instant_formats_as_iso8601() {
+        let iso = |ms| Timestamp::from_epoch_ms(ms).to_iso8601();
+
+        assert_eq!(iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso(1_786_492_800_000), "2026-08-12T00:00:00Z");
+        // A fraction appears only when there is one, which is Go's and Java's spelling.
+        assert_eq!(iso(1_786_492_800_123), "2026-08-12T00:00:00.123Z");
+        // Before the epoch the millisecond floors rather than truncating towards zero, which is
+        // the direction `i128::div_euclid` is chosen for.
+        assert_eq!(iso(-1), "1969-12-31T23:59:59.999Z");
+        assert_eq!(iso(-86_400_000), "1969-12-31T00:00:00Z");
+    }
+
+    /// The four spellings the other implementations write all read back as the same instant.
+    #[test]
+    fn an_iso8601_instant_parses_from_every_implementations_format() {
+        let parse = Timestamp::parse_iso8601;
+        let expected = Some(Timestamp::from_epoch_ms(1_786_492_800_000));
+
+        assert_eq!(parse("2026-08-12T00:00:00.000Z"), expected, "TypeScript");
+        assert_eq!(parse("2026-08-12T00:00:00Z"), expected, "Go and Java");
+        assert_eq!(parse("2026-08-12T00:00:00+00:00"), expected, "Python");
+        assert_eq!(
+            parse("2026-08-12T00:00:00.000000000Z"),
+            expected,
+            "RFC3339Nano"
+        );
+        // An offset is applied rather than ignored, in either direction.
+        assert_eq!(parse("2026-08-12T01:30:00+01:30"), expected);
+        assert_eq!(parse("2026-08-11T19:00:00-05:00"), expected);
+
+        // Conductor formats with an explicit numeric offset rather than `Z`, deliberately:
+        // `datetime.fromisoformat` rejects `Z` before Python 3.11 and dbos-transact-py supports
+        // 3.10 (`services/conductor/openmetrics.go`, layout `2006-01-02T15:04:05.999-07:00`).
+        // Its fraction is elided on a whole second, so both of these reach a reader.
+        assert_eq!(parse("2026-08-12T00:00:00+00:00"), expected);
+        assert_eq!(
+            parse("2026-08-12T00:00:00.123+00:00"),
+            Some(Timestamp::from_epoch_ms(1_786_492_800_123))
+        );
+
+        // Sub-millisecond digits truncate rather than round, and a short fraction pads.
+        let ms = |t: Option<Timestamp>| t.unwrap().as_epoch_ms() % 1_000;
+        assert_eq!(ms(parse("2026-08-12T00:00:00.5Z")), 500);
+        assert_eq!(ms(parse("2026-08-12T00:00:00.123999Z")), 123);
+
+        // Strict RFC 3339: the offset is required and carries its colon. Neither rejection is
+        // reachable from a writer — Python's `isoformat` always emits the colon, and Conductor's
+        // layout spells the offset `-07:00` — and Conductor's own reader is Go's `time.RFC3339`,
+        // which rejects exactly the same two. Accepting them would be this crate inventing
+        // leniency nobody asked for.
+        for bad in [
+            "",
+            "2026-08-12",
+            "2026-08-12T00:00",
+            "not-a-date-at-all",
+            "2026-13-01T00:00:00Z",
+            "2026-08-12T24:00:00Z",
+            "2026-08-12T00:00:00",
+            "2026-08-12T00:00:00+0130",
+        ] {
+            assert_eq!(parse(bad), None, "{bad:?} is not an instant this reads");
+        }
+    }
+
+    /// Formatting and parsing are inverses, which is what makes the column round-trip.
+    #[test]
+    fn an_iso8601_instant_round_trips() {
+        for ms in [
+            0,
+            -1,
+            1_786_492_800_000,
+            1_709_209_845_123,
+            951_827_445_999,
+            -2_203_977_600_000,
+        ] {
+            let instant = Timestamp::from_epoch_ms(ms);
+            assert_eq!(
+                Timestamp::parse_iso8601(&instant.to_iso8601()),
+                Some(instant),
+                "{ms} did not survive the round trip"
+            );
+        }
+    }
 
     /// Instants and durations do not mix, which is the point of separating them.
     #[test]
@@ -1298,8 +1435,18 @@ impl DebounceRequest<'_> {
 ///
 /// Three outcomes rather than the flat record the references return: their `DebounceResult`
 /// carries `bounced_workflow_id` alongside a run of `holder_*` fields, of which exactly one group
-/// is ever populated. Reading it means checking which.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// is ever populated. Reading it means checking which — and a stored one means *guessing* which,
+/// since nothing in the shape rules out both groups being set at once. Named states cannot encode
+/// that, so the ambiguity is gone rather than resolved by convention.
+///
+/// **The serialized form is this implementation's own, and it is this type's derive.** A step is
+/// only ever replayed by the SDK that wrote it — workflows cross languages by enqueue alone — so
+/// the encoding is recorded in the `serialization` column rather than agreed between
+/// implementations. Python's default is `py_pickle`, base64-encoded pickle, and it is the *user's*
+/// configurable serializer at that: there is no common wire form to conform to. The consequence is
+/// that renaming a variant or field here changes what a replay expects to read, so a rename wants
+/// the same care a schema change does.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Debounce {
     /// The existing delayed workflow was extended, and its inputs replaced.
     Bounced {
@@ -1321,7 +1468,7 @@ pub enum Debounce {
 /// configured instances of one class), a holder that is **not debounced** is an ordinary
 /// deduplicated enqueue, and a **different application** means the collision is across
 /// applications sharing the database.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DebounceHolder {
     /// The workflow holding the key.
     pub workflow_id: String,
@@ -1697,4 +1844,183 @@ pub enum WrittenBy {
     /// records nothing of its own — a step that reruns rewrites its stream entries, which is
     /// what makes the step the thing being replayed.
     Step,
+}
+
+/// Whether a schedule fires.
+///
+/// Two states in every implementation. Pausing does not delete the row or forget
+/// [`ScheduleRecord::last_fired_at`], so resuming picks up where it left off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ScheduleStatus {
+    /// Firing on its cron expression.
+    Active,
+    /// Registered but not firing.
+    Paused,
+}
+
+impl ScheduleStatus {
+    /// The stored spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScheduleStatus::Active => "ACTIVE",
+            ScheduleStatus::Paused => "PAUSED",
+        }
+    }
+
+    /// Parses a stored value, for the reason [`WorkflowStatus::parse`] returns an option.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "ACTIVE" => ScheduleStatus::Active,
+            "PAUSED" => ScheduleStatus::Paused,
+            _ => return None,
+        })
+    }
+}
+
+/// A registered schedule, as stored.
+///
+/// The row carries both a *definition* — the cron expression, the workflow it fires, its context
+/// and queue — and *runtime state*: the status and when it last fired. Which half a write may
+/// touch is the distinction the update methods are built around, so a redeployment that re-applies
+/// an unchanged definition does not restart a schedule or forget where it had got to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScheduleRecord {
+    /// Generated identity, distinct from the name. Preserved across re-registration.
+    pub schedule_id: String,
+    /// The schedule's name, which is its address — unique across the whole table.
+    pub schedule_name: String,
+    /// The registered function the schedule fires.
+    pub workflow_name: String,
+    /// The class that function belongs to, for class-bound workflows.
+    pub workflow_class_name: Option<String>,
+    /// The cron expression, uninterpreted. This layer stores it and never parses it.
+    pub schedule: String,
+    /// Whether the schedule fires.
+    pub status: ScheduleStatus,
+    /// The encoded context handed to each firing, opaque here as every payload is.
+    pub context: String,
+    /// When the schedule last fired.
+    ///
+    /// Stored as ISO-8601 text rather than the epoch milliseconds every other time column holds,
+    /// and read back through [`Timestamp::parse_iso8601`] so a caller gets an instant either way.
+    /// The four implementations write four spellings of it — see
+    /// [`SystemDatabase::update_schedule_last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at).
+    pub last_fired_at: Option<Timestamp>,
+    /// Whether missed firings are made up when a paused or stopped schedule resumes.
+    pub automatic_backfill: bool,
+    /// The timezone the cron expression is read in, or `None` for UTC.
+    pub cron_timezone: Option<String>,
+    /// The queue firings are enqueued onto, or `None` for [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    pub queue_name: Option<String>,
+    /// The application that owns the schedule, or `None` if it is unclaimed.
+    pub application_name: Option<String>,
+}
+
+/// A schedule to register, as the caller supplies it.
+///
+/// Borrowed and separate from [`ScheduleRecord`] for the reason [`NewQueue`] is separate from
+/// [`QueueRecord`]: registering does not require an owner, and the record always reports one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSchedule<'a> {
+    /// See [`ScheduleRecord::schedule_id`]. `None` generates one.
+    ///
+    /// All four implementations end up with a generated UUID; they differ only in which layer
+    /// generates it. Java's DAO does, as this does. TypeScript and Python generate one layer
+    /// higher, at every call site that registers a schedule, and hand this layer a value it must
+    /// take. That is the same split `application_name` has, and it resolves the same way: the
+    /// fallback lives here because nothing sits above this layer yet, and becomes a second line
+    /// of defence rather than the only one once Phase 2's registration layer does.
+    pub schedule_id: Option<&'a str>,
+    /// See [`ScheduleRecord::schedule_name`].
+    pub schedule_name: &'a str,
+    /// See [`ScheduleRecord::workflow_name`].
+    pub workflow_name: &'a str,
+    /// See [`ScheduleRecord::workflow_class_name`].
+    pub workflow_class_name: Option<&'a str>,
+    /// See [`ScheduleRecord::schedule`].
+    pub schedule: &'a str,
+    /// See [`ScheduleRecord::status`].
+    pub status: ScheduleStatus,
+    /// See [`ScheduleRecord::context`].
+    pub context: &'a str,
+    /// See [`ScheduleRecord::last_fired_at`]. Only used on a fresh insert: the upsert's conflict
+    /// clause keeps the stored value, so re-registering a schedule cannot rewind it.
+    pub last_fired_at: Option<Timestamp>,
+    /// See [`ScheduleRecord::automatic_backfill`].
+    pub automatic_backfill: bool,
+    /// See [`ScheduleRecord::cron_timezone`].
+    pub cron_timezone: Option<&'a str>,
+    /// See [`ScheduleRecord::queue_name`].
+    pub queue_name: Option<&'a str>,
+    /// The application to register the schedule for; `None` means the writing handle's own.
+    pub application_name: Option<&'a str>,
+}
+
+impl<'a> NewSchedule<'a> {
+    /// An active schedule with no context, firing the named workflow on the given expression.
+    pub fn new(schedule_name: &'a str, workflow_name: &'a str, schedule: &'a str) -> Self {
+        Self {
+            schedule_id: None,
+            schedule_name,
+            workflow_name,
+            workflow_class_name: None,
+            schedule,
+            status: ScheduleStatus::Active,
+            context: "null",
+            last_fired_at: None,
+            automatic_backfill: false,
+            cron_timezone: None,
+            queue_name: None,
+            application_name: None,
+        }
+    }
+}
+
+/// The fields of a registered schedule that a partial update may change.
+///
+/// **Definition only.** The identity, the status and the last firing are runtime state, moved by
+/// their own methods, so re-applying a definition cannot silently restart a schedule or forget
+/// where it had got to. TypeScript draws the same line and says so in a comment; this makes it
+/// unrepresentable instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleUpdate<'a> {
+    /// See [`ScheduleRecord::schedule`].
+    pub schedule: Change<&'a str>,
+    /// See [`ScheduleRecord::context`].
+    pub context: Change<&'a str>,
+    /// See [`ScheduleRecord::automatic_backfill`].
+    pub automatic_backfill: Change<bool>,
+    /// See [`ScheduleRecord::cron_timezone`].
+    pub cron_timezone: Change<Option<&'a str>>,
+    /// See [`ScheduleRecord::queue_name`].
+    pub queue_name: Change<Option<&'a str>>,
+}
+
+impl ScheduleUpdate<'_> {
+    /// Whether this would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.schedule.is_leave()
+            && self.context.is_leave()
+            && self.automatic_backfill.is_leave()
+            && self.cron_timezone.is_leave()
+            && self.queue_name.is_leave()
+    }
+}
+
+/// Which schedules a listing returns.
+///
+/// Every field narrows; an empty filter returns the table. `applications` takes the
+/// *observability* form — unset means the reading handle's own plus the unclaimed — because this
+/// is a search rather than an addressed read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleFilter<'a> {
+    /// Only these statuses, or every status when empty.
+    pub statuses: Vec<ScheduleStatus>,
+    /// Only schedules firing these workflows, or every workflow when empty.
+    pub workflow_names: Vec<&'a str>,
+    /// Only schedules whose name starts with one of these, or every name when empty.
+    pub schedule_name_prefixes: Vec<&'a str>,
+    /// Which applications' schedules to return.
+    pub applications: Applications<'a>,
 }

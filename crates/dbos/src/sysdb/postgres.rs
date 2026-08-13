@@ -70,9 +70,10 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    ApplicationRowCounts, Applications, Debounce, DebounceHolder, DebounceRequest, EventRecord,
-    Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow, NotificationRecord,
-    OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
+    ApplicationRowCounts, Applications, Change, Debounce, DebounceHolder, DebounceRequest,
+    EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow,
+    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
+    RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate,
     StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
     WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
     duration_from_secs, is_valid_application_name, validate_attributes,
@@ -145,6 +146,11 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// Prefixes rather than exact codes, deliberately. The first version of the migration runner's
 /// classifier listed codes and was wrong twice; matching the class the standard defines is what
 /// stopped that.
+///
+/// TODO(dbos-team): UPSTREAM item 8. Classifying by class prefix means a *protocol* violation
+/// lands in whichever class it happens to carry rather than being called permanent, so some are
+/// retried. Worth checking whether the other implementations' classifiers have the same property —
+/// they classify by code lists, which have the opposite failure mode.
 fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     if let Some(code) = sqlstate {
         return match &code[..2.min(code.len())] {
@@ -347,6 +353,192 @@ fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
 }
 
 impl PostgresSystemDatabase {
+    /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
+    ///
+    /// The shape every system-database call needs when it must be atomic with the step recording
+    /// it: **check, run, record**. Python's `call_txn_as_step` (`_sys_db.py:6407`) and
+    /// TypeScript's `runTransactionalStep` (`system_database.ts:1430`) are the same three steps
+    /// around a caller's connection; this one owns the transaction instead.
+    ///
+    /// - **Already recorded** — the stored output is decoded and returned.
+    /// - **Succeeds** — the result and the checkpoint commit together, so no crash can leave one
+    ///   without the other.
+    /// - **Fails** — the transaction rolls back and nothing is recorded, so a replay runs the
+    ///   work again. Both references do this, and recording the failure instead would be worse
+    ///   than it sounds: a step written from a dropped connection would freeze a transient outage
+    ///   into a permanent answer for that workflow.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 14. That last point is a real asymmetry, not a detail. An *ordinary* step's
+    /// failure is recorded and replayed as the same failure in both references; only these
+    /// internal ones drop it, so a replay can take a different branch from the run it is
+    /// replaying — create fails with "already exists", an operator deletes the schedule, and the
+    /// replay succeeds. Worth deciding whether that is intended, and documenting it either way.
+    ///
+    /// Without a `caller` this is just the work on its own transaction: no step is checked and
+    /// none is written.
+    ///
+    /// `work` takes the transaction by value and hands it back, rather than borrowing it. A
+    /// borrowing closure cannot promise its future is `Send`, which every caller needs behind
+    /// `#[async_trait]` — the same constraint [`with_retry`] documents.
+    async fn run_transactional_step<T, F, Fut>(
+        &self,
+        caller: Option<(&str, i32)>,
+        step_name: &str,
+        timing: StepTiming,
+        work: F,
+    ) -> Result<T, Error>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        F: Fn(sqlx::Transaction<'static, sqlx::Postgres>) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<(sqlx::Transaction<'static, sqlx::Postgres>, T), Error>> + Send,
+    {
+        let mut tx = self.pool.begin().await?;
+
+        if let Some((workflow_id, step_id)) = caller
+            && let Some(step) = self
+                .check_step_on(&mut tx, workflow_id, step_id, step_name)
+                .await?
+        {
+            tx.commit().await?;
+            tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
+            // Only a success is ever recorded here, so a step carrying an error is a row this
+            // path did not write. Python asserts the same thing at its own replay
+            // (`_sys_db.py:6420`); reporting beats asserting, but the expectation is identical.
+            //
+            // A void method reaches here too, and does not trip this: `()` serialises to the
+            // four-character string `null`, so the column holds a value rather than SQL NULL.
+            // Whether a step ran is answered by the row existing, never by its output being
+            // empty — which is also why `Option<T>` returns round-trip correctly, a recorded
+            // `None` and an absent step being the same JSON and different answers.
+            let recorded = step.output.as_deref().ok_or_else(|| {
+                Error::Malformed(format!(
+                    "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
+                ))
+            })?;
+            return serde_json::from_str(recorded).map_err(|e| {
+                Error::Malformed(format!(
+                    "workflow {workflow_id} step {step_id} ({step_name}) has an output this \
+                     build cannot read: {e}"
+                ))
+            });
+        }
+
+        // A failure rolls the transaction back and records nothing, so the replay runs the work
+        // again. Both references do exactly this — Python's `with self.engine.begin()`
+        // (`_sys_db.py:6415`) and TypeScript's `catch { ROLLBACK; throw }` (`system_database.ts:1461`)
+        // — and the alternative is worse than it sounds: a step recorded from a dropped connection
+        // freezes a transient outage into a permanent answer for that workflow.
+        let (mut tx, value) = work(tx).await?;
+
+        if let Some((workflow_id, step_id)) = caller {
+            // `serde_json` only fails here on a type that cannot be JSON — a non-string map key,
+            // a NaN — and every payload this takes is a plain record.
+            let recorded = serde_json::to_string(&value)
+                .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
+            self.record_step_on(
+                &mut tx,
+                workflow_id,
+                step_id,
+                step_name,
+                Outcome::Output(Some(&recorded)),
+                Some(PORTABLE_JSON),
+                Some(timing),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(value)
+    }
+
+    /// [`upsert_schedule`](SystemDatabase::upsert_schedule) against a caller's transaction.
+    ///
+    /// Shared with [`apply_schedules`](SystemDatabase::apply_schedules), which differs only in
+    /// how many run under one commit.
+    ///
+    /// Takes a `Transaction` rather than the `&mut PgConnection` its neighbours take, because
+    /// this is three statements that have to be one: the resolve, the write, and the read-back
+    /// that says whether the write claimed anything. A connection would let them interleave.
+    ///
+    /// `schedule_id` is a parameter and the application name is not, though both have a field on
+    /// [`NewSchedule`] that falls back. The id's fallback generates a UUID, so a caller has to
+    /// generate it once outside its retry loop or a second attempt would insert under a fresh id.
+    /// The name's fallback is the handle's own, which this can read for itself.
+    async fn upsert_schedule_on(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        schedule: &NewSchedule<'_>,
+        schedule_id: &str,
+    ) -> Result<(), Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let application_name = schedule
+            .application_name
+            .or(self.application_name.as_deref());
+        // Asked before the write, because a peer's name has to be refused rather than merged into.
+        let owner = resolve_owning_application(
+            tx,
+            schedules_table,
+            "schedule_name",
+            schedule.schedule_name,
+            application_name,
+            "Schedule",
+        )
+        .await?;
+
+        // The conflict clause is the whole design: the definition columns take the new values, and
+        // `schedule_id`, `status` and `last_fired_at` are absent, so they keep the stored ones. A
+        // redeployment therefore cannot resume a paused schedule or forget where it had got to.
+        //
+        // Ownership is claimed, never taken: `COALESCE` leaves an owned row alone, so a registration
+        // landing between the resolve above and this write keeps the name it took.
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {schedules_table} \
+             (schedule_id, schedule_name, workflow_name, workflow_class_name, schedule, status, \
+              context, last_fired_at, automatic_backfill, cron_timezone, queue_name, \
+              application_name) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+             ON CONFLICT (schedule_name) DO UPDATE SET \
+               workflow_name = EXCLUDED.workflow_name, \
+               workflow_class_name = EXCLUDED.workflow_class_name, \
+               schedule = EXCLUDED.schedule, \
+               context = EXCLUDED.context, \
+               automatic_backfill = EXCLUDED.automatic_backfill, \
+               cron_timezone = EXCLUDED.cron_timezone, \
+               queue_name = EXCLUDED.queue_name, \
+               application_name = COALESCE({schedules_table}.application_name, \
+                                           EXCLUDED.application_name)"
+        )))
+        .bind(schedule_id)
+        .bind(schedule.schedule_name)
+        .bind(schedule.workflow_name)
+        .bind(schedule.workflow_class_name)
+        .bind(schedule.schedule)
+        .bind(schedule.status.as_str())
+        .bind(schedule.context)
+        .bind(schedule.last_fired_at.map(Timestamp::to_iso8601))
+        .bind(schedule.automatic_backfill)
+        .bind(schedule.cron_timezone)
+        .bind(schedule.queue_name)
+        .bind(owner.as_deref())
+        .execute(&mut **tx)
+        .await?;
+
+        // Read back, since the `COALESCE` above declines to claim without saying why.
+        resolve_owning_application(
+            tx,
+            schedules_table,
+            "schedule_name",
+            schedule.schedule_name,
+            application_name,
+            "Schedule",
+        )
+        .await?;
+        tracing::debug!(
+            schedule_name = schedule.schedule_name,
+            "registered or updated a schedule"
+        );
+        Ok(())
+    }
+
     /// Whether `application_version` is the newest this application has registered.
     ///
     /// **True when nothing is registered**, which is what lets a database that has never seen a
@@ -385,33 +577,6 @@ fn version_predicate(is_latest: bool, param: usize) -> String {
     } else {
         format!("application_version = ${param}")
     }
-}
-
-/// Records a debounce's outcome as its caller's step, inside the caller's transaction.
-///
-/// Nothing to do when no workflow is bouncing — a client debouncing directly has no step to
-/// checkpoint against.
-async fn record_debounce_step(
-    db: &PostgresSystemDatabase,
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    caller: Option<(&str, i32)>,
-    outcome: &Debounce,
-    timing: StepTiming,
-) -> Result<(), Error> {
-    let Some((workflow_id, step_id)) = caller else {
-        return Ok(());
-    };
-    let recorded = encode_debounce(outcome);
-    db.record_step_on(
-        tx,
-        workflow_id,
-        step_id,
-        DEBOUNCE_STEP_NAME,
-        Outcome::Output(Some(&recorded)),
-        Some(PORTABLE_JSON),
-        Some(timing),
-    )
-    .await
 }
 
 /// The tables this backend addresses, quoted and schema-qualified.
@@ -627,79 +792,84 @@ const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 /// only crosses one by enqueue, so this is a convention rather than a wire format.
 const DEBOUNCE_STEP_NAME: &str = "DBOS.debounceDelayedWorkflow";
 
-/// Encodes a debounce outcome for the step's `output` column.
-///
-/// **This format is this implementation's own.** A step is only ever replayed by the SDK that
-/// wrote it — workflows cross languages by enqueue alone — so the encoding is recorded in the
-/// `serialization` column rather than agreed between implementations. Python's default is
-/// `py_pickle`, base64-encoded pickle, and it is the *user's* configurable serializer at that:
-/// there is no common wire form to conform to.
-///
-/// The field names still follow the references' `DebounceResult` — nullable fields where exactly
-/// one group is populated — because a shape someone can recognise beats one invented here. The
-/// instance is ours: no reference carries it, for the reason recorded on the trait method.
-/// [`Debounce`] is the same information with the states named instead of implied.
-fn encode_debounce(outcome: &Debounce) -> String {
-    let (bounced, holder) = match outcome {
-        Debounce::Bounced { workflow_id } => (Some(workflow_id.as_str()), None),
-        Debounce::Held(holder) => (None, Some(holder)),
-        Debounce::Unheld => (None, None),
-    };
-    serde_json::json!({
-        "bounced_workflow_id": bounced,
-        "holder_workflow_id": holder.map(|h| h.workflow_id.as_str()),
-        "holder_is_debounced": holder.is_some_and(|h| h.is_debounced),
-        "holder_workflow_name": holder.and_then(|h| h.workflow_name.as_deref()),
-        "holder_workflow_class_name": holder.and_then(|h| h.class_name.as_deref()),
-        "holder_workflow_config_name": holder.and_then(|h| h.config_name.as_deref()),
-        "holder_application_name": holder.and_then(|h| h.application_name.as_deref()),
-    })
-    .to_string()
-}
-
-/// Reads back what [`encode_debounce`] wrote, so a replay reports the first run's decision.
-///
-/// A value this cannot parse means the column holds something this build does not understand,
-/// which is what [`Error::Malformed`] is for — the same treatment a sleep's wake time gets.
-fn decode_debounce(
-    output: Option<&str>,
-    workflow_id: &str,
-    step_id: i32,
-) -> Result<Debounce, Error> {
-    let malformed = |detail: &str| {
-        Error::Malformed(format!(
-            "workflow {workflow_id} step {step_id} is a debounce whose output {detail}"
-        ))
-    };
-    let recorded = output.ok_or_else(|| malformed("is missing"))?;
-    let value: serde_json::Value =
-        serde_json::from_str(recorded).map_err(|e| malformed(&format!("is not JSON: {e}")))?;
-    let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
-
-    if let Some(workflow_id) = text("bounced_workflow_id") {
-        return Ok(Debounce::Bounced { workflow_id });
-    }
-    match text("holder_workflow_id") {
-        None => Ok(Debounce::Unheld),
-        Some(workflow_id) => Ok(Debounce::Held(DebounceHolder {
-            workflow_id,
-            is_debounced: value
-                .get("holder_is_debounced")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            workflow_name: text("holder_workflow_name"),
-            class_name: text("holder_workflow_class_name"),
-            config_name: text("holder_workflow_config_name"),
-            application_name: text("holder_application_name"),
-        })),
-    }
-}
-
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
      rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, \
      application_name";
+
+/// Every column of a schedule row, in the order [`schedule_from_row`] reads them.
+const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
+     schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name, \
+     application_name";
+
+/// The step names the schedule methods record, which a replay compares against.
+///
+/// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause
+/// and resume are two names there because they are two API calls; they reach one method here, so
+/// the name follows the status being set rather than the method being called.
+///
+/// **`DBOS.upsertSchedule` is the exception**: TypeScript has no such method — its upsert is
+/// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is this
+/// crate's, camelCased from Python's by analogy with the seven that are verbatim.
+const CREATE_SCHEDULE_STEP_NAME: &str = "DBOS.createSchedule";
+const UPSERT_SCHEDULE_STEP_NAME: &str = "DBOS.upsertSchedule";
+const GET_SCHEDULE_STEP_NAME: &str = "DBOS.getSchedule";
+const LIST_SCHEDULES_STEP_NAME: &str = "DBOS.listSchedules";
+const UPDATE_SCHEDULE_STEP_NAME: &str = "DBOS.updateSchedule";
+const PAUSE_SCHEDULE_STEP_NAME: &str = "DBOS.pauseSchedule";
+const RESUME_SCHEDULE_STEP_NAME: &str = "DBOS.resumeSchedule";
+const DELETE_SCHEDULE_STEP_NAME: &str = "DBOS.deleteSchedule";
+
+/// Escapes the wildcards in a `LIKE` prefix so the caller's string matches itself.
+///
+/// A schedule name containing `%` or `_` is an ordinary name, not a pattern. The backslash is
+/// escaped first, or escaping the wildcards would introduce pairs this then re-reads.
+///
+/// No `ESCAPE` clause accompanies this: backslash is already `LIKE`'s default escape character in
+/// both backends, and spelling it out would mean a `'\\'` literal in the statement — which is one
+/// character or two depending on `standard_conforming_strings`, and with it off swallows the
+/// closing quote and makes the statement a syntax error. The pattern itself is bound, so its
+/// backslashes are data and never go through literal parsing at all.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn schedule_from_row(row: &sqlx::postgres::PgRow) -> Result<ScheduleRecord, Error> {
+    let stored: String = row.try_get("status")?;
+    let status = ScheduleStatus::parse(&stored).ok_or_else(|| {
+        Error::Malformed(format!(
+            "schedule status {stored:?} is not one this build knows"
+        ))
+    })?;
+    let stored: Option<String> = row.try_get("last_fired_at")?;
+    let last_fired_at = stored
+        .map(|stored| {
+            Timestamp::parse_iso8601(&stored).ok_or_else(|| {
+                Error::Malformed(format!(
+                    "last_fired_at {stored:?} is not an ISO-8601 instant"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(ScheduleRecord {
+        schedule_id: row.try_get("schedule_id")?,
+        schedule_name: row.try_get("schedule_name")?,
+        workflow_name: row.try_get("workflow_name")?,
+        workflow_class_name: row.try_get("workflow_class_name")?,
+        schedule: row.try_get("schedule")?,
+        status,
+        context: row.try_get("context")?,
+        last_fired_at,
+        automatic_backfill: row.try_get("automatic_backfill")?,
+        cron_timezone: row.try_get("cron_timezone")?,
+        queue_name: row.try_get("queue_name")?,
+        application_name: row.try_get("application_name")?,
+    })
+}
 
 fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
     // The two periods are `DOUBLE PRECISION` seconds, not the integer milliseconds used
@@ -721,7 +891,7 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
         // (`wfqueue.ts:118`), so a hand-edited row does not make a peer and this
         // implementation disagree about what the same queue is.
         //
-        // TODO: raise with the DBOS team. Reading it away means a queue whose limit was half
+        // TODO(dbos-team): UPSTREAM item 4. Reading it away means a queue whose limit was half
         // written runs unthrottled and says nothing, which is a silent safety failure rather
         // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
         // NULL))` in a future shared migration would make the question moot for everyone.
@@ -769,7 +939,7 @@ const VERSION_COLUMNS: &str =
 /// that point — as do Python's and TypeScript's, which also read by name alone. Queue and
 /// schedule names have no such replacement.
 ///
-/// TODO: raise per-application queue and schedule names with the DBOS team. Their global
+/// TODO(dbos-team): UPSTREAM item 9, per-application queue and schedule names. Their global
 /// uniqueness means two applications sharing a system database cannot both register `orders`, so
 /// anyone sharing one needs an application prefix by convention because the schema will not
 /// disambiguate. Routing is not the obstacle — a dequeue is already scoped by `application_name`,
@@ -778,6 +948,20 @@ const VERSION_COLUMNS: &str =
 /// `(application_name, name)` key mirroring 106 and 107 would settle it, but it is a larger change
 /// than the version one, because `workflow_status.queue_name` stores a bare string that would then
 /// no longer identify a queue on its own.
+///
+/// TODO(dbos-team): UPSTREAM item 1. This read is exact only while the name is globally unique.
+/// Migrations 106 and 107 exist to replace `application_versions`' `UNIQUE (version_name)` with
+/// per-application keys, and when the old constraint is finally dropped a name may exist once per
+/// application — so this returns an arbitrary matching row and a claimant is non-deterministically
+/// refused or allowed. Python's `_resolve_row_owner` and TypeScript's `#resolveRowOwner` read by
+/// name alone too, so the drop migration wants an `application_name IS NOT DISTINCT FROM` scope on
+/// this read in all three, agreed before anyone writes the drop.
+///
+/// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED —
+/// the default in all of them — a registrar can claim the row in between. The write is
+/// self-guarding, so it matches zero rows rather than landing on the wrong one, but the caller is
+/// told `Ok`: an operator can believe a version rollback took effect when it did not. A
+/// `SELECT … FOR UPDATE` here would settle it, or reporting rows-affected to the caller.
 async fn resolve_owning_application(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
@@ -1134,7 +1318,7 @@ impl PostgresSystemDatabase {
     {
         let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
-        // TODO: revisit clearing `started_at_epoch_ms` here — raise upstream, since all four
+        // TODO(dbos-team): UPSTREAM item 6, clearing `started_at_epoch_ms` here. All four
         // implementations do it identically (`system_database.go:1910`, `system_database.ts:1536`,
         // `_sys_db.py:1062`) and none of them explain it.
         //
@@ -1579,7 +1763,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // reason migration 7 exists — `executor_id` defaults to `"local"` and collides
             // between processes on one machine.
             //
-            // TODO: raise this divergence with the DBOS team before v1. No implementation does
+            // TODO(dbos-team): UPSTREAM item 10, to settle before v1. No implementation does
             // exactly what the `CASE` does, and the 2–2 split is weaker than it looks: Java and
             // TypeScript are the same code (identical `shouldCommit` flag, identical comment),
             // and Go's commit is entangled with its enqueue path, which must commit regardless.
@@ -1652,6 +1836,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.is_debounced)
             // Both Python and TypeScript apply the application name fallback a layer up, in the
             // executor and the client. It is here so that this layer can stand alone.
+            //
+            // TODO(dbos-team): UPSTREAM item 3, which asks for nothing beyond awareness. Rows come
+            // out identical either way, since no upstream path arrives unfilled — but a reviewer
+            // comparing implementations should not read the extra fallback as a behavioural
+            // difference. It becomes a redundant second line of defence when Phase 2's executor
+            // lands, which is a reason to keep it rather than remove it.
             .bind(
                 workflow
                     .application_name
@@ -3606,7 +3796,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // select nothing and report an empty partition, which reads as "no work" rather than as
         // the mistake it is.
         //
-        // TODO: settle this with the whole DBOS team — all four implementations differ, and no
+        // TODO(dbos-team): UPSTREAM item 5 — all four implementations differ, and no
         // two arrived at their answer the same way. Go guards every partition clause with
         // `len(input.QueuePartitionKey) > 0`, so empty *is* its absent value. Java normalises it
         // (`QueuesDAO.java:36`, `if (partitionKey != null && partitionKey.isEmpty())
@@ -3720,7 +3910,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
             let version_predicate = version_predicate(is_latest, 3);
 
-            // TODO: raise `SKIP LOCKED` on CockroachDB with the wider DBOS team.
+            // TODO(dbos-team): UPSTREAM item 7, `SKIP LOCKED` on CockroachDB.
             //
             // CockroachDB resolves write intents *asynchronously* after a commit, and
             // `SKIP LOCKED` skips a row whose intent is still unresolved rather than waiting for
@@ -3742,8 +3932,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // team's to make rather than this port's. The tests read rows back before asserting
             // an exact dequeue; see `settle` in the integration tests.
             //
-            // TODO: `SKIP LOCKED` under-delivers on CockroachDB — settle with the wider DBOS
-            // team before changing it.
+            // TODO(dbos-team): UPSTREAM item 7. `SKIP LOCKED` under-delivers on CockroachDB;
+            // settle before changing it.
             //
             // CockroachDB resolves write intents asynchronously after a commit, and `SKIP LOCKED`
             // skips a row whose intent is still unresolved rather than waiting. A workflow
@@ -3861,8 +4051,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // recursion below, which have to agree: an anchor that started from a different
         // population than the step continued through would skip or repeat partitions silently.
         let eligible_predicate = "queue_name = $1 AND status = 'ENQUEUED' \
-                        AND ($2::text IS NULL OR application_name = $2 \
-                             OR application_name IS NULL)";
+                                  AND ($2::text IS NULL OR application_name = $2 \
+                                       OR application_name IS NULL)";
 
         with_retry(&self.retry, "get_queue_partitions", move || async move {
             // A loose index scan, not `SELECT DISTINCT`. Neither backend can skip to the next
@@ -3934,8 +4124,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // shared predicate all three of its uses must agree on — see
                 // `get_queue_partitions`.
                 let eligible_predicate = "queue_name = $1 AND status = 'ENQUEUED' \
-                                AND ($2::text IS NULL OR application_name = $2 \
-                                     OR application_name IS NULL)";
+                                          AND ($2::text IS NULL OR application_name = $2 \
+                                               OR application_name IS NULL)";
 
                 // The same loose index scan `get_queue_partitions` uses, then one head per
                 // partition. `workflow_uuid` breaks ties in the head order so every worker ranks
@@ -3999,7 +4189,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                             OR application_name IS NULL)"
                 );
 
-                // TODO: this `SKIP LOCKED` under-delivers on CockroachDB for the reason given
+                // TODO(dbos-team): UPSTREAM item 7. This `SKIP LOCKED` under-delivers on CockroachDB
+                // for the reason given
                 // on `start_queued_workflows` — a head enqueued moments ago is skipped and its
                 // partition idles until the next sweep. **Recommendation: plain `FOR UPDATE` on
                 // CockroachDB**, applied here as well as there. Settle with the wider DBOS team
@@ -4217,7 +4408,6 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<Debounce, Error> {
         request.validate()?;
         let workflow_table = self.tables.workflow_status.as_str();
-        let pool = &self.pool;
         let application_name = request
             .application_name
             .or(self.application_name.as_deref());
@@ -4233,120 +4423,113 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "debounce_delayed_workflow",
             move || async move {
-                let mut tx = pool.begin().await?;
+                // A replay reports what the first run decided, which the wrapper handles: bouncing
+                // again would push a delay the first run already pushed, against a workflow that
+                // may since have started.
+                self.run_transactional_step(
+                    caller,
+                    DEBOUNCE_STEP_NAME,
+                    timing,
+                    |mut tx| async move {
+                        // The cap is what stops a steady stream of requests postponing the workflow
+                        // forever: past the deadline, the delay stops moving. `CASE` rather than the
+                        // `LEAST` this backend has, so the statement stays diffable against the four
+                        // references, which all spell the cap out this way.
+                        //
+                        // `is_debounced` and the workflow's identity are both in the guard. Without the
+                        // identity, two unrelated workflows whose keys happen to concatenate the same way
+                        // — or two configured instances of one class — would overwrite each other's
+                        // inputs; without `is_debounced`, an ordinary deduplicated enqueue would be
+                        // silently rescheduled.
+                        //
+                        // `application_name` is claimed for the target the way its dequeue would: left
+                        // unclaimed, every peer coalesces onto the one workflow and the last inputs win.
+                        //
+                        // These stay Rust comments. A `\` continuation strips the newline, so a `--`
+                        // comment inside the string would comment out the rest of the statement.
+                        let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                            "UPDATE {workflow_table} \
+                             SET delay_until_epoch_ms = CASE \
+                                     WHEN debounce_deadline_epoch_ms IS NOT NULL \
+                                      AND debounce_deadline_epoch_ms < $4 \
+                                     THEN debounce_deadline_epoch_ms \
+                                     ELSE $4 \
+                                 END, \
+                                 inputs = $5, serialization = $6, updated_at = $7, \
+                                 application_name = COALESCE(application_name, $8) \
+                             WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
+                               AND class_name IS NOT DISTINCT FROM $9 \
+                               AND config_name IS NOT DISTINCT FROM $10 \
+                               AND status = 'DELAYED' AND is_debounced = TRUE \
+                               AND ($8::text IS NULL OR application_name = $8 \
+                                    OR application_name IS NULL) \
+                             RETURNING workflow_uuid"
+                        )))
+                        .bind(request.workflow_name)
+                        .bind(request.queue_name)
+                        .bind(request.deduplication_id)
+                        .bind(request.delay_until.as_epoch_ms())
+                        .bind(request.inputs)
+                        .bind(request.serialization)
+                        .bind(Timestamp::now().as_epoch_ms())
+                        .bind(application_name)
+                        // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL the
+                        // enqueue stored rather than matching nothing, as `=` would.
+                        .bind(request.class_name)
+                        .bind(request.config_name)
+                        .fetch_optional(&mut *tx)
+                        .await?;
 
-                // A replay reports what the first run decided. Bouncing again would push a delay
-                // the first run already pushed, against a workflow that may since have started.
-                if let Some((workflow_id, step_id)) = caller
-                    && let Some(step) = self
-                        .check_step_on(&mut tx, workflow_id, step_id, DEBOUNCE_STEP_NAME)
-                        .await?
-                {
-                    tracing::debug!(workflow_id, step_id, "replaying debounce");
-                    tx.commit().await?;
-                    return decode_debounce(step.output.as_deref(), workflow_id, step_id);
-                }
+                        if let Some(workflow_id) = bounced {
+                            return Ok((tx, Debounce::Bounced { workflow_id }));
+                        }
 
-                // The cap is what stops a steady stream of requests postponing the workflow
-                // forever: past the deadline, the delay stops moving. `CASE` rather than the
-                // `LEAST` this backend has, so the statement stays diffable against the four
-                // references, which all spell the cap out this way.
-                //
-                // `is_debounced` and the workflow's identity are both in the guard. Without the
-                // identity, two unrelated workflows whose keys happen to concatenate the same way
-                // — or two configured instances of one class — would overwrite each other's
-                // inputs; without `is_debounced`, an ordinary deduplicated enqueue would be
-                // silently rescheduled.
-                //
-                // `application_name` is claimed for the target the way its dequeue would: left
-                // unclaimed, every peer coalesces onto the one workflow and the last inputs win.
-                //
-                // These stay Rust comments. A `\` continuation strips the newline, so a `--`
-                // comment inside the string would comment out the rest of the statement.
-                let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} \
-                     SET delay_until_epoch_ms = CASE \
-                             WHEN debounce_deadline_epoch_ms IS NOT NULL \
-                              AND debounce_deadline_epoch_ms < $4 \
-                             THEN debounce_deadline_epoch_ms \
-                             ELSE $4 \
-                         END, \
-                         inputs = $5, serialization = $6, updated_at = $7, \
-                         application_name = COALESCE(application_name, $8) \
-                     WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
-                       AND class_name IS NOT DISTINCT FROM $9 \
-                       AND config_name IS NOT DISTINCT FROM $10 \
-                       AND status = 'DELAYED' AND is_debounced = TRUE \
-                       AND ($8::text IS NULL OR application_name = $8 \
-                            OR application_name IS NULL) \
-                     RETURNING workflow_uuid"
-                )))
-                .bind(request.workflow_name)
-                .bind(request.queue_name)
-                .bind(request.deduplication_id)
-                .bind(request.delay_until.as_epoch_ms())
-                .bind(request.inputs)
-                .bind(request.serialization)
-                .bind(Timestamp::now().as_epoch_ms())
-                .bind(application_name)
-                // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL the
-                // enqueue stored rather than matching nothing, as `=` would.
-                .bind(request.class_name)
-                .bind(request.config_name)
-                .fetch_optional(&mut *tx)
-                .await?;
+                        // Deliberately unscoped: whatever blocked the update above is what the caller needs
+                        // described, and a peer's workflow is the most useful case to be able to name.
+                        type HolderRow = (
+                            String,
+                            bool,
+                            Option<String>,
+                            Option<String>,
+                            Option<String>,
+                            Option<String>,
+                        );
+                        let holder: Option<HolderRow> = sqlx::query_as(AssertSqlSafe(format!(
+                            "SELECT workflow_uuid, is_debounced, name, class_name, config_name, \
+                                    application_name \
+                             FROM {workflow_table} \
+                             WHERE queue_name = $1 AND deduplication_id = $2"
+                        )))
+                        .bind(request.queue_name)
+                        .bind(request.deduplication_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
 
-                if let Some(workflow_id) = bounced {
-                    let outcome = Debounce::Bounced { workflow_id };
-                    record_debounce_step(self, &mut tx, caller, &outcome, timing).await?;
-                    tx.commit().await?;
-                    return Ok(outcome);
-                }
-
-                // Deliberately unscoped: whatever blocked the update above is what the caller needs
-                // described, and a peer's workflow is the most useful case to be able to name.
-                type HolderRow = (
-                    String,
-                    bool,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                );
-                let holder: Option<HolderRow> = sqlx::query_as(AssertSqlSafe(format!(
-                    "SELECT workflow_uuid, is_debounced, name, class_name, config_name, \
-                            application_name \
-                     FROM {workflow_table} \
-                     WHERE queue_name = $1 AND deduplication_id = $2"
-                )))
-                .bind(request.queue_name)
-                .bind(request.deduplication_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                let outcome = match holder {
-                    None => Debounce::Unheld,
-                    Some((
-                        workflow_id,
-                        is_debounced,
-                        workflow_name,
-                        class_name,
-                        config_name,
-                        application_name,
-                    )) => Debounce::Held(DebounceHolder {
-                        workflow_id,
-                        is_debounced,
-                        workflow_name,
-                        class_name,
-                        config_name,
-                        application_name,
-                    }),
-                };
-                // Recorded even when nothing bounced: the step consumed its id either way, and a
-                // replay that re-ran it would report a holder that has since changed.
-                record_debounce_step(self, &mut tx, caller, &outcome, timing).await?;
-                tx.commit().await?;
-                Ok(outcome)
+                        let outcome = match holder {
+                            None => Debounce::Unheld,
+                            Some((
+                                workflow_id,
+                                is_debounced,
+                                workflow_name,
+                                class_name,
+                                config_name,
+                                application_name,
+                            )) => Debounce::Held(DebounceHolder {
+                                workflow_id,
+                                is_debounced,
+                                workflow_name,
+                                class_name,
+                                config_name,
+                                application_name,
+                            }),
+                        };
+                        // Returned even when nothing bounced, so the wrapper records it: the step
+                        // consumed its id either way, and a replay that re-ran it would report a holder
+                        // that has since changed.
+                        Ok((tx, outcome))
+                    },
+                )
+                .await
             },
         )
         .await
@@ -4364,6 +4547,442 @@ impl SystemDatabase for PostgresSystemDatabase {
             .execute(pool)
             .await?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn create_schedule(
+        &self,
+        schedule: &NewSchedule<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let application_name = schedule
+            .application_name
+            .or(self.application_name.as_deref());
+        // Generated once, outside the retry: a retry after a lost commit acknowledgement must
+        // find its own row rather than insert a second one under a fresh id.
+        let schedule_id = schedule
+            .schedule_id
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+        let schedule_id = schedule_id.as_str();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "create_schedule", move || async move {
+            self.run_transactional_step(
+                caller,
+                CREATE_SCHEDULE_STEP_NAME,
+                timing,
+                |mut tx| async move {
+                    // A peer holding the name is a collision this layer cannot resolve; this
+                    // application holding it is one the caller can, so the two are different errors.
+                    let owner = resolve_owning_application(
+                        &mut tx,
+                        schedules_table,
+                        "schedule_name",
+                        schedule.schedule_name,
+                        application_name,
+                        "Schedule",
+                    )
+                    .await?;
+
+                    // A plain insert, as all four references issue: the unique index refuses a name
+                    // already taken, and there is nothing to do afterwards but say which index it
+                    // was. Python and TypeScript catch the violation and report the name; the
+                    // constraint tells us whether the id collided instead, which they cannot.
+                    let inserted = sqlx::query(AssertSqlSafe(format!(
+                        "INSERT INTO {schedules_table} \
+                         (schedule_id, schedule_name, workflow_name, workflow_class_name, \
+                          schedule, status, context, last_fired_at, automatic_backfill, \
+                          cron_timezone, queue_name, application_name) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
+                    )))
+                    .bind(schedule_id)
+                    .bind(schedule.schedule_name)
+                    .bind(schedule.workflow_name)
+                    .bind(schedule.workflow_class_name)
+                    .bind(schedule.schedule)
+                    .bind(schedule.status.as_str())
+                    .bind(schedule.context)
+                    .bind(schedule.last_fired_at.map(Timestamp::to_iso8601))
+                    .bind(schedule.automatic_backfill)
+                    .bind(schedule.cron_timezone)
+                    .bind(schedule.queue_name)
+                    .bind(owner.as_deref())
+                    .execute(&mut *tx)
+                    .await;
+
+                    match inserted {
+                        Ok(_) => {
+                            tracing::debug!(
+                                schedule_name = schedule.schedule_name,
+                                schedule_id,
+                                "registered a schedule"
+                            );
+                            Ok((tx, ()))
+                        }
+                        Err(error) if is_unique_violation(&error) => {
+                            let kind = match error.as_database_error().and_then(|e| e.constraint())
+                            {
+                                Some(c) if c.ends_with("_pkey") => "Schedule id",
+                                _ => "Schedule",
+                            };
+                            Err(Error::AlreadyRegistered {
+                                kind,
+                                name: match kind {
+                                    "Schedule id" => schedule_id.to_owned(),
+                                    _ => schedule.schedule_name.to_owned(),
+                                },
+                            })
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn upsert_schedule(
+        &self,
+        schedule: &NewSchedule<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error> {
+        let schedule_id = schedule
+            .schedule_id
+            .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+        let schedule_id = schedule_id.as_str();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "upsert_schedule", move || async move {
+            self.run_transactional_step(
+                caller,
+                UPSERT_SCHEDULE_STEP_NAME,
+                timing,
+                |mut tx| async move {
+                    self.upsert_schedule_on(&mut tx, schedule, schedule_id)
+                        .await?;
+                    Ok((tx, ()))
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn get_schedule(
+        &self,
+        name: &str,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Option<ScheduleRecord>, Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "get_schedule", move || async move {
+            // A read is a step too: a workflow that branches on a schedule has to see the same
+            // schedule on replay, whatever an operator changed in between.
+            self.run_transactional_step(
+                caller,
+                GET_SCHEDULE_STEP_NAME,
+                timing,
+                |mut tx| async move {
+                    let row = sqlx::query(AssertSqlSafe(format!(
+                        "SELECT {SCHEDULE_COLUMNS} FROM {schedules_table} WHERE schedule_name = $1"
+                    )))
+                    .bind(name)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let schedule = row.as_ref().map(schedule_from_row).transpose()?;
+                    Ok((tx, schedule))
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn apply_schedules(&self, schedules: &[NewSchedule<'_>]) -> Result<(), Error> {
+        let pool = &self.pool;
+        // Identities for the rows this call may create, generated once for the same reason
+        // `create_schedule` generates its one outside the retry.
+        let ids: Vec<String> = schedules
+            .iter()
+            .map(|s| {
+                s.schedule_id
+                    .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned)
+            })
+            .collect();
+        let ids = ids.as_slice();
+
+        with_retry(&self.retry, "apply_schedules", move || async move {
+            let mut tx = pool.begin().await?;
+            for (schedule, schedule_id) in schedules.iter().zip(ids) {
+                self.upsert_schedule_on(&mut tx, schedule, schedule_id)
+                    .await?;
+            }
+            tx.commit().await?;
+            tracing::debug!(count = schedules.len(), "applied schedules");
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list_schedules(
+        &self,
+        filter: &ScheduleFilter<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Vec<ScheduleRecord>, Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let application_name = self.application_name.as_deref();
+        let statuses: Vec<&str> = filter.statuses.iter().map(|s| s.as_str()).collect();
+        let statuses = statuses.as_slice();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "list_schedules", move || async move {
+            self.run_transactional_step(
+                caller,
+                LIST_SCHEDULES_STEP_NAME,
+                timing,
+                |mut tx| async move {
+                    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+                    q.push(SCHEDULE_COLUMNS)
+                        .push(" FROM ")
+                        .push(schedules_table)
+                        .push(" WHERE TRUE");
+                    if !statuses.is_empty() {
+                        q.push(" AND status = ANY(").push_bind(statuses).push(")");
+                    }
+                    if !filter.workflow_names.is_empty() {
+                        q.push(" AND workflow_name = ANY(")
+                            .push_bind(&filter.workflow_names[..])
+                            .push(")");
+                    }
+                    // A prefix match, so the pattern is built rather than bound whole: the
+                    // caller's string is data, and `%` or `_` inside it must match itself.
+                    if !filter.schedule_name_prefixes.is_empty() {
+                        q.push(" AND (");
+                        for (i, prefix) in filter.schedule_name_prefixes.iter().enumerate() {
+                            if i > 0 {
+                                q.push(" OR ");
+                            }
+                            q.push("schedule_name LIKE ")
+                                .push_bind(format!("{}%", escape_like(prefix)));
+                        }
+                        q.push(")");
+                    }
+                    // A search, so an unset scope means this application's own plus the unclaimed.
+                    match &filter.applications {
+                        Applications::Any => {}
+                        Applications::Named(names) if names.is_empty() => {}
+                        Applications::Named(names) => {
+                            q.push(" AND (application_name = ANY(")
+                                .push_bind(&names[..])
+                                .push(") OR application_name IS NULL)");
+                        }
+                        Applications::Unset => {
+                            if let Some(name) = application_name {
+                                q.push(" AND (application_name = ")
+                                    .push_bind(name)
+                                    .push(" OR application_name IS NULL)");
+                            }
+                        }
+                    }
+                    q.push(" ORDER BY schedule_name");
+                    let rows = q.build().fetch_all(&mut *tx).await?;
+                    let schedules: Vec<ScheduleRecord> = rows
+                        .iter()
+                        .map(schedule_from_row)
+                        .collect::<Result<_, _>>()?;
+                    Ok((tx, schedules))
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn update_schedule(
+        &self,
+        name: &str,
+        update: &ScheduleUpdate<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "update_schedule", move || async move {
+            self.run_transactional_step(
+                caller,
+                UPDATE_SCHEDULE_STEP_NAME,
+                timing,
+                |mut tx| async move {
+                    // An empty update still has to say whether the schedule exists, so it becomes
+                    // a read rather than an early return: silence would report a typo as success.
+                    let changed = if update.is_empty() {
+                        sqlx::query_scalar::<_, i32>(AssertSqlSafe(format!(
+                            "SELECT 1 FROM {schedules_table} WHERE schedule_name = $1"
+                        )))
+                        .bind(name)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .is_some()
+                    } else {
+                        let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE ");
+                        q.push(schedules_table).push(" SET ");
+                        let mut separated = q.separated(", ");
+                        if let Change::Set(schedule) = update.schedule {
+                            separated
+                                .push("schedule = ")
+                                .push_bind_unseparated(schedule);
+                        }
+                        if let Change::Set(context) = update.context {
+                            separated.push("context = ").push_bind_unseparated(context);
+                        }
+                        if let Change::Set(backfill) = update.automatic_backfill {
+                            separated
+                                .push("automatic_backfill = ")
+                                .push_bind_unseparated(backfill);
+                        }
+                        if let Change::Set(timezone) = update.cron_timezone {
+                            separated
+                                .push("cron_timezone = ")
+                                .push_bind_unseparated(timezone);
+                        }
+                        if let Change::Set(queue_name) = update.queue_name {
+                            separated
+                                .push("queue_name = ")
+                                .push_bind_unseparated(queue_name);
+                        }
+                        q.push(" WHERE schedule_name = ").push_bind(name);
+                        q.build().execute(&mut *tx).await?.rows_affected() > 0
+                    };
+                    if !changed {
+                        return Err(Error::NotRegistered {
+                            kind: "Schedule",
+                            name: name.to_owned(),
+                        });
+                    }
+                    Ok((tx, ()))
+                },
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn set_schedule_status(
+        &self,
+        name: &str,
+        status: ScheduleStatus,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        // Pause and resume are two API calls in the references and two step names with them, so a
+        // replay of one is not mistaken for the other.
+        let step_name = match status {
+            ScheduleStatus::Active => RESUME_SCHEDULE_STEP_NAME,
+            ScheduleStatus::Paused => PAUSE_SCHEDULE_STEP_NAME,
+        };
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "set_schedule_status", move || async move {
+            self.run_transactional_step(caller, step_name, timing, |mut tx| async move {
+                let updated = sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {schedules_table} SET status = $2 WHERE schedule_name = $1"
+                )))
+                .bind(name)
+                .bind(status.as_str())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+                if updated == 0 {
+                    return Err(Error::NotRegistered {
+                        kind: "Schedule",
+                        name: name.to_owned(),
+                    });
+                }
+                tracing::debug!(
+                    schedule_name = name,
+                    status = status.as_str(),
+                    "set a schedule's status"
+                );
+                Ok((tx, ()))
+            })
+            .await
+        })
+        .await
+    }
+
+    async fn update_schedule_last_fired_at(
+        &self,
+        name: &str,
+        last_fired_at: Timestamp,
+    ) -> Result<(), Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let pool = &self.pool;
+        // Formatted once, outside the retry: every attempt records the same firing.
+        let last_fired_at = last_fired_at.to_iso8601();
+        let last_fired_at = last_fired_at.as_str();
+
+        with_retry(
+            &self.retry,
+            "update_schedule_last_fired_at",
+            move || async move {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {schedules_table} SET last_fired_at = $2 WHERE schedule_name = $1"
+                )))
+                .bind(name)
+                .bind(last_fired_at)
+                .execute(pool)
+                .await?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error> {
+        let schedules_table = self.tables.workflow_schedules.as_str();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(&self.retry, "delete_schedule", move || async move {
+            self.run_transactional_step(
+                caller,
+                DELETE_SCHEDULE_STEP_NAME,
+                timing,
+                |mut tx| async move {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {schedules_table} WHERE schedule_name = $1"
+                    )))
+                    .bind(name)
+                    .execute(&mut *tx)
+                    .await?;
+                    Ok((tx, ()))
+                },
+            )
+            .await
         })
         .await
     }

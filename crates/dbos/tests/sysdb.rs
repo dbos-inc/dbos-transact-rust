@@ -6,9 +6,10 @@ use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Applications, Change, Debounce, DebounceRequest, Fork, ForkOptions, ForkPoint, Message,
-    NewQueue, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
-    RateLimit, RenameBatching, RenameFrom, StepTiming, Submission, Timestamp, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
+    NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
+    QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter, ScheduleStatus,
+    ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -6223,6 +6224,1065 @@ async fn finishing_releases_the_deduplication_key() {
             .as_deref(),
         Some("wf-next")
     );
+}
+
+/// The names a filter returns, which is what most of the listing assertions are about.
+async fn schedule_names(sys: &PostgresSystemDatabase, filter: &ScheduleFilter<'_>) -> Vec<String> {
+    sys.list_schedules(filter, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.schedule_name)
+        .collect()
+}
+
+/// A schedule round-trips through the database unchanged.
+#[tokio::test]
+async fn a_schedule_round_trips() {
+    let (sys, _db) = sysdb().await;
+    let schedule = NewSchedule {
+        schedule_id: Some("sch-1"),
+        workflow_class_name: Some("Reports"),
+        context: r#"{"tenant":"acme"}"#,
+        last_fired_at: Some(Timestamp::from_epoch_ms(1_786_492_800_000)),
+        automatic_backfill: true,
+        cron_timezone: Some("Europe/London"),
+        queue_name: Some("reports"),
+        ..NewSchedule::new("nightly", "generate_report", "0 0 * * *")
+    };
+    sys.create_schedule(&schedule, None).await.unwrap();
+
+    let stored = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    assert_eq!(stored.schedule_id, "sch-1");
+    assert_eq!(stored.schedule_name, "nightly");
+    assert_eq!(stored.workflow_name, "generate_report");
+    assert_eq!(stored.workflow_class_name.as_deref(), Some("Reports"));
+    assert_eq!(stored.schedule, "0 0 * * *");
+    assert_eq!(stored.status, ScheduleStatus::Active);
+    assert_eq!(stored.context, r#"{"tenant":"acme"}"#);
+    assert_eq!(
+        stored.last_fired_at,
+        Some(Timestamp::from_epoch_ms(1_786_492_800_000)),
+        "the instant survives the column's ISO-8601 encoding"
+    );
+    assert!(stored.automatic_backfill);
+    assert_eq!(stored.cron_timezone.as_deref(), Some("Europe/London"));
+    assert_eq!(stored.queue_name.as_deref(), Some("reports"));
+
+    assert_eq!(sys.get_schedule("no-such", None).await.unwrap(), None);
+}
+
+/// A value another implementation wrote reads back as the same instant this one would write.
+#[tokio::test]
+async fn a_peers_last_fired_at_spelling_is_read_as_an_instant() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let sys = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // The column is text, so each implementation writes its own spelling of the same instant,
+    // and Conductor writes an explicit numeric offset rather than `Z` on purpose.
+    for stored in [
+        "2026-08-12T00:00:00.000Z",
+        "2026-08-12T00:00:00Z",
+        "2026-08-12T00:00:00+00:00",
+        "2026-08-12T00:00:00.000000000Z",
+        "2026-08-12T01:30:00+01:30",
+    ] {
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_schedules" SET "last_fired_at" = $1
+               WHERE "schedule_name" = $2"#,
+        )
+        .bind(stored)
+        .bind("nightly")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sys.get_schedule("nightly", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_fired_at,
+            Some(Timestamp::from_epoch_ms(1_786_492_800_000)),
+            "{stored:?} is the same instant"
+        );
+    }
+
+    // A value that is not an instant at all is reported rather than read as never-fired.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_schedules" SET "last_fired_at" = 'yesterday'
+           WHERE "schedule_name" = $1"#,
+    )
+    .bind("nightly")
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        sys.get_schedule("nightly", None).await,
+        Err(Error::Malformed(_))
+    ));
+}
+
+/// An id is generated when the caller supplies none, and it survives re-registration.
+#[tokio::test]
+async fn a_schedule_keeps_its_identity_across_a_re_apply() {
+    let (sys, _db) = sysdb().await;
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+    let first = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    assert!(!first.schedule_id.is_empty(), "an id is generated");
+
+    // The definition moves; the identity and the runtime state do not.
+    sys.set_schedule_status("nightly", ScheduleStatus::Paused, None)
+        .await
+        .unwrap();
+    sys.update_schedule_last_fired_at("nightly", Timestamp::from_epoch_ms(1_786_492_800_000))
+        .await
+        .unwrap();
+    sys.upsert_schedule(
+        &NewSchedule {
+            workflow_class_name: Some("Reports"),
+            ..NewSchedule::new("nightly", "generate_report", "*/5 * * * *")
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let after = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    assert_eq!(after.schedule_id, first.schedule_id, "the identity is kept");
+    assert_eq!(after.schedule, "*/5 * * * *", "the definition moved");
+    assert_eq!(after.workflow_class_name.as_deref(), Some("Reports"));
+    assert_eq!(
+        after.status,
+        ScheduleStatus::Paused,
+        "a redeployment does not resume a paused schedule"
+    );
+    assert_eq!(
+        after.last_fired_at,
+        Some(Timestamp::from_epoch_ms(1_786_492_800_000)),
+        "nor forget where it had got to"
+    );
+}
+
+/// Registering a name this application already holds is an error, not an update.
+#[tokio::test]
+async fn creating_a_schedule_twice_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let schedule = NewSchedule::new("nightly", "generate_report", "0 0 * * *");
+    sys.create_schedule(&schedule, None).await.unwrap();
+
+    assert!(matches!(
+        sys.create_schedule(&schedule, None).await,
+        Err(Error::AlreadyRegistered {
+            kind: "Schedule",
+            ref name
+        }) if name == "nightly"
+    ));
+
+    // The id has its own unique index, and a collision on it is reported as itself rather than
+    // as a name collision — which is what all four references report it as.
+    let taken = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    assert!(matches!(
+        sys.create_schedule(
+            &NewSchedule {
+                schedule_id: Some(&taken.schedule_id),
+                ..NewSchedule::new("hourly", "sweep", "0 * * * *")
+            },
+            None
+        )
+        .await,
+        Err(Error::AlreadyRegistered {
+            kind: "Schedule id",
+            ..
+        })
+    ));
+
+    // The upsert is the way to re-register, and it leaves one row behind.
+    sys.upsert_schedule(&schedule, None).await.unwrap();
+    assert_eq!(
+        sys.list_schedules(&ScheduleFilter::default(), None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A peer's name is a collision the pre-check names, and a race is one it cannot.
+#[tokio::test]
+async fn a_creation_losing_to_a_peer_reports_what_it_can_see() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+
+    // Beta takes the name *while alpha is mid-call*: under READ COMMITTED alpha's resolve reads a
+    // snapshot from before beta committed, so the insert is the first thing that can see it.
+    // Beta's uncommitted insert makes the interleaving deterministic — alpha blocks on the unique
+    // index until beta commits, rather than racing it.
+    let mut beta_tx = pool.begin().await.unwrap();
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_schedules"
+           (schedule_id, schedule_name, workflow_name, schedule, status, context, application_name)
+           VALUES ($1, $2, $3, $4, 'ACTIVE', 'null', 'beta')"#,
+    )
+    .bind("sch-beta")
+    .bind("nightly")
+    .bind("generate_report")
+    .bind("0 0 * * *")
+    .execute(&mut *beta_tx)
+    .await
+    .unwrap();
+
+    let racing = tokio::spawn(async move {
+        alpha
+            .create_schedule(
+                &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+                None,
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let started_waiting = std::time::Instant::now();
+    beta_tx.commit().await.unwrap();
+    assert!(
+        started_waiting.elapsed() < std::time::Duration::from_millis(300),
+        "beta's commit should be what releases alpha, not the other way round"
+    );
+
+    // The index refused it, and the index does not know whose row it protected. Reported as the
+    // name being taken, which is what all four references report for any collision here.
+    // Distinguishing it would mean a second query on a fresh transaction after every failure,
+    // which no implementation does.
+    assert!(
+        matches!(
+            racing.await.unwrap(),
+            Err(Error::AlreadyRegistered {
+                kind: "Schedule",
+                ..
+            })
+        ),
+        "a peer that commits mid-call is indistinguishable from this application's own name"
+    );
+
+    // Committed before the call, the same collision is named exactly: the pre-check sees it.
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    assert!(matches!(
+        alpha
+            .create_schedule(
+                &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+                None
+            )
+            .await,
+        Err(Error::RegisteredByAnother {
+            kind: "Schedule",
+            ref holder,
+            ..
+        }) if holder == "beta"
+    ));
+}
+
+/// A peer's schedule name is a collision this layer cannot resolve.
+#[tokio::test]
+async fn a_schedule_name_held_by_another_application_is_refused() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let beta = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("beta"),
+            ..Settings::default()
+        },
+    );
+
+    let schedule = NewSchedule::new("nightly", "generate_report", "0 0 * * *");
+    alpha.create_schedule(&schedule, None).await.unwrap();
+    assert_eq!(
+        alpha
+            .get_schedule("nightly", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .application_name
+            .as_deref(),
+        Some("alpha")
+    );
+
+    for result in [
+        beta.create_schedule(&schedule, None).await,
+        beta.upsert_schedule(&schedule, None).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(Error::RegisteredByAnother {
+                kind: "Schedule",
+                ref holder,
+                ..
+            }) if holder == "alpha"
+        ));
+    }
+
+    // An anonymous handle claims an unclaimed row rather than colliding with it.
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+    anonymous
+        .create_schedule(&NewSchedule::new("hourly", "sweep", "0 * * * *"), None)
+        .await
+        .unwrap();
+    beta.upsert_schedule(&NewSchedule::new("hourly", "sweep", "0 * * * *"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        beta.get_schedule("hourly", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .application_name
+            .as_deref(),
+        Some("beta")
+    );
+}
+
+/// Applying a set of schedules is one transaction, so a collision moves none of them.
+#[tokio::test]
+async fn applying_schedules_is_all_or_nothing() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let beta = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("beta"),
+            ..Settings::default()
+        },
+    );
+    alpha
+        .create_schedule(
+            &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Beta declares two, the second of which alpha already holds.
+    let result = beta
+        .apply_schedules(&[
+            NewSchedule::new("hourly", "sweep", "0 * * * *"),
+            NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        ])
+        .await;
+    assert!(matches!(
+        result,
+        Err(Error::RegisteredByAnother { ref holder, .. }) if holder == "alpha"
+    ));
+    assert_eq!(
+        beta.get_schedule("hourly", None).await.unwrap(),
+        None,
+        "the first schedule rolled back with the second"
+    );
+
+    // Without the collision, both land, and re-applying is a no-op.
+    let declared = [
+        NewSchedule::new("hourly", "sweep", "0 * * * *"),
+        NewSchedule::new("weekly", "archive", "0 0 * * 0"),
+    ];
+    beta.apply_schedules(&declared).await.unwrap();
+    beta.apply_schedules(&declared).await.unwrap();
+    assert_eq!(
+        schedule_names(&beta, &ScheduleFilter::default()).await,
+        ["hourly", "weekly"]
+    );
+    assert!(
+        beta.apply_schedules(&[]).await.is_ok(),
+        "applying nothing is not an error"
+    );
+
+    // Runtime state on a declaration is taken at face value rather than refused: it seeds a fresh
+    // row and the conflict clause keeps the stored value on an existing one. Deciding whether a
+    // declaration should carry it at all belongs to whatever builds the declaration.
+    let paused = NewSchedule {
+        status: ScheduleStatus::Paused,
+        last_fired_at: Some(Timestamp::from_epoch_ms(1_786_492_800_000)),
+        ..NewSchedule::new("paused-decl", "run", "0 0 * * *")
+    };
+    let declared_paused = [paused];
+    beta.apply_schedules(&declared_paused).await.unwrap();
+    let seeded = beta
+        .get_schedule("paused-decl", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seeded.status, ScheduleStatus::Paused);
+    assert_eq!(
+        seeded.last_fired_at,
+        Some(Timestamp::from_epoch_ms(1_786_492_800_000))
+    );
+
+    beta.set_schedule_status("paused-decl", ScheduleStatus::Active, None)
+        .await
+        .unwrap();
+    beta.apply_schedules(&declared_paused).await.unwrap();
+    assert_eq!(
+        beta.get_schedule("paused-decl", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ScheduleStatus::Active,
+        "re-applying does not pause a schedule an operator resumed"
+    );
+}
+
+/// Every filter narrows, and a prefix match treats wildcards as ordinary characters.
+#[tokio::test]
+async fn schedules_are_listed_by_status_workflow_and_prefix() {
+    let (sys, _db) = sysdb().await;
+    for (name, workflow_name) in [
+        ("report-nightly", "generate_report"),
+        ("report-weekly", "generate_report"),
+        ("sweep-hourly", "sweep"),
+        ("100%-odd", "sweep"),
+    ] {
+        sys.create_schedule(&NewSchedule::new(name, workflow_name, "0 0 * * *"), None)
+            .await
+            .unwrap();
+    }
+    sys.set_schedule_status("report-weekly", ScheduleStatus::Paused, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        schedule_names(&sys, &ScheduleFilter::default()).await,
+        [
+            "100%-odd",
+            "report-nightly",
+            "report-weekly",
+            "sweep-hourly"
+        ],
+        "an empty filter returns the table, ordered by name"
+    );
+    assert_eq!(
+        schedule_names(
+            &sys,
+            &ScheduleFilter {
+                statuses: vec![ScheduleStatus::Paused],
+                ..Default::default()
+            }
+        )
+        .await,
+        ["report-weekly"]
+    );
+    assert_eq!(
+        schedule_names(
+            &sys,
+            &ScheduleFilter {
+                workflow_names: vec!["sweep"],
+                ..Default::default()
+            }
+        )
+        .await,
+        ["100%-odd", "sweep-hourly"]
+    );
+    assert_eq!(
+        schedule_names(
+            &sys,
+            &ScheduleFilter {
+                schedule_name_prefixes: vec!["report-", "sweep-"],
+                ..Default::default()
+            }
+        )
+        .await,
+        ["report-nightly", "report-weekly", "sweep-hourly"],
+        "prefixes are an OR, not an AND"
+    );
+    // `%` is a character in a name, not a wildcard: were it one, this would match everything.
+    assert_eq!(
+        schedule_names(
+            &sys,
+            &ScheduleFilter {
+                schedule_name_prefixes: vec!["100%"],
+                ..Default::default()
+            }
+        )
+        .await,
+        ["100%-odd"]
+    );
+    // The filters compose.
+    assert_eq!(
+        schedule_names(
+            &sys,
+            &ScheduleFilter {
+                statuses: vec![ScheduleStatus::Active],
+                workflow_names: vec!["generate_report"],
+                ..Default::default()
+            }
+        )
+        .await,
+        ["report-nightly"]
+    );
+}
+
+/// A listing is a search, so it defaults to this application's schedules plus the unclaimed.
+#[tokio::test]
+async fn a_schedule_listing_defaults_to_its_own_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let alpha = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("alpha"),
+            ..Settings::default()
+        },
+    );
+    let beta = PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings {
+            application_name: Some("beta"),
+            ..Settings::default()
+        },
+    );
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    alpha
+        .create_schedule(&NewSchedule::new("alpha-job", "run", "0 0 * * *"), None)
+        .await
+        .unwrap();
+    beta.create_schedule(&NewSchedule::new("beta-job", "run", "0 0 * * *"), None)
+        .await
+        .unwrap();
+    anonymous
+        .create_schedule(&NewSchedule::new("nobody-job", "run", "0 0 * * *"), None)
+        .await
+        .unwrap();
+
+    let scoped = |applications| ScheduleFilter {
+        applications,
+        ..Default::default()
+    };
+    assert_eq!(
+        schedule_names(&alpha, &scoped(Applications::Unset)).await,
+        ["alpha-job", "nobody-job"],
+        "its own plus the unclaimed"
+    );
+    assert_eq!(
+        schedule_names(&alpha, &scoped(Applications::Any)).await,
+        ["alpha-job", "beta-job", "nobody-job"]
+    );
+    assert_eq!(
+        schedule_names(&alpha, &scoped(Applications::Named(vec!["beta"]))).await,
+        ["beta-job", "nobody-job"]
+    );
+    assert_eq!(
+        schedule_names(&anonymous, &scoped(Applications::Unset)).await,
+        ["alpha-job", "beta-job", "nobody-job"],
+        "an unnamed handle has no application to narrow to"
+    );
+
+    // A schedule is addressed by name, so an id-keyed read crosses applications.
+    assert!(
+        alpha
+            .get_schedule("beta-job", None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// An update moves the definition and leaves the runtime state alone.
+#[tokio::test]
+async fn updating_a_schedule_touches_only_its_definition() {
+    let (sys, _db) = sysdb().await;
+    sys.create_schedule(
+        &NewSchedule {
+            cron_timezone: Some("Europe/London"),
+            queue_name: Some("reports"),
+            ..NewSchedule::new("nightly", "generate_report", "0 0 * * *")
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    sys.set_schedule_status("nightly", ScheduleStatus::Paused, None)
+        .await
+        .unwrap();
+    sys.update_schedule_last_fired_at("nightly", Timestamp::from_epoch_ms(1_786_492_800_000))
+        .await
+        .unwrap();
+    let before = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+
+    sys.update_schedule(
+        "nightly",
+        &ScheduleUpdate {
+            schedule: Change::Set("*/5 * * * *"),
+            automatic_backfill: Change::Set(true),
+            // Both nullable columns clear, which is why they are `Change<Option<_>>`.
+            cron_timezone: Change::Set(None),
+            queue_name: Change::Set(None),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let after = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    assert_eq!(after.schedule, "*/5 * * * *");
+    assert!(after.automatic_backfill);
+    assert_eq!(after.cron_timezone, None);
+    assert_eq!(after.queue_name, None);
+    assert_eq!(
+        after.context, before.context,
+        "unnamed fields are untouched"
+    );
+    assert_eq!(after.schedule_id, before.schedule_id);
+    assert_eq!(after.status, ScheduleStatus::Paused);
+    assert_eq!(after.last_fired_at, before.last_fired_at);
+}
+
+/// A write addressed to a name nothing holds is an error rather than a silent no-op.
+#[tokio::test]
+async fn addressing_a_missing_schedule_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let missing = |result: Result<(), Error>| matches!(result, Err(Error::NotRegistered { kind: "Schedule", ref name }) if name == "ghost");
+
+    assert!(missing(
+        sys.update_schedule(
+            "ghost",
+            &ScheduleUpdate {
+                schedule: Change::Set("0 0 * * *"),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    ));
+    // An empty update still reports the name, or a typo would read as success.
+    assert!(missing(
+        sys.update_schedule("ghost", &ScheduleUpdate::default(), None)
+            .await
+    ));
+    assert!(missing(
+        sys.set_schedule_status("ghost", ScheduleStatus::Paused, None)
+            .await
+    ));
+
+    // The two that race a concurrent delete stay silent, so the scheduler loop has nothing to
+    // absorb when an operator removes a schedule between firing and recording it.
+    sys.update_schedule_last_fired_at("ghost", Timestamp::from_epoch_ms(1_786_492_800_000))
+        .await
+        .unwrap();
+    sys.delete_schedule("ghost", None).await.unwrap();
+
+    // An empty update against a schedule that does exist changes nothing and succeeds.
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+    let before = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    sys.update_schedule("nightly", &ScheduleUpdate::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_schedule("nightly", None).await.unwrap().unwrap(),
+        before
+    );
+}
+
+/// Pausing and resuming move only the status, and deleting removes the row.
+#[tokio::test]
+async fn a_schedule_pauses_resumes_and_deletes() {
+    let (sys, _db) = sysdb().await;
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+    sys.update_schedule_last_fired_at("nightly", Timestamp::from_epoch_ms(1_786_492_800_000))
+        .await
+        .unwrap();
+
+    sys.set_schedule_status("nightly", ScheduleStatus::Paused, None)
+        .await
+        .unwrap();
+    let paused = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    assert_eq!(paused.status, ScheduleStatus::Paused);
+    assert_eq!(
+        paused.last_fired_at,
+        Some(Timestamp::from_epoch_ms(1_786_492_800_000)),
+        "pausing does not forget where it had got to"
+    );
+
+    sys.set_schedule_status("nightly", ScheduleStatus::Active, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_schedule("nightly", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ScheduleStatus::Active
+    );
+
+    sys.delete_schedule("nightly", None).await.unwrap();
+    assert_eq!(sys.get_schedule("nightly", None).await.unwrap(), None);
+}
+
+/// A schedule write driven by a workflow step is replayed from its checkpoint, not redone.
+#[tokio::test]
+async fn a_schedule_step_replays_rather_than_repeating() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        Some(("wf-caller", 0)),
+    )
+    .await
+    .unwrap();
+    let recorded = sys
+        .check_step("wf-caller", 0, "DBOS.createSchedule")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recorded.step_name, "DBOS.createSchedule",
+        "the write and its checkpoint committed together"
+    );
+    // A method returning nothing still records something: the JSON `null`, not a NULL column.
+    // Whether a step ran is answered by the row existing, never by its output being empty.
+    assert_eq!(recorded.output.as_deref(), Some("null"));
+    assert_eq!(recorded.error, None);
+
+    // Replaying returns the first run's outcome. Without the step, this second create would be
+    // `AlreadyRegistered` — the name is taken, by the first run.
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        Some(("wf-caller", 0)),
+    )
+    .await
+    .unwrap();
+
+    // A read replays its recorded answer rather than the current row, so a workflow branching on
+    // a schedule sees the same one however an operator has since changed it.
+    let first = sys
+        .get_schedule("nightly", Some(("wf-caller", 1)))
+        .await
+        .unwrap()
+        .unwrap();
+    sys.update_schedule(
+        "nightly",
+        &ScheduleUpdate {
+            schedule: Change::Set("*/5 * * * *"),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sys.get_schedule("nightly", Some(("wf-caller", 1)))
+            .await
+            .unwrap()
+            .unwrap(),
+        first,
+        "the replay is the recorded schedule, not the changed one"
+    );
+    assert_eq!(
+        sys.get_schedule("nightly", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .schedule,
+        "*/5 * * * *",
+        "and the change did land"
+    );
+
+    // A read that found nothing records `null` too, and replays as the `None` it was — not as an
+    // absent step, which is the same JSON and a different meaning.
+    assert_eq!(
+        sys.get_schedule("no-such", Some(("wf-caller", 4)))
+            .await
+            .unwrap(),
+        None
+    );
+    sys.create_schedule(&NewSchedule::new("no-such", "run", "0 0 * * *"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_schedule("no-such", Some(("wf-caller", 4)))
+            .await
+            .unwrap(),
+        None,
+        "the replay is the recorded absence, not the schedule that now exists"
+    );
+    sys.delete_schedule("no-such", None).await.unwrap();
+
+    // A listing replays as a whole, empty included.
+    let listed = sys
+        .list_schedules(&ScheduleFilter::default(), Some(("wf-caller", 2)))
+        .await
+        .unwrap();
+    sys.delete_schedule("nightly", None).await.unwrap();
+    assert_eq!(
+        sys.list_schedules(&ScheduleFilter::default(), Some(("wf-caller", 2)))
+            .await
+            .unwrap(),
+        listed
+    );
+    assert!(
+        sys.list_schedules(&ScheduleFilter::default(), Some(("wf-caller", 3)))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a fresh step sees the deletion"
+    );
+}
+
+/// Pausing and resuming record different steps, so one never replays as the other.
+#[tokio::test]
+async fn pausing_and_resuming_are_distinct_steps() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    sys.set_schedule_status("nightly", ScheduleStatus::Paused, Some(("wf-caller", 0)))
+        .await
+        .unwrap();
+    sys.set_schedule_status("nightly", ScheduleStatus::Active, Some(("wf-caller", 1)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.check_step("wf-caller", 0, "DBOS.pauseSchedule")
+            .await
+            .unwrap()
+            .map(|s| s.step_name),
+        Some("DBOS.pauseSchedule".to_owned())
+    );
+    assert_eq!(
+        sys.check_step("wf-caller", 1, "DBOS.resumeSchedule")
+            .await
+            .unwrap()
+            .map(|s| s.step_name),
+        Some("DBOS.resumeSchedule".to_owned())
+    );
+}
+
+/// The four writes the replay test above does not drive: each replays rather than repeating.
+///
+/// Every case changes the row out from under the recorded step first, so a replay that re-ran the
+/// work would be visible — and in the update's case would fail outright, the schedule having been
+/// deleted between the two calls.
+#[tokio::test]
+async fn every_schedule_write_replays_from_its_checkpoint() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    let schedule = |cron| NewSchedule::new("nightly", "generate_report", cron);
+    let cron = async |sys: &PostgresSystemDatabase| {
+        sys.get_schedule("nightly", None)
+            .await
+            .unwrap()
+            .map(|s| s.schedule)
+    };
+
+    // Upsert. The replay must not put the definition back.
+    sys.upsert_schedule(&schedule("0 0 * * *"), Some(("wf-caller", 0)))
+        .await
+        .unwrap();
+    sys.update_schedule(
+        "nightly",
+        &ScheduleUpdate {
+            schedule: Change::Set("*/5 * * * *"),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    sys.upsert_schedule(&schedule("0 0 * * *"), Some(("wf-caller", 0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        cron(&sys).await.as_deref(),
+        Some("*/5 * * * *"),
+        "the replayed upsert wrote nothing"
+    );
+
+    // Update. Its replay succeeds against a schedule that no longer exists, which re-running
+    // could not do: the row is gone, and an addressed write to a missing name is refused.
+    sys.update_schedule(
+        "nightly",
+        &ScheduleUpdate {
+            schedule: Change::Set("*/10 * * * *"),
+            ..Default::default()
+        },
+        Some(("wf-caller", 1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cron(&sys).await.as_deref(), Some("*/10 * * * *"));
+    sys.delete_schedule("nightly", None).await.unwrap();
+    sys.update_schedule(
+        "nightly",
+        &ScheduleUpdate {
+            schedule: Change::Set("*/10 * * * *"),
+            ..Default::default()
+        },
+        Some(("wf-caller", 1)),
+    )
+    .await
+    .unwrap();
+
+    // Status. The replay must not pause a schedule an operator has since resumed.
+    sys.create_schedule(&schedule("0 0 * * *"), None)
+        .await
+        .unwrap();
+    sys.set_schedule_status("nightly", ScheduleStatus::Paused, Some(("wf-caller", 2)))
+        .await
+        .unwrap();
+    sys.set_schedule_status("nightly", ScheduleStatus::Active, None)
+        .await
+        .unwrap();
+    sys.set_schedule_status("nightly", ScheduleStatus::Paused, Some(("wf-caller", 2)))
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_schedule("nightly", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ScheduleStatus::Active,
+        "the replayed pause left the resumed schedule alone"
+    );
+
+    // Delete. The replay must not remove the schedule registered since.
+    sys.delete_schedule("nightly", Some(("wf-caller", 3)))
+        .await
+        .unwrap();
+    sys.create_schedule(&schedule("0 0 * * *"), None)
+        .await
+        .unwrap();
+    sys.delete_schedule("nightly", Some(("wf-caller", 3)))
+        .await
+        .unwrap();
+    assert!(
+        cron(&sys).await.is_some(),
+        "the replayed delete removed nothing"
+    );
+
+    // Four steps for four ids, and nothing from the calls that passed no caller — a `None` is not
+    // a step at some other position, it is no step at all.
+    let steps = sys
+        .list_workflow_steps("wf-caller", true, None, None)
+        .await
+        .unwrap();
+    let names: Vec<&str> = steps.iter().map(|s| s.step_name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "DBOS.upsertSchedule",
+            "DBOS.updateSchedule",
+            "DBOS.pauseSchedule",
+            "DBOS.deleteSchedule",
+        ]
+    );
+    // All four return nothing, so all four record the JSON `null` rather than a NULL column.
+    assert!(steps.iter().all(|s| s.output.as_deref() == Some("null")));
+}
+
+/// A failed step leaves no checkpoint, so a replay runs the work again.
+#[tokio::test]
+async fn a_failed_schedule_step_records_nothing() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // The name is taken, so this fails — and takes the step's checkpoint down with it, both being
+    // on the one transaction.
+    assert!(matches!(
+        sys.create_schedule(
+            &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+            Some(("wf-caller", 0))
+        )
+        .await,
+        Err(Error::AlreadyRegistered { .. })
+    ));
+    assert_eq!(
+        sys.check_step("wf-caller", 0, "DBOS.createSchedule")
+            .await
+            .unwrap(),
+        None,
+        "a write that failed is not a step a replay can adopt"
+    );
+
+    // So the work runs again, and can now succeed — which is what both references do, and the
+    // reason a caller must not read a failed step as a settled answer.
+    sys.delete_schedule("nightly", None).await.unwrap();
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        Some(("wf-caller", 0)),
+    )
+    .await
+    .unwrap();
+    assert!(sys.get_schedule("nightly", None).await.unwrap().is_some());
 }
 
 /// Enqueues a debounced workflow holding `key`, released at `delay_until`.
