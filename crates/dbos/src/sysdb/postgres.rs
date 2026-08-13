@@ -70,12 +70,12 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
-    NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate,
-    RateLimit, RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission,
-    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus,
-    WrittenBy, duration_from_ms, duration_from_secs, is_valid_application_name,
-    validate_attributes,
+    ApplicationRowCounts, Applications, Debounce, DebounceHolder, DebounceRequest, EventRecord,
+    Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
+    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
+    duration_from_secs, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -387,6 +387,33 @@ fn version_predicate(is_latest: bool, param: usize) -> String {
     }
 }
 
+/// Records a debounce's outcome as its caller's step, inside the caller's transaction.
+///
+/// Nothing to do when no workflow is bouncing — a client debouncing directly has no step to
+/// checkpoint against.
+async fn record_debounce_step(
+    db: &PostgresSystemDatabase,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    caller: Option<(&str, i32)>,
+    outcome: &Debounce,
+    timing: StepTiming,
+) -> Result<(), Error> {
+    let Some((workflow_id, step_id)) = caller else {
+        return Ok(());
+    };
+    let recorded = encode_debounce(outcome);
+    db.record_step_on(
+        tx,
+        workflow_id,
+        step_id,
+        DEBOUNCE_STEP_NAME,
+        Outcome::Output(Some(&recorded)),
+        Some(PORTABLE_JSON),
+        Some(timing),
+    )
+    .await
+}
+
 /// The tables this backend addresses, quoted and schema-qualified.
 ///
 /// One field per table rather than a map: every lookup is a literal in this file, so a missing
@@ -591,6 +618,82 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
 /// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
 const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
+
+/// The step a debounce records when a workflow does the bouncing.
+///
+/// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations disagree
+/// on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's, which is the
+/// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
+/// only crosses one by enqueue, so this is a convention rather than a wire format.
+const DEBOUNCE_STEP_NAME: &str = "DBOS.debounceDelayedWorkflow";
+
+/// Encodes a debounce outcome for the step's `output` column.
+///
+/// **This format is this implementation's own.** A step is only ever replayed by the SDK that
+/// wrote it — workflows cross languages by enqueue alone — so the encoding is recorded in the
+/// `serialization` column rather than agreed between implementations. Python's default is
+/// `py_pickle`, base64-encoded pickle, and it is the *user's* configurable serializer at that:
+/// there is no common wire form to conform to.
+///
+/// The field names still follow the references' `DebounceResult` — nullable fields where exactly
+/// one group is populated — because a shape someone can recognise beats one invented here. The
+/// instance is ours: no reference carries it, for the reason recorded on the trait method.
+/// [`Debounce`] is the same information with the states named instead of implied.
+fn encode_debounce(outcome: &Debounce) -> String {
+    let (bounced, holder) = match outcome {
+        Debounce::Bounced { workflow_id } => (Some(workflow_id.as_str()), None),
+        Debounce::Held(holder) => (None, Some(holder)),
+        Debounce::Unheld => (None, None),
+    };
+    serde_json::json!({
+        "bounced_workflow_id": bounced,
+        "holder_workflow_id": holder.map(|h| h.workflow_id.as_str()),
+        "holder_is_debounced": holder.is_some_and(|h| h.is_debounced),
+        "holder_workflow_name": holder.and_then(|h| h.workflow_name.as_deref()),
+        "holder_workflow_class_name": holder.and_then(|h| h.class_name.as_deref()),
+        "holder_workflow_config_name": holder.and_then(|h| h.config_name.as_deref()),
+        "holder_application_name": holder.and_then(|h| h.application_name.as_deref()),
+    })
+    .to_string()
+}
+
+/// Reads back what [`encode_debounce`] wrote, so a replay reports the first run's decision.
+///
+/// A value this cannot parse means the column holds something this build does not understand,
+/// which is what [`Error::Malformed`] is for — the same treatment a sleep's wake time gets.
+fn decode_debounce(
+    output: Option<&str>,
+    workflow_id: &str,
+    step_id: i32,
+) -> Result<Debounce, Error> {
+    let malformed = |detail: &str| {
+        Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} is a debounce whose output {detail}"
+        ))
+    };
+    let recorded = output.ok_or_else(|| malformed("is missing"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(recorded).map_err(|e| malformed(&format!("is not JSON: {e}")))?;
+    let text = |key: &str| value.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+
+    if let Some(workflow_id) = text("bounced_workflow_id") {
+        return Ok(Debounce::Bounced { workflow_id });
+    }
+    match text("holder_workflow_id") {
+        None => Ok(Debounce::Unheld),
+        Some(workflow_id) => Ok(Debounce::Held(DebounceHolder {
+            workflow_id,
+            is_debounced: value
+                .get("holder_is_debounced")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            workflow_name: text("holder_workflow_name"),
+            class_name: text("holder_workflow_class_name"),
+            config_name: text("holder_workflow_config_name"),
+            application_name: text("holder_application_name"),
+        })),
+    }
+}
 
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
@@ -4066,6 +4169,148 @@ impl SystemDatabase for PostgresSystemDatabase {
             q.build().execute(pool).await?;
             Ok(())
         })
+        .await
+    }
+
+    async fn debounce_delayed_workflow(
+        &self,
+        request: &DebounceRequest<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Debounce, Error> {
+        request.validate()?;
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let application_name = request
+            .application_name
+            .or(self.application_name.as_deref());
+
+        // Read once per attempt, so a retry after a lost commit acknowledgement records the times
+        // of the attempt that actually landed.
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        with_retry(
+            &self.retry,
+            "debounce_delayed_workflow",
+            move || async move {
+                let mut tx = pool.begin().await?;
+
+                // A replay reports what the first run decided. Bouncing again would push a delay
+                // the first run already pushed, against a workflow that may since have started.
+                if let Some((workflow_id, step_id)) = caller
+                    && let Some(step) = self
+                        .check_step_on(&mut tx, workflow_id, step_id, DEBOUNCE_STEP_NAME)
+                        .await?
+                {
+                    tracing::debug!(workflow_id, step_id, "replaying debounce");
+                    tx.commit().await?;
+                    return decode_debounce(step.output.as_deref(), workflow_id, step_id);
+                }
+
+                // The cap is what stops a steady stream of requests postponing the workflow
+                // forever: past the deadline, the delay stops moving. `CASE` rather than the
+                // `LEAST` this backend has, so the statement stays diffable against the four
+                // references, which all spell the cap out this way.
+                //
+                // `is_debounced` and the workflow's identity are both in the guard. Without the
+                // identity, two unrelated workflows whose keys happen to concatenate the same way
+                // — or two configured instances of one class — would overwrite each other's
+                // inputs; without `is_debounced`, an ordinary deduplicated enqueue would be
+                // silently rescheduled.
+                //
+                // `application_name` is claimed for the target the way its dequeue would: left
+                // unclaimed, every peer coalesces onto the one workflow and the last inputs win.
+                //
+                // These stay Rust comments. A `\` continuation strips the newline, so a `--`
+                // comment inside the string would comment out the rest of the statement.
+                let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "UPDATE {workflow_table} \
+                     SET delay_until_epoch_ms = CASE \
+                             WHEN debounce_deadline_epoch_ms IS NOT NULL \
+                              AND debounce_deadline_epoch_ms < $4 \
+                             THEN debounce_deadline_epoch_ms \
+                             ELSE $4 \
+                         END, \
+                         inputs = $5, serialization = $6, updated_at = $7, \
+                         application_name = COALESCE(application_name, $8) \
+                     WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
+                       AND class_name IS NOT DISTINCT FROM $9 \
+                       AND config_name IS NOT DISTINCT FROM $10 \
+                       AND status = 'DELAYED' AND is_debounced = TRUE \
+                       AND ($8::text IS NULL OR application_name = $8 \
+                            OR application_name IS NULL) \
+                     RETURNING workflow_uuid"
+                )))
+                .bind(request.workflow_name)
+                .bind(request.queue_name)
+                .bind(request.deduplication_id)
+                .bind(request.delay_until.as_epoch_ms())
+                .bind(request.inputs)
+                .bind(request.serialization)
+                .bind(Timestamp::now().as_epoch_ms())
+                .bind(application_name)
+                // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL the
+                // enqueue stored rather than matching nothing, as `=` would.
+                .bind(request.class_name)
+                .bind(request.config_name)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                if let Some(workflow_id) = bounced {
+                    let outcome = Debounce::Bounced { workflow_id };
+                    record_debounce_step(self, &mut tx, caller, &outcome, timing).await?;
+                    tx.commit().await?;
+                    return Ok(outcome);
+                }
+
+                // Deliberately unscoped: whatever blocked the update above is what the caller needs
+                // described, and a peer's workflow is the most useful case to be able to name.
+                type HolderRow = (
+                    String,
+                    bool,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                );
+                let holder: Option<HolderRow> = sqlx::query_as(AssertSqlSafe(format!(
+                    "SELECT workflow_uuid, is_debounced, name, class_name, config_name, \
+                            application_name \
+                     FROM {workflow_table} \
+                     WHERE queue_name = $1 AND deduplication_id = $2"
+                )))
+                .bind(request.queue_name)
+                .bind(request.deduplication_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                let outcome = match holder {
+                    None => Debounce::Unheld,
+                    Some((
+                        workflow_id,
+                        is_debounced,
+                        workflow_name,
+                        class_name,
+                        config_name,
+                        application_name,
+                    )) => Debounce::Held(DebounceHolder {
+                        workflow_id,
+                        is_debounced,
+                        workflow_name,
+                        class_name,
+                        config_name,
+                        application_name,
+                    }),
+                };
+                // Recorded even when nothing bounced: the step consumed its id either way, and a
+                // replay that re-ran it would report a holder that has since changed.
+                record_debounce_step(self, &mut tx, caller, &outcome, timing).await?;
+                tx.commit().await?;
+                Ok(outcome)
+            },
+        )
         .await
     }
 

@@ -1214,6 +1214,129 @@ impl QueueUpdate {
     }
 }
 
+/// A request to debounce a workflow onto a deduplication key.
+///
+/// A struct rather than nine parameters because five of them are `Option<&str>`, and transposing
+/// two would compile. Python guards the same signature by making every argument
+/// keyword-only (`def debounce_delayed_workflow(self, *, …)`); named fields are the same
+/// protection.
+///
+/// **No `new` and no `Default`**, unlike [`NewWorkflow`] and [`NewQueue`], which take a single
+/// identifying string. A constructor here would take three `&str` in a row and hand back the
+/// transposition this type exists to prevent, and a default would fabricate a request with empty
+/// names — the values the enqueue side rejects. Every field is named at the call site on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DebounceRequest<'a> {
+    /// The registered function name, matched so a key collision between unrelated workflows never
+    /// overwrites the wrong one's inputs.
+    pub workflow_name: &'a str,
+    /// The class the function belongs to, for class-bound workflows.
+    pub class_name: Option<&'a str>,
+    /// The configured instance name, for instance-bound workflows.
+    ///
+    /// Matched alongside the name and class because all three identify a workflow: two configured
+    /// instances of one class share a name *and* a class, so without this a bounce for one could
+    /// extend the other and replace its inputs. TypeScript matches the name and class; Python
+    /// matches the name alone.
+    pub config_name: Option<&'a str>,
+    /// The queue the debounced workflow sits on.
+    pub queue_name: &'a str,
+    /// The debounce key, held in `deduplication_id` while the workflow is delayed.
+    pub deduplication_id: &'a str,
+    /// When the workflow should be released, capped at its debounce deadline.
+    pub delay_until: Timestamp,
+    /// The inputs to run with, replacing whatever the previous request left.
+    pub inputs: Option<&'a str>,
+    /// How `inputs` is encoded.
+    pub serialization: Option<&'a str>,
+    /// The application the bounce acts for; `None` means the writing handle's own.
+    pub application_name: Option<&'a str>,
+}
+
+impl DebounceRequest<'_> {
+    /// Rejects the values no writer could have stored, so a bounce cannot silently match nothing.
+    ///
+    /// The same rule [`NewWorkflow::validate`] applies on the way in: an empty class or instance
+    /// is absent rather than a value, and matching one would find no row and report the key unheld
+    /// — indistinguishable from a key nobody holds.
+    pub fn validate(&self) -> Result<(), Error> {
+        for (field, value) in [
+            ("workflow_name", self.workflow_name),
+            ("queue_name", self.queue_name),
+            ("deduplication_id", self.deduplication_id),
+        ] {
+            if value.is_empty() {
+                return Err(Error::InvalidInput {
+                    field,
+                    detail: "must not be empty".to_owned(),
+                });
+            }
+        }
+        for (field, value) in [
+            ("class_name", self.class_name),
+            ("config_name", self.config_name),
+            ("inputs", self.inputs),
+            ("serialization", self.serialization),
+            ("application_name", self.application_name),
+        ] {
+            if value == Some("") {
+                return Err(Error::InvalidInput {
+                    field,
+                    detail: "must be absent rather than empty".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a debounce did, or why it could not.
+///
+/// Recorded as a debounce step's output when one runs inside a workflow, so a replay reports what
+/// the first run did rather than bouncing again — see
+/// [`SystemDatabase::debounce_delayed_workflow`](crate::sysdb::SystemDatabase::debounce_delayed_workflow).
+///
+/// Three outcomes rather than the flat record the references return: their `DebounceResult`
+/// carries `bounced_workflow_id` alongside a run of `holder_*` fields, of which exactly one group
+/// is ever populated. Reading it means checking which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Debounce {
+    /// The existing delayed workflow was extended, and its inputs replaced.
+    Bounced {
+        /// The workflow whose delay moved.
+        workflow_id: String,
+    },
+    /// The key is held by a workflow this bounce could not extend, described so the caller can
+    /// tell a legitimate collision from a coincidence.
+    Held(DebounceHolder),
+    /// Nothing holds the key, so the caller should start a fresh workflow.
+    Unheld,
+}
+
+/// The workflow holding a deduplication key, when a debounce could not extend it.
+///
+/// A bounce fails for more than one reason and they want different responses, so the holder is
+/// described rather than merely reported: a **different name, class or instance** under the same
+/// key is a collision between unrelated workflows (`"a" + "b-c"` against `"a-b" + "c"`, or two
+/// configured instances of one class), a holder that is **not debounced** is an ordinary
+/// deduplicated enqueue, and a **different application** means the collision is across
+/// applications sharing the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebounceHolder {
+    /// The workflow holding the key.
+    pub workflow_id: String,
+    /// Whether the holder is itself a debounced workflow.
+    pub is_debounced: bool,
+    /// The holder's registered function name.
+    pub workflow_name: Option<String>,
+    /// The holder's class, for a class-bound workflow.
+    pub class_name: Option<String>,
+    /// The holder's configured instance name, for an instance-bound workflow.
+    pub config_name: Option<String>,
+    /// The application that owns the holder, or `None` if it is unclaimed.
+    pub application_name: Option<String>,
+}
+
 /// A queue as the registry holds it.
 ///
 /// The registry exists so a queue's limits can be read and changed without the executor that

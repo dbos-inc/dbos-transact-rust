@@ -56,11 +56,11 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    ApplicationRowCounts, Applications, EventRecord, Fork, ForkOptions, ForkPoint, Message,
-    NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
-    QueueUpdate, RenameBatching, RenameFrom, StepRecord, StepTiming, StreamRecord, Submission,
-    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
-    WrittenBy,
+    ApplicationRowCounts, Applications, Debounce, DebounceRequest, EventRecord, Fork, ForkOptions,
+    ForkPoint, Message, NewQueue, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
+    OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, StepRecord, StepTiming,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -694,6 +694,43 @@ pub trait SystemDatabase: Send + Sync {
     /// Unscoped, like the other reads and writes addressed by queue name. Ownership is not
     /// updatable: see [`QueueUpdate`].
     async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error>;
+
+    /// Extends a debounced workflow's delay and replaces its inputs, or reports who holds the key.
+    ///
+    /// A debounce coalesces repeated requests onto one delayed workflow: each call pushes the
+    /// release further out and overwrites the inputs, so the workflow eventually runs once with
+    /// the most recent ones. The new delay is **capped at the workflow's debounce deadline**, so
+    /// a steady stream of requests cannot postpone it forever.
+    ///
+    /// Matching includes the workflow's name, class and configured instance, so a key collision
+    /// between unrelated workflows — the classic `"a" + "b-c"` against `"a-b" + "c"`, or two
+    /// configured instances of one class — never overwrites another workflow's inputs. It falls
+    /// through to [`Debounce::Held`] instead, which describes the holder well enough for a caller
+    /// to tell a collision from a coincidence.
+    ///
+    /// TODO(dbos-team): no implementation matches all three. TypeScript matches the name and
+    /// class, Python the name alone, so a bounce for one configured instance can extend another's
+    /// workflow and replace its inputs — even though Go's registry key is already
+    /// `instanceQualifiedName(name, config_name)`. Propose adding the instance everywhere, and the
+    /// class to Python.
+    ///
+    /// [`DebounceRequest::application_name`] is the application the bounce acts *for*; `None`
+    /// means this handle's own. Only that application's holders and unclaimed ones are extended, and an unclaimed one
+    /// is claimed in the same statement — left unclaimed, every peer would coalesce onto the one
+    /// workflow and the last inputs would win.
+    /// `caller` names the workflow step this runs as, when a workflow is doing the bouncing.
+    /// Given one, the bounce and its step checkpoint **commit together**: a crash can never leave
+    /// one without the other, which on recovery would bounce work that had already been bounced.
+    /// A replay returns what the first run decided rather than bouncing again.
+    ///
+    /// Python and TypeScript get that atomicity by passing a database connection down from
+    /// `call_txn_as_step`. This layer names no driver type, so it takes the step instead and owns
+    /// the transaction — the same shape as [`send_messages`](Self::send_messages).
+    async fn debounce_delayed_workflow(
+        &self,
+        request: &DebounceRequest<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Debounce, Error>;
 
     /// Removes a queue from the registry.
     ///

@@ -5,10 +5,10 @@ mod support;
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, Change, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewWorkflow,
-    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit, RenameBatching,
-    RenameFrom, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, WrittenBy,
+    Applications, Change, Debounce, DebounceRequest, Fork, ForkOptions, ForkPoint, Message,
+    NewQueue, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
+    RateLimit, RenameBatching, RenameFrom, StepTiming, Submission, Timestamp, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -6131,4 +6131,468 @@ async fn an_empty_update_is_a_no_op() {
             .await
             .unwrap();
     assert_eq!(before, after, "an empty update records no write");
+}
+
+/// Enqueues a debounced workflow holding `key`, released at `delay_until`.
+async fn enqueue_debounced(
+    sys: &PostgresSystemDatabase,
+    id: &str,
+    name: &str,
+    key: &str,
+    delay: std::time::Duration,
+    deadline: Option<Timestamp>,
+) {
+    let wf = NewWorkflow {
+        name: Some(name),
+        queue_name: Some("orders"),
+        deduplication_id: Some(key),
+        is_debounced: true,
+        delay: Some(delay),
+        debounce_deadline: deadline,
+        input: Some("\"first\""),
+        application_version: Some("v1"),
+        ..NewWorkflow::new(id)
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+}
+
+fn bounce<'a>(name: &'a str, key: &'a str, delay_until: Timestamp) -> DebounceRequest<'a> {
+    DebounceRequest {
+        workflow_name: name,
+        class_name: None,
+        config_name: None,
+        queue_name: "orders",
+        deduplication_id: key,
+        delay_until,
+        inputs: Some("\"later\""),
+        serialization: None,
+        application_name: None,
+    }
+}
+
+/// Enqueues a debounced workflow belonging to a configured instance of a class.
+async fn enqueue_debounced_instance(
+    sys: &PostgresSystemDatabase,
+    id: &str,
+    class_name: &str,
+    config_name: &str,
+    key: &str,
+) {
+    let wf = NewWorkflow {
+        name: Some("checkout"),
+        class_name: Some(class_name),
+        config_name: Some(config_name),
+        queue_name: Some("orders"),
+        deduplication_id: Some(key),
+        is_debounced: true,
+        delay: Some(std::time::Duration::from_secs(3600)),
+        input: Some("\"first\""),
+        application_version: Some("v1"),
+        ..NewWorkflow::new(id)
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+}
+
+/// The class and instance are part of the identity, so one instance never bounces another's.
+#[tokio::test]
+async fn a_bounce_matches_the_class_and_configured_instance() {
+    let (sys, _db) = sysdb().await;
+    enqueue_debounced_instance(&sys, "wf-east", "Checkout", "east", "cart-1").await;
+
+    // Same name and class, a different instance: a collision, not a bounce.
+    let west = DebounceRequest {
+        class_name: Some("Checkout"),
+        config_name: Some("west"),
+        ..bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000))
+    };
+    match sys.debounce_delayed_workflow(&west, None).await.unwrap() {
+        Debounce::Held(holder) => {
+            assert_eq!(holder.workflow_id, "wf-east");
+            assert_eq!(holder.class_name.as_deref(), Some("Checkout"));
+            assert_eq!(holder.config_name.as_deref(), Some("east"));
+        }
+        other => panic!("expected the east instance reported as the holder, got {other:?}"),
+    }
+
+    // An unclassed bounce is a third identity again, not a match for either.
+    assert!(matches!(
+        sys.debounce_delayed_workflow(
+            &bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
+            None
+        )
+        .await
+        .unwrap(),
+        Debounce::Held(_)
+    ));
+
+    // The east instance's own bounce lands.
+    let east = DebounceRequest {
+        class_name: Some("Checkout"),
+        config_name: Some("east"),
+        ..bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000))
+    };
+    assert_eq!(
+        sys.debounce_delayed_workflow(&east, None).await.unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-east".to_owned()
+        }
+    );
+}
+
+/// An empty class or instance is absent rather than a value, so a bounce carrying one is refused
+/// instead of matching nothing and reporting a held key unheld.
+#[tokio::test]
+async fn a_bounce_refuses_an_empty_class_or_instance() {
+    let (sys, _db) = sysdb().await;
+    let request = DebounceRequest {
+        class_name: Some(""),
+        ..bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000))
+    };
+    assert!(matches!(
+        sys.debounce_delayed_workflow(&request, None).await,
+        Err(Error::InvalidInput {
+            field: "class_name",
+            ..
+        })
+    ));
+}
+
+/// A bounce pushes the release out and replaces the inputs.
+#[tokio::test]
+async fn a_bounce_extends_the_delay_and_replaces_the_inputs() {
+    let (sys, _db) = sysdb().await;
+    enqueue_debounced(
+        &sys,
+        "wf-debounced",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+
+    let pushed_to = Timestamp::from_epoch_ms(9_000_000_000);
+    assert_eq!(
+        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", pushed_to), None)
+            .await
+            .unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-debounced".to_owned()
+        },
+    );
+
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    assert_eq!(read.delay_until, Some(pushed_to));
+    assert_eq!(read.input.as_deref(), Some("\"later\""));
+    assert_eq!(read.status, WorkflowStatus::Delayed);
+}
+
+/// The debounce deadline caps how far a bounce can push the release.
+///
+/// Without the cap a steady stream of requests postpones the workflow forever.
+#[tokio::test]
+async fn a_bounce_cannot_push_past_the_debounce_deadline() {
+    let (sys, _db) = sysdb().await;
+    let deadline = Timestamp::from_epoch_ms(5_000_000_000);
+    enqueue_debounced(
+        &sys,
+        "wf-capped",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        Some(deadline),
+    )
+    .await;
+
+    sys.debounce_delayed_workflow(
+        &bounce(
+            "checkout",
+            "cart-1",
+            Timestamp::from_epoch_ms(9_000_000_000),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sys.get_workflow("wf-capped")
+            .await
+            .unwrap()
+            .unwrap()
+            .delay_until,
+        Some(deadline),
+        "the deadline caps the push, so the workflow still runs",
+    );
+}
+
+/// A key held by a different workflow is reported rather than overwritten.
+#[tokio::test]
+async fn a_key_collision_reports_the_holder() {
+    let (sys, _db) = sysdb().await;
+    enqueue_debounced(
+        &sys,
+        "wf-held",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+
+    // Same key, different workflow — the `"a" + "b-c"` against `"a-b" + "c"` case.
+    let result = sys
+        .debounce_delayed_workflow(
+            &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
+            None,
+        )
+        .await
+        .unwrap();
+    match result {
+        Debounce::Held(holder) => {
+            assert_eq!(holder.workflow_id, "wf-held");
+            assert!(holder.is_debounced);
+            assert_eq!(holder.workflow_name.as_deref(), Some("checkout"));
+        }
+        other => panic!("expected the holder to be reported, got {other:?}"),
+    }
+
+    // And the holder's inputs are untouched.
+    assert_eq!(
+        sys.get_workflow("wf-held")
+            .await
+            .unwrap()
+            .unwrap()
+            .input
+            .as_deref(),
+        Some("\"first\""),
+    );
+}
+
+/// An unheld key reports that nothing holds it, so the caller starts fresh.
+#[tokio::test]
+async fn an_unheld_key_is_reported_as_unheld() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.debounce_delayed_workflow(
+            &bounce(
+                "checkout",
+                "never-used",
+                Timestamp::from_epoch_ms(9_000_000)
+            ),
+            None
+        )
+        .await
+        .unwrap(),
+        Debounce::Unheld,
+    );
+}
+
+/// A bounce never extends a peer's workflow, and claims an unclaimed one.
+#[tokio::test]
+async fn a_bounce_stays_within_an_application() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let anonymous = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    enqueue_debounced(
+        &beta,
+        "wf-beta",
+        "checkout",
+        "beta-key",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+    enqueue_debounced(
+        &anonymous,
+        "wf-nobody",
+        "checkout",
+        "free-key",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+
+    // Beta's is reported, not extended.
+    let result = alpha
+        .debounce_delayed_workflow(
+            &bounce("checkout", "beta-key", Timestamp::from_epoch_ms(9_000_000)),
+            None,
+        )
+        .await
+        .unwrap();
+    match result {
+        Debounce::Held(holder) => {
+            assert_eq!(holder.application_name.as_deref(), Some("beta"));
+        }
+        other => panic!("expected beta reported as the holder, got {other:?}"),
+    }
+
+    // The unclaimed one is extended and claimed in the same statement.
+    assert_eq!(
+        alpha
+            .debounce_delayed_workflow(
+                &bounce("checkout", "free-key", Timestamp::from_epoch_ms(9_000_000)),
+                None
+            )
+            .await
+            .unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-nobody".to_owned()
+        },
+    );
+    assert_eq!(
+        alpha
+            .get_workflow("wf-nobody")
+            .await
+            .unwrap()
+            .unwrap()
+            .application_name
+            .as_deref(),
+        Some("alpha"),
+        "bouncing an unclaimed workflow claims it, as its dequeue would",
+    );
+}
+
+/// A bounce from inside a workflow records a step, and a replay reports the first run's decision.
+///
+/// The step and the bounce commit together, so a crash cannot leave one without the other. On
+/// replay the delay must not move again: the first run already pushed it, and the workflow it
+/// pushed may since have started.
+#[tokio::test]
+async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    enqueue_debounced(
+        &sys,
+        "wf-debounced",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+
+    let pushed_to = Timestamp::from_epoch_ms(9_000_000_000);
+    let first = sys
+        .debounce_delayed_workflow(
+            &bounce("checkout", "cart-1", pushed_to),
+            Some(("wf-caller", 0)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first,
+        Debounce::Bounced {
+            workflow_id: "wf-debounced".to_owned()
+        },
+    );
+
+    // Recorded as a step, so a replay has something to read.
+    let steps = sys
+        .list_workflow_steps("wf-caller", true, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| s.step_name.as_str())
+            .collect::<Vec<_>>(),
+        ["DBOS.debounceDelayedWorkflow"],
+    );
+
+    // Move the delay out from under the replay: if it bounced again, this would be overwritten.
+    sys.set_workflow_delay(
+        "wf-debounced",
+        WorkflowDelay::Until(Timestamp::from_epoch_ms(1)),
+    )
+    .await
+    .unwrap();
+
+    let replayed = sys
+        .debounce_delayed_workflow(
+            &bounce(
+                "checkout",
+                "cart-1",
+                Timestamp::from_epoch_ms(7_000_000_000),
+            ),
+            Some(("wf-caller", 0)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed, first, "a replay reports the first run's decision");
+    assert_eq!(
+        sys.get_workflow("wf-debounced")
+            .await
+            .unwrap()
+            .unwrap()
+            .delay_until,
+        Some(Timestamp::from_epoch_ms(1)),
+        "and does not bounce again",
+    );
+}
+
+/// A held key replays as held, with the holder it originally reported.
+#[tokio::test]
+async fn a_replayed_bounce_reports_the_original_holder() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    enqueue_debounced(
+        &sys,
+        "wf-held",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+
+    let first = sys
+        .debounce_delayed_workflow(
+            &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
+            Some(("wf-caller", 0)),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first, Debounce::Held(_)), "got {first:?}");
+
+    // The holder finishes, so a fresh bounce would now report the key unheld.
+    sys.record_workflow_outcome("wf-held", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+
+    let replayed = sys
+        .debounce_delayed_workflow(
+            &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
+            Some(("wf-caller", 0)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed, first,
+        "the recorded holder is reported, not one re-read after it changed",
+    );
 }
