@@ -732,6 +732,28 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<(&str, i32)>,
     ) -> Result<Debounce, Error>;
 
+    /// The workflow currently holding a deduplication key, if any.
+    ///
+    /// The caller for this is an enqueue that **lost a race and wants to adopt the winner**:
+    /// submitting under a key another workflow holds fails on the unique index, and a
+    /// return-the-existing-one policy then asks who won and reports that id instead of erroring
+    /// (`client.ts:430`, `Debouncer.java:322`). `None` means the holder finished between the
+    /// conflict and this read — the key is free again and the caller should retry the insert
+    /// rather than treat it as an error.
+    ///
+    /// Narrow on purpose: the id alone. A bounce needs to know far more about the holder, but it
+    /// reads that for itself — see [`types::Debounce::Held`].
+    ///
+    /// Unscoped, because a deduplication key is an address rather than a search: migration 27's
+    /// partial index makes `(queue_name, deduplication_id)` unique wherever the key is set, so at
+    /// most one row can match. That the index is global rather than per-application is the same
+    /// shared-database question queue names raise; it is not this method's to answer.
+    async fn get_deduplication_key_holder(
+        &self,
+        queue_name: &str,
+        deduplication_id: &str,
+    ) -> Result<Option<String>, Error>;
+
     /// Removes a queue from the registry.
     ///
     /// Only the registration. Workflows already enqueued keep their `queue_name` and are still

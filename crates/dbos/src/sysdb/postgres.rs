@@ -2014,9 +2014,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             // rather than clobbering the winner's result. It also makes this retry-safe — a
             // retry after a lost acknowledgement finds its own write and reports
             // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
+            // Finishing releases the deduplication key, as it does in all four implementations.
+            // The unique index spans every status, so a key left on a finished row would be
+            // held forever and nothing could ever be submitted under it again.
             let updated = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} SET status = $2, output = $3, error = $4, \
-                 updated_at = $5, completed_at = $5 \
+                 updated_at = $5, completed_at = $5, deduplication_id = NULL \
                  WHERE workflow_uuid = $1 AND status = 'PENDING'"
             )))
             .bind(workflow_id)
@@ -4066,6 +4069,41 @@ impl SystemDatabase for PostgresSystemDatabase {
                     );
                 }
                 Ok(started)
+            },
+        )
+        .await
+    }
+
+    async fn get_deduplication_key_holder(
+        &self,
+        queue_name: &str,
+        deduplication_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+
+        with_retry(
+            &self.retry,
+            "get_deduplication_key_holder",
+            move || async move {
+                // No status filter, and none is needed: every terminal transition clears the key, so
+                // a row still carrying one is by definition an active holder. The references filter
+                // on nothing either.
+                let holder: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT workflow_uuid FROM {workflow_table} \
+                     WHERE queue_name = $1 AND deduplication_id = $2"
+                )))
+                .bind(queue_name)
+                .bind(deduplication_id)
+                .fetch_optional(pool)
+                .await?;
+                tracing::debug!(
+                    queue_name,
+                    deduplication_id,
+                    ?holder,
+                    "read the key's holder"
+                );
+                Ok(holder)
             },
         )
         .await

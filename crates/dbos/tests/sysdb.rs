@@ -6133,6 +6133,98 @@ async fn an_empty_update_is_a_no_op() {
     assert_eq!(before, after, "an empty update records no write");
 }
 
+/// The lookup answers who holds a key, so a losing enqueue can adopt the winner.
+#[tokio::test]
+async fn the_deduplication_key_holder_is_read_by_queue_and_key() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        queue_name: Some("orders"),
+        deduplication_id: Some("cart-1"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-holder")
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.get_deduplication_key_holder("orders", "cart-1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("wf-holder")
+    );
+
+    // The key is scoped to its queue, and an unheld key is `None` rather than an error — the
+    // caller retries its insert instead of reporting a conflict it can no longer see.
+    assert_eq!(
+        sys.get_deduplication_key_holder("shipping", "cart-1")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        sys.get_deduplication_key_holder("orders", "cart-2")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// Finishing releases the key, so the next submission under it succeeds.
+#[tokio::test]
+async fn finishing_releases_the_deduplication_key() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let held = NewWorkflow {
+        queue_name: Some("orders"),
+        deduplication_id: Some("cart-1"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-first")
+    };
+    sys.init_workflow(&held, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // It has to reach a terminal status through `PENDING`, which is where the outcome lands.
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+    sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        .await
+        .unwrap();
+    sys.record_workflow_outcome("wf-first", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.get_deduplication_key_holder("orders", "cart-1")
+            .await
+            .unwrap(),
+        None,
+        "a finished workflow no longer holds its key"
+    );
+
+    // And the key is genuinely free: the unique index spans every status, so this insert would
+    // fail if the finished row still carried it.
+    let next = NewWorkflow {
+        queue_name: Some("orders"),
+        deduplication_id: Some("cart-1"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-next")
+    };
+    sys.init_workflow(&next, None, Submission::Fresh)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_deduplication_key_holder("orders", "cart-1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("wf-next")
+    );
+}
+
 /// Enqueues a debounced workflow holding `key`, released at `delay_until`.
 async fn enqueue_debounced(
     sys: &PostgresSystemDatabase,
