@@ -1,7 +1,5 @@
 //! The system database surface, against real databases.
 
-mod support;
-
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
@@ -13,7 +11,8 @@ use dbos::sysdb::types::{
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
-use support::{Backend, test_database};
+use dbos_test_support as support;
+use dbos_test_support::{Backend, test_database};
 
 fn workflow(id: &str) -> NewWorkflow<'_> {
     NewWorkflow {

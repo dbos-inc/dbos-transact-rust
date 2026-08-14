@@ -9,12 +9,10 @@
 //!
 //! These run on the raw lane, because the migrations are the thing under test.
 
-mod support;
-
 use dbos::sysdb::migrations::{Dialect, Migration, build_migrations};
 use sqlx::{PgPool, Row};
 
-use support::{Backend, raw_database};
+use dbos_test_support::{Backend, raw_database};
 
 fn dialect_for(backend: Backend) -> Dialect {
     match backend {

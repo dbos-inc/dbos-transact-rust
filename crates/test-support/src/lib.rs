@@ -17,16 +17,20 @@
 //! following Java's `PgContainer`. CockroachDB is a v1 backend, not a smoke-tested
 //! afterthought, and the switch is what makes the second CI leg a one-variable change.
 //!
-//! Note that Rust compiles each `tests/*.rs` file into its own binary, so "the shared
-//! server" is shared within a test binary, not across them. Prefer few, larger integration
-//! test files over many small ones — each additional file is another container.
+//! Note that Rust compiles each `tests/*.rs` file into its own binary, and the crate's own
+//! `#[cfg(test)]` code into one more, so "the shared server" is shared within a binary rather
+//! than across them. Prefer few, larger test files over many small ones — each additional one
+//! is another container.
 //!
 //! A fresh database per test is only right while there is nothing to migrate. Once there
 //! is, this becomes a pool of pre-migrated databases leased per test and truncated on
 //! release (Java's model): migrating per test would put the whole CockroachDB online-DDL
 //! cost straight back, which is the reason this harness exists at all.
-
-#![allow(dead_code)] // Not every test binary uses every helper.
+//!
+//! **A crate rather than a module under `tests/`.** A `mod support;` is visible only to the
+//! integration test binaries, so anything it tests has to be `pub` — the crate boundary,
+//! not the design, would decide the public API. As a dev-dependency it is reachable from
+//! `#[cfg(test)]` code in `src/` too, which is where a test of a crate-private thing belongs.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,0 +1,27 @@
+[package]
+name = "dbos-test-support"
+description = "Database containers for the DBOS test suite. Not published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+# The harness applies the real migrations and quotes the real schema name, so it uses the
+# crate under test rather than a copy of it. `dbos` dev-depends on this crate in turn, which
+# Cargo allows precisely because a dev-dependency is outside the normal build graph.
+#
+# `default-features = false` is load-bearing, not tidiness: `cargo check --no-default-features`
+# selects every workspace member, and a request for `dbos`'s defaults from here would unify
+# `engine` back on and leave the boundary gate asserting nothing. The harness needs only the
+# system database layer, which is the half that gate exists to protect.
+dbos = { path = "../dbos", default-features = false }
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+] }
+testcontainers = "0.27"
+tokio = { version = "1", features = ["time", "sync"] }

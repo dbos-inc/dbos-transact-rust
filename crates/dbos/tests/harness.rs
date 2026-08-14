@@ -4,12 +4,10 @@
 //! everything later depends on actually works: a real database on both v1 backends,
 //! containers shared rather than multiplied, and nothing left running afterwards.
 
-mod support;
-
 use std::sync::Arc;
 
 use dbos::sysdb::DEFAULT_SCHEMA;
-use support::{Backend, SharedSlot, raw_database, test_database};
+use dbos_test_support::{Backend, SharedSlot, raw_database, test_database};
 
 /// The harness reaches a real server and can run SQL on a fresh database.
 ///

@@ -78,11 +78,15 @@ jobs:
     # The library must compile with the engine feature off. This is the boundary between
     # the system database / Conductor layers and everything built on top of them, and a
     # compile failure here is the only thing that catches a stray dependency across it.
+    #
+    # `-p dbos` because the check is about one crate: run over the workspace, any member
+    # asking for `dbos`'s defaults would unify `engine` back on and the gate would pass
+    # whatever happened. `dbos-test-support` declines them for the same reason.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --no-default-features
+      - run: cargo check -p dbos --no-default-features
 
   test:
     name: Test (${{ matrix.backend }})

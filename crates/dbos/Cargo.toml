@@ -54,10 +54,12 @@ time = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-# Integration tests need a real database, and testcontainers is the only way they get one:
-# no environment variable points the suite at a long-lived server, so a green `cargo test`
-# means the same thing on a laptop as in CI.
-testcontainers = "0.27"
+# Tests need a real database, and testcontainers is the only way they get one: no environment
+# variable points the suite at a long-lived server, so a green `cargo test` means the same
+# thing on a laptop as in CI. The harness is its own crate so that `#[cfg(test)]` code in
+# `src/` can reach it too — a module under `tests/` is visible only to the other integration
+# test binaries, which would force anything it tests to be public.
+dbos-test-support = { path = "../test-support" }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

@@ -452,14 +452,24 @@ name = "dbos"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "dbos-test-support",
  "serde",
  "serde_json",
  "sqlx",
- "testcontainers",
  "time",
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "dbos-test-support"
+version = "0.1.2"
+dependencies = [
+ "dbos",
+ "sqlx",
+ "testcontainers",
+ "tokio",
 ]
 
 [[package]]

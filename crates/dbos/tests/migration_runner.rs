@@ -5,13 +5,12 @@
 //! that a database another implementation has taken further is left alone. `migrations.rs`
 //! covers whether the statements themselves are valid.
 
-mod support;
-
 use dbos::sysdb::migrations::runner;
 use dbos::sysdb::migrations::{Dialect, SHARED_MIGRATIONS, quote_identifier};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-use support::raw_database;
+use dbos_test_support as support;
+use dbos_test_support::raw_database;
 
 use dbos::sysdb::DEFAULT_SCHEMA as SCHEMA;
 

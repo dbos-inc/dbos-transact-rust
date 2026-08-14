@@ -45,6 +45,11 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# A path dependency carries no version, which reads as a wildcard. The rule is aimed at
+# `"*"` against a registry crate, where it means "any future breaking release is fine";
+# a path within this workspace is pinned by being in the workspace at all. `dbos-test-support`
+# and `dbos`'s dev-dependency on it are the only two, and neither is published.
+allow-wildcard-paths = true
 # Duplicate versions are a warning, not an error: with sqlx and tokio in the graph
 # some duplication is out of our hands, and failing CI on a transitive dependency's
 # version skew would make the gate noise rather than signal.
