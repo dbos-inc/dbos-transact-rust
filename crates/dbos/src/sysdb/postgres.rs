@@ -227,10 +227,15 @@ pub struct Config<'a> {
     pub url: &'a str,
     /// Maximum pooled connections.
     pub max_connections: u32,
-    /// Whether the schema uses LISTEN/NOTIFY triggers.
+    /// Whether to use LISTEN/NOTIFY rather than polling.
     ///
-    /// Here rather than on [`Settings`] because it is a *migration* input: it decides which
-    /// variant of the schema is applied, and `from_pool` never migrates.
+    /// Here rather than on [`Settings`] because it is a *migration* input as well as a runtime
+    /// one: it decides which variant of the schema is applied, and `from_pool` never migrates.
+    /// CockroachDB has no LISTEN/NOTIFY, so the dialect forces polling there whatever this says.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 15. Deciding the schema from a per-process setting is
+    /// permanent and affects every application sharing the database — see the note on
+    /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
