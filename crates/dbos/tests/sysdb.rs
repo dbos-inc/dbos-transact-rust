@@ -6433,7 +6433,8 @@ async fn a_creation_losing_to_a_peer_reports_what_it_can_see() {
     );
 
     // Beta takes the name *while alpha is mid-call*: under READ COMMITTED alpha's resolve reads a
-    // snapshot from before beta committed, so the insert is the first thing that can see it.
+    // snapshot from before beta committed, so the insert is the first thing that can see it. On a
+    // SERIALIZABLE backend the resolve gets another look — see the assertion at the end.
     // Beta's uncommitted insert makes the interleaving deterministic — alpha blocks on the unique
     // index until beta commits, rather than racing it.
     let mut beta_tx = pool.begin().await.unwrap();
@@ -6466,19 +6467,31 @@ async fn a_creation_losing_to_a_peer_reports_what_it_can_see() {
         "beta's commit should be what releases alpha, not the other way round"
     );
 
-    // The index refused it, and the index does not know whose row it protected. Reported as the
-    // name being taken, which is what all four references report for any collision here.
-    // Distinguishing it would mean a second query on a fresh transaction after every failure,
-    // which no implementation does.
+    // **Which collision it reports depends on the isolation level, and both are true.**
+    //
+    // Under PostgreSQL's `READ COMMITTED` the resolve has already taken its snapshot, so the unique
+    // index is the first thing to see beta — and an index does not know whose row it protected. So
+    // the error says only that the name is taken, which is what all four references report for any
+    // collision here; naming the holder would mean a second query on a fresh transaction after
+    // every failure, which none of them does.
+    //
+    // CockroachDB is `SERIALIZABLE`: the conflict makes the statement retry, the resolve runs again
+    // against a snapshot that now includes beta, and it can name the holder. Strictly the better
+    // answer, and the same code produces both — so what is asserted is that the collision is
+    // reported, not which sentence it uses.
+    let outcome = racing.await.unwrap();
     assert!(
         matches!(
-            racing.await.unwrap(),
+            outcome,
             Err(Error::AlreadyRegistered {
+                kind: "Schedule",
+                ..
+            }) | Err(Error::RegisteredByAnother {
                 kind: "Schedule",
                 ..
             })
         ),
-        "a peer that commits mid-call is indistinguishable from this application's own name"
+        "a peer that commits mid-call is a collision either way, got {outcome:?}"
     );
 
     // Committed before the call, the same collision is named exactly: the pre-check sees it.

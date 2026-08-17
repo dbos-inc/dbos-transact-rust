@@ -4840,8 +4840,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // An empty update still has to say whether the schedule exists, so it becomes
                     // a read rather than an early return: silence would report a typo as success.
                     let changed = if update.is_empty() {
+                        // include explict cast for CRDB compat
                         sqlx::query_scalar::<_, i32>(AssertSqlSafe(format!(
-                            "SELECT 1 FROM {schedules_table} WHERE schedule_name = $1"
+                            "SELECT 1::int4 FROM {schedules_table} WHERE schedule_name = $1"
                         )))
                         .bind(name)
                         .fetch_optional(&mut *tx)
