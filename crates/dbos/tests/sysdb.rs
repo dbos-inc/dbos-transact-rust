@@ -5784,7 +5784,12 @@ async fn worker_concurrency_bounds_a_dequeue() {
 /// Global concurrency counts what every executor has running, not just this one.
 #[tokio::test]
 async fn global_concurrency_counts_across_executors() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
+    // Both assertions below are exact counts, so an under-delivering dequeue breaks them: too few
+    // started, and then the second executor finds the slack the first one left.
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
     let queue = NewQueue {
         concurrency: Some(2),
         ..NewQueue::new("orders")
@@ -6387,9 +6392,16 @@ async fn the_deduplication_key_holder_is_read_by_queue_and_key() {
 }
 
 /// Finishing releases the key, so the next submission under it succeeds.
+///
+/// Reaching a terminal status means going through `PENDING`, and the only route there is a dequeue —
+/// `init_workflow`'s conflict path does not touch `status`, and `resume` enqueues rather than starts.
+/// So this inherits the dequeue's CockroachDB caveat despite being a test about neither.
 #[tokio::test]
 async fn finishing_releases_the_deduplication_key() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
     sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
         .await
         .unwrap();
@@ -6403,14 +6415,23 @@ async fn finishing_releases_the_deduplication_key() {
         .await
         .unwrap();
 
-    // It has to reach a terminal status through `PENDING`, which is where the outcome lands.
+    // It has to reach a terminal status through `PENDING`, which is where the outcome lands. Both
+    // steps are asserted rather than assumed: a dequeue that returned nothing leaves the workflow
+    // `ENQUEUED`, the outcome write finds no `PENDING` row and reports `AlreadyFinished`, and the
+    // key assertion below then fails for a reason that has nothing to do with deduplication.
     let registered = sys.get_queue("orders").await.unwrap().unwrap();
-    sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
-        .await
-        .unwrap();
-    sys.record_workflow_outcome("wf-first", Outcome::Output(Some("\"done\"")))
-        .await
-        .unwrap();
+    assert_eq!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+            .await
+            .unwrap(),
+        ["wf-first"],
+    );
+    assert_eq!(
+        sys.record_workflow_outcome("wf-first", Outcome::Output(Some("\"done\"")))
+            .await
+            .unwrap(),
+        OutcomeWrite::Recorded,
+    );
 
     assert_eq!(
         sys.get_deduplication_key_holder("orders", "cart-1")
