@@ -56,12 +56,12 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    ApplicationRowCounts, Applications, Debounce, DebounceRequest, EventRecord, Fork, ForkOptions,
-    ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue,
-    Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRecord,
-    Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult,
-    WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EventRecord,
+    Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom,
+    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -147,6 +147,51 @@ pub trait SystemDatabase: Send + Sync {
         workflow_id: &str,
         outcome: Outcome<'_>,
     ) -> Result<OutcomeWrite, Error>;
+
+    /// Waits for a workflow to finish and reports how it did.
+    ///
+    /// The read counterpart of [`record_workflow_outcome`](Self::record_workflow_outcome): what one
+    /// run records, this is how everyone else finds out. A workflow handle's result is this call,
+    /// and so is the adopt half of park-and-adopt — a run that loses the status-gated outcome write
+    /// reads back the outcome that won.
+    ///
+    /// **It polls, and every implementation does.** There is no wakeup for workflow completion in
+    /// any of the four: no channel carries it and no trigger publishes it, so the only way to learn
+    /// that a status has changed is to look. `poll_interval` is how often, and the caller supplies
+    /// it because the engine's configuration owns that number.
+    ///
+    /// **No timeout**, following Python and Go. A wait ends when the workflow does, and a caller
+    /// that wants to stop sooner drops the future.
+    ///
+    /// **A missing row is always [`Error::NonExistentWorkflow`].** This waits for a workflow to
+    /// *finish*, not for one to exist. Python, Go and TypeScript take a `fail_if_missing` flag that
+    /// chooses between the two and default it to waiting; Java has no flag and always waits.
+    ///
+    /// **A deliberate divergence, and a narrow one.** That default was never chosen: `git log -S`
+    /// puts the flag's arrival in the park-and-adopt change itself, which added it so *its* new
+    /// caller could have the error, and defaulted it to the behaviour every existing caller already
+    /// had. Meanwhile waiting through an absent row means a workflow deleted mid-wait hangs its
+    /// waiter forever — the hazard those same commits describe, then apply to one call site in
+    /// three. Within a process the case for waiting cannot even arise: every path that yields a
+    /// workflow id inserts the row first. What is given up is a caller holding an id from outside
+    /// this process, awaiting it before whoever owns it enqueues — which is a loop over this
+    /// error, and reads better one level up than as a flag every other caller has to decline.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 17.
+    ///
+    /// Cancellation and dead-lettering are reported as values rather than errors; see [`AwaitedOutcome`]
+    /// for why that is not merely convenient.
+    ///
+    /// **Each poll takes a connection for the length of a query.** A hundred waiters are a hundred
+    /// queries per interval, so this belongs under the same concurrency cap as the other waits that
+    /// re-check the database — Python caps them together at half its pool with
+    /// `sys_db_polling_concurrency`. There is no such cap in this crate yet, and this method is one
+    /// of the reasons to add one.
+    async fn await_workflow_result(
+        &self,
+        workflow_id: &str,
+        poll_interval: Duration,
+    ) -> Result<AwaitedOutcome, Error>;
 
     /// Moves a delayed workflow's release time.
     ///

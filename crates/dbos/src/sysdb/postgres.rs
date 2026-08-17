@@ -70,9 +70,9 @@ use super::retry::{RetryPolicy, with_retry};
 use std::time::Duration;
 
 use super::types::{
-    ApplicationRowCounts, Applications, Change, Debounce, DebounceHolder, DebounceRequest,
-    EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow,
-    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
+    ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
+    DebounceRequest, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule,
+    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate,
     StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
     WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
@@ -2237,6 +2237,87 @@ impl SystemDatabase for PostgresSystemDatabase {
             })
         })
         .await
+    }
+
+    async fn await_workflow_result(
+        &self,
+        workflow_id: &str,
+        poll_interval: Duration,
+    ) -> Result<AwaitedOutcome, Error> {
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        // Four columns and the attempt count, not the whole row: this runs once per interval for
+        // as long as the caller waits, where `get_workflow` reads thirty-odd columns to answer a
+        // question about one. Python reads the same narrow set for the same reason.
+        let select = format!(
+            "SELECT status, output, error, serialization, recovery_attempts \
+             FROM {workflow_table} WHERE workflow_uuid = $1"
+        );
+        let select = &select;
+
+        loop {
+            // Inside the loop, so a transient failure is retried by the policy and a lasting one
+            // reaches the caller rather than being swallowed by the wait.
+            let row = with_retry(&self.retry, "await_workflow_result", move || async move {
+                Ok(sqlx::query(AssertSqlSafe(select.clone()))
+                    .bind(workflow_id)
+                    .fetch_optional(pool)
+                    .await?)
+            })
+            .await?;
+
+            match row {
+                Some(row) => {
+                    let status_text: String = row.try_get("status")?;
+                    let status = WorkflowStatus::parse(&status_text).ok_or_else(|| {
+                        Error::Malformed(format!("unknown workflow status {status_text:?}"))
+                    })?;
+                    let settled = match status {
+                        WorkflowStatus::Success => Some(AwaitedOutcome::Succeeded {
+                            output: row.try_get("output")?,
+                            serialization: row.try_get("serialization")?,
+                        }),
+                        WorkflowStatus::Error => Some(AwaitedOutcome::Failed {
+                            // A failed workflow with no error is a row no implementation writes:
+                            // the status and the payload are set by one statement. Reported rather
+                            // than turned into an empty message, which a caller would try to
+                            // deserialize.
+                            error: row.try_get::<Option<String>, _>("error")?.ok_or_else(|| {
+                                Error::Malformed(format!(
+                                    "workflow {workflow_id} failed with no error recorded"
+                                ))
+                            })?,
+                            serialization: row.try_get("serialization")?,
+                        }),
+                        WorkflowStatus::Cancelled => Some(AwaitedOutcome::Cancelled),
+                        WorkflowStatus::MaxRecoveryAttemptsExceeded => {
+                            Some(AwaitedOutcome::Parked {
+                                recovery_attempts: row
+                                    .try_get::<Option<i64>, _>("recovery_attempts")?
+                                    .unwrap_or_default(),
+                            })
+                        }
+                        // Still running, queued, or waiting to be released. Nothing to report yet.
+                        WorkflowStatus::Pending
+                        | WorkflowStatus::Enqueued
+                        | WorkflowStatus::Delayed => None,
+                    };
+                    if let Some(settled) = settled {
+                        tracing::debug!(workflow_id, status = status.as_str(), "workflow settled");
+                        return Ok(settled);
+                    }
+                }
+                // Waiting for a workflow to finish, not for one to exist. A caller holding an id
+                // from outside this process loops over this error.
+                None => {
+                    return Err(Error::NonExistentWorkflow {
+                        workflow_ids: vec![workflow_id.to_owned()],
+                    });
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     async fn set_workflow_delay(

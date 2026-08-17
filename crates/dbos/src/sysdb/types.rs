@@ -1024,6 +1024,70 @@ impl<'a> Outcome<'a> {
     }
 }
 
+/// How somebody else's workflow ended.
+///
+/// The read counterpart of [`Outcome`], and it has four variants where that has two. `Outcome` is
+/// what a *run* reports, and a run can only return or raise. Cancelling and parking are done to a
+/// workflow rather than by it, so they are states no run ever reports — and it is precisely the
+/// caller waiting on a workflow it is not running that has to be told about them.
+///
+/// **"Awaited" is the references' own word for that side of the relationship**, and it is load-bearing
+/// rather than decorative: Python raises `DBOSAwaitedWorkflowCancelledError` specifically so a
+/// cancelled *awaited* workflow is not mistaken for the *awaiting* one having been cancelled. The
+/// same distinction is why the variants below are values — see the second bullet.
+///
+/// Not named for terminality, because one variant is not terminal:
+/// [`WorkflowStatus::is_terminal`] is deliberately false for
+/// [`MaxRecoveryAttemptsExceeded`](WorkflowStatus::MaxRecoveryAttemptsExceeded), which
+/// [`Parked`](Self::Parked) is. It ends a *wait* without ending the workflow, since the workflow can
+/// still be resumed.
+///
+/// **All four come back as values, including the two that are failures.** Two reasons, and the
+/// second is the one that would be a bug:
+///
+/// - A failed workflow's error is encoded in whatever the workflow chose, and this layer does not
+///   deserialize payloads. So a failure is already data here rather than something to raise, and
+///   Go's `AwaitWorkflowResult` returns the same string for the same reason.
+/// - **A cancelled workflow must not be reported as the caller being cancelled.**
+///   [`Error::WorkflowCancelled`] means the opposite thing
+///   — the step-replay check refusing to run *this* workflow's steps — and returning it here would
+///   read as the waiter having been cancelled. Python is explicit about the distinction, raising a
+///   separate `DBOSAwaitedWorkflowCancelledError` "because the awaiting workflow is not being
+///   cancelled". Reporting all four uniformly leaves the user-facing error taxonomy to the engine,
+///   which owns it.
+///
+/// Go returns a result *and* an error together for the same call, which in Rust is only
+/// expressible as a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwaitedOutcome {
+    /// It returned. `None` is a void return, which is a success and not an absent result.
+    Succeeded {
+        /// Encoded return value.
+        output: Option<String>,
+        /// How `output` is encoded.
+        serialization: Option<String>,
+    },
+    /// It raised, carrying the encoded error.
+    Failed {
+        /// Encoded error.
+        error: String,
+        /// How `error` is encoded.
+        serialization: Option<String>,
+    },
+    /// It was cancelled, so it has neither a value nor an error of its own.
+    Cancelled,
+    /// It was recovered too many times and parked, so it has neither.
+    ///
+    /// The limit it exceeded is not stored — `max_recovery_attempts` is an input to
+    /// [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) rather than a column — so
+    /// the count is what can be reported. Go reports `attempts - 2` as the limit, which is an
+    /// approximation of the same missing number.
+    Parked {
+        /// Recovery attempts recorded against the workflow.
+        recovery_attempts: i64,
+    },
+}
+
 /// When a step ran, start and finish together.
 ///
 /// A pair rather than two fields because the database records completed steps: a start with no

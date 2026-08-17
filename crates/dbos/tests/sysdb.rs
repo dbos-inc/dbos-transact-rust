@@ -3,11 +3,11 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, Change, Debounce, DebounceRequest, Fork, ForkOptions, ForkPoint, Message,
-    NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
-    QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter, ScheduleStatus,
-    ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy,
+    Applications, AwaitedOutcome, Change, Debounce, DebounceRequest, Fork, ForkOptions, ForkPoint,
+    Message, NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
+    ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -486,6 +486,221 @@ async fn recording_an_outcome_for_a_missing_workflow_is_not_an_error() {
         .await
         .expect("a missing row should not be an error");
     assert_eq!(result, OutcomeWrite::AlreadyFinished);
+}
+
+// ==================== await_workflow_result ====================
+
+/// A brisk poll: these tests are about what a wait returns, not how often it looks.
+const BRISK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Long enough to prove a wait is waiting, short enough not to pad the suite.
+const BRIEFLY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Both outcomes a run can record come back as values, the failure included.
+#[tokio::test]
+async fn an_await_returns_a_recorded_outcome() {
+    let (sys, _db) = sysdb().await;
+    for id in ["wf-ok", "wf-bad"] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+
+    sys.record_workflow_outcome("wf-ok", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.await_workflow_result("wf-ok", BRISK_POLL)
+            .await
+            .unwrap(),
+        AwaitedOutcome::Succeeded {
+            output: Some("\"done\"".to_owned()),
+            // Stamped by `init_workflow` from the workflow's own input encoding.
+            serialization: Some("portable_json".to_owned()),
+        }
+    );
+
+    // Not raised: this layer does not deserialize payloads, so a failure is data like any other.
+    sys.record_workflow_outcome("wf-bad", Outcome::Error("\"boom\""))
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.await_workflow_result("wf-bad", BRISK_POLL)
+            .await
+            .unwrap(),
+        AwaitedOutcome::Failed {
+            error: "\"boom\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        }
+    );
+}
+
+/// A void return is a success, not an absent result.
+#[tokio::test]
+async fn an_await_reports_a_void_return_as_a_success() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-void"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_workflow_outcome("wf-void", Outcome::Output(None))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        sys.await_workflow_result("wf-void", BRISK_POLL)
+            .await
+            .unwrap(),
+        AwaitedOutcome::Succeeded { output: None, .. }
+    ));
+}
+
+/// A workflow still running is waited on, and the wait ends when the outcome lands.
+#[tokio::test]
+async fn an_await_waits_for_a_workflow_that_has_not_finished() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-slow"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // Recorded by another handle, as the awaiting process never is the running one.
+    let finisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    let finishing = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        finisher
+            .record_workflow_outcome("wf-slow", Outcome::Output(Some("\"late\"")))
+            .await
+            .unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let settled = sys
+        .await_workflow_result("wf-slow", BRISK_POLL)
+        .await
+        .unwrap();
+    let waited = started.elapsed();
+    finishing.await.unwrap();
+
+    assert_eq!(
+        settled,
+        AwaitedOutcome::Succeeded {
+            output: Some("\"late\"".to_owned()),
+            serialization: Some("portable_json".to_owned()),
+        }
+    );
+    assert!(
+        waited >= BRIEFLY,
+        "it cannot have read an outcome that had not been recorded"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(5),
+        "waited {waited:?}"
+    );
+}
+
+/// Cancellation is a terminal state no run reports, and it is a value rather than an error.
+///
+/// Reporting it as `Error::WorkflowCancelled` would say the *waiter* had been cancelled, which is
+/// the distinction Python keeps by raising a separate error for the awaited workflow.
+#[tokio::test]
+async fn an_await_reports_a_cancelled_workflow_as_cancelled() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-doomed"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.cancel_workflows(&["wf-doomed"], false).await.unwrap();
+
+    assert_eq!(
+        sys.await_workflow_result("wf-doomed", BRISK_POLL)
+            .await
+            .unwrap(),
+        AwaitedOutcome::Cancelled
+    );
+}
+
+/// A parked workflow ends the wait too, carrying the attempt count.
+///
+/// It would otherwise be waited on forever: `MAX_RECOVERY_ATTEMPTS_EXCEEDED` is not terminal — the
+/// workflow can still be resumed — but nothing is running to produce an outcome.
+#[tokio::test]
+async fn an_await_reports_a_parked_workflow_rather_than_waiting_for_it() {
+    let (sys, _db) = sysdb().await;
+    let parked = workflow("wf-parked");
+    sys.init_workflow(&parked, None, Submission::Fresh)
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        if sys
+            .init_workflow(&parked, Some(2), Submission::Recovery)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    let settled = sys
+        .await_workflow_result("wf-parked", BRISK_POLL)
+        .await
+        .unwrap();
+    let AwaitedOutcome::Parked { recovery_attempts } = settled else {
+        panic!("expected a parked workflow, got {settled:?}");
+    };
+    assert!(
+        recovery_attempts > 2,
+        "the count that passed the limit, got {recovery_attempts}"
+    );
+}
+
+/// An absent row is reported rather than waited through, and a caller that wants to wait can.
+///
+/// The references take a `fail_if_missing` flag here and default it to waiting. This does not, so
+/// the deleted-mid-wait hang is unreachable for every caller rather than for the one that opts out;
+/// the cost is that holding an id from outside this process becomes a loop, which is what the second
+/// half of this test is.
+#[tokio::test]
+async fn an_absent_row_is_reported_and_a_caller_may_still_wait_for_one() {
+    let (sys, db) = sysdb().await;
+
+    let err = sys
+        .await_workflow_result("never-existed", BRISK_POLL)
+        .await
+        .expect_err("an id that names nothing has no outcome to wait for");
+    assert!(
+        matches!(err, Error::NonExistentWorkflow { ref workflow_ids } if workflow_ids == &["never-existed"]),
+        "got {err:?}"
+    );
+
+    // Enqueued by another process, after this one has already started waiting for it.
+    let inserting = tokio::spawn({
+        let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        async move {
+            tokio::time::sleep(BRIEFLY).await;
+            sys.init_workflow(&workflow("wf-later"), None, Submission::Fresh)
+                .await
+                .unwrap();
+            sys.record_workflow_outcome("wf-later", Outcome::Output(Some("\"arrived\"")))
+                .await
+                .unwrap();
+        }
+    });
+
+    // The loop the flag used to be. Readable here because the absence is a value to match on, which
+    // is the half of this that is a language difference: in Python the same loop is a `try`/`except`
+    // around a poll, and pushing it down into the system database is the more attractive option.
+    let settled = loop {
+        match sys.await_workflow_result("wf-later", BRISK_POLL).await {
+            Err(Error::NonExistentWorkflow { .. }) => tokio::time::sleep(BRISK_POLL).await,
+            other => break other.unwrap(),
+        }
+    };
+    inserting.await.unwrap();
+
+    assert_eq!(
+        settled,
+        AwaitedOutcome::Succeeded {
+            output: Some("\"arrived\"".to_owned()),
+            serialization: Some("portable_json".to_owned()),
+        }
+    );
 }
 
 /// The trait is usable behind a pointer, which is what keeps a second backend droppable in.
@@ -7759,4 +7974,20 @@ async fn a_replayed_bounce_reports_the_original_holder() {
         replayed, first,
         "the recorded holder is reported, not one re-read after it changed",
     );
+}
+
+/// TEMPORARY — deleted before commit. Does `1::int4` decode as `i32` on both backends?
+#[tokio::test]
+async fn temp_probe_literal_cast() {
+    let (_sys, db) = sysdb().await;
+    let pool = db.pool().await;
+
+    let plain: Result<Option<i32>, _> = sqlx::query_scalar("SELECT 1").fetch_optional(&pool).await;
+    eprintln!("PROBE plain `SELECT 1` as i32: {plain:?}");
+
+    let cast: Result<Option<i32>, _> = sqlx::query_scalar("SELECT 1::int4")
+        .fetch_optional(&pool)
+        .await;
+    eprintln!("PROBE `SELECT 1::int4` as i32: {cast:?}");
+    assert_eq!(cast.unwrap(), Some(1), "the cast form must decode as i32");
 }
