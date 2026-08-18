@@ -43,6 +43,7 @@ pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
 pub mod error;
 pub mod migrations;
+pub(crate) mod notify;
 pub mod postgres;
 pub mod retry;
 pub mod types;
