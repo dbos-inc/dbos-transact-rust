@@ -40,8 +40,8 @@
 //! worse, would disagree with the `id || '::' || key` that migration 1's trigger and every other
 //! SDK put on the wire.
 
-// The first caller arrives with `get_event`; until then nothing in the crate subscribes or wakes.
-// Remove this when that lands.
+// `get_event` subscribes and waits, but nothing pushes yet, so the wake paths and the other two
+// keys have no caller until `recv`, `read_stream_value` and the listener land. Remove this then.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

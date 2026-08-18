@@ -66,17 +66,20 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
+use super::notify::{Registry, event_key};
 use super::retry::{RetryPolicy, with_retry};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
-    DebounceRequest, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule,
-    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate,
-    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
-    duration_from_secs, is_valid_application_name, validate_attributes,
+    ApplicationRowCounts, Applications, AwaitedOutcome, BlockingCaller, Change, Debounce,
+    DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
+    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRecord,
+    Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -332,6 +335,14 @@ pub struct PostgresSystemDatabase {
     /// closes the pool, so every in-flight poll fails permanently and releases its permit, and a
     /// waiter parked here then acquires, queries, and gets the same failure one query later.
     polling: tokio::sync::Semaphore,
+    /// Who is waiting for what, so that something knowing a row was written can cut a wait short.
+    ///
+    /// **Nothing wakes it yet**, and every blocking read here is correct anyway: the wait loop is
+    /// what delivers, and this only ever shortens an interval. It is subscribed to from the first
+    /// caller rather than added alongside the listener because the ordering is the part that cannot
+    /// be retrofitted — a caller must be registered *before* it looks, or it misses whatever lands
+    /// between the look and the wait.
+    notify: Arc<Registry>,
 }
 
 impl PostgresSystemDatabase {
@@ -379,6 +390,7 @@ impl PostgresSystemDatabase {
                 pool.options().get_max_connections(),
             )),
             pool,
+            notify: Arc::default(),
             tables: Tables::new(config.settings.schema),
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
@@ -400,6 +412,7 @@ impl PostgresSystemDatabase {
                 pool.options().get_max_connections(),
             )),
             pool,
+            notify: Arc::default(),
             tables: Tables::new(settings.schema),
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
@@ -811,6 +824,35 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
 /// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`].
 const SLEEP_STEP_NAME: &str = "DBOS.sleep";
 
+/// Which of the two things a checkpointed sleep is.
+///
+/// Both write the same row under the same name and both return the same instant. What differs is
+/// the `completed_at` the step is stamped with, and so the duration every timeline and step
+/// aggregate reports for it.
+///
+/// **A 2–2 split across the references, but not a coin toss** — it splits by *caller*, and the two
+/// implementations that distinguish the callers do so explicitly. Python and TypeScript each carry
+/// a flag for exactly this (`project_completion_time`, `recordCompletionAtDeadline`), set for real
+/// sleeps and clear for the deadline `recv` and `get_event` register. Java projects both only
+/// because `recv` and `getEvent` call the very same `durableSleepEndTime` and it has no flag to do
+/// otherwise; Go never projects at all, so its sleeps look instantaneous.
+///
+/// Private, and the flag those two references expose is not on
+/// [`record_sleep`](SystemDatabase::record_sleep): a caller registering a deadline reaches for the
+/// blocking read, not for this. Nothing outside this module has both a reason to record a sleep and
+/// a reason to choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SleepKind {
+    /// A sleep the caller intends to wait out, stamped complete at the wake time — in the future
+    /// when the row is written, so a timeline shows an hour's sleep as an hour.
+    Durable,
+    /// A deadline the caller registers and usually abandons early, stamped complete now.
+    ///
+    /// Projecting here would report a `get_event` that answered in 200ms under a 60s timeout as a
+    /// minute-long operation, in every step aggregate and on every Conductor timeline.
+    Deadline,
+}
+
 /// The encoding this layer uses for values it produces itself.
 ///
 /// Distinct from the workflow's own format: a sleep's wake time is a plain number written and
@@ -858,6 +900,22 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
 /// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
 const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
+
+/// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`]: all four
+/// implementations record exactly `"DBOS.getEvent"`.
+const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
+
+/// How long a blocking read waits before looking at the database again.
+///
+/// **This is the delivery latency, not a fallback interval.** Nothing pushes yet, so whatever this
+/// is, it is how long a `get_event` takes to see a value another process has already committed.
+/// One second is what every reference does when it has no push transport running — Python without
+/// a listener, and Java always. TypeScript's 10s is not a counterexample: it is a fallback beneath
+/// a listener that does the delivering, and copying the number without the listener would be a
+/// tenfold regression against the rest.
+///
+/// It becomes a fallback when the listener lands, and gets Python's 60s in that configuration.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The step a debounce records when a workflow does the bouncing.
 ///
@@ -1506,6 +1564,97 @@ fn step_from_row(row: &sqlx::postgres::PgRow, workflow_id: &str) -> Result<StepR
             .try_get::<Option<i64>, _>("completed_at_epoch_ms")?
             .map(Timestamp::from_epoch_ms),
     })
+}
+
+impl PostgresSystemDatabase {
+    /// [`record_sleep`](SystemDatabase::record_sleep), for both kinds of caller.
+    ///
+    /// The trait exposes only the sleep. The deadline a blocking read registers is the same
+    /// checkpoint — same step name, same recorded wake time, same replay — differing in the
+    /// `completed_at` it is stamped with, and [`SleepKind`] says why that is a distinction worth
+    /// making.
+    async fn checkpoint_sleep(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        duration: Duration,
+        kind: SleepKind,
+    ) -> Result<Timestamp, Error> {
+        let pool = &self.pool;
+        // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
+        // the clock per attempt would push it further out each time.
+        let started_at = Timestamp::now();
+        let wake_at =
+            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
+
+        with_retry(&self.retry, "checkpoint_sleep", move || async move {
+            // No transaction, unlike `set_event`: there is no separate write to orphan here —
+            // the step record *is* the write, and the wake time is its output. The check-then-
+            // record race is caught by the insert's `ON CONFLICT` below, and the insert and the
+            // executor claim inside `record_step_on` are safe by their ordering.
+            let mut conn = pool.acquire().await?;
+
+            // A replay wakes at the *original* instant. Starting the clock again would make a
+            // workflow that crashed fifty minutes into an hour sleep another full hour.
+            if let Some(step) = self
+                .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                .await?
+            {
+                tracing::debug!(workflow_id, step_id, "replaying sleep");
+                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
+            }
+            tracing::debug!(
+                workflow_id,
+                step_id,
+                duration_ms = duration.as_millis() as u64,
+                "running sleep"
+            );
+
+            let recorded = wake_at.as_epoch_ms().to_string();
+            let timing = StepTiming {
+                started_at,
+                // A sleep is stamped complete at its wake time, which is in the future — so the
+                // step's recorded duration is the sleep. A deadline is stamped now, because the
+                // caller registering it usually returns long before it. Both are fixed outside the
+                // retry, since `completed_at` is also the token that recognises this caller's own
+                // write after a lost acknowledgement.
+                completed_at: match kind {
+                    SleepKind::Durable => wake_at,
+                    SleepKind::Deadline => started_at,
+                },
+            };
+            match self
+                .record_step_on(
+                    &mut conn,
+                    workflow_id,
+                    step_id,
+                    SLEEP_STEP_NAME,
+                    Outcome::Output(Some(&recorded)),
+                    Some(PORTABLE_JSON),
+                    Some(timing),
+                )
+                .await
+            {
+                Ok(()) => Ok(wake_at),
+                // A rival recorded the sleep between our check and our write. Its wake time is
+                // the one every execution must agree on, so adopt it rather than returning ours.
+                // Python swallows this and returns its own, which two runs would disagree about.
+                Err(Error::StepAlreadyRecorded { .. }) => {
+                    let step = self
+                        .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Malformed(
+                                "sleep reported as recorded but cannot be read back".to_owned(),
+                            )
+                        })?;
+                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+    }
 }
 
 impl PostgresSystemDatabase {
@@ -3431,74 +3580,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         duration: Duration,
     ) -> Result<Timestamp, Error> {
-        let pool = &self.pool;
-        // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
-        // the clock per attempt would push it further out each time.
-        let started_at = Timestamp::now();
-        let wake_at =
-            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
-
-        with_retry(&self.retry, "record_sleep", move || async move {
-            // No transaction, unlike `set_event`: there is no separate write to orphan here —
-            // the step record *is* the write, and the wake time is its output. The check-then-
-            // record race is caught by the insert's `ON CONFLICT` below, and the insert and the
-            // executor claim inside `record_step_on` are safe by their ordering.
-            let mut conn = pool.acquire().await?;
-
-            // A replay wakes at the *original* instant. Starting the clock again would make a
-            // workflow that crashed fifty minutes into an hour sleep another full hour.
-            if let Some(step) = self
-                .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
-                .await?
-            {
-                tracing::debug!(workflow_id, step_id, "replaying sleep");
-                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
-            }
-            tracing::debug!(
-                workflow_id,
-                step_id,
-                duration_ms = duration.as_millis() as u64,
-                "running sleep"
-            );
-
-            let recorded = wake_at.as_epoch_ms().to_string();
-            let timing = StepTiming {
-                started_at,
-                // The wake time, which is in the future — so the step's recorded duration is the
-                // sleep. Java does the same; nothing in execution or recovery reads the column.
-                completed_at: wake_at,
-            };
-            match self
-                .record_step_on(
-                    &mut conn,
-                    workflow_id,
-                    step_id,
-                    SLEEP_STEP_NAME,
-                    Outcome::Output(Some(&recorded)),
-                    Some(PORTABLE_JSON),
-                    Some(timing),
-                )
-                .await
-            {
-                Ok(()) => Ok(wake_at),
-                // A rival recorded the sleep between our check and our write. Its wake time is
-                // the one every execution must agree on, so adopt it rather than returning ours.
-                // Python swallows this and returns its own, which two runs would disagree about.
-                Err(Error::StepAlreadyRecorded { .. }) => {
-                    let step = self
-                        .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Malformed(
-                                "sleep reported as recorded but cannot be read back".to_owned(),
-                            )
-                        })?;
-                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await
+        self.checkpoint_sleep(workflow_id, step_id, duration, SleepKind::Durable)
+            .await
     }
 
     async fn set_event(
@@ -3576,6 +3659,192 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             tx.commit().await?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_event(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+        caller: Option<BlockingCaller<'_>>,
+    ) -> Result<Option<EncodedValue>, Error> {
+        let events_table = self.tables.workflow_events.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // One statement, and the pass that finds a row is the one that answers the call. A miss
+        // carries nothing back whatever the select list says, so asking only whether the key exists
+        // would buy nothing and would leave the value still to be fetched.
+        let select = format!(
+            "SELECT value, serialization FROM {events_table} WHERE workflow_uuid = $1 AND key = $2"
+        );
+        let select = &select;
+        // When the step began, for the step it records at the end — so a workflow's timeline shows
+        // the wait, not the instant the answer was written down.
+        let started_at = Timestamp::now();
+
+        // A replay returns what the first run saw and does not wait again. Including the `None` a
+        // timeout produced: that is a result, and re-running the wait would let a value that
+        // arrived late change a decision the workflow has already taken.
+        if let Some(caller) = caller
+            && let Some(step) = self
+                .check_step(caller.workflow_id, caller.step_id, GET_EVENT_STEP_NAME)
+                .await?
+        {
+            tracing::debug!(
+                workflow_id = caller.workflow_id,
+                step_id = caller.step_id,
+                key,
+                "replaying get_event"
+            );
+            return Ok(step.output.map(|value| EncodedValue {
+                value,
+                serialization: step.serialization,
+            }));
+        }
+
+        // **Before the first look, never after.** A caller that looked first and registered second
+        // would miss anything written in between and then wait out its whole timeout for a value
+        // already in the table. Nothing wakes this yet — the loop below delivers on its own — but
+        // the ordering is what makes a wakeup safe to add.
+        let mut subscription = self.notify.subscribe(event_key(workflow_id, key));
+
+        // Recorded whether or not the value turns out to be there already, so which steps a run
+        // writes does not depend on how a race went. A recovery gets the original instant back, so
+        // a read that waited fifty of its sixty seconds and crashed has ten left rather than sixty.
+        let deadline = match caller {
+            Some(caller) => {
+                self.checkpoint_sleep(
+                    caller.workflow_id,
+                    caller.timeout_step_id,
+                    timeout,
+                    SleepKind::Deadline,
+                )
+                .await?
+            }
+            // A timeout so large it cannot be represented is one that never elapses, which is what
+            // the caller asked for.
+            None => started_at
+                .checked_add(timeout)
+                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX)),
+        };
+
+        // Look, wait a bounded interval, look again. **This loop is what delivers** — a wakeup only
+        // ever shortens the interval, so the wait is correct with nothing pushing at all, which is
+        // every SDK's CockroachDB configuration and this crate's CI.
+        let found = loop {
+            let row = with_retry(&self.retry, "get_event", move || async move {
+                // Inside the retried region, so a look that is backing off is not holding a permit
+                // through its backoff — and dropped before the wait below, so a caller parked
+                // between looks holds nothing. See the `polling` field for why a cap on waiters
+                // rather than on queries would deadlock.
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
+                Ok(sqlx::query(AssertSqlSafe(select.clone()))
+                    .bind(workflow_id)
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?)
+            })
+            .await?;
+            if let Some(row) = row {
+                break Some(EncodedValue {
+                    value: row.try_get("value")?,
+                    serialization: row.try_get("serialization")?,
+                });
+            }
+
+            let Some(remaining) = deadline.duration_since(Timestamp::now()) else {
+                break None;
+            };
+            if remaining.is_zero() {
+                break None;
+            }
+            // Wait to be woken, but not past whichever bound comes first. The interval caps it so
+            // that a wakeup nothing sends — or one that is dropped — costs one interval rather than
+            // the whole timeout; the remaining time caps it so a wait never overruns the deadline.
+            // Elapsing is not an error here: both outcomes mean the same thing, which is look
+            // again.
+            let _ = tokio::time::timeout(remaining.min(RECHECK_INTERVAL), subscription.notified())
+                .await;
+        };
+        // Nothing below waits, and the registration is only worth its map entry while something
+        // does.
+        drop(subscription);
+
+        // **Outside a workflow this is the whole call.** There is no step to record, so there is
+        // nothing for a transaction to be atomic with — and the last look the loop took is the
+        // answer. TypeScript returns its polled row the same way.
+        let Some(caller) = caller else {
+            tracing::debug!(
+                workflow_id,
+                key,
+                found = found.is_some(),
+                "get_event finished"
+            );
+            return Ok(found);
+        };
+
+        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
+        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+        let found = found.as_ref();
+
+        // Two statements, and they have to be one commit: whether to record and the recording. The
+        // check that opened the call cannot stand in for this one, because the wait between them is
+        // exactly when another execution of this workflow would have recorded its own answer.
+        with_retry(&self.retry, "get_event", move || async move {
+            let mut tx = pool.begin().await?;
+            if let Some(step) = self
+                .check_step_on(
+                    &mut tx,
+                    caller.workflow_id,
+                    caller.step_id,
+                    GET_EVENT_STEP_NAME,
+                )
+                .await?
+            {
+                tx.commit().await?;
+                tracing::debug!(
+                    workflow_id = caller.workflow_id,
+                    step_id = caller.step_id,
+                    key,
+                    "adopting a rival execution's get_event"
+                );
+                return Ok(step.output.map(|value| EncodedValue {
+                    value,
+                    serialization: step.serialization,
+                }));
+            }
+
+            // The event's own encoded value under the event's own format, not a wrapper around the
+            // pair — so the column holds what the publisher wrote and stays legible to whoever
+            // reads the row, this crate included. All four references record exactly this. A
+            // timeout records a NULL output, which is how they spell "there was nothing" too.
+            self.record_step_on(
+                &mut tx,
+                caller.workflow_id,
+                caller.step_id,
+                GET_EVENT_STEP_NAME,
+                Outcome::Output(found.map(|v| v.value.as_str())),
+                found.and_then(|v| v.serialization.as_deref()),
+                Some(timing),
+            )
+            .await?;
+            tx.commit().await?;
+            tracing::debug!(
+                workflow_id = caller.workflow_id,
+                step_id = caller.step_id,
+                key,
+                found = found.is_some(),
+                "get_event finished"
+            );
+            Ok(found.cloned())
         })
         .await
     }

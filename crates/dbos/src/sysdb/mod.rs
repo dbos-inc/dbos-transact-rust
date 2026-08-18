@@ -57,12 +57,12 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EventRecord,
-    Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
-    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, Applications, AwaitedOutcome, BlockingCaller, Debounce, DebounceRequest,
+    EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule,
+    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
+    QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus,
+    ScheduleUpdate, StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -76,7 +76,9 @@ use types::{
 ///
 /// The methods that must be atomic with the step recording them take a `caller: Option<(&str,
 /// i32)>` — a workflow id and step id — and own the transaction internally, rather than taking a
-/// caller's connection the way Python and TypeScript do.
+/// caller's connection the way Python and TypeScript do. The blocking reads take a
+/// [`BlockingCaller`] instead, which is the same thing plus the step their deadline is recorded
+/// under.
 ///
 /// TODO(dbos-team): UPSTREAM item 13, the shape itself. Threading a `PoolClient` or `sa.Connection` through the
 /// system database makes atomicity the call site's job to remember, and is the part that would not
@@ -540,17 +542,14 @@ pub trait SystemDatabase: Send + Sync {
     /// The step's `completed_at` is stamped at the **wake time**, which is in the future when
     /// the row is written — so a timeline shows an hour's sleep as an hour rather than as an
     /// instant. Nothing in execution or recovery reads that column; it is for step aggregates,
-    /// metrics, and Conductor.
+    /// metrics, and Conductor. Java does the same; Go never projects, so its sleeps look
+    /// instantaneous.
     ///
-    /// Java does the same unconditionally. Go never projects, so its sleeps look instantaneous.
-    /// Python alone distinguishes the two with a `project_completion_time` flag, leaving it off
-    /// for `recv` and `get_event`, which register a deadline they may abandon early and would
-    /// otherwise be recorded as having waited the whole timeout.
-    ///
-    /// TODO: revisit when `recv` and `get_event` land. They are the only callers that would ever
-    /// want the other behaviour, and both are blocked on Stage 4's notifier. A first pass modelled
-    /// Python's flag as a `SleepKind` enum and dropped it: a 1-of-4 divergence, over a column
-    /// nothing executes on, decided before either caller existed. Decide it with them.
+    /// The deadline [`get_event`](Self::get_event) registers is the same checkpoint with the
+    /// opposite stamping, since a read that answers in milliseconds under a minute's timeout has
+    /// not taken a minute. Python and TypeScript expose that as a flag on this method; here it is
+    /// the implementation's business, because no caller of *this* method wants it — a caller
+    /// registering a deadline is calling the blocking read, not recording a sleep by hand.
     async fn record_sleep(
         &self,
         workflow_id: &str,
@@ -580,6 +579,54 @@ pub trait SystemDatabase: Send + Sync {
         value: &str,
         serialization: Option<&str>,
     ) -> Result<(), Error>;
+
+    /// Reads a key another workflow published, waiting up to `timeout` for it to appear.
+    ///
+    /// The read counterpart of [`set_event`](Self::set_event). `workflow_id` is the workflow being
+    /// read *from*; `caller`, if any, is the workflow doing the reading.
+    ///
+    /// **Absence is a value, not an error.** `Ok(None)` means the key was not there when the
+    /// deadline passed, which is indistinguishable from the key never being set — the same answer
+    /// Python and TypeScript return. Go raises a timeout error instead, but it does so in its
+    /// engine, above the layer this trait describes, and an error is the one thing a caller cannot
+    /// synthesise if it wanted the other shape.
+    ///
+    /// **How it waits.** Subscribe, look, wait a bounded interval, look again. The loop is what
+    /// delivers: a wakeup only ever says "look again", never what changed, so with no wakeups at
+    /// all this still returns as soon as the next interval comes round. That is not a degraded
+    /// mode — CockroachDB has no `LISTEN`/`NOTIFY`, so it is every SDK's Cockroach configuration
+    /// and this crate's CI.
+    ///
+    /// **The caller's cancellation is the caller's business.** A `get_event` in a workflow
+    /// cancelled mid-wait runs to its deadline here; TypeScript re-checks the caller's status every
+    /// interval, which costs a second query per pass to do what dropping the future does for free.
+    /// Python does not check either. Same position as
+    /// [`await_workflow_result`](Self::await_workflow_result): a caller that wants to stop sooner
+    /// drops the future.
+    ///
+    /// **Inside a workflow it is two checkpoints, not one.** `caller.step_id` records the read, so
+    /// a replay returns the value the first run saw rather than waiting again — including the
+    /// `None` a timeout produced, which is a result like any other. `caller.timeout_step_id`
+    /// records the deadline as a `DBOS.sleep` before the first wait, so a recovery resumes the
+    /// original deadline instead of restarting the timeout. It is stamped complete now rather than
+    /// at the deadline — see [`record_sleep`](Self::record_sleep) for the distinction. The deadline is recorded
+    /// whether or not the value happens to be there already, so the steps a run records do not
+    /// depend on how a race went.
+    ///
+    /// Outside a workflow there is neither: the deadline is the wall clock, nothing is recorded,
+    /// and the look that ended the wait is the whole answer.
+    ///
+    /// **Each look takes a connection**, so they run under the polling concurrency cap — the same
+    /// one [`await_workflow_result`](Self::await_workflow_result) waits under, and for the same
+    /// reason. The step record is not a poll and does not run under it: it happens once, after the
+    /// waiting is over.
+    async fn get_event(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+        caller: Option<BlockingCaller<'_>>,
+    ) -> Result<Option<EncodedValue>, Error>;
 
     /// Every message sent to a workflow, oldest first, consumed or not.
     ///

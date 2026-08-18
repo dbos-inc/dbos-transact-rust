@@ -1671,6 +1671,47 @@ pub struct NotificationRecord {
     pub consumed: bool,
 }
 
+/// The workflow a blocking read runs on behalf of, and the steps it records against.
+///
+/// A struct where every other method here takes `caller: Option<(&str, i32)>`, because this one
+/// carries **two** step ids and they are not interchangeable: one records the read itself, the
+/// other the deadline it waits until. `Some(("wf", 4, 5))` says nothing about which is which, and
+/// transposing them is a mistake nothing catches until a recovery replays the wrong step under the
+/// wrong name. Every reference passes these three together too — Python's
+/// `GetEventWorkflowContext`, TypeScript's `{workflowID, functionID, timeoutFunctionID}`.
+///
+/// `None` at the call site is a caller outside a workflow: it has no steps to record and nothing
+/// to replay, so it waits on the wall clock and returns whatever it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockingCaller<'a> {
+    /// The workflow doing the reading — the caller, never the workflow being read from.
+    pub workflow_id: &'a str,
+    /// The step the read itself is recorded under, which is what makes it replay rather than
+    /// wait a second time.
+    pub step_id: i32,
+    /// The step the deadline is checkpointed under, recorded as a `DBOS.sleep` the caller may
+    /// abandon early rather than one it waits out.
+    ///
+    /// Separate from `step_id` because a recovery has to resume the *same* deadline rather than
+    /// start the timeout again — a read that waited fifty of its sixty seconds and crashed has ten
+    /// left.
+    pub timeout_step_id: i32,
+}
+
+/// An encoded payload and the format it is encoded in.
+///
+/// What the blocking reads return: this layer moves payloads as opaque strings and never decodes
+/// one, so the format has to travel with the value for the caller to make sense of it.
+/// [`get_event`](crate::sysdb::SystemDatabase::get_event) returns this; `recv` and
+/// `read_stream_value` will return it too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedValue {
+    /// The payload, exactly as it was stored.
+    pub value: String,
+    /// How `value` is encoded, or `None` if whoever wrote it recorded no format.
+    pub serialization: Option<String>,
+}
+
 /// A key/value a workflow published, as `workflow_events` holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventRecord {
