@@ -203,6 +203,20 @@ pub struct Settings<'a> {
     /// Not an identity of the process, which is [`executor_id`](Self::executor_id): several
     /// executors of one application share a name, and that is the point of having one.
     pub application_name: Option<&'a str>,
+    /// How many polling reads may run at once against this handle's pool.
+    ///
+    /// Every wait here is a loop that re-queries the database, and each pass takes a connection.
+    /// Uncapped, enough waiters empty the pool and starve the control plane — enqueue, dequeue,
+    /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
+    /// longer happen.
+    ///
+    /// `None` is half the pool and at least one, which is Python's default
+    /// (`sys_db_polling_concurrency`) and TypeScript's. `Some(0)` switches the cap off, which the
+    /// references spell as any non-positive number.
+    ///
+    /// Named without a `sys_db_` prefix, unlike Python: that prefix distinguishes the system
+    /// database's pool from its others, and this field already sits on a `sysdb` type.
+    pub polling_concurrency: Option<u32>,
 }
 
 impl Default for Settings<'_> {
@@ -216,6 +230,7 @@ impl Default for Settings<'_> {
             retry: RetryPolicy::default(),
             executor_id: None,
             application_name: None,
+            polling_concurrency: None,
         }
     }
 }
@@ -261,6 +276,28 @@ impl<'a> Config<'a> {
 }
 
 /// A system database backed by PostgreSQL or CockroachDB.
+/// The polling cap for a pool of `pool_size` connections.
+///
+/// `configured` is the caller's choice: `None` takes the default, and `Some(0)` switches the cap
+/// off. Python and TypeScript spell the second as any non-positive number, which they need because
+/// their integers are signed and their configuration untyped; here the only unsigned value that can
+/// mean "off" is zero.
+///
+/// **The default is half the pool, and at least one.** Both references use exactly this, and the
+/// half is what leaves the other half for the control plane. The minimum matters at
+/// `max_connections = 1`, where half is zero — and a cap of zero would not be a small budget but a
+/// permanent block, the opposite of what a caller asking for a small pool wants.
+///
+/// Off is a permit count nothing will exhaust rather than an absent semaphore, so the handle holds
+/// one unconditional [`Semaphore`](tokio::sync::Semaphore) with no branch on the acquire path.
+fn polling_limit(configured: Option<u32>, pool_size: u32) -> usize {
+    match configured {
+        Some(0) => tokio::sync::Semaphore::MAX_PERMITS,
+        Some(n) => n as usize,
+        None => usize::max((pool_size / 2) as usize, 1),
+    }
+}
+
 pub struct PostgresSystemDatabase {
     pool: PgPool,
     /// Schema-qualified, quoted table names, built once.
@@ -273,6 +310,28 @@ pub struct PostgresSystemDatabase {
     /// The application every row this handle writes is stamped with. See
     /// [`Settings::application_name`].
     application_name: Option<String>,
+    /// Bounds the concurrent polling reads this handle's waits make.
+    ///
+    /// Every wait here is a loop that re-queries the database, and each pass takes a connection.
+    /// Uncapped, enough waiters empty the pool and starve the control plane — enqueue, dequeue,
+    /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
+    /// longer happen. Python and TypeScript cap the same thing the same way; see
+    /// [`Settings::polling_concurrency`] for the size and [`polling_limit`] for the default.
+    ///
+    /// **A permit covers one query, never a wait.** A call site acquires, queries, and lets the
+    /// permit drop before waiting. Held across the wait it would cap concurrent *waiters* rather
+    /// than concurrent queries, and one pool's worth of them would block every later one forever —
+    /// a deadlock assembled from operations that are individually fine.
+    ///
+    /// **It goes inside the retry loop, not around it.** A poll that failed and is backing off is
+    /// asleep, not querying, so a permit held through the backoff is held for up to a minute.
+    /// Python says the same at each of its call sites: "under the limiter, inside `db_retry` so the
+    /// permit frees across backoff."
+    ///
+    /// Never closed, which is what makes `acquire` infallible at the call sites. Closing the handle
+    /// closes the pool, so every in-flight poll fails permanently and releases its permit, and a
+    /// waiter parked here then acquires, queries, and gets the same failure one query later.
+    polling: tokio::sync::Semaphore,
 }
 
 impl PostgresSystemDatabase {
@@ -313,6 +372,12 @@ impl PostgresSystemDatabase {
         })?;
 
         Ok(Self {
+            // The cap's default is read off the pool rather than off `config.max_connections`, so
+            // that it is the same expression here and in `from_pool`, which never sees a `Config`.
+            polling: tokio::sync::Semaphore::new(polling_limit(
+                config.settings.polling_concurrency,
+                pool.options().get_max_connections(),
+            )),
             pool,
             tables: Tables::new(config.settings.schema),
             retry: config.settings.retry,
@@ -329,6 +394,11 @@ impl PostgresSystemDatabase {
     /// describe a handle rather than a constructor plus a set of chained overrides.
     pub fn from_pool(pool: PgPool, settings: &Settings<'_>) -> Self {
         Self {
+            // A caller's pool knows its own size, so the default needs nothing passed alongside it.
+            polling: tokio::sync::Semaphore::new(polling_limit(
+                settings.polling_concurrency,
+                pool.options().get_max_connections(),
+            )),
             pool,
             tables: Tables::new(settings.schema),
             retry: settings.retry,
@@ -2254,11 +2324,20 @@ impl SystemDatabase for PostgresSystemDatabase {
              FROM {workflow_table} WHERE workflow_uuid = $1"
         );
         let select = &select;
+        let polling = &self.polling;
 
         loop {
             // Inside the loop, so a transient failure is retried by the policy and a lasting one
             // reaches the caller rather than being swallowed by the wait.
             let row = with_retry(&self.retry, "await_workflow_result", move || async move {
+                // Inside the retried region, so a poll that is backing off is not holding a permit
+                // for the length of its backoff. Released before the sleep below too, so a waiter
+                // parked between polls holds nothing: the cap bounds concurrent *queries*, and one
+                // that bounded concurrent waiters would deadlock at the first pool's worth of them.
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
                 Ok(sqlx::query(AssertSqlSafe(select.clone()))
                     .bind(workflow_id)
                     .fetch_optional(pool)
@@ -3265,6 +3344,10 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn close(&self) {
+        // Closing the pool is the whole of it, including for the waits parked on a polling permit:
+        // every in-flight poll's query fails permanently and releases its permit, so a parked
+        // waiter acquires, queries, and gets the same failure. An earlier version also closed the
+        // limiter to end those waits one query sooner; deleting it failed no test, so it is gone.
         self.pool.close().await;
     }
 
@@ -5242,7 +5325,36 @@ impl SystemDatabase for PostgresSystemDatabase {
 
 #[cfg(test)]
 mod tests {
-    use super::split_database;
+    use super::{polling_limit, split_database};
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn the_default_polling_cap_is_half_the_pool() {
+        assert_eq!(polling_limit(None, 10), 5);
+        assert_eq!(polling_limit(None, 21), 10);
+    }
+
+    /// Half of one is zero, which as a cap would block every poll forever rather than allow a
+    /// small number of them.
+    #[test]
+    fn a_pool_too_small_to_halve_still_admits_one_poll() {
+        assert_eq!(polling_limit(None, 1), 1);
+        assert_eq!(polling_limit(None, 0), 1);
+    }
+
+    #[test]
+    fn a_configured_polling_cap_is_taken_as_given() {
+        assert_eq!(polling_limit(Some(3), 10), 3);
+        // Above the pool size is the caller's business: this caps polling, the pool caps
+        // connections. Neither reference rejects it either.
+        assert_eq!(polling_limit(Some(100), 10), 100);
+    }
+
+    /// Off is a permit count nothing will exhaust, not an absent semaphore.
+    #[test]
+    fn zero_switches_the_polling_cap_off() {
+        assert_eq!(polling_limit(Some(0), 10), Semaphore::MAX_PERMITS);
+    }
 
     #[test]
     fn splits_a_url_into_its_maintenance_form_and_database() {

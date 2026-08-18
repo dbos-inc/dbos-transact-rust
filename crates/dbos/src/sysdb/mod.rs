@@ -182,11 +182,18 @@ pub trait SystemDatabase: Send + Sync {
     /// Cancellation and dead-lettering are reported as values rather than errors; see [`AwaitedOutcome`]
     /// for why that is not merely convenient.
     ///
-    /// **Each poll takes a connection for the length of a query.** A hundred waiters are a hundred
-    /// queries per interval, so this belongs under the same concurrency cap as the other waits that
-    /// re-check the database — Python caps them together at half its pool with
-    /// `sys_db_polling_concurrency`. There is no such cap in this crate yet, and this method is one
-    /// of the reasons to add one.
+    /// **Each poll takes a connection for the length of a query**, so this waits under the polling
+    /// concurrency cap — half the pool by default, configured by
+    /// [`Settings::polling_concurrency`](postgres::Settings::polling_concurrency). Python caps the
+    /// same waits together at half its pool with `sys_db_polling_concurrency`, and TypeScript has
+    /// the equivalent. A hundred uncapped waiters are a hundred queries per interval, which empties
+    /// the pool and starves the control plane — leaving those waiters blocked on writes that can no
+    /// longer happen.
+    ///
+    /// The permit covers the query and not the wait: it is taken inside the retried region and
+    /// released before the interval sleep, so a waiter parked between polls holds nothing. A cap on
+    /// concurrent *waiters* rather than concurrent queries would deadlock at the first pool's worth
+    /// of them.
     async fn await_workflow_result(
         &self,
         workflow_id: &str,

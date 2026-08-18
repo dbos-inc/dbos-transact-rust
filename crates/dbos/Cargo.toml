@@ -41,8 +41,8 @@ serde_json = "1"
 # wire format — a step is replayed by the SDK that wrote it — so the derived shape is ours to
 # choose, and choosing it by hand for each type was the alternative.
 serde = { version = "1", features = ["derive"] }
-# `time` only, for backoff between retries.
-tokio = { version = "1", features = ["time"] }
+# `time` for backoff between retries; `sync` for the semaphore capping concurrent polling reads.
+tokio = { version = "1", features = ["time", "sync"] }
 # `workflow_schedules.last_fired_at` is ISO-8601 text rather than the epoch milliseconds every
 # other time column holds, so one column needs a calendar. `std` has none — `SystemTime` and
 # `Duration` and nothing else — and the alternative was hand-written civil-date arithmetic to

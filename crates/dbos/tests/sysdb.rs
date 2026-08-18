@@ -596,6 +596,124 @@ async fn an_await_waits_for_a_workflow_that_has_not_finished() {
     );
 }
 
+/// A cap of one must not starve the waiters it is not currently admitting.
+///
+/// The whole design of the polling cap rests on a permit covering the *query* and never the wait.
+/// Held across the interval sleep instead, one waiter on a workflow that never finishes would hold
+/// the only permit for the life of the process, and every other waiter would block behind it — not
+/// slowly, but forever.
+///
+/// The never-finishing waiter is the point. An earlier version of this test finished every
+/// workflow, which a permit held across the wait survives comfortably: the waiters merely serialise,
+/// each releasing as its own answer arrives. Verified by mutation — hoisting the permit out of the
+/// retried region must fail this test, and against that earlier version it did not.
+#[tokio::test]
+async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            polling_concurrency: Some(1),
+            ..Settings::default()
+        },
+    ));
+
+    const OTHERS: usize = 4;
+    let ids: Vec<String> = (0..OTHERS).map(|i| format!("wf-capped-{i}")).collect();
+    for id in std::iter::once(&"wf-never".to_owned()).chain(ids.iter()) {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+
+    // First, and given a head start, so it is the one holding the permit if the permit is held.
+    let forever = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move { sys.await_workflow_result("wf-never", BRISK_POLL).await })
+    };
+    tokio::time::sleep(BRIEFLY).await;
+
+    let waiting: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let (sys, id) = (std::sync::Arc::clone(&sys), id.clone());
+            tokio::spawn(async move { sys.await_workflow_result(&id, BRISK_POLL).await })
+        })
+        .collect();
+    tokio::time::sleep(BRIEFLY).await;
+
+    let finisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    for id in &ids {
+        finisher
+            .record_workflow_outcome(id, Outcome::Output(Some("\"done\"")))
+            .await
+            .unwrap();
+    }
+
+    for (id, handle) in ids.iter().zip(waiting) {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .unwrap_or_else(|_| panic!("{id} starved: a permit is being held across a wait"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settled,
+            AwaitedOutcome::Succeeded {
+                output: Some("\"done\"".to_owned()),
+                serialization: Some("portable_json".to_owned()),
+            }
+        );
+    }
+
+    // Still waiting, as it should be, and dropped rather than awaited.
+    assert!(!forever.is_finished());
+    forever.abort();
+}
+
+/// A wait on a closed handle reports rather than hanging, including one parked on a polling permit.
+///
+/// Run at a cap of one with the permit held by the waiter itself, so this covers the case that once
+/// argued for closing the limiter alongside the pool: closing the pool is enough on its own, since
+/// every in-flight poll then fails permanently and releases its permit. Verified by mutation — the
+/// limiter close was deleted and no test failed, which is why it is not there.
+#[tokio::test]
+async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
+    let db = test_database().await;
+    // One permit, and it is held by the waiter below, so the second wait can only be ended by the
+    // close itself.
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            polling_concurrency: Some(1),
+            ..Settings::default()
+        },
+    ));
+    sys.init_workflow(&workflow("wf-closing"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let waiting = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.await_workflow_result("wf-closing", BRISK_POLL)
+                .await
+                .map(|_| ())
+        })
+    };
+    // Parked rather than not yet scheduled.
+    tokio::time::sleep(BRIEFLY).await;
+
+    sys.close().await;
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(20), waiting)
+        .await
+        .expect("closing the handle left a waiter parked")
+        .unwrap();
+    assert!(
+        ended.is_err(),
+        "a wait on a closed handle must report rather than succeed"
+    );
+}
+
 /// Cancellation is a terminal state no run reports, and it is a value rather than an error.
 ///
 /// Reporting it as `Error::WorkflowCancelled` would say the *waiter* had been cancelled, which is
