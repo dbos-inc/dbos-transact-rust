@@ -1412,7 +1412,11 @@ async fn results_are_ordered_and_pageable() {
 #[tokio::test]
 async fn payloads_can_be_left_unloaded() {
     use dbos::sysdb::types::WorkflowFilter as F;
-    let (sys, db) = sysdb().await;
+    // `_db` rather than `db`: the lease has to outlive every query below. Dropping it early
+    // returns the database to the pool while this test is still reading, so another test leases it
+    // and `reset()`s it — deleting these rows underneath the assertions. That is what this test did
+    // until 2026-08-18, and it hung CI for six hours.
+    let (sys, _db) = sysdb().await;
     let wf = NewWorkflow {
         input: Some(r#"{"positionalArgs":[1]}"#),
         ..NewWorkflow::new("wf-payload")
@@ -1423,7 +1427,6 @@ async fn payloads_can_be_left_unloaded() {
     sys.record_workflow_outcome("wf-payload", Outcome::Output(Some("42")))
         .await
         .unwrap();
-    drop(db);
 
     let loaded = &sys.list_workflows(&F::default()).await.unwrap()[0];
     assert_eq!(loaded.input.as_deref(), Some(r#"{"positionalArgs":[1]}"#));
