@@ -76,9 +76,9 @@ use types::{
 ///
 /// The methods that must be atomic with the step recording them take a `caller: Option<(&str,
 /// i32)>` — a workflow id and step id — and own the transaction internally, rather than taking a
-/// caller's connection the way Python and TypeScript do. The blocking reads take a
-/// [`BlockingCaller`] instead, which is the same thing plus the step their deadline is recorded
-/// under.
+/// caller's connection the way Python and TypeScript do. [`get_event`](SystemDatabase::get_event)
+/// takes a [`BlockingCaller`] instead — the same thing plus the step its deadline is recorded
+/// under — because there the caller is optional and a wrapped `Option` is what reads.
 ///
 /// TODO(dbos-team): UPSTREAM item 13, the shape itself. Threading a `PoolClient` or `sa.Connection` through the
 /// system database makes atomicity the call site's job to remember, and is the part that would not
@@ -412,6 +412,59 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
     ) -> Result<(), Error>;
+
+    /// Takes the oldest message sent to a workflow, waiting up to `timeout` for one to arrive.
+    ///
+    /// The read counterpart of [`send_messages`](Self::send_messages), and the consuming one: a
+    /// message is delivered exactly once, marked `consumed` rather than deleted so that what a
+    /// workflow was sent stays visible to export and audit.
+    ///
+    /// **The caller is not optional, unlike [`get_event`](Self::get_event)'s** — and so it is not a
+    /// [`BlockingCaller`] either. All four implementations require a workflow, and the workflow
+    /// receiving *is* the workflow calling, so `workflow_id` is the destination and the step owner
+    /// at once. A client outside a workflow has
+    /// [`get_all_notifications`](Self::get_all_notifications) to read with and no way to consume,
+    /// which is the right shape: consuming without a step to record it against would lose the
+    /// message on any retry.
+    ///
+    /// The struct is what makes `get_event`'s *optional* caller readable; with nothing optional to
+    /// wrap it would buy only naming. Python, TypeScript and Java each carry a caller type for
+    /// `get_event` and pass `recv`'s three flat, which is three implementations reaching the same
+    /// place — Java's is even named `GetEventCaller`.
+    ///
+    /// `step_id` records the receive, so a replay returns the message rather than taking another.
+    /// `timeout_step_id` records the deadline, so a recovery resumes it rather than restarting the
+    /// timeout.
+    ///
+    /// `topic` of `None` is the default topic, stored as the same sentinel
+    /// [`send_messages`](Self::send_messages) writes — a real string rather than SQL `NULL`,
+    /// because nothing equals `NULL` and a receiver selecting on it would never find its own
+    /// message.
+    ///
+    /// **Two concurrent receivers on one (workflow, topic) is
+    /// [`Error::ConcurrentRecv`].** One message goes to one of them, so the other can only wait out
+    /// its timeout and report nothing — which the sender cannot distinguish from not having sent.
+    /// Python and Go reject it; TypeScript and Java allow it. Erring towards the error is the
+    /// recoverable direction: a layer above can swallow one this layer raises, and cannot
+    /// manufacture one it never raised. The guard is per process; two receivers in *different*
+    /// processes are arbitrated at the database by the consuming statement, which is the case
+    /// recovery actually produces.
+    ///
+    /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
+    /// raises a timeout error, in its engine rather than at this layer.
+    ///
+    /// The waiting, the two checkpoints and the polling cap are exactly
+    /// [`get_event`](Self::get_event)'s; what differs is that the message is consumed and recorded
+    /// in one transaction, since a message taken but not recorded would be lost outright rather
+    /// than merely re-read.
+    async fn recv(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        timeout_step_id: i32,
+        topic: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<EncodedValue>, Error>;
 
     /// Appends a value to a workflow's stream.
     ///

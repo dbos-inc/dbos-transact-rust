@@ -102,6 +102,38 @@ impl Registry {
         }
     }
 
+    /// Registers *sole* interest in `key`, or `None` if something is already waiting on it.
+    ///
+    /// For `recv`, where two waiters are a bug rather than a pattern: one message can only go to
+    /// one of them, so the loser waits out its timeout and reports that nothing arrived — which is
+    /// indistinguishable, to the workflow that wrote it, from nothing having been sent. Python and
+    /// Go both reject the second receiver for this reason; TypeScript and Java allow it and let the
+    /// consuming `UPDATE` decide.
+    ///
+    /// **This is a per-process guard and cannot be more than that.** Two receivers in different
+    /// processes — the recovery double-run case — never meet here, and are arbitrated at the
+    /// database by the `consumed = FALSE` predicate. Rejecting here is worth having anyway: it
+    /// turns the case a single process *can* see into an error the caller can act on.
+    ///
+    /// A key built from two different pairs (see the non-injectivity note above) is rejected as a
+    /// duplicate although it is not one. Python and Go concatenate the same way and share the
+    /// property exactly; it errs towards refusing a legitimate receiver rather than admitting two,
+    /// which is the direction to err in.
+    pub(crate) fn subscribe_exclusive(self: &Arc<Self>, key: String) -> Option<Subscription> {
+        let mut waiters = self.waiters.lock().expect("registry lock");
+        if waiters.contains_key(&key) {
+            return None;
+        }
+        let sender = tokio::sync::broadcast::Sender::new(1);
+        let receiver = sender.subscribe();
+        waiters.insert(key.clone(), sender);
+        Some(Subscription {
+            key,
+            registry: Arc::clone(self),
+            receiver,
+        })
+    }
+
     /// Wakes everything waiting on `key`.
     ///
     /// A wake for nobody is ordinary rather than an error: a listener sees every process's
@@ -255,6 +287,72 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), waiter.notified())
             .await
             .expect("a colliding key should still wake, harmlessly");
+    }
+
+    /// One receiver per (workflow, topic), and the registration is free again once it goes.
+    #[tokio::test]
+    async fn a_second_exclusive_waiter_is_refused_until_the_first_is_gone() {
+        let registry = Arc::new(Registry::default());
+        let key = message_key("wf-1", Some("orders"));
+
+        let first = registry
+            .subscribe_exclusive(key.clone())
+            .expect("nothing was waiting");
+        assert!(
+            registry.subscribe_exclusive(key.clone()).is_none(),
+            "a second receiver on one topic must be refused, not queued behind the first",
+        );
+
+        drop(first);
+        assert_eq!(registry.registered(), 0);
+        assert!(
+            registry.subscribe_exclusive(key).is_some(),
+            "the topic is free again once its receiver has gone",
+        );
+    }
+
+    /// Exclusivity is per key, so it does not reach across topics or across kinds of wait.
+    #[tokio::test]
+    async fn exclusivity_covers_one_key_and_no_more() {
+        let registry = Arc::new(Registry::default());
+        let _orders = registry
+            .subscribe_exclusive(message_key("wf-1", Some("orders")))
+            .expect("nothing was waiting");
+
+        let _refunds = registry
+            .subscribe_exclusive(message_key("wf-1", Some("refunds")))
+            .expect("another topic on the same workflow is a different wait");
+        let _elsewhere = registry
+            .subscribe_exclusive(message_key("wf-2", Some("orders")))
+            .expect("another workflow on the same topic is a different wait");
+        // And the prefix keeps a receiver from blocking an event waiter that names the same two
+        // strings, which is what the prefix is for.
+        let _event = registry.subscribe(event_key("wf-1", "orders"));
+
+        assert_eq!(registry.registered(), 4, "four distinct waits, four keys");
+    }
+
+    /// A shared waiter and an exclusive one refuse each other, in both orders.
+    ///
+    /// Nothing in the crate does this — the prefixes keep `recv` and the shared waits on disjoint
+    /// keys — but the map is one map, so the behaviour is worth pinning rather than discovering.
+    #[tokio::test]
+    async fn an_exclusive_waiter_and_a_shared_one_do_not_share_a_key() {
+        let registry = Arc::new(Registry::default());
+        let key = message_key("wf-1", None);
+
+        let shared = registry.subscribe(key.clone());
+        assert!(registry.subscribe_exclusive(key.clone()).is_none());
+        drop(shared);
+
+        let _exclusive = registry
+            .subscribe_exclusive(key.clone())
+            .expect("free again");
+        // The other order is *not* symmetric: `subscribe` does not check for an exclusive holder,
+        // so it joins rather than refusing. Which is why what keeps `recv` alone on its key is the
+        // prefix, not this map — pinned here so the asymmetry is a decision rather than a surprise.
+        let _joined = registry.subscribe(key);
+        assert_eq!(registry.registered(), 1);
     }
 
     #[tokio::test]

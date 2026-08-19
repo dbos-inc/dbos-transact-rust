@@ -66,7 +66,7 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
-use super::notify::{Registry, event_key};
+use super::notify::{Registry, event_key, message_key};
 use super::retry::{RetryPolicy, with_retry};
 use std::sync::Arc;
 use std::time::Duration;
@@ -904,6 +904,9 @@ const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 /// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`]: all four
 /// implementations record exactly `"DBOS.getEvent"`.
 const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
+
+/// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT_STEP_NAME`].
+const RECV_STEP_NAME: &str = "DBOS.recv";
 
 /// How long a blocking read waits before looking at the database again.
 ///
@@ -3372,6 +3375,237 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn recv(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        timeout_step_id: i32,
+        topic: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<EncodedValue>, Error> {
+        let notifications_table = self.tables.notifications.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // What `send_messages` stored. The default topic is a sentinel rather than SQL `NULL`,
+        // because nothing equals `NULL` and this predicate would never match its own message.
+        let stored_topic = topic.unwrap_or(NULL_TOPIC);
+        let started_at = Timestamp::now();
+
+        // Two statements, unlike `get_event`'s one, and here the split is forced rather than
+        // chosen: a message cannot be read without taking it, and taking it has to be atomic with
+        // recording the step. So the poll asks only whether something is waiting, and the taking
+        // happens once, below.
+        // `LIMIT 1` because this asks a yes/no question: without it the statement returns a row per
+        // unconsumed message, once per interval, for as long as the receiver waits — and a producer
+        // outrunning its consumer is exactly when that grows. Go asks the same question the same
+        // way, as `SELECT EXISTS (SELECT 1 …)`; Python, TypeScript and Java all project `topic` with
+        // no bound, and so all three pay for rows they discard. Bounding beats `EXISTS` here only in
+        // that nothing has to be decoded — a bare `1` types as `INT4` on PostgreSQL and `INT8` on
+        // CockroachDB, and a column never read cannot be read wrongly.
+        let probe = format!(
+            "SELECT 1 FROM {notifications_table} \
+             WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE LIMIT 1"
+        );
+        // The oldest unconsumed message for the topic, marked consumed as it is read.
+        //
+        // **`AND consumed = FALSE` on the outer statement is not a restatement of the subquery.** At
+        // READ COMMITTED two receivers resolve the subquery to the same oldest `message_uuid`; one
+        // updates, the other blocks on the row lock and, when it is released, re-evaluates this
+        // predicate against the committed version, matching nothing. Without it the loser's qual is
+        // still true of the row the winner just took and its `RETURNING` hands the same message
+        // back.
+        //
+        // **It is defence in depth rather than the arbitration**, because the taking and the step
+        // record share a transaction: a loser that gets past this predicate still conflicts on the
+        // step and rolls its consumption back. Worth keeping anyway — it makes the loser's `UPDATE`
+        // a no-op instead of a redundant write, and it means correctness does not rest on the step
+        // insert being the thing that fails.
+        //
+        // The destination and topic are *not* restated out here, though Python, TypeScript and Java
+        // all restate them: `message_uuid` is the primary key, so the row the subquery names
+        // already carries both and repeating them cannot exclude anything.
+        //
+        // TODO(dbos-team): UPSTREAM item 16. Go omits this predicate — the only one of the five to
+        // do so. Item 16 reads that as a live double-delivery bug; on re-reading Go it is not, for
+        // the reason above: `runAsTxn` puts `ConsumeMessage` and `RecordOperationResult` in one
+        // transaction under `defer tx.Rollback`, and the second execution's record conflicts on
+        // `(workflow_uuid, function_id)`, so its consumption is discarded with it. The divergence
+        // stands and the one-line fix is still worth making; the severity does not. Item 16 has
+        // been rewritten to say so.
+        let consume = format!(
+            "UPDATE {notifications_table} SET consumed = TRUE \
+             WHERE message_uuid = ( \
+                 SELECT message_uuid FROM {notifications_table} \
+                 WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE \
+                 ORDER BY created_at_epoch_ms ASC LIMIT 1 \
+             ) AND consumed = FALSE \
+             RETURNING message, serialization"
+        );
+        let (probe, consume) = (&probe, &consume);
+
+        // A replay returns the message the first run took and does not take another. Including the
+        // `None` a timeout produced — taking a message on replay would deliver, to one workflow,
+        // two messages it only ever recorded one of.
+        if let Some(step) = self
+            .check_step(workflow_id, step_id, RECV_STEP_NAME)
+            .await?
+        {
+            tracing::debug!(
+                workflow_id,
+                step_id = step_id,
+                topic = stored_topic,
+                "replaying recv"
+            );
+            return Ok(step.output.map(|value| EncodedValue {
+                value,
+                serialization: step.serialization,
+            }));
+        }
+
+        // Exclusive, and before the first look for both reasons at once: registering after looking
+        // would miss a message that landed in between, and a second receiver has to be refused
+        // before it starts waiting rather than after it has waited out a timeout for a message it
+        // was never going to get.
+        let mut subscription = self
+            .notify
+            .subscribe_exclusive(message_key(workflow_id, topic))
+            .ok_or_else(|| Error::ConcurrentRecv {
+                workflow_id: workflow_id.to_owned(),
+                topic: topic.map(str::to_owned),
+            })?;
+
+        // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
+        // sixty seconds and crashed has ten left rather than sixty.
+        let deadline = self
+            .checkpoint_sleep(workflow_id, timeout_step_id, timeout, SleepKind::Deadline)
+            .await?;
+
+        // Look, wait a bounded interval, look again — `get_event`'s loop exactly, and for the same
+        // reason: with nothing pushing, this is what delivers.
+        loop {
+            let has_message = with_retry(&self.retry, "recv", move || async move {
+                // Inside the retried region and dropped before the wait, so neither a backoff nor a
+                // parked receiver holds a permit. See the `polling` field.
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
+                Ok(sqlx::query(AssertSqlSafe(probe.clone()))
+                    .bind(workflow_id)
+                    .bind(stored_topic)
+                    .fetch_optional(pool)
+                    .await?
+                    .is_some())
+            })
+            .await?;
+            if has_message {
+                break;
+            }
+
+            // Past the deadline and exactly on it are the same answer — no time left — but
+            // `duration_since` reports the first as `None` and the second as zero. Folding them
+            // keeps that one decision in one place; leaving the zero case to the wait below would
+            // spin, since a zero-length timeout returns at once and the next look is another query.
+            let remaining = deadline
+                .duration_since(Timestamp::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = tokio::time::timeout(remaining.min(RECHECK_INTERVAL), subscription.notified())
+                .await;
+        }
+        // Released here rather than at the end of the call: the taking below does not wait, and
+        // holding the topic through it would keep the next `recv` out for no reason.
+        drop(subscription);
+
+        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
+        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+
+        // **One commit, and it has to be.** A message taken but not recorded is gone: the row is
+        // marked consumed, so a replay finds no step, takes nothing, and reports a timeout for a
+        // message that was delivered to nobody. That is why this runs once, after the waiting, and
+        // never inside the loop.
+        //
+        // No isolation level is pinned, unlike TypeScript's explicit `READ COMMITTED`. On
+        // PostgreSQL that is the default and the predicate above arbitrates; on CockroachDB the
+        // default is `SERIALIZABLE`, which aborts the loser instead — a `40` SQLSTATE, which the
+        // retry policy classifies as transient, so it comes back round, finds nothing unconsumed,
+        // and records the same `None` it would have recorded either way.
+        with_retry(&self.retry, "recv", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // The check that opened this call cannot stand in for this one: the wait between them
+            // is exactly when another execution of this workflow would have recorded its own
+            // answer. Same transaction as the write, so there is no window between deciding to
+            // take a message and taking it.
+            if let Some(step) = self
+                .check_step_on(&mut tx, workflow_id, step_id, RECV_STEP_NAME)
+                .await?
+            {
+                tx.commit().await?;
+                tracing::debug!(
+                    workflow_id,
+                    step_id = step_id,
+                    "adopting a rival execution's recv"
+                );
+                return Ok(step.output.map(|value| EncodedValue {
+                    value,
+                    serialization: step.serialization,
+                }));
+            }
+
+            let row = sqlx::query(AssertSqlSafe(consume.clone()))
+                .bind(workflow_id)
+                .bind(stored_topic)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let message = match row {
+                Some(row) => Some(EncodedValue {
+                    value: row.try_get("message")?,
+                    serialization: row.try_get("serialization")?,
+                }),
+                None => None,
+            };
+
+            // The sender's own payload under the sender's own format, as `get_event` records the
+            // publisher's. A timeout records a NULL output.
+            //
+            // **A conflict here is reported, and the rollback is what makes that safe.** It means
+            // another execution recorded this step between the check above and this write — at READ
+            // COMMITTED the check ran on an earlier snapshot than the `UPDATE`, so this attempt may
+            // have taken a message. Dropping the transaction un-takes it, so the message stays
+            // available and exactly one execution's `recv` is recorded. Adopting the rival's answer
+            // instead would be defensible, but nothing in this crate does that: the same conflict
+            // from `run_transactional_step` and from `get_event` reaches the caller, and two
+            // executors believing they own one workflow is worth reporting rather than smoothing
+            // over.
+            self.record_step_on(
+                &mut tx,
+                workflow_id,
+                step_id,
+                RECV_STEP_NAME,
+                Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
+                message.as_ref().and_then(|m| m.serialization.as_deref()),
+                Some(timing),
+            )
+            .await?;
+            tx.commit().await?;
+            tracing::debug!(
+                workflow_id,
+                step_id = step_id,
+                topic = stored_topic,
+                received = message.is_some(),
+                "recv finished"
+            );
+            Ok(message)
+        })
+        .await
+    }
+
     async fn write_stream(
         &self,
         workflow_id: &str,
@@ -3756,9 +3990,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                 });
             }
 
-            let Some(remaining) = deadline.duration_since(Timestamp::now()) else {
-                break None;
-            };
+            // Past the deadline and exactly on it are the same answer — no time left — but
+            // `duration_since` reports the first as `None` and the second as zero. Folding them
+            // keeps that one decision in one place; leaving the zero case to the wait below would
+            // spin, since a zero-length timeout returns at once and the next look is another query.
+            let remaining = deadline
+                .duration_since(Timestamp::now())
+                .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
                 break None;
             }
