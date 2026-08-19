@@ -61,8 +61,8 @@ use types::{
     EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule,
     NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
     QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -695,6 +695,44 @@ pub trait SystemDatabase: Send + Sync {
     /// The *current* value: `set_event` upserts, so a key set twice appears once. The per-step
     /// history lives in `workflow_events_history`, which this does not read.
     async fn get_all_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>, Error>;
+
+    /// Reads one offset of a stream, with the producing workflow's status.
+    ///
+    /// The read counterpart of [`write_stream`](Self::write_stream), and **the only one of the
+    /// three reads here that does not block.** It looks once and reports what it found. The waiting
+    /// belongs to the engine's `read_stream`, which loops this over rising offsets and is what a
+    /// caller actually reaches for; this is the one indexed read underneath it.
+    ///
+    /// That split is Python's and TypeScript's, and their method is named exactly this. Go returns
+    /// every entry from `offset` onward in one call instead — the only implementation that batches,
+    /// and the only one whose database layer has to decide how much of a stream to buy at once.
+    ///
+    /// **One statement, so the value and the status share a snapshot**, which is the reason this
+    /// returns [`StreamRead`] rather than a value: a reader deciding whether to wait needs both,
+    /// and needs them to agree. A `LEFT JOIN` from `workflow_status`, so a workflow with nothing at
+    /// the offset still reports its status; matching the offset exactly keeps it a single lookup
+    /// on the `(workflow_uuid, key, offset)` primary key.
+    ///
+    /// **A missing workflow is [`Error::NonExistentWorkflow`].** Python and TypeScript report a
+    /// null status instead and their engines raise immediately on it, which is the same answer one
+    /// layer up; this crate already spells a missing workflow that way in
+    /// [`await_workflow_result`](Self::await_workflow_result).
+    ///
+    /// Nothing at the offset is `value: None` rather than an error — an offset a producer has not
+    /// reached yet is the ordinary case, and the reason a reader waits.
+    ///
+    /// **Each call takes a connection**, and the loop above makes it a poll, so it runs under the
+    /// polling concurrency cap like the other two. Python and TypeScript both say so at this exact
+    /// method.
+    ///
+    /// No caller, no step, no deadline. A stream read is not a checkpoint: the loop that drives it
+    /// records one, and each offset re-read on replay yields what it yielded before.
+    async fn read_stream_value(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        offset: i32,
+    ) -> Result<StreamRead, Error>;
 
     /// Every stream entry a workflow has written, grouped by key and in stream order.
     async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error>;

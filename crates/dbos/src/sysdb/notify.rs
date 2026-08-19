@@ -40,8 +40,10 @@
 //! worse, would disagree with the `id || '::' || key` that migration 1's trigger and every other
 //! SDK put on the wire.
 
-// `get_event` subscribes and waits, but nothing pushes yet, so the wake paths and the other two
-// keys have no caller until `recv`, `read_stream_value` and the listener land. Remove this then.
+// Three things here still have no caller. `wake` and `wake_all` wait on the listener, since nothing
+// pushes yet. `stream_key` waits on the engine's `read_stream` loop: `read_stream_value` reads one
+// offset and returns, so the subscription for a stream belongs to whatever loops it — which is also
+// why streams are the one wait here that this module does not yet see. Remove when those land.
 #![allow(dead_code)]
 
 use std::collections::HashMap;

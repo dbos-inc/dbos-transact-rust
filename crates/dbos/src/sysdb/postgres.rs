@@ -76,10 +76,10 @@ use super::types::{
     DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
     Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRecord,
-    Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs, is_valid_application_name,
-    validate_attributes,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
+    is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -4147,6 +4147,84 @@ impl SystemDatabase for PostgresSystemDatabase {
                     })
                 })
                 .collect()
+        })
+        .await
+    }
+
+    async fn read_stream_value(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        offset: i32,
+    ) -> Result<StreamRead, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let streams_table = self.tables.streams.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // `workflow_status` drives the join, so the statement returns a row whenever the workflow
+        // exists — with or without a value at the offset — and no row only when it does not. The
+        // join predicate carries the key and offset rather than the `WHERE` clause, which is what
+        // makes that distinction possible at all.
+        //
+        // `"offset"` is quoted throughout because it is a reserved word, and aliased on the way out
+        // so it can be read back plainly. Matching it exactly keeps this one lookup on the
+        // `(workflow_uuid, key, offset)` primary key.
+        let select = format!(
+            "SELECT w.status AS status, s.value AS value, s.serialization AS serialization, \
+             s.\"offset\" AS stream_offset \
+             FROM {workflow_table} w \
+             LEFT OUTER JOIN {streams_table} s \
+               ON s.workflow_uuid = w.workflow_uuid AND s.key = $2 AND s.\"offset\" = $3 \
+             WHERE w.workflow_uuid = $1"
+        );
+        let select = &select;
+
+        with_retry(&self.retry, "read_stream_value", move || async move {
+            // A reader's loop calls this once per offset and then once per interval while it waits,
+            // so it is a poll like the other two and is capped like them. Inside the retried region,
+            // so a call that is backing off is not holding a permit through its backoff.
+            let _permit = polling
+                .acquire()
+                .await
+                .expect("the polling limiter is never closed");
+            let row = sqlx::query(AssertSqlSafe(select.clone()))
+                .bind(workflow_id)
+                .bind(key)
+                .bind(offset)
+                .fetch_optional(pool)
+                .await?;
+
+            // No row at all means no such workflow — the outer table drives the join. Reported
+            // rather than returned as an absent status, because a stream nobody can write to is not
+            // a stream that is merely empty, and every engine turns the null status into this same
+            // error the moment it sees one.
+            let Some(row) = row else {
+                return Err(Error::NonExistentWorkflow {
+                    workflow_ids: vec![workflow_id.to_owned()],
+                });
+            };
+
+            let status_text: String = row.try_get("status")?;
+            let status = WorkflowStatus::parse(&status_text).ok_or_else(|| {
+                Error::Malformed(format!("unknown workflow status {status_text:?}"))
+            })?;
+
+            // `streams."offset"` is `NOT NULL`, so a NULL here can only mean the join matched
+            // nothing: there is no entry at this offset. Python and TypeScript read the same column
+            // for the same reason.
+            //
+            // Probing `value` would answer identically today, since it is `NOT NULL` too — but the
+            // question being asked is whether the *join* matched, and keying on a payload column
+            // makes the answer hostage to that column staying non-nullable. `serialization`, one
+            // column over, already is nullable.
+            let value = match row.try_get::<Option<i32>, _>("stream_offset")? {
+                Some(_) => Some(EncodedValue {
+                    value: row.try_get("value")?,
+                    serialization: row.try_get("serialization")?,
+                }),
+                None => None,
+            };
+
+            Ok(StreamRead { status, value })
         })
         .await
     }

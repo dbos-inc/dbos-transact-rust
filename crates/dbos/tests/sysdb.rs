@@ -5276,6 +5276,210 @@ async fn a_replay_that_changed_its_batch_size_is_refused() {
     assert!(sys.get_all_notifications("wf-y").await.unwrap().is_empty());
 }
 
+/// One offset reads back with the producer's status, from one snapshot.
+#[tokio::test]
+async fn a_stream_offset_reads_back_with_its_producers_status() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-stream",
+        0,
+        "progress",
+        "\"a\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let read = sys
+        .read_stream_value("wf-stream", "progress", 0)
+        .await
+        .unwrap();
+    assert_eq!(read.status, WorkflowStatus::Pending);
+    assert_eq!(
+        read.value,
+        Some(EncodedValue {
+            value: "\"a\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        })
+    );
+}
+
+/// Nothing at the offset still reports the status, which is what a reader waits on.
+///
+/// The `LEFT JOIN` is what makes this possible: a reader that got no row at all could not tell
+/// "not written yet" from "no such workflow", and those are the two answers it has to act on
+/// differently.
+#[tokio::test]
+async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // Nothing written at all, and no such key either — both are simply empty offsets.
+    for (key, offset) in [("progress", 0), ("never-written", 0), ("progress", 7)] {
+        let read = sys
+            .read_stream_value("wf-stream", key, offset)
+            .await
+            .unwrap();
+        assert_eq!(read.value, None, "key {key} offset {offset}");
+        assert_eq!(read.status, WorkflowStatus::Pending);
+    }
+
+    // And the status is the *current* one, so a reader sees the producer stop.
+    sys.record_workflow_outcome("wf-stream", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+    let read = sys
+        .read_stream_value("wf-stream", "progress", 0)
+        .await
+        .unwrap();
+    assert_eq!(read.status, WorkflowStatus::Success);
+    assert_eq!(read.value, None);
+}
+
+/// A stream nobody can write to is an error, not an empty stream.
+#[tokio::test]
+async fn reading_a_stream_of_a_missing_workflow_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let err = sys
+        .read_stream_value("wf-nobody", "progress", 0)
+        .await
+        .expect_err("there is no workflow to wait on");
+    assert!(
+        matches!(err, Error::NonExistentWorkflow { ref workflow_ids }
+            if workflow_ids == &["wf-nobody".to_owned()]),
+        "unexpected error: {err:?}",
+    );
+}
+
+/// The closing sentinel comes back as a value; recognising it is the loop's job, not this layer's.
+#[tokio::test]
+async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-stream",
+        0,
+        "progress",
+        "\"a\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+    sys.close_stream("wf-stream", 1, "progress").await.unwrap();
+
+    assert_eq!(
+        sys.read_stream_value("wf-stream", "progress", 1)
+            .await
+            .unwrap()
+            .value
+            .map(|v| v.value),
+        Some(dbos::sysdb::STREAM_CLOSED.to_owned()),
+        "the sentinel is a value at an offset like any other",
+    );
+    // And it is the last one: nothing follows a close.
+    assert_eq!(
+        sys.read_stream_value("wf-stream", "progress", 2)
+            .await
+            .unwrap()
+            .value,
+        None,
+    );
+}
+
+/// A reader draining a stream sees every offset in order, and stops at the first empty one.
+///
+/// This is the loop the engine will own, written out by hand — the point being that everything it
+/// needs comes from this one call: the value, whether there is one, and whether the producer is
+/// still going.
+#[tokio::test]
+async fn the_offsets_of_a_stream_read_back_as_the_stream() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for (step_id, value) in [(0, "\"a\""), (1, "\"b\""), (2, "\"c\"")] {
+        sys.write_stream(
+            "wf-stream",
+            step_id,
+            "progress",
+            value,
+            Some("portable_json"),
+            WrittenBy::Workflow,
+        )
+        .await
+        .unwrap();
+    }
+    sys.close_stream("wf-stream", 3, "progress").await.unwrap();
+
+    let mut read = Vec::new();
+    for offset in 0..10 {
+        let at = sys
+            .read_stream_value("wf-stream", "progress", offset)
+            .await
+            .unwrap();
+        match at.value {
+            Some(v) if v.value == dbos::sysdb::STREAM_CLOSED => break,
+            Some(v) => read.push(v.value),
+            None => break,
+        }
+    }
+    assert_eq!(read, ["\"a\"", "\"b\"", "\"c\""]);
+}
+
+/// A read waiting at a cap of one does not hold its permit across the calls around it.
+///
+/// The loop is above this layer, so unlike `recv` and `get_event` the permit is taken and released
+/// inside a single call — but the property that matters is the same: a reader parked between
+/// offsets must not be holding one.
+#[tokio::test]
+async fn capped_stream_reads_do_not_block_each_other() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            polling_concurrency: Some(1),
+            ..Settings::default()
+        },
+    ));
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-stream",
+        0,
+        "progress",
+        "\"a\"",
+        None,
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let sys = std::sync::Arc::clone(&sys);
+            tokio::spawn(async move { sys.read_stream_value("wf-stream", "progress", 0).await })
+        })
+        .collect();
+    for reader in readers {
+        let read = tokio::time::timeout(RECHECK * 20, reader)
+            .await
+            .expect("a reader starved behind the polling cap")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.value.map(|v| v.value), Some("\"a\"".to_owned()));
+    }
+}
+
 /// Stream entries land at consecutive offsets, in the order they were written.
 #[tokio::test]
 async fn stream_writes_are_appended_in_order() {

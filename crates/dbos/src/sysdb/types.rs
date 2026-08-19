@@ -1723,6 +1723,28 @@ pub struct EventRecord {
     pub serialization: Option<String>,
 }
 
+/// One offset of a stream, read together with its producer's liveness.
+///
+/// The pair is the point. A reader deciding whether to wait needs to know both whether a value is
+/// there and whether the workflow that would write one is still running, and it needs them to agree
+/// — read separately, a reader can find nothing at the offset, then find the workflow finished, and
+/// stop one value short of a stream that was complete all along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamRead {
+    /// The producing workflow's status, from the same snapshot as `value`.
+    ///
+    /// **A terminal status does not mean the stream is finished.** Cancelling a workflow and
+    /// timing one out both set the status from outside while it is still writing, so a reader that
+    /// stops here must first drain to the first empty offset.
+    pub status: WorkflowStatus,
+    /// The value at the offset, or `None` if nothing is written there yet.
+    ///
+    /// The closing sentinel [`STREAM_CLOSED`](crate::sysdb::STREAM_CLOSED) arrives here like any
+    /// other value; recognising it belongs to the loop, which is the only thing that knows the
+    /// stream is being read rather than inspected.
+    pub value: Option<EncodedValue>,
+}
+
 /// One entry of a workflow's stream, as `streams` holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRecord {
