@@ -3,10 +3,10 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, AwaitedOutcome, BlockingCaller, Change, Debounce, DebounceRequest, EncodedValue,
-    Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow, OnExistingQueue,
-    Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
-    ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp,
+    Applications, AwaitedOutcome, Change, Debounce, DebounceRequest, EncodedValue, Fork,
+    ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule, NewWorkflow,
+    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit, RenameBatching,
+    RenameFrom, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp,
     WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
@@ -3178,7 +3178,7 @@ async fn a_read_records_the_publishers_own_payload() {
         .await
         .unwrap();
 
-    let caller = BlockingCaller {
+    let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
@@ -3209,7 +3209,7 @@ async fn a_replayed_read_returns_what_the_first_run_saw() {
         .await
         .unwrap();
 
-    let caller = BlockingCaller {
+    let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
@@ -3239,7 +3239,7 @@ async fn a_replayed_timeout_stays_a_timeout() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
 
-    let caller = BlockingCaller {
+    let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
@@ -3297,7 +3297,7 @@ async fn a_replayed_read_does_not_depend_on_the_row_still_existing() {
         .await
         .unwrap();
 
-    let caller = BlockingCaller {
+    let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
@@ -3350,7 +3350,7 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
                 "wf-publisher",
                 "progress",
                 RECHECK * 30,
-                Some(BlockingCaller {
+                Some(GetEventCaller {
                     workflow_id: "wf-reader",
                     step_id: 0,
                     timeout_step_id: 1,
@@ -3411,7 +3411,7 @@ async fn a_read_records_a_deadline_it_may_abandon_rather_than_a_sleep() {
         "wf-publisher",
         "progress",
         timeout,
-        Some(BlockingCaller {
+        Some(GetEventCaller {
             workflow_id: "wf-reader",
             step_id: 0,
             timeout_step_id: 1,
@@ -3460,7 +3460,7 @@ async fn a_recovered_read_resumes_the_original_deadline() {
             "wf-publisher",
             "progress",
             std::time::Duration::from_secs(600),
-            Some(BlockingCaller {
+            Some(GetEventCaller {
                 workflow_id: "wf-reader",
                 step_id: 0,
                 timeout_step_id: 1,
@@ -3495,7 +3495,7 @@ async fn a_cancelled_reader_stops_rather_than_waiting() {
             "wf-publisher",
             "progress",
             std::time::Duration::from_secs(600),
-            Some(BlockingCaller {
+            Some(GetEventCaller {
                 workflow_id: "wf-reader",
                 step_id: 0,
                 timeout_step_id: 1,

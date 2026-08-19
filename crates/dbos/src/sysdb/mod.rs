@@ -57,8 +57,8 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, BlockingCaller, Debounce, DebounceRequest,
-    EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule,
+    ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EncodedValue,
+    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule,
     NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
     QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
@@ -77,8 +77,10 @@ use types::{
 /// The methods that must be atomic with the step recording them take a `caller: Option<(&str,
 /// i32)>` — a workflow id and step id — and own the transaction internally, rather than taking a
 /// caller's connection the way Python and TypeScript do. [`get_event`](SystemDatabase::get_event)
-/// takes a [`BlockingCaller`] instead — the same thing plus the step its deadline is recorded
-/// under — because there the caller is optional and a wrapped `Option` is what reads.
+/// takes a [`GetEventCaller`] instead — the same thing plus the step its deadline is recorded
+/// under — because there the caller is optional and a wrapped `Option` is what reads. It is named
+/// for its one method rather than for blocking in general: `recv` blocks too and takes plain
+/// parameters, because its caller is required and its two step ids are not optional together.
 ///
 /// TODO(dbos-team): UPSTREAM item 13, the shape itself. Threading a `PoolClient` or `sa.Connection` through the
 /// system database makes atomicity the call site's job to remember, and is the part that would not
@@ -419,8 +421,8 @@ pub trait SystemDatabase: Send + Sync {
     /// message is delivered exactly once, marked `consumed` rather than deleted so that what a
     /// workflow was sent stays visible to export and audit.
     ///
-    /// **The caller is not optional, unlike [`get_event`](Self::get_event)'s** — and so it is not a
-    /// [`BlockingCaller`] either. All four implementations require a workflow, and the workflow
+    /// **The caller is not optional, unlike [`get_event`](Self::get_event)'s** — which is why the
+    /// three parts are plain parameters here and a [`GetEventCaller`] there. All four implementations require a workflow, and the workflow
     /// receiving *is* the workflow calling, so `workflow_id` is the destination and the step owner
     /// at once. A client outside a workflow has
     /// [`get_all_notifications`](Self::get_all_notifications) to read with and no way to consume,
@@ -678,7 +680,7 @@ pub trait SystemDatabase: Send + Sync {
         workflow_id: &str,
         key: &str,
         timeout: Duration,
-        caller: Option<BlockingCaller<'_>>,
+        caller: Option<GetEventCaller<'_>>,
     ) -> Result<Option<EncodedValue>, Error>;
 
     /// Every message sent to a workflow, oldest first, consumed or not.

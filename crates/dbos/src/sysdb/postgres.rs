@@ -80,8 +80,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, BlockingCaller, Change, Debounce,
-    DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
+    ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
+    DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
     Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
     ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead,
@@ -4071,7 +4071,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         key: &str,
         timeout: Duration,
-        caller: Option<BlockingCaller<'_>>,
+        caller: Option<GetEventCaller<'_>>,
     ) -> Result<Option<EncodedValue>, Error> {
         let events_table = self.tables.workflow_events.as_str();
         let (pool, polling) = (&self.pool, &self.polling);

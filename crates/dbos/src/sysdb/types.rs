@@ -1671,7 +1671,8 @@ pub struct NotificationRecord {
     pub consumed: bool,
 }
 
-/// The workflow a blocking read runs on behalf of, and the steps it records against.
+/// The workflow a [`get_event`](crate::sysdb::SystemDatabase::get_event) runs on behalf of, and the
+/// steps it records against.
 ///
 /// A struct where every other method here takes `caller: Option<(&str, i32)>`, because this one
 /// carries **two** step ids and they are not interchangeable: one records the read itself, the
@@ -1681,9 +1682,12 @@ pub struct NotificationRecord {
 /// `GetEventWorkflowContext`, TypeScript's `{workflowID, functionID, timeoutFunctionID}`.
 ///
 /// `None` at the call site is a caller outside a workflow: it has no steps to record and nothing
-/// to replay, so it waits on the wall clock and returns whatever it found.
+/// to replay, so it waits on the wall clock and returns whatever it found. That optionality is why
+/// this is a type at all — `recv` blocks and checkpoints the same two steps, but requires its
+/// caller, so it takes them as plain parameters with nothing to wrap. Java draws the line in the
+/// same place, with a `GetEventCaller` record and none for `recv`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockingCaller<'a> {
+pub struct GetEventCaller<'a> {
     /// The workflow doing the reading — the caller, never the workflow being read from.
     pub workflow_id: &'a str,
     /// The step the read itself is recorded under, which is what makes it replay rather than
