@@ -3537,6 +3537,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         // no bound, and so all three pay for rows they discard. Bounding beats `EXISTS` here only in
         // that nothing has to be decoded — a bare `1` types as `INT4` on PostgreSQL and `INT8` on
         // CockroachDB, and a column never read cannot be read wrongly.
+        //
+        // TODO(dbos-team): UPSTREAM item 18. The three unbounded ones ship rows they discard, on
+        // the statement every waiting `recv` runs once per interval. One word fixes each.
         let probe = format!(
             "SELECT 1 FROM {notifications_table} \
              WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE LIMIT 1"
