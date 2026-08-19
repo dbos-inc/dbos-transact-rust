@@ -43,6 +43,7 @@ pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
 pub mod error;
 pub mod migrations;
+pub(crate) mod notify;
 pub mod postgres;
 pub mod retry;
 pub mod types;
@@ -56,12 +57,12 @@ pub use error::{BackendError, BackendErrorKind, Error};
 use std::time::Duration;
 
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EventRecord,
-    Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
-    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EncodedValue,
+    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule,
+    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
+    QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus,
+    ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -75,7 +76,11 @@ use types::{
 ///
 /// The methods that must be atomic with the step recording them take a `caller: Option<(&str,
 /// i32)>` — a workflow id and step id — and own the transaction internally, rather than taking a
-/// caller's connection the way Python and TypeScript do.
+/// caller's connection the way Python and TypeScript do. [`get_event`](SystemDatabase::get_event)
+/// takes a [`GetEventCaller`] instead — the same thing plus the step its deadline is recorded
+/// under — because there the caller is optional and a wrapped `Option` is what reads. It is named
+/// for its one method rather than for blocking in general: `recv` blocks too and takes plain
+/// parameters, because its caller is required and its two step ids are not optional together.
 ///
 /// TODO(dbos-team): UPSTREAM item 13, the shape itself. Threading a `PoolClient` or `sa.Connection` through the
 /// system database makes atomicity the call site's job to remember, and is the part that would not
@@ -410,6 +415,59 @@ pub trait SystemDatabase: Send + Sync {
         send_to_forks: bool,
     ) -> Result<(), Error>;
 
+    /// Takes the oldest message sent to a workflow, waiting up to `timeout` for one to arrive.
+    ///
+    /// The read counterpart of [`send_messages`](Self::send_messages), and the consuming one: a
+    /// message is delivered exactly once, marked `consumed` rather than deleted so that what a
+    /// workflow was sent stays visible to export and audit.
+    ///
+    /// **The caller is not optional, unlike [`get_event`](Self::get_event)'s** — which is why the
+    /// three parts are plain parameters here and a [`GetEventCaller`] there. All four implementations require a workflow, and the workflow
+    /// receiving *is* the workflow calling, so `workflow_id` is the destination and the step owner
+    /// at once. A client outside a workflow has
+    /// [`get_all_notifications`](Self::get_all_notifications) to read with and no way to consume,
+    /// which is the right shape: consuming without a step to record it against would lose the
+    /// message on any retry.
+    ///
+    /// The struct is what makes `get_event`'s *optional* caller readable; with nothing optional to
+    /// wrap it would buy only naming. Python, TypeScript and Java each carry a caller type for
+    /// `get_event` and pass `recv`'s three flat, which is three implementations reaching the same
+    /// place — Java's is even named `GetEventCaller`.
+    ///
+    /// `step_id` records the receive, so a replay returns the message rather than taking another.
+    /// `timeout_step_id` records the deadline, so a recovery resumes it rather than restarting the
+    /// timeout.
+    ///
+    /// `topic` of `None` is the default topic, stored as the same sentinel
+    /// [`send_messages`](Self::send_messages) writes — a real string rather than SQL `NULL`,
+    /// because nothing equals `NULL` and a receiver selecting on it would never find its own
+    /// message.
+    ///
+    /// **Two concurrent receivers on one (workflow, topic) is
+    /// [`Error::ConcurrentRecv`].** One message goes to one of them, so the other can only wait out
+    /// its timeout and report nothing — which the sender cannot distinguish from not having sent.
+    /// Python and Go reject it; TypeScript and Java allow it. Erring towards the error is the
+    /// recoverable direction: a layer above can swallow one this layer raises, and cannot
+    /// manufacture one it never raised. The guard is per process; two receivers in *different*
+    /// processes are arbitrated at the database by the consuming statement, which is the case
+    /// recovery actually produces.
+    ///
+    /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
+    /// raises a timeout error, in its engine rather than at this layer.
+    ///
+    /// The waiting, the two checkpoints and the polling cap are exactly
+    /// [`get_event`](Self::get_event)'s; what differs is that the message is consumed and recorded
+    /// in one transaction, since a message taken but not recorded would be lost outright rather
+    /// than merely re-read.
+    async fn recv(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        timeout_step_id: i32,
+        topic: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<EncodedValue>, Error>;
+
     /// Appends a value to a workflow's stream.
     ///
     /// The offset is allocated by the insert itself, as `MAX(offset) + 1` for the key — so two
@@ -539,17 +597,14 @@ pub trait SystemDatabase: Send + Sync {
     /// The step's `completed_at` is stamped at the **wake time**, which is in the future when
     /// the row is written — so a timeline shows an hour's sleep as an hour rather than as an
     /// instant. Nothing in execution or recovery reads that column; it is for step aggregates,
-    /// metrics, and Conductor.
+    /// metrics, and Conductor. Java does the same; Go never projects, so its sleeps look
+    /// instantaneous.
     ///
-    /// Java does the same unconditionally. Go never projects, so its sleeps look instantaneous.
-    /// Python alone distinguishes the two with a `project_completion_time` flag, leaving it off
-    /// for `recv` and `get_event`, which register a deadline they may abandon early and would
-    /// otherwise be recorded as having waited the whole timeout.
-    ///
-    /// TODO: revisit when `recv` and `get_event` land. They are the only callers that would ever
-    /// want the other behaviour, and both are blocked on Stage 4's notifier. A first pass modelled
-    /// Python's flag as a `SleepKind` enum and dropped it: a 1-of-4 divergence, over a column
-    /// nothing executes on, decided before either caller existed. Decide it with them.
+    /// The deadline [`get_event`](Self::get_event) registers is the same checkpoint with the
+    /// opposite stamping, since a read that answers in milliseconds under a minute's timeout has
+    /// not taken a minute. Python and TypeScript expose that as a flag on this method; here it is
+    /// the implementation's business, because no caller of *this* method wants it — a caller
+    /// registering a deadline is calling the blocking read, not recording a sleep by hand.
     async fn record_sleep(
         &self,
         workflow_id: &str,
@@ -580,6 +635,54 @@ pub trait SystemDatabase: Send + Sync {
         serialization: Option<&str>,
     ) -> Result<(), Error>;
 
+    /// Reads a key another workflow published, waiting up to `timeout` for it to appear.
+    ///
+    /// The read counterpart of [`set_event`](Self::set_event). `workflow_id` is the workflow being
+    /// read *from*; `caller`, if any, is the workflow doing the reading.
+    ///
+    /// **Absence is a value, not an error.** `Ok(None)` means the key was not there when the
+    /// deadline passed, which is indistinguishable from the key never being set — the same answer
+    /// Python and TypeScript return. Go raises a timeout error instead, but it does so in its
+    /// engine, above the layer this trait describes, and an error is the one thing a caller cannot
+    /// synthesise if it wanted the other shape.
+    ///
+    /// **How it waits.** Subscribe, look, wait a bounded interval, look again. The loop is what
+    /// delivers: a wakeup only ever says "look again", never what changed, so with no wakeups at
+    /// all this still returns as soon as the next interval comes round. That is not a degraded
+    /// mode — CockroachDB has no `LISTEN`/`NOTIFY`, so it is every SDK's Cockroach configuration
+    /// and this crate's CI.
+    ///
+    /// **The caller's cancellation is the caller's business.** A `get_event` in a workflow
+    /// cancelled mid-wait runs to its deadline here; TypeScript re-checks the caller's status every
+    /// interval, which costs a second query per pass to do what dropping the future does for free.
+    /// Python does not check either. Same position as
+    /// [`await_workflow_result`](Self::await_workflow_result): a caller that wants to stop sooner
+    /// drops the future.
+    ///
+    /// **Inside a workflow it is two checkpoints, not one.** `caller.step_id` records the read, so
+    /// a replay returns the value the first run saw rather than waiting again — including the
+    /// `None` a timeout produced, which is a result like any other. `caller.timeout_step_id`
+    /// records the deadline as a `DBOS.sleep` before the first wait, so a recovery resumes the
+    /// original deadline instead of restarting the timeout. It is stamped complete now rather than
+    /// at the deadline — see [`record_sleep`](Self::record_sleep) for the distinction. The deadline is recorded
+    /// whether or not the value happens to be there already, so the steps a run records do not
+    /// depend on how a race went.
+    ///
+    /// Outside a workflow there is neither: the deadline is the wall clock, nothing is recorded,
+    /// and the look that ended the wait is the whole answer.
+    ///
+    /// **Each look takes a connection**, so they run under the polling concurrency cap — the same
+    /// one [`await_workflow_result`](Self::await_workflow_result) waits under, and for the same
+    /// reason. The step record is not a poll and does not run under it: it happens once, after the
+    /// waiting is over.
+    async fn get_event(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+        caller: Option<GetEventCaller<'_>>,
+    ) -> Result<Option<EncodedValue>, Error>;
+
     /// Every message sent to a workflow, oldest first, consumed or not.
     ///
     /// Receiving marks `consumed` rather than deleting, so this reports what a workflow was sent
@@ -594,6 +697,44 @@ pub trait SystemDatabase: Send + Sync {
     /// The *current* value: `set_event` upserts, so a key set twice appears once. The per-step
     /// history lives in `workflow_events_history`, which this does not read.
     async fn get_all_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>, Error>;
+
+    /// Reads one offset of a stream, with the producing workflow's status.
+    ///
+    /// The read counterpart of [`write_stream`](Self::write_stream), and **the only one of the
+    /// three reads here that does not block.** It looks once and reports what it found. The waiting
+    /// belongs to the engine's `read_stream`, which loops this over rising offsets and is what a
+    /// caller actually reaches for; this is the one indexed read underneath it.
+    ///
+    /// That split is Python's and TypeScript's, and their method is named exactly this. Go returns
+    /// every entry from `offset` onward in one call instead — the only implementation that batches,
+    /// and the only one whose database layer has to decide how much of a stream to buy at once.
+    ///
+    /// **One statement, so the value and the status share a snapshot**, which is the reason this
+    /// returns [`StreamRead`] rather than a value: a reader deciding whether to wait needs both,
+    /// and needs them to agree. A `LEFT JOIN` from `workflow_status`, so a workflow with nothing at
+    /// the offset still reports its status; matching the offset exactly keeps it a single lookup
+    /// on the `(workflow_uuid, key, offset)` primary key.
+    ///
+    /// **A missing workflow is [`Error::NonExistentWorkflow`].** Python and TypeScript report a
+    /// null status instead and their engines raise immediately on it, which is the same answer one
+    /// layer up; this crate already spells a missing workflow that way in
+    /// [`await_workflow_result`](Self::await_workflow_result).
+    ///
+    /// Nothing at the offset is `value: None` rather than an error — an offset a producer has not
+    /// reached yet is the ordinary case, and the reason a reader waits.
+    ///
+    /// **Each call takes a connection**, and the loop above makes it a poll, so it runs under the
+    /// polling concurrency cap like the other two. Python and TypeScript both say so at this exact
+    /// method.
+    ///
+    /// No caller, no step, no deadline. A stream read is not a checkpoint: the loop that drives it
+    /// records one, and each offset re-read on replay yields what it yielded before.
+    async fn read_stream_value(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        offset: i32,
+    ) -> Result<StreamRead, Error>;
 
     /// Every stream entry a workflow has written, grouped by key and in stream order.
     async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error>;

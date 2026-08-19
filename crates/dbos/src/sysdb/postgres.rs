@@ -58,25 +58,36 @@
 //! id is an identity read, and answering "no such workflow" for one that plainly exists would be
 //! a lie. See [`Applications`] for how a caller overrides the default.
 
+// The two halves of the wakeup path, both of which are this backend's rather than the trait's:
+// `LISTEN`/`NOTIFY` is PostgreSQL's, and CockroachDB has neither it nor `pg_notify`. The registry
+// they feed is in `sysdb::notify`, where it is backend-neutral.
+mod listener;
+mod notifier;
+
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
+use self::listener::Listener;
+use self::notifier::Notifier;
 use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
+use super::notify::{EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key};
 use super::retry::{RetryPolicy, with_retry};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
-    DebounceRequest, EventRecord, Fork, ForkOptions, ForkPoint, Message, NewQueue, NewSchedule,
-    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate,
-    StepRecord, StepTiming, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
-    duration_from_secs, is_valid_application_name, validate_attributes,
+    DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
+    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead,
+    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
+    is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -217,6 +228,16 @@ pub struct Settings<'a> {
     /// Named without a `sys_db_` prefix, unlike Python: that prefix distinguishes the system
     /// database's pool from its others, and this field already sits on a `sysdb` type.
     pub polling_concurrency: Option<u32>,
+    /// How long a written key waits for company before this handle pushes a wakeup for it.
+    ///
+    /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
+    /// setting to. Longer trades wakeup latency for fewer notifying transactions;
+    /// `Some(Duration::ZERO)` turns coalescing off, which is a push per write — the behaviour the
+    /// database triggers had, and what migrations 43 and 44 dropped them to get away from.
+    ///
+    /// Nothing here is load-bearing whatever it is set to: a wakeup only ever shortens a wait that
+    /// re-queries on its own interval regardless.
+    pub notification_coalesce: Option<Duration>,
 }
 
 impl Default for Settings<'_> {
@@ -231,6 +252,7 @@ impl Default for Settings<'_> {
             executor_id: None,
             application_name: None,
             polling_concurrency: None,
+            notification_coalesce: None,
         }
     }
 }
@@ -332,6 +354,38 @@ pub struct PostgresSystemDatabase {
     /// closes the pool, so every in-flight poll fails permanently and releases its permit, and a
     /// waiter parked here then acquires, queries, and gets the same failure one query later.
     polling: tokio::sync::Semaphore,
+    /// Who is waiting for what, so that something knowing a row was written can cut a wait short.
+    ///
+    /// **Nothing wakes it yet**, and every blocking read here is correct anyway: the wait loop is
+    /// what delivers, and this only ever shortens an interval. It is subscribed to from the first
+    /// caller rather than added alongside the listener because the ordering is the part that cannot
+    /// be retrofitted — a caller must be registered *before* it looks, or it misses whatever lands
+    /// between the look and the wait.
+    notify: Arc<Registry>,
+    /// The listener, which is where a wait reads how long it may sleep.
+    ///
+    /// Held whether or not one is running — an unstarted listener is not delivering, which is the
+    /// right answer for CockroachDB and for a handle that never asked for one. Shared with the task
+    /// in [`listener_task`](Self::listener_task), which is the only thing that sets the bit.
+    listener: Arc<Listener>,
+    /// The listener's task, kept so that [`close`](SystemDatabase::close) can wait for it to stop.
+    ///
+    /// Holding it is what makes closing mean the listener has *ended*, rather than merely that it
+    /// has been told to. Without it a listener that failed to recognise the shutdown would go on
+    /// reconnecting against a closed pool for the life of the process, and nothing would say so.
+    ///
+    /// A `std::sync::Mutex` because it is only ever taken and replaced, never held across an await.
+    listener_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The other direction: what this handle writes, told to the processes waiting on it.
+    ///
+    /// Held whether or not anything is being pushed, because the local wake it does is right on
+    /// every backend — see [`Notifier::signal`]. Only the outbound half is gated, and by the same
+    /// call that starts the listener.
+    notifier: Arc<Notifier>,
+    /// The notifier's task, kept for the same reason as the listener's — with one difference that
+    /// decides the order in [`close`](SystemDatabase::close): its last act is a database write, so
+    /// it has to be finished *before* the pool closes rather than by it.
+    notifier_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl PostgresSystemDatabase {
@@ -371,20 +425,116 @@ impl PostgresSystemDatabase {
             })
         })?;
 
-        Ok(Self {
+        // Hoisted because the listener needs the same registry the handle's waits subscribe to.
+        let notify: Arc<Registry> = Arc::default();
+        let handle = Self {
             // The cap's default is read off the pool rather than off `config.max_connections`, so
             // that it is the same expression here and in `from_pool`, which never sees a `Config`.
             polling: tokio::sync::Semaphore::new(polling_limit(
                 config.settings.polling_concurrency,
                 pool.options().get_max_connections(),
             )),
+            listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
+            notifier: Arc::new(Notifier::new(
+                pool.clone(),
+                Arc::clone(&notify),
+                config.settings.notification_coalesce,
+            )),
             pool,
+            notify,
+            listener_task: std::sync::Mutex::default(),
+            notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(config.settings.schema),
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
             application_name: config.settings.application_name.map(str::to_owned),
-        })
+        };
+
+        // The same flag that decided whether the database got its NOTIFY triggers decides whether
+        // this process listens for them, which is UPSTREAM item 15's complaint — but with the
+        // triggers absent there would be nothing to hear, so following it here is right whatever
+        // the flag's shape should be.
+        if config.use_listen_notify {
+            handle.start_notifications().await;
+        }
+        Ok(handle)
+    }
+
+    /// Starts this handle's two notification tasks, reporting whether they were started.
+    ///
+    /// **Both halves of one decision**, which is why there is one call rather than two: a listener,
+    /// which turns other processes' writes into wakeups here, and a notifier, which turns this
+    /// handle's writes into wakeups there. Neither is much use in a deployment that cannot have the
+    /// other, and both are governed by whether the database does `LISTEN`/`NOTIFY` at all.
+    ///
+    /// **Never load-bearing, and reporting rather than failing for that reason.** Every wait here
+    /// re-queries on its own interval and is correct with neither task running; they only shorten
+    /// those waits, and let the interval that bounds them lengthen from a second to a minute. So a
+    /// deployment that cannot support them is a slower deployment, not a broken one, and nothing
+    /// here returns an error a caller would have to decide what to do about.
+    ///
+    /// Declines on CockroachDB, which has no `LISTEN`/`NOTIFY` — a listener there would be a task
+    /// failing and retrying forever, and a push would be a statement the database rejects outright
+    /// (`42883`, "unknown function: pg_notify()").
+    /// [`connect`](Self::connect) calls this for you when [`Config::use_listen_notify`] is set; a
+    /// caller that brought its own pool calls it itself.
+    ///
+    /// [`close`](SystemDatabase::close) is the shutdown for both.
+    pub async fn start_notifications(&self) -> bool {
+        match migrations::runner::detect_dialect(&self.pool).await {
+            Ok(migrations::Dialect::Cockroach) => {
+                tracing::debug!(
+                    "not starting a notification listener: CockroachDB has no LISTEN/NOTIFY, so \
+                     waits re-query on their own interval, which is what delivers there"
+                );
+                return false;
+            }
+            Ok(migrations::Dialect::Postgres) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start a notification listener");
+                return false;
+            }
+        }
+
+        // A second call is a caller being careful rather than a mistake, and a second task of
+        // either kind would be pure waste: two listeners wake the same waiters twice, and two
+        // flush loops drain one queue between them.
+        let mut listening = self.listener_task.lock().expect("listener lock");
+        if listening.as_ref().is_none_or(|task| task.is_finished()) {
+            *listening = Some(tokio::spawn(Arc::clone(&self.listener).run()));
+        }
+        let mut notifying = self.notifier_task.lock().expect("notifier lock");
+        if notifying.as_ref().is_none_or(|task| task.is_finished()) {
+            // Enabled first: `signal` queues nothing until it is, and nothing would drain what it
+            // queued before the loop exists.
+            self.notifier.enable();
+            *notifying = Some(tokio::spawn(Arc::clone(&self.notifier).run()));
+        }
+        true
+    }
+
+    /// Whether this handle pushes its own writes to the processes waiting on them.
+    ///
+    /// The outbound counterpart of [`is_delivering`](Self::is_delivering), and unlike it there is
+    /// nothing to prove: a push is a statement that either runs or is logged and dropped, so this
+    /// says only that [`start_notifications`](Self::start_notifications) enabled it.
+    pub fn is_pushing(&self) -> bool {
+        self.notifier.is_pushing()
+    }
+
+    /// Whether a notification listener is currently delivering to this handle.
+    ///
+    /// **Not merely whether one was started.** It is set once a listener has proved a notification
+    /// actually arrives, and cleared if it stops — see
+    /// [`start_notifications`](Self::start_notifications). False is a working
+    /// configuration, not a fault: it means waits re-query every second instead of every minute,
+    /// which is what CockroachDB does always and what any deployment does when its subscription
+    /// cannot be relied on.
+    ///
+    /// Java exposes the same as `notificationSource.isRunning()`.
+    pub fn is_delivering(&self) -> bool {
+        self.listener.is_delivering()
     }
 
     /// Wraps an existing pool, assuming the schema is already migrated.
@@ -393,13 +543,24 @@ impl PostgresSystemDatabase {
     /// harness. Takes the same [`Settings`] as [`connect`](Self::connect), so there is one way to
     /// describe a handle rather than a constructor plus a set of chained overrides.
     pub fn from_pool(pool: PgPool, settings: &Settings<'_>) -> Self {
+        // Hoisted because the listener needs the same registry the handle's waits subscribe to.
+        let notify: Arc<Registry> = Arc::default();
         Self {
             // A caller's pool knows its own size, so the default needs nothing passed alongside it.
             polling: tokio::sync::Semaphore::new(polling_limit(
                 settings.polling_concurrency,
                 pool.options().get_max_connections(),
             )),
+            listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
+            notifier: Arc::new(Notifier::new(
+                pool.clone(),
+                Arc::clone(&notify),
+                settings.notification_coalesce,
+            )),
             pool,
+            notify,
+            listener_task: std::sync::Mutex::default(),
+            notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(settings.schema),
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
@@ -811,6 +972,35 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
 /// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`].
 const SLEEP_STEP_NAME: &str = "DBOS.sleep";
 
+/// Which of the two things a checkpointed sleep is.
+///
+/// Both write the same row under the same name and both return the same instant. What differs is
+/// the `completed_at` the step is stamped with, and so the duration every timeline and step
+/// aggregate reports for it.
+///
+/// **A 2–2 split across the references, but not a coin toss** — it splits by *caller*, and the two
+/// implementations that distinguish the callers do so explicitly. Python and TypeScript each carry
+/// a flag for exactly this (`project_completion_time`, `recordCompletionAtDeadline`), set for real
+/// sleeps and clear for the deadline `recv` and `get_event` register. Java projects both only
+/// because `recv` and `getEvent` call the very same `durableSleepEndTime` and it has no flag to do
+/// otherwise; Go never projects at all, so its sleeps look instantaneous.
+///
+/// Private, and the flag those two references expose is not on
+/// [`record_sleep`](SystemDatabase::record_sleep): a caller registering a deadline reaches for the
+/// blocking read, not for this. Nothing outside this module has both a reason to record a sleep and
+/// a reason to choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SleepKind {
+    /// A sleep the caller intends to wait out, stamped complete at the wake time — in the future
+    /// when the row is written, so a timeline shows an hour's sleep as an hour.
+    Durable,
+    /// A deadline the caller registers and usually abandons early, stamped complete now.
+    ///
+    /// Projecting here would report a `get_event` that answered in 200ms under a 60s timeout as a
+    /// minute-long operation, in every step aggregate and on every Conductor timeline.
+    Deadline,
+}
+
 /// The encoding this layer uses for values it produces itself.
 ///
 /// Distinct from the workflow's own format: a sleep's wake time is a plain number written and
@@ -858,6 +1048,13 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
 /// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
 const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
+
+/// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`]: all four
+/// implementations record exactly `"DBOS.getEvent"`.
+const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
+
+/// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT_STEP_NAME`].
+const RECV_STEP_NAME: &str = "DBOS.recv";
 
 /// The step a debounce records when a workflow does the bouncing.
 ///
@@ -1506,6 +1703,97 @@ fn step_from_row(row: &sqlx::postgres::PgRow, workflow_id: &str) -> Result<StepR
             .try_get::<Option<i64>, _>("completed_at_epoch_ms")?
             .map(Timestamp::from_epoch_ms),
     })
+}
+
+impl PostgresSystemDatabase {
+    /// [`record_sleep`](SystemDatabase::record_sleep), for both kinds of caller.
+    ///
+    /// The trait exposes only the sleep. The deadline a blocking read registers is the same
+    /// checkpoint — same step name, same recorded wake time, same replay — differing in the
+    /// `completed_at` it is stamped with, and [`SleepKind`] says why that is a distinction worth
+    /// making.
+    async fn checkpoint_sleep(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        duration: Duration,
+        kind: SleepKind,
+    ) -> Result<Timestamp, Error> {
+        let pool = &self.pool;
+        // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
+        // the clock per attempt would push it further out each time.
+        let started_at = Timestamp::now();
+        let wake_at =
+            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
+
+        with_retry(&self.retry, "checkpoint_sleep", move || async move {
+            // No transaction, unlike `set_event`: there is no separate write to orphan here —
+            // the step record *is* the write, and the wake time is its output. The check-then-
+            // record race is caught by the insert's `ON CONFLICT` below, and the insert and the
+            // executor claim inside `record_step_on` are safe by their ordering.
+            let mut conn = pool.acquire().await?;
+
+            // A replay wakes at the *original* instant. Starting the clock again would make a
+            // workflow that crashed fifty minutes into an hour sleep another full hour.
+            if let Some(step) = self
+                .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                .await?
+            {
+                tracing::debug!(workflow_id, step_id, "replaying sleep");
+                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
+            }
+            tracing::debug!(
+                workflow_id,
+                step_id,
+                duration_ms = duration.as_millis() as u64,
+                "running sleep"
+            );
+
+            let recorded = wake_at.as_epoch_ms().to_string();
+            let timing = StepTiming {
+                started_at,
+                // A sleep is stamped complete at its wake time, which is in the future — so the
+                // step's recorded duration is the sleep. A deadline is stamped now, because the
+                // caller registering it usually returns long before it. Both are fixed outside the
+                // retry, since `completed_at` is also the token that recognises this caller's own
+                // write after a lost acknowledgement.
+                completed_at: match kind {
+                    SleepKind::Durable => wake_at,
+                    SleepKind::Deadline => started_at,
+                },
+            };
+            match self
+                .record_step_on(
+                    &mut conn,
+                    workflow_id,
+                    step_id,
+                    SLEEP_STEP_NAME,
+                    Outcome::Output(Some(&recorded)),
+                    Some(PORTABLE_JSON),
+                    Some(timing),
+                )
+                .await
+            {
+                Ok(()) => Ok(wake_at),
+                // A rival recorded the sleep between our check and our write. Its wake time is
+                // the one every execution must agree on, so adopt it rather than returning ours.
+                // Python swallows this and returns its own, which two runs would disagree about.
+                Err(Error::StepAlreadyRecorded { .. }) => {
+                    let step = self
+                        .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Malformed(
+                                "sleep reported as recorded but cannot be read back".to_owned(),
+                            )
+                        })?;
+                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+    }
 }
 
 impl PostgresSystemDatabase {
@@ -3223,6 +3511,243 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn recv(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        timeout_step_id: i32,
+        topic: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Option<EncodedValue>, Error> {
+        let notifications_table = self.tables.notifications.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // What `send_messages` stored. The default topic is a sentinel rather than SQL `NULL`,
+        // because nothing equals `NULL` and this predicate would never match its own message.
+        let stored_topic = topic.unwrap_or(NULL_TOPIC);
+        let started_at = Timestamp::now();
+
+        // Two statements, unlike `get_event`'s one, and here the split is forced rather than
+        // chosen: a message cannot be read without taking it, and taking it has to be atomic with
+        // recording the step. So the poll asks only whether something is waiting, and the taking
+        // happens once, below.
+        // `LIMIT 1` because this asks a yes/no question: without it the statement returns a row per
+        // unconsumed message, once per interval, for as long as the receiver waits — and a producer
+        // outrunning its consumer is exactly when that grows. Go asks the same question the same
+        // way, as `SELECT EXISTS (SELECT 1 …)`; Python, TypeScript and Java all project `topic` with
+        // no bound, and so all three pay for rows they discard. Bounding beats `EXISTS` here only in
+        // that nothing has to be decoded — a bare `1` types as `INT4` on PostgreSQL and `INT8` on
+        // CockroachDB, and a column never read cannot be read wrongly.
+        //
+        // TODO(dbos-team): UPSTREAM item 18. The three unbounded ones ship rows they discard, on
+        // the statement every waiting `recv` runs once per interval. One word fixes each.
+        let probe = format!(
+            "SELECT 1 FROM {notifications_table} \
+             WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE LIMIT 1"
+        );
+        // The oldest unconsumed message for the topic, marked consumed as it is read.
+        //
+        // **`AND consumed = FALSE` on the outer statement is not a restatement of the subquery.** At
+        // READ COMMITTED two receivers resolve the subquery to the same oldest `message_uuid`; one
+        // updates, the other blocks on the row lock and, when it is released, re-evaluates this
+        // predicate against the committed version, matching nothing. Without it the loser's qual is
+        // still true of the row the winner just took and its `RETURNING` hands the same message
+        // back.
+        //
+        // **It is defence in depth rather than the arbitration**, because the taking and the step
+        // record share a transaction: a loser that gets past this predicate still conflicts on the
+        // step and rolls its consumption back. Worth keeping anyway — it makes the loser's `UPDATE`
+        // a no-op instead of a redundant write, and it means correctness does not rest on the step
+        // insert being the thing that fails.
+        //
+        // The destination and topic are *not* restated out here, though Python, TypeScript and Java
+        // all restate them: `message_uuid` is the primary key, so the row the subquery names
+        // already carries both and repeating them cannot exclude anything.
+        //
+        // TODO(dbos-team): UPSTREAM item 16. Go omits this predicate — the only one of the five to
+        // do so. Item 16 reads that as a live double-delivery bug; on re-reading Go it is not, for
+        // the reason above: `runAsTxn` puts `ConsumeMessage` and `RecordOperationResult` in one
+        // transaction under `defer tx.Rollback`, and the second execution's record conflicts on
+        // `(workflow_uuid, function_id)`, so its consumption is discarded with it. The divergence
+        // stands and the one-line fix is still worth making; the severity does not. Item 16 has
+        // been rewritten to say so.
+        let consume = format!(
+            "UPDATE {notifications_table} SET consumed = TRUE \
+             WHERE message_uuid = ( \
+                 SELECT message_uuid FROM {notifications_table} \
+                 WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE \
+                 ORDER BY created_at_epoch_ms ASC LIMIT 1 \
+             ) AND consumed = FALSE \
+             RETURNING message, serialization"
+        );
+        let (probe, consume) = (&probe, &consume);
+
+        // A replay returns the message the first run took and does not take another. Including the
+        // `None` a timeout produced — taking a message on replay would deliver, to one workflow,
+        // two messages it only ever recorded one of.
+        if let Some(step) = self
+            .check_step(workflow_id, step_id, RECV_STEP_NAME)
+            .await?
+        {
+            tracing::debug!(
+                workflow_id,
+                step_id = step_id,
+                topic = stored_topic,
+                "replaying recv"
+            );
+            return Ok(step.output.map(|value| EncodedValue {
+                value,
+                serialization: step.serialization,
+            }));
+        }
+
+        // Exclusive, and before the first look for both reasons at once: registering after looking
+        // would miss a message that landed in between, and a second receiver has to be refused
+        // before it starts waiting rather than after it has waited out a timeout for a message it
+        // was never going to get.
+        let mut subscription = self
+            .notify
+            .subscribe_exclusive(message_key(workflow_id, topic))
+            .ok_or_else(|| Error::ConcurrentRecv {
+                workflow_id: workflow_id.to_owned(),
+                topic: topic.map(str::to_owned),
+            })?;
+
+        // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
+        // sixty seconds and crashed has ten left rather than sixty.
+        let deadline = self
+            .checkpoint_sleep(workflow_id, timeout_step_id, timeout, SleepKind::Deadline)
+            .await?;
+
+        // Look, wait a bounded interval, look again — `get_event`'s loop exactly, and for the same
+        // reason: with nothing pushing, this is what delivers.
+        loop {
+            let has_message = with_retry(&self.retry, "recv", move || async move {
+                // Inside the retried region and dropped before the wait, so neither a backoff nor a
+                // parked receiver holds a permit. See the `polling` field.
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
+                Ok(sqlx::query(AssertSqlSafe(probe.clone()))
+                    .bind(workflow_id)
+                    .bind(stored_topic)
+                    .fetch_optional(pool)
+                    .await?
+                    .is_some())
+            })
+            .await?;
+            if has_message {
+                break;
+            }
+
+            // Past the deadline and exactly on it are the same answer — no time left — but
+            // `duration_since` reports the first as `None` and the second as zero. Folding them
+            // keeps that one decision in one place; leaving the zero case to the wait below would
+            // spin, since a zero-length timeout returns at once and the next look is another query.
+            let remaining = deadline
+                .duration_since(Timestamp::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = tokio::time::timeout(
+                remaining.min(self.listener.poll_interval()),
+                subscription.notified(),
+            )
+            .await;
+        }
+        // Released here rather than at the end of the call: the taking below does not wait, and
+        // holding the topic through it would keep the next `recv` out for no reason.
+        drop(subscription);
+
+        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
+        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+
+        // **One commit, and it has to be.** A message taken but not recorded is gone: the row is
+        // marked consumed, so a replay finds no step, takes nothing, and reports a timeout for a
+        // message that was delivered to nobody. That is why this runs once, after the waiting, and
+        // never inside the loop.
+        //
+        // No isolation level is pinned, unlike TypeScript's explicit `READ COMMITTED`. On
+        // PostgreSQL that is the default and the predicate above arbitrates; on CockroachDB the
+        // default is `SERIALIZABLE`, which aborts the loser instead — a `40` SQLSTATE, which the
+        // retry policy classifies as transient, so it comes back round, finds nothing unconsumed,
+        // and records the same `None` it would have recorded either way.
+        with_retry(&self.retry, "recv", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // The check that opened this call cannot stand in for this one: the wait between them
+            // is exactly when another execution of this workflow would have recorded its own
+            // answer. Same transaction as the write, so there is no window between deciding to
+            // take a message and taking it.
+            if let Some(step) = self
+                .check_step_on(&mut tx, workflow_id, step_id, RECV_STEP_NAME)
+                .await?
+            {
+                tx.commit().await?;
+                tracing::debug!(
+                    workflow_id,
+                    step_id = step_id,
+                    "adopting a rival execution's recv"
+                );
+                return Ok(step.output.map(|value| EncodedValue {
+                    value,
+                    serialization: step.serialization,
+                }));
+            }
+
+            let row = sqlx::query(AssertSqlSafe(consume.clone()))
+                .bind(workflow_id)
+                .bind(stored_topic)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let message = match row {
+                Some(row) => Some(EncodedValue {
+                    value: row.try_get("message")?,
+                    serialization: row.try_get("serialization")?,
+                }),
+                None => None,
+            };
+
+            // The sender's own payload under the sender's own format, as `get_event` records the
+            // publisher's. A timeout records a NULL output.
+            //
+            // **A conflict here is reported, and the rollback is what makes that safe.** It means
+            // another execution recorded this step between the check above and this write — at READ
+            // COMMITTED the check ran on an earlier snapshot than the `UPDATE`, so this attempt may
+            // have taken a message. Dropping the transaction un-takes it, so the message stays
+            // available and exactly one execution's `recv` is recorded. Adopting the rival's answer
+            // instead would be defensible, but nothing in this crate does that: the same conflict
+            // from `run_transactional_step` and from `get_event` reaches the caller, and two
+            // executors believing they own one workflow is worth reporting rather than smoothing
+            // over.
+            self.record_step_on(
+                &mut tx,
+                workflow_id,
+                step_id,
+                RECV_STEP_NAME,
+                Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
+                message.as_ref().and_then(|m| m.serialization.as_deref()),
+                Some(timing),
+            )
+            .await?;
+            tx.commit().await?;
+            tracing::debug!(
+                workflow_id,
+                step_id = step_id,
+                topic = stored_topic,
+                received = message.is_some(),
+                "recv finished"
+            );
+            Ok(message)
+        })
+        .await
+    }
+
     async fn write_stream(
         &self,
         workflow_id: &str,
@@ -3316,6 +3841,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                 }
 
                 tx.commit().await?;
+                // Committed, so a reader woken by this finds the entry — including the sentinel a
+                // close writes, which is how a reader learns the stream has ended. Migration 43
+                // dropped the trigger that used to do it. The replay above returns before here on
+                // purpose: it wrote nothing, so there is nothing new to look at.
+                self.notifier.signal(STREAMS_CHANNEL, workflow_id, key);
                 return Ok(());
             }
 
@@ -3344,11 +3874,33 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn close(&self) {
-        // Closing the pool is the whole of it, including for the waits parked on a polling permit:
-        // every in-flight poll's query fails permanently and releases its permit, so a parked
-        // waiter acquires, queries, and gets the same failure. An earlier version also closed the
-        // limiter to end those waits one query sooner; deleting it failed no test, so it is gone.
+        // **Before the pool closes**, because the notifier's last act is a database write: whatever
+        // it was still holding in its coalescing window goes out, so a value written a moment ago
+        // wakes readers elsewhere rather than leaving them to wait out an interval. Doing this
+        // after `pool.close()` would turn every such flush into a logged failure.
+        self.notifier.stop();
+        let task = self.notifier_task.lock().expect("notifier lock").take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+
+        // Closing the pool is the whole of it for the waits parked on a polling permit: every
+        // in-flight poll's query fails permanently and releases its permit, so a parked waiter
+        // acquires, queries, and gets the same failure. An earlier version also closed the limiter
+        // to end those waits one query sooner; deleting it failed no test, so it is gone.
         self.pool.close().await;
+
+        // The listener is told to stop by the same act — it watches the pool's close event — but
+        // being told is not the same as having stopped, and this is where the difference shows.
+        // Waiting for it means a caller that closed a handle can rely on nothing of this one's
+        // still running, and it is what makes a listener that failed to recognise the shutdown a
+        // hang rather than a warning logged every second forever.
+        let task = self.listener_task.lock().expect("listener lock").take();
+        if let Some(task) = task {
+            // The task itself never panics or is aborted, so an error here would be a bug rather
+            // than a shutdown to report on; either way the listener is not running.
+            let _ = task.await;
+        }
     }
 
     async fn check_step(
@@ -3431,74 +3983,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         duration: Duration,
     ) -> Result<Timestamp, Error> {
-        let pool = &self.pool;
-        // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
-        // the clock per attempt would push it further out each time.
-        let started_at = Timestamp::now();
-        let wake_at =
-            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
-
-        with_retry(&self.retry, "record_sleep", move || async move {
-            // No transaction, unlike `set_event`: there is no separate write to orphan here —
-            // the step record *is* the write, and the wake time is its output. The check-then-
-            // record race is caught by the insert's `ON CONFLICT` below, and the insert and the
-            // executor claim inside `record_step_on` are safe by their ordering.
-            let mut conn = pool.acquire().await?;
-
-            // A replay wakes at the *original* instant. Starting the clock again would make a
-            // workflow that crashed fifty minutes into an hour sleep another full hour.
-            if let Some(step) = self
-                .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
-                .await?
-            {
-                tracing::debug!(workflow_id, step_id, "replaying sleep");
-                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
-            }
-            tracing::debug!(
-                workflow_id,
-                step_id,
-                duration_ms = duration.as_millis() as u64,
-                "running sleep"
-            );
-
-            let recorded = wake_at.as_epoch_ms().to_string();
-            let timing = StepTiming {
-                started_at,
-                // The wake time, which is in the future — so the step's recorded duration is the
-                // sleep. Java does the same; nothing in execution or recovery reads the column.
-                completed_at: wake_at,
-            };
-            match self
-                .record_step_on(
-                    &mut conn,
-                    workflow_id,
-                    step_id,
-                    SLEEP_STEP_NAME,
-                    Outcome::Output(Some(&recorded)),
-                    Some(PORTABLE_JSON),
-                    Some(timing),
-                )
-                .await
-            {
-                Ok(()) => Ok(wake_at),
-                // A rival recorded the sleep between our check and our write. Its wake time is
-                // the one every execution must agree on, so adopt it rather than returning ours.
-                // Python swallows this and returns its own, which two runs would disagree about.
-                Err(Error::StepAlreadyRecorded { .. }) => {
-                    let step = self
-                        .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
-                        .await?
-                        .ok_or_else(|| {
-                            Error::Malformed(
-                                "sleep reported as recorded but cannot be read back".to_owned(),
-                            )
-                        })?;
-                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await
+        self.checkpoint_sleep(workflow_id, step_id, duration, SleepKind::Durable)
+            .await
     }
 
     async fn set_event(
@@ -3575,7 +4061,203 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await?;
 
             tx.commit().await?;
+            // Committed, so a reader woken by this finds the row. Migration 44 dropped the trigger
+            // that used to do it from inside the transaction above.
+            self.notifier.signal(EVENTS_CHANNEL, workflow_id, key);
             Ok(())
+        })
+        .await
+    }
+
+    async fn get_event(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+        caller: Option<GetEventCaller<'_>>,
+    ) -> Result<Option<EncodedValue>, Error> {
+        let events_table = self.tables.workflow_events.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // One statement, and the pass that finds a row is the one that answers the call. A miss
+        // carries nothing back whatever the select list says, so asking only whether the key exists
+        // would buy nothing and would leave the value still to be fetched.
+        let select = format!(
+            "SELECT value, serialization FROM {events_table} WHERE workflow_uuid = $1 AND key = $2"
+        );
+        let select = &select;
+        // When the step began, for the step it records at the end — so a workflow's timeline shows
+        // the wait, not the instant the answer was written down.
+        let started_at = Timestamp::now();
+
+        // A replay returns what the first run saw and does not wait again. Including the `None` a
+        // timeout produced: that is a result, and re-running the wait would let a value that
+        // arrived late change a decision the workflow has already taken.
+        if let Some(caller) = caller
+            && let Some(step) = self
+                .check_step(caller.workflow_id, caller.step_id, GET_EVENT_STEP_NAME)
+                .await?
+        {
+            tracing::debug!(
+                workflow_id = caller.workflow_id,
+                step_id = caller.step_id,
+                key,
+                "replaying get_event"
+            );
+            return Ok(step.output.map(|value| EncodedValue {
+                value,
+                serialization: step.serialization,
+            }));
+        }
+
+        // **Before the first look, never after.** A caller that looked first and registered second
+        // would miss anything written in between and then wait out its whole timeout for a value
+        // already in the table. Nothing wakes this yet — the loop below delivers on its own — but
+        // the ordering is what makes a wakeup safe to add.
+        let mut subscription = self.notify.subscribe(event_key(workflow_id, key));
+
+        // Recorded whether or not the value turns out to be there already, so which steps a run
+        // writes does not depend on how a race went. A recovery gets the original instant back, so
+        // a read that waited fifty of its sixty seconds and crashed has ten left rather than sixty.
+        let deadline = match caller {
+            Some(caller) => {
+                self.checkpoint_sleep(
+                    caller.workflow_id,
+                    caller.timeout_step_id,
+                    timeout,
+                    SleepKind::Deadline,
+                )
+                .await?
+            }
+            // A timeout so large it cannot be represented is one that never elapses, which is what
+            // the caller asked for.
+            None => started_at
+                .checked_add(timeout)
+                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX)),
+        };
+
+        // Look, wait a bounded interval, look again. **This loop is what delivers** — a wakeup only
+        // ever shortens the interval, so the wait is correct with nothing pushing at all, which is
+        // every SDK's CockroachDB configuration and this crate's CI.
+        let found = loop {
+            let row = with_retry(&self.retry, "get_event", move || async move {
+                // Inside the retried region, so a look that is backing off is not holding a permit
+                // through its backoff — and dropped before the wait below, so a caller parked
+                // between looks holds nothing. See the `polling` field for why a cap on waiters
+                // rather than on queries would deadlock.
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
+                Ok(sqlx::query(AssertSqlSafe(select.clone()))
+                    .bind(workflow_id)
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?)
+            })
+            .await?;
+            if let Some(row) = row {
+                break Some(EncodedValue {
+                    value: row.try_get("value")?,
+                    serialization: row.try_get("serialization")?,
+                });
+            }
+
+            // Past the deadline and exactly on it are the same answer — no time left — but
+            // `duration_since` reports the first as `None` and the second as zero. Folding them
+            // keeps that one decision in one place; leaving the zero case to the wait below would
+            // spin, since a zero-length timeout returns at once and the next look is another query.
+            let remaining = deadline
+                .duration_since(Timestamp::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                break None;
+            }
+            // Wait to be woken, but not past whichever bound comes first. The interval caps it so
+            // that a wakeup nothing sends — or one that is dropped — costs one interval rather than
+            // the whole timeout; the remaining time caps it so a wait never overruns the deadline.
+            // Elapsing is not an error here: both outcomes mean the same thing, which is look
+            // again.
+            let _ = tokio::time::timeout(
+                remaining.min(self.listener.poll_interval()),
+                subscription.notified(),
+            )
+            .await;
+        };
+        // Nothing below waits, and the registration is only worth its map entry while something
+        // does.
+        drop(subscription);
+
+        // **Outside a workflow this is the whole call.** There is no step to record, so there is
+        // nothing for a transaction to be atomic with — and the last look the loop took is the
+        // answer. TypeScript returns its polled row the same way.
+        let Some(caller) = caller else {
+            tracing::debug!(
+                workflow_id,
+                key,
+                found = found.is_some(),
+                "get_event finished"
+            );
+            return Ok(found);
+        };
+
+        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
+        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+        let found = found.as_ref();
+
+        // Two statements, and they have to be one commit: whether to record and the recording. The
+        // check that opened the call cannot stand in for this one, because the wait between them is
+        // exactly when another execution of this workflow would have recorded its own answer.
+        with_retry(&self.retry, "get_event", move || async move {
+            let mut tx = pool.begin().await?;
+            if let Some(step) = self
+                .check_step_on(
+                    &mut tx,
+                    caller.workflow_id,
+                    caller.step_id,
+                    GET_EVENT_STEP_NAME,
+                )
+                .await?
+            {
+                tx.commit().await?;
+                tracing::debug!(
+                    workflow_id = caller.workflow_id,
+                    step_id = caller.step_id,
+                    key,
+                    "adopting a rival execution's get_event"
+                );
+                return Ok(step.output.map(|value| EncodedValue {
+                    value,
+                    serialization: step.serialization,
+                }));
+            }
+
+            // The event's own encoded value under the event's own format, not a wrapper around the
+            // pair — so the column holds what the publisher wrote and stays legible to whoever
+            // reads the row, this crate included. All four references record exactly this. A
+            // timeout records a NULL output, which is how they spell "there was nothing" too.
+            self.record_step_on(
+                &mut tx,
+                caller.workflow_id,
+                caller.step_id,
+                GET_EVENT_STEP_NAME,
+                Outcome::Output(found.map(|v| v.value.as_str())),
+                found.and_then(|v| v.serialization.as_deref()),
+                Some(timing),
+            )
+            .await?;
+            tx.commit().await?;
+            tracing::debug!(
+                workflow_id = caller.workflow_id,
+                step_id = caller.step_id,
+                key,
+                found = found.is_some(),
+                "get_event finished"
+            );
+            Ok(found.cloned())
         })
         .await
     }
@@ -3640,6 +4322,84 @@ impl SystemDatabase for PostgresSystemDatabase {
                     })
                 })
                 .collect()
+        })
+        .await
+    }
+
+    async fn read_stream_value(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        offset: i32,
+    ) -> Result<StreamRead, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let streams_table = self.tables.streams.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // `workflow_status` drives the join, so the statement returns a row whenever the workflow
+        // exists — with or without a value at the offset — and no row only when it does not. The
+        // join predicate carries the key and offset rather than the `WHERE` clause, which is what
+        // makes that distinction possible at all.
+        //
+        // `"offset"` is quoted throughout because it is a reserved word, and aliased on the way out
+        // so it can be read back plainly. Matching it exactly keeps this one lookup on the
+        // `(workflow_uuid, key, offset)` primary key.
+        let select = format!(
+            "SELECT w.status AS status, s.value AS value, s.serialization AS serialization, \
+             s.\"offset\" AS stream_offset \
+             FROM {workflow_table} w \
+             LEFT OUTER JOIN {streams_table} s \
+               ON s.workflow_uuid = w.workflow_uuid AND s.key = $2 AND s.\"offset\" = $3 \
+             WHERE w.workflow_uuid = $1"
+        );
+        let select = &select;
+
+        with_retry(&self.retry, "read_stream_value", move || async move {
+            // A reader's loop calls this once per offset and then once per interval while it waits,
+            // so it is a poll like the other two and is capped like them. Inside the retried region,
+            // so a call that is backing off is not holding a permit through its backoff.
+            let _permit = polling
+                .acquire()
+                .await
+                .expect("the polling limiter is never closed");
+            let row = sqlx::query(AssertSqlSafe(select.clone()))
+                .bind(workflow_id)
+                .bind(key)
+                .bind(offset)
+                .fetch_optional(pool)
+                .await?;
+
+            // No row at all means no such workflow — the outer table drives the join. Reported
+            // rather than returned as an absent status, because a stream nobody can write to is not
+            // a stream that is merely empty, and every engine turns the null status into this same
+            // error the moment it sees one.
+            let Some(row) = row else {
+                return Err(Error::NonExistentWorkflow {
+                    workflow_ids: vec![workflow_id.to_owned()],
+                });
+            };
+
+            let status_text: String = row.try_get("status")?;
+            let status = WorkflowStatus::parse(&status_text).ok_or_else(|| {
+                Error::Malformed(format!("unknown workflow status {status_text:?}"))
+            })?;
+
+            // `streams."offset"` is `NOT NULL`, so a NULL here can only mean the join matched
+            // nothing: there is no entry at this offset. Python and TypeScript read the same column
+            // for the same reason.
+            //
+            // Probing `value` would answer identically today, since it is `NOT NULL` too — but the
+            // question being asked is whether the *join* matched, and keying on a payload column
+            // makes the answer hostage to that column staying non-nullable. `serialization`, one
+            // column over, already is nullable.
+            let value = match row.try_get::<Option<i32>, _>("stream_offset")? {
+                Some(_) => Some(EncodedValue {
+                    value: row.try_get("value")?,
+                    serialization: row.try_get("serialization")?,
+                }),
+                None => None,
+            };
+
+            Ok(StreamRead { status, value })
         })
         .await
     }

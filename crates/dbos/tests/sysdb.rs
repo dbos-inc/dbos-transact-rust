@@ -3,11 +3,11 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, AwaitedOutcome, Change, Debounce, DebounceRequest, Fork, ForkOptions, ForkPoint,
-    Message, NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite,
-    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
-    ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
+    Applications, AwaitedOutcome, Change, Debounce, DebounceRequest, EncodedValue, Fork,
+    ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule, NewWorkflow,
+    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit, RenameBatching,
+    RenameFrom, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -3037,6 +3037,1448 @@ async fn replaying_set_event_does_not_republish() {
     assert_eq!(rows.0, 1, "the replay added no history row either");
 }
 
+/// How long the blocking reads wait between looks. Nothing pushes yet, so it is also how long a
+/// value takes to arrive.
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Publisher and reader, both initialised, sharing one handle.
+async fn publisher_and_reader(sys: &PostgresSystemDatabase, publisher: &str, reader: &str) {
+    for id in [publisher, reader] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+}
+
+/// A value already published comes back without a wait.
+#[tokio::test]
+async fn an_event_already_published_returns_at_once() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.set_event("wf-publisher", 0, "progress", "50", Some("portable_json"))
+        .await
+        .unwrap();
+
+    let began = Timestamp::now();
+    let found = sys
+        .get_event("wf-publisher", "progress", RECHECK * 30, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        found,
+        Some(EncodedValue {
+            value: "50".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        })
+    );
+    // The first look answers it, so no interval is spent. Generous, because the assertion is
+    // "did not wait for the loop" rather than a latency budget.
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK,
+        "a value already there should not cost an interval",
+    );
+}
+
+/// A value published *after* the wait began still arrives — which is the whole feature.
+///
+/// **Nothing pushes.** No listener exists yet and no trigger fires into this process, so what
+/// delivers here is the re-query, exactly as it does on CockroachDB in every SDK. If this passes
+/// only once a notification transport lands, the transport has become load-bearing and the design
+/// has gone wrong.
+#[tokio::test]
+async fn a_value_published_during_the_wait_still_arrives() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+
+    let publishing = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            // Long enough that the reader's first look has already found nothing, so the value can
+            // only be delivered by a later pass of the loop.
+            tokio::time::sleep(BRIEFLY).await;
+            sys.set_event(
+                "wf-publisher",
+                0,
+                "progress",
+                "\"done\"",
+                Some("portable_json"),
+            )
+            .await
+            .unwrap();
+        })
+    };
+
+    // The read is given ten minutes, so its deadline cannot be what ends the wait — only the loop
+    // finding the value can be. Bounded at ten intervals: an interval sized for a transport that
+    // does not exist yet would still deliver, eventually, and "eventually" is the regression.
+    let began = Timestamp::now();
+    let found = tokio::time::timeout(
+        RECHECK * 10,
+        sys.get_event("wf-publisher", "progress", RECHECK * 600, None),
+    )
+    .await
+    .expect("the wait loop never delivered a value that was published during it")
+    .unwrap();
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK * 5,
+        "delivered, but far slower than the interval it is supposed to run at",
+    );
+
+    publishing.await.unwrap();
+    assert_eq!(
+        found,
+        Some(EncodedValue {
+            value: "\"done\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        })
+    );
+}
+
+/// Nothing published by the deadline is a value, not an error.
+///
+/// Python and TypeScript return the same. Go raises a timeout instead, but in its engine — and an
+/// error is the one shape a caller cannot synthesise from the other.
+#[tokio::test]
+async fn a_read_that_finds_nothing_reports_absence() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let found = sys
+        .get_event("wf-publisher", "never-set", BRIEFLY, None)
+        .await
+        .unwrap();
+    assert_eq!(found, None);
+
+    // A workflow that does not exist reads the same way: this waits for a key, not for a workflow.
+    let found = sys
+        .get_event("wf-nobody", "progress", BRIEFLY, None)
+        .await
+        .unwrap();
+    assert_eq!(found, None);
+}
+
+/// A read inside a workflow records the publisher's own payload, in the publisher's own format.
+///
+/// Not a wrapper around the pair: the column holds what was published, so the row stays legible to
+/// an operator and to every other implementation, all four of which record exactly this.
+#[tokio::test]
+async fn a_read_records_the_publishers_own_payload() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.set_event("wf-publisher", 0, "progress", "50", Some("pickle"))
+        .await
+        .unwrap();
+
+    let caller = GetEventCaller {
+        workflow_id: "wf-reader",
+        step_id: 0,
+        timeout_step_id: 1,
+    };
+    sys.get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
+        .await
+        .unwrap();
+
+    let step = sys
+        .check_step("wf-reader", 0, "DBOS.getEvent")
+        .await
+        .unwrap()
+        .expect("reading an event inside a workflow is a step");
+    assert_eq!(step.output.as_deref(), Some("50"));
+    assert_eq!(
+        step.serialization.as_deref(),
+        Some("pickle"),
+        "the publisher's format travels with the value, not this layer's",
+    );
+}
+
+/// A replay returns what the first run saw, whatever has been published since.
+#[tokio::test]
+async fn a_replayed_read_returns_what_the_first_run_saw() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.set_event("wf-publisher", 0, "progress", "50", None)
+        .await
+        .unwrap();
+
+    let caller = GetEventCaller {
+        workflow_id: "wf-reader",
+        step_id: 0,
+        timeout_step_id: 1,
+    };
+    let first = sys
+        .get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
+        .await
+        .unwrap();
+    assert_eq!(first.as_ref().map(|v| v.value.as_str()), Some("50"));
+
+    sys.set_event("wf-publisher", 1, "progress", "100", None)
+        .await
+        .unwrap();
+    let replayed = sys
+        .get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed, first,
+        "a replay must not see a value that arrived after the decision it fed",
+    );
+}
+
+/// A timeout is a result too, so a replay of one does not wait again — or find a late value.
+#[tokio::test]
+async fn a_replayed_timeout_stays_a_timeout() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+
+    let caller = GetEventCaller {
+        workflow_id: "wf-reader",
+        step_id: 0,
+        timeout_step_id: 1,
+    };
+    assert_eq!(
+        sys.get_event("wf-publisher", "progress", BRIEFLY, Some(caller))
+            .await
+            .unwrap(),
+        None,
+    );
+
+    // The replay is asked for thirty intervals, with still nothing published — so an
+    // implementation that looked again rather than replaying would sit here rather than answer,
+    // and the bound is what catches it. Nothing is published yet on purpose: with a value in the
+    // table the first look ends the wait, and waiting-when-it-should-not becomes invisible.
+    let began = Timestamp::now();
+    assert_eq!(
+        tokio::time::timeout(
+            RECHECK * 5,
+            sys.get_event("wf-publisher", "progress", RECHECK * 30, Some(caller)),
+        )
+        .await
+        .expect("a replay waited instead of returning the answer it had already recorded")
+        .unwrap(),
+        None,
+    );
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK,
+        "a replay must not wait at all",
+    );
+
+    // And a value arriving after the fact does not change it.
+    sys.set_event("wf-publisher", 0, "progress", "50", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
+            .await
+            .unwrap(),
+        None,
+        "the recorded absence is the answer, not a fresh look",
+    );
+}
+
+/// A replay does not go looking at the publisher's table at all.
+///
+/// The recorded answer is the answer, so a replay must survive the row it was read from being
+/// gone — deleted with its workflow, or garbage-collected. An implementation that replayed by
+/// looking again would find nothing and sit here for the ten minutes it was given.
+#[tokio::test]
+async fn a_replayed_read_does_not_depend_on_the_row_still_existing() {
+    let (sys, db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.set_event("wf-publisher", 0, "progress", "50", None)
+        .await
+        .unwrap();
+
+    let caller = GetEventCaller {
+        workflow_id: "wf-reader",
+        step_id: 0,
+        timeout_step_id: 1,
+    };
+    let timeout = std::time::Duration::from_secs(600);
+    let first = sys
+        .get_event("wf-publisher", "progress", timeout, Some(caller))
+        .await
+        .unwrap();
+    assert_eq!(first.as_ref().map(|v| v.value.as_str()), Some("50"));
+
+    // The published value goes away, while the deadline the first run checkpointed has ten minutes
+    // left — so nothing but the recorded step can end this wait.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "DELETE FROM dbos.workflow_events WHERE workflow_uuid = 'wf-publisher'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let replayed = tokio::time::timeout(
+        RECHECK * 10,
+        sys.get_event("wf-publisher", "progress", timeout, Some(caller)),
+    )
+    .await
+    .expect("a replay went looking for a row it had already read")
+    .unwrap();
+    assert_eq!(replayed, first);
+}
+
+/// A rival execution that records the read while this one is waiting wins, and this one adopts it.
+///
+/// The check that opens the read cannot cover this: the rival's step lands *during* the wait. So
+/// the final read checks again inside the transaction that records, which is what makes the two
+/// executions agree rather than making the loser fail.
+#[tokio::test]
+async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+
+    let reading = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.get_event(
+                "wf-publisher",
+                "progress",
+                RECHECK * 30,
+                Some(GetEventCaller {
+                    workflow_id: "wf-reader",
+                    step_id: 0,
+                    timeout_step_id: 1,
+                }),
+            )
+            .await
+        })
+    };
+
+    // While it waits: another execution of wf-reader records the step, and only then does the value
+    // appear. So the wait ends on a value this call must not return.
+    tokio::time::sleep(BRIEFLY).await;
+    sys.record_step(
+        "wf-reader",
+        0,
+        "DBOS.getEvent",
+        Outcome::Output(Some("\"rival\"")),
+        Some("portable_json"),
+        None,
+    )
+    .await
+    .unwrap();
+    sys.set_event("wf-publisher", 0, "progress", "\"mine\"", None)
+        .await
+        .unwrap();
+
+    let found = tokio::time::timeout(RECHECK * 20, reading)
+        .await
+        .expect("the read never finished")
+        .unwrap()
+        .expect("losing the race is not a failure");
+    assert_eq!(
+        found,
+        Some(EncodedValue {
+            value: "\"rival\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        }),
+        "the recorded step is the workflow's answer, whoever wrote it",
+    );
+}
+
+/// The deadline is checkpointed as a step that completes now, not one that completes at the
+/// deadline.
+///
+/// A read that answers in milliseconds under a long timeout must not be recorded as having taken
+/// the whole timeout, or every step aggregate and every Conductor timeline reports it that way.
+/// The sleep tests above cover the other stamping, which is what a real sleep gets.
+#[tokio::test]
+async fn a_read_records_a_deadline_it_may_abandon_rather_than_a_sleep() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.set_event("wf-publisher", 0, "progress", "50", None)
+        .await
+        .unwrap();
+
+    let timeout = std::time::Duration::from_secs(600);
+    sys.get_event(
+        "wf-publisher",
+        "progress",
+        timeout,
+        Some(GetEventCaller {
+            workflow_id: "wf-reader",
+            step_id: 0,
+            timeout_step_id: 1,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let sleep = sys
+        .check_step("wf-reader", 1, "DBOS.sleep")
+        .await
+        .unwrap()
+        .expect("the deadline is checkpointed even when the value is already there");
+    let started = sleep.started_at.unwrap();
+    let completed = sleep.completed_at.unwrap();
+    let deadline: i64 = sleep.output.unwrap().parse().unwrap();
+
+    assert!(
+        deadline - started.as_epoch_ms() >= timeout.as_millis() as i64,
+        "the recorded deadline is still ten minutes out; only the completion differs",
+    );
+    assert!(
+        completed.duration_since(started).unwrap() < RECHECK,
+        "a deadline is stamped complete now, not at the deadline: \
+         started {started:?}, completed {completed:?}",
+    );
+}
+
+/// A recovered read resumes the original deadline instead of restarting the timeout.
+///
+/// Set up the way a crash leaves it: the deadline step is already recorded and has already passed,
+/// while the read itself never got as far as recording anything. A ten-minute timeout must then
+/// expire at once rather than ten minutes from now.
+#[tokio::test]
+async fn a_recovered_read_resumes_the_original_deadline() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.record_sleep("wf-reader", 1, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+
+    let began = Timestamp::now();
+    let found = tokio::time::timeout(
+        RECHECK * 10,
+        sys.get_event(
+            "wf-publisher",
+            "progress",
+            std::time::Duration::from_secs(600),
+            Some(GetEventCaller {
+                workflow_id: "wf-reader",
+                step_id: 0,
+                timeout_step_id: 1,
+            }),
+        ),
+    )
+    .await
+    .expect("the recovered deadline had already passed; the timeout was restarted instead")
+    .unwrap();
+
+    assert_eq!(found, None);
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK * 5,
+        "the recovered deadline had already passed; the timeout was restarted instead",
+    );
+}
+
+/// A read inside a cancelled workflow stops at its next step boundary rather than waiting out its
+/// timeout.
+///
+/// Free, rather than a per-interval status check: the replay check that opens every read is a join
+/// against `workflow_status`, so a cancelled caller is reported by the query already being made.
+#[tokio::test]
+async fn a_cancelled_reader_stops_rather_than_waiting() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.cancel_workflows(&["wf-reader"], false).await.unwrap();
+
+    let err = tokio::time::timeout(
+        RECHECK * 10,
+        sys.get_event(
+            "wf-publisher",
+            "progress",
+            std::time::Duration::from_secs(600),
+            Some(GetEventCaller {
+                workflow_id: "wf-reader",
+                step_id: 0,
+                timeout_step_id: 1,
+            }),
+        ),
+    )
+    .await
+    .expect("a cancelled reader waited out its timeout instead of stopping")
+    .expect_err("a cancelled workflow finds out at its next step boundary");
+    assert!(
+        matches!(err, Error::WorkflowCancelled { ref workflow_id } if workflow_id == "wf-reader"),
+        "unexpected error: {err:?}",
+    );
+}
+
+/// A read waiting at a cap of one does not hold its permit across the wait.
+///
+/// The failure this rules out is a deadlock built from safe parts: cap the concurrent *waiters*
+/// rather than the concurrent queries and one pool's worth of blocked reads blocks every later one
+/// until they time out. The first reader here waits for something nobody will ever publish, so if
+/// it holds the permit it holds it for the full timeout.
+#[tokio::test]
+async fn a_capped_read_does_not_hold_its_permit_across_the_wait() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            polling_concurrency: Some(1),
+            ..Settings::default()
+        },
+    ));
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.set_event("wf-publisher", 0, "published", "50", None)
+        .await
+        .unwrap();
+
+    // First, and given a head start, so it is the one holding the permit if the permit is held.
+    let forever = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.get_event("wf-publisher", "never-published", RECHECK * 60, None)
+                .await
+        })
+    };
+    tokio::time::sleep(BRIEFLY).await;
+
+    let found = tokio::time::timeout(
+        RECHECK * 10,
+        sys.get_event("wf-publisher", "published", RECHECK * 30, None),
+    )
+    .await
+    .expect("starved: a polling permit is being held across a wait")
+    .unwrap();
+    assert_eq!(found.map(|v| v.value), Some("50".to_owned()));
+
+    // Still waiting, as it should be, and dropped rather than awaited.
+    assert!(!forever.is_finished());
+    forever.abort();
+}
+
+/// One message to `wf-receiver`, from a sender outside a workflow.
+async fn send_to_receiver(sys: &PostgresSystemDatabase, topic: Option<&str>, message: &str) {
+    sys.send_messages(
+        &[Message {
+            destination_id: "wf-receiver",
+            topic,
+            message,
+            idempotency_key: None,
+        }],
+        Some("portable_json"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+}
+
+/// A message already waiting is taken without a wait, and taken means consumed.
+#[tokio::test]
+async fn a_message_already_waiting_is_taken_at_once() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+
+    let began = Timestamp::now();
+    let taken = sys
+        .recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        taken,
+        Some(EncodedValue {
+            value: "\"one\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        })
+    );
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK,
+        "a message already there should not cost an interval",
+    );
+
+    // Marked rather than deleted, so what a workflow was sent stays visible to export and audit.
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].consumed, "receiving consumes the message");
+
+    let step = sys
+        .check_step("wf-receiver", 0, "DBOS.recv")
+        .await
+        .unwrap()
+        .expect("receiving is a step");
+    assert_eq!(step.output.as_deref(), Some("\"one\""));
+    assert_eq!(
+        step.serialization.as_deref(),
+        Some("portable_json"),
+        "the sender's format travels with the message",
+    );
+}
+
+/// A message sent *after* the wait began still arrives, with nothing pushing.
+#[tokio::test]
+async fn a_message_sent_during_the_wait_still_arrives() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let sending = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            // Long enough that the receiver's first look has already found nothing.
+            tokio::time::sleep(BRIEFLY).await;
+            send_to_receiver(&sys, None, "\"late\"").await;
+        })
+    };
+
+    // Ten minutes to receive in, so the deadline cannot be what ends the wait — only the loop
+    // finding the message can be — and ten intervals to do it in.
+    let began = Timestamp::now();
+    let taken = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 0, 1, None, RECHECK * 600),
+    )
+    .await
+    .expect("the wait loop never delivered a message that was sent during it")
+    .unwrap();
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK * 5,
+        "delivered, but far slower than the interval it is supposed to run at",
+    );
+
+    sending.await.unwrap();
+    assert_eq!(taken.map(|m| m.value), Some("\"late\"".to_owned()));
+}
+
+/// Nothing sent by the deadline is a value, not an error — and it is recorded as one.
+#[tokio::test]
+async fn a_recv_that_finds_nothing_reports_absence() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.recv("wf-receiver", 0, 1, Some("orders"), BRIEFLY)
+            .await
+            .unwrap(),
+        None,
+    );
+    let step = sys
+        .check_step("wf-receiver", 0, "DBOS.recv")
+        .await
+        .unwrap()
+        .expect("a timeout is a result, and results are recorded");
+    assert_eq!(step.output, None, "nothing received is a NULL output");
+
+    // A message on another topic is not this receiver's, and the sentinel topic is its own topic
+    // rather than a wildcard.
+    send_to_receiver(&sys, None, "\"untopicked\"").await;
+    assert_eq!(
+        sys.recv("wf-receiver", 2, 3, Some("orders"), BRIEFLY)
+            .await
+            .unwrap(),
+        None,
+        "a message on the default topic is not a message on `orders`",
+    );
+}
+
+/// Messages are taken oldest first, and each exactly once.
+#[tokio::test]
+async fn messages_are_taken_oldest_first() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for message in ["\"one\"", "\"two\"", "\"three\""] {
+        send_to_receiver(&sys, Some("orders"), message).await;
+    }
+
+    let mut taken = Vec::new();
+    for step_id in [0, 2, 4] {
+        taken.push(
+            sys.recv(
+                "wf-receiver",
+                step_id,
+                step_id + 1,
+                Some("orders"),
+                RECHECK * 600,
+            )
+            .await
+            .unwrap()
+            .map(|m| m.value),
+        );
+    }
+    assert_eq!(
+        taken,
+        [
+            Some("\"one\"".to_owned()),
+            Some("\"two\"".to_owned()),
+            Some("\"three\"".to_owned()),
+        ],
+        "FIFO, and no message twice",
+    );
+}
+
+/// A replay returns the message the first run took, and does not take another.
+#[tokio::test]
+async fn a_replayed_recv_does_not_take_a_second_message() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+    send_to_receiver(&sys, Some("orders"), "\"two\"").await;
+
+    let first = sys
+        .recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+        .await
+        .unwrap();
+    let replayed = sys
+        .recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+        .await
+        .unwrap();
+
+    assert_eq!(replayed, first, "a replay returns, it does not receive");
+    let consumed = sys
+        .get_all_notifications("wf-receiver")
+        .await
+        .unwrap()
+        .iter()
+        .filter(|n| n.consumed)
+        .count();
+    assert_eq!(consumed, 1, "the replay must not have taken the second one");
+}
+
+/// A replay does not go looking for a message it has already been given.
+///
+/// The recorded answer is the answer, so a replay must return at once even when the queue is empty
+/// — an implementation that looked again would sit here for the ten minutes it was given.
+#[tokio::test]
+async fn a_replayed_recv_does_not_wait_for_a_message_it_already_has() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+
+    let timeout = RECHECK * 600;
+    let first = sys
+        .recv("wf-receiver", 0, 1, Some("orders"), timeout)
+        .await
+        .unwrap();
+    assert_eq!(first.as_ref().map(|m| m.value.as_str()), Some("\"one\""));
+
+    // Nothing is waiting now, and the deadline the first run checkpointed has ten minutes left —
+    // so only the recorded step can end this call.
+    let began = Timestamp::now();
+    let replayed = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 0, 1, Some("orders"), timeout),
+    )
+    .await
+    .expect("a replay waited for a message it had already received")
+    .unwrap();
+    assert_eq!(replayed, first);
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK,
+        "a replay must not wait at all",
+    );
+}
+
+/// A rival execution that records the receive mid-wait wins, and this one takes no message.
+///
+/// The check that opens the call cannot cover this: the rival's step lands *during* the wait. So
+/// the taking checks again inside the transaction that records, which is what keeps the message on
+/// the queue rather than consuming it for a step nobody will record.
+#[tokio::test]
+async fn a_recv_defers_to_a_rival_that_recorded_first() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                .await
+        })
+    };
+
+    // While it waits: another execution of wf-receiver records the step, and only then does a
+    // message appear. So the wait ends on a message this call must not take.
+    tokio::time::sleep(BRIEFLY).await;
+    sys.record_step(
+        "wf-receiver",
+        0,
+        "DBOS.recv",
+        Outcome::Output(Some("\"rival\"")),
+        Some("portable_json"),
+        None,
+    )
+    .await
+    .unwrap();
+    send_to_receiver(&sys, Some("orders"), "\"mine\"").await;
+
+    let taken = tokio::time::timeout(RECHECK * 20, receiving)
+        .await
+        .expect("the receive never finished")
+        .unwrap()
+        .expect("losing to a rival is not a failure");
+    assert_eq!(
+        taken.map(|m| m.value),
+        Some("\"rival\"".to_owned()),
+        "the recorded step is the workflow's answer, whoever wrote it",
+    );
+
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert!(
+        notifications.iter().all(|n| !n.consumed),
+        "the message must still be on the queue: nothing recorded having taken it",
+    );
+}
+
+/// A second receiver on one (workflow, topic) is refused rather than left to time out.
+///
+/// One message goes to one of them, so the loser would wait out its whole timeout and report that
+/// nothing arrived — which the sender cannot tell apart from not having sent. Python and Go refuse
+/// it too; TypeScript and Java allow it.
+#[tokio::test]
+async fn a_second_receiver_on_one_topic_is_refused() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let waiting = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                .await
+        })
+    };
+    tokio::time::sleep(BRIEFLY).await;
+
+    // Bounded, because the regression is that it *waits*: a second receiver that is admitted
+    // rather than refused sits out its whole ten minutes for a message it was never going to get,
+    // which is exactly the behaviour being ruled out.
+    let err = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 600),
+    )
+    .await
+    .expect("a second receiver was admitted and left to wait rather than refused")
+    .expect_err("a second receiver on one topic is a bug in the caller, and is told so");
+    assert!(
+        matches!(
+            err,
+            Error::ConcurrentRecv { ref workflow_id, ref topic }
+                if workflow_id == "wf-receiver" && topic.as_deref() == Some("orders")
+        ),
+        "unexpected error: {err:?}",
+    );
+
+    // Another topic on the same workflow is a different wait, and is not refused.
+    send_to_receiver(&sys, Some("refunds"), "\"other\"").await;
+    assert!(
+        sys.recv("wf-receiver", 4, 5, Some("refunds"), RECHECK * 600)
+            .await
+            .unwrap()
+            .is_some(),
+    );
+
+    waiting.abort();
+}
+
+/// Two receivers racing at the database consume one message between them, not two.
+///
+/// **The cross-process case, which the in-process guard cannot see** — two handles have two
+/// registries, so both get past `subscribe_exclusive` exactly as two executors recovering one
+/// workflow would. What arbitrates here is the database: the consuming `UPDATE` re-evaluates
+/// `consumed = FALSE` against the winner's committed row, and the losing transaction rolls back
+/// whatever it took when its step write conflicts. Two messages are queued so that a loser going
+/// back for a *different* one would be visible as a second consumed row.
+///
+/// **What this does not pin:** the `consumed = FALSE` predicate itself. Removing it and re-running
+/// this test passes, because the transaction covers the same case — verified by mutation. The
+/// predicate stays for the reasons given where it is written, but no test here can tell it apart,
+/// and claiming otherwise would be worse than saying so.
+#[tokio::test]
+async fn two_receivers_cannot_take_the_same_message() {
+    let db = test_database().await;
+    // Two handles over one pool: separate registries, so the in-process exclusivity does not apply
+    // and both reach the database — which is the situation this test is about.
+    let first = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    let second = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    first
+        .init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    send_to_receiver(&first, Some("orders"), "\"one\"").await;
+    send_to_receiver(&first, Some("orders"), "\"two\"").await;
+
+    let racing: Vec<_> = [first.clone(), second.clone()]
+        .into_iter()
+        .map(|sys| {
+            tokio::spawn(async move {
+                sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                    .await
+            })
+        })
+        .collect();
+
+    let mut answers = Vec::new();
+    for handle in racing {
+        answers.push(
+            tokio::time::timeout(RECHECK * 20, handle)
+                .await
+                .expect("a racing receiver never finished")
+                .unwrap()
+                .expect("losing the race is not a failure"),
+        );
+    }
+
+    assert_eq!(
+        answers[0], answers[1],
+        "both executions of one workflow must report the message its one recorded step holds",
+    );
+    let notifications = first.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "one message was received, so exactly one may be consumed: {notifications:?}",
+    );
+}
+
+/// A receive inside a cancelled workflow stops rather than waiting out its timeout.
+#[tokio::test]
+async fn a_cancelled_receiver_stops_rather_than_waiting() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.cancel_workflows(&["wf-receiver"], false).await.unwrap();
+
+    let err = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600),
+    )
+    .await
+    .expect("a cancelled receiver waited out its timeout instead of stopping")
+    .expect_err("a cancelled workflow finds out at its next step boundary");
+    assert!(
+        matches!(err, Error::WorkflowCancelled { ref workflow_id } if workflow_id == "wf-receiver"),
+        "unexpected error: {err:?}",
+    );
+}
+
+/// A recovered receive resumes the original deadline instead of restarting the timeout.
+#[tokio::test]
+async fn a_recovered_recv_resumes_the_original_deadline() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_sleep("wf-receiver", 1, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+
+    let began = Timestamp::now();
+    let taken = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600),
+    )
+    .await
+    .expect("the recovered deadline had already passed; the timeout was restarted instead")
+    .unwrap();
+
+    assert_eq!(taken, None);
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK * 5,
+        "the recovered deadline had already passed; the timeout was restarted instead",
+    );
+}
+
+/// A receiver waiting at a cap of one does not hold its permit across the wait.
+#[tokio::test]
+async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            polling_concurrency: Some(1),
+            ..Settings::default()
+        },
+    ));
+    for id in ["wf-receiver", "wf-other"] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    sys.send_messages(
+        &[Message {
+            destination_id: "wf-other",
+            topic: None,
+            message: "\"here\"",
+            idempotency_key: None,
+        }],
+        Some("portable_json"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // First, and given a head start, so it is the one holding the permit if the permit is held.
+    let forever = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("never-sent"), RECHECK * 600)
+                .await
+        })
+    };
+    tokio::time::sleep(BRIEFLY).await;
+
+    let taken = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-other", 0, 1, None, RECHECK * 600),
+    )
+    .await
+    .expect("starved: a polling permit is being held across a wait")
+    .unwrap();
+    assert_eq!(taken.map(|m| m.value), Some("\"here\"".to_owned()));
+
+    assert!(!forever.is_finished());
+    forever.abort();
+}
+
+/// Whether to skip a test that needs a listener, which CockroachDB cannot have.
+///
+/// Not a gap in coverage: the *absence* of a listener is covered everywhere else, since every other
+/// test in this file runs on both backends with none running, and that is the configuration
+/// CockroachDB is always in.
+fn skip_without_listen_notify(db: &support::TestDatabase) -> bool {
+    let skipping = matches!(db.backend(), Backend::Cockroach);
+    if skipping {
+        eprintln!(
+            "skipped on CockroachDB: it has no LISTEN/NOTIFY, so there is no listener to test"
+        );
+    }
+    skipping
+}
+
+/// A handle with a listener running, once the listener has proved it delivers.
+///
+/// The wait matters: starting a listener spawns a task that connects and self-tests, so a caller
+/// that raced it would see the short interval and could not tell push from polling.
+async fn listening(pool: sqlx::PgPool) -> PostgresSystemDatabase {
+    let sys = PostgresSystemDatabase::from_pool(pool, &Settings::default());
+    assert!(
+        sys.start_notifications().await,
+        "PostgreSQL supports LISTEN/NOTIFY, so one should have started",
+    );
+    for _ in 0..100 {
+        if sys.is_delivering() {
+            return sys;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the listener never proved it delivers");
+}
+
+/// A listener delivers a message far sooner than the interval it licenses.
+///
+/// **This is the whole point of the listener and the only way to see it.** Once one is delivering,
+/// a `recv` re-queries every *minute* rather than every second — so a message arriving in
+/// milliseconds can only have come from a notification. Run it with the listener off and the same
+/// call takes up to a second; run it with the interval switch broken and it takes up to a minute.
+///
+/// It is `recv` rather than `get_event` because migration 1's trigger is the only one left: 43 and
+/// 44 dropped the events and streams triggers, and the writer-side push that replaces them is a
+/// separate change.
+#[tokio::test]
+async fn a_listener_delivers_a_message_sooner_than_the_interval_allows() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let sys = std::sync::Arc::new(listening(db.pool().await).await);
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                .await
+        })
+    };
+    // Long enough that the receiver's first look has already found nothing and it is parked on an
+    // interval that will not come round for a minute.
+    tokio::time::sleep(BRIEFLY).await;
+
+    let sent = Timestamp::now();
+    send_to_receiver(&sys, Some("orders"), "\"pushed\"").await;
+    let taken = tokio::time::timeout(RECHECK * 20, receiving)
+        .await
+        .expect("the message never arrived")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(taken.map(|m| m.value), Some("\"pushed\"".to_owned()));
+    let waited = Timestamp::now().duration_since(sent).unwrap();
+    assert!(
+        waited < RECHECK,
+        "took {waited:?} after the send, which is the re-query rather than the notification",
+    );
+}
+
+/// A message that arrives with no notification is still found, on the next connect.
+///
+/// **`NOTIFY` is not queued for absent listeners**, so anything written while this process had no
+/// connection is simply gone — and with the interval at a minute, the waiter would sit there long
+/// past its own timeout. Waking every waiter on connect is what covers that. Go and Java both do
+/// it; Python and TypeScript do not, and rely on the fallback catching it.
+///
+/// **The gap is manufactured rather than raced for.** An earlier version of this test killed the
+/// listener's connection and sent a message, which proved nothing: `PgListener` reconnects in
+/// milliseconds, so the notification was delivered normally and the test passed with the wake
+/// removed — verified by mutation. Here the row is inserted with triggers off, so no notification
+/// is ever sent for it, and only then is the connection killed. Nothing but the wake on reconnect
+/// can end the wait inside a minute.
+#[tokio::test]
+async fn a_message_that_notified_nobody_is_found_on_reconnect() {
+    const TAG: &str = "listener-outage";
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    // Tagged so the listener's own connection can be found and killed; everything this handle
+    // opens carries it.
+    let pool = db
+        .pool_options()
+        .connect_with(db.options().application_name(TAG))
+        .await
+        .expect("failed to connect");
+    let sys = std::sync::Arc::new(listening(pool).await);
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                .await
+        })
+    };
+    // Parked, and — because a listener is delivering — parked for a minute rather than a second.
+    tokio::time::sleep(BRIEFLY).await;
+
+    // `session_replication_role = replica` suppresses user triggers for this session, so migration
+    // 1's NOTIFY never fires for this row. The message is committed and waiting; nobody was told.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "SET session_replication_role = replica",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(
+        "INSERT INTO dbos.notifications (destination_uuid, topic, message, serialization) \
+         VALUES ('wf-receiver', 'orders', '\"unannounced\"', 'portable_json')",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Now force the listener round its reconnect path. Its wake is the only thing that can tell
+    // the waiter to look again before its own interval, which is fifty-nine seconds away.
+    db.kill_connections(TAG).await;
+
+    let taken = tokio::time::timeout(RECHECK * 30, receiving)
+        .await
+        .expect("the message was never found: nothing woke the waiter after the gap")
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.map(|m| m.value), Some("\"unannounced\"".to_owned()));
+}
+
+/// Closing the handle stops the listener, without anything having to remember to.
+///
+/// **The pool is the whole shutdown mechanism.** `PgListener` is built with
+/// `connect_with(&pool)`, so it watches the pool's close event: the wait it is parked in is
+/// cancelled with `PoolClosed`, which the listener reads as "stop" rather than as an error to
+/// reconnect through. So there is no separate stop-the-listener call to forget to make.
+///
+/// **The two assertions below are different claims and both are needed.** `close` returning is the
+/// pool having every connection back, the listener's included, and the task having ended. That
+/// second half is what `is_delivering` going false cannot show on its own: the transient error path
+/// clears it too, so a listener that failed to recognise the shutdown — reconnecting against a
+/// closed pool for the life of the process — would satisfy it.
+#[tokio::test]
+async fn closing_the_handle_stops_the_listener() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let sys = listening(db.pool().await).await;
+    assert!(sys.is_delivering());
+
+    // Returns only once every connection is back, the listener's included — so this call is also
+    // the assertion that the listener does not hold one open forever.
+    tokio::time::timeout(RECHECK * 10, sys.close())
+        .await
+        .expect("closing hung: the listener never released its connection");
+
+    for _ in 0..100 {
+        if !sys.is_delivering() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the listener outlived the handle that owns it");
+}
+
+/// CockroachDB gets no listener, and says so rather than failing.
+///
+/// It has no `LISTEN`/`NOTIFY` at all, so a listener there would be a task erroring and retrying
+/// forever. Waits re-query on their own interval instead, which is what delivers on that backend —
+/// and is why every test in this file passes on it.
+#[tokio::test]
+async fn cockroach_gets_no_listener_and_reports_it() {
+    let db = test_database().await;
+    let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    let started = sys.start_notifications().await;
+
+    match db.backend() {
+        Backend::Cockroach => {
+            assert!(!started, "CockroachDB has no LISTEN/NOTIFY to start one on");
+            assert!(!sys.is_delivering());
+        }
+        Backend::Postgres => assert!(started),
+    }
+}
+
+/// An event set in another process reaches a reader far sooner than its interval allows.
+///
+/// **The events counterpart of the message test above, and what migration 44 took away.** That one
+/// rides migration 1's surviving trigger; here the trigger is gone and the writer's own push is the
+/// only thing that can put a notification on the wire. The reader is delivering, so its next look
+/// is a minute away — arriving in milliseconds can only be the push.
+///
+/// Two handles over one database, each with its own pool and its own registry, which is what two
+/// processes look like from in here: the reader cannot be woken by the writer's local wake, because
+/// they share no registry.
+#[tokio::test]
+async fn an_event_set_elsewhere_arrives_sooner_than_the_interval_allows() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let reader = std::sync::Arc::new(listening(db.pool().await).await);
+    let writer = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    assert!(writer.start_notifications().await);
+    assert!(
+        writer.is_pushing(),
+        "a writer that pushes nothing wakes nobody"
+    );
+    writer
+        .init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let reading = {
+        let reader = std::sync::Arc::clone(&reader);
+        tokio::spawn(async move {
+            reader
+                .get_event("wf-publisher", "ready", RECHECK * 600, None)
+                .await
+        })
+    };
+    // Long enough that the reader's first look has already found nothing and it is parked on an
+    // interval that will not come round for a minute.
+    tokio::time::sleep(BRIEFLY).await;
+
+    let published = Timestamp::now();
+    writer
+        .set_event("wf-publisher", 0, "ready", "\"go\"", Some("portable_json"))
+        .await
+        .unwrap();
+    let found = tokio::time::timeout(RECHECK * 20, reading)
+        .await
+        .expect("the event never arrived")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(found.map(|v| v.value), Some("\"go\"".to_owned()));
+    let waited = Timestamp::now().duration_since(published).unwrap();
+    assert!(
+        waited < RECHECK,
+        "took {waited:?} after the write, which is a re-query rather than the push",
+    );
+}
+
+/// A stream write puts a notification where migration 43's trigger used to put one.
+///
+/// **Read off the wire rather than through a waiter**, because there is no waiter to use: nothing
+/// in this crate waits on a stream — the loop that would is the engine's, and decision 9 keeps it
+/// there. So the test listens on the channel itself and asserts the payload, which is the contract
+/// a reader in another process depends on: `id::key`, unescaped, exactly as the dropped trigger
+/// wrote it.
+#[tokio::test]
+async fn a_stream_write_is_pushed_where_the_trigger_used_to_publish() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let mut wire = sqlx::postgres::PgListener::connect_with(&db.pool().await)
+        .await
+        .expect("failed to listen");
+    wire.listen("dbos_streams_channel").await.unwrap();
+
+    let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    assert!(sys.start_notifications().await);
+    sys.init_workflow(&workflow("wf-producer"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-producer",
+        0,
+        "progress",
+        "\"a\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let notification = tokio::time::timeout(RECHECK * 5, wire.recv())
+        .await
+        .expect("nothing was pushed for the write")
+        .unwrap();
+    assert_eq!(notification.payload(), "wf-producer::progress");
+}
+
+/// Closing a handle pushes what its coalescing window was still holding.
+///
+/// **Without the final flush this value would reach nobody**, and the test says so rather than
+/// racing to say it: the window is five seconds here, so the ordinary flush cannot deliver inside
+/// the three the assertion allows, and a stopped loop never delivers at all. The write is the last
+/// thing the handle does, which is exactly the case a shutdown drops — a workflow that publishes
+/// its result and exits.
+#[tokio::test]
+async fn a_close_pushes_what_the_window_was_still_holding() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let mut wire = sqlx::postgres::PgListener::connect_with(&db.pool().await)
+        .await
+        .expect("failed to listen");
+    wire.listen("dbos_workflow_events_channel").await.unwrap();
+
+    let sys = PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            notification_coalesce: Some(RECHECK * 5),
+            ..Settings::default()
+        },
+    );
+    assert!(sys.start_notifications().await);
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.set_event("wf-publisher", 0, "ready", "\"go\"", Some("portable_json"))
+        .await
+        .unwrap();
+
+    sys.close().await;
+
+    let notification = tokio::time::timeout(RECHECK * 3, wire.recv())
+        .await
+        .expect("the close dropped what the window was holding")
+        .unwrap();
+    assert_eq!(notification.payload(), "wf-publisher::ready");
+}
+
+/// A write wakes a waiter in its own process with nothing pushing at all.
+///
+/// **This is the one wakeup that works on every backend**, and the reason it is worth having: no
+/// listener, no push, no round trip — the writer wakes the registry directly on its way out. On
+/// CockroachDB it is the *only* thing that can shorten a wait, since there is no `LISTEN`/`NOTIFY`
+/// to fall back on; that is why this test does not skip.
+///
+/// Go signals its local registry the same way. Python and TypeScript do not, and their own
+/// process's waiters hear their writes back off the wire — which on a backend with no wire means
+/// waiting out the interval.
+#[tokio::test]
+async fn a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing() {
+    let (sys, _db) = sysdb().await;
+    let sys = std::sync::Arc::new(sys);
+    assert!(
+        !sys.is_pushing(),
+        "no listener was started, so nothing pushes"
+    );
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let reading = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.get_event("wf-publisher", "ready", RECHECK * 600, None)
+                .await
+        })
+    };
+    // Parked, and — with nothing delivering — parked for a second, so its own next look is most of
+    // a second away from the write below.
+    tokio::time::sleep(BRIEFLY).await;
+
+    let published = Timestamp::now();
+    sys.set_event("wf-publisher", 0, "ready", "\"go\"", Some("portable_json"))
+        .await
+        .unwrap();
+    let found = tokio::time::timeout(RECHECK * 20, reading)
+        .await
+        .expect("the event never arrived")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(found.map(|v| v.value), Some("\"go\"".to_owned()));
+    let waited = Timestamp::now().duration_since(published).unwrap();
+    assert!(
+        waited < RECHECK / 2,
+        "took {waited:?} after the write, which is the re-query rather than the wake",
+    );
+}
+
 /// A replayed sleep wakes at the original instant, not a fresh one.
 ///
 /// This is the whole point of checkpointing it: a workflow that slept an hour and crashed fifty
@@ -4234,6 +5676,210 @@ async fn a_replay_that_changed_its_batch_size_is_refused() {
     // And nothing extra was delivered.
     assert_eq!(sys.get_all_notifications("wf-x").await.unwrap().len(), 1);
     assert!(sys.get_all_notifications("wf-y").await.unwrap().is_empty());
+}
+
+/// One offset reads back with the producer's status, from one snapshot.
+#[tokio::test]
+async fn a_stream_offset_reads_back_with_its_producers_status() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-stream",
+        0,
+        "progress",
+        "\"a\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let read = sys
+        .read_stream_value("wf-stream", "progress", 0)
+        .await
+        .unwrap();
+    assert_eq!(read.status, WorkflowStatus::Pending);
+    assert_eq!(
+        read.value,
+        Some(EncodedValue {
+            value: "\"a\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        })
+    );
+}
+
+/// Nothing at the offset still reports the status, which is what a reader waits on.
+///
+/// The `LEFT JOIN` is what makes this possible: a reader that got no row at all could not tell
+/// "not written yet" from "no such workflow", and those are the two answers it has to act on
+/// differently.
+#[tokio::test]
+async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    // Nothing written at all, and no such key either — both are simply empty offsets.
+    for (key, offset) in [("progress", 0), ("never-written", 0), ("progress", 7)] {
+        let read = sys
+            .read_stream_value("wf-stream", key, offset)
+            .await
+            .unwrap();
+        assert_eq!(read.value, None, "key {key} offset {offset}");
+        assert_eq!(read.status, WorkflowStatus::Pending);
+    }
+
+    // And the status is the *current* one, so a reader sees the producer stop.
+    sys.record_workflow_outcome("wf-stream", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+    let read = sys
+        .read_stream_value("wf-stream", "progress", 0)
+        .await
+        .unwrap();
+    assert_eq!(read.status, WorkflowStatus::Success);
+    assert_eq!(read.value, None);
+}
+
+/// A stream nobody can write to is an error, not an empty stream.
+#[tokio::test]
+async fn reading_a_stream_of_a_missing_workflow_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let err = sys
+        .read_stream_value("wf-nobody", "progress", 0)
+        .await
+        .expect_err("there is no workflow to wait on");
+    assert!(
+        matches!(err, Error::NonExistentWorkflow { ref workflow_ids }
+            if workflow_ids == &["wf-nobody".to_owned()]),
+        "unexpected error: {err:?}",
+    );
+}
+
+/// The closing sentinel comes back as a value; recognising it is the loop's job, not this layer's.
+#[tokio::test]
+async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-stream",
+        0,
+        "progress",
+        "\"a\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+    sys.close_stream("wf-stream", 1, "progress").await.unwrap();
+
+    assert_eq!(
+        sys.read_stream_value("wf-stream", "progress", 1)
+            .await
+            .unwrap()
+            .value
+            .map(|v| v.value),
+        Some(dbos::sysdb::STREAM_CLOSED.to_owned()),
+        "the sentinel is a value at an offset like any other",
+    );
+    // And it is the last one: nothing follows a close.
+    assert_eq!(
+        sys.read_stream_value("wf-stream", "progress", 2)
+            .await
+            .unwrap()
+            .value,
+        None,
+    );
+}
+
+/// A reader draining a stream sees every offset in order, and stops at the first empty one.
+///
+/// This is the loop the engine will own, written out by hand — the point being that everything it
+/// needs comes from this one call: the value, whether there is one, and whether the producer is
+/// still going.
+#[tokio::test]
+async fn the_offsets_of_a_stream_read_back_as_the_stream() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    for (step_id, value) in [(0, "\"a\""), (1, "\"b\""), (2, "\"c\"")] {
+        sys.write_stream(
+            "wf-stream",
+            step_id,
+            "progress",
+            value,
+            Some("portable_json"),
+            WrittenBy::Workflow,
+        )
+        .await
+        .unwrap();
+    }
+    sys.close_stream("wf-stream", 3, "progress").await.unwrap();
+
+    let mut read = Vec::new();
+    for offset in 0..10 {
+        let at = sys
+            .read_stream_value("wf-stream", "progress", offset)
+            .await
+            .unwrap();
+        match at.value {
+            Some(v) if v.value == dbos::sysdb::STREAM_CLOSED => break,
+            Some(v) => read.push(v.value),
+            None => break,
+        }
+    }
+    assert_eq!(read, ["\"a\"", "\"b\"", "\"c\""]);
+}
+
+/// A read waiting at a cap of one does not hold its permit across the calls around it.
+///
+/// The loop is above this layer, so unlike `recv` and `get_event` the permit is taken and released
+/// inside a single call — but the property that matters is the same: a reader parked between
+/// offsets must not be holding one.
+#[tokio::test]
+async fn capped_stream_reads_do_not_block_each_other() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            polling_concurrency: Some(1),
+            ..Settings::default()
+        },
+    ));
+    sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-stream",
+        0,
+        "progress",
+        "\"a\"",
+        None,
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let sys = std::sync::Arc::clone(&sys);
+            tokio::spawn(async move { sys.read_stream_value("wf-stream", "progress", 0).await })
+        })
+        .collect();
+    for reader in readers {
+        let read = tokio::time::timeout(RECHECK * 20, reader)
+            .await
+            .expect("a reader starved behind the polling cap")
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.value.map(|v| v.value), Some("\"a\"".to_owned()));
+    }
 }
 
 /// Stream entries land at consecutive offsets, in the order they were written.
@@ -8116,20 +9762,4 @@ async fn a_replayed_bounce_reports_the_original_holder() {
         replayed, first,
         "the recorded holder is reported, not one re-read after it changed",
     );
-}
-
-/// TEMPORARY — deleted before commit. Does `1::int4` decode as `i32` on both backends?
-#[tokio::test]
-async fn temp_probe_literal_cast() {
-    let (_sys, db) = sysdb().await;
-    let pool = db.pool().await;
-
-    let plain: Result<Option<i32>, _> = sqlx::query_scalar("SELECT 1").fetch_optional(&pool).await;
-    eprintln!("PROBE plain `SELECT 1` as i32: {plain:?}");
-
-    let cast: Result<Option<i32>, _> = sqlx::query_scalar("SELECT 1::int4")
-        .fetch_optional(&pool)
-        .await;
-    eprintln!("PROBE `SELECT 1::int4` as i32: {cast:?}");
-    assert_eq!(cast.unwrap(), Some(1), "the cast form must decode as i32");
 }
