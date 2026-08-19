@@ -65,6 +65,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
+use super::listen::Listener;
 use super::migrations::{self, quote_identifier};
 use super::notify::{Registry, event_key, message_key};
 use super::retry::{RetryPolicy, with_retry};
@@ -343,6 +344,20 @@ pub struct PostgresSystemDatabase {
     /// be retrofitted — a caller must be registered *before* it looks, or it misses whatever lands
     /// between the look and the wait.
     notify: Arc<Registry>,
+    /// The listener, which is where a wait reads how long it may sleep.
+    ///
+    /// Held whether or not one is running — an unstarted listener is not delivering, which is the
+    /// right answer for CockroachDB and for a handle that never asked for one. Shared with the task
+    /// in [`listener_task`](Self::listener_task), which is the only thing that sets the bit.
+    listener: Arc<Listener>,
+    /// The listener's task, kept so that [`close`](SystemDatabase::close) can wait for it to stop.
+    ///
+    /// Holding it is what makes closing mean the listener has *ended*, rather than merely that it
+    /// has been told to. Without it a listener that failed to recognise the shutdown would go on
+    /// reconnecting against a closed pool for the life of the process, and nothing would say so.
+    ///
+    /// A `std::sync::Mutex` because it is only ever taken and replaced, never held across an await.
+    listener_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl PostgresSystemDatabase {
@@ -382,21 +397,87 @@ impl PostgresSystemDatabase {
             })
         })?;
 
-        Ok(Self {
+        // Hoisted because the listener needs the same registry the handle's waits subscribe to.
+        let notify: Arc<Registry> = Arc::default();
+        let handle = Self {
             // The cap's default is read off the pool rather than off `config.max_connections`, so
             // that it is the same expression here and in `from_pool`, which never sees a `Config`.
             polling: tokio::sync::Semaphore::new(polling_limit(
                 config.settings.polling_concurrency,
                 pool.options().get_max_connections(),
             )),
+            listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             pool,
-            notify: Arc::default(),
+            notify,
+            listener_task: std::sync::Mutex::default(),
             tables: Tables::new(config.settings.schema),
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
             executor_id: config.settings.executor_id.map(str::to_owned),
             application_name: config.settings.application_name.map(str::to_owned),
-        })
+        };
+
+        // The same flag that decided whether the database got its NOTIFY triggers decides whether
+        // this process listens for them, which is UPSTREAM item 15's complaint — but with the
+        // triggers absent there would be nothing to hear, so following it here is right whatever
+        // the flag's shape should be.
+        if config.use_listen_notify {
+            handle.start_notification_listener().await;
+        }
+        Ok(handle)
+    }
+
+    /// Starts a notification listener on a background task, reporting whether one was started.
+    ///
+    /// **Never load-bearing, and reporting rather than failing for that reason.** Every wait here
+    /// re-queries on its own interval and is correct with no listener at all; this only shortens
+    /// them, and lets the interval that bounds them lengthen from a second to a minute. So a
+    /// deployment that cannot support one is a slower deployment, not a broken one, and nothing
+    /// here returns an error a caller would have to decide what to do about.
+    ///
+    /// Declines on CockroachDB, which has no `LISTEN`/`NOTIFY` — starting one there would be a task
+    /// failing and retrying forever. [`connect`](Self::connect) calls this for you when
+    /// [`Config::use_listen_notify`] is set; a caller that brought its own pool calls it itself.
+    ///
+    /// The task ends when the pool closes, so [`close`](SystemDatabase::close) is its shutdown.
+    pub async fn start_notification_listener(&self) -> bool {
+        match migrations::runner::detect_dialect(&self.pool).await {
+            Ok(migrations::Dialect::Cockroach) => {
+                tracing::debug!(
+                    "not starting a notification listener: CockroachDB has no LISTEN/NOTIFY, so \
+                     waits re-query on their own interval, which is what delivers there"
+                );
+                return false;
+            }
+            Ok(migrations::Dialect::Postgres) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start a notification listener");
+                return false;
+            }
+        }
+
+        let mut running = self.listener_task.lock().expect("listener lock");
+        // A second call is a caller being careful rather than a mistake, and two listeners on one
+        // registry would be pure waste: they would wake the same waiters twice.
+        if running.as_ref().is_some_and(|task| !task.is_finished()) {
+            return true;
+        }
+        *running = Some(tokio::spawn(Arc::clone(&self.listener).run()));
+        true
+    }
+
+    /// Whether a notification listener is currently delivering to this handle.
+    ///
+    /// **Not merely whether one was started.** It is set once a listener has proved a notification
+    /// actually arrives, and cleared if it stops — see
+    /// [`start_notification_listener`](Self::start_notification_listener). False is a working
+    /// configuration, not a fault: it means waits re-query every second instead of every minute,
+    /// which is what CockroachDB does always and what any deployment does when its subscription
+    /// cannot be relied on.
+    ///
+    /// Java exposes the same as `notificationSource.isRunning()`.
+    pub fn is_delivering(&self) -> bool {
+        self.listener.is_delivering()
     }
 
     /// Wraps an existing pool, assuming the schema is already migrated.
@@ -405,14 +486,18 @@ impl PostgresSystemDatabase {
     /// harness. Takes the same [`Settings`] as [`connect`](Self::connect), so there is one way to
     /// describe a handle rather than a constructor plus a set of chained overrides.
     pub fn from_pool(pool: PgPool, settings: &Settings<'_>) -> Self {
+        // Hoisted because the listener needs the same registry the handle's waits subscribe to.
+        let notify: Arc<Registry> = Arc::default();
         Self {
             // A caller's pool knows its own size, so the default needs nothing passed alongside it.
             polling: tokio::sync::Semaphore::new(polling_limit(
                 settings.polling_concurrency,
                 pool.options().get_max_connections(),
             )),
+            listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             pool,
-            notify: Arc::default(),
+            notify,
+            listener_task: std::sync::Mutex::default(),
             tables: Tables::new(settings.schema),
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
@@ -907,18 +992,6 @@ const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
 
 /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT_STEP_NAME`].
 const RECV_STEP_NAME: &str = "DBOS.recv";
-
-/// How long a blocking read waits before looking at the database again.
-///
-/// **This is the delivery latency, not a fallback interval.** Nothing pushes yet, so whatever this
-/// is, it is how long a `get_event` takes to see a value another process has already committed.
-/// One second is what every reference does when it has no push transport running — Python without
-/// a listener, and Java always. TypeScript's 10s is not a counterexample: it is a fallback beneath
-/// a listener that does the delivering, and copying the number without the listener would be a
-/// tenfold regression against the rest.
-///
-/// It becomes a fallback when the listener lands, and gets Python's 60s in that configuration.
-const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The step a debounce records when a workflow does the bouncing.
 ///
@@ -3511,8 +3584,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             if remaining.is_zero() {
                 break;
             }
-            let _ = tokio::time::timeout(remaining.min(RECHECK_INTERVAL), subscription.notified())
-                .await;
+            let _ = tokio::time::timeout(
+                remaining.min(self.listener.poll_interval()),
+                subscription.notified(),
+            )
+            .await;
         }
         // Released here rather than at the end of the call: the taking below does not wait, and
         // holding the topic through it would keep the next `recv` out for no reason.
@@ -3727,11 +3803,23 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn close(&self) {
-        // Closing the pool is the whole of it, including for the waits parked on a polling permit:
-        // every in-flight poll's query fails permanently and releases its permit, so a parked
-        // waiter acquires, queries, and gets the same failure. An earlier version also closed the
-        // limiter to end those waits one query sooner; deleting it failed no test, so it is gone.
+        // Closing the pool is the whole of it for the waits parked on a polling permit: every
+        // in-flight poll's query fails permanently and releases its permit, so a parked waiter
+        // acquires, queries, and gets the same failure. An earlier version also closed the limiter
+        // to end those waits one query sooner; deleting it failed no test, so it is gone.
         self.pool.close().await;
+
+        // The listener is told to stop by the same act — it watches the pool's close event — but
+        // being told is not the same as having stopped, and this is where the difference shows.
+        // Waiting for it means a caller that closed a handle can rely on nothing of this one's
+        // still running, and it is what makes a listener that failed to recognise the shutdown a
+        // hang rather than a warning logged every second forever.
+        let task = self.listener_task.lock().expect("listener lock").take();
+        if let Some(task) = task {
+            // The task itself never panics or is aborted, so an error here would be a bug rather
+            // than a shutdown to report on; either way the listener is not running.
+            let _ = task.await;
+        }
     }
 
     async fn check_step(
@@ -4005,8 +4093,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             // the whole timeout; the remaining time caps it so a wait never overruns the deadline.
             // Elapsing is not an error here: both outcomes mean the same thing, which is look
             // again.
-            let _ = tokio::time::timeout(remaining.min(RECHECK_INTERVAL), subscription.notified())
-                .await;
+            let _ = tokio::time::timeout(
+                remaining.min(self.listener.poll_interval()),
+                subscription.notified(),
+            )
+            .await;
         };
         // Nothing below waits, and the registration is only worth its map entry while something
         // does.

@@ -40,16 +40,28 @@
 //! worse, would disagree with the `id || '::' || key` that migration 1's trigger and every other
 //! SDK put on the wire.
 
-// Three things here still have no caller. `wake` and `wake_all` wait on the listener, since nothing
-// pushes yet. `stream_key` waits on the engine's `read_stream` loop: `read_stream_value` reads one
-// offset and returns, so the subscription for a stream belongs to whatever loops it — which is also
-// why streams are the one wait here that this module does not yet see. Remove when those land.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::NULL_TOPIC;
+
+/// The channel a message notification arrives on, published by migration 1's trigger.
+pub(crate) const NOTIFICATIONS_CHANNEL: &str = "dbos_notifications_channel";
+/// The channel an event notification arrives on. Migration 44 dropped the trigger that fed it;
+/// the writer-side push replaces it.
+pub(crate) const EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
+/// The channel a stream notification arrives on. Migration 43 dropped its trigger, as 44 did for
+/// events.
+pub(crate) const STREAMS_CHANNEL: &str = "dbos_streams_channel";
+
+/// The prefixes, as constants rather than literals in three `format!`s.
+///
+/// A waiter's key and a notification's key are built by different code and have to come out
+/// string-identical; sharing the prefix is what stops them drifting apart silently. Java's
+/// `SignalKey` centralises the same three.
+const MESSAGE_PREFIX: &str = "m";
+const EVENT_PREFIX: &str = "e";
+const STREAM_PREFIX: &str = "s";
 
 /// The key a `recv` waits on.
 ///
@@ -57,17 +69,45 @@ use super::NULL_TOPIC;
 /// what a notification carries, and the stored row never holds `NULL` — nothing equals `NULL`, so a
 /// receiver selecting on `topic = $1` would never find its own message.
 pub(crate) fn message_key(destination_id: &str, topic: Option<&str>) -> String {
-    format!("m::{destination_id}::{}", topic.unwrap_or(NULL_TOPIC))
+    format!(
+        "{MESSAGE_PREFIX}::{destination_id}::{}",
+        topic.unwrap_or(NULL_TOPIC)
+    )
 }
 
 /// The key a `get_event` waits on.
 pub(crate) fn event_key(workflow_id: &str, key: &str) -> String {
-    format!("e::{workflow_id}::{key}")
+    format!("{EVENT_PREFIX}::{workflow_id}::{key}")
 }
 
-/// The key a `read_stream_value` waits on.
+/// The key a `read_stream_value`'s loop waits on.
+///
+/// **The one key here with no caller**, and deliberately so: `read_stream_value` reads a single
+/// offset and returns, so the subscription belongs to the loop above it — the engine's
+/// `read_stream`, which does not exist yet. Decision 9 in the design note settles that the loop
+/// stays there rather than moving behind the trait, so this waits for an engine rather than for a
+/// change of mind. The listener already derives this key from the streams channel and wakes nobody
+/// with it, which is correct until then.
+#[allow(dead_code)]
 pub(crate) fn stream_key(workflow_id: &str, key: &str) -> String {
-    format!("s::{workflow_id}::{key}")
+    format!("{STREAM_PREFIX}::{workflow_id}::{key}")
+}
+
+/// The key a notification names, or `None` for a channel this does not listen on.
+///
+/// **The concatenation the module header is about.** The payload is a wire `id::key` whose halves
+/// may each contain `::`, so it is prepended to whole and never split — which is what makes this
+/// agree with the three functions above for every input, including the ones a parser would get
+/// wrong. Java does exactly this (`SignalKey.signalFor(channel, payload)`); Go is the only
+/// implementation that splits, and only in a polling fallback this crate has no equivalent of.
+pub(crate) fn key_for(channel: &str, payload: &str) -> Option<String> {
+    let prefix = match channel {
+        NOTIFICATIONS_CHANNEL => MESSAGE_PREFIX,
+        EVENTS_CHANNEL => EVENT_PREFIX,
+        STREAMS_CHANNEL => STREAM_PREFIX,
+        _ => return None,
+    };
+    Some(format!("{prefix}::{payload}"))
 }
 
 /// Who is waiting for what.
@@ -254,20 +294,51 @@ mod tests {
             ("wf-1", "key::with::colons"),
             ("::leading", "trailing::"),
         ] {
-            assert_eq!(event_key(id, key), format!("e::{}", wire(id, key)));
-            assert_eq!(stream_key(id, key), format!("s::{}", wire(id, key)));
+            let payload = wire(id, key);
+            assert_eq!(event_key(id, key), format!("e::{payload}"));
+            assert_eq!(stream_key(id, key), format!("s::{payload}"));
             assert_eq!(
                 message_key(id, Some(key)),
-                format!("m::{}", wire(id, key)),
+                format!("m::{payload}"),
                 "a listener must reach the waiter by prefixing the payload verbatim"
+            );
+
+            // The round trip, which is the property the whole rule exists for: what a waiter
+            // registered and what the listener derives from the wire are the same string. These
+            // ids and keys are chosen to defeat a parser, so anything that splits fails here.
+            assert_eq!(
+                key_for(NOTIFICATIONS_CHANNEL, &payload).as_deref(),
+                Some(message_key(id, Some(key)).as_str())
+            );
+            assert_eq!(
+                key_for(EVENTS_CHANNEL, &payload).as_deref(),
+                Some(event_key(id, key).as_str())
+            );
+            assert_eq!(
+                key_for(STREAMS_CHANNEL, &payload).as_deref(),
+                Some(stream_key(id, key).as_str())
             );
         }
 
         // The no-topic case goes through the same rule, the sentinel standing in for the topic.
+        let sentinel_payload = wire("wf-1", NULL_TOPIC);
+        assert_eq!(message_key("wf-1", None), format!("m::{sentinel_payload}"));
         assert_eq!(
-            message_key("wf-1", None),
-            format!("m::{}", wire("wf-1", NULL_TOPIC))
+            key_for(NOTIFICATIONS_CHANNEL, &sentinel_payload).as_deref(),
+            Some(message_key("wf-1", None).as_str()),
+            "a message with no topic is reached the same way as any other",
         );
+    }
+
+    /// A channel this does not listen on is `None` rather than a guess.
+    ///
+    /// Nothing else publishes on a connection this listens on today, so this is about what happens
+    /// when something does: a notification with no home is dropped, not turned into a key that
+    /// might collide with a real one.
+    #[test]
+    fn an_unknown_channel_names_no_key() {
+        assert_eq!(key_for("some_other_channel", "wf-1::k"), None);
+        assert_eq!(key_for("", "wf-1::k"), None);
     }
 
     /// Two different pairs can render one key, and the registry is allowed to conflate them.

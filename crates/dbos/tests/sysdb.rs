@@ -4077,6 +4077,215 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
     forever.abort();
 }
 
+/// Whether to skip a test that needs a listener, which CockroachDB cannot have.
+///
+/// Not a gap in coverage: the *absence* of a listener is covered everywhere else, since every other
+/// test in this file runs on both backends with none running, and that is the configuration
+/// CockroachDB is always in.
+fn skip_without_listen_notify(db: &support::TestDatabase) -> bool {
+    let skipping = matches!(db.backend(), Backend::Cockroach);
+    if skipping {
+        eprintln!(
+            "skipped on CockroachDB: it has no LISTEN/NOTIFY, so there is no listener to test"
+        );
+    }
+    skipping
+}
+
+/// A handle with a listener running, once the listener has proved it delivers.
+///
+/// The wait matters: starting a listener spawns a task that connects and self-tests, so a caller
+/// that raced it would see the short interval and could not tell push from polling.
+async fn listening(pool: sqlx::PgPool) -> PostgresSystemDatabase {
+    let sys = PostgresSystemDatabase::from_pool(pool, &Settings::default());
+    assert!(
+        sys.start_notification_listener().await,
+        "PostgreSQL supports LISTEN/NOTIFY, so one should have started",
+    );
+    for _ in 0..100 {
+        if sys.is_delivering() {
+            return sys;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the listener never proved it delivers");
+}
+
+/// A listener delivers a message far sooner than the interval it licenses.
+///
+/// **This is the whole point of the listener and the only way to see it.** Once one is delivering,
+/// a `recv` re-queries every *minute* rather than every second — so a message arriving in
+/// milliseconds can only have come from a notification. Run it with the listener off and the same
+/// call takes up to a second; run it with the interval switch broken and it takes up to a minute.
+///
+/// It is `recv` rather than `get_event` because migration 1's trigger is the only one left: 43 and
+/// 44 dropped the events and streams triggers, and the writer-side push that replaces them is a
+/// separate change.
+#[tokio::test]
+async fn a_listener_delivers_a_message_sooner_than_the_interval_allows() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let sys = std::sync::Arc::new(listening(db.pool().await).await);
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                .await
+        })
+    };
+    // Long enough that the receiver's first look has already found nothing and it is parked on an
+    // interval that will not come round for a minute.
+    tokio::time::sleep(BRIEFLY).await;
+
+    let sent = Timestamp::now();
+    send_to_receiver(&sys, Some("orders"), "\"pushed\"").await;
+    let taken = tokio::time::timeout(RECHECK * 20, receiving)
+        .await
+        .expect("the message never arrived")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(taken.map(|m| m.value), Some("\"pushed\"".to_owned()));
+    let waited = Timestamp::now().duration_since(sent).unwrap();
+    assert!(
+        waited < RECHECK,
+        "took {waited:?} after the send, which is the re-query rather than the notification",
+    );
+}
+
+/// A message that arrives with no notification is still found, on the next connect.
+///
+/// **`NOTIFY` is not queued for absent listeners**, so anything written while this process had no
+/// connection is simply gone — and with the interval at a minute, the waiter would sit there long
+/// past its own timeout. Waking every waiter on connect is what covers that. Go and Java both do
+/// it; Python and TypeScript do not, and rely on the fallback catching it.
+///
+/// **The gap is manufactured rather than raced for.** An earlier version of this test killed the
+/// listener's connection and sent a message, which proved nothing: `PgListener` reconnects in
+/// milliseconds, so the notification was delivered normally and the test passed with the wake
+/// removed — verified by mutation. Here the row is inserted with triggers off, so no notification
+/// is ever sent for it, and only then is the connection killed. Nothing but the wake on reconnect
+/// can end the wait inside a minute.
+#[tokio::test]
+async fn a_message_that_notified_nobody_is_found_on_reconnect() {
+    const TAG: &str = "listener-outage";
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    // Tagged so the listener's own connection can be found and killed; everything this handle
+    // opens carries it.
+    let pool = db
+        .pool_options()
+        .connect_with(db.options().application_name(TAG))
+        .await
+        .expect("failed to connect");
+    let sys = std::sync::Arc::new(listening(pool).await);
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+                .await
+        })
+    };
+    // Parked, and — because a listener is delivering — parked for a minute rather than a second.
+    tokio::time::sleep(BRIEFLY).await;
+
+    // `session_replication_role = replica` suppresses user triggers for this session, so migration
+    // 1's NOTIFY never fires for this row. The message is committed and waiting; nobody was told.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "SET session_replication_role = replica",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(
+        "INSERT INTO dbos.notifications (destination_uuid, topic, message, serialization) \
+         VALUES ('wf-receiver', 'orders', '\"unannounced\"', 'portable_json')",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    // Now force the listener round its reconnect path. Its wake is the only thing that can tell
+    // the waiter to look again before its own interval, which is fifty-nine seconds away.
+    db.kill_connections(TAG).await;
+
+    let taken = tokio::time::timeout(RECHECK * 30, receiving)
+        .await
+        .expect("the message was never found: nothing woke the waiter after the gap")
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.map(|m| m.value), Some("\"unannounced\"".to_owned()));
+}
+
+/// Closing the handle stops the listener, without anything having to remember to.
+///
+/// **The pool is the whole shutdown mechanism.** `PgListener` is built with
+/// `connect_with(&pool)`, so it watches the pool's close event: the wait it is parked in is
+/// cancelled with `PoolClosed`, which the listener reads as "stop" rather than as an error to
+/// reconnect through. So there is no separate stop-the-listener call to forget to make.
+///
+/// **The two assertions below are different claims and both are needed.** `close` returning is the
+/// pool having every connection back, the listener's included, and the task having ended. That
+/// second half is what `is_delivering` going false cannot show on its own: the transient error path
+/// clears it too, so a listener that failed to recognise the shutdown — reconnecting against a
+/// closed pool for the life of the process — would satisfy it.
+#[tokio::test]
+async fn closing_the_handle_stops_the_listener() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let sys = listening(db.pool().await).await;
+    assert!(sys.is_delivering());
+
+    // Returns only once every connection is back, the listener's included — so this call is also
+    // the assertion that the listener does not hold one open forever.
+    tokio::time::timeout(RECHECK * 10, sys.close())
+        .await
+        .expect("closing hung: the listener never released its connection");
+
+    for _ in 0..100 {
+        if !sys.is_delivering() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the listener outlived the handle that owns it");
+}
+
+/// CockroachDB gets no listener, and says so rather than failing.
+///
+/// It has no `LISTEN`/`NOTIFY` at all, so a listener there would be a task erroring and retrying
+/// forever. Waits re-query on their own interval instead, which is what delivers on that backend —
+/// and is why every test in this file passes on it.
+#[tokio::test]
+async fn cockroach_gets_no_listener_and_reports_it() {
+    let db = test_database().await;
+    let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    let started = sys.start_notification_listener().await;
+
+    match db.backend() {
+        Backend::Cockroach => {
+            assert!(!started, "CockroachDB has no LISTEN/NOTIFY to start one on");
+            assert!(!sys.is_delivering());
+        }
+        Backend::Postgres => assert!(started),
+    }
+}
+
 /// A replayed sleep wakes at the original instant, not a fresh one.
 ///
 /// This is the whole point of checkpointing it: a workflow that slept an hour and crashed fifty
