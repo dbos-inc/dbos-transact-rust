@@ -11,7 +11,7 @@
 //! to a query a minute. See [`SHORT_INTERVAL`] and [`LONG_INTERVAL`].
 //!
 //! **The listener never parses a payload.** It prepends its channel's prefix and looks the whole
-//! string up; see [`key_for`](super::notify::key_for) for why splitting is not merely unnecessary
+//! string up; see [`key_for`](crate::sysdb::notify::key_for) for why splitting is not merely unnecessary
 //! but wrong.
 
 use std::sync::Arc;
@@ -21,7 +21,9 @@ use std::time::Duration;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 
-use super::notify::{EVENTS_CHANNEL, NOTIFICATIONS_CHANNEL, Registry, STREAMS_CHANNEL, key_for};
+use crate::sysdb::notify::{
+    EVENTS_CHANNEL, NOTIFICATIONS_CHANNEL, Registry, STREAMS_CHANNEL, key_for,
+};
 
 /// What every wait uses with no listener delivering, and what a stream read always uses.
 ///

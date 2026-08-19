@@ -58,16 +58,23 @@
 //! id is an identity read, and answering "no such workflow" for one that plainly exists would be
 //! a lie. See [`Applications`] for how a caller overrides the default.
 
+// The two halves of the wakeup path, both of which are this backend's rather than the trait's:
+// `LISTEN`/`NOTIFY` is PostgreSQL's, and CockroachDB has neither it nor `pg_notify`. The registry
+// they feed is in `sysdb::notify`, where it is backend-neutral.
+mod listener;
+mod notifier;
+
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
+use self::listener::Listener;
+use self::notifier::Notifier;
 use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
-use super::listen::Listener;
 use super::migrations::{self, quote_identifier};
-use super::notify::{Registry, event_key, message_key};
+use super::notify::{EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key};
 use super::retry::{RetryPolicy, with_retry};
 use std::sync::Arc;
 use std::time::Duration;
@@ -221,6 +228,16 @@ pub struct Settings<'a> {
     /// Named without a `sys_db_` prefix, unlike Python: that prefix distinguishes the system
     /// database's pool from its others, and this field already sits on a `sysdb` type.
     pub polling_concurrency: Option<u32>,
+    /// How long a written key waits for company before this handle pushes a wakeup for it.
+    ///
+    /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
+    /// setting to. Longer trades wakeup latency for fewer notifying transactions;
+    /// `Some(Duration::ZERO)` turns coalescing off, which is a push per write — the behaviour the
+    /// database triggers had, and what migrations 43 and 44 dropped them to get away from.
+    ///
+    /// Nothing here is load-bearing whatever it is set to: a wakeup only ever shortens a wait that
+    /// re-queries on its own interval regardless.
+    pub notification_coalesce: Option<Duration>,
 }
 
 impl Default for Settings<'_> {
@@ -235,6 +252,7 @@ impl Default for Settings<'_> {
             executor_id: None,
             application_name: None,
             polling_concurrency: None,
+            notification_coalesce: None,
         }
     }
 }
@@ -358,6 +376,16 @@ pub struct PostgresSystemDatabase {
     ///
     /// A `std::sync::Mutex` because it is only ever taken and replaced, never held across an await.
     listener_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The other direction: what this handle writes, told to the processes waiting on it.
+    ///
+    /// Held whether or not anything is being pushed, because the local wake it does is right on
+    /// every backend — see [`Notifier::signal`]. Only the outbound half is gated, and by the same
+    /// call that starts the listener.
+    notifier: Arc<Notifier>,
+    /// The notifier's task, kept for the same reason as the listener's — with one difference that
+    /// decides the order in [`close`](SystemDatabase::close): its last act is a database write, so
+    /// it has to be finished *before* the pool closes rather than by it.
+    notifier_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl PostgresSystemDatabase {
@@ -407,9 +435,15 @@ impl PostgresSystemDatabase {
                 pool.options().get_max_connections(),
             )),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
+            notifier: Arc::new(Notifier::new(
+                pool.clone(),
+                Arc::clone(&notify),
+                config.settings.notification_coalesce,
+            )),
             pool,
             notify,
             listener_task: std::sync::Mutex::default(),
+            notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(config.settings.schema),
             retry: config.settings.retry,
             // Copied out: the handle outlives the borrowed configuration.
@@ -422,25 +456,32 @@ impl PostgresSystemDatabase {
         // triggers absent there would be nothing to hear, so following it here is right whatever
         // the flag's shape should be.
         if config.use_listen_notify {
-            handle.start_notification_listener().await;
+            handle.start_notifications().await;
         }
         Ok(handle)
     }
 
-    /// Starts a notification listener on a background task, reporting whether one was started.
+    /// Starts this handle's two notification tasks, reporting whether they were started.
+    ///
+    /// **Both halves of one decision**, which is why there is one call rather than two: a listener,
+    /// which turns other processes' writes into wakeups here, and a notifier, which turns this
+    /// handle's writes into wakeups there. Neither is much use in a deployment that cannot have the
+    /// other, and both are governed by whether the database does `LISTEN`/`NOTIFY` at all.
     ///
     /// **Never load-bearing, and reporting rather than failing for that reason.** Every wait here
-    /// re-queries on its own interval and is correct with no listener at all; this only shortens
-    /// them, and lets the interval that bounds them lengthen from a second to a minute. So a
-    /// deployment that cannot support one is a slower deployment, not a broken one, and nothing
+    /// re-queries on its own interval and is correct with neither task running; they only shorten
+    /// those waits, and let the interval that bounds them lengthen from a second to a minute. So a
+    /// deployment that cannot support them is a slower deployment, not a broken one, and nothing
     /// here returns an error a caller would have to decide what to do about.
     ///
-    /// Declines on CockroachDB, which has no `LISTEN`/`NOTIFY` — starting one there would be a task
-    /// failing and retrying forever. [`connect`](Self::connect) calls this for you when
-    /// [`Config::use_listen_notify`] is set; a caller that brought its own pool calls it itself.
+    /// Declines on CockroachDB, which has no `LISTEN`/`NOTIFY` — a listener there would be a task
+    /// failing and retrying forever, and a push would be a statement the database rejects outright
+    /// (`42883`, "unknown function: pg_notify()").
+    /// [`connect`](Self::connect) calls this for you when [`Config::use_listen_notify`] is set; a
+    /// caller that brought its own pool calls it itself.
     ///
-    /// The task ends when the pool closes, so [`close`](SystemDatabase::close) is its shutdown.
-    pub async fn start_notification_listener(&self) -> bool {
+    /// [`close`](SystemDatabase::close) is the shutdown for both.
+    pub async fn start_notifications(&self) -> bool {
         match migrations::runner::detect_dialect(&self.pool).await {
             Ok(migrations::Dialect::Cockroach) => {
                 tracing::debug!(
@@ -456,21 +497,37 @@ impl PostgresSystemDatabase {
             }
         }
 
-        let mut running = self.listener_task.lock().expect("listener lock");
-        // A second call is a caller being careful rather than a mistake, and two listeners on one
-        // registry would be pure waste: they would wake the same waiters twice.
-        if running.as_ref().is_some_and(|task| !task.is_finished()) {
-            return true;
+        // A second call is a caller being careful rather than a mistake, and a second task of
+        // either kind would be pure waste: two listeners wake the same waiters twice, and two
+        // flush loops drain one queue between them.
+        let mut listening = self.listener_task.lock().expect("listener lock");
+        if listening.as_ref().is_none_or(|task| task.is_finished()) {
+            *listening = Some(tokio::spawn(Arc::clone(&self.listener).run()));
         }
-        *running = Some(tokio::spawn(Arc::clone(&self.listener).run()));
+        let mut notifying = self.notifier_task.lock().expect("notifier lock");
+        if notifying.as_ref().is_none_or(|task| task.is_finished()) {
+            // Enabled first: `signal` queues nothing until it is, and nothing would drain what it
+            // queued before the loop exists.
+            self.notifier.enable();
+            *notifying = Some(tokio::spawn(Arc::clone(&self.notifier).run()));
+        }
         true
+    }
+
+    /// Whether this handle pushes its own writes to the processes waiting on them.
+    ///
+    /// The outbound counterpart of [`is_delivering`](Self::is_delivering), and unlike it there is
+    /// nothing to prove: a push is a statement that either runs or is logged and dropped, so this
+    /// says only that [`start_notifications`](Self::start_notifications) enabled it.
+    pub fn is_pushing(&self) -> bool {
+        self.notifier.is_pushing()
     }
 
     /// Whether a notification listener is currently delivering to this handle.
     ///
     /// **Not merely whether one was started.** It is set once a listener has proved a notification
     /// actually arrives, and cleared if it stops — see
-    /// [`start_notification_listener`](Self::start_notification_listener). False is a working
+    /// [`start_notifications`](Self::start_notifications). False is a working
     /// configuration, not a fault: it means waits re-query every second instead of every minute,
     /// which is what CockroachDB does always and what any deployment does when its subscription
     /// cannot be relied on.
@@ -495,9 +552,15 @@ impl PostgresSystemDatabase {
                 pool.options().get_max_connections(),
             )),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
+            notifier: Arc::new(Notifier::new(
+                pool.clone(),
+                Arc::clone(&notify),
+                settings.notification_coalesce,
+            )),
             pool,
             notify,
             listener_task: std::sync::Mutex::default(),
+            notifier_task: std::sync::Mutex::default(),
             tables: Tables::new(settings.schema),
             retry: settings.retry,
             // Copied out: the handle outlives the borrowed settings.
@@ -3775,6 +3838,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                 }
 
                 tx.commit().await?;
+                // Committed, so a reader woken by this finds the entry — including the sentinel a
+                // close writes, which is how a reader learns the stream has ended. Migration 43
+                // dropped the trigger that used to do it. The replay above returns before here on
+                // purpose: it wrote nothing, so there is nothing new to look at.
+                self.notifier.signal(STREAMS_CHANNEL, workflow_id, key);
                 return Ok(());
             }
 
@@ -3803,6 +3871,16 @@ impl SystemDatabase for PostgresSystemDatabase {
     }
 
     async fn close(&self) {
+        // **Before the pool closes**, because the notifier's last act is a database write: whatever
+        // it was still holding in its coalescing window goes out, so a value written a moment ago
+        // wakes readers elsewhere rather than leaving them to wait out an interval. Doing this
+        // after `pool.close()` would turn every such flush into a logged failure.
+        self.notifier.stop();
+        let task = self.notifier_task.lock().expect("notifier lock").take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+
         // Closing the pool is the whole of it for the waits parked on a polling permit: every
         // in-flight poll's query fails permanently and releases its permit, so a parked waiter
         // acquires, queries, and gets the same failure. An earlier version also closed the limiter
@@ -3980,6 +4058,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await?;
 
             tx.commit().await?;
+            // Committed, so a reader woken by this finds the row. Migration 44 dropped the trigger
+            // that used to do it from inside the transaction above.
+            self.notifier.signal(EVENTS_CHANNEL, workflow_id, key);
             Ok(())
         })
         .await

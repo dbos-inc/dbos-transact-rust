@@ -42,7 +42,6 @@ pub const STREAM_CLOSED: &str = "__DBOS_STREAM_CLOSED__";
 pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
 pub mod error;
-pub(crate) mod listen;
 pub mod migrations;
 pub(crate) mod notify;
 pub mod postgres;

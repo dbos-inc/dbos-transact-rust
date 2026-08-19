@@ -4099,7 +4099,7 @@ fn skip_without_listen_notify(db: &support::TestDatabase) -> bool {
 async fn listening(pool: sqlx::PgPool) -> PostgresSystemDatabase {
     let sys = PostgresSystemDatabase::from_pool(pool, &Settings::default());
     assert!(
-        sys.start_notification_listener().await,
+        sys.start_notifications().await,
         "PostgreSQL supports LISTEN/NOTIFY, so one should have started",
     );
     for _ in 0..100 {
@@ -4275,7 +4275,7 @@ async fn closing_the_handle_stops_the_listener() {
 async fn cockroach_gets_no_listener_and_reports_it() {
     let db = test_database().await;
     let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
-    let started = sys.start_notification_listener().await;
+    let started = sys.start_notifications().await;
 
     match db.backend() {
         Backend::Cockroach => {
@@ -4284,6 +4284,199 @@ async fn cockroach_gets_no_listener_and_reports_it() {
         }
         Backend::Postgres => assert!(started),
     }
+}
+
+/// An event set in another process reaches a reader far sooner than its interval allows.
+///
+/// **The events counterpart of the message test above, and what migration 44 took away.** That one
+/// rides migration 1's surviving trigger; here the trigger is gone and the writer's own push is the
+/// only thing that can put a notification on the wire. The reader is delivering, so its next look
+/// is a minute away — arriving in milliseconds can only be the push.
+///
+/// Two handles over one database, each with its own pool and its own registry, which is what two
+/// processes look like from in here: the reader cannot be woken by the writer's local wake, because
+/// they share no registry.
+#[tokio::test]
+async fn an_event_set_elsewhere_arrives_sooner_than_the_interval_allows() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let reader = std::sync::Arc::new(listening(db.pool().await).await);
+    let writer = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    assert!(writer.start_notifications().await);
+    assert!(
+        writer.is_pushing(),
+        "a writer that pushes nothing wakes nobody"
+    );
+    writer
+        .init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let reading = {
+        let reader = std::sync::Arc::clone(&reader);
+        tokio::spawn(async move {
+            reader
+                .get_event("wf-publisher", "ready", RECHECK * 600, None)
+                .await
+        })
+    };
+    // Long enough that the reader's first look has already found nothing and it is parked on an
+    // interval that will not come round for a minute.
+    tokio::time::sleep(BRIEFLY).await;
+
+    let published = Timestamp::now();
+    writer
+        .set_event("wf-publisher", 0, "ready", "\"go\"", Some("portable_json"))
+        .await
+        .unwrap();
+    let found = tokio::time::timeout(RECHECK * 20, reading)
+        .await
+        .expect("the event never arrived")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(found.map(|v| v.value), Some("\"go\"".to_owned()));
+    let waited = Timestamp::now().duration_since(published).unwrap();
+    assert!(
+        waited < RECHECK,
+        "took {waited:?} after the write, which is a re-query rather than the push",
+    );
+}
+
+/// A stream write puts a notification where migration 43's trigger used to put one.
+///
+/// **Read off the wire rather than through a waiter**, because there is no waiter to use: nothing
+/// in this crate waits on a stream — the loop that would is the engine's, and decision 9 keeps it
+/// there. So the test listens on the channel itself and asserts the payload, which is the contract
+/// a reader in another process depends on: `id::key`, unescaped, exactly as the dropped trigger
+/// wrote it.
+#[tokio::test]
+async fn a_stream_write_is_pushed_where_the_trigger_used_to_publish() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let mut wire = sqlx::postgres::PgListener::connect_with(&db.pool().await)
+        .await
+        .expect("failed to listen");
+    wire.listen("dbos_streams_channel").await.unwrap();
+
+    let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+    assert!(sys.start_notifications().await);
+    sys.init_workflow(&workflow("wf-producer"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-producer",
+        0,
+        "progress",
+        "\"a\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let notification = tokio::time::timeout(RECHECK * 5, wire.recv())
+        .await
+        .expect("nothing was pushed for the write")
+        .unwrap();
+    assert_eq!(notification.payload(), "wf-producer::progress");
+}
+
+/// Closing a handle pushes what its coalescing window was still holding.
+///
+/// **Without the final flush this value would reach nobody**, and the test says so rather than
+/// racing to say it: the window is five seconds here, so the ordinary flush cannot deliver inside
+/// the three the assertion allows, and a stopped loop never delivers at all. The write is the last
+/// thing the handle does, which is exactly the case a shutdown drops — a workflow that publishes
+/// its result and exits.
+#[tokio::test]
+async fn a_close_pushes_what_the_window_was_still_holding() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let mut wire = sqlx::postgres::PgListener::connect_with(&db.pool().await)
+        .await
+        .expect("failed to listen");
+    wire.listen("dbos_workflow_events_channel").await.unwrap();
+
+    let sys = PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            notification_coalesce: Some(RECHECK * 5),
+            ..Settings::default()
+        },
+    );
+    assert!(sys.start_notifications().await);
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.set_event("wf-publisher", 0, "ready", "\"go\"", Some("portable_json"))
+        .await
+        .unwrap();
+
+    sys.close().await;
+
+    let notification = tokio::time::timeout(RECHECK * 3, wire.recv())
+        .await
+        .expect("the close dropped what the window was holding")
+        .unwrap();
+    assert_eq!(notification.payload(), "wf-publisher::ready");
+}
+
+/// A write wakes a waiter in its own process with nothing pushing at all.
+///
+/// **This is the one wakeup that works on every backend**, and the reason it is worth having: no
+/// listener, no push, no round trip — the writer wakes the registry directly on its way out. On
+/// CockroachDB it is the *only* thing that can shorten a wait, since there is no `LISTEN`/`NOTIFY`
+/// to fall back on; that is why this test does not skip.
+///
+/// Go signals its local registry the same way. Python and TypeScript do not, and their own
+/// process's waiters hear their writes back off the wire — which on a backend with no wire means
+/// waiting out the interval.
+#[tokio::test]
+async fn a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing() {
+    let (sys, _db) = sysdb().await;
+    let sys = std::sync::Arc::new(sys);
+    assert!(
+        !sys.is_pushing(),
+        "no listener was started, so nothing pushes"
+    );
+    sys.init_workflow(&workflow("wf-publisher"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let reading = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.get_event("wf-publisher", "ready", RECHECK * 600, None)
+                .await
+        })
+    };
+    // Parked, and — with nothing delivering — parked for a second, so its own next look is most of
+    // a second away from the write below.
+    tokio::time::sleep(BRIEFLY).await;
+
+    let published = Timestamp::now();
+    sys.set_event("wf-publisher", 0, "ready", "\"go\"", Some("portable_json"))
+        .await
+        .unwrap();
+    let found = tokio::time::timeout(RECHECK * 20, reading)
+        .await
+        .expect("the event never arrived")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(found.map(|v| v.value), Some("\"go\"".to_owned()));
+    let waited = Timestamp::now().duration_since(published).unwrap();
+    assert!(
+        waited < RECHECK / 2,
+        "took {waited:?} after the write, which is the re-query rather than the wake",
+    );
 }
 
 /// A replayed sleep wakes at the original instant, not a fresh one.
