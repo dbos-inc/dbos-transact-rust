@@ -7,8 +7,9 @@
 //!
 //! # Status
 //!
-//! Under construction, and not yet usable. There is no public API here yet; the system
-//! database layer lands first.
+//! Under construction. The system database layer landed first and the execution engine is
+//! being built on it; what is public here is the lifecycle — [`Config`], [`DBOS`], and
+//! [`Executor`] — with registration, workflows and steps arriving next.
 //!
 //! # Cargo features
 //!
@@ -19,3 +20,20 @@
 #![forbid(unsafe_code)]
 
 pub mod sysdb;
+
+#[cfg(feature = "engine")]
+mod config;
+#[cfg(feature = "engine")]
+mod dbos;
+#[cfg(feature = "engine")]
+mod error;
+
+// Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
+// `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
+// because it *is* the brand — nobody writes `tokio::TOKIO`.
+#[cfg(feature = "engine")]
+pub use config::{APP_VERSION_ENV, Config, DATABASE_URL_ENV, Serializer};
+#[cfg(feature = "engine")]
+pub use dbos::{DBOS, Executor};
+#[cfg(feature = "engine")]
+pub use error::{Error, Result};

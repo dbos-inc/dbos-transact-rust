@@ -12,9 +12,13 @@ default = ["engine"]
 # Gates the durable execution engine: registry, contexts, workflows, steps, queues,
 # scheduler, messaging, and the client. With it off, what remains is the system database
 # and Conductor layers — the surface a future FFI host would consume. Nothing is behind
-# it yet, but it exists now so `cargo check --no-default-features` is a standing CI gate
-# rather than something switched on once the boundary is already blurred.
-engine = []
+# it yet beyond the lifecycle, but it exists so `cargo check --no-default-features` is a
+# standing CI gate rather than something switched on once the boundary is already blurred.
+#
+# `tokio/rt` is enabled from here rather than from the dependency itself, which is what keeps
+# the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`, `spawn` — is the
+# engine's, and a core-only build has no business pulling one in.
+engine = ["tokio/rt"]
 # A `macros` feature (implying `engine`) arrives with the `dbos-macros` crate. Adding a
 # feature is not a breaking change, so it waits until it re-exports something.
 
@@ -42,7 +46,15 @@ serde_json = "1"
 # choose, and choosing it by hand for each type was the alternative.
 serde = { version = "1", features = ["derive"] }
 # `time` for backoff between retries; `sync` for the semaphore capping concurrent polling reads.
+# `rt` arrives with the `engine` feature rather than here.
 tokio = { version = "1", features = ["time", "sync"] }
+# The error channel. `thiserror` rather than a hand-written `Display`/`Error` pair because an
+# application is expected to hold a `dbos::Error` inside its own error enum, which is the derive's
+# `#[from]`/`#[error(transparent)]` idiom on both sides of the boundary.
+thiserror = "2"
+# The application version is the SHA-256 of the running executable (PLAN.md §4.14). Already in the
+# tree by way of sqlx, but named here because this crate depends on it directly.
+sha2 = "0.10"
 # `workflow_schedules.last_fired_at` is ISO-8601 text rather than the epoch milliseconds every
 # other time column holds, so one column needs a calendar. `std` has none — `SystemTime` and
 # `Duration` and nothing else — and the alternative was hand-written civil-date arithmetic to
