@@ -3,6 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::config::{APP_VERSION_ENV, Config, Serializer};
+use crate::registry::{Registry, Snapshot};
 use crate::sysdb::{SystemDatabase, postgres};
 use crate::{Error, Result};
 
@@ -16,6 +17,7 @@ pub struct Executor {
     application_version: String,
     serializer: Serializer,
     runtime: tokio::runtime::Handle,
+    workflows: Snapshot,
 }
 
 /// The executor is assembled whole here rather than grown a field at a time, so several of these
@@ -31,8 +33,15 @@ impl Executor {
     /// The mirror of [`shutdown`](Self::shutdown), and here for the same reason: these are the
     /// executor's own fields, so the executor is what sets them up. [`DBOS::launch`] is left with
     /// what is actually its business — deciding whether to build one at all, and installing it.
-    async fn start(config: &Config) -> Result<Self> {
+    async fn start(config: &Config, workflows: Snapshot) -> Result<Self> {
         config.validate()?;
+
+        if workflows.is_empty() {
+            tracing::warn!(
+                "no workflows are registered: this executor will recover nothing and dequeue \
+                 nothing. Register before calling `launch`."
+            );
+        }
 
         let executor_id = config
             .executor_id
@@ -76,6 +85,7 @@ impl Executor {
             // Decision 20: the runtime is the executor's, taken here. `start` is `async`, so a
             // runtime is necessarily current.
             runtime: tokio::runtime::Handle::current(),
+            workflows,
         })
     }
 
@@ -97,6 +107,15 @@ impl Executor {
     /// How payloads are encoded.
     pub(crate) fn serializer(&self) -> &Serializer {
         &self.serializer
+    }
+
+    /// The workflows this executor was launched with.
+    ///
+    /// A snapshot, frozen at launch. Recovery reads it while the application may still be calling
+    /// into the instance, and a map that could grow underneath a recovery pass is a recovery pass
+    /// that may or may not find a workflow depending on timing.
+    pub(crate) fn workflows(&self) -> &Snapshot {
+        &self.workflows
     }
 
     /// The runtime workflows are spawned onto.
@@ -151,6 +170,9 @@ pub struct DBOS(Arc<Inner>);
 
 struct Inner {
     config: Config,
+    /// Every workflow registered so far. Lives on the instance rather than the executor, because
+    /// registration happens before there is an executor.
+    registry: Registry,
     /// `None` until launched. Read on every operation, written twice in a process's life, so a
     /// reader-biased lock rather than the async one below.
     executor: RwLock<Option<Arc<Executor>>>,
@@ -190,6 +212,7 @@ impl DBOS {
     pub fn new(config: Config) -> Self {
         Self(Arc::new(Inner {
             config,
+            registry: Registry::default(),
             executor: RwLock::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
         }))
@@ -198,6 +221,11 @@ impl DBOS {
     /// The configuration this instance was built with.
     pub fn config(&self) -> &Config {
         &self.0.config
+    }
+
+    /// Everything registered so far.
+    pub(crate) fn registry(&self) -> &Registry {
+        &self.0.registry
     }
 
     /// Whether an executor is running.
@@ -219,7 +247,7 @@ impl DBOS {
             return Ok(());
         }
 
-        let executor = Executor::start(&self.0.config).await?;
+        let executor = Executor::start(&self.0.config, self.0.registry.snapshot()).await?;
         *self.write_executor() = Some(Arc::new(executor));
         Ok(())
     }

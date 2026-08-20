@@ -47,6 +47,40 @@ pub enum Error {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    /// Two workflows were registered under one identity.
+    ///
+    /// Uniqueness is on the whole `(name, class_name, config_name)` triple. A name resolving to
+    /// two functions is a workflow that recovers as the wrong one, which is why this is an error
+    /// rather than a last-registration-wins.
+    #[error("a workflow is already registered as {key}")]
+    AlreadyRegistered {
+        /// The identity that was registered twice.
+        key: String,
+    },
+
+    /// A value could not be encoded for the database.
+    #[error("could not serialize the workflow {what}")]
+    Serialization {
+        /// Which value: `argument`, `result`.
+        what: &'static str,
+        /// The underlying failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// A value from the database could not be decoded.
+    ///
+    /// Usually a signature that changed under a workflow already in flight — the row holds what
+    /// the old code wrote, and the new code cannot read it.
+    #[error("could not deserialize the workflow {what}")]
+    Deserialization {
+        /// Which value: `argument`, `result`.
+        what: &'static str,
+        /// The underlying failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// The system database failed.
     #[error(transparent)]
     SystemDatabase(#[from] crate::sysdb::Error),

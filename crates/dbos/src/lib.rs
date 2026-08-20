@@ -24,9 +24,13 @@ pub mod sysdb;
 #[cfg(feature = "engine")]
 mod config;
 #[cfg(feature = "engine")]
+mod context;
+#[cfg(feature = "engine")]
 mod dbos;
 #[cfg(feature = "engine")]
 mod error;
+#[cfg(feature = "engine")]
+mod registry;
 
 // Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
@@ -34,6 +38,15 @@ mod error;
 #[cfg(feature = "engine")]
 pub use config::{APP_VERSION_ENV, Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
+pub use context::Ctx;
+#[cfg(feature = "engine")]
 pub use dbos::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use error::{Error, Result};
+#[cfg(feature = "engine")]
+pub use registry::{WorkflowFn, WorkflowKey, WorkflowRef};
+// Nameable but hidden: the arity markers are inferred at every call site, and are exported only
+// so that `WorkflowFn` can be spelled in a bound at all.
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub use registry::{NoArgs, OneArg};

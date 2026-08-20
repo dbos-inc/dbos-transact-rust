@@ -202,6 +202,36 @@ async fn two_applications_sharing_a_database_own_their_own_versions() {
     two.shutdown().await;
 }
 
+/// Registration is a before-launch activity, because the executor holds a snapshot.
+#[tokio::test]
+async fn registering_after_launch_is_refused() {
+    async fn noop() -> dbos::Result<()> {
+        Ok(())
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("register-app", &db));
+    dbos.register_workflow("before", noop)
+        .expect("registration before launch is fine");
+
+    dbos.launch().await.expect("launch failed");
+    let err = dbos.register_workflow("after", noop).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::AlreadyLaunched {
+                operation: "register_workflow"
+            }
+        ),
+        "{err}"
+    );
+
+    // And again after shutting down, since the instance outlives the executor.
+    dbos.shutdown().await;
+    dbos.register_workflow("after", noop)
+        .expect("registration is open again once shut down");
+}
+
 /// Configuration is checked before anything is connected, so a bad name fails fast rather than
 /// after a pool and a migration run.
 #[tokio::test]
