@@ -54,7 +54,7 @@ tokio = { version = "1", features = ["time", "sync"] }
 thiserror = "2"
 # The application version is the SHA-256 of the running executable (PLAN.md §4.14). Already in the
 # tree by way of sqlx, but named here because this crate depends on it directly.
-sha2 = "0.10"
+sha2 = "0.11"
 # `workflow_schedules.last_fired_at` is ISO-8601 text rather than the epoch milliseconds every
 # other time column holds, so one column needs a calendar. `std` has none — `SystemTime` and
 # `Duration` and nothing else — and the alternative was hand-written civil-date arithmetic to
@@ -66,6 +66,9 @@ time = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+# Tests define application error types to check that a workflow's *own* failures round-trip, which
+# is the case that matters; the crate already depends on `thiserror` for its own error channel.
+thiserror = "2"
 # Tests need a real database, and testcontainers is the only way they get one: no environment
 # variable points the suite at a long-lived server, so a green `cargo test` means the same
 # thing on a laptop as in CI. The harness is its own crate so that `#[cfg(test)]` code in

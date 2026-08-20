@@ -31,6 +31,10 @@ mod dbos;
 mod error;
 #[cfg(feature = "engine")]
 mod registry;
+#[cfg(feature = "engine")]
+mod serialization;
+#[cfg(feature = "engine")]
+mod workflow;
 
 // Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
@@ -44,9 +48,4 @@ pub use dbos::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use error::{Error, Result};
 #[cfg(feature = "engine")]
-pub use registry::{WorkflowFn, WorkflowKey, WorkflowRef};
-// Nameable but hidden: the arity markers are inferred at every call site, and are exported only
-// so that `WorkflowFn` can be spelled in a bound at all.
-#[cfg(feature = "engine")]
-#[doc(hidden)]
-pub use registry::{NoArgs, OneArg};
+pub use registry::{WorkflowKey, WorkflowRef};

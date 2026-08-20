@@ -81,7 +81,81 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    /// A workflow was started that this executor has no registration for.
+    ///
+    /// In-process this cannot happen — a `WorkflowRef` comes from a registration. It is reachable
+    /// through recovery and dequeue, where the name comes from a row and the code that registered
+    /// it may be gone.
+    #[error("no workflow is registered as {key}")]
+    NotRegistered {
+        /// The identity that was looked up.
+        key: String,
+    },
+
+    /// The workflow was cancelled by shutdown while this caller was waiting for it.
+    ///
+    /// Its row stays `PENDING`, so a later executor recovers it. Nothing was lost; this caller
+    /// simply stopped being the one waiting.
+    #[error("the workflow {workflow_id} was interrupted by shutdown and left PENDING")]
+    Interrupted {
+        /// The workflow that was interrupted.
+        workflow_id: String,
+    },
+
+    /// The workflow finished by returning an error.
+    #[error("the workflow {workflow_id} failed: {message}")]
+    WorkflowFailed {
+        /// The workflow that failed.
+        workflow_id: String,
+        /// What it reported.
+        message: String,
+    },
+
+    /// The workflow was cancelled.
+    #[error("the workflow {workflow_id} was cancelled")]
+    WorkflowCancelled {
+        /// The workflow that was cancelled.
+        workflow_id: String,
+    },
+
+    /// The workflow was recovered too many times and is parked.
+    #[error("the workflow {workflow_id} exceeded {recovery_attempts} recovery attempts")]
+    MaxRecoveryAttemptsExceeded {
+        /// The workflow that was parked.
+        workflow_id: String,
+        /// How many attempts it took.
+        recovery_attempts: i64,
+    },
+
+    /// The application's own code failed.
+    ///
+    /// This is how a workflow reports a failure of its own rather than one of ours, and it is what
+    /// the `error` column records — the application's message, not a wrapper around it, because
+    /// `transparent` forwards both `Display` and `source`.
+    ///
+    /// Built with [`Error::application`], never inferred. There is deliberately no blanket
+    /// `impl<E: std::error::Error> From<E> for Error`: it collides with `core`'s reflexive
+    /// `impl<T> From<T> for T` for as long as this type is itself a `std::error::Error`, which it
+    /// must be so an application can hold one in its own error enum. `anyhow` buys the blanket
+    /// conversion by giving up the trait; that trade is closed here.
+    #[error(transparent)]
+    Application(Box<dyn std::error::Error + Send + Sync>),
+
     /// The system database failed.
     #[error(transparent)]
     SystemDatabase(#[from] crate::sysdb::Error),
+}
+
+impl Error {
+    /// Wraps an application's own error.
+    ///
+    /// The conversion `?` cannot do for itself, so it reads `.map_err(Error::application)?` at the
+    /// boundary between an application's errors and ours. One line, and explicit about which side
+    /// of the boundary a failure came from.
+    pub fn application<E>(error: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Error::Application(Box::new(error))
+    }
 }

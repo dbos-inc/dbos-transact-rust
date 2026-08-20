@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::serialization::{decode, encode};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -150,46 +151,6 @@ impl Registry {
     }
 }
 
-/// A workflow function this crate can register.
-///
-/// Implemented for `async fn()` and `async fn(P)`, and nothing else. `Marker` distinguishes the two
-/// impls for the coherence checker, which cannot see that a type is never both `Fn()` and `Fn(P)`;
-/// it is inferred at every call site and never written down. This is axum's `Handler` trick, used
-/// for two rungs rather than sixteen — axum needs a ladder because each of its parameters is an
-/// independently extracted value, whereas a workflow's arguments all collapse into the one
-/// serialized payload the database stores.
-pub trait WorkflowFn<P, R, Marker>: Send + Sync + 'static {
-    /// Calls the workflow.
-    fn call(&self, input: P) -> BoxFuture<'static, Result<R>>;
-}
-
-/// Marker for `async fn() -> Result<R>`.
-#[doc(hidden)]
-pub struct NoArgs;
-/// Marker for `async fn(P) -> Result<R>`.
-#[doc(hidden)]
-pub struct OneArg;
-
-impl<F, Fut, R> WorkflowFn<(), R, NoArgs> for F
-where
-    F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<R>> + Send + 'static,
-{
-    fn call(&self, (): ()) -> BoxFuture<'static, Result<R>> {
-        Box::pin(self())
-    }
-}
-
-impl<F, Fut, P, R> WorkflowFn<P, R, OneArg> for F
-where
-    F: Fn(P) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<R>> + Send + 'static,
-{
-    fn call(&self, input: P) -> BoxFuture<'static, Result<R>> {
-        Box::pin(self(input))
-    }
-}
-
 /// A registered workflow, with its argument and result types kept.
 ///
 /// This is what registration returns and what a call site holds. The registry stores only the
@@ -215,7 +176,6 @@ impl<P, R> WorkflowRef<P, R> {
     }
 
     /// The instance this workflow is registered with.
-    #[allow(dead_code, reason = "read by `run` and `start`")]
     pub(crate) fn dbos(&self) -> &DBOS {
         &self.dbos
     }
@@ -248,14 +208,16 @@ impl DBOS {
     /// registration afterwards would be invisible to recovery and to dequeue — which is worse than
     /// an error, because the workflow would appear to work until the process restarted.
     ///
-    /// The function takes its own argument, or none. It never takes a context.
-    pub fn register_workflow<P, R, M, F>(
+    /// A workflow takes exactly one argument and never a context. One that needs nothing takes
+    /// `_: ()`; one that needs several takes a struct or a tuple.
+    pub fn register_workflow<P, R, F, Fut>(
         &self,
         name: &str,
         workflow: F,
     ) -> Result<WorkflowRef<P, R>>
     where
-        F: WorkflowFn<P, R, M>,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
         P: Serialize + DeserializeOwned + Send + 'static,
         R: Serialize + DeserializeOwned + Send + 'static,
     {
@@ -263,13 +225,14 @@ impl DBOS {
     }
 
     /// [`register_workflow`](DBOS::register_workflow) under a full identity triple.
-    pub fn register_workflow_as<P, R, M, F>(
+    pub fn register_workflow_as<P, R, F, Fut>(
         &self,
         key: WorkflowKey,
         workflow: F,
     ) -> Result<WorkflowRef<P, R>>
     where
-        F: WorkflowFn<P, R, M>,
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R>> + Send + 'static,
         P: Serialize + DeserializeOwned + Send + 'static,
         R: Serialize + DeserializeOwned + Send + 'static,
     {
@@ -283,9 +246,9 @@ impl DBOS {
         let erased: ErasedWorkflow = Arc::new(move |input: Option<String>| {
             let workflow = Arc::clone(&workflow);
             Box::pin(async move {
-                let input = decode::<P>(input.as_deref())?;
-                let output = workflow.call(input).await?;
-                encode(&output)
+                let input = decode::<P>(input.as_deref(), "argument")?;
+                let output = workflow(input).await?;
+                encode(&output, "result")
             })
         });
 
@@ -298,27 +261,6 @@ impl DBOS {
     }
 }
 
-/// Decodes a workflow argument.
-///
-/// An absent argument reads as JSON `null`, which is what a zero-argument workflow's `()` decodes
-/// from — so the two arities share one erased signature rather than needing two.
-fn decode<P: DeserializeOwned>(input: Option<&str>) -> Result<P> {
-    serde_json::from_str(input.unwrap_or("null")).map_err(|source| Error::Deserialization {
-        what: "argument",
-        source,
-    })
-}
-
-/// Encodes a workflow result.
-fn encode<R: Serialize>(output: &R) -> Result<Option<String>> {
-    serde_json::to_string(output)
-        .map(Some)
-        .map_err(|source| Error::Serialization {
-            what: "result",
-            source,
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,7 +270,7 @@ mod tests {
         DBOS::new(Config::new("registry-test", "postgres://unused"))
     }
 
-    async fn takes_nothing() -> Result<String> {
+    async fn takes_nothing(_: ()) -> Result<String> {
         Ok("nothing".to_owned())
     }
 
@@ -337,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn both_arities_register_without_a_turbofish() {
+    fn registration_infers_the_argument_and_result_types() {
         let dbos = dbos();
         let nothing = dbos
             .register_workflow("takes_nothing", takes_nothing)

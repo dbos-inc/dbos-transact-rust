@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::{APP_VERSION_ENV, Config, Serializer};
 use crate::registry::{Registry, Snapshot};
 use crate::sysdb::{SystemDatabase, postgres};
+use crate::workflow::Tasks;
 use crate::{Error, Result};
 
 /// The running half of DBOS, created by [`DBOS::launch`] and dropped by [`DBOS::shutdown`].
@@ -18,6 +19,8 @@ pub struct Executor {
     serializer: Serializer,
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
+    app_name: String,
+    tasks: Tasks,
 }
 
 /// The executor is assembled whole here rather than grown a field at a time, so several of these
@@ -86,6 +89,8 @@ impl Executor {
             // runtime is necessarily current.
             runtime: tokio::runtime::Handle::current(),
             workflows,
+            app_name: config.app_name.clone(),
+            tasks: Tasks::default(),
         })
     }
 
@@ -97,6 +102,16 @@ impl Executor {
     /// Identifies this process among the executors sharing the database.
     pub fn executor_id(&self) -> &str {
         &self.executor_id
+    }
+
+    /// Names the application whose rows this executor owns.
+    pub fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    /// The workflows this executor started and has not seen finish.
+    pub(crate) fn tasks(&self) -> &Tasks {
+        &self.tasks
     }
 
     /// The version of the application's code, as workflow rows record it.
@@ -139,6 +154,17 @@ impl Executor {
     /// Takes `&self`, not `self`: the instance drops its handle here, but a workflow still running
     /// may hold another, and shutting down is precisely the moment when that is true.
     pub(crate) async fn shutdown(&self) {
+        // Cancel first, then close: a workflow still running would otherwise fail its next query
+        // against a closed pool and record an *error* outcome, turning an interrupted workflow
+        // into a permanently failed one. Cancelling leaves every row `PENDING`, which is what a
+        // later executor recovers.
+        let cancelled = self.tasks.abort_all();
+        if cancelled > 0 {
+            tracing::info!(
+                cancelled,
+                "cancelled workflows still running; they stay PENDING"
+            );
+        }
         self.sysdb.close().await;
     }
 }
@@ -353,6 +379,8 @@ async fn compute_application_version(app_name: &str) -> Result<String> {
     tokio::task::spawn_blocking(move || {
         use sha2::Digest as _;
 
+        use std::io::Read as _;
+
         let exe = std::env::current_exe().map_err(|e| version_error("find", &e))?;
         let mut file = std::fs::File::open(&exe).map_err(|e| version_error("read", &e))?;
         let mut hasher = sha2::Sha256::new();
@@ -360,7 +388,19 @@ async fn compute_application_version(app_name: &str) -> Result<String> {
         // two (name, binary) pairs can produce the same input.
         hasher.update(app_name.as_bytes());
         hasher.update([0u8]);
-        std::io::copy(&mut file, &mut hasher).map_err(|e| version_error("read", &e))?;
+
+        // In chunks rather than into memory: an executable is tens of megabytes, and there is
+        // nothing to be gained by holding all of it at once.
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|e| version_error("read", &e))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&chunk[..read]);
+        }
 
         let mut hex = String::with_capacity(64);
         for byte in hasher.finalize() {

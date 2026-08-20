@@ -205,7 +205,7 @@ async fn two_applications_sharing_a_database_own_their_own_versions() {
 /// Registration is a before-launch activity, because the executor holds a snapshot.
 #[tokio::test]
 async fn registering_after_launch_is_refused() {
-    async fn noop() -> dbos::Result<()> {
+    async fn noop(_: ()) -> dbos::Result<()> {
         Ok(())
     }
 
