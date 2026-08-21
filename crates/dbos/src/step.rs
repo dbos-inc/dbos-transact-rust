@@ -33,6 +33,22 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
 /// ordinarily callable and ordinarily testable, and it is what Python does. Inside another step the
 /// same applies: a step is a leaf, so a nested one is a plain call rather than a second checkpoint.
 ///
+/// **A workflow body must await each step before starting the next.** The flag that makes a step a
+/// leaf lives on the workflow rather than on the call stack, so two steps in flight at once — under
+/// `tokio::join!`, `select!`, or any other concurrent combinator — see each other's. Two ways that
+/// goes wrong, and both are silent: a step that starts while another's body is running takes the
+/// plain path above and is *not* checkpointed, so a replay runs it again; and a sibling finishing
+/// clears the flag for a step still inside its body, so a step nested in that one allocates an id
+/// after all. Step ids then fall out of poll order, and a replay that interleaves differently meets
+/// a recorded step under the wrong name — which is a system-database error, so the workflow records
+/// nothing, stays `PENDING`, and is recovered until it parks.
+///
+/// That is a known gap rather than a rule with a workaround. Concurrent steps are a later change:
+/// the flag has to become per-call-stack — a nested [`Ctx`](crate::Ctx) scope around the body, so
+/// that nesting is exact and siblings cannot see each other — and wants a count of live steps, so
+/// that genuine concurrency is refused loudly rather than degrading to a plain call. Until then,
+/// sequential is the contract.
+///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.
 pub async fn step<T, E, F, Fut>(name: &str, body: F) -> Result<T, E>

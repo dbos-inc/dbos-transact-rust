@@ -49,6 +49,15 @@ struct WorkflowState {
     /// inside a step is a plain call. Without this the inner call would allocate a step id of its
     /// own and every step after it would replay against the wrong slot — a correctness trap rather
     /// than a policy question, and Go #420 draws the same line.
+    ///
+    /// **Here, and so per-workflow, which is only right while steps run one at a time.** The
+    /// question is really per-call-stack, so two steps in flight at once share an answer meant for
+    /// one — silently, and in both directions; [`step`](crate::step) documents what that costs a
+    /// caller and why sequential is the contract for now. Supporting concurrency starts by moving
+    /// this out of here: the flag belongs to the [`Ctx`] that [`Ctx::in_step_scope`] wraps the body
+    /// with, rather than to the state every clone shares, and then `WorkflowState` holds only what
+    /// genuinely belongs to the whole workflow — the id and the step counter. A count of live steps
+    /// would stay here, since refusing concurrency is a question about the workflow.
     in_step: AtomicBool,
 }
 
