@@ -2,7 +2,6 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,13 +15,6 @@ use crate::handle::WorkflowHandle;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
 use crate::sysdb::types::{AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission};
-
-/// How often an adopting caller asks whether the run that won has finished.
-///
-/// Workflow completion has no wakeup in any implementation — no channel carries it and no trigger
-/// publishes it — so the only way to learn a status changed is to look. One second is the interval
-/// every reference polls at.
-const OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
 ///
@@ -308,7 +300,15 @@ where
             return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
 
-        let task = spawn_execution(&executor, self.key().clone(), workflow_id.clone(), input);
+        // No slot: a caller starting a workflow is its own backpressure, and blocking
+        // `start` behind recovery's cap would make an unrelated backlog look like a hang.
+        let task = spawn_execution(
+            &executor,
+            self.key().clone(),
+            workflow_id.clone(),
+            input,
+            None,
+        );
         Ok(WorkflowHandle::local(executor, workflow_id, task))
     }
 }
@@ -326,6 +326,7 @@ pub(crate) fn spawn_execution(
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
@@ -333,6 +334,9 @@ pub(crate) fn spawn_execution(
         {
             let executor = Arc::clone(executor);
             async move {
+                // Held for the whole run, so a bounded submitter's cap counts workflows that are
+                // *running* rather than workflows it has managed to spawn.
+                let _slot = slot;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
                 let panic_log = PanicLog {
                     workflow_id: &workflow_id,
@@ -427,7 +431,7 @@ pub(crate) async fn adopt(
 ) -> std::result::Result<Option<String>, Failure> {
     let outcome = executor
         .sysdb()
-        .await_workflow_result(workflow_id, OUTCOME_POLL_INTERVAL)
+        .await_workflow_result(workflow_id, executor.outcome_poll_interval())
         .await
         .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
     match outcome {
@@ -450,6 +454,7 @@ pub(crate) async fn adopt(
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::*;
 

@@ -21,6 +21,13 @@ pub struct Executor {
     workflows: Snapshot,
     app_name: String,
     tasks: Tasks,
+    /// Bounds the recovered workflows this executor claims and runs at once.
+    ///
+    /// Held here rather than passed down because recovery is spawned from `launch` and its
+    /// per-workflow submissions happen later, in a background task with no configuration of its
+    /// own. See [`Config::recovery_concurrency`].
+    recovery: Arc<tokio::sync::Semaphore>,
+    outcome_poll_interval: std::time::Duration,
 }
 
 impl Executor {
@@ -102,6 +109,8 @@ impl Executor {
             workflows,
             app_name: config.app_name.clone(),
             tasks: Tasks::default(),
+            recovery: Arc::new(tokio::sync::Semaphore::new(config.recovery_limit())),
+            outcome_poll_interval: config.outcome_poll_interval(),
         };
         Ok((executor, pending))
     }
@@ -124,6 +133,20 @@ impl Executor {
     /// The workflows this executor started and has not seen finish.
     pub(crate) fn tasks(&self) -> &Tasks {
         &self.tasks
+    }
+
+    /// A slot to run one recovered workflow in, waiting for one if they are all taken.
+    ///
+    /// `None` only if the semaphore were closed, which nothing does; recovery then proceeds
+    /// uncapped rather than refusing to recover, since a missing bound is worse as a stall than as
+    /// a crowd.
+    pub(crate) async fn recovery_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.recovery).acquire_owned().await.ok()
+    }
+
+    /// How often an adopting caller asks whether the run that won has finished.
+    pub(crate) fn outcome_poll_interval(&self) -> std::time::Duration {
+        self.outcome_poll_interval
     }
 
     /// The version of the application's code, as workflow rows record it.

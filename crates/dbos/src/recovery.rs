@@ -18,7 +18,7 @@ use crate::sysdb;
 use crate::sysdb::types::{NewWorkflow, Submission};
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
-/// Runs the recovery list in the background, one submission at a time.
+/// Runs the recovery list in the background, bounded by the executor's recovery concurrency.
 ///
 /// The driver is registered with the executor's task set, so shutdown aborts a recovery still in
 /// flight the same way it aborts the workflows themselves — everything it managed to submit stays
@@ -26,6 +26,10 @@ use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 ///
 /// Per-workflow failures are logged, never propagated: recovery is a sweep, and one bad row must
 /// not strand every workflow behind it.
+///
+/// The sweep waits for a slot before each row rather than racing through the list, so an executor
+/// that died holding a large backlog resumes it at a rate its connection pool can serve instead of
+/// spawning the whole backlog at once. See [`Config::recovery_concurrency`](crate::Config).
 pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
     if pending.is_empty() {
         tracing::debug!("no workflows to recover");
@@ -41,7 +45,11 @@ pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
             let executor = Arc::clone(&executor);
             async move {
                 for workflow_id in pending {
-                    if let Err(error) = recover_one(&executor, &workflow_id).await {
+                    // Taken before the row is claimed, not after: an executor that re-stamped
+                    // more workflows than it is prepared to run would have counted a recovery
+                    // attempt against each of them for nothing.
+                    let slot = executor.recovery_slot().await;
+                    if let Err(error) = recover_one(&executor, &workflow_id, slot).await {
                         tracing::warn!(
                             workflow_id,
                             error = %error,
@@ -60,7 +68,11 @@ pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
 /// The registry is consulted *before* the row is claimed: an `init_workflow` that succeeded and
 /// then found no registration would have burned a recovery attempt and re-stamped the executor on
 /// a workflow this process cannot run.
-async fn recover_one(executor: &Arc<Executor>, workflow_id: &str) -> crate::Result<()> {
+async fn recover_one(
+    executor: &Arc<Executor>,
+    workflow_id: &str,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> crate::Result<()> {
     let row = executor
         .sysdb()
         .get_workflow(workflow_id)
@@ -133,7 +145,9 @@ async fn recover_one(executor: &Arc<Executor>, workflow_id: &str) -> crate::Resu
         "recovering the workflow"
     );
     // Detached: recovered workflows run concurrently, and the driver moves on. The handle is not
-    // awaited by anyone, which is exactly the case the execution layer's own logging covers.
-    spawn_execution(executor, key, workflow_id.to_owned(), row.input);
+    // awaited by anyone, which is exactly the case the execution layer's own logging covers. The
+    // slot goes with it and is released when the workflow ends, which is what bounds the crowd —
+    // every path above this one returns without spawning and drops it here instead.
+    spawn_execution(executor, key, workflow_id.to_owned(), row.input, slot);
     Ok(())
 }
