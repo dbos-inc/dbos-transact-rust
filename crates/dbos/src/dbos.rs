@@ -69,7 +69,8 @@ impl Executor {
                 ..postgres::Settings::default()
             },
         })
-        .await?;
+        .await
+        .map_err(Error::SystemDatabase)?;
 
         register_version(&sysdb, &application_version).await?;
 
@@ -309,7 +310,9 @@ impl DBOS {
     /// Java's `ensureLaunched(caller)`, and for its reason: the useful half of the error is which
     /// call was too early.
     pub(crate) fn executor(&self, operation: &'static str) -> Result<Arc<Executor>> {
-        self.read_executor().ok_or(Error::NotLaunched { operation })
+        self.read_executor().ok_or(Error::NotLaunched {
+            operation: operation.into(),
+        })
     }
 
     fn read_executor(&self) -> Option<Arc<Executor>> {
@@ -348,8 +351,15 @@ impl std::fmt::Debug for DBOS {
 /// the symptom — an executor that starts cleanly and is handed no unversioned work — reads as a
 /// broken queue rather than as a deliberate policy.
 async fn register_version(sysdb: &impl SystemDatabase, version: &str) -> Result<()> {
-    sysdb.create_application_version(version, None).await?;
-    match sysdb.get_latest_application_version(None).await? {
+    sysdb
+        .create_application_version(version, None)
+        .await
+        .map_err(Error::SystemDatabase)?;
+    match sysdb
+        .get_latest_application_version(None)
+        .await
+        .map_err(Error::SystemDatabase)?
+    {
         Some(latest) if latest.version_name != version => {
             tracing::warn!(
                 application_version = version,
@@ -437,7 +447,7 @@ mod tests {
             matches!(
                 err,
                 Error::NotLaunched {
-                    operation: "application_version"
+                    operation: std::borrow::Cow::Borrowed("application_version")
                 }
             ),
             "{err}"

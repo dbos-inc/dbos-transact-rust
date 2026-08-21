@@ -5,6 +5,7 @@
 
 use dbos::sysdb::{SystemDatabase, postgres::PostgresSystemDatabase, postgres::Settings};
 use dbos::{Config, DBOS, Error};
+use std::borrow::Cow;
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -220,7 +221,7 @@ async fn registering_after_launch_is_refused() {
         matches!(
             err,
             Error::AlreadyLaunched {
-                operation: "register_workflow"
+                operation: Cow::Borrowed("register_workflow")
             }
         ),
         "{err}"

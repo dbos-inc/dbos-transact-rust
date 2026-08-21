@@ -1,6 +1,6 @@
 //! Running workflows, against real databases.
 
-use std::error::Error as _;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -8,6 +8,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
+use dbos::sysdb::{BackendError, BackendErrorKind};
 use dbos::{Config, DBOS, Error};
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -89,41 +90,104 @@ async fn a_zero_argument_workflow_records_no_input() {
     dbos.shutdown().await;
 }
 
-/// A workflow that fails in the application's own terms records ERROR, and the row carries the
-/// application's message rather than a wrapper around it.
+/// An application's own error type survives the database intact.
 ///
-/// The error type here is deliberately not one of ours: a real workflow fails with its own error,
-/// converted at the boundary with `.map_err(Error::application)`, and what must reach the database
-/// is what *it* said.
+/// This is the point of the error being a type parameter: `CardDeclined` comes back as
+/// `CardDeclined`, matchable, rather than as a name and a message describing it.
 #[tokio::test]
-async fn a_failing_workflow_records_the_applications_own_error() {
-    #[derive(Debug, thiserror::Error)]
-    #[error("the card was declined")]
-    struct CardDeclined;
-
-    async fn charge() -> Result<(), CardDeclined> {
-        Err(CardDeclined)
+async fn an_application_error_type_round_trips_as_itself() {
+    // Two derives and nothing else. No variant holding a `dbos::Error`, no `From` impl, no trait
+    // to implement: the engine wraps this type rather than this type making room for the engine.
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    enum CheckoutError {
+        #[error("the card was declined after {attempts} attempts")]
+        CardDeclined { attempts: u32 },
     }
 
-    async fn fails(_: ()) -> dbos::Result<()> {
-        charge().await.map_err(Error::application)?;
+    async fn checkout(_: ()) -> dbos::Result<u32, CheckoutError> {
+        // `?` lifts the application's error into ours through the blanket conversion the type
+        // parameter buys.
+        Err(CheckoutError::CardDeclined { attempts: 3 })?
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("typed-error-app", &db));
+    let checkout = dbos.register_workflow("checkout", checkout).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // The run that failed gets its own error, structure and all.
+    let err = checkout.run(()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Application(CheckoutError::CardDeclined { attempts: 3 })
+        ),
+        "{err:?}"
+    );
+
+    // And so does a caller adopting the finished workflow, which reads it back out of the column.
+    let rows = reader(&db)
+        .await
+        .list_workflows(&Default::default())
+        .await
+        .expect("read failed");
+    assert_eq!(rows[0].status, WorkflowStatus::Error);
+    let recorded: Error<CheckoutError> =
+        serde_json::from_str(rows[0].error.as_deref().expect("an error was recorded"))
+            .expect("the column holds the application's own error");
+    assert!(
+        matches!(
+            recorded,
+            Error::Application(CheckoutError::CardDeclined { attempts: 3 })
+        ),
+        "the field survives, not just the message: {recorded:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A workflow converts a foreign error at the boundary, because a durable one must serialize.
+///
+/// The case a library error lands in: a third party's type has no serde derives and cannot cross a
+/// column, so it becomes the workflow's own error where the two meet. One `map_err` at the call
+/// site, and everything downstream — the row, the replay, the caller — gets full fidelity.
+#[tokio::test]
+async fn a_foreign_error_is_converted_at_the_boundary() {
+    // Somebody else's error type: `Debug + Display` and nothing more.
+    #[derive(Debug, thiserror::Error)]
+    #[error("the gateway refused the card")]
+    struct GatewayRefused;
+
+    async fn charge() -> Result<(), GatewayRefused> {
+        Err(GatewayRefused)
+    }
+
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    enum PaymentError {
+        #[error("charging failed: {reason}")]
+        Gateway { reason: String },
+    }
+
+    async fn pay(_: ()) -> dbos::Result<(), PaymentError> {
+        charge().await.map_err(|e| PaymentError::Gateway {
+            reason: e.to_string(),
+        })?;
         Ok(())
     }
 
     let db = test_database().await;
     let dbos = DBOS::new(config("fail-app", &db));
-    let fails = dbos.register_workflow("fails", fails).unwrap();
+    let pay = dbos.register_workflow("pay", pay).unwrap();
     dbos.launch().await.expect("launch failed");
 
-    // The caller that ran it gets the application's error *object* back, not a string round-tripped
-    // through the database. Only a caller that adopts someone else's run reads back a
-    // `WorkflowFailed` built from the recorded message, because by then the object is gone.
-    let err = fails.run(()).await.unwrap_err();
-    assert!(matches!(err, Error::Application(_)), "{err}");
-    assert_eq!(err.to_string(), "the card was declined");
+    let err = pay.run(()).await.unwrap_err();
     assert!(
-        err.source().is_none(),
-        "transparent forwards the application's own source chain, and it has none"
+        matches!(err, Error::Application(PaymentError::Gateway { .. })),
+        "{err}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "charging failed: the gateway refused the card"
     );
 
     let rows = reader(&db)
@@ -132,10 +196,60 @@ async fn a_failing_workflow_records_the_applications_own_error() {
         .await
         .expect("read failed");
     assert_eq!(rows[0].status, WorkflowStatus::Error);
+    // The column holds the failure encoded, not stringified, so what comes back out of it is the
+    // error itself rather than a description of it.
+    let recorded: Error<PaymentError> =
+        serde_json::from_str(rows[0].error.as_deref().expect("an error was recorded"))
+            .expect("the error column holds an encoded error");
+    assert!(matches!(
+        recorded,
+        Error::Application(PaymentError::Gateway { .. })
+    ));
+    assert_eq!(recorded.to_string(), err.to_string());
+
+    dbos.shutdown().await;
+}
+
+/// A database failure leaves the workflow `PENDING` instead of recording it as failed.
+///
+/// The blip case: a connection drops while the engine checkpoints, the error propagates out
+/// through the workflow body, and the workflow had not failed — the database had. Recording ERROR
+/// would assert something false about work that could still be finished, and the row is the only
+/// copy of that fact.
+#[tokio::test]
+async fn a_database_failure_is_not_the_workflows_outcome() {
+    async fn blips(_: ()) -> dbos::Result<()> {
+        Err(Error::SystemDatabase(dbos::sysdb::Error::Backend(
+            BackendError {
+                message: "connection reset by peer".to_owned(),
+                sqlstate: None,
+                kind: BackendErrorKind::Connection,
+            },
+        )))
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("blip-app", &db));
+    let blips = dbos.register_workflow("blips", blips).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let err = blips.run(()).await.unwrap_err();
+    assert!(matches!(err, Error::SystemDatabase(_)), "{err}");
+
+    let rows = reader(&db)
+        .await
+        .list_workflows(&Default::default())
+        .await
+        .expect("read failed");
     assert_eq!(
-        rows[0].error.as_deref(),
-        Some("the card was declined"),
-        "the application's message, not a DBOS wrapper around it"
+        rows[0].status,
+        WorkflowStatus::Pending,
+        "left for a later executor to recover, not recorded as failed"
+    );
+    assert!(
+        rows[0].error.is_none(),
+        "nothing terminal was written: {:?}",
+        rows[0].error
     );
 
     dbos.shutdown().await;
@@ -156,7 +270,7 @@ async fn the_row_exists_before_the_body_starts() {
             async move {
                 started.notify_one();
                 release.notified().await;
-                dbos::Result::Ok(())
+                Ok::<_, dbos::Error>(())
             }
         })
         .unwrap()
@@ -202,7 +316,7 @@ async fn shutdown_cancels_a_running_workflow_and_leaves_it_pending() {
                 started.notify_one();
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 finished.fetch_add(1, Ordering::SeqCst);
-                dbos::Result::Ok(())
+                Ok::<_, dbos::Error>(())
             }
         })
         .unwrap()
@@ -250,7 +364,7 @@ async fn dropping_the_future_does_not_stop_the_workflow() {
             async move {
                 started.notify_one();
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                dbos::Result::Ok(7u32)
+                Ok::<_, dbos::Error>(7u32)
             }
         })
         .unwrap()
@@ -294,7 +408,7 @@ async fn running_before_launch_is_refused() {
         matches!(
             err,
             Error::NotLaunched {
-                operation: "run a workflow"
+                operation: Cow::Borrowed("run a workflow")
             }
         ),
         "{err}"

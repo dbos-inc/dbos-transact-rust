@@ -13,18 +13,24 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::error::{DurableError, EngineOnly, Failure};
 use crate::serialization::{decode, encode};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// A registered workflow with its types erased: encoded argument in, encoded result out.
+/// A registered workflow with its types erased: encoded argument in, encoded outcome out.
 ///
 /// That *is* an FFI shape, and deliberately so (§9.2) — a host language marshals strings and never
-/// a Rust type. No context parameter appears in it, because the context is ambient.
-pub(crate) type ErasedWorkflow =
-    Arc<dyn Fn(Option<String>) -> BoxFuture<'static, Result<Option<String>>> + Send + Sync>;
+/// a Rust type. No context parameter appears in it, because the context is ambient. The error is
+/// erased along with the value, which is what lets a caller keep a typed error while recovery,
+/// holding only a row, keeps none.
+pub(crate) type ErasedWorkflow = Arc<
+    dyn Fn(Option<String>) -> BoxFuture<'static, std::result::Result<Option<String>, Failure>>
+        + Send
+        + Sync,
+>;
 
 /// What identifies a workflow, as the `workflow_status` row stores it.
 ///
@@ -156,15 +162,18 @@ impl Registry {
 /// This is what registration returns and what a call site holds. The registry stores only the
 /// erased form; the types live here, so a caller gets them checked once at registration rather
 /// than at every invocation by string.
-pub struct WorkflowRef<P, R> {
+pub struct WorkflowRef<P, R, E = EngineOnly> {
     dbos: DBOS,
     key: Arc<WorkflowKey>,
-    /// `fn(P) -> R` rather than `(P, R)`: it makes this `Send`, `Sync` and `Unpin` whatever `P`
-    /// and `R` are, since the reference does not hold either — it only names them.
-    types: PhantomData<fn(P) -> R>,
+    /// `E` is the *application's* error type, the one inside [`Error::Application`], so a workflow
+    /// that only fails in DBOS's own terms leaves it at [`EngineOnly`].
+    ///
+    /// `fn(P) -> (R, E)` rather than a tuple: it makes this `Send`, `Sync` and `Unpin` whatever the
+    /// parameters are, since the reference does not hold any of them — it only names them.
+    types: PhantomData<fn(P) -> (R, E)>,
 }
 
-impl<P, R> WorkflowRef<P, R> {
+impl<P, R, E> WorkflowRef<P, R, E> {
     /// The identity this workflow was registered under.
     pub fn key(&self) -> &WorkflowKey {
         &self.key
@@ -183,7 +192,7 @@ impl<P, R> WorkflowRef<P, R> {
 
 /// Hand-written: the derive would demand `P: Clone, R: Clone`, which a reference that holds
 /// neither has no business requiring.
-impl<P, R> Clone for WorkflowRef<P, R> {
+impl<P, R, E> Clone for WorkflowRef<P, R, E> {
     fn clone(&self) -> Self {
         Self {
             dbos: self.dbos.clone(),
@@ -193,7 +202,7 @@ impl<P, R> Clone for WorkflowRef<P, R> {
     }
 }
 
-impl<P, R> std::fmt::Debug for WorkflowRef<P, R> {
+impl<P, R, E> std::fmt::Debug for WorkflowRef<P, R, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowRef")
             .field("key", &self.key.to_string())
@@ -210,35 +219,37 @@ impl DBOS {
     ///
     /// A workflow takes exactly one argument and never a context. One that needs nothing takes
     /// `_: ()`; one that needs several takes a struct or a tuple.
-    pub fn register_workflow<P, R, F, Fut>(
+    pub fn register_workflow<P, R, E, F, Fut>(
         &self,
         name: &str,
         workflow: F,
-    ) -> Result<WorkflowRef<P, R>>
+    ) -> Result<WorkflowRef<P, R, E>>
     where
         F: Fn(P) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
         P: Serialize + DeserializeOwned + Send + 'static,
         R: Serialize + DeserializeOwned + Send + 'static,
+        E: DurableError,
     {
         self.register_workflow_as(WorkflowKey::new(name), workflow)
     }
 
     /// [`register_workflow`](DBOS::register_workflow) under a full identity triple.
-    pub fn register_workflow_as<P, R, F, Fut>(
+    pub fn register_workflow_as<P, R, E, F, Fut>(
         &self,
         key: WorkflowKey,
         workflow: F,
-    ) -> Result<WorkflowRef<P, R>>
+    ) -> Result<WorkflowRef<P, R, E>>
     where
         F: Fn(P) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R>> + Send + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
         P: Serialize + DeserializeOwned + Send + 'static,
         R: Serialize + DeserializeOwned + Send + 'static,
+        E: DurableError,
     {
         if self.is_launched() {
             return Err(Error::AlreadyLaunched {
-                operation: "register_workflow",
+                operation: "register_workflow".into(),
             });
         }
 
@@ -246,9 +257,22 @@ impl DBOS {
         let erased: ErasedWorkflow = Arc::new(move |input: Option<String>| {
             let workflow = Arc::clone(&workflow);
             Box::pin(async move {
-                let input = decode::<P>(input.as_deref(), "argument")?;
-                let output = workflow(input).await?;
-                encode(&output, "result")
+                let input = decode::<P, EngineOnly>(input.as_deref(), "argument")
+                    .map_err(Failure::Control)?;
+                match workflow(input).await {
+                    Ok(output) => encode(&output, "result")
+                        .map(Some)
+                        .map_err(Failure::Control),
+                    // The whole `Error<E>` is what gets recorded, application variant and all, so
+                    // the column is self-describing: a reader knows the envelope without having to
+                    // guess whether the payload is one of ours or one of the workflow's.
+                    Err(error) => Err(match error.control() {
+                        Some(control) => Failure::Control(control),
+                        None => {
+                            Failure::Recorded(encode(&error, "error").map_err(Failure::Control)?)
+                        }
+                    }),
+                }
             })
         });
 
@@ -263,6 +287,8 @@ impl DBOS {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use crate::Config;
 
@@ -288,8 +314,11 @@ mod tests {
         assert_eq!(nothing.name(), "takes_nothing");
         assert_eq!(one.name(), "takes_one");
         // Closures too, which is what a macro will generate into.
-        dbos.register_workflow("closure", |s: String| async move { Ok(s.len()) })
-            .unwrap();
+        dbos.register_workflow(
+            "closure",
+            |s: String| async move { Ok::<_, Error>(s.len()) },
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -335,12 +364,12 @@ mod tests {
         assert!(
             matches!(
                 err,
-                Error::Deserialization {
-                    what: "argument",
+                Failure::Control(Error::Deserialization {
+                    what: Cow::Borrowed("argument"),
                     ..
-                }
+                })
             ),
-            "{err}"
+            "{err:?}"
         );
     }
 

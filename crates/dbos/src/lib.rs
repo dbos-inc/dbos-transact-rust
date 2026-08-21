@@ -46,6 +46,6 @@ pub use context::Ctx;
 #[cfg(feature = "engine")]
 pub use dbos::{DBOS, Executor};
 #[cfg(feature = "engine")]
-pub use error::{Error, Result};
+pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};

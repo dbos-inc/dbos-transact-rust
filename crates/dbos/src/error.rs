@@ -1,28 +1,111 @@
 //! The error channel for the execution engine.
 //!
-//! [`Error`] is what every engine operation returns, and it is deliberately an ordinary
-//! `std::error::Error`: an application's own error type is expected to hold one, usually as a
-//! `#[error(transparent)] DBOS(#[from] dbos::Error)` variant, and `#[from]` needs the trait.
+//! [`Error`] is generic over what the *application* failed with, and that one decision shapes the
+//! rest. The engine wraps the application rather than the application making room for the engine:
+//! a workflow returning `dbos::Result<Receipt, CheckoutError>` fails with either
+//! [`Error::Application`] carrying a `CheckoutError`, or one of the engine's own variants. The
+//! application's error type stays DBOS-agnostic — two derives, no variant of ours inside it, no
+//! trait it has to know about.
 //!
-//! **There is no blanket `impl<E: std::error::Error> From<E> for Error`**, and the reason is a
-//! language constraint rather than a preference: such an impl collides with `core`'s reflexive
-//! `impl<T> From<T> for T` for as long as `Error` is itself a `std::error::Error`. `anyhow` buys
-//! its blanket conversion by *not* implementing the trait, and that trade is closed here. An
-//! application error therefore becomes ours through an explicit conversion at the site that needs
-//! one, and ours becomes an application's through `#[from]`.
+//! **The generic parameter buys back a blanket conversion**, which is what makes that work.
+//! `impl<E> From<E> for Error<E>` is accepted where `impl<E: std::error::Error> From<E> for Error`
+//! is not: the overlap with `core`'s reflexive `impl<T> From<T> for T` would need `E = Error<E>`,
+//! an infinite type the occurs check rules out. So `?` lifts an application's own error into ours
+//! with no impl written by anyone. `anyhow` gives up `std::error::Error` to get the same thing;
+//! here it costs a type parameter instead.
+//!
+//! The price is paid inside this crate rather than by its users: the blanket impl is why
+//! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
+//! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
-/// The result of an engine operation.
-pub type Result<T> = std::result::Result<T, Error>;
+use std::borrow::Cow;
 
-/// Everything the engine can fail with.
+/// The error type of a workflow with no failure of its own.
+///
+/// Named for what it makes the channel: `Error<EngineOnly>` carries the engine's own errors and
+/// nothing else. Uninhabited, so the compiler knows [`Error::Application`] cannot be constructed,
+/// which is what lets an engine error be carried into any workflow's channel by a total conversion
+/// rather than by a panic waiting for an input that cannot arrive.
+///
+/// This is the default parameter, so bare `dbos::Error` means "a failure of DBOS's", and
+/// `dbos::Result<T>` is the result of an engine operation. A `From<MyError>` bound failing against
+/// `Error<EngineOnly>` is the compiler saying the workflow declared no application error type —
+/// the fix is to return `dbos::Result<T, MyError>`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum EngineOnly {}
+
+impl std::fmt::Display for EngineOnly {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {}
+    }
+}
+
+impl std::error::Error for EngineOnly {}
+
+/// What an application may fail with, inside [`Error::Application`].
+///
+/// Notably **not** `From<Error>`: an application error type knows nothing about this crate. The
+/// bounds are only what the engine needs of it:
+///
+/// - `Serialize` + `DeserializeOwned` — a recorded failure has to survive a column, and decoding
+///   needs a concrete type. This is the whole reason the error is a type parameter rather than a
+///   trait object.
+/// - `std::error::Error` — so a failure reads as a failure: `Display` for a log, `source` for a
+///   caller walking the chain.
+///
+/// Implemented for anything meeting them, so an application writes no impl:
+///
+/// ```
+/// #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+/// enum CheckoutError {
+///     #[error("the card was declined")]
+///     CardDeclined,
+/// }
+///
+/// async fn checkout(cart: u32) -> dbos::Result<u32, CheckoutError> {
+///     Err(CheckoutError::CardDeclined)?
+/// }
+/// ```
+pub trait DurableError:
+    serde::Serialize + serde::de::DeserializeOwned + std::error::Error + 'static
+{
+}
+
+impl<E> DurableError for E where
+    E: serde::Serialize + serde::de::DeserializeOwned + std::error::Error + 'static
+{
+}
+
+/// The result of a durable function, or of an engine operation.
+///
+/// `Result<T>` is the engine's own — it cannot carry an application failure, because
+/// [`EngineOnly`] has no values. `Result<T, CheckoutError>` is a workflow's, and note the second
+/// parameter is the *application's* error rather than the whole error type: it expands to
+/// `std::result::Result<T, Error<CheckoutError>>`.
+pub type Result<T, E = EngineOnly> = std::result::Result<T, Error<E>>;
+
+/// Everything a durable function can fail with.
 ///
 /// `#[non_exhaustive]` because the twenty codes the other implementations share (§4.6) arrive with
 /// the phases that raise them; matching callers need a wildcard arm from the start rather than a
-/// breaking change later. This is the attribute used where it belongs — on an enum, whose variants
-/// grow — as opposed to on an options struct, where it would forbid `..Default::default()`.
-#[derive(Debug, thiserror::Error)]
+/// breaking change later.
+///
+/// **Serializable, and that is load-bearing.** A failed workflow records the error it failed with,
+/// and a replay has to give back *that error* rather than a description of it — the same fidelity
+/// a successful result gets. Every payload is data this crate or the application owns, so encoding
+/// costs a derive; the only fields that cannot survive a round trip are the `serde_json::Error`
+/// sources, marked `#[serde(skip)]` and explained where they are declared.
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
-pub enum Error {
+pub enum Error<E = EngineOnly> {
+    /// A failure reported by the workflow body itself.
+    ///
+    /// The application's own error, held as itself rather than reduced to a description of one.
+    /// The run that fails and the replay that reads the row back both produce this variant with an
+    /// equal payload, which is the property the whole generic parameter exists for.
+    #[error(transparent)]
+    Application(E),
+
     /// An operation needing a running executor was called before [`launch`](crate::DBOS::launch).
     ///
     /// Names the operation, following Java's `ensureLaunched(caller)`: the useful half of this
@@ -30,7 +113,7 @@ pub enum Error {
     #[error("cannot {operation} before DBOS is launched")]
     NotLaunched {
         /// The operation that was called too early.
-        operation: &'static str,
+        operation: Cow<'static, str>,
     },
 
     /// An operation that must happen before launch was called after it.
@@ -40,7 +123,7 @@ pub enum Error {
     #[error("cannot {operation} after DBOS is launched")]
     AlreadyLaunched {
         /// The operation that was called too late.
-        operation: &'static str,
+        operation: Cow<'static, str>,
     },
 
     /// The configuration could not be used.
@@ -59,26 +142,36 @@ pub enum Error {
     },
 
     /// A value could not be encoded for the database.
-    #[error("could not serialize the workflow {what}")]
+    #[error("could not serialize the workflow {what}: {message}")]
     Serialization {
-        /// Which value: `argument`, `result`.
-        what: &'static str,
-        /// The underlying failure.
+        /// Which value: `argument`, `result`, `error`.
+        what: Cow<'static, str>,
+        /// What the serializer said.
+        message: String,
+        /// The live failure, when this process is the one that produced it.
+        ///
+        /// `serde_json::Error` is not itself deserializable, so this is one of the two payloads
+        /// here that cannot come back out of a column. [`message`](Self::Serialization::message)
+        /// carries what it said, which is what a reader of a recorded error actually needs.
+        #[serde(skip)]
         #[source]
-        source: serde_json::Error,
+        source: Option<serde_json::Error>,
     },
 
     /// A value from the database could not be decoded.
     ///
     /// Usually a signature that changed under a workflow already in flight — the row holds what
     /// the old code wrote, and the new code cannot read it.
-    #[error("could not deserialize the workflow {what}")]
+    #[error("could not deserialize the workflow {what}: {message}")]
     Deserialization {
-        /// Which value: `argument`, `result`.
-        what: &'static str,
-        /// The underlying failure.
+        /// Which value: `argument`, `result`, `error`.
+        what: Cow<'static, str>,
+        /// What the deserializer said.
+        message: String,
+        /// The live failure, when this process is the one that produced it.
+        #[serde(skip)]
         #[source]
-        source: serde_json::Error,
+        source: Option<serde_json::Error>,
     },
 
     /// A workflow was started that this executor has no registration for.
@@ -102,7 +195,11 @@ pub enum Error {
         workflow_id: String,
     },
 
-    /// The workflow finished by returning an error.
+    /// A workflow failed, and what it failed with was not one of ours to decode.
+    ///
+    /// The degraded read: the row was written by another SDK, whose serializer chose its own
+    /// shape, so the message is what survives. A workflow this SDK recorded comes back as the
+    /// error itself.
     #[error("the workflow {workflow_id} failed: {message}")]
     WorkflowFailed {
         /// The workflow that failed.
@@ -127,35 +224,193 @@ pub enum Error {
         recovery_attempts: i64,
     },
 
-    /// The application's own code failed.
-    ///
-    /// This is how a workflow reports a failure of its own rather than one of ours, and it is what
-    /// the `error` column records — the application's message, not a wrapper around it, because
-    /// `transparent` forwards both `Display` and `source`.
-    ///
-    /// Built with [`Error::application`], never inferred. There is deliberately no blanket
-    /// `impl<E: std::error::Error> From<E> for Error`: it collides with `core`'s reflexive
-    /// `impl<T> From<T> for T` for as long as this type is itself a `std::error::Error`, which it
-    /// must be so an application can hold one in its own error enum. `anyhow` buys the blanket
-    /// conversion by giving up the trait; that trade is closed here.
-    #[error(transparent)]
-    Application(Box<dyn std::error::Error + Send + Sync>),
-
     /// The system database failed.
+    ///
+    /// Deliberately not a `#[from]`: that impl overlaps the blanket `From<E> for Error<E>` at
+    /// `Error<sysdb::Error>`. Engine code names the variant instead.
     #[error(transparent)]
-    SystemDatabase(#[from] crate::sysdb::Error),
+    SystemDatabase(crate::sysdb::Error),
 }
 
-impl Error {
-    /// Wraps an application's own error.
+/// The conversion that makes `?` work on an application's own error.
+///
+/// Accepted only because `Error` is generic — see the module documentation.
+impl<E> From<E> for Error<E> {
+    fn from(error: E) -> Self {
+        Error::Application(error)
+    }
+}
+
+impl<E> Error<E> {
+    /// Re-targets this error at another application error type.
     ///
-    /// The conversion `?` cannot do for itself, so it reads `.map_err(Error::application)?` at the
-    /// boundary between an application's errors and ours. One line, and explicit about which side
-    /// of the boundary a failure came from.
-    pub fn application<E>(error: E) -> Self
-    where
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        Error::Application(Box::new(error))
+    /// One match over the engine's variants, kept in a single place so [`lift`](Self::lift) and
+    /// any later conversion share the list rather than each carrying a copy of it.
+    fn map_application<E2>(self, f: impl FnOnce(E) -> E2) -> Error<E2> {
+        match self {
+            Error::Application(error) => Error::Application(f(error)),
+            Error::NotLaunched { operation } => Error::NotLaunched { operation },
+            Error::AlreadyLaunched { operation } => Error::AlreadyLaunched { operation },
+            Error::Config(message) => Error::Config(message),
+            Error::AlreadyRegistered { key } => Error::AlreadyRegistered { key },
+            Error::Serialization {
+                what,
+                message,
+                source,
+            } => Error::Serialization {
+                what,
+                message,
+                source,
+            },
+            Error::Deserialization {
+                what,
+                message,
+                source,
+            } => Error::Deserialization {
+                what,
+                message,
+                source,
+            },
+            Error::NotRegistered { key } => Error::NotRegistered { key },
+            Error::Interrupted { workflow_id } => Error::Interrupted { workflow_id },
+            Error::WorkflowFailed {
+                workflow_id,
+                message,
+            } => Error::WorkflowFailed {
+                workflow_id,
+                message,
+            },
+            Error::WorkflowCancelled { workflow_id } => Error::WorkflowCancelled { workflow_id },
+            Error::MaxRecoveryAttemptsExceeded {
+                workflow_id,
+                recovery_attempts,
+            } => Error::MaxRecoveryAttemptsExceeded {
+                workflow_id,
+                recovery_attempts,
+            },
+            Error::SystemDatabase(error) => Error::SystemDatabase(error),
+        }
+    }
+
+    /// The control signal this failure is, if it is one.
+    ///
+    /// A control error is not the workflow's *outcome*: a cancelled workflow recorded as having
+    /// failed would come back permanently failed, having lost that it was interrupted rather than
+    /// wrong. So the recording layer asks this before writing anything terminal.
+    ///
+    /// A plain match on the outermost variant is enough. That is a consequence of the inversion:
+    /// an application error type has nowhere to hide one of ours, so a control signal is either
+    /// the outermost variant or it is not present.
+    pub(crate) fn control(&self) -> Option<Error<EngineOnly>> {
+        match self {
+            Error::WorkflowCancelled { workflow_id } => Some(Error::WorkflowCancelled {
+                workflow_id: workflow_id.clone(),
+            }),
+            Error::Interrupted { workflow_id } => Some(Error::Interrupted {
+                workflow_id: workflow_id.clone(),
+            }),
+            // *Every* system-database failure, not just a cancellation. A database failure is a
+            // failure of the engine's substrate; it is never a statement about what the workflow
+            // computed, so recording it as that workflow's outcome asserts something false. A
+            // transient blip while the engine checkpoints would otherwise permanently fail a
+            // workflow that had not failed — and the row is the only copy of that fact.
+            //
+            // A deterministic one — `UnexpectedStep`, `Malformed` — retries rather than failing
+            // fast. That is the deliberate trade: `MAX_RECOVERY_ATTEMPTS` bounds it and parks the
+            // workflow, where recording ERROR would have discarded work a fixed deployment could
+            // still have finished.
+            Error::SystemDatabase(error) => Some(Error::SystemDatabase(error.clone())),
+            _ => None,
+        }
+    }
+}
+
+impl Error<EngineOnly> {
+    /// Carries an engine error into a durable function's own error channel.
+    ///
+    /// Total, and that is the point of [`EngineOnly`] being uninhabited: the `Application` arm
+    /// holds a value of a type with no values, so the compiler discharges it rather than this
+    /// needing a panic or a fallback for a case that cannot occur.
+    pub(crate) fn lift<E>(self) -> Error<E> {
+        self.map_application(|impossible| match impossible {})
+    }
+}
+
+/// How an erased workflow failed.
+///
+/// Two cases, and keeping them apart is the point: what the workflow itself returned, which is its
+/// outcome and gets recorded, and a signal from the engine, which is not. A cancelled workflow
+/// recorded as having *failed* would come back permanently failed, having lost that it was
+/// interrupted rather than wrong.
+#[derive(Debug)]
+pub(crate) enum Failure {
+    /// The workflow's own failure — the whole [`Error`] envelope, encoded by the serializer that
+    /// owns the row. This is what the error column records and what a replay decodes.
+    Recorded(String),
+    /// One of ours. Never recorded as the workflow's outcome.
+    Control(Error<EngineOnly>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize, PartialEq)]
+    #[error("the card was declined after {attempts} attempts")]
+    struct CardDeclined {
+        attempts: u32,
+    }
+
+    /// The property the type parameter exists for: an application error is held as itself, so it
+    /// comes back as itself.
+    #[test]
+    fn an_application_error_round_trips_whole() {
+        let error: Error<CardDeclined> = CardDeclined { attempts: 3 }.into();
+        let json = serde_json::to_string(&error).unwrap();
+        let back: Error<CardDeclined> = serde_json::from_str(&json).unwrap();
+
+        let Error::Application(back) = back else {
+            panic!("expected an application error, got {back:?}")
+        };
+        assert_eq!(back, CardDeclined { attempts: 3 }, "the field survives");
+        assert_eq!(error.to_string(), back.to_string());
+    }
+
+    /// `?` on the application's own error needs no impl from the application.
+    #[test]
+    fn the_blanket_conversion_lifts_an_application_error() {
+        fn fallible() -> Result<(), CardDeclined> {
+            Err(CardDeclined { attempts: 1 })?
+        }
+        assert!(matches!(
+            fallible().unwrap_err(),
+            Error::Application(CardDeclined { attempts: 1 })
+        ));
+    }
+
+    #[test]
+    fn an_engine_error_lifts_into_any_channel() {
+        let engine: Error = Error::NotLaunched {
+            operation: "run a workflow".into(),
+        };
+        let lifted: Error<CardDeclined> = engine.lift();
+        assert_eq!(
+            lifted.to_string(),
+            "cannot run a workflow before DBOS is launched"
+        );
+    }
+
+    #[test]
+    fn only_control_errors_report_themselves_as_control() {
+        let cancelled: Error<CardDeclined> = Error::WorkflowCancelled {
+            workflow_id: "wf-1".to_owned(),
+        };
+        assert!(cancelled.control().is_some());
+
+        let failed: Error<CardDeclined> = CardDeclined { attempts: 1 }.into();
+        assert!(
+            failed.control().is_none(),
+            "an application failure is an outcome, not a signal"
+        );
     }
 }

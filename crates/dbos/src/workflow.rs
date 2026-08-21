@@ -9,10 +9,10 @@ use tokio::task::AbortHandle;
 
 use crate::context::Ctx;
 use crate::dbos::Executor;
+use crate::error::{DurableError, Error, Failure, Result};
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission};
-use crate::{Error, Result};
 
 /// How often an adopting caller asks whether the run that won has finished.
 ///
@@ -72,23 +72,41 @@ impl Tasks {
     }
 }
 
-impl<P, R> WorkflowRef<P, R>
+impl<P, R, E> WorkflowRef<P, R, E>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
     R: Serialize + DeserializeOwned + Send + 'static,
+    E: DurableError,
 {
     /// Runs this workflow durably and waits for its result.
     ///
     /// The workflow is recorded before its body starts, so a process that dies mid-run leaves a
     /// `PENDING` row a later executor recovers. Awaiting is a convenience over the durable run
     /// rather than the thing that makes it durable: drop this future and the workflow carries on.
-    pub async fn run(&self, input: P) -> Result<R> {
-        let executor = self.dbos().executor("run a workflow")?;
+    pub async fn run(&self, input: P) -> Result<R, E> {
+        let executor = self
+            .dbos()
+            .executor("run a workflow")
+            .map_err(Error::lift)?;
         let workflow_id = uuid::Uuid::new_v4().to_string();
-        let input = encode(&input, "argument")?;
+        let input = Some(encode(&input, "argument")?);
 
-        let output = run_durably(executor, self.key().clone(), workflow_id, input).await?;
-        decode(output.as_deref(), "result")
+        match run_durably(executor, self.key().clone(), workflow_id.clone(), input).await {
+            Ok(output) => decode(output.as_deref(), "result"),
+            // The workflow's own failure, decoded back into the caller's error type — the same
+            // fidelity the result gets, and the reason the error is a type parameter. Execution
+            // and replay read the same bytes, so they return the same error.
+            //
+            // Degrades to the message when the column does not hold one of ours, which is what a
+            // row written by another SDK looks like: its serializer chose its own shape, and no
+            // amount of type information here will reconstruct a type that was never Rust's.
+            Err(Failure::Recorded(encoded)) => Err(decode::<_, E>(Some(&encoded), "error")
+                .unwrap_or_else(|_| Error::WorkflowFailed {
+                    workflow_id,
+                    message: encoded,
+                })),
+            Err(Failure::Control(control)) => Err(control.lift()),
+        }
     }
 }
 
@@ -100,7 +118,7 @@ async fn run_durably(
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
-) -> Result<Option<String>> {
+) -> std::result::Result<Option<String>, Failure> {
     let initialized = executor
         .sysdb()
         .init_workflow(
@@ -118,7 +136,8 @@ async fn run_durably(
             Some(MAX_RECOVERY_ATTEMPTS),
             Submission::Fresh,
         )
-        .await?;
+        .await
+        .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
 
     // Someone else owns this row — the id was supplied and a previous run has it, or another
     // executor claimed it first. Adopting rather than erroring is what makes a retried request
@@ -146,7 +165,9 @@ async fn run_durably(
     match task.await {
         Ok(outcome) => outcome,
         // Only shutdown aborts a workflow task, and it leaves the row `PENDING` on purpose.
-        Err(join) if join.is_cancelled() => Err(Error::Interrupted { workflow_id }),
+        Err(join) if join.is_cancelled() => {
+            Err(Failure::Control(Error::Interrupted { workflow_id }))
+        }
         Err(join) => std::panic::resume_unwind(join.into_panic()),
     }
 }
@@ -158,12 +179,14 @@ async fn execute(
     workflow_id: &str,
     input: Option<String>,
     ctx: Ctx,
-) -> Result<Option<String>> {
+) -> std::result::Result<Option<String>, Failure> {
     let workflow = executor
         .workflows()
         .get(key)
-        .ok_or_else(|| Error::NotRegistered {
-            key: key.to_string(),
+        .ok_or_else(|| {
+            Failure::Control(Error::NotRegistered {
+                key: key.to_string(),
+            })
         })?
         .clone();
 
@@ -174,15 +197,19 @@ async fn execute(
             executor
                 .sysdb()
                 .record_workflow_outcome(workflow_id, Outcome::Output(output.as_deref()))
-                .await?
+                .await
         }
-        Err(error) => {
+        // A control signal is not the workflow's outcome, so nothing terminal is written and the
+        // row stays where it was for a later executor to pick up.
+        Err(Failure::Control(_)) => return outcome,
+        Err(Failure::Recorded(encoded)) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Error(&error.to_string()))
-                .await?
+                .record_workflow_outcome(workflow_id, Outcome::Error(encoded))
+                .await
         }
-    };
+    }
+    .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
 
     match write {
         OutcomeWrite::Recorded => outcome,
@@ -200,23 +227,28 @@ async fn execute(
 }
 
 /// Reads back the outcome of a workflow this caller does not own.
-async fn adopt(executor: &Executor, workflow_id: &str) -> Result<Option<String>> {
-    match executor
+async fn adopt(
+    executor: &Executor,
+    workflow_id: &str,
+) -> std::result::Result<Option<String>, Failure> {
+    let outcome = executor
         .sysdb()
         .await_workflow_result(workflow_id, OUTCOME_POLL_INTERVAL)
-        .await?
-    {
+        .await
+        .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
+    match outcome {
         AwaitedOutcome::Succeeded { output, .. } => Ok(output),
-        AwaitedOutcome::Failed { error, .. } => Err(Error::WorkflowFailed {
+        // Handed back encoded, for the caller to decode into its own error type — the adopting
+        // caller knows what that is and this function does not.
+        AwaitedOutcome::Failed { error, .. } => Err(Failure::Recorded(error)),
+        AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
             workflow_id: workflow_id.to_owned(),
-            message: error,
-        }),
-        AwaitedOutcome::Cancelled => Err(Error::WorkflowCancelled {
-            workflow_id: workflow_id.to_owned(),
-        }),
-        AwaitedOutcome::Parked { recovery_attempts } => Err(Error::MaxRecoveryAttemptsExceeded {
-            workflow_id: workflow_id.to_owned(),
-            recovery_attempts,
-        }),
+        })),
+        AwaitedOutcome::Parked { recovery_attempts } => {
+            Err(Failure::Control(Error::MaxRecoveryAttemptsExceeded {
+                workflow_id: workflow_id.to_owned(),
+                recovery_attempts,
+            }))
+        }
     }
 }
