@@ -32,6 +32,8 @@ mod error;
 #[cfg(feature = "engine")]
 mod event;
 #[cfg(feature = "engine")]
+mod handle;
+#[cfg(feature = "engine")]
 mod recovery;
 #[cfg(feature = "engine")]
 mod registry;
@@ -56,6 +58,10 @@ pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
 pub use event::set_event;
 #[cfg(feature = "engine")]
+pub use handle::WorkflowHandle;
+#[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use step::step;
+#[cfg(feature = "engine")]
+pub use workflow::StartOptions;

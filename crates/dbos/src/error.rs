@@ -208,6 +208,16 @@ pub enum Error<E = EngineOnly> {
         key: String,
     },
 
+    /// A workflow id resolved to no row at all.
+    ///
+    /// Unreachable through a handle this process minted — starting is what wrote the row — and
+    /// reachable through anything that takes a caller's workflow id on faith.
+    #[error("no workflow exists with id {workflow_id}")]
+    WorkflowNotFound {
+        /// The id that matched nothing.
+        workflow_id: String,
+    },
+
     /// The workflow was cancelled by shutdown while this caller was waiting for it.
     ///
     /// Its row stays `PENDING`, so a later executor recovers it. Nothing was lost; this caller
@@ -309,6 +319,7 @@ impl<E> Error<E> {
                 source,
             },
             Error::NotRegistered { key } => Error::NotRegistered { key },
+            Error::WorkflowNotFound { workflow_id } => Error::WorkflowNotFound { workflow_id },
             Error::Interrupted { workflow_id } => Error::Interrupted { workflow_id },
             Error::WorkflowFailed {
                 workflow_id,

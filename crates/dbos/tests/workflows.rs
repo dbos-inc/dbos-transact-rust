@@ -539,12 +539,13 @@ async fn running_before_launch_is_refused() {
     let dbos = DBOS::new(config("unlaunched-app", &db));
     let double = dbos.register_workflow("double", double).unwrap();
 
+    // `run` is `start` plus awaiting, so the refusal names the start — the half that was refused.
     let err = double.run(1).await.unwrap_err();
     assert!(
         matches!(
             err,
             Error::NotLaunched {
-                operation: Cow::Borrowed("run a workflow")
+                operation: Cow::Borrowed("start a workflow")
             }
         ),
         "{err}"

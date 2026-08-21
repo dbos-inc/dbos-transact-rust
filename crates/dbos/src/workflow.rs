@@ -11,8 +11,9 @@ use tracing::Instrument;
 use crate::context::Ctx;
 use crate::dbos::Executor;
 use crate::error::{DurableError, Error, Failure, Result};
+use crate::handle::WorkflowHandle;
 use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::{decode, encode};
+use crate::serialization::encode;
 use crate::sysdb::types::{AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission};
 
 /// How often an adopting caller asks whether the run that won has finished.
@@ -100,6 +101,22 @@ impl Drop for PanicLog<'_> {
     }
 }
 
+/// What a caller may say about a start, beyond the input.
+///
+/// A struct rather than a builder, matching how `sysdb` spells optional arguments; the common case
+/// pays nothing because [`run`](WorkflowRef::run) and [`start`](WorkflowRef::start) keep their
+/// no-option forms. Deliberately **not** `#[non_exhaustive]` — that would forbid the
+/// `..Default::default()` form this type is built around. Adding a field stays non-breaking for
+/// every caller who wrote it.
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions<'a> {
+    /// The workflow's id, in place of a generated one.
+    ///
+    /// A caller-supplied id is an idempotency key: starting the same id twice joins the workflow
+    /// already running — or already finished — rather than failing the second caller.
+    pub workflow_id: Option<&'a str>,
+}
+
 impl<P, R, E> WorkflowRef<P, R, E>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
@@ -108,85 +125,81 @@ where
 {
     /// Runs this workflow durably and waits for its result.
     ///
-    /// The workflow is recorded before its body starts, so a process that dies mid-run leaves a
-    /// `PENDING` row a later executor recovers. Awaiting is a convenience over the durable run
-    /// rather than the thing that makes it durable: drop this future and the workflow carries on.
+    /// [`start`](Self::start) followed by [`result`](crate::WorkflowHandle::result) — one
+    /// mechanism, packaged as the common case. The workflow is recorded before its body starts,
+    /// so a process that dies mid-run leaves a `PENDING` row a later executor recovers. Awaiting
+    /// is a convenience over the durable run rather than the thing that makes it durable: drop
+    /// this future and the workflow carries on.
     pub async fn run(&self, input: P) -> Result<R, E> {
-        let executor = self
-            .dbos()
-            .executor("run a workflow")
-            .map_err(Error::lift)?;
-        let workflow_id = uuid::Uuid::new_v4().to_string();
+        self.run_with(input, StartOptions::default()).await
+    }
+
+    /// [`run`](Self::run), with something to say about how it starts.
+    pub async fn run_with(&self, input: P, options: StartOptions<'_>) -> Result<R, E> {
+        self.start_with(input, options)
+            .await
+            .map_err(Error::lift)?
+            .result()
+            .await
+    }
+
+    /// Starts this workflow durably and returns a handle to it, without waiting.
+    pub async fn start(&self, input: P) -> Result<WorkflowHandle<R, E>> {
+        self.start_with(input, StartOptions::default()).await
+    }
+
+    /// [`start`](Self::start), with something to say about how.
+    ///
+    /// Returns as soon as the workflow is recorded and spawned. If the id is already owned —
+    /// another process is running it, or a previous run finished it — the handle joins the
+    /// existing run rather than this being an error: the id is an idempotency key, and honouring
+    /// it is the promise (decision 13). The error is the engine's own channel, because a start
+    /// fails only in the engine's terms; the *workflow's* failures come out of the handle.
+    pub async fn start_with(
+        &self,
+        input: P,
+        options: StartOptions<'_>,
+    ) -> Result<WorkflowHandle<R, E>> {
+        let executor = self.dbos().executor("start a workflow")?;
+        let workflow_id = match options.workflow_id {
+            Some(id) => id.to_owned(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
         let input = Some(encode(&input, "argument")?);
 
-        match run_durably(executor, self.key().clone(), workflow_id.clone(), input).await {
-            Ok(output) => decode(output.as_deref(), "result"),
-            // The workflow's own failure, decoded back into the caller's error type — the same
-            // fidelity the result gets, and the reason the error is a type parameter. Execution
-            // and replay read the same bytes, so they return the same error.
-            //
-            // Degrades to the message when the column does not hold one of ours, which is what a
-            // row written by another SDK looks like: its serializer chose its own shape, and no
-            // amount of type information here will reconstruct a type that was never Rust's.
-            Err(Failure::Recorded(encoded)) => Err(decode::<_, E>(Some(&encoded), "error")
-                .unwrap_or_else(|_| Error::WorkflowFailed {
-                    workflow_id,
-                    message: encoded,
-                })),
-            Err(Failure::Control(control)) => Err(control.lift()),
+        let initialized = executor
+            .sysdb()
+            .init_workflow(
+                &NewWorkflow {
+                    name: Some(&self.key().name),
+                    class_name: self.key().class_name.as_deref(),
+                    config_name: self.key().config_name.as_deref(),
+                    input: input.as_deref(),
+                    serialization: Some(executor.serializer().name()),
+                    executor_id: Some(executor.executor_id()),
+                    application_name: Some(executor.app_name()),
+                    application_version: Some(executor.application_version()),
+                    ..NewWorkflow::new(&workflow_id)
+                },
+                Some(MAX_RECOVERY_ATTEMPTS),
+                Submission::Fresh,
+            )
+            .await
+            .map_err(Error::SystemDatabase)?;
+
+        // Someone else owns this row — the id was supplied and a previous run has it, or another
+        // executor claimed it first. Joining rather than erroring is what makes a retried request
+        // idempotent, and it is where Python waits too.
+        if !initialized.should_execute {
+            tracing::debug!(
+                workflow_id,
+                "the workflow is already owned; the handle joins the existing run"
+            );
+            return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
-    }
-}
 
-/// Records the workflow, runs it if this caller owns it, and returns its encoded outcome.
-///
-/// Typeless from here down, which is what lets recovery reuse it: recovery has a row, not types.
-async fn run_durably(
-    executor: Arc<Executor>,
-    key: WorkflowKey,
-    workflow_id: String,
-    input: Option<String>,
-) -> std::result::Result<Option<String>, Failure> {
-    let initialized = executor
-        .sysdb()
-        .init_workflow(
-            &NewWorkflow {
-                name: Some(&key.name),
-                class_name: key.class_name.as_deref(),
-                config_name: key.config_name.as_deref(),
-                input: input.as_deref(),
-                serialization: Some(executor.serializer().name()),
-                executor_id: Some(executor.executor_id()),
-                application_name: Some(executor.app_name()),
-                application_version: Some(executor.application_version()),
-                ..NewWorkflow::new(&workflow_id)
-            },
-            Some(MAX_RECOVERY_ATTEMPTS),
-            Submission::Fresh,
-        )
-        .await
-        .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
-
-    // Someone else owns this row — the id was supplied and a previous run has it, or another
-    // executor claimed it first. Adopting rather than erroring is what makes a retried request
-    // idempotent, and it is where Python waits too.
-    if !initialized.should_execute {
-        tracing::debug!(
-            workflow_id,
-            "the workflow is already owned; adopting its outcome"
-        );
-        return adopt(&executor, &workflow_id).await;
-    }
-
-    let task = spawn_execution(&executor, key, workflow_id.clone(), input);
-
-    match task.await {
-        Ok(outcome) => outcome,
-        // Only shutdown aborts a workflow task, and it leaves the row `PENDING` on purpose.
-        Err(join) if join.is_cancelled() => {
-            Err(Failure::Control(Error::Interrupted { workflow_id }))
-        }
-        Err(join) => std::panic::resume_unwind(join.into_panic()),
+        let task = spawn_execution(&executor, self.key().clone(), workflow_id.clone(), input);
+        Ok(WorkflowHandle::local(executor, workflow_id, task))
     }
 }
 
@@ -299,7 +312,7 @@ async fn execute(
 }
 
 /// Reads back the outcome of a workflow this caller does not own.
-async fn adopt(
+pub(crate) async fn adopt(
     executor: &Executor,
     workflow_id: &str,
 ) -> std::result::Result<Option<String>, Failure> {
