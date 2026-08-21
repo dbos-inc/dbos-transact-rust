@@ -255,6 +255,107 @@ async fn a_database_failure_is_not_the_workflows_outcome() {
     dbos.shutdown().await;
 }
 
+/// Steps inside a real `run` are checkpointed under the workflow that ran them.
+#[tokio::test]
+async fn a_workflow_records_the_steps_it_took() {
+    async fn three_steps(_: ()) -> dbos::Result<u32> {
+        let mut total = 0;
+        for (n, name) in ["one", "two", "three"].into_iter().enumerate() {
+            total += dbos::step(name, || async move { dbos::Result::Ok(n as u32 + 1) }).await?;
+        }
+        Ok(total)
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("steps-app", &db));
+    let workflow = dbos.register_workflow("three_steps", three_steps).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    assert_eq!(workflow.run(()).await.expect("the workflow failed"), 6);
+
+    let reader = reader(&db).await;
+    let rows = reader
+        .list_workflows(&Default::default())
+        .await
+        .expect("read failed");
+    let steps = reader
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .await
+        .expect("read failed");
+    let seen: Vec<(i32, &str, Option<&str>)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str(), s.output.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (0, "one", Some("1")),
+            (1, "two", Some("2")),
+            (2, "three", Some("3"))
+        ]
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A step's error type round-trips the same way, so a replay resumes with the error it recorded.
+#[tokio::test]
+async fn a_step_error_type_round_trips_as_itself() {
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    enum ChargeError {
+        #[error("insufficient funds: short by {short}")]
+        InsufficientFunds { short: u32 },
+    }
+
+    async fn pay(_: ()) -> dbos::Result<u32, ChargeError> {
+        // A step shares the workflow's error channel, so the body needs no type of its own.
+        dbos::step("charge", || async {
+            Err(ChargeError::InsufficientFunds { short: 12 })?
+        })
+        .await
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("step-error-app", &db));
+    let pay = dbos.register_workflow("pay", pay).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let err = pay.run(()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Application(ChargeError::InsufficientFunds { short: 12 })
+        ),
+        "{err:?}"
+    );
+
+    let reader = reader(&db).await;
+    let rows = reader
+        .list_workflows(&Default::default())
+        .await
+        .expect("read failed");
+    let steps = reader
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Error<ChargeError> = serde_json::from_str(
+        steps[0]
+            .error
+            .as_deref()
+            .expect("the step recorded an error"),
+    )
+    .expect("the column holds the application's own error");
+    assert!(
+        matches!(
+            recorded,
+            Error::Application(ChargeError::InsufficientFunds { short: 12 })
+        ),
+        "{recorded:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// The workflow is recorded before its body runs, which is what makes a crash recoverable.
 #[tokio::test]
 async fn the_row_exists_before_the_body_starts() {

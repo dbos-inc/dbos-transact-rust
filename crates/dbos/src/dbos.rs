@@ -23,13 +23,6 @@ pub struct Executor {
     tasks: Tasks,
 }
 
-/// The executor is assembled whole here rather than grown a field at a time, so several of these
-/// are read only by the commits that follow — registration, workflows, steps. Resolving them at
-/// launch is the point: an executor that exists is one whose identity is already settled.
-#[allow(
-    dead_code,
-    reason = "consumed by the workflow commits; resolved at launch regardless"
-)]
 impl Executor {
     /// Resolves this executor's identity, connects, and registers the running version.
     ///

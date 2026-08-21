@@ -20,7 +20,7 @@
 
 use std::borrow::Cow;
 
-/// The error type of a workflow with no failure of its own.
+/// The error type of a workflow or step with no failure of its own.
 ///
 /// Named for what it makes the channel: `Error<EngineOnly>` carries the engine's own errors and
 /// nothing else. Uninhabited, so the compiler knows [`Error::Application`] cannot be constructed,
@@ -90,15 +90,15 @@ pub type Result<T, E = EngineOnly> = std::result::Result<T, Error<E>>;
 /// the phases that raise them; matching callers need a wildcard arm from the start rather than a
 /// breaking change later.
 ///
-/// **Serializable, and that is load-bearing.** A failed workflow records the error it failed with,
-/// and a replay has to give back *that error* rather than a description of it — the same fidelity
-/// a successful result gets. Every payload is data this crate or the application owns, so encoding
-/// costs a derive; the only fields that cannot survive a round trip are the `serde_json::Error`
-/// sources, marked `#[serde(skip)]` and explained where they are declared.
+/// **Serializable, and that is load-bearing.** A failed workflow or step records the error it
+/// failed with, and a replay has to give back *that error* rather than a description of it — the
+/// same fidelity a successful result gets. Every payload is data this crate or the application
+/// owns, so encoding costs a derive; the only fields that cannot survive a round trip are the
+/// `serde_json::Error` sources, marked `#[serde(skip)]` and explained where they are declared.
 #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum Error<E = EngineOnly> {
-    /// A failure reported by the workflow body itself.
+    /// A failure reported by the workflow or step body itself.
     ///
     /// The application's own error, held as itself rather than reduced to a description of one.
     /// The run that fails and the replay that reads the row back both produce this variant with an
@@ -197,9 +197,9 @@ pub enum Error<E = EngineOnly> {
 
     /// A workflow failed, and what it failed with was not one of ours to decode.
     ///
-    /// The degraded read: the row was written by another SDK, whose serializer chose its own
-    /// shape, so the message is what survives. A workflow this SDK recorded comes back as the
-    /// error itself.
+    /// The workflow-level twin of [`StepFailed`](Self::StepFailed), and raised for the same
+    /// reason: the row was written by another SDK, whose serializer chose its own shape. The
+    /// message is what survives. A workflow this SDK recorded comes back as the error itself.
     #[error("the workflow {workflow_id} failed: {message}")]
     WorkflowFailed {
         /// The workflow that failed.
@@ -222,6 +222,18 @@ pub enum Error<E = EngineOnly> {
         workflow_id: String,
         /// How many attempts it took.
         recovery_attempts: i64,
+    },
+
+    /// A recorded step failed, and what it failed with was not one of ours to decode.
+    ///
+    /// Raised on replay against a row another SDK wrote: its serializer chose its own shape, so
+    /// the message is what survives. A step this SDK recorded replays as the error itself.
+    #[error("the step {step} failed: {message}")]
+    StepFailed {
+        /// The step's name.
+        step: String,
+        /// What it reported when it ran.
+        message: String,
     },
 
     /// The system database failed.
@@ -288,6 +300,7 @@ impl<E> Error<E> {
                 workflow_id,
                 recovery_attempts,
             },
+            Error::StepFailed { step, message } => Error::StepFailed { step, message },
             Error::SystemDatabase(error) => Error::SystemDatabase(error),
         }
     }

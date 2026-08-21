@@ -8,8 +8,8 @@
 //! # Status
 //!
 //! Under construction. The system database layer landed first and the execution engine is
-//! being built on it; what is public here is the lifecycle — [`Config`], [`DBOS`], and
-//! [`Executor`] — with registration, workflows and steps arriving next.
+//! being built on it; the lifecycle, registration, workflows and steps are here, with recovery,
+//! events, queues and the scheduler arriving next.
 //!
 //! # Cargo features
 //!
@@ -34,6 +34,8 @@ mod registry;
 #[cfg(feature = "engine")]
 mod serialization;
 #[cfg(feature = "engine")]
+mod step;
+#[cfg(feature = "engine")]
 mod workflow;
 
 // Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
@@ -49,3 +51,5 @@ pub use dbos::{DBOS, Executor};
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
+#[cfg(feature = "engine")]
+pub use step::step;

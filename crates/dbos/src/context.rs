@@ -9,7 +9,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::dbos::Executor;
 
@@ -43,6 +43,13 @@ struct WorkflowState {
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
+    /// Whether a step is on the stack right now.
+    ///
+    /// A step is a leaf: the checkpoint it writes stands for everything the body did, so a step
+    /// inside a step is a plain call. Without this the inner call would allocate a step id of its
+    /// own and every step after it would replay against the wrong slot — a correctness trap rather
+    /// than a policy question, and Go #420 draws the same line.
+    in_step: AtomicBool,
 }
 
 impl WorkflowState {
@@ -53,13 +60,13 @@ impl WorkflowState {
 
 impl Ctx {
     /// A context for a workflow about to run.
-    #[allow(dead_code, reason = "the workflow commit is what starts one")]
     pub(crate) fn new(executor: Arc<Executor>, workflow_id: impl Into<String>) -> Self {
         Self {
             executor,
             workflow: Arc::new(WorkflowState {
                 workflow_id: workflow_id.into(),
                 next_step_id: AtomicI32::new(0),
+                in_step: AtomicBool::new(false),
             }),
         }
     }
@@ -90,21 +97,34 @@ impl Ctx {
     /// counter would let two tasks allocate the same step id — but it is surprising enough that
     /// `the_context_does_not_cross_a_spawn` pins it as behaviour rather than leaving it to be
     /// discovered.
-    #[allow(dead_code, reason = "the workflow commit is what enters one")]
     pub(crate) async fn scope<F: Future>(ctx: Ctx, future: F) -> F::Output {
         CURRENT.scope(ctx, future).await
     }
 
     /// The next step id in this workflow, zero-based and never reused.
-    #[allow(dead_code, reason = "allocated by the step commit")]
     pub(crate) fn next_step_id(&self) -> i32 {
         self.workflow.next_step_id()
     }
 
     /// The executor running this workflow.
-    #[allow(dead_code, reason = "read by the workflow and step commits")]
     pub(crate) fn executor(&self) -> &Arc<Executor> {
         &self.executor
+    }
+
+    /// Whether a step is already running in this workflow.
+    pub(crate) fn in_step(&self) -> bool {
+        self.workflow.in_step.load(Ordering::Relaxed)
+    }
+
+    /// Runs `body` with [`in_step`](Self::in_step) set, restoring it afterwards.
+    ///
+    /// A guard rather than a plain pair of writes, so the flag is cleared even when the body
+    /// returns early or panics — a step that failed must not leave the workflow believing it is
+    /// still inside one.
+    pub(crate) async fn in_step_scope<F: Future>(&self, body: F) -> F::Output {
+        let _guard = InStep(Arc::clone(&self.workflow));
+        self.workflow.in_step.store(true, Ordering::Relaxed);
+        body.await
     }
 }
 
@@ -120,6 +140,15 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
+/// Clears the in-step flag however the step ends.
+struct InStep(Arc<WorkflowState>);
+
+impl Drop for InStep {
+    fn drop(&mut self) {
+        self.0.in_step.store(false, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +160,7 @@ mod tests {
         WorkflowState {
             workflow_id: "wf-1".to_owned(),
             next_step_id: AtomicI32::new(0),
+            in_step: AtomicBool::new(false),
         }
     }
 
