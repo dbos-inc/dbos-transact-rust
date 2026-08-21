@@ -118,7 +118,23 @@ impl std::fmt::Display for WorkflowKey {
 /// that could still change underneath it is the thing the snapshot rules out.
 #[derive(Default)]
 pub(crate) struct Registry {
-    workflows: RwLock<HashMap<WorkflowKey, ErasedWorkflow>>,
+    state: RwLock<State>,
+}
+
+/// The map and whether it may still change, under one lock.
+///
+/// **One lock, deliberately.** "Are we launched?" and "what is registered?" have to be answered by
+/// the same critical section or the answer to the first can go stale before the second is used: a
+/// registration that read "not launched" and then inserted after [`snapshot`](Registry::snapshot)
+/// had already run would be accepted, handed back a [`WorkflowRef`], and left out of the map the
+/// executor actually runs — which surfaces much later as a workflow that starts, fails to resolve,
+/// and sits `PENDING` until it parks. Reading the executor slot in [`DBOS`] cannot close that
+/// window, because the slot is not what registration races.
+#[derive(Default)]
+struct State {
+    workflows: HashMap<WorkflowKey, ErasedWorkflow>,
+    /// Set when a snapshot is taken, cleared when the executor it was taken for goes away.
+    frozen: bool,
 }
 
 /// A registry frozen at launch.
@@ -129,27 +145,51 @@ impl Registry {
     ///
     /// Uniqueness is on the whole triple, which is Java's model and the strictest of the three:
     /// a name that resolves to two functions is a workflow that recovers as the wrong one.
+    ///
+    /// Refuses outright once frozen. The operation is named here rather than passed in because
+    /// registration is the only thing that inserts.
     fn insert(&self, key: WorkflowKey, workflow: ErasedWorkflow) -> Result<()> {
-        let mut workflows = self
-            .workflows
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if workflows.contains_key(&key) {
+        let mut state = self.write();
+        if state.frozen {
+            return Err(Error::AlreadyLaunched {
+                operation: "register_workflow".into(),
+            });
+        }
+        if state.workflows.contains_key(&key) {
             return Err(Error::AlreadyRegistered {
                 key: key.to_string(),
             });
         }
-        workflows.insert(key, workflow);
+        state.workflows.insert(key, workflow);
         Ok(())
     }
 
-    /// Freezes the registry for an executor to hold.
+    /// Freezes the registry and hands back what it holds, for an executor to keep.
+    ///
+    /// Taking the copy and closing the door are one act, which is the whole point of the shared
+    /// lock: between them there is no moment for a registration to slip through.
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let workflows = self
-            .workflows
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::new(workflows.clone())
+        let mut state = self.write();
+        state.frozen = true;
+        Arc::new(state.workflows.clone())
+    }
+
+    /// Reopens the registry, for an instance with no executor holding a snapshot.
+    ///
+    /// Called when a launch fails and when one is shut down — both under the lifecycle lock, so
+    /// this cannot race the [`snapshot`](Self::snapshot) it undoes. Without the first of those a
+    /// failed launch would leave the instance permanently unregistrable, which is a worse failure
+    /// than the one that caused it.
+    pub(crate) fn thaw(&self) {
+        self.write().frozen = false;
+    }
+
+    /// A poisoned lock here cannot mean torn state: every section under it is infallible, so a
+    /// panic elsewhere leaves the map and the flag whole.
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, State> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -254,12 +294,6 @@ impl DBOS {
         R: Serialize + DeserializeOwned + Send + 'static,
         E: DurableError,
     {
-        if self.is_launched() {
-            return Err(Error::AlreadyLaunched {
-                operation: "register_workflow".into(),
-            });
-        }
-
         let workflow = Arc::new(workflow);
         let erased: ErasedWorkflow = Arc::new(move |input: Option<String>| {
             let workflow = Arc::clone(&workflow);
@@ -379,6 +413,38 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// The window the shared lock closes: once a snapshot exists, nothing may be added to the map
+    /// it was taken from, because the executor holding it would never see the addition.
+    #[test]
+    fn a_snapshot_closes_the_registry_and_releasing_it_reopens() {
+        let dbos = dbos();
+        dbos.register_workflow("before", takes_nothing).unwrap();
+
+        let snapshot = dbos.registry().snapshot();
+        assert_eq!(snapshot.len(), 1);
+
+        let err = dbos.register_workflow("after", takes_nothing).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::AlreadyLaunched {
+                    operation: Cow::Borrowed("register_workflow")
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            dbos.registry().snapshot().len(),
+            1,
+            "the refused registration is not in the map either"
+        );
+
+        dbos.registry().thaw();
+        dbos.register_workflow("after", takes_nothing)
+            .expect("releasing the snapshot reopens registration");
+        assert_eq!(dbos.registry().snapshot().len(), 2);
     }
 
     #[test]

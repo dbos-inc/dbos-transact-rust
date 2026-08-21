@@ -303,6 +303,31 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
     holder.shutdown().await;
 }
 
+/// A failed launch leaves registration open, rather than freezing the registry for good.
+///
+/// `launch` freezes the registry as it takes its snapshot, which is what stops a registration
+/// landing where the executor will not see it. Nothing holds that snapshot when the launch then
+/// fails, so the door has to open again — otherwise one bad configuration would make the instance
+/// permanently unregistrable, a worse failure than the one that caused it.
+#[tokio::test]
+async fn a_failed_launch_leaves_registration_open() {
+    async fn noop(_: ()) -> dbos::Result<()> {
+        Ok(())
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(Config {
+        database_url: String::new(),
+        ..config("reopen-app", &db)
+    });
+    dbos.register_workflow("before", noop)
+        .expect("registration before launch is fine");
+    assert!(dbos.launch().await.is_err());
+
+    dbos.register_workflow("after", noop)
+        .expect("a failed launch must not leave the registry frozen");
+}
+
 /// A failed launch leaves the instance launchable, rather than poisoned.
 #[tokio::test]
 async fn a_failed_launch_can_be_followed_by_a_good_one() {

@@ -285,8 +285,18 @@ impl DBOS {
             return Ok(());
         }
 
-        let (executor, pending) =
-            Executor::start(&self.0.config, self.0.registry.snapshot()).await?;
+        // Freezing the registry and reading it are one act, so a registration cannot land between
+        // the two and be handed back a `WorkflowRef` for a workflow this executor will not have.
+        let workflows = self.0.registry.snapshot();
+        let (executor, pending) = match Executor::start(&self.0.config, workflows).await {
+            Ok(started) => started,
+            Err(error) => {
+                // Nothing was installed, so nothing holds the snapshot and registration is open
+                // again. Leaving it frozen would make one failed launch permanent.
+                self.0.registry.thaw();
+                return Err(error);
+            }
+        };
         let executor = Arc::new(executor);
         *self.write_executor() = Some(Arc::clone(&executor));
         // Installed first, recovered second: the recovery task runs against the same executor the
@@ -306,6 +316,9 @@ impl DBOS {
             return;
         };
         executor.shutdown().await;
+        // The instance outlives the executor, so registration opens again: relaunching takes a
+        // fresh snapshot, and what that executor holds is its own.
+        self.0.registry.thaw();
         tracing::info!(app_name = self.0.config.app_name, "DBOS shut down");
     }
 
