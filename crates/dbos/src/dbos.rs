@@ -544,6 +544,26 @@ mod tests {
         assert_ne!(one, other);
     }
 
+    /// The registry lives on the instance, so anything a registered closure captures is held by
+    /// the instance holding it. A closure capturing a `DBOS` is therefore a cycle and the
+    /// instance — with its executor and its connection pool — is never freed, which is why
+    /// nothing the engine puts in there may capture one. This pins that: `register_workflow` must
+    /// not quietly store a handle to `self` alongside the caller's closure, and the workflow-facing
+    /// calls must stay reachable without one.
+    #[test]
+    fn registration_does_not_make_the_instance_hold_itself() {
+        let dbos = DBOS::new(config());
+        let alive = Arc::downgrade(&dbos.0);
+        dbos.register_workflow("noop", |()| async { Ok::<_, Error>(()) })
+            .unwrap();
+        drop(dbos);
+        assert_eq!(
+            alive.strong_count(),
+            0,
+            "the instance outlived every handle to it: something in the registry holds it"
+        );
+    }
+
     #[test]
     fn debug_does_not_print_the_database_url() {
         let dbos = DBOS::new(Config::new("test-app", "postgres://user:hunter2@host/db"));

@@ -56,7 +56,7 @@ pub use dbos::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
-pub use event::set_event;
+pub use event::{get_event, set_event};
 #[cfg(feature = "engine")]
 pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]

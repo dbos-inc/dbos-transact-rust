@@ -215,6 +215,17 @@ impl DBOS {
     ///
     /// A workflow takes exactly one argument and never a context. One that needs nothing takes
     /// `_: ()`; one that needs several takes a struct or a tuple.
+    ///
+    /// **Do not capture the [`DBOS`] instance in `workflow`.** The registry lives on the instance,
+    /// so the closure is stored inside the very `Arc` a captured handle points at — a cycle, and
+    /// the instance, its executor and its connection pool are then never freed. Nothing a workflow
+    /// body needs requires one: [`step`](crate::step), [`set_event`](crate::set_event) and
+    /// [`get_event`](crate::get_event) all read the ambient context.
+    ///
+    /// A [`WorkflowRef`] holds an instance too, so capturing one — to start a child workflow —
+    /// has the same effect. That is a known gap rather than a rule anyone can follow around:
+    /// until starting a child reads the ambient context the way a step does, such an application
+    /// leaks one instance, which for a process that launches once is a bounded cost.
     pub fn register_workflow<P, R, E, F, Fut>(
         &self,
         name: &str,

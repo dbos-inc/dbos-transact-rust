@@ -149,6 +149,25 @@ pub enum Error<E = EngineOnly> {
         operation: Cow<'static, str>,
     },
 
+    /// An instance method was called from inside a workflow another instance is running.
+    ///
+    /// An instance method takes its executor from the handle it was called on, and its step ids
+    /// from the ambient context. Normally those are the same instance and the distinction never
+    /// surfaces. When they are not, there is no safe way to pick: the ids come from this
+    /// workflow's counter and the checkpoint would be written through the other instance's system
+    /// database, so it would land where the workflow that allocated them cannot see it — the
+    /// replay skip would never match, the read would run again on recovery, and this workflow's
+    /// counter would have moved on regardless.
+    ///
+    /// The free functions cannot raise this: they take both halves from the one context.
+    #[error(
+        "{operation} was called on a different DBOS instance than the one running this workflow"
+    )]
+    WrongInstance {
+        /// The operation that was called on the wrong instance.
+        operation: Cow<'static, str>,
+    },
+
     /// The configuration could not be used.
     #[error("invalid configuration: {0}")]
     Config(String),
@@ -298,6 +317,7 @@ impl<E> Error<E> {
             Error::AlreadyLaunched { operation } => Error::AlreadyLaunched { operation },
             Error::NotInWorkflow { operation } => Error::NotInWorkflow { operation },
             Error::InsideStep { operation } => Error::InsideStep { operation },
+            Error::WrongInstance { operation } => Error::WrongInstance { operation },
             Error::Config(message) => Error::Config(message),
             Error::AlreadyRegistered { key } => Error::AlreadyRegistered { key },
             Error::Serialization {
@@ -382,15 +402,18 @@ impl Error<EngineOnly> {
     /// needing a panic or a fallback for a case that cannot occur.
     ///
     /// Public because a workflow with its own error type sometimes holds an engine-channel
-    /// result — [`DBOS::get_event`](crate::DBOS::get_event) inside a workflow is the first — and
+    /// result — [`WorkflowRef::start`](crate::WorkflowRef::start) is one, and
+    /// [`DBOS::get_event`](crate::DBOS::get_event) called from inside a workflow another — and
     /// `?` cannot lift `Error<EngineOnly>` into `Error<E>` on its own: the blanket conversion
     /// would wrap the whole error as the application's. This is the conversion written out:
     ///
     /// ```ignore
-    /// let step: Option<u32> = dbos.get_event(&id, "progress", timeout)
-    ///     .await
-    ///     .map_err(Error::lift)?;
+    /// let child = checkout.start(order).await.map_err(Error::lift)?;
     /// ```
+    ///
+    /// The workflow-facing calls do not need it: [`step`](crate::step),
+    /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) are all generic over
+    /// the caller's channel, so `?` works on them directly.
     pub fn lift<E>(self) -> Error<E> {
         self.map_application(|impossible| match impossible {})
     }

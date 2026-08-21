@@ -1,17 +1,24 @@
 //! Workflow events: a key/value a workflow publishes and anyone may read.
 //!
-//! Two surfaces, split by where the caller stands. [`set_event`] is a free function like
-//! [`step`](crate::step), callable only from inside a workflow — publishing is something a
-//! workflow does, and the checkpoint that makes it replay-safe needs the ambient step-id
-//! sequence. [`DBOS::get_event`] is an instance method, because the natural reader is outside any
-//! workflow — an HTTP handler polling for progress — though a workflow that reads is checkpointed
-//! correctly too.
+//! Three surfaces, split by where the caller stands. [`set_event`] and [`get_event`] are free
+//! functions like [`step`](crate::step), callable only from inside a workflow: they take the
+//! executor and the step-id sequence from the ambient context, so a workflow body needs no
+//! handle to anything. [`DBOS::get_event`] is the instance method for the other reader — an HTTP
+//! handler polling for progress, outside any workflow, where there is nothing ambient to take an
+//! executor from.
 //!
-//! Both are thin: `sysdb` owns the transactional write, the replay skip, the blocking read, and
-//! the cross-SDK step names (`DBOS.setEvent`, `DBOS.getEvent`). What the engine adds is the step
-//! ids from the ambient context, the payload encoding, and the guards on where each call may
+//! **The free reader is not just symmetry.** The registry lives on the instance, so a registered
+//! closure that captures a [`DBOS`] is stored inside the very `Arc` it holds a strong reference
+//! to: a cycle, which keeps the instance, its executor and its connection pool alive for the life
+//! of the process. Making a workflow capture a handle in order to read an event would have made
+//! that the documented way to write one.
+//!
+//! All three are thin: `sysdb` owns the transactional write, the replay skip, the blocking read,
+//! and the cross-SDK step names (`DBOS.setEvent`, `DBOS.getEvent`). What the engine adds is the
+//! step ids from the ambient context, the payload encoding, and the guards on where each call may
 //! stand.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -19,6 +26,7 @@ use serde::de::DeserializeOwned;
 
 use crate::DBOS;
 use crate::context::Ctx;
+use crate::dbos::Executor;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::GetEventCaller;
@@ -70,19 +78,62 @@ where
     Ok(())
 }
 
+/// Reads a key a workflow published, waiting up to `timeout` for it to appear.
+///
+/// The reader for a workflow body, and the counterpart of [`set_event`]: it takes the executor
+/// from the ambient context, so a workflow that reads an event needs no [`DBOS`] handle and its
+/// registered closure captures nothing. That is what keeps the registry free of strong references
+/// back to the instance holding it — see the module documentation.
+///
+/// `Ok(None)` means the key was not there when the deadline passed — absence is a value, not an
+/// error, and `Duration::ZERO` makes this a poll: look once, do not wait.
+///
+/// The read is checkpointed as two steps (the read and its deadline), so a replay returns what the
+/// first run saw, including a timeout's `None`, instead of waiting again. The error is the
+/// *workflow's* channel, like [`step`](crate::step)'s and [`set_event`]'s, so `?` needs no
+/// conversion. From inside a *step* it reads plainly with no checkpoint, the step's own checkpoint
+/// standing for everything its body did — the same leaf rule as a nested step.
+///
+/// Outside a workflow there is no context to read, so this is [`Error::NotInWorkflow`]. That is
+/// where [`DBOS::get_event`] is the call.
+pub async fn get_event<T, E>(
+    workflow_id: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<Option<T>, E>
+where
+    T: DeserializeOwned,
+    E: DurableError,
+{
+    let Some(ctx) = Ctx::current() else {
+        return Err(Error::NotInWorkflow {
+            operation: "get_event".into(),
+        });
+    };
+    let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
+    read(ctx.executor(), workflow_id, key, timeout, caller).await
+}
+
 impl DBOS {
     /// Reads a key a workflow published, waiting up to `timeout` for it to appear.
+    ///
+    /// The reader for code outside a workflow — the natural caller, an HTTP handler asking how far
+    /// a workflow has got — where there is nothing ambient to take an executor from. **Inside a
+    /// workflow, reach for the free [`get_event`] instead**: it needs no handle, so the closure a
+    /// workflow is registered as captures nothing, and a captured [`DBOS`] is a cycle with the
+    /// registry that holds the closure.
     ///
     /// `Ok(None)` means the key was not there when the deadline passed — absence is a value, not
     /// an error, and `Duration::ZERO` makes this a poll: look once, do not wait.
     ///
-    /// From outside a workflow — the natural caller, an HTTP handler asking how far a workflow
-    /// has got — this is a passthrough. From inside one, the read is checkpointed as two steps
-    /// (the read and its deadline), so a replay returns what the first run saw, including a
-    /// timeout's `None`, instead of waiting again; a workflow with its own error type carries the
-    /// result over with [`Error::lift`]. From inside a *step*, it reads plainly with no
-    /// checkpoint, the step's own checkpoint standing for everything its body did — the same leaf
-    /// rule as a nested step.
+    /// Called from inside a workflow anyway, it behaves as the free function does — the read is
+    /// checkpointed as two steps, and a read from inside a step is plain — except that it reports
+    /// in the engine's own error channel, so a workflow with its own error type carries the result
+    /// over with [`Error::lift`].
+    ///
+    /// With one exception it cannot share: this takes its executor from `self` and its step ids
+    /// from the ambient context, so a handle to some *other* instance would split the two. That is
+    /// [`Error::WrongInstance`] rather than a silent write into the wrong database.
     pub async fn get_event<T: DeserializeOwned>(
         &self,
         workflow_id: &str,
@@ -90,24 +141,55 @@ impl DBOS {
         timeout: Duration,
     ) -> Result<Option<T>> {
         let executor = self.executor("get_event")?;
-
         let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
-        // Field order is the contract: the read's id first, the deadline's second, matching what
-        // every SDK records and what a replay looks up.
-        let caller = ctx.as_ref().map(|ctx| GetEventCaller {
-            workflow_id: ctx.workflow_id(),
-            step_id: ctx.next_step_id(),
-            timeout_step_id: ctx.next_step_id(),
-        });
-
-        match executor
-            .sysdb()
-            .get_event(workflow_id, key, timeout, caller)
-            .await
-            .map_err(Error::SystemDatabase)?
+        // Exactly where the two halves would be combined: a caller is about to be built from the
+        // ambient context and handed to `self`'s executor. Inside a step `ctx` is already `None`,
+        // so nothing is checkpointed and there is nothing to disagree about — that read is plain
+        // whichever instance serves it.
+        if ctx
+            .as_ref()
+            .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
         {
-            None => Ok(None),
-            Some(found) => decode(Some(&found.value), "event value").map(Some),
+            return Err(Error::WrongInstance {
+                operation: "get_event".into(),
+            });
         }
+        let caller = ctx.as_ref().map(caller_for);
+        read(&executor, workflow_id, key, timeout, caller).await
+    }
+}
+
+/// Where the caller stands, for `sysdb` to checkpoint the read against.
+///
+/// Field order is the contract: the read's id first, the deadline's second, matching what every
+/// SDK records and what a replay looks up.
+fn caller_for(ctx: &Ctx) -> GetEventCaller<'_> {
+    GetEventCaller {
+        workflow_id: ctx.workflow_id(),
+        step_id: ctx.next_step_id(),
+        timeout_step_id: ctx.next_step_id(),
+    }
+}
+
+/// The read itself, shared by both surfaces.
+///
+/// `sysdb` owns the blocking wait and the replay skip, so what is left here is decoding what it
+/// found. Generic over the caller's error channel for the same reason [`decode`] is: the failure
+/// is an engine variant either way, and `E` only says which channel it travels in.
+async fn read<T: DeserializeOwned, E>(
+    executor: &Executor,
+    workflow_id: &str,
+    key: &str,
+    timeout: Duration,
+    caller: Option<GetEventCaller<'_>>,
+) -> Result<Option<T>, E> {
+    match executor
+        .sysdb()
+        .get_event(workflow_id, key, timeout, caller)
+        .await
+        .map_err(Error::SystemDatabase)?
+    {
+        None => Ok(None),
+        Some(found) => decode(Some(&found.value), "event value").map(Some),
     }
 }

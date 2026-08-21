@@ -157,12 +157,35 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
             Ok::<_, dbos::Error>(())
         })
         .unwrap();
-    // Reads through the instance from inside a workflow — with its own error type, which is what
-    // `Error::lift` is public for.
-    let in_workflow = {
+    // Reads through the ambient context, with its own error type — and captures nothing, which is
+    // the point: a closure holding a `DBOS` would be stored inside the very instance it holds.
+    let in_workflow = dbos
+        .register_workflow("in_workflow", |publisher_id: String| async move {
+            let answer: Option<u32> =
+                dbos::get_event(&publisher_id, "answer", Duration::ZERO).await?;
+            Ok::<_, Error<ReaderError>>(answer)
+        })
+        .unwrap();
+    // Reads from inside a step: a leaf, so no ids are allocated for the read.
+    let in_step = dbos
+        .register_workflow("in_step", |publisher_id: String| async move {
+            let answer = dbos::step("read", move || async move {
+                let answer: Option<u32> =
+                    dbos::get_event(&publisher_id, "answer", Duration::ZERO).await?;
+                Ok(answer)
+            })
+            .await?;
+            Ok::<_, dbos::Error>(answer)
+        })
+        .unwrap();
+    // The instance method called from inside a workflow is still supported, and still
+    // checkpointed the same way; it needs `Error::lift` because it reports in the engine's own
+    // channel, and it needs a captured handle, which is why the free function is the one to reach
+    // for.
+    let via_instance = {
         let dbos = dbos.clone();
         dbos.clone()
-            .register_workflow("in_workflow", move |publisher_id: String| {
+            .register_workflow("via_instance", move |publisher_id: String| {
                 let dbos = dbos.clone();
                 async move {
                     let answer: Option<u32> = dbos
@@ -170,25 +193,6 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
                         .await
                         .map_err(Error::lift)?;
                     Ok::<_, Error<ReaderError>>(answer)
-                }
-            })
-            .unwrap()
-    };
-    // Reads from inside a step: a leaf, so no ids are allocated for the read.
-    let in_step = {
-        let dbos = dbos.clone();
-        dbos.clone()
-            .register_workflow("in_step", move |publisher_id: String| {
-                let dbos = dbos.clone();
-                async move {
-                    let answer = dbos::step("read", move || async move {
-                        let answer: Option<u32> = dbos
-                            .get_event(&publisher_id, "answer", Duration::ZERO)
-                            .await?;
-                        Ok(answer)
-                    })
-                    .await?;
-                    Ok::<_, dbos::Error>(answer)
                 }
             })
             .unwrap()
@@ -216,6 +220,13 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
     );
     assert_eq!(
         in_step
+            .run(publisher_id.clone())
+            .await
+            .expect("the reader failed"),
+        Some(42)
+    );
+    assert_eq!(
+        via_instance
             .run(publisher_id.clone())
             .await
             .expect("the reader failed"),
@@ -257,8 +268,76 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
         [(0, "read".to_owned())],
         "the step is the only checkpoint; the read inside it left no ids"
     );
+    assert_eq!(
+        steps_of("via_instance").await,
+        [
+            (0, "DBOS.getEvent".to_owned()),
+            (1, "DBOS.sleep".to_owned())
+        ],
+        "the instance method checkpoints a workflow's read the same way"
+    );
 
     dbos.shutdown().await;
+}
+
+/// The instance method refuses a handle that is not the instance running the workflow.
+///
+/// It takes its executor from the handle and its step ids from the ambient context. Normally those
+/// are the same instance; when they are not, the checkpoint would be written through one database
+/// against ids issued by another, so it would land where the workflow that allocated them cannot
+/// see it. Refused rather than silently split.
+#[tokio::test]
+async fn reading_through_another_instance_from_inside_a_workflow_is_refused() {
+    let db = test_database().await;
+    let other = DBOS::new(config("other-app", &db));
+    let owner = DBOS::new(config("owner-app", &db));
+
+    let reads_through_other = {
+        let other = other.clone();
+        owner
+            .register_workflow("reads_through_other", move |()| {
+                let other = other.clone();
+                async move {
+                    let answer: Option<u32> =
+                        other.get_event("wf-1", "answer", Duration::ZERO).await?;
+                    Ok::<_, dbos::Error>(answer)
+                }
+            })
+            .unwrap()
+    };
+    // From inside a *step* the read is plain — nothing is checkpointed, so the two halves are
+    // never combined and there is nothing to refuse.
+    let in_step = {
+        let other = other.clone();
+        owner
+            .register_workflow("reads_in_step", move |()| {
+                let other = other.clone();
+                async move {
+                    let answer = dbos::step("read", move || async move {
+                        let answer: Option<u32> =
+                            other.get_event("wf-1", "answer", Duration::ZERO).await?;
+                        Ok(answer)
+                    })
+                    .await?;
+                    Ok::<_, dbos::Error>(answer)
+                }
+            })
+            .unwrap()
+    };
+    other.launch().await.expect("launch failed");
+    owner.launch().await.expect("launch failed");
+
+    let err = reads_through_other.run(()).await.unwrap_err();
+    assert!(matches!(err, Error::WrongInstance { .. }), "{err}");
+
+    assert_eq!(
+        in_step.run(()).await.expect("a plain read is allowed"),
+        None,
+        "no such workflow, so no such event — but not a refusal"
+    );
+
+    owner.shutdown().await;
+    other.shutdown().await;
 }
 
 /// `set_event` needs a workflow around it, and refuses a step — there is no plain version of a
@@ -269,6 +348,14 @@ async fn set_event_refuses_to_run_outside_a_workflow_or_inside_a_step() {
     assert!(
         matches!(outside.unwrap_err(), Error::NotInWorkflow { .. }),
         "no workflow, no step sequence to checkpoint against"
+    );
+
+    // The free reader is the same: it takes its executor from the context, and outside a workflow
+    // there is none. That is where `DBOS::get_event` is the call.
+    let outside: dbos::Result<Option<u32>> = dbos::get_event("wf-1", "key", Duration::ZERO).await;
+    assert!(
+        matches!(outside.unwrap_err(), Error::NotInWorkflow { .. }),
+        "no workflow, no executor to read through"
     );
 
     let db = test_database().await;
