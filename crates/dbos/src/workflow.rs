@@ -185,8 +185,11 @@ where
 ///
 /// A drop guard because the unwind is the only place the case can be observed: an async block's
 /// live locals are dropped as the panic unwinds out of `poll`, with `std::thread::panicking()`
-/// true, and the workflow span still entered. Completing normally defuses it with `mem::forget`;
-/// an abort also drops it, but outside a panic, so shutdown stays quiet.
+/// true, and the workflow span still entered.
+///
+/// `panicking()` is the whole of the discrimination, which is why there is nothing to defuse. The
+/// guard is dropped on every path — completion, panic, and the abort that shutdown issues — and
+/// only the middle one is inside an unwind.
 struct PanicLog<'a> {
     workflow_id: &'a str,
 }
@@ -338,12 +341,10 @@ pub(crate) fn spawn_execution(
                 // *running* rather than workflows it has managed to spawn.
                 let _slot = slot;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
-                let panic_log = PanicLog {
+                let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                let outcome = execute(&executor, &key, &workflow_id, input, ctx).await;
-                std::mem::forget(panic_log);
-                outcome
+                execute(&executor, &key, &workflow_id, input, ctx).await
             }
         }
         .instrument(span),
@@ -575,11 +576,10 @@ mod tests {
         let _guard = tracing::subscriber::set_default(Capture(Arc::clone(&events)));
 
         tokio::spawn(async {
-            let panic_log = PanicLog {
+            let _panic_log = PanicLog {
                 workflow_id: "wf-fine",
             };
             tokio::task::yield_now().await;
-            std::mem::forget(panic_log);
         })
         .await
         .expect("the task must complete");

@@ -8,8 +8,8 @@
 //! # Status
 //!
 //! Under construction. The system database layer landed first and the execution engine is
-//! being built on it; the lifecycle, registration, workflows and steps are here, with recovery,
-//! events, queues and the scheduler arriving next.
+//! being built on it; the lifecycle, registration, workflows, steps, events and recovery are
+//! here, with queues, the scheduler and the client arriving next.
 //!
 //! # Cargo features
 //!

@@ -125,11 +125,20 @@ impl Ctx {
         self.workflow.in_step.load(Ordering::Relaxed)
     }
 
-    /// Runs `body` with [`in_step`](Self::in_step) set, restoring it afterwards.
+    /// Runs `body` with [`in_step`](Self::in_step) set, clearing it afterwards.
     ///
     /// A guard rather than a plain pair of writes, so the flag is cleared even when the body
     /// returns early or panics — a step that failed must not leave the workflow believing it is
     /// still inside one.
+    ///
+    /// **Clearing, not restoring**, and along this call stack the two are the same thing: [`step`]
+    /// only reaches here when no step was on the stack, so the flag was false on the way in. They
+    /// come apart only between *concurrent* steps, where one finishing clears the flag for another
+    /// still running — which is the gap [`in_step`](Self::in_step) describes, and is not something
+    /// restoring here would fix, because the flag is shared rather than per-stack in the first
+    /// place.
+    ///
+    /// [`step`]: crate::step
     pub(crate) async fn in_step_scope<F: Future>(&self, body: F) -> F::Output {
         let _guard = InStep(Arc::clone(&self.workflow));
         self.workflow.in_step.store(true, Ordering::Relaxed);

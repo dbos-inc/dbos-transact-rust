@@ -5,6 +5,7 @@
 //! workflow from a database row, where the argument is a string and the function is a name.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -155,13 +156,15 @@ impl Registry {
                 operation: "register_workflow".into(),
             });
         }
-        if state.workflows.contains_key(&key) {
-            return Err(Error::AlreadyRegistered {
-                key: key.to_string(),
-            });
+        match state.workflows.entry(key) {
+            Entry::Occupied(taken) => Err(Error::AlreadyRegistered {
+                key: taken.key().to_string(),
+            }),
+            Entry::Vacant(slot) => {
+                slot.insert(workflow);
+                Ok(())
+            }
         }
-        state.workflows.insert(key, workflow);
-        Ok(())
     }
 
     /// Freezes the registry and hands back what it holds, for an executor to keep.

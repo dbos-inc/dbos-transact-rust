@@ -9,11 +9,11 @@ authors.workspace = true
 
 [features]
 default = ["engine"]
-# Gates the durable execution engine: registry, contexts, workflows, steps, queues,
-# scheduler, messaging, and the client. With it off, what remains is the system database
-# and Conductor layers — the surface a future FFI host would consume. Nothing is behind
-# it yet beyond the lifecycle, but it exists so `cargo check --no-default-features` is a
-# standing CI gate rather than something switched on once the boundary is already blurred.
+# Gates the durable execution engine: the lifecycle, registry, contexts, workflows, steps,
+# events and recovery so far, with queues, the scheduler, messaging and the client to come.
+# With it off, what remains is the system database and Conductor layers — the surface a future
+# FFI host would consume. `cargo check --no-default-features` is a standing CI gate, so the
+# boundary is checked continuously rather than rediscovered once it has already blurred.
 #
 # `tokio/rt` is enabled from here rather than from the dependency itself, which is what keeps
 # the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`, `spawn` — is the
