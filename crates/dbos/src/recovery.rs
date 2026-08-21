@@ -18,7 +18,7 @@ use crate::sysdb;
 use crate::sysdb::types::{NewWorkflow, Submission};
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
-/// Runs the recovery list in the background, bounded by the executor's recovery concurrency.
+/// Runs the recovery list in the background, one submission at a time.
 ///
 /// The driver is registered with the executor's task set, so shutdown aborts a recovery still in
 /// flight the same way it aborts the workflows themselves — everything it managed to submit stays
@@ -27,9 +27,32 @@ use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 /// Per-workflow failures are logged, never propagated: recovery is a sweep, and one bad row must
 /// not strand every workflow behind it.
 ///
-/// The sweep waits for a slot before each row rather than racing through the list, so an executor
-/// that died holding a large backlog resumes it at a rate its connection pool can serve instead of
-/// spawning the whole backlog at once. See [`Config::recovery_concurrency`](crate::Config).
+/// # This should become a re-enqueue
+///
+/// Executing here, in the process that found the row, is **Java's shape and only Java's**.
+/// Python, TypeScript and Go re-enqueue every recovered workflow instead — non-queued ones onto
+/// the internal queue — through one `reenqueue_for_recovery` / `ReenqueueForRecovery` call, and
+/// let the queue dispatch them. `sdk-parity.md` divergence 12 records the split and calls Java the
+/// odd one out.
+///
+/// Three things that buys, and none of them is available to this module today:
+///
+/// - **Idempotence.** The queue's atomic `ENQUEUED` → `PENDING` dequeue admits exactly one runner,
+///   so a duplicate recovery request costs nothing. Here, two executors that both believe they own
+///   a row are held apart by `init_workflow`'s guard instead, which is a narrower promise.
+/// - **The fleet shares the work.** A re-enqueued workflow can be picked up by any executor on the
+///   version; one recovered here runs here, so an executor that comes back to a large backlog
+///   works through all of it alone.
+/// - **Concurrency stops being this module's problem.** The sweep below spawns every pending
+///   workflow at once, unbounded, and a process that died holding a large backlog will contend for
+///   its own connection pool on the next launch. A queue owns that question — and note the other
+///   three do not answer it either: their internal queue carries no default limit, so the bound is
+///   a knob on the queue rather than something recovery decides.
+///
+/// This is not the shape to keep, but it is the only one available until the engine has queues:
+/// `sysdb` has `INTERNAL_QUEUE`, `start_queued_workflows` and `clear_queue_assignment`, and no
+/// `reenqueue_for_recovery` at all. When queues land, this module should lose its executor and its
+/// `spawn_execution` call and become that one write.
 pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
     if pending.is_empty() {
         tracing::debug!("no workflows to recover");
@@ -45,11 +68,7 @@ pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
             let executor = Arc::clone(&executor);
             async move {
                 for workflow_id in pending {
-                    // Taken before the row is claimed, not after: an executor that re-stamped
-                    // more workflows than it is prepared to run would have counted a recovery
-                    // attempt against each of them for nothing.
-                    let slot = executor.recovery_slot().await;
-                    if let Err(error) = recover_one(&executor, &workflow_id, slot).await {
+                    if let Err(error) = recover_one(&executor, &workflow_id).await {
                         tracing::warn!(
                             workflow_id,
                             error = %error,
@@ -68,11 +87,7 @@ pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
 /// The registry is consulted *before* the row is claimed: an `init_workflow` that succeeded and
 /// then found no registration would have burned a recovery attempt and re-stamped the executor on
 /// a workflow this process cannot run.
-async fn recover_one(
-    executor: &Arc<Executor>,
-    workflow_id: &str,
-    slot: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> crate::Result<()> {
+async fn recover_one(executor: &Arc<Executor>, workflow_id: &str) -> crate::Result<()> {
     let row = executor
         .sysdb()
         .get_workflow(workflow_id)
@@ -145,9 +160,7 @@ async fn recover_one(
         "recovering the workflow"
     );
     // Detached: recovered workflows run concurrently, and the driver moves on. The handle is not
-    // awaited by anyone, which is exactly the case the execution layer's own logging covers. The
-    // slot goes with it and is released when the workflow ends, which is what bounds the crowd —
-    // every path above this one returns without spawning and drops it here instead.
-    spawn_execution(executor, key, workflow_id.to_owned(), row.input, slot);
+    // awaited by anyone, which is exactly the case the execution layer's own logging covers.
+    spawn_execution(executor, key, workflow_id.to_owned(), row.input);
     Ok(())
 }

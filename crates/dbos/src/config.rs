@@ -143,22 +143,6 @@ pub struct Config {
     /// `None` is half the pool and at least one; `Some(0)` switches the cap off.
     pub polling_concurrency: Option<u32>,
 
-    /// How many recovered workflows may be claimed and run at once.
-    ///
-    /// `None` is [`max_connections`](Self::max_connections) and at least one; `Some(0)` switches
-    /// the cap off.
-    ///
-    /// Recovery is the one submitter with no natural backpressure: a process that died holding ten
-    /// thousand `PENDING` workflows would otherwise claim and spawn all ten thousand on the next
-    /// launch, every one of them contending for a pool of ten. The pool size is the default
-    /// because a recovered workflow that is making progress is one that will want a connection to
-    /// checkpoint with, and queueing beyond that only moves the wait into the pool — where it is
-    /// shared with the control plane rather than held here.
-    ///
-    /// The permit is taken before the row is claimed, not after, so an executor never re-stamps
-    /// more workflows than it is prepared to run.
-    pub recovery_concurrency: Option<usize>,
-
     /// How often a caller waiting on a workflow it does not own asks whether it has finished.
     ///
     /// `None` is one second, the interval every implementation polls at. Workflow completion has
@@ -192,7 +176,6 @@ impl Config {
             use_listen_notify: true,
             migrate: true,
             polling_concurrency: None,
-            recovery_concurrency: None,
             outcome_poll_interval: None,
             notification_coalesce: None,
         }
@@ -241,18 +224,6 @@ impl Config {
             ));
         }
         Ok(())
-    }
-
-    /// How many recovered workflows may run at once, resolved.
-    ///
-    /// The shape `polling_concurrency` already uses: `Some(0)` is uncapped, and the default is
-    /// derived from the pool rather than fixed.
-    pub(crate) fn recovery_limit(&self) -> usize {
-        match self.recovery_concurrency {
-            Some(0) => tokio::sync::Semaphore::MAX_PERMITS,
-            Some(n) => n,
-            None => usize::max(self.max_connections as usize, 1),
-        }
     }
 
     /// How often an adopting caller looks, resolved.
@@ -323,22 +294,6 @@ mod tests {
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
         let err = Config::new("app", "").validate().unwrap_err();
         assert!(err.to_string().contains(DATABASE_URL_ENV), "{err}");
-    }
-
-    #[test]
-    fn the_recovery_cap_defaults_to_the_pool_and_zero_switches_it_off() {
-        let config = |recovery_concurrency| Config {
-            max_connections: 8,
-            recovery_concurrency,
-            ..Config::new("app", "postgres://x")
-        };
-        assert_eq!(config(None).recovery_limit(), 8, "the pool by default");
-        assert_eq!(config(Some(3)).recovery_limit(), 3);
-        assert_eq!(
-            config(Some(0)).recovery_limit(),
-            tokio::sync::Semaphore::MAX_PERMITS,
-            "zero is uncapped, as it is for `polling_concurrency`"
-        );
     }
 
     #[test]

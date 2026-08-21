@@ -5,7 +5,7 @@
 //! demonstration the workstream exists for, minus only the process boundary.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
@@ -144,130 +144,6 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
     assert_eq!(two.load(Ordering::SeqCst), 1, "step two ran exactly once");
 
     dbos.shutdown().await;
-}
-
-/// Recovery runs no more workflows at once than it is allowed to.
-///
-/// Five workflows are abandoned at a gate, then a second instance recovers them with the cap set
-/// to two. Without a bound the sweep claims and spawns all five at once, every one of them
-/// contending for a pool of ten — the case a process that died holding a large backlog turns into.
-#[tokio::test]
-async fn recovery_runs_no_more_workflows_at_once_than_its_cap() {
-    const ABANDONED: usize = 5;
-    const CAP: usize = 2;
-
-    /// Counts a workflow for as long as its body exists.
-    ///
-    /// A guard rather than a pair of writes, because a cancelled workflow's body never reaches the
-    /// line after its await — the future is simply dropped. That is also what makes `running`
-    /// reaching zero a real statement about shutdown: it goes to zero only once every body has
-    /// actually been dropped, which is what `abort_all` waits for.
-    struct Live(Arc<AtomicUsize>);
-
-    impl Live {
-        fn enter(running: &Arc<AtomicUsize>, peak: &AtomicUsize) -> Self {
-            let live = running.fetch_add(1, Ordering::SeqCst) + 1;
-            peak.fetch_max(live, Ordering::SeqCst);
-            Self(Arc::clone(running))
-        }
-    }
-
-    impl Drop for Live {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    let running = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    // Starts empty, so every workflow blocks in its body until the test hands out permits.
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-
-    let db = test_database().await;
-    let blocks = |dbos: &DBOS| {
-        let (running, peak, gate) = (Arc::clone(&running), Arc::clone(&peak), Arc::clone(&gate));
-        dbos.register_workflow("blocks", move |()| {
-            let (running, peak, gate) =
-                (Arc::clone(&running), Arc::clone(&peak), Arc::clone(&gate));
-            async move {
-                let _live = Live::enter(&running, &peak);
-                gate.acquire()
-                    .await
-                    .expect("the gate is never closed")
-                    .forget();
-                Ok::<_, dbos::Error>(())
-            }
-        })
-        .unwrap()
-    };
-
-    // Abandon five at the gate.
-    let first = DBOS::new(config("cap-app", &db));
-    let workflow = blocks(&first);
-    first.launch().await.expect("launch failed");
-    for _ in 0..ABANDONED {
-        drop(workflow.start(()).await.expect("start failed"));
-    }
-    await_at_least(&running, ABANDONED).await;
-    first.shutdown().await;
-    assert_eq!(
-        running.load(Ordering::SeqCst),
-        0,
-        "shutdown waits for the bodies it cancelled"
-    );
-    peak.store(0, Ordering::SeqCst);
-
-    // Recover them with the cap on.
-    let second = DBOS::new(Config {
-        recovery_concurrency: Some(CAP),
-        ..config("cap-app", &db)
-    });
-    let workflow = blocks(&second);
-    second.launch().await.expect("relaunch failed");
-
-    await_at_least(&running, CAP).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        peak.load(Ordering::SeqCst),
-        CAP,
-        "the sweep ran more than its cap allows"
-    );
-
-    // Let them drain: as each finishes it frees a slot for the next, and the cap still holds.
-    gate.add_permits(ABANDONED);
-    let reader = reader(&db).await;
-    for row in reader
-        .list_workflows(&Default::default())
-        .await
-        .expect("read failed")
-    {
-        await_status(&reader, &row.workflow_id, WorkflowStatus::Success).await;
-    }
-    assert_eq!(peak.load(Ordering::SeqCst), CAP, "the cap held throughout");
-
-    second.shutdown().await;
-    drop(workflow);
-}
-
-/// Polls until `counter` reaches at least `want`, which is how a test waits on work it cannot
-/// join.
-///
-/// At least, not exactly: an unbounded sweep blows straight past the cap, and this should hand
-/// back so the assertion on the peak can say so, rather than waiting out the deadline for a count
-/// that will never be hit on the nose.
-async fn await_at_least(counter: &AtomicUsize, want: usize) {
-    tokio::time::timeout(DEADLINE, async {
-        while counter.load(Ordering::SeqCst) < want {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "wanted {want} running, saw {}",
-            counter.load(Ordering::SeqCst)
-        )
-    });
 }
 
 /// A row whose registration is gone is skipped, and does not strand the workflows behind it.

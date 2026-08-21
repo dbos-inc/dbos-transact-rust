@@ -303,15 +303,7 @@ where
             return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
 
-        // No slot: a caller starting a workflow is its own backpressure, and blocking
-        // `start` behind recovery's cap would make an unrelated backlog look like a hang.
-        let task = spawn_execution(
-            &executor,
-            self.key().clone(),
-            workflow_id.clone(),
-            input,
-            None,
-        );
+        let task = spawn_execution(&executor, self.key().clone(), workflow_id.clone(), input);
         Ok(WorkflowHandle::local(executor, workflow_id, task))
     }
 }
@@ -329,7 +321,6 @@ pub(crate) fn spawn_execution(
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
-    slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
@@ -337,9 +328,6 @@ pub(crate) fn spawn_execution(
         {
             let executor = Arc::clone(executor);
             async move {
-                // Held for the whole run, so a bounded submitter's cap counts workflows that are
-                // *running* rather than workflows it has managed to spawn.
-                let _slot = slot;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
