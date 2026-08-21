@@ -1,7 +1,5 @@
 //! The system database surface, against real databases.
 
-use std::borrow::Cow;
-
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
@@ -4855,10 +4853,7 @@ async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
         .await;
     assert!(matches!(
         result,
-        Err(Error::InvalidInput {
-            field: Cow::Borrowed("forked_id"),
-            ..
-        })
+        Err(Error::InvalidInput { ref field, .. }) if field == "forked_id"
     ));
 }
 
@@ -4920,10 +4915,7 @@ async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
     assert!(
         matches!(
             result,
-            Err(Error::InvalidInput {
-                field: Cow::Borrowed("timeout"),
-                ..
-            })
+            Err(Error::InvalidInput { ref field, .. }) if field == "timeout"
         ),
         "expected the timeout to be refused, got {result:?}"
     );
@@ -7101,10 +7093,7 @@ async fn a_rename_refuses_a_bad_target_name() {
         assert!(
             matches!(
                 result,
-                Err(Error::InvalidInput {
-                    field: Cow::Borrowed("new_name"),
-                    ..
-                })
+                Err(Error::InvalidInput { ref field, .. }) if field == "new_name"
             ),
             "{bad:?} should be rejected, got {result:?}",
         );
@@ -7120,10 +7109,7 @@ async fn a_rename_refuses_a_bad_target_name() {
         .await;
     assert!(matches!(
         result,
-        Err(Error::InvalidInput {
-            field: Cow::Borrowed("new_name"),
-            ..
-        })
+        Err(Error::InvalidInput { ref field, .. }) if field == "new_name"
     ));
 }
 
@@ -7760,10 +7746,7 @@ async fn an_empty_partition_key_is_refused() {
     assert!(
         matches!(
             result,
-            Err(Error::InvalidInput {
-                field: Cow::Borrowed("partition_key"),
-                ..
-            })
+            Err(Error::InvalidInput { ref field, .. }) if field == "partition_key"
         ),
         "got {result:?}",
     );
@@ -7936,10 +7919,7 @@ async fn a_sweep_refuses_an_unsuitable_queue() {
         assert!(
             matches!(
                 result,
-                Err(Error::InvalidInput {
-                    field: Cow::Borrowed("queue"),
-                    ..
-                })
+                Err(Error::InvalidInput { ref field, .. }) if field == "queue"
             ),
             "{} should be refused, got {result:?}",
             queue.name,
@@ -8395,10 +8375,7 @@ async fn creating_a_schedule_twice_is_refused() {
 
     assert!(matches!(
         sys.create_schedule(&schedule, None).await,
-        Err(Error::AlreadyRegistered {
-            kind: Cow::Borrowed("Schedule"),
-            ref name
-        }) if name == "nightly"
+        Err(Error::AlreadyRegistered { ref kind, ref name, .. }) if kind == "Schedule" && name == "nightly"
     ));
 
     // The id has its own unique index, and a collision on it is reported as itself rather than
@@ -8413,10 +8390,7 @@ async fn creating_a_schedule_twice_is_refused() {
             None
         )
         .await,
-        Err(Error::AlreadyRegistered {
-            kind: Cow::Borrowed("Schedule id"),
-            ..
-        })
+        Err(Error::AlreadyRegistered { ref kind, .. }) if kind == "Schedule id"
     ));
 
     // The upsert is the way to re-register, and it leaves one row behind.
@@ -8494,13 +8468,8 @@ async fn a_creation_losing_to_a_peer_reports_what_it_can_see() {
     assert!(
         matches!(
             outcome,
-            Err(Error::AlreadyRegistered {
-                kind: Cow::Borrowed("Schedule"),
-                ..
-            }) | Err(Error::RegisteredByAnother {
-                kind: Cow::Borrowed("Schedule"),
-                ..
-            })
+            Err(Error::AlreadyRegistered { ref kind, .. } | Error::RegisteredByAnother { ref kind, .. })
+                if kind == "Schedule"
         ),
         "a peer that commits mid-call is a collision either way, got {outcome:?}"
     );
@@ -8520,11 +8489,7 @@ async fn a_creation_losing_to_a_peer_reports_what_it_can_see() {
                 None
             )
             .await,
-        Err(Error::RegisteredByAnother {
-            kind: Cow::Borrowed("Schedule"),
-            ref holder,
-            ..
-        }) if holder == "beta"
+        Err(Error::RegisteredByAnother { ref kind, ref holder, .. }) if kind == "Schedule" && holder == "beta"
     ));
 }
 
@@ -8567,11 +8532,7 @@ async fn a_schedule_name_held_by_another_application_is_refused() {
     ] {
         assert!(matches!(
             result,
-            Err(Error::RegisteredByAnother {
-                kind: Cow::Borrowed("Schedule"),
-                ref holder,
-                ..
-            }) if holder == "alpha"
+            Err(Error::RegisteredByAnother { ref kind, ref holder, .. }) if kind == "Schedule" && holder == "alpha"
         ));
     }
 
@@ -8901,7 +8862,7 @@ async fn updating_a_schedule_touches_only_its_definition() {
 #[tokio::test]
 async fn addressing_a_missing_schedule_is_refused() {
     let (sys, _db) = sysdb().await;
-    let missing = |result: Result<(), Error>| matches!(result, Err(Error::NotRegistered { kind: Cow::Borrowed("Schedule"), ref name }) if name == "ghost");
+    let missing = |result: Result<(), Error>| matches!(result, Err(Error::NotRegistered { ref kind, ref name, .. }) if kind == "Schedule" && name == "ghost");
 
     assert!(missing(
         sys.update_schedule(
@@ -9429,10 +9390,7 @@ async fn a_bounce_refuses_an_empty_class_or_instance() {
     };
     assert!(matches!(
         sys.debounce_delayed_workflow(&request, None).await,
-        Err(Error::InvalidInput {
-            field: Cow::Borrowed("class_name"),
-            ..
-        })
+        Err(Error::InvalidInput { ref field, .. }) if field == "class_name"
     ));
 }
 
