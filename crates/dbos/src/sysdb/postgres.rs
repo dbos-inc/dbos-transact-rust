@@ -1257,7 +1257,7 @@ async fn resolve_owning_application(
         None => Ok(Some(holder)),
         Some(claimant) if claimant == holder => Ok(Some(holder)),
         Some(claimant) => Err(Error::RegisteredByAnother {
-            kind,
+            kind: kind.into(),
             name: name.to_owned(),
             holder,
             claimant: Some(claimant.to_owned()),
@@ -1468,13 +1468,13 @@ impl PostgresSystemDatabase {
     ) -> Result<(), Error> {
         if workflow_id.is_empty() {
             return Err(Error::InvalidInput {
-                field: "workflow_id",
+                field: "workflow_id".into(),
                 detail: "must not be empty".to_owned(),
             });
         }
         if step_id < 0 {
             return Err(Error::InvalidInput {
-                field: "step_id",
+                field: "step_id".into(),
                 detail: "must not be negative".to_owned(),
             });
         }
@@ -3076,7 +3076,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             Some(Ok(ms)) => Some(ms),
             Some(Err(_)) => {
                 return Err(Error::InvalidInput {
-                    field: "timeout",
+                    field: "timeout".into(),
                     detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
                 });
             }
@@ -3355,13 +3355,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             if let Some(key) = message.idempotency_key {
                 if key.is_empty() {
                     return Err(Error::InvalidInput {
-                        field: "idempotency_key",
+                        field: "idempotency_key".into(),
                         detail: "must be absent rather than empty".to_owned(),
                     });
                 }
                 if !keys.insert(key) {
                     return Err(Error::InvalidInput {
-                        field: "idempotency_key",
+                        field: "idempotency_key".into(),
                         detail: format!("{key} is used by more than one message"),
                     });
                 }
@@ -4737,7 +4737,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // rather than one to take here.
         if partition_key == Some("") {
             return Err(Error::InvalidInput {
-                field: "partition_key",
+                field: "partition_key".into(),
                 detail: "must be absent rather than empty".to_owned(),
             });
         }
@@ -5020,7 +5020,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // deliberately does without.
         if !queue.partition_queue || queue.concurrency != Some(1) || queue.rate_limit.is_some() {
             return Err(Error::InvalidInput {
-                field: "queue",
+                field: "queue".into(),
                 detail: format!(
                     "a partitioned sweep needs a partitioned queue with concurrency 1 and no \
                      rate limit, but {:?} is partitioned={} concurrency={:?} rate_limited={}",
@@ -5560,7 +5560,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                                 _ => "Schedule",
                             };
                             Err(Error::AlreadyRegistered {
-                                kind,
+                                kind: kind.into(),
                                 name: match kind {
                                     "Schedule id" => schedule_id.to_owned(),
                                     _ => schedule.schedule_name.to_owned(),
@@ -5804,7 +5804,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     };
                     if !changed {
                         return Err(Error::NotRegistered {
-                            kind: "Schedule",
+                            kind: "Schedule".into(),
                             name: name.to_owned(),
                         });
                     }
@@ -5846,7 +5846,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .rows_affected();
                 if updated == 0 {
                     return Err(Error::NotRegistered {
-                        kind: "Schedule",
+                        kind: "Schedule".into(),
                         name: name.to_owned(),
                     });
                 }
@@ -5925,7 +5925,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<ApplicationRowCounts, Error> {
         if !is_valid_application_name(new_name) {
             return Err(Error::InvalidInput {
-                field: "new_name",
+                field: "new_name".into(),
                 detail: "must be 3 to 30 characters of lowercase letters, digits, dashes and \
                          underscores"
                     .to_owned(),
@@ -5933,13 +5933,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         if source.application() == Some(new_name) {
             return Err(Error::InvalidInput {
-                field: "new_name",
+                field: "new_name".into(),
                 detail: format!("{new_name:?} already holds that name"),
             });
         }
         if let RenameBatching::Batched(0) = batching {
             return Err(Error::InvalidInput {
-                field: "batching",
+                field: "batching".into(),
                 detail: "a batch must hold at least one workflow".to_owned(),
             });
         }
@@ -6030,7 +6030,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // parent that replays and finds an empty child id has no workflow to attach to.
         if child_workflow_id.is_empty() {
             return Err(Error::InvalidInput {
-                field: "child_workflow_id",
+                field: "child_workflow_id".into(),
                 detail: "must not be empty".to_owned(),
             });
         }

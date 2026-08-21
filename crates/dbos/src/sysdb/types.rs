@@ -494,7 +494,7 @@ impl<'a> NewWorkflow<'a> {
     pub fn validate(&self) -> Result<(), Error> {
         if self.workflow_id.is_empty() {
             return Err(Error::InvalidInput {
-                field: "workflow_id",
+                field: "workflow_id".into(),
                 detail: "must not be empty".to_owned(),
             });
         }
@@ -512,7 +512,7 @@ impl<'a> NewWorkflow<'a> {
         ] {
             if *value == Some("") {
                 return Err(Error::InvalidInput {
-                    field,
+                    field: field.into(),
                     detail: "must be absent rather than empty".to_owned(),
                 });
             }
@@ -523,7 +523,7 @@ impl<'a> NewWorkflow<'a> {
         for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
             if value == Some(Duration::ZERO) {
                 return Err(Error::InvalidInput {
-                    field,
+                    field: field.into(),
                     detail: "must be a positive, non-zero duration".to_owned(),
                 });
             }
@@ -1127,7 +1127,7 @@ pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error>
     };
     serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json).map_err(|e| {
         Error::InvalidInput {
-            field: "attributes",
+            field: "attributes".into(),
             detail: format!("must be a JSON object: {e}"),
         }
     })?;
@@ -1468,7 +1468,7 @@ impl DebounceRequest<'_> {
         ] {
             if value.is_empty() {
                 return Err(Error::InvalidInput {
-                    field,
+                    field: field.into(),
                     detail: "must not be empty".to_owned(),
                 });
             }
@@ -1482,7 +1482,7 @@ impl DebounceRequest<'_> {
         ] {
             if value == Some("") {
                 return Err(Error::InvalidInput {
-                    field,
+                    field: field.into(),
                     detail: "must be absent rather than empty".to_owned(),
                 });
             }
@@ -1808,20 +1808,20 @@ impl<'a> Fork<'a> {
     pub(crate) fn validate(&self) -> Result<(), Error> {
         if self.source_id.is_empty() {
             return Err(Error::InvalidInput {
-                field: "source_id",
+                field: "source_id".into(),
                 detail: "must not be empty".to_owned(),
             });
         }
         // `None` asks for one to be generated; `Some("")` is an id that cannot be looked up.
         if self.forked_id == Some("") {
             return Err(Error::InvalidInput {
-                field: "forked_id",
+                field: "forked_id".into(),
                 detail: "must be absent rather than empty".to_owned(),
             });
         }
         if self.start_step < 0 {
             return Err(Error::InvalidInput {
-                field: "start_step",
+                field: "start_step".into(),
                 detail: "must not be negative".to_owned(),
             });
         }
@@ -1900,7 +1900,7 @@ impl ForkOptions<'_> {
         ] {
             if *value == Some("") {
                 return Err(Error::InvalidInput {
-                    field,
+                    field: field.into(),
                     detail: "must be absent rather than empty".to_owned(),
                 });
             }
@@ -1908,7 +1908,7 @@ impl ForkOptions<'_> {
         // As on `NewWorkflow`: a zero timeout would expire the fork before it ran.
         if self.timeout == Some(Duration::ZERO) {
             return Err(Error::InvalidInput {
-                field: "timeout",
+                field: "timeout".into(),
                 detail: "must be absent rather than zero".to_owned(),
             });
         }
@@ -1921,7 +1921,7 @@ impl ForkOptions<'_> {
         for (index, (original, _)) in self.replacement_children.iter().enumerate() {
             if original.is_empty() {
                 return Err(Error::InvalidInput {
-                    field: "replacement_children",
+                    field: "replacement_children".into(),
                     detail: "a replaced child id must not be empty".to_owned(),
                 });
             }
@@ -1930,7 +1930,7 @@ impl ForkOptions<'_> {
                 .any(|(earlier, _)| earlier == original)
             {
                 return Err(Error::InvalidInput {
-                    field: "replacement_children",
+                    field: "replacement_children".into(),
                     detail: format!("{original} is replaced more than once"),
                 });
             }

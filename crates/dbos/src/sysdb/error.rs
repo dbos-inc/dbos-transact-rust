@@ -4,11 +4,19 @@
 //! on it, both input types validate into it, and a second backend will construct it without
 //! seeing any of the trait's method signatures.
 
+use std::borrow::Cow;
+
 /// What went wrong talking to the system database.
 ///
 /// Deliberately not `sqlx::Error`: that type names a specific driver, and this trait has to be
 /// implementable by a backend that does not use one.
-#[derive(Debug)]
+///
+/// Serializable, because the engine records a failed step's error and has to give back *that
+/// error* on replay rather than a description of it. Nothing here names a driver type, so this
+/// costs a derive: the same rule that keeps a second backend possible is what makes it encodable.
+/// The `&'static str` discriminants are [`Cow`] for the same reason — a borrowed
+/// string has nothing to borrow from when it comes back out of a column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Error {
     /// The database rejected or could not serve the request.
     Backend(BackendError),
@@ -49,7 +57,7 @@ pub enum Error {
     /// This one never reaches the database at all.
     InvalidInput {
         /// The field at fault.
-        field: &'static str,
+        field: Cow<'static, str>,
         /// What was wrong with it.
         detail: String,
     },
@@ -135,14 +143,14 @@ pub enum Error {
     /// register under a different name.
     AlreadyRegistered {
         /// What kind of thing it is, capitalised for a message: `"Schedule"`.
-        kind: &'static str,
+        kind: Cow<'static, str>,
         /// The name already taken.
         name: String,
     },
     /// A write addressed a name with no row behind it.
     NotRegistered {
         /// What kind of thing it is, capitalised for a message: `"Schedule"`.
-        kind: &'static str,
+        kind: Cow<'static, str>,
         /// The name that matched nothing.
         name: String,
     },
@@ -157,7 +165,7 @@ pub enum Error {
     /// was renamed without its rows being moved — which is what `rename_application` is for.
     RegisteredByAnother {
         /// What kind of thing it is, capitalised for a message: `"Queue"`, `"Application version"`.
-        kind: &'static str,
+        kind: Cow<'static, str>,
         /// The contested name.
         name: String,
         /// The application that holds it.
@@ -268,7 +276,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A failure the database or its driver reported.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendError {
     /// What the driver said.
     pub message: String,
@@ -291,7 +299,7 @@ impl std::fmt::Display for BackendError {
 ///
 /// Classification is the backend's job, not the retry loop's: SQLSTATEs are Postgres's, and a
 /// SQLite backend would decide on message text instead. Python and Go both split it this way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackendErrorKind {
     /// The connection failed, or the server cannot serve requests right now.
     ///
