@@ -71,12 +71,18 @@ impl Executor {
         .await
         .map_err(Error::SystemDatabase)?;
 
-        register_version(&sysdb, &application_version).await?;
-
-        let pending = sysdb
-            .get_pending_workflows(&executor_id, &application_version)
-            .await
-            .map_err(Error::SystemDatabase)?;
+        // Everything that can fail after the connect goes through one call, so there is one error
+        // path and it closes the handle. `connect` has already spawned the listener and the
+        // notifier, and the listener's only way out of its loop is the pool closing — so a handle
+        // dropped without `close` leaves both tasks and every connection alive for the life of the
+        // process, with each retried `launch` adding another set.
+        let pending = match prepare(&sysdb, &executor_id, &application_version).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                sysdb.close().await;
+                return Err(error);
+            }
+        };
 
         tracing::info!(
             app_name = config.app_name,
@@ -353,6 +359,24 @@ impl std::fmt::Debug for DBOS {
             .field("launched", &self.is_launched())
             .finish_non_exhaustive()
     }
+}
+
+/// Registers this version and lists what a previous run of this executor abandoned.
+///
+/// One function rather than two calls inline so that [`Executor::start`] has a single error path
+/// to close the system database on; see the comment at its call site. Everything between the
+/// connect and the executor being built belongs here for that reason, and anything added later
+/// belongs here too.
+async fn prepare(
+    sysdb: &impl SystemDatabase,
+    executor_id: &str,
+    application_version: &str,
+) -> Result<Vec<String>> {
+    register_version(sysdb, application_version).await?;
+    sysdb
+        .get_pending_workflows(executor_id, application_version)
+        .await
+        .map_err(Error::SystemDatabase)
 }
 
 /// Registers this version and warns if it is not the one a rolling deploy would prefer.

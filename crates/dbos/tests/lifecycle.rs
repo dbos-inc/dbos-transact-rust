@@ -6,6 +6,7 @@
 use dbos::sysdb::{SystemDatabase, postgres::PostgresSystemDatabase, postgres::Settings};
 use dbos::{Config, DBOS, Error};
 use std::borrow::Cow;
+use std::time::Duration;
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -243,6 +244,63 @@ async fn an_invalid_application_name_is_refused_at_launch() {
     let err = dbos.launch().await.unwrap_err();
     assert!(matches!(err, Error::Config(_)), "{err}");
     assert!(!dbos.is_launched());
+}
+
+/// A launch that fails *after* connecting closes the system database on its way out.
+///
+/// `connect` spawns a listener and a notifier, and the listener's only way out of its loop is the
+/// pool closing — so a handle dropped without `close()` leaves both tasks and every connection
+/// alive for the life of the process, with each retried launch adding another set. Nothing about
+/// that is visible from the instance, which is why this counts connections on the server.
+///
+/// The failure used here is a version name a peer application already holds: reachable only once
+/// the pool is up, which is exactly the window that used to leak.
+#[tokio::test]
+async fn a_launch_that_fails_after_connecting_closes_the_database() {
+    /// Tags the connections this test opens, so they can be told from every other test's on the
+    /// shared server.
+    const TAG: &str = "dbos-launch-leak-probe";
+    const CONTESTED: &str = "contested-v1";
+
+    let db = test_database().await;
+    let holder = DBOS::new(Config {
+        application_version: Some(CONTESTED.to_owned()),
+        ..config("version-holder", &db)
+    });
+    holder.launch().await.expect("launch failed");
+
+    // A second application claiming the same version name: `register_version` is refused, which
+    // happens after the connect and before the executor exists.
+    for attempt in 1..=3 {
+        let loser = DBOS::new(Config {
+            application_version: Some(CONTESTED.to_owned()),
+            database_url: format!("{}?application_name={TAG}", db.url()),
+            ..config("version-loser", &db)
+        });
+        let err = loser.launch().await.unwrap_err();
+        assert!(
+            matches!(err, Error::SystemDatabase(_)),
+            "attempt {attempt}: {err}"
+        );
+        assert!(!loser.is_launched());
+    }
+
+    // The server drops a session shortly after its client goes away, so this is a bounded wait
+    // rather than a single look. A leak never converges; a close does, immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let open = db.connection_count(TAG).await;
+        if open == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{open} connections from three failed launches are still open"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    holder.shutdown().await;
 }
 
 /// A failed launch leaves the instance launchable, rather than poisoned.
