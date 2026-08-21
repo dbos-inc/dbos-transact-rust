@@ -30,6 +30,8 @@ mod dbos;
 #[cfg(feature = "engine")]
 mod error;
 #[cfg(feature = "engine")]
+mod event;
+#[cfg(feature = "engine")]
 mod recovery;
 #[cfg(feature = "engine")]
 mod registry;
@@ -51,6 +53,8 @@ pub use context::Ctx;
 pub use dbos::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
+#[cfg(feature = "engine")]
+pub use event::set_event;
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]

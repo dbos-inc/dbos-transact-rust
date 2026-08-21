@@ -126,6 +126,29 @@ pub enum Error<E = EngineOnly> {
         operation: Cow<'static, str>,
     },
 
+    /// An operation that only makes sense inside a workflow was called outside one.
+    ///
+    /// [`set_event`](crate::set_event) is the first: it checkpoints its write under a step id,
+    /// and outside a workflow there is no step-id sequence to record against — unlike a step,
+    /// whose body can simply run plainly.
+    #[error("{operation} must be called from within a workflow")]
+    NotInWorkflow {
+        /// The operation that needed a workflow around it.
+        operation: Cow<'static, str>,
+    },
+
+    /// An operation that allocates a step id was called from inside a step.
+    ///
+    /// A step is a leaf: its checkpoint stands for everything the body did, so an id-allocating
+    /// operation inside one would shift every later step onto the wrong replay slot. The same
+    /// rule that makes a nested step a plain call makes this an error — there is no plain
+    /// version of a durable write to degrade to.
+    #[error("{operation} cannot be called from within a step")]
+    InsideStep {
+        /// The operation that was called inside a step.
+        operation: Cow<'static, str>,
+    },
+
     /// The configuration could not be used.
     #[error("invalid configuration: {0}")]
     Config(String),
@@ -263,6 +286,8 @@ impl<E> Error<E> {
             Error::Application(error) => Error::Application(f(error)),
             Error::NotLaunched { operation } => Error::NotLaunched { operation },
             Error::AlreadyLaunched { operation } => Error::AlreadyLaunched { operation },
+            Error::NotInWorkflow { operation } => Error::NotInWorkflow { operation },
+            Error::InsideStep { operation } => Error::InsideStep { operation },
             Error::Config(message) => Error::Config(message),
             Error::AlreadyRegistered { key } => Error::AlreadyRegistered { key },
             Error::Serialization {
@@ -344,7 +369,18 @@ impl Error<EngineOnly> {
     /// Total, and that is the point of [`EngineOnly`] being uninhabited: the `Application` arm
     /// holds a value of a type with no values, so the compiler discharges it rather than this
     /// needing a panic or a fallback for a case that cannot occur.
-    pub(crate) fn lift<E>(self) -> Error<E> {
+    ///
+    /// Public because a workflow with its own error type sometimes holds an engine-channel
+    /// result — [`DBOS::get_event`](crate::DBOS::get_event) inside a workflow is the first — and
+    /// `?` cannot lift `Error<EngineOnly>` into `Error<E>` on its own: the blanket conversion
+    /// would wrap the whole error as the application's. This is the conversion written out:
+    ///
+    /// ```ignore
+    /// let step: Option<u32> = dbos.get_event(&id, "progress", timeout)
+    ///     .await
+    ///     .map_err(Error::lift)?;
+    /// ```
+    pub fn lift<E>(self) -> Error<E> {
         self.map_application(|impossible| match impossible {})
     }
 }
