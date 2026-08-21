@@ -29,7 +29,13 @@ impl Executor {
     /// The mirror of [`shutdown`](Self::shutdown), and here for the same reason: these are the
     /// executor's own fields, so the executor is what sets them up. [`DBOS::launch`] is left with
     /// what is actually its business — deciding whether to build one at all, and installing it.
-    async fn start(config: &Config, workflows: Snapshot) -> Result<Self> {
+    ///
+    /// Also returns the recovery list — the workflows a previous run of this executor id and
+    /// application version left `PENDING`. Listed *here*, before launch returns, because the
+    /// decision about what is abandoned must predate anything the application starts: a workflow
+    /// started the instant launch returns is `PENDING` too, and a list taken any later would claim
+    /// it and run it twice. Only the execution of the list is backgrounded.
+    async fn start(config: &Config, workflows: Snapshot) -> Result<(Self, Vec<String>)> {
         config.validate()?;
 
         if workflows.is_empty() {
@@ -67,6 +73,11 @@ impl Executor {
 
         register_version(&sysdb, &application_version).await?;
 
+        let pending = sysdb
+            .get_pending_workflows(&executor_id, &application_version)
+            .await
+            .map_err(Error::SystemDatabase)?;
+
         tracing::info!(
             app_name = config.app_name,
             executor_id,
@@ -74,7 +85,7 @@ impl Executor {
             "DBOS launched"
         );
 
-        Ok(Self {
+        let executor = Self {
             sysdb: Box::new(sysdb),
             executor_id,
             application_version,
@@ -85,7 +96,8 @@ impl Executor {
             workflows,
             app_name: config.app_name.clone(),
             tasks: Tasks::default(),
-        })
+        };
+        Ok((executor, pending))
     }
 
     /// The system database this executor is running against.
@@ -267,8 +279,14 @@ impl DBOS {
             return Ok(());
         }
 
-        let executor = Executor::start(&self.0.config, self.0.registry.snapshot()).await?;
-        *self.write_executor() = Some(Arc::new(executor));
+        let (executor, pending) =
+            Executor::start(&self.0.config, self.0.registry.snapshot()).await?;
+        let executor = Arc::new(executor);
+        *self.write_executor() = Some(Arc::clone(&executor));
+        // Installed first, recovered second: the recovery task runs against the same executor the
+        // application sees, and an application call racing it is exactly the case the pre-listed
+        // recovery set makes safe.
+        crate::recovery::spawn(executor, pending);
         Ok(())
     }
 

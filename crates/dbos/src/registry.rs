@@ -71,10 +71,6 @@ impl WorkflowKey {
     /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
     /// compares an init against an existing row (`WorkflowDAO.java:120`), which is a defence
     /// nobody writes against a distinction that cannot occur.
-    #[allow(
-        dead_code,
-        reason = "recovery reads rows; that is the next commit but one"
-    )]
     pub(crate) fn from_row(
         name: impl Into<String>,
         class_name: Option<&str>,

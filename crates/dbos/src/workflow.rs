@@ -26,7 +26,7 @@ const OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// The default every implementation shares. It only counts recoveries and dequeues; starting a
 /// workflow fresh never approaches it.
-const MAX_RECOVERY_ATTEMPTS: i64 = 100;
+pub(crate) const MAX_RECOVERY_ATTEMPTS: i64 = 100;
 
 /// The workflows this executor started and has not seen finish.
 ///
@@ -46,7 +46,7 @@ impl Tasks {
     /// The cost is that a finished workflow's handle lingers until the next one starts, which is a
     /// pointer, and the benefit is that a workflow whose caller dropped its future is still
     /// reachable by shutdown — which is the case that matters.
-    fn insert(&self, handle: AbortHandle) {
+    pub(crate) fn insert(&self, handle: AbortHandle) {
         let mut running = self.lock();
         running.retain(|handle| !handle.is_finished());
         running.push(handle);
@@ -178,29 +178,7 @@ async fn run_durably(
         return adopt(&executor, &workflow_id).await;
     }
 
-    // Spawned, not awaited in place: the workflow's life is the executor's, not the caller's, so
-    // dropping the returned future must not stop the run and shutdown must be able to reach it.
-    //
-    // The span travels with the task, so everything the workflow logs — the engine's own events
-    // and the application's — carries the workflow id without threading it anywhere.
-    let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
-    let task = {
-        let executor = Arc::clone(&executor);
-        let workflow_id = workflow_id.clone();
-        executor.runtime().clone().spawn(
-            async move {
-                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
-                let panic_log = PanicLog {
-                    workflow_id: &workflow_id,
-                };
-                let outcome = execute(&executor, &key, &workflow_id, input, ctx).await;
-                std::mem::forget(panic_log);
-                outcome
-            }
-            .instrument(span),
-        )
-    };
-    executor.tasks().insert(task.abort_handle());
+    let task = spawn_execution(&executor, key, workflow_id.clone(), input);
 
     match task.await {
         Ok(outcome) => outcome,
@@ -210,6 +188,40 @@ async fn run_durably(
         }
         Err(join) => std::panic::resume_unwind(join.into_panic()),
     }
+}
+
+/// Spawns the workflow body on the executor's runtime and registers it for shutdown to reach.
+///
+/// Spawned, not awaited in place: the workflow's life is the executor's, not the caller's, so
+/// dropping any future that observes the returned handle must not stop the run. Both submitters go
+/// through here — a caller's `run`, which awaits the handle, and recovery, which does not.
+///
+/// The span travels with the task, so everything the workflow logs — the engine's own events and
+/// the application's — carries the workflow id without threading it anywhere.
+pub(crate) fn spawn_execution(
+    executor: &Arc<Executor>,
+    key: WorkflowKey,
+    workflow_id: String,
+    input: Option<String>,
+) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
+    let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
+    let task = executor.runtime().clone().spawn(
+        {
+            let executor = Arc::clone(executor);
+            async move {
+                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
+                let panic_log = PanicLog {
+                    workflow_id: &workflow_id,
+                };
+                let outcome = execute(&executor, &key, &workflow_id, input, ctx).await;
+                std::mem::forget(panic_log);
+                outcome
+            }
+        }
+        .instrument(span),
+    );
+    executor.tasks().insert(task.abort_handle());
+    task
 }
 
 /// Runs the body with a context ambient and records what it did.

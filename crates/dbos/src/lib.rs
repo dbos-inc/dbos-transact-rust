@@ -30,6 +30,8 @@ mod dbos;
 #[cfg(feature = "engine")]
 mod error;
 #[cfg(feature = "engine")]
+mod recovery;
+#[cfg(feature = "engine")]
 mod registry;
 #[cfg(feature = "engine")]
 mod serialization;
