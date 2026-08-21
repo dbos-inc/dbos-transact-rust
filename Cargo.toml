@@ -4,7 +4,7 @@ resolver = "3"
 # front: `dbos-macros` arrives with the attribute macros, and `dbos-transact` only when a
 # signpost release to `dbos` is cut. `test-support` is unpublished and exists so that tests
 # needing a real database can live beside the code they test, rather than only under `tests/`.
-members = ["crates/dbos", "crates/test-support"]
+members = ["crates/dbos", "crates/test-support", "demo-apps/dbos-rust-starter"]
 
 [workspace.package]
 # Published placeholders occupy 0.1.1 on crates.io, so the first real release must be
