@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::task::AbortHandle;
+use tracing::Instrument;
 
 use crate::context::Ctx;
 use crate::dbos::Executor;
@@ -69,6 +70,33 @@ impl Tasks {
         self.running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Logs a panic escaping a workflow body, from inside the unwind.
+///
+/// A panic is deliberately not an outcome — nothing is recorded and the row stays `PENDING`, the
+/// same as a crash — but it must not be *silent*. Tokio parks the panic in the `JoinHandle`, and a
+/// caller that dropped its future never joins it, so without this the only evidence would be the
+/// panic hook's stderr line: no workflow id, nothing about the durable consequence.
+///
+/// A drop guard because the unwind is the only place the case can be observed: an async block's
+/// live locals are dropped as the panic unwinds out of `poll`, with `std::thread::panicking()`
+/// true, and the workflow span still entered. Completing normally defuses it with `mem::forget`;
+/// an abort also drops it, but outside a panic, so shutdown stays quiet.
+struct PanicLog<'a> {
+    workflow_id: &'a str,
+}
+
+impl Drop for PanicLog<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::error!(
+                workflow_id = self.workflow_id,
+                "the workflow body panicked: no outcome is recorded, and the row stays PENDING \
+                 for a later executor to recover"
+            );
+        }
     }
 }
 
@@ -152,13 +180,25 @@ async fn run_durably(
 
     // Spawned, not awaited in place: the workflow's life is the executor's, not the caller's, so
     // dropping the returned future must not stop the run and shutdown must be able to reach it.
+    //
+    // The span travels with the task, so everything the workflow logs — the engine's own events
+    // and the application's — carries the workflow id without threading it anywhere.
+    let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     let task = {
         let executor = Arc::clone(&executor);
         let workflow_id = workflow_id.clone();
-        executor.runtime().clone().spawn(async move {
-            let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
-            execute(&executor, &key, &workflow_id, input, ctx).await
-        })
+        executor.runtime().clone().spawn(
+            async move {
+                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
+                let panic_log = PanicLog {
+                    workflow_id: &workflow_id,
+                };
+                let outcome = execute(&executor, &key, &workflow_id, input, ctx).await;
+                std::mem::forget(panic_log);
+                outcome
+            }
+            .instrument(span),
+        )
     };
     executor.tasks().insert(task.abort_handle());
 
@@ -200,8 +240,16 @@ async fn execute(
                 .await
         }
         // A control signal is not the workflow's outcome, so nothing terminal is written and the
-        // row stays where it was for a later executor to pick up.
-        Err(Failure::Control(_)) => return outcome,
+        // row stays where it was for a later executor to pick up. Warned rather than debug-logged,
+        // because the caller may have dropped its future — this line can be the only evidence.
+        Err(Failure::Control(control)) => {
+            tracing::warn!(
+                error = %control,
+                "a control signal ended this execution: nothing is recorded, and the row stays \
+                 PENDING"
+            );
+            return outcome;
+        }
         Err(Failure::Recorded(encoded)) => {
             executor
                 .sysdb()
@@ -209,10 +257,22 @@ async fn execute(
                 .await
         }
     }
-    .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
+    .map_err(|error| {
+        tracing::warn!(
+            error = %error,
+            "could not record the workflow's outcome: the row stays PENDING"
+        );
+        Failure::Control(Error::SystemDatabase(error))
+    })?;
 
     match write {
-        OutcomeWrite::Recorded => outcome,
+        OutcomeWrite::Recorded => {
+            match &outcome {
+                Ok(_) => tracing::debug!("the workflow completed; its output is recorded"),
+                Err(_) => tracing::debug!("the workflow failed; its error is recorded"),
+            }
+            outcome
+        }
         // Another run finished this workflow while this one was working. It is superseded, so what
         // it computed is not the answer — the recorded outcome is, and every caller must agree on
         // which one that is.
@@ -250,5 +310,101 @@ async fn adopt(
                 recovery_attempts,
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A subscriber that keeps every event's level and message, and nothing else.
+    ///
+    /// Hand-rolled because the crate has no `tracing-subscriber` dependency, and one test does not
+    /// justify one: the trait is eight methods, six of which do nothing here.
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        use std::fmt::Write;
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(format!("{} ", event.metadata().level()));
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The premise the guard is built on, pinned: an async block's live locals are dropped during
+    /// the panic's unwind out of `poll`, so the guard fires while `std::thread::panicking()` is
+    /// still true. Were a runtime change to defer that drop past the catch, the error line would
+    /// vanish silently — this is the test that notices.
+    ///
+    /// `#[tokio::test]` runs a current-thread runtime, which is what lets a thread-local
+    /// subscriber observe a spawned task.
+    #[tokio::test]
+    async fn a_panic_in_a_spawned_task_is_logged_from_the_unwind() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(Capture(Arc::clone(&events)));
+
+        let task = tokio::spawn(async {
+            let _log = PanicLog {
+                workflow_id: "wf-boom",
+            };
+            // Held across an await point, as the real guard is.
+            tokio::task::yield_now().await;
+            panic!("a bug, not an outcome");
+        });
+        let joined = task.await.expect_err("the task must panic");
+        assert!(joined.is_panic());
+
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("ERROR") && e.contains("panicked")),
+            "the unwind must produce the error event: {events:?}"
+        );
+    }
+
+    /// The defused path: a task that completes normally logs nothing.
+    #[tokio::test]
+    async fn a_completed_task_logs_no_panic() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(Capture(Arc::clone(&events)));
+
+        tokio::spawn(async {
+            let panic_log = PanicLog {
+                workflow_id: "wf-fine",
+            };
+            tokio::task::yield_now().await;
+            std::mem::forget(panic_log);
+        })
+        .await
+        .expect("the task must complete");
+
+        let events = events.lock().unwrap();
+        assert!(events.is_empty(), "{events:?}");
     }
 }

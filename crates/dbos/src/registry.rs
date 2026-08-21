@@ -277,6 +277,7 @@ impl DBOS {
         });
 
         self.registry().insert(key.clone(), erased)?;
+        tracing::debug!(workflow = %key, "registered a workflow");
         Ok(WorkflowRef {
             dbos: self.clone(),
             key: Arc::new(key),

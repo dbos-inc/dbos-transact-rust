@@ -4,6 +4,7 @@ use std::future::Future;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tracing::Instrument;
 
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
@@ -42,6 +43,11 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
+        tracing::debug!(
+            step_name = name,
+            "the step body runs plainly, not as a checkpoint: it is outside a workflow, or \
+             inside another step"
+        );
         return body().await;
     };
 
@@ -55,14 +61,21 @@ where
         .await
         .map_err(Error::SystemDatabase)?;
     if let Some(recorded) = recorded {
+        tracing::debug!(
+            step_id,
+            step_name = name,
+            "the step replays from its checkpoint; the body does not run"
+        );
         return match recorded.error {
             Some(error) => Err(revive(&error, name)),
             None => decode(recorded.output.as_deref(), "step result"),
         };
     }
 
+    // The span nests inside the workflow's, so anything the body logs carries both ids.
+    let span = tracing::info_span!("step", step_id, step_name = name);
     let started_at = Timestamp::now();
-    let outcome = ctx.in_step_scope(body()).await;
+    let outcome = ctx.in_step_scope(body()).instrument(span).await;
 
     // Built once and held, not rebuilt per attempt: `record_step` compares the stored completion
     // time against this one to tell its own retried write from another execution's, and a fresh
@@ -88,12 +101,24 @@ where
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
+            tracing::debug!(
+                step_id,
+                step_name = name,
+                "the step ran; its output is recorded"
+            );
         }
         Err(error) => {
             // A control error is not the step's result. A cancelled workflow that recorded its
             // cancellation as a step failure would replay as *permanently* failed, having lost the
-            // fact that it was interrupted rather than wrong.
+            // fact that it was interrupted rather than wrong. Debug rather than warn: the signal
+            // propagates into the workflow's channel, and the recording layer above warns once,
+            // with the durable consequence.
             if error.control().is_some() {
+                tracing::debug!(
+                    step_id,
+                    step_name = name,
+                    "a control signal ended the step; nothing is checkpointed"
+                );
                 return outcome;
             }
             // The error itself, encoded, not a description of it: a replay gives back the error
@@ -111,6 +136,11 @@ where
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
+            tracing::debug!(
+                step_id,
+                step_name = name,
+                "the step failed; its error is recorded"
+            );
         }
     }
     outcome

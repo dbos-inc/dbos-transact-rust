@@ -356,6 +356,41 @@ async fn a_step_error_type_round_trips_as_itself() {
     dbos.shutdown().await;
 }
 
+/// A panic is not an outcome: nothing is recorded, and an awaiting caller gets the panic back.
+///
+/// The row staying PENDING is the point — a panic is treated as a crash, not a failure, so a
+/// later executor recovers the workflow instead of it being permanently failed by a bug.
+#[tokio::test]
+async fn a_panicking_workflow_leaves_its_row_pending() {
+    async fn explodes(_: ()) -> dbos::Result<()> {
+        panic!("a bug, not an outcome")
+    }
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("panic-app", &db));
+    let explodes = dbos.register_workflow("explodes", explodes).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // On its own task, because the panic is re-raised in the awaiting caller.
+    let joined = tokio::spawn(async move { explodes.run(()).await }).await;
+    let panicked = joined.expect_err("the panic must reach the awaiting caller");
+    assert!(panicked.is_panic(), "{panicked}");
+
+    let rows = reader(&db)
+        .await
+        .list_workflows(&Default::default())
+        .await
+        .expect("read failed");
+    assert_eq!(
+        rows[0].status,
+        WorkflowStatus::Pending,
+        "a panic records nothing: the row is left for recovery, like a crash"
+    );
+    assert!(rows[0].error.is_none(), "{:?}", rows[0].error);
+
+    dbos.shutdown().await;
+}
+
 /// The workflow is recorded before its body runs, which is what makes a crash recoverable.
 #[tokio::test]
 async fn the_row_exists_before_the_body_starts() {
