@@ -166,11 +166,17 @@ impl Executor {
     /// Takes `&self`, not `self`: the instance drops its handle here, but a workflow still running
     /// may hold another, and shutting down is precisely the moment when that is true.
     pub(crate) async fn shutdown(&self) {
-        // Cancel first, then close: a workflow still running would otherwise fail its next query
-        // against a closed pool and record an *error* outcome, turning an interrupted workflow
-        // into a permanently failed one. Cancelling leaves every row `PENDING`, which is what a
-        // later executor recovers.
-        let cancelled = self.tasks.abort_all();
+        // Cancel, wait, then close — and the wait is what the ordering rests on. `abort` only
+        // schedules cancellation at a task's next yield point, so without waiting this would close
+        // the pool while the bodies it cancelled were still running, and returning would mean
+        // "told to stop" rather than "stopped". Waiting is also what lets a relaunch in this
+        // process start against a genuinely quiet executor.
+        //
+        // What keeps an interrupted workflow from being *recorded* as failed is not this ordering
+        // but `Error::control`, which treats every system-database failure as a signal rather than
+        // an outcome. Cancelling leaves every row `PENDING`, which is what a later executor
+        // recovers.
+        let cancelled = self.tasks.abort_all().await;
         if cancelled > 0 {
             tracing::info!(
                 cancelled,

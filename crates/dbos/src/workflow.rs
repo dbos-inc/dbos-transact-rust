@@ -1,5 +1,6 @@
 //! Running a workflow durably.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,13 +32,27 @@ pub(crate) const MAX_RECOVERY_ATTEMPTS: i64 = 100;
 
 /// The workflows this executor started and has not seen finish.
 ///
-/// Only abort handles, deliberately: this is what [`shutdown`](Executor::shutdown) uses to cancel
-/// in-flight work, and nothing here ever awaits a task. A caller awaiting its own workflow holds
-/// the `JoinHandle`; a caller that dropped its future is no longer waiting but the workflow is
-/// still running, and shutdown still has to reach it.
+/// Abort handles to reach them with, and a count of how many are still alive to wait on. Nothing
+/// here holds a `JoinHandle`: a caller awaiting its own workflow holds that, and a caller that
+/// dropped its future is no longer waiting though the workflow is still running — which is exactly
+/// the case shutdown has to reach. The count stands in for joining, and is what lets shutdown mean
+/// "quiet" rather than "told to stop".
 #[derive(Default)]
 pub(crate) struct Tasks {
-    running: Mutex<Vec<AbortHandle>>,
+    state: Mutex<State>,
+    /// Woken as each task's future is dropped, so [`abort_all`](Tasks::abort_all) can wait for the
+    /// last one out without polling for it.
+    ended: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct State {
+    running: Vec<AbortHandle>,
+    /// How many spawned futures exist and have not been dropped.
+    live: usize,
+    /// Set by [`abort_all`](Tasks::abort_all). A task registered after the sweep is cancelled on
+    /// arrival rather than added to a list nothing will read again.
+    closed: bool,
 }
 
 impl Tasks {
@@ -47,31 +62,126 @@ impl Tasks {
     /// The cost is that a finished workflow's handle lingers until the next one starts, which is a
     /// pointer, and the benefit is that a workflow whose caller dropped its future is still
     /// reachable by shutdown — which is the case that matters.
-    pub(crate) fn insert(&self, handle: AbortHandle) {
-        let mut running = self.lock();
-        running.retain(|handle| !handle.is_finished());
-        running.push(handle);
+    ///
+    /// A task arriving after the sweep is aborted here instead. That is the race between spawning
+    /// and registering: a workflow started as shutdown ran would otherwise never be cancelled and
+    /// would outlive the shutdown meant to stop it.
+    fn insert(&self, handle: AbortHandle) {
+        let mut state = self.lock();
+        if state.closed {
+            drop(state);
+            handle.abort();
+            return;
+        }
+        state.running.retain(|handle| !handle.is_finished());
+        state.running.push(handle);
     }
 
-    /// Cancels every workflow still running, reporting how many were cancelled.
+    /// Counts a task about to be spawned.
+    fn arrived(&self) {
+        self.lock().live += 1;
+    }
+
+    /// Un-counts one whose future has been dropped, waking a shutdown waiting for the last.
+    ///
+    /// Runs from a `Drop`, including one unwinding out of a panicking workflow, so it takes care
+    /// not to panic itself: the count cannot legitimately go below zero — one guard per task,
+    /// dropped once — and saturating rather than wrapping keeps a bug here from becoming an abort.
+    fn departed(&self) {
+        {
+            let mut state = self.lock();
+            state.live = state.live.saturating_sub(1);
+        }
+        self.ended.notify_waiters();
+    }
+
+    /// Cancels every workflow still running and waits for them to stop, reporting how many were
+    /// cancelled.
     ///
     /// Their rows stay `PENDING`, which is the point: a cancelled workflow is one a later executor
     /// recovers, so an abrupt shutdown loses no work. Writing a terminal status here would be the
     /// bug — it would mark as finished something that never finished.
-    pub(crate) fn abort_all(&self) -> usize {
-        let mut running = self.lock();
-        let live: Vec<AbortHandle> = running.drain(..).filter(|h| !h.is_finished()).collect();
-        for handle in &live {
-            handle.abort();
+    ///
+    /// **The wait is the half that makes this mean anything.** `abort` is not synchronous; it
+    /// schedules cancellation at the task's next yield point, so without waiting, shutdown returns
+    /// while the bodies it cancelled may still be running. The wait is unbounded, matching what
+    /// `close` already does with its listener: a task that ignores cancellation should be a hang
+    /// that gets fixed rather than a warning logged forever.
+    pub(crate) async fn abort_all(&self) -> usize {
+        let cancelled = {
+            let mut state = self.lock();
+            state.closed = true;
+            let live: Vec<AbortHandle> = state
+                .running
+                .drain(..)
+                .filter(|handle| !handle.is_finished())
+                .collect();
+            for handle in &live {
+                handle.abort();
+            }
+            live.len()
+        };
+
+        loop {
+            // Registered before the count is read, so a task ending in between is not missed:
+            // `notify_waiters` wakes only those already waiting.
+            let ended = self.ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            // Bound to a `let` so the guard is released before the await, not held across it.
+            let live = self.lock().live;
+            if live == 0 {
+                break;
+            }
+            ended.await;
         }
-        live.len()
+        cancelled
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<AbortHandle>> {
-        self.running
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Keeps a spawned task counted for as long as its future exists.
+///
+/// Built *before* the spawn and moved into the future, which is the whole trick: it is then
+/// dropped however the task ends — completed, panicked, or cancelled before its first poll. A
+/// guard created inside the body would miss that last case entirely and leave
+/// [`abort_all`](Tasks::abort_all) waiting forever on a task that never started.
+struct TaskGuard(Arc<Executor>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.tasks().departed();
+    }
+}
+
+/// Spawns `future` on the executor's runtime, counted and reachable by shutdown.
+///
+/// Two things every spawn here needs and both are easy to get subtly wrong alone: the abort handle
+/// is what lets shutdown *reach* the task, and the guard is what lets it *wait* for it. Doing them
+/// in one place is also what orders them correctly — the guard exists before the spawn, so a
+/// shutdown racing this one either aborts the task through `insert` or waits for it through the
+/// count, and never misses it through both.
+pub(crate) fn spawn_tracked<F>(
+    executor: &Arc<Executor>,
+    future: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    executor.tasks().arrived();
+    let guard = TaskGuard(Arc::clone(executor));
+    let task = executor.runtime().clone().spawn(async move {
+        let _guard = guard;
+        future.await
+    });
+    executor.tasks().insert(task.abort_handle());
+    task
 }
 
 /// Logs a panic escaping a workflow body, from inside the unwind.
@@ -218,7 +328,8 @@ pub(crate) fn spawn_execution(
     input: Option<String>,
 ) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
-    let task = executor.runtime().clone().spawn(
+    spawn_tracked(
+        executor,
         {
             let executor = Arc::clone(executor);
             async move {
@@ -232,9 +343,7 @@ pub(crate) fn spawn_execution(
             }
         }
         .instrument(span),
-    );
-    executor.tasks().insert(task.abort_handle());
-    task
+    )
 }
 
 /// Runs the body with a context ambient and records what it did.
@@ -411,6 +520,47 @@ mod tests {
                 .any(|e| e.starts_with("ERROR") && e.contains("panicked")),
             "the unwind must produce the error event: {events:?}"
         );
+    }
+
+    /// The half that makes shutdown mean "stopped" rather than "told to stop": the sweep does not
+    /// finish while a task it cancelled is still on its way out.
+    #[tokio::test]
+    async fn abort_all_waits_until_every_task_has_departed() {
+        let tasks = Arc::new(Tasks::default());
+        tasks.arrived();
+
+        let mut sweep = {
+            let tasks = Arc::clone(&tasks);
+            tokio::spawn(async move { tasks.abort_all().await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut sweep)
+                .await
+                .is_err(),
+            "the sweep returned while a task was still live"
+        );
+
+        tasks.departed();
+        tokio::time::timeout(Duration::from_secs(10), sweep)
+            .await
+            .expect("the sweep never noticed the last task leaving")
+            .expect("the sweep panicked");
+    }
+
+    /// The race between spawning a workflow and registering it: one that arrives after the sweep
+    /// has run is cancelled here, rather than outliving the shutdown meant to stop it.
+    #[tokio::test]
+    async fn a_task_arriving_after_the_sweep_is_cancelled() {
+        let tasks = Tasks::default();
+        tasks.abort_all().await;
+
+        let task = tokio::spawn(std::future::pending::<()>());
+        tasks.insert(task.abort_handle());
+
+        let joined = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the late task was never cancelled");
+        assert!(joined.expect_err("it must be cancelled").is_cancelled());
     }
 
     /// The defused path: a task that completes normally logs nothing.

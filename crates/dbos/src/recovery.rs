@@ -16,7 +16,7 @@ use crate::error::Error;
 use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::types::{NewWorkflow, Submission};
-use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution};
+use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
 /// Runs the recovery list in the background, one submission at a time.
 ///
@@ -35,7 +35,8 @@ pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
         workflows = pending.len(),
         "recovering workflows a previous run left PENDING"
     );
-    let task = executor.runtime().clone().spawn(
+    spawn_tracked(
+        &executor,
         {
             let executor = Arc::clone(&executor);
             async move {
@@ -52,7 +53,6 @@ pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
         }
         .instrument(tracing::info_span!("recovery")),
     );
-    executor.tasks().insert(task.abort_handle());
 }
 
 /// Resubmits one abandoned workflow, if this executor still can and should.
