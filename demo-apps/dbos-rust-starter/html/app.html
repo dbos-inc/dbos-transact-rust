@@ -658,7 +658,7 @@
         window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
 
         currentId = randomString;
-        await fetch(`/workflow/${currentId}`, { method: "GET" });
+        await fetch(`/workflow/${encodeURIComponent(currentId)}`, { method: "POST" });
         await checkProgress();
         enableCrashButton();
       }
@@ -692,7 +692,7 @@
         if (!currentId) return;
 
         try {
-          const response = await fetch(`/last_step/${currentId}`);
+          const response = await fetch(`/last_step/${encodeURIComponent(currentId)}`);
           if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
           const step = Number(await response.text()) + 1;

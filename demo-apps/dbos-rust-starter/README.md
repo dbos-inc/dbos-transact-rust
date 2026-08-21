@@ -24,6 +24,11 @@ Open <http://localhost:8080>, launch a workflow, and crash the app mid-run. Rest
 `cargo run -p dbos-rust-starter` again — `launch()` recovers the workflow, the steps that already
 finished do not run again, and the progress display picks up where it left off.
 
+The server listens on loopback only, since the crash button exits the process. Ctrl-C is the
+other way out and takes the tidy path: it stops serving and calls `shutdown()`, which leaves any
+workflow still running `PENDING` for the next launch to recover — the same end as the crash
+button, reached deliberately.
+
 ## The application version
 
 The app pins its application version to `0.1.0` (override with `DBOS__APPVERSION`). DBOS defaults

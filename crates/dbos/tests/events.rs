@@ -63,7 +63,7 @@ async fn progress_events_survive_recovery_without_republishing() {
         .await
         .expect("the workflow never reached its gate");
 
-    // The demo's `GET /laststep` handler: an outside caller polling with a zero timeout.
+    // The demo's `GET /last_step` handler: an outside caller polling with a zero timeout.
     let reader = reader(&db).await;
     let rows = reader
         .list_workflows(&Default::default())

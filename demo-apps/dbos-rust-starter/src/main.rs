@@ -96,14 +96,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let router = Router::new()
         .route("/", get(index))
-        .route("/workflow/{task_id}", get(start_workflow))
+        .route("/workflow/{task_id}", post(start_workflow))
         .route("/last_step/{task_id}", get(last_step))
         .route("/crash", post(crash))
         .with_state(app);
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    // Loopback, not 0.0.0.0: this app ships a button that exits the process, which is a fine
+    // thing to hand yourself and a poor thing to hand your network.
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
     println!("Server starting on http://localhost:8080");
-    axum::serve(listener, router).await?;
+    // Serving until Ctrl-C rather than forever is what makes the line below reachable — and
+    // `shutdown` is worth reaching: it leaves every running workflow PENDING for the next launch
+    // to recover, which is the same path the crash button takes the long way round.
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("Shutting down");
+        })
+        .await?;
 
     dbos.shutdown().await;
     Ok(())
@@ -117,7 +127,9 @@ async fn index() -> Html<&'static str> {
 /// Starts the workflow under the caller's id and returns at once; the handle is dropped.
 ///
 /// The id is the caller's, so posting the same task twice joins the workflow already running
-/// rather than failing — the id is an idempotency key, and a double-click is not an error.
+/// rather than failing — the id is an idempotency key, and a double-click is not an error. A
+/// `POST` because it starts something: a `GET` that does is one a prefetch or a back button can
+/// fire on the user's behalf.
 async fn start_workflow(
     State(app): State<App>,
     Path(task_id): Path<String>,
