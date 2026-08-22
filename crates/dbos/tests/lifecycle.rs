@@ -255,6 +255,15 @@ async fn an_invalid_application_name_is_refused_at_launch() {
 ///
 /// The failure used here is a version name a peer application already holds: reachable only once
 /// the pool is up, which is exactly the window that used to leak.
+///
+/// **This discriminates on Postgres only, and deliberately runs on both.** The listener is what
+/// pins the pool — it owns a clone and exits only when that pool closes — so with LISTEN/NOTIFY
+/// off nothing survives the drop, and CockroachDB, which has no LISTEN/NOTIFY, never starts one.
+/// Verified rather than assumed: with the fix reverted this fails on Postgres with nine
+/// connections open, and passes on CockroachDB and on Postgres with `use_listen_notify: false`.
+/// So the assertion is trivially satisfied on the Cockroach leg rather than proving anything
+/// there, and it is left running because "no connections leaked" is still true and still worth
+/// asserting on both.
 #[tokio::test]
 async fn a_launch_that_fails_after_connecting_closes_the_database() {
     /// Tags the connections this test opens, so they can be told from every other test's on the
