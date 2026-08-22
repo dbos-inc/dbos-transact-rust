@@ -22,10 +22,11 @@
 //! than across them. Prefer few, larger test files over many small ones — each additional one
 //! is another container.
 //!
-//! A fresh database per test is only right while there is nothing to migrate. Once there
-//! is, this becomes a pool of pre-migrated databases leased per test and truncated on
-//! release (Java's model): migrating per test would put the whole CockroachDB online-DDL
-//! cost straight back, which is the reason this harness exists at all.
+//! **Pooled databases are built from a baseline, not by replaying the migrations.** One
+//! database per process is migrated for real; every database the pool hands out is then built
+//! from that one's finished schema. Replaying 55 versions of online DDL costs about 17s on
+//! CockroachDB against 0.8s for the schema it ends at, because the corpus creates indexes it
+//! later drops and the end state does none of that work. `Baseline` has the details.
 //!
 //! **A crate rather than a module under `tests/`.** A `mod support;` is visible only to the
 //! integration test binaries, so anything it tests has to be `pub` — the crate boundary,
@@ -64,14 +65,22 @@ const CONTAINER_LABEL: (&str, &str) = ("dev.dbos.test-harness", "true");
 
 /// The most migrated databases to keep, and so the widest a suite can run.
 ///
-/// Four is enough that tests overlap usefully and small enough that CockroachDB's setup stays
-/// bounded: migrating four costs about 50s there against roughly 75s for twelve, and the
-/// difference buys parallelism a suite this size cannot use.
+/// This used to be a migration budget: each pooled database cost a full corpus run, so four
+/// was as many as CockroachDB could afford. The baseline took that cost away — a pooled
+/// database is now under a second there — and what bounds this number instead is how much
+/// parallelism a suite this size can actually use. Four still fits a CI runner's core count,
+/// so it stays; raising it is now cheap if a suite ever outgrows it.
 pub const POOL_SIZE: usize = 4;
 
 /// How long to wait for the server to accept connections after the container starts.
 /// CockroachDB is the slow one; Postgres is usually ready in well under a second.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many times to try creating a database from a template before giving up.
+const CREATE_DATABASE_ATTEMPTS: u32 = 10;
+
+/// How long to wait for a template's last session to go away before trying again.
+const TEMPLATE_RETRY_WAIT: Duration = Duration::from_millis(100);
 
 /// Which database engine the suite is running against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +116,98 @@ impl Backend {
     }
 }
 
+/// Whether a `sqlx` error carries a particular SQLSTATE.
+fn has_code(error: &sqlx::Error, code: &str) -> bool {
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|c| c == code)
+}
+
+/// How a pooled database is built once one database has been migrated for real.
+///
+/// **Replaying the corpus per pooled database is the thing this exists to avoid.** The corpus
+/// is a history, and a history does work it later undoes: it creates four indexes that a later
+/// migration drops, and rewrites `enqueue_workflow` three times. CockroachDB charges for every
+/// step of that as an online schema change — measured at 17s against 0.8s for the schema those
+/// steps arrive at, and 2.9s against 0.1s on PostgreSQL.
+///
+/// **What the two arms have in common is that neither is a second definition of the schema.**
+/// Both are derived, in-process, from a database the real runner migrated moments earlier, so
+/// there is nothing to keep in step with `migrations/` and nothing to regenerate when a
+/// migration lands. A checked-in baseline would be faster still — it would remove the one real
+/// migration a process makes — and would be one more copy of the schema to go stale.
+///
+/// `a_pooled_database_matches_one_the_migrations_built` is what holds this honest: it compares
+/// the catalogue of a leased database against one the corpus built, on both backends.
+enum Baseline {
+    /// PostgreSQL copies the migrated database with `CREATE DATABASE ... TEMPLATE`, which is
+    /// exact by construction. Holds its name.
+    Template(String),
+    /// CockroachDB has no `TEMPLATE`, so it replays a dump of the finished schema. Holds the
+    /// SQL.
+    Replay(String),
+}
+
+/// Dumps `schema` as SQL that recreates it: tables, then functions, then the recorded version.
+///
+/// CockroachDB only. `SHOW CREATE ALL TABLES` emits tables with their indexes inline and their
+/// foreign keys as trailing `ALTER`s — which is the whole reason the replay is fast, since an
+/// index that arrives with its table costs nothing to build.
+///
+/// The version row is dumped as data because a database that carries the schema but not the
+/// version is not migrated as far as anything else is concerned: the runner would read 0 and
+/// apply the corpus over the top of it.
+async fn dump_schema(pool: &sqlx::PgPool, schema: &str) -> String {
+    let quoted = quote_identifier(schema);
+    let mut sql = String::new();
+
+    let tables: Vec<String> = sqlx::query_scalar("SHOW CREATE ALL TABLES")
+        .fetch_all(pool)
+        .await
+        .expect("failed to dump the table definitions");
+    for table in tables {
+        sql.push_str(&table);
+        sql.push('\n');
+    }
+
+    // By name, then every overload of each: `SHOW CREATE FUNCTION` takes a name and returns a
+    // row per signature, and `information_schema.routines` has a row per signature too.
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT routine_name FROM information_schema.routines \
+         WHERE routine_schema = $1 ORDER BY routine_name",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .expect("failed to list the functions to dump");
+    for name in names {
+        let definitions: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT create_statement FROM [SHOW CREATE FUNCTION {quoted}.{}]",
+            quote_identifier(&name),
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| panic!("failed to dump function {name}: {e}"));
+        for definition in definitions {
+            sql.push_str(&definition);
+            sql.push_str(";\n");
+        }
+    }
+
+    let version: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT version FROM {quoted}.dbos_migrations"
+    )))
+    .fetch_one(pool)
+    .await
+    .expect("failed to read the recorded migration version");
+    sql.push_str(&format!(
+        "INSERT INTO {quoted}.dbos_migrations (version) VALUES ({version});\n"
+    ));
+
+    sql
+}
+
 /// A running database server, shared by every test holding an [`Arc`] of it.
 ///
 /// Dropping the last `Arc` removes the container.
@@ -116,11 +217,15 @@ pub struct TestServer {
     port: u16,
     /// How many migrated databases may exist at once.
     ///
-    /// Each one costs a full migration run, which is seconds on PostgreSQL and around 40 of
-    /// them on CockroachDB. Uncapped, the count would follow peak parallelism — twelve on a
-    /// twelve-core machine — so a lease past the cap waits for a database to come back rather
-    /// than paying to widen the pool.
+    /// Uncapped, the count would follow peak parallelism — twelve on a twelve-core machine —
+    /// so a lease past the cap waits for a database to come back rather than widening the pool.
     permits: Arc<tokio::sync::Semaphore>,
+    /// How a pooled database is built, derived once from a database migrated for real.
+    ///
+    /// A [`OnceCell`](tokio::sync::OnceCell) rather than eager setup in [`TestServer::start`]:
+    /// a binary whose tests all take the raw lane — the migration tests do — must not pay for
+    /// a migration it never uses.
+    baseline: tokio::sync::OnceCell<Baseline>,
     /// Migrated databases not currently leased, by name.
     ///
     /// A `std::sync::Mutex` rather than an async one because it is only ever held long enough
@@ -268,6 +373,7 @@ impl TestServer {
             host,
             port,
             permits: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
+            baseline: tokio::sync::OnceCell::new(),
             idle: std::sync::Mutex::new(Vec::new()),
             _container: container,
         };
@@ -328,41 +434,129 @@ impl TestServer {
     ///
     /// The handle keeps this server alive, so a test may hold only the database.
     pub async fn create_database(self: &Arc<Self>) -> TestDatabase {
+        self.create_database_from(None).await
+    }
+
+    /// Creates a fresh database, optionally as a copy of `template`.
+    ///
+    /// Copying is PostgreSQL's `TEMPLATE`, which is a file-level copy of a database nothing is
+    /// connected to — 0.1s against the 2.9s of migrating one. CockroachDB has no equivalent
+    /// (`unsupported template`, cockroachdb/cockroach#10151), which is why [`Baseline`] has a
+    /// second arm rather than one shared implementation.
+    async fn create_database_from(self: &Arc<Self>, template: Option<&str>) -> TestDatabase {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let name = format!("dbos_test_{}", NEXT.fetch_add(1, Ordering::Relaxed));
 
-        let mut conn = self
-            .admin_options("postgres")
-            .connect()
-            .await
-            .expect("failed to connect as admin");
         // sqlx 0.9 requires a query string to be `&'static str` or explicitly asserted
-        // safe. The name is generated from a counter, never from input.
-        sqlx::raw_sql(AssertSqlSafe(format!(r#"CREATE DATABASE "{name}""#)))
-            .execute(&mut conn)
-            .await
-            .unwrap_or_else(|e| panic!("failed to create database {name}: {e}"));
-        {
-            use sqlx::Connection;
-            let _ = conn.close().await;
-        }
+        // safe. Both names are generated here, never taken from input.
+        let sql = match template {
+            Some(template) => format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#),
+            None => format!(r#"CREATE DATABASE "{name}""#),
+        };
 
-        TestDatabase {
-            url: self.url_for(&name),
-            options: self.admin_options(&name),
-            server: Arc::clone(self),
-            name,
-            pooled: false,
-            permit: None,
+        // Retried, because `TEMPLATE` fails outright while any session is still attached to the
+        // source. The pool that migrated it is closed before we get here, but a PostgreSQL
+        // backend exits a moment after its client disconnects and is still in `pg_stat_activity`
+        // until it does — a race that shows up as an occasional failed run rather than a
+        // reproducible one. A plain create has no such failure mode and simply never retries.
+        let mut last_error = None;
+        for _ in 0..CREATE_DATABASE_ATTEMPTS {
+            let mut conn = self
+                .admin_options("postgres")
+                .connect()
+                .await
+                .expect("failed to connect as admin");
+            let result = sqlx::raw_sql(AssertSqlSafe(sql.clone()))
+                .execute(&mut conn)
+                .await;
+            {
+                use sqlx::Connection;
+                let _ = conn.close().await;
+            }
+            match result {
+                Ok(_) => {
+                    return TestDatabase {
+                        url: self.url_for(&name),
+                        options: self.admin_options(&name),
+                        server: Arc::clone(self),
+                        name,
+                        pooled: false,
+                        permit: None,
+                    };
+                }
+                // `object_in_use` — someone is still connected to the template.
+                Err(e) if template.is_some() && has_code(&e, "55006") => {
+                    last_error = Some(e);
+                    tokio::time::sleep(TEMPLATE_RETRY_WAIT).await;
+                }
+                Err(e) => panic!("failed to create database {name}: {e}"),
+            }
+        }
+        panic!(
+            "failed to create database {name} from a template after \
+             {CREATE_DATABASE_ATTEMPTS} attempts: {}",
+            last_error.expect("the loop only exits here after an error"),
+        );
+    }
+
+    /// How a pooled database is built on this server, deriving it on the first call.
+    ///
+    /// Deriving it means migrating one database for real, which is the only full corpus run a
+    /// process makes. That database is then kept and never leased: PostgreSQL cannot copy a
+    /// template anything is connected to, and letting CockroachDB alone hand it out would buy
+    /// one replay — under two seconds — for a second code path.
+    async fn baseline(self: &Arc<Self>) -> &Baseline {
+        self.baseline
+            .get_or_init(|| async {
+                let db = self.create_database().await;
+                let pool = db.pool().await;
+                dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
+                    .await
+                    .expect("failed to migrate the baseline database");
+                let baseline = match self.backend {
+                    Backend::Postgres => Baseline::Template(db.name.clone()),
+                    Backend::Cockroach => {
+                        Baseline::Replay(dump_schema(&pool, DEFAULT_SCHEMA).await)
+                    }
+                };
+                pool.close().await;
+                // `db` drops here. It is not pooled, so nothing hands it back and the database
+                // stays on the server — which is exactly what a template needs.
+                baseline
+            })
+            .await
+    }
+
+    /// Creates a database already in the state the migrations leave one in, without running
+    /// them.
+    async fn create_migrated(self: &Arc<Self>) -> TestDatabase {
+        match self.baseline().await {
+            Baseline::Template(template) => self.create_database_from(Some(template)).await,
+            Baseline::Replay(schema_sql) => {
+                let db = self.create_database().await;
+                let pool = db.pool().await;
+                // The dump carries no `CREATE SCHEMA` of its own — `SHOW CREATE ALL TABLES`
+                // emits tables and nothing that holds them.
+                let sql = format!(
+                    "CREATE SCHEMA IF NOT EXISTS {};\n{schema_sql}",
+                    quote_identifier(DEFAULT_SCHEMA),
+                );
+                sqlx::raw_sql(AssertSqlSafe(sql))
+                    .execute(&pool)
+                    .await
+                    .expect("failed to apply the schema baseline");
+                pool.close().await;
+                db
+            }
         }
     }
 
-    /// Leases a database with the DBOS schema applied, migrating one if the pool is empty.
+    /// Leases a database with the DBOS schema applied, building one if the pool is empty.
     ///
-    /// **Migrating once per database and reusing it is the point.** The corpus is 47
-    /// migrations and CockroachDB applies schema changes online, so a full run there takes
-    /// tens of seconds — paying that per test would make the CockroachDB leg unusable long
-    /// before the suite is finished.
+    /// **Reusing a database rather than building one per test is the point.** CockroachDB
+    /// applies schema changes online, so even the baseline path is not free — and the corpus
+    /// itself takes tens of seconds there. Paying either per test would make the CockroachDB
+    /// leg unusable long before the suite is finished.
     ///
     /// Cleaning happens here rather than on release: `Drop` cannot await, and a test that
     /// panics would skip its own cleanup. Doing it on acquire means a database is always
@@ -385,16 +579,8 @@ impl TestServer {
                 pooled: true,
                 permit: None,
             },
-            None => {
-                // Only reachable POOL_SIZE times: past that a permit implies an idle database.
-                let fresh = self.create_database().await;
-                let pool = fresh.pool().await;
-                dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
-                    .await
-                    .expect("failed to migrate a pooled test database");
-                pool.close().await;
-                fresh
-            }
+            // Only reachable POOL_SIZE times: past that a permit implies an idle database.
+            None => self.create_migrated().await,
         };
         db.pooled = true;
         db.permit = Some(permit);
