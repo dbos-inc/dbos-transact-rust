@@ -1,0 +1,20 @@
+# The Workflows tab of the DBOS starter app, and the acceptance test for the execution engine:
+# launch a workflow, crash the process, restart, and watch it resume at the step after the last
+# one that finished.
+[package]
+name = "dbos-rust-starter"
+description = "DBOS Rust starter app"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+dbos = { path = "../../crates/dbos" }
+
+axum = "0.8"
+# `signal` for the Ctrl-C that ends the serve loop, so `shutdown` is reached rather than skipped.
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tracing-subscriber = "0.3"

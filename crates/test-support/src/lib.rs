@@ -548,4 +548,30 @@ impl TestDatabase {
             .await
             .expect("failed to terminate connections");
     }
+
+    /// How many connections tagged with `application_name` are open on the server.
+    ///
+    /// The counting half of [`kill_connections`](Self::kill_connections), and tagged for the same
+    /// reason: tests share a server, so "how many connections are open" is only a question a test
+    /// can answer about its own. Put the tag on the pool under test by appending
+    /// `?application_name=…` to the URL it is given.
+    ///
+    /// The admin connection below is untagged, so it does not count itself.
+    pub async fn connection_count(&self, application_name: &str) -> i64 {
+        let sql = match self.backend() {
+            Backend::Cockroach => format!(
+                "SELECT count(*) FROM [SHOW CLUSTER SESSIONS] \
+                 WHERE application_name = '{application_name}'"
+            ),
+            Backend::Postgres => format!(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE application_name = '{application_name}'"
+            ),
+        };
+        let mut admin = self.admin_connection().await;
+        sqlx::query_scalar(AssertSqlSafe(sql))
+            .fetch_one(&mut admin)
+            .await
+            .expect("failed to count connections")
+    }
 }

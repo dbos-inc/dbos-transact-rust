@@ -7,8 +7,9 @@
 //!
 //! # Status
 //!
-//! Under construction, and not yet usable. There is no public API here yet; the system
-//! database layer lands first.
+//! Under construction. The system database layer landed first and the execution engine is
+//! being built on it; the lifecycle, registration, workflows, steps, events and recovery are
+//! here, with queues, the scheduler and the client arriving next.
 //!
 //! # Cargo features
 //!
@@ -19,3 +20,48 @@
 #![forbid(unsafe_code)]
 
 pub mod sysdb;
+
+#[cfg(feature = "engine")]
+mod config;
+#[cfg(feature = "engine")]
+mod context;
+#[cfg(feature = "engine")]
+mod dbos;
+#[cfg(feature = "engine")]
+mod error;
+#[cfg(feature = "engine")]
+mod event;
+#[cfg(feature = "engine")]
+mod handle;
+#[cfg(feature = "engine")]
+mod recovery;
+#[cfg(feature = "engine")]
+mod registry;
+#[cfg(feature = "engine")]
+mod serialization;
+#[cfg(feature = "engine")]
+mod step;
+#[cfg(feature = "engine")]
+mod workflow;
+
+// Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
+// `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
+// because it *is* the brand — nobody writes `tokio::TOKIO`.
+#[cfg(feature = "engine")]
+pub use config::{APP_VERSION_ENV, Config, DATABASE_URL_ENV, Serializer};
+#[cfg(feature = "engine")]
+pub use context::Ctx;
+#[cfg(feature = "engine")]
+pub use dbos::{DBOS, Executor};
+#[cfg(feature = "engine")]
+pub use error::{DurableError, EngineOnly, Error, Result};
+#[cfg(feature = "engine")]
+pub use event::{get_event, set_event};
+#[cfg(feature = "engine")]
+pub use handle::WorkflowHandle;
+#[cfg(feature = "engine")]
+pub use registry::{WorkflowKey, WorkflowRef};
+#[cfg(feature = "engine")]
+pub use step::step;
+#[cfg(feature = "engine")]
+pub use workflow::StartOptions;
