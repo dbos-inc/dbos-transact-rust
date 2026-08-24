@@ -203,7 +203,10 @@ jobs:
                 "- pooled database builds: \($harness | total(.pooled_build_ms) | s) across \($harness | total(.pooled_builds)) builds",
                 "- resets on lease: \($harness | total(.reset_ms) | s) across \($harness | total(.leases)) leases"
             '
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Both, deliberately. The job summary is where a person reads this, but GitHub
+          # exposes no API for it, so a summary that goes only there cannot be fetched,
+          # diffed against last week's run, or read by anything but a browser.
+          } | tee -a "$GITHUB_STEP_SUMMARY"
         env:
           RUNNER_TIMINGS: ${{ github.workspace }}/harness-timings.jsonl
           RUNNER_TEST_LOG: ${{ github.workspace }}/test-output.log

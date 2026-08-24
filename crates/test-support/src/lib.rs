@@ -415,6 +415,14 @@ impl<T> Default for SharedSlot<T> {
 
 static SHARED: SharedSlot<TestServer> = SharedSlot::new();
 
+/// The CockroachDB schema dump, kept for the life of the process rather than the server.
+///
+/// **Deliberately not a `SharedSlot`.** The container must go away when the last test drops it,
+/// which is what the `Weak` above is for; a dump is a `String` with nothing to leak, and keeping
+/// it is what makes a mid-binary restart cost a replay instead of a corpus run. Separating the
+/// two lifetimes is the whole point — the expensive artifact should not die with the cheap one.
+static CACHED_DUMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The shared server for this test binary, starting it if no test currently holds one.
 pub async fn shared_server() -> Arc<TestServer> {
     SHARED
@@ -650,6 +658,27 @@ impl TestServer {
         self.baseline
             .get_or_init(|| async {
                 let building = Instant::now();
+                // A dump outlives the server it came from, so a process that starts a second
+                // one does not migrate again. That is not hypothetical: the crate's own unit
+                // tests are the case it was written for. libtest orders by name, the only two
+                // modules wanting a database sort as `context::` and `step::`, and the ninety
+                // or so pure tests in between release the last handle — so the container is
+                // removed and restarted mid-binary. Measured in CI, the second corpus run cost
+                // 22s of the CockroachDB leg.
+                //
+                // Sound because the dump is portable SQL, derived from a database the real
+                // runner migrated in this same process: a fresh server replaying it lands on
+                // the schema `migrations/` defines, which is the property
+                // `a_pooled_database_matches_one_the_migrations_built` asserts either way.
+                // PostgreSQL has nothing to cache — its baseline is a template *database*,
+                // which belongs to the container that holds it — and needs none, at 0.6s
+                // against CockroachDB's 19s.
+                if self.backend == Backend::Cockroach
+                    && let Some(sql) = CACHED_DUMP.get()
+                {
+                    Timings::add(&self.timings.baseline_nanos, building.elapsed());
+                    return Baseline::Replay(sql.clone());
+                }
                 let db = self.create_database().await;
                 let pool = db.pool().await;
                 let migrating = Instant::now();
@@ -663,6 +692,9 @@ impl TestServer {
                         let dumping = Instant::now();
                         let sql = dump_schema(&pool, DEFAULT_SCHEMA).await;
                         Timings::add(&self.timings.dump_nanos, dumping.elapsed());
+                        // Ignored if another server got there first: both dumps describe the
+                        // same schema, so which one wins does not matter.
+                        let _ = CACHED_DUMP.set(sql.clone());
                         Baseline::Replay(sql)
                     }
                 };
