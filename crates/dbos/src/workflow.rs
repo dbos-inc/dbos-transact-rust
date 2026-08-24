@@ -398,12 +398,12 @@ async fn run_until_deadline<F>(
     workflow_id: &str,
     deadline: Option<Timestamp>,
     body: F,
-) -> std::result::Result<Option<String>, Failure>
+) -> Ended
 where
     F: Future<Output = std::result::Result<Option<String>, Failure>>,
 {
     let Some(deadline) = deadline else {
-        return body.await;
+        return Ended::Body(body.await);
     };
     let remaining = deadline
         .duration_since(Timestamp::now())
@@ -413,28 +413,68 @@ where
     // recording a completed workflow as cancelled would discard work that was actually done.
     tokio::select! {
         biased;
-        outcome = body => outcome,
+        outcome = body => Ended::Body(outcome),
         () = tokio::time::sleep(remaining) => {
-            tracing::info!(workflow_id, "the workflow exceeded its deadline and is cancelled");
-            // Durable, unlike every other stop this engine performs. Failing to write it is not
-            // fatal — the row stays PENDING and is recovered, where the expired deadline is read
-            // again and cancels immediately — so this logs rather than propagating.
-            if let Err(error) = executor
-                .sysdb()
-                .cancel_workflows(&[workflow_id], false)
-                .await
-            {
-                tracing::error!(
-                    workflow_id,
-                    %error,
-                    "could not record the deadline cancellation; the row stays PENDING for recovery"
-                );
-            }
-            // Control, so the layer above records nothing: `cancel_workflows` has already written
-            // the terminal state, and an outcome write behind it would contradict the row.
-            Err(Failure::Control(Error::WorkflowCancelled {
-                workflow_id: workflow_id.to_owned(),
-            }))
+            Ended::Terminal(cancel_at_deadline(executor, workflow_id).await)
+        }
+    }
+}
+
+/// How an execution ended, and so whether its caller has anything left to record.
+enum Ended {
+    /// The body ran to a conclusion. That conclusion is this execution's outcome and is written.
+    Body(std::result::Result<Option<String>, Failure>),
+    /// The deadline fired and the row is already terminal — cancelled here, or finished by another
+    /// execution while this one was working. What it holds is the answer; nothing more is written.
+    Terminal(std::result::Result<Option<String>, Failure>),
+}
+
+/// Cancels a workflow whose deadline has passed, and settles on what the row ends up holding.
+///
+/// **`cancel_workflows` reports which ids actually moved, and that is the whole reason to read
+/// it.** `cancel_batch` leaves a workflow that has already finished alone, so an empty result here
+/// means a rival execution recorded an outcome first — recovery after this process was presumed
+/// dead, or another SDK sharing the system database. That outcome is the workflow's, and this
+/// caller must be told the same thing every other caller reads, not a cancellation that the row
+/// does not record and that `handle.status()` would immediately contradict.
+async fn cancel_at_deadline(
+    executor: &Executor,
+    workflow_id: &str,
+) -> std::result::Result<Option<String>, Failure> {
+    let cancelled = || {
+        Err(Failure::Control(Error::WorkflowCancelled {
+            workflow_id: workflow_id.to_owned(),
+        }))
+    };
+    tracing::info!(
+        workflow_id,
+        "the workflow exceeded its deadline and is cancelled"
+    );
+    // Durable, unlike every other stop this engine performs. Failing to write it is not fatal —
+    // the row stays PENDING and is recovered, where the expired deadline is read again and cancels
+    // immediately — so this logs rather than propagating, and still reports the cancellation it
+    // was unable to record.
+    match executor
+        .sysdb()
+        .cancel_workflows(&[workflow_id], false)
+        .await
+    {
+        Ok(moved) if moved.iter().any(|id| id == workflow_id) => cancelled(),
+        Ok(_) => {
+            tracing::warn!(
+                workflow_id,
+                "the deadline fired on a workflow another execution had already finished; its \
+                 recorded outcome stands"
+            );
+            adopt(executor, workflow_id).await
+        }
+        Err(error) => {
+            tracing::error!(
+                workflow_id,
+                %error,
+                "could not record the deadline cancellation; the row stays PENDING for recovery"
+            );
+            cancelled()
         }
     }
 }
@@ -458,13 +498,19 @@ async fn execute(
         })?
         .clone();
 
-    let outcome = run_until_deadline(
+    let outcome = match run_until_deadline(
         executor,
         workflow_id,
         deadline,
         Ctx::scope(ctx, workflow(input)),
     )
-    .await;
+    .await
+    {
+        Ended::Body(outcome) => outcome,
+        // The row is terminal already — this execution has no outcome of its own to write, and a
+        // write behind the one that is there would be refused anyway.
+        Ended::Terminal(settled) => return settled,
+    };
 
     let write = match &outcome {
         Ok(output) => {
@@ -473,14 +519,17 @@ async fn execute(
                 .record_workflow_outcome(workflow_id, Outcome::Output(output.as_deref()))
                 .await
         }
-        // A control signal is not the workflow's outcome, so nothing terminal is written and the
-        // row stays where it was for a later executor to pick up. Warned rather than debug-logged,
-        // because the caller may have dropped its future — this line can be the only evidence.
+        // A control signal is not the workflow's outcome, so this execution writes nothing
+        // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
+        // after a shutdown or a failed write, already CANCELLED when the signal is a cancellation
+        // raised elsewhere and observed by a preemptible step — so the line reports what this
+        // execution did and does not claim a status it has not read. Warned rather than
+        // debug-logged, because the caller may have dropped its future: this can be the only
+        // evidence.
         Err(Failure::Control(control)) => {
             tracing::warn!(
                 error = %control,
-                "a control signal ended this execution: nothing is recorded, and the row stays \
-                 PENDING"
+                "a control signal ended this execution: it records no outcome of its own"
             );
             return outcome;
         }

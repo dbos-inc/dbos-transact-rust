@@ -87,7 +87,7 @@ pub struct StepOptions<E = EngineOnly> {
     /// system database.
     ///
     /// The cost is a periodic status read per running step, at
-    /// [`Config::outcome_poll_interval`](crate::Config::outcome_poll_interval), under the same
+    /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the same
     /// polling-concurrency cap as every other database-backed wait. Python's `preemptible` does
     /// the same and hardcodes its interval.
     ///
@@ -187,15 +187,21 @@ impl<E> StepOptions<E> {
     /// The wait before the attempt following `failures` failures.
     ///
     /// `interval * rate^failures`, capped. Saturating rather than panicking on a nonsensical rate:
-    /// a negative or `NaN` `backoff_rate` yields a non-finite or negative product, and the clamp
-    /// sends both to the cap rather than to a `Duration` constructor that would panic. A retry that
-    /// waits too long is a misconfiguration; a retry that aborts the process is a bug.
+    /// a negative or `NaN` `backoff_rate` yields a non-finite or negative product, and a large one
+    /// yields a product past what a `Duration` can hold — all three go to the cap rather than to a
+    /// constructor that would panic. A retry that waits too long is a misconfiguration; a retry
+    /// that aborts the process is a bug.
+    ///
+    /// **The cap is applied to the `f64`, not to the `Duration` built from it.** Clamping
+    /// afterwards reads the same and is not: `Duration::from_secs_f64` panics on any value that
+    /// overflows a `Duration`, so `interval: 1s, backoff_rate: 1e10` reaches the panic on its
+    /// second failure with the clamp sitting unreachable behind it.
     fn backoff(&self, failures: u32) -> Duration {
         let grown = self.interval.as_secs_f64() * self.backoff_rate.powi(failures as i32);
-        if !grown.is_finite() || grown < 0.0 {
+        if !grown.is_finite() || grown < 0.0 || grown >= self.max_interval.as_secs_f64() {
             return self.max_interval;
         }
-        Duration::from_secs_f64(grown).min(self.max_interval)
+        Duration::from_secs_f64(grown)
     }
 }
 
@@ -640,12 +646,16 @@ mod tests {
 
     /// A rate that cannot produce a duration yields the cap rather than a panic.
     ///
-    /// `Duration::from_secs_f64` panics on a negative or non-finite value, and a step retry is the
-    /// worst place to discover that: it would take the process down on a config typo, mid-workflow.
+    /// `Duration::from_secs_f64` panics on a negative or non-finite value **and on a finite one
+    /// past `u64::MAX` seconds**, and a step retry is the worst place to discover any of the three:
+    /// it would take the process down on a config typo, mid-workflow. `1e10` is the case a clamp
+    /// applied to the `Duration` rather than to the `f64` misses — `1e20` is finite, positive, and
+    /// still unrepresentable.
     #[test]
     fn a_nonsensical_backoff_rate_yields_the_cap() {
         let cap = Duration::from_secs(30);
-        for rate in [-2.0, f64::NAN, f64::INFINITY] {
+        // An odd exponent, so a negative rate is still negative by the time it is measured.
+        for rate in [-2.0, f64::NAN, f64::INFINITY, 1e10, f64::MAX] {
             let options = StepOptions::<EngineOnly> {
                 interval: Duration::from_secs(1),
                 backoff_rate: rate,
@@ -654,6 +664,15 @@ mod tests {
             };
             assert_eq!(options.backoff(3), cap, "rate {rate}");
         }
+        // The overflow the guard alone does not catch: `1e10^2` is finite and positive, and
+        // `1e20` seconds is past `u64::MAX`.
+        let overflows = StepOptions::<EngineOnly> {
+            interval: Duration::from_secs(1),
+            backoff_rate: 1e10,
+            max_interval: cap,
+            ..Default::default()
+        };
+        assert_eq!(overflows.backoff(2), cap);
     }
 
     /// The default is the three-way majority, and it does not retry.

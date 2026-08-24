@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::WorkflowStatus;
+use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{Config, DBOS, Error, StartOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -234,4 +234,66 @@ async fn shutdown_does_not_durably_cancel_a_workflow_that_has_a_deadline() {
         WorkflowStatus::Pending,
         "shutdown durably cancelled a workflow it should have left for recovery"
     );
+}
+
+/// A deadline that fires after another execution has already finished the workflow reports **that
+/// outcome**, not a cancellation.
+///
+/// `cancel_batch` leaves a finished row alone, so the cancellation this execution attempts moves
+/// nothing. Reporting `WorkflowCancelled` anyway would hand this caller an answer no other caller
+/// can see: the row says `SUCCESS`, and so does `handle.status()` on the very same handle.
+#[tokio::test]
+async fn a_deadline_that_loses_to_a_recorded_outcome_reports_that_outcome() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("deadline-race-app", &db));
+    let workflow = dbos
+        .register_workflow("runs_forever", |()| async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<u32, dbos::Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "finished-elsewhere";
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Some(Duration::from_millis(600)),
+            },
+        )
+        .await
+        .expect("start failed");
+
+    // A rival execution — a recovery after this process was presumed dead — records the outcome
+    // while the body here is still sleeping, and before the deadline fires.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let reader = reader(&db).await;
+    reader
+        .record_workflow_outcome(id, Outcome::Output(Some("7")))
+        .await
+        .expect("the rival could not record its outcome");
+
+    assert_eq!(
+        handle
+            .result()
+            .await
+            .expect("the deadline reported a cancellation over a recorded result"),
+        7,
+        "the caller must read what the row holds"
+    );
+
+    let row = reader
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(
+        row.status,
+        WorkflowStatus::Success,
+        "the deadline overwrote a terminal row"
+    );
+
+    dbos.shutdown().await;
 }
