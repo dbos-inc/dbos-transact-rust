@@ -367,11 +367,11 @@ pub(crate) fn spawn_execution(
         {
             let executor = Arc::clone(executor);
             async move {
-                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id);
+                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline);
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, ctx, deadline).await
+                execute(&executor, &key, &workflow_id, input, ctx).await
             }
         }
         .instrument(span),
@@ -486,7 +486,6 @@ async fn execute(
     workflow_id: &str,
     input: Option<String>,
     ctx: Ctx,
-    deadline: Option<Timestamp>,
 ) -> std::result::Result<Option<String>, Failure> {
     let workflow = executor
         .workflows()
@@ -498,6 +497,11 @@ async fn execute(
         })?
         .clone();
 
+    // From the context rather than from a parameter beside it: the deadline is part of what this
+    // workflow *is* for the whole of its run — a child launched halfway through reads the same
+    // value this `select!` is watching — so one copy travels with the context and nothing can hand
+    // the two halves different instants.
+    let deadline = ctx.deadline();
     let outcome = match run_until_deadline(
         executor,
         workflow_id,

@@ -712,7 +712,7 @@ mod tests {
     }
 
     fn ctx(dbos: &DBOS, id: &str) -> Ctx {
-        Ctx::new(dbos.executor("test").expect("launched"), id)
+        Ctx::new(dbos.executor("test").expect("launched"), id, None)
     }
 
     #[tokio::test]
