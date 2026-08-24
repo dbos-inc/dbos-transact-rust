@@ -263,6 +263,41 @@ where
             .await
     }
 
+    /// The running workflow this call is a child of, or `None` when it is a root.
+    ///
+    /// Two refusals, both of them four-of-four, and both about the step counter:
+    ///
+    /// - **Inside a step is an error, not a plain call.** A step is a leaf whose checkpoint stands
+    ///   for everything its body did, so an id-allocating call inside one would shift every later
+    ///   step onto the wrong replay slot. A nested *step* degrades to a plain call because there is
+    ///   a plain version of it; there is no undurable version of starting a child.
+    /// - **A `WorkflowRef` from another instance is [`Error::WrongInstance`].** The step id would
+    ///   come from this workflow's counter and the launch record would be written through the other
+    ///   instance's system database, landing where the workflow that allocated it cannot see it.
+    ///   `get_event` refuses the same combination for the same reason.
+    ///
+    /// Allocating the step id here is what makes the launch position stable across a replay, and it
+    /// happens before anything can fail on the way to using it.
+    fn parent(&self) -> Result<Option<Parent>> {
+        let Some(ctx) = Ctx::current() else {
+            return Ok(None);
+        };
+        if ctx.in_step() {
+            return Err(Error::InsideStep {
+                operation: "starting a workflow".into(),
+            });
+        }
+        if !Arc::ptr_eq(ctx.executor(), &self.dbos().executor("start a workflow")?) {
+            return Err(Error::WrongInstance {
+                operation: "starting a workflow".into(),
+            });
+        }
+        Ok(Some(Parent {
+            workflow_id: ctx.workflow_id().to_owned(),
+            step_id: ctx.next_step_id(),
+        }))
+    }
+
     /// Starts this workflow durably and returns a handle to it, without waiting.
     pub async fn start(&self, input: P) -> Result<WorkflowHandle<R, E>> {
         self.start_with(input, StartOptions::default()).await
@@ -281,11 +316,38 @@ where
         options: StartOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         let executor = self.dbos().executor("start a workflow")?;
-        let workflow_id = match options.workflow_id {
-            Some(id) => id.to_owned(),
-            None => uuid::Uuid::new_v4().to_string(),
-        };
+        // **The ambient context is what makes this a child.** Every reference overloads the same
+        // call rather than adding a `start_child`, so factoring a workflow body out into its own
+        // workflow does not change how its call sites are written — and a workflow started from
+        // outside one is unaffected by everything below.
+        let parent = self.parent()?;
         let input = Some(encode(&input, "argument")?);
+
+        // The launch is recorded against the parent before anything is created, so a replay of
+        // this position finds the child it already started instead of starting a second one.
+        if let Some(parent) = &parent
+            && let Some(child) = parent.recorded_launch(&executor, &self.key().name).await?
+        {
+            tracing::debug!(
+                parent_workflow_id = parent.workflow_id,
+                step_id = parent.step_id,
+                workflow_id = child,
+                "the child workflow was already started; the handle joins it"
+            );
+            return Ok(WorkflowHandle::polling(executor, child));
+        }
+
+        let workflow_id = match (options.workflow_id, &parent) {
+            // An application-assigned id wins over the derivation, in every reference.
+            (Some(id), _) => id.to_owned(),
+            // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
+            // parent re-derives the same id, so the launch is idempotent even when the crash
+            // landed between creating the child and recording it. Rust's step ids are zero-based
+            // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
+            // so a first child is `parent-0` here and in three of the four.
+            (None, Some(parent)) => format!("{}-{}", parent.workflow_id, parent.step_id),
+            (None, None) => uuid::Uuid::new_v4().to_string(),
+        };
 
         // **A directly started workflow gets its deadline now, and the row carries it.** Python
         // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
@@ -299,6 +361,7 @@ where
             .timeout
             .and_then(|timeout| Timestamp::now().checked_add(timeout));
 
+        let started_at = Timestamp::now();
         let initialized = executor
             .sysdb()
             .init_workflow(
@@ -313,6 +376,7 @@ where
                     application_version: Some(executor.application_version()),
                     timeout: options.timeout,
                     deadline,
+                    parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
                     ..NewWorkflow::new(&workflow_id)
                 },
                 Some(MAX_RECOVERY_ATTEMPTS),
@@ -320,6 +384,16 @@ where
             )
             .await
             .map_err(Error::SystemDatabase)?;
+
+        // **After the child exists, not before**, and the order is what makes a crash between the
+        // two harmless: a parent that dies here leaves a child row and no launch record, and the
+        // replay re-derives the same id, finds the row owned, and joins it. The reverse order
+        // would leave a launch record pointing at a workflow that was never created.
+        if let Some(parent) = &parent {
+            parent
+                .record_launch(&executor, &workflow_id, &self.key().name, started_at)
+                .await?;
+        }
 
         // Someone else owns this row — the id was supplied and a previous run has it, or another
         // executor claimed it first. Joining rather than erroring is what makes a retried request
@@ -343,6 +417,74 @@ where
             initialized.deadline,
         );
         Ok(WorkflowHandle::local(executor, workflow_id, task))
+    }
+}
+
+/// The workflow a child is being started from: its id, and the step id the launch occupies.
+///
+/// Built once per `start_with` call, because building it *allocates a step id* — the parent's
+/// counter moves whether or not the launch ends up creating anything, which is what keeps a replay
+/// aligned with the run it is replaying.
+struct Parent {
+    workflow_id: String,
+    step_id: i32,
+}
+
+impl Parent {
+    /// Reads back a launch recorded at this position, if this parent has run this far before.
+    ///
+    /// `check_step` compares the recorded name, so a mismatch here is already
+    /// [`Error::UnexpectedStep`] before this sees it. What is left to check is the child id: a row
+    /// under the right name carrying none was written by a plain step, which means the parent's
+    /// code changed — `step("charge")` became a child workflow named `charge` — and starting a
+    /// child now would give this position two meanings across two runs.
+    ///
+    /// **Stricter than the references here.** Python falls through to a fresh launch when the
+    /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
+    /// up loud rather than wrong — the write conflicts a moment later — but only after a child row
+    /// has been created and orphaned, which is a worse thing to leave behind than an error.
+    async fn recorded_launch(
+        &self,
+        executor: &Executor,
+        step_name: &str,
+    ) -> Result<Option<String>> {
+        let Some(recorded) = executor
+            .sysdb()
+            .check_step(&self.workflow_id, self.step_id, step_name)
+            .await
+            .map_err(Error::SystemDatabase)?
+        else {
+            return Ok(None);
+        };
+        recorded.child_workflow_id.map(Some).ok_or_else(|| {
+            Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+                workflow_id: self.workflow_id.clone(),
+                step_id: self.step_id,
+                expected: format!("a child workflow launch of {step_name}"),
+                recorded: format!("a plain step named {step_name}"),
+            })
+        })
+    }
+
+    /// Records the launch, so the replay above finds it.
+    async fn record_launch(
+        &self,
+        executor: &Executor,
+        child_workflow_id: &str,
+        step_name: &str,
+        started_at: Timestamp,
+    ) -> Result<()> {
+        executor
+            .sysdb()
+            .record_child_workflow(
+                &self.workflow_id,
+                child_workflow_id,
+                self.step_id,
+                step_name,
+                Some(started_at),
+            )
+            .await
+            .map_err(Error::SystemDatabase)
     }
 }
 
