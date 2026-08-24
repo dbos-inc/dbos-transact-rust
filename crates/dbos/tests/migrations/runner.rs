@@ -2,8 +2,8 @@
 //!
 //! What is tested here is the bookkeeping rather than the SQL — that a fresh database ends up
 //! at the right version, that a second call does nothing, that an interrupted run resumes, and
-//! that a database another implementation has taken further is left alone. `migrations.rs`
-//! covers whether the statements themselves are valid.
+//! that a database another implementation has taken further is left alone. The sibling `sql`
+//! module covers whether the statements themselves are valid.
 
 use dbos::sysdb::migrations::runner;
 use dbos::sysdb::migrations::{Dialect, SHARED_MIGRATIONS, quote_identifier};
