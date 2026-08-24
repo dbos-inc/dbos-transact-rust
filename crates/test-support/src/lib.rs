@@ -335,6 +335,179 @@ impl Timings {
     }
 }
 
+/// Set to any value to make every process migrate its own baseline.
+///
+/// The cache below is derived rather than checked in, so it cannot go stale in the usual way —
+/// but it is keyed on the migration SQL, not on the runner that applies it, so a change in how
+/// the runner behaves without any SQL changing is the one thing the key cannot see. This is the
+/// escape hatch for that, and for bisecting anything that smells like a schema difference.
+pub const NO_BASELINE_CACHE_ENV: &str = "DBOS_TEST_NO_BASELINE_CACHE";
+
+/// The CockroachDB schema dump, cached on disk under the target directory.
+///
+/// **Scope is the whole point.** [`CACHED_DUMP`] spares a process a second corpus run; this
+/// spares every process after the first one its only corpus run. Measured in CI, the cockroach
+/// leg spends about 173s migrating baselines across ten test binaries — one each — and cargo
+/// runs those binaries one after another, so it is 173s of straight-line wall clock to reach a
+/// schema that is identical every time.
+///
+/// **It is still not a second definition of the schema**, which is the property worth keeping.
+/// The file is written by a process that migrated a real database with the real runner, and the
+/// key covers every migration's rendered SQL, so a migration that changes anything at all lands
+/// on a different key and nothing stale can be read. What a checked-in baseline would cost —
+/// something to regenerate, and a reviewer having to believe it matches — is exactly what
+/// deriving it avoids. `a_pooled_database_matches_one_the_migrations_built` still holds the
+/// whole arrangement honest, unchanged.
+mod baseline_cache {
+    use std::path::{Path, PathBuf};
+
+    use dbos::sysdb::DEFAULT_SCHEMA;
+    use dbos::sysdb::migrations::{Dialect, build_migrations};
+
+    /// FNV-1a, inline and deterministic.
+    ///
+    /// Not `DefaultHasher`: its output is explicitly not stable across releases, so a toolchain
+    /// upgrade would silently miss every cache entry. A miss is only ever a slow run rather than
+    /// a wrong one, but a cache that quietly stops working is worse than no cache, because
+    /// nothing says so.
+    fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Everything that decides what the dumped schema looks like.
+    ///
+    /// The migration corpus is the substance. The schema name is in every rendered statement.
+    /// **The image tag matters too**, and less obviously: the dump is `SHOW CREATE ALL TABLES`
+    /// output, so its syntax belongs to the server that produced it, and replaying one version's
+    /// dump into another is not a thing to do by accident.
+    pub(super) fn key(image: (&str, &str)) -> u64 {
+        let mut hash = fnv1a(DEFAULT_SCHEMA.as_bytes(), 0xcbf2_9ce4_8422_2325);
+        hash = fnv1a(image.0.as_bytes(), hash);
+        hash = fnv1a(image.1.as_bytes(), hash);
+        // `true` for `use_listen_notify`, matching the runner call in `baseline`. It changes
+        // nothing on CockroachDB, which has no LISTEN/NOTIFY, and is hashed anyway so that a
+        // harness which ever stops passing `true` cannot read a file written by one that did.
+        for migration in build_migrations(DEFAULT_SCHEMA, Dialect::Cockroach, true) {
+            hash = fnv1a(&migration.version.to_le_bytes(), hash);
+            hash = fnv1a(migration.sql.as_bytes(), hash);
+            hash = fnv1a(&[u8::from(migration.online)], hash);
+            hash = fnv1a(migration.guard.unwrap_or("").as_bytes(), hash);
+        }
+        hash
+    }
+
+    /// Where the dump for this corpus lives, or `None` if caching is off or the path is unknown.
+    ///
+    /// Derived from the running test binary — `target/<profile>/deps/<name>` — rather than from
+    /// `CARGO_TARGET_TMPDIR`, which cargo sets for integration tests but not for the unit tests
+    /// compiled into `src/`, and those are a third of the binaries this needs to serve. Living
+    /// under the target directory means it is already ignored, already per-workspace, and
+    /// already removed by `cargo clean`.
+    pub(super) fn path(image: (&str, &str)) -> Option<PathBuf> {
+        if std::env::var_os(super::NO_BASELINE_CACHE_ENV).is_some() {
+            return None;
+        }
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?.parent()?;
+        Some(dir.join(format!("dbos-baseline-{:016x}.sql", key(image))))
+    }
+
+    /// The cached dump, if one is there and readable.
+    pub(super) fn load(path: &Path) -> Option<String> {
+        let sql = std::fs::read_to_string(path).ok()?;
+        (!sql.trim().is_empty()).then_some(sql)
+    }
+
+    /// Writes the dump so that no reader can observe a partial one.
+    ///
+    /// Write-then-rename, because `rename` within a directory is atomic: a reader sees the old
+    /// file or the new one, never half of either. Two processes racing here both write the same
+    /// bytes — same key, same schema — so whichever rename lands last is equally correct.
+    ///
+    /// Failures are ignored. A cache that cannot be written is a slower suite, and turning that
+    /// into a test failure would be trading a real guarantee for a performance one.
+    pub(super) fn store(path: &Path, sql: &str) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let temporary = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
+        if std::fs::write(&temporary, sql).is_ok() && std::fs::rename(&temporary, path).is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+    }
+}
+
+#[cfg(test)]
+mod baseline_cache_tests {
+    use super::baseline_cache::{key, load, store};
+
+    const IMAGE: (&str, &str) = ("cockroachdb/cockroach", "latest-v26.2");
+
+    /// The key must be a function of its inputs and nothing else, or two binaries in one run
+    /// disagree about which file to read.
+    #[test]
+    fn the_same_inputs_give_the_same_key() {
+        assert_eq!(key(IMAGE), key(IMAGE));
+    }
+
+    /// **The server version is part of the schema's identity.** The dump is `SHOW CREATE ALL
+    /// TABLES` output, whose syntax belongs to the server that produced it, so replaying one
+    /// version's into another is exactly the mistake this half of the key exists to prevent.
+    #[test]
+    fn a_different_server_version_gets_a_different_key() {
+        assert_ne!(key(IMAGE), key(("cockroachdb/cockroach", "latest-v25.1")));
+        assert_ne!(key(IMAGE), key(("cockroachdb/cockroach-unstable", IMAGE.1)));
+    }
+
+    /// A cached dump has to come back byte for byte: it is replayed as SQL, so anything less
+    /// is a schema that silently differs from the one the migrations build.
+    #[test]
+    fn a_stored_dump_loads_back_unchanged() {
+        let dir = std::env::temp_dir().join(format!("dbos-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
+        let path = dir.join("baseline.sql");
+        let sql = "CREATE TABLE dbos.t (a INT8);\nINSERT INTO dbos.dbos_migrations VALUES (107);\n";
+
+        assert_eq!(
+            load(&path),
+            None,
+            "nothing is cached before anything is stored"
+        );
+        store(&path, sql);
+        assert_eq!(load(&path).as_deref(), Some(sql));
+
+        // Whitespace-only is treated as absent: a zero-length file is what a torn write or an
+        // out-of-space failure leaves behind, and replaying it would produce an empty schema
+        // that fails much later and much less clearly.
+        store(&path, "   \n");
+        assert_eq!(load(&path), None);
+
+        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
+    }
+
+    /// Writing must not leave the temporary file behind, or the target directory accumulates
+    /// one per process for the life of the checkout.
+    #[test]
+    fn storing_leaves_only_the_cache_file() {
+        let dir = std::env::temp_dir().join(format!("dbos-cache-tidy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
+        let path = dir.join("baseline.sql");
+        store(&path, "CREATE TABLE dbos.t (a INT8);\n");
+
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("failed to list the test directory")
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(left, vec!["baseline.sql".to_owned()]);
+
+        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
+    }
+}
+
 /// A running database server, shared by every test holding an [`Arc`] of it.
 ///
 /// Dropping the last `Arc` removes the container.
@@ -679,6 +852,19 @@ impl TestServer {
                     Timings::add(&self.timings.baseline_nanos, building.elapsed());
                     return Baseline::Replay(sql.clone());
                 }
+                // Then the same dump left by an earlier process, which is what spares every
+                // test binary after the first its corpus run. Cheap enough to be worth trying
+                // before starting a database: a file read against ~19s of online DDL.
+                let cache = (self.backend == Backend::Cockroach)
+                    .then(|| baseline_cache::path(COCKROACH_IMAGE))
+                    .flatten();
+                if let Some(path) = cache.as_deref()
+                    && let Some(sql) = baseline_cache::load(path)
+                {
+                    let sql = CACHED_DUMP.get_or_init(|| sql).clone();
+                    Timings::add(&self.timings.baseline_nanos, building.elapsed());
+                    return Baseline::Replay(sql);
+                }
                 let db = self.create_database().await;
                 let pool = db.pool().await;
                 let migrating = Instant::now();
@@ -695,6 +881,9 @@ impl TestServer {
                         // Ignored if another server got there first: both dumps describe the
                         // same schema, so which one wins does not matter.
                         let _ = CACHED_DUMP.set(sql.clone());
+                        if let Some(path) = cache.as_deref() {
+                            baseline_cache::store(path, &sql);
+                        }
                         Baseline::Replay(sql)
                     }
                 };
