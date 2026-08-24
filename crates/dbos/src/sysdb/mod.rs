@@ -1211,4 +1211,53 @@ pub trait SystemDatabase: Send + Sync {
         step_name: &str,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error>;
+
+    /// Reads back a recorded child-workflow await, or `None` if the parent has not got this far.
+    ///
+    /// The replay gate for [`record_child_result`](Self::record_child_result), and the reason a
+    /// parent that already learned its child's outcome does not wait for it a second time. Provided
+    /// rather than implemented, because it is [`check_step`](Self::check_step) under the one name
+    /// every implementation records these under — a backend has nothing of its own to add.
+    async fn check_child_result(
+        &self,
+        parent_workflow_id: &str,
+        step_id: i32,
+    ) -> Result<Option<StepRecord>, Error> {
+        self.check_step(parent_workflow_id, step_id, GET_RESULT_STEP_NAME)
+            .await
+    }
+
+    /// Records what a child workflow returned, as a step of the parent that awaited it.
+    ///
+    /// **The parent's second checkpoint for one child.** The first — `record_child_workflow` —
+    /// records the *launch* and deliberately carries no result, because the child's outcome lives
+    /// on the child's own row. This one records that the parent *observed* that outcome, which is
+    /// a different fact and one only the parent can state: it is what lets a replayed parent
+    /// continue from a value it already has instead of waiting on a workflow that may since have
+    /// been forked, deleted, or restarted.
+    ///
+    /// Unlike its sibling, this **is** [`record_step`](Self::record_step) with a child id attached,
+    /// and it resolves a duplicate write the same way — by comparing the completion timestamp. It
+    /// is a separate method only so the child id stays off that signature, which every ordinary
+    /// step would then pass `None` to.
+    ///
+    /// The step name is not a parameter for the same reason it is not one on
+    /// [`record_sleep`](Self::record_sleep): `"DBOS.getResult"` is what all four implementations
+    /// write, and a caller that could choose would be choosing wrong.
+    async fn record_child_result(
+        &self,
+        parent_workflow_id: &str,
+        step_id: i32,
+        child_workflow_id: &str,
+        outcome: Outcome<'_>,
+        serialization: Option<&str>,
+        timing: Option<StepTiming>,
+    ) -> Result<(), Error>;
 }
+
+/// What every implementation names the step a parent writes when it awaits a child.
+///
+/// Python (`_sys_db.py`, `function_name="DBOS.getResult"`), TypeScript, Go (`StepName:
+/// "DBOS.getResult"`) and Java all record exactly this, so a step listing reads the same whichever
+/// SDK ran the parent — which is what Conductor renders.
+pub(crate) const GET_RESULT_STEP_NAME: &str = "DBOS.getResult";

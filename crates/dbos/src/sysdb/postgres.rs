@@ -72,10 +72,10 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use self::listener::Listener;
 use self::notifier::Notifier;
-use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
 use super::notify::{EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key};
 use super::retry::{RetryPolicy, with_retry};
+use super::{GET_RESULT_STEP_NAME, PARTITIONED_DEQUEUE_SWEEP_CAP};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -679,6 +679,7 @@ impl PostgresSystemDatabase {
                 Outcome::Output(Some(&recorded)),
                 Some(PORTABLE_JSON),
                 Some(timing),
+                None,
             )
             .await?;
         }
@@ -1465,6 +1466,9 @@ impl PostgresSystemDatabase {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        // The workflow this step's result was adopted from, for a parent awaiting a child.
+        // `None` for a step that did its own work.
+        child_workflow_id: Option<&str>,
     ) -> Result<(), Error> {
         if workflow_id.is_empty() {
             return Err(Error::InvalidInput {
@@ -1515,8 +1519,8 @@ impl PostgresSystemDatabase {
             let stored: Option<Option<i64>> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, output, \
                  error, serialization, started_at_epoch_ms, completed_at_epoch_ms, \
-                 application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 application_name, child_workflow_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
                  SET completed_at_epoch_ms = {steps_table}.completed_at_epoch_ms \
                  RETURNING completed_at_epoch_ms"
@@ -1533,6 +1537,7 @@ impl PostgresSystemDatabase {
             // and the conflict update leaves an existing row's owner alone for the same reason
             // the completion timestamp is left alone.
             .bind(application_name)
+            .bind(child_workflow_id)
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1771,6 +1776,7 @@ impl PostgresSystemDatabase {
                     Outcome::Output(Some(&recorded)),
                     Some(PORTABLE_JSON),
                     Some(timing),
+                    None,
                 )
                 .await
             {
@@ -3501,6 +3507,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     Outcome::Output(None),
                     None,
                     Some(timing),
+                    None,
                 )
                 .await?;
             }
@@ -3733,6 +3740,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
                 message.as_ref().and_then(|m| m.serialization.as_deref()),
                 Some(timing),
+                None,
             )
             .await?;
             tx.commit().await?;
@@ -3836,6 +3844,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                         Outcome::Output(None),
                         None,
                         Some(timing),
+                        None,
                     )
                     .await?;
                 }
@@ -3938,6 +3947,34 @@ impl SystemDatabase for PostgresSystemDatabase {
                 outcome,
                 serialization,
                 timing,
+                None,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn record_child_result(
+        &self,
+        parent_workflow_id: &str,
+        step_id: i32,
+        child_workflow_id: &str,
+        outcome: Outcome<'_>,
+        serialization: Option<&str>,
+        timing: Option<StepTiming>,
+    ) -> Result<(), Error> {
+        let pool = &self.pool;
+        with_retry(&self.retry, "record_child_result", move || async move {
+            let mut conn = pool.acquire().await?;
+            self.record_step_on(
+                &mut conn,
+                parent_workflow_id,
+                step_id,
+                GET_RESULT_STEP_NAME,
+                outcome,
+                serialization,
+                timing,
+                Some(child_workflow_id),
             )
             .await
         })
@@ -4057,6 +4094,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Outcome::Output(None),
                 None,
                 Some(timing),
+                None,
             )
             .await?;
 
@@ -4247,6 +4285,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Outcome::Output(found.map(|v| v.value.as_str())),
                 found.and_then(|v| v.serialization.as_deref()),
                 Some(timing),
+                None,
             )
             .await?;
             tx.commit().await?;

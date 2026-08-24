@@ -27,6 +27,10 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 ///
 /// Zero-based, matching Go, TypeScript and Java: a parent's first child is `parent-0`. Python is
 /// the one-based outlier, which is the step-numbering inconsistency showing up in an id.
+///
+/// **A `run` costs two step ids** — the launch and the await — so consecutive children are `-0` and
+/// `-2` rather than `-0` and `-1`. Every reference numbers them the same way, for the same reason:
+/// one counter, and both halves take from it.
 #[tokio::test]
 async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
     let db = test_database().await;
@@ -60,7 +64,7 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
     assert_eq!(total, 142, "both children ran");
 
     let reader = reader(&db).await;
-    for (step_id, expected) in [(0, "the-parent-0"), (1, "the-parent-1")] {
+    for (step_id, expected) in [(0, "the-parent-0"), (2, "the-parent-2")] {
         let row = reader
             .get_workflow(expected)
             .await
@@ -158,7 +162,9 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
                 .list_workflow_steps(id, false, None, None)
                 .await
                 .expect("read failed");
-            if steps.len() >= 3 {
+            // Two children launched and awaited, and the third launched: five steps, with the
+            // third child's await still outstanding.
+            if steps.len() >= 5 {
                 break;
             }
             assert!(
@@ -244,7 +250,11 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
         .list_workflow_steps(id, false, None, None)
         .await
         .expect("read failed");
-    assert_eq!(steps.len(), 3, "one launch per child: {steps:?}");
+    assert_eq!(
+        steps.len(),
+        6,
+        "a launch and an await per child, and no second set: {steps:?}"
+    );
     assert_eq!(
         bodies.load(Ordering::SeqCst),
         ran_before + 1,
@@ -522,6 +532,249 @@ async fn a_workflow_started_outside_a_workflow_has_no_parent() {
         .expect("read failed")
         .expect("the row is missing");
     assert!(row.parent_workflow_id.is_none());
+
+    dbos.shutdown().await;
+}
+
+/// Awaiting a child is itself a step: the parent records what the child returned.
+///
+/// `DBOS.getResult` is the name all four implementations write, so a step listing reads the same
+/// whichever SDK ran the parent. The row carries the child's own encoded output, not a re-encoding
+/// of it, and the child id beside it.
+#[tokio::test]
+async fn awaiting_a_child_is_recorded_as_a_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("await-checkpoint-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(99) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move { child.run(()).await }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "records-its-await";
+    assert_eq!(
+        parent
+            .run_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(id),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("the parent failed"),
+        99
+    );
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(id, true, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 2, "one launch, one await: {steps:?}");
+    assert_eq!(steps[0].step_name, "child", "the launch");
+    assert_eq!(steps[1].step_name, "DBOS.getResult", "the await");
+    assert_eq!(steps[1].output.as_deref(), Some("99"));
+    assert_eq!(
+        steps[1].child_workflow_id.as_deref(),
+        Some("records-its-await-0"),
+        "the await says which child it was waiting on"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A replayed parent takes the recorded outcome instead of waiting on the child again.
+///
+/// The child is deleted out from under the recovered parent — a workflow that no longer exists
+/// cannot be awaited, so finishing anyway is only possible from the recorded value.
+#[tokio::test]
+async fn a_replayed_parent_reads_the_recorded_outcome_rather_than_waiting_again() {
+    let db = test_database().await;
+    let id = "already-knows";
+    let reader = reader(&db).await;
+
+    // First process: the child finishes and its result is recorded, then the parent is killed
+    // before it can finish.
+    {
+        let dbos = DBOS::new(config("replay-await-app", &db));
+        let child = dbos
+            .register_workflow("child", |()| async move { Ok::<u32, Error>(5) })
+            .unwrap();
+        let parent = dbos
+            .register_workflow("parent", move |()| {
+                let child = child.clone();
+                async move {
+                    let value = child.run(()).await?;
+                    // Long enough that shutdown lands after the await is recorded.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok::<u32, Error>(value)
+                }
+            })
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+        parent
+            .start_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(id),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("start failed");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let steps = reader
+                .list_workflow_steps(id, false, None, None)
+                .await
+                .expect("read failed");
+            if steps.len() == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the await was never recorded: {steps:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        dbos.shutdown().await;
+    }
+
+    // The child is gone. Only the parent's recorded copy of its result is left.
+    reader
+        .delete_workflows(&[&format!("{id}-0")], false)
+        .await
+        .expect("delete failed");
+    assert!(
+        reader
+            .get_workflow(&format!("{id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the child was deleted"
+    );
+
+    // Second process: recovery replays the parent, which must not go looking for the child.
+    let dbos = DBOS::new(config("replay-await-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(5) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move { child.run(()).await }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    drop(parent);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let row = reader
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing");
+        if row.status == WorkflowStatus::Success {
+            assert_eq!(row.output.as_deref(), Some("5"), "from the recorded await");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replayed parent did not finish; status {:?}",
+            row.status
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    dbos.shutdown().await;
+}
+
+/// A cancelled child is reported to its parent as an *awaited* cancellation, not as the parent
+/// being cancelled — and that outcome is recorded like any other.
+#[tokio::test]
+async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("cancelled-child-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<u32, Error>(1)
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                // Its own budget, so the child cancels itself while the parent waits.
+                child
+                    .run_with(
+                        (),
+                        StartOptions {
+                            timeout: Some(Duration::from_millis(300)),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "waits-on-a-doomed-child";
+    let error = parent
+        .run_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect_err("the parent succeeded");
+    match &error {
+        Error::AwaitedWorkflowCancelled { workflow_id } => {
+            assert_eq!(
+                workflow_id, "waits-on-a-doomed-child-0",
+                "the child, not the parent"
+            );
+        }
+        other => panic!("expected an awaited cancellation, got {other:?}"),
+    }
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None)
+        .await
+        .expect("read failed");
+    let await_step = steps
+        .iter()
+        .find(|step| step.step_name == "DBOS.getResult")
+        .expect("the await was not recorded");
+    let recorded = await_step.error.as_deref().expect("no error recorded");
+    assert!(
+        recorded.contains("AwaitedWorkflowCancelled"),
+        "the row says the awaited workflow was cancelled: {recorded}"
+    );
+
+    // The parent failed with it rather than being cancelled itself.
+    let row = reader
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(
+        row.status,
+        WorkflowStatus::Error,
+        "the parent failed; it was not itself cancelled"
+    );
 
     dbos.shutdown().await;
 }
