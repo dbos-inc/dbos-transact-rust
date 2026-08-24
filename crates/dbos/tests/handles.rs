@@ -50,6 +50,7 @@ async fn starting_a_taken_id_joins_the_existing_run() {
 
     let options = || StartOptions {
         workflow_id: Some("task-42"),
+        ..Default::default()
     };
     // Returns at once, before the workflow finishes: it is blocked at the gate.
     let first = slow.start_with((), options()).await.expect("start failed");
@@ -112,6 +113,7 @@ async fn a_polling_handle_returns_the_typed_error_the_run_recorded() {
 
     let options = || StartOptions {
         workflow_id: Some("order-1"),
+        ..Default::default()
     };
     let err = checkout
         .run_with((), options())

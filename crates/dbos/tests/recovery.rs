@@ -75,14 +75,20 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
             let (one, two) = (Arc::clone(&one), Arc::clone(&two));
             let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
             async move {
-                dbos::step("one", move || async move {
-                    one.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                dbos::step("one", || {
+                    let one = Arc::clone(&one);
+                    async move {
+                        one.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
                 })
                 .await?;
-                dbos::step("two", move || async move {
-                    two.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                dbos::step("two", || {
+                    let two = Arc::clone(&two);
+                    async move {
+                        two.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
                 })
                 .await?;
                 reached.notify_one();

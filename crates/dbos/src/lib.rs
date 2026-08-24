@@ -40,6 +40,8 @@ mod registry;
 #[cfg(feature = "engine")]
 mod serialization;
 #[cfg(feature = "engine")]
+mod sleep;
+#[cfg(feature = "engine")]
 mod step;
 #[cfg(feature = "engine")]
 mod workflow;
@@ -62,6 +64,8 @@ pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
-pub use step::step;
+pub use sleep::sleep;
+#[cfg(feature = "engine")]
+pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use workflow::StartOptions;

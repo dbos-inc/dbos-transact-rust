@@ -18,7 +18,11 @@ default = ["engine"]
 # `tokio/rt` is enabled from here rather than from the dependency itself, which is what keeps
 # the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`, `spawn` — is the
 # engine's, and a core-only build has no business pulling one in.
-engine = ["tokio/rt"]
+# `macros` joins `rt` for the same reason: the step supervisor races a body against its timeout
+# with `tokio::select!`, and that is engine code. Without it here the lib only compiled because
+# dev-dependencies happened to turn the feature on for the test build — which `cargo doc` and
+# `--no-default-features` both see through.
+engine = ["tokio/rt", "tokio/macros"]
 # A `macros` feature (implying `engine`) arrives with the `dbos-macros` crate. Adding a
 # feature is not a breaking change, so it waits until it re-exports something.
 
@@ -35,6 +39,12 @@ tracing = "0.1"
 # `async fn` in traits is stable but not dyn-compatible, and `SystemDatabase` has to be a
 # trait object so a second backend can be dropped in without the callers changing.
 async-trait = "0.1"
+# `CancellationToken` alone: the step supervisor needs a signal a body can observe from work the
+# runtime cannot interrupt by dropping a future — a `spawn_blocking` thread, or a client holding
+# its own cancel handle. Already in the tree as a transitive dependency of `sqlx`, so this adds a
+# name to the manifest and no crate to the build. PLAN.md §4.5 already reaches for the same crate's
+# `TaskTracker` at shutdown.
+tokio-util = { version = "0.7", default-features = false }
 # Owner identities for the single-execution guard, and workflow ids.
 uuid = { version = "1", features = ["v4"] }
 # Columns whose shape this layer owns rather than passes through: `authenticated_roles` is always

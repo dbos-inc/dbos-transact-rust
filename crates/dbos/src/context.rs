@@ -11,6 +11,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::dbos::Executor;
 
 tokio::task_local! {
@@ -27,6 +29,17 @@ tokio::task_local! {
 pub struct Ctx {
     executor: Arc<Executor>,
     workflow: Arc<WorkflowState>,
+    /// Fires when the step running under this context should stop.
+    ///
+    /// **On the `Ctx` rather than on [`WorkflowState`], because it belongs to one attempt.** A
+    /// retried step gets a fresh token per attempt, and the shared state is exactly what must not
+    /// carry it — a token cancelled by attempt one would arrive already-cancelled at attempt two.
+    /// [`in_step_scope`](Self::in_step_scope) rebinds the task-local with a `Ctx` holding the
+    /// attempt's token, which works because cloning a `Ctx` shares the workflow state that has to
+    /// be shared and copies only this.
+    ///
+    /// `None` outside a step, and outside a step there is nothing to cancel.
+    step_cancellation: Option<CancellationToken>,
 }
 
 /// The parts of a workflow that outlive any one call within it.
@@ -77,6 +90,7 @@ impl Ctx {
                 next_step_id: AtomicI32::new(0),
                 in_step: AtomicBool::new(false),
             }),
+            step_cancellation: None,
         }
     }
 
@@ -139,10 +153,37 @@ impl Ctx {
     /// place.
     ///
     /// [`step`]: crate::step
-    pub(crate) async fn in_step_scope<F: Future>(&self, body: F) -> F::Output {
+    pub(crate) async fn in_step_scope<F: Future>(
+        &self,
+        cancellation: Option<CancellationToken>,
+        body: F,
+    ) -> F::Output {
         let _guard = InStep(Arc::clone(&self.workflow));
         self.workflow.in_step.store(true, Ordering::Relaxed);
-        body.await
+        // Rebinding rather than mutating: the body must see this attempt's token, and the `Ctx`
+        // the workflow body holds must not acquire one that outlives the step.
+        let scoped = Ctx {
+            executor: Arc::clone(&self.executor),
+            workflow: Arc::clone(&self.workflow),
+            step_cancellation: cancellation,
+        };
+        CURRENT.scope(scoped, body).await
+    }
+
+    /// Fires when the running step should stop.
+    ///
+    /// Observe it from work the runtime cannot stop by dropping this future — a `spawn_blocking`
+    /// thread, or a client that holds its own cancel handle. **Ordinary `async` code needs
+    /// nothing**: a step that times out has its future dropped, which stops it at its next
+    /// suspension point and runs its destructors on the way out, so a connection is returned and a
+    /// guard released without the body containing a line about it. That is what TypeScript's
+    /// `stepStatus.timeoutSignal` is for, and Rust gets the common case for free where TypeScript
+    /// has to abandon the attempt and discard its eventual settlement.
+    ///
+    /// Returns a token that is never cancelled when there is no step running, so a body that is
+    /// also called outside a workflow needs no second path.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.step_cancellation.clone().unwrap_or_default()
     }
 }
 

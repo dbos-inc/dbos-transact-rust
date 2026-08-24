@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -14,7 +15,9 @@ use crate::error::{DurableError, Error, Failure, Result};
 use crate::handle::WorkflowHandle;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
-use crate::sysdb::types::{AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission};
+use crate::sysdb::types::{
+    AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
+};
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
 ///
@@ -220,6 +223,18 @@ pub struct StartOptions<'a> {
     /// A caller-supplied id is an idempotency key: starting the same id twice joins the workflow
     /// already running — or already finished — rather than failing the second caller.
     pub workflow_id: Option<&'a str>,
+    /// How long the whole workflow may take. `None` lets it run as long as it likes.
+    ///
+    /// **Durable, and unlike a step timeout it cancels rather than fails.** The budget becomes a
+    /// wall-clock deadline stored on the row, so it survives a crash: a workflow recovered with
+    /// two minutes left has two minutes, not the whole budget again. On expiry the row goes
+    /// `CANCELLED` and callers awaiting it get [`Error::WorkflowCancelled`], which is what all four
+    /// references do.
+    ///
+    /// A step's [`timeout`](crate::StepOptions::timeout) bounds one attempt and is recorded as a
+    /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
+    /// cancelled workflow was interrupted, not wrong.
+    pub timeout: Option<Duration>,
 }
 
 impl<P, R, E> WorkflowRef<P, R, E>
@@ -272,6 +287,18 @@ where
         };
         let input = Some(encode(&input, "argument")?);
 
+        // **A directly started workflow gets its deadline now, and the row carries it.** Python
+        // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
+        // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
+        // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
+        // not another hour, and a crash loop cannot extend the budget indefinitely.
+        //
+        // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
+        // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
+        let deadline = options
+            .timeout
+            .and_then(|timeout| Timestamp::now().checked_add(timeout));
+
         let initialized = executor
             .sysdb()
             .init_workflow(
@@ -284,6 +311,8 @@ where
                     executor_id: Some(executor.executor_id()),
                     application_name: Some(executor.app_name()),
                     application_version: Some(executor.application_version()),
+                    timeout: options.timeout,
+                    deadline,
                     ..NewWorkflow::new(&workflow_id)
                 },
                 Some(MAX_RECOVERY_ATTEMPTS),
@@ -303,7 +332,16 @@ where
             return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
 
-        let task = spawn_execution(&executor, self.key().clone(), workflow_id.clone(), input);
+        // The deadline the *database* holds, not the one this caller offered: `init_workflow`
+        // turns a budget into an instant against its own clock, and an existing row keeps the
+        // deadline it already had rather than taking a new one from a joining caller.
+        let task = spawn_execution(
+            &executor,
+            self.key().clone(),
+            workflow_id.clone(),
+            input,
+            initialized.deadline,
+        );
         Ok(WorkflowHandle::local(executor, workflow_id, task))
     }
 }
@@ -321,6 +359,7 @@ pub(crate) fn spawn_execution(
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
+    deadline: Option<Timestamp>,
 ) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
@@ -332,11 +371,112 @@ pub(crate) fn spawn_execution(
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, ctx).await
+                execute(&executor, &key, &workflow_id, input, ctx, deadline).await
             }
         }
         .instrument(span),
     )
+}
+
+/// Runs `body` until it finishes or its deadline passes, cancelling it durably if the deadline wins.
+///
+/// **This is the engine's only durable-cancellation path, and shutdown deliberately does not go
+/// through it.** Go #426 had to fix exactly that confusion: its shutdown cancelled a context, the
+/// context fired the durable cancel hook, and workflows that should have stayed `PENDING` for
+/// recovery were written `CANCELLED` — inverting what shutdown means. Here the two use different
+/// mechanisms rather than a shared hook. A deadline is a branch of this `select!` that writes
+/// `CANCELLED` before returning; shutdown aborts the task outright, so no code of ours runs, no
+/// row is written, and the workflow is recovered. There is no cause to inspect because there is no
+/// single hook both reach, which is why this carries no cancellation-cause enum.
+///
+/// The deadline is an *instant* rather than a budget, and that is what makes it survive a crash: a
+/// workflow recovered with two minutes left waits two minutes, not the whole timeout again. A
+/// deadline already in the past yields a zero wait and cancels at once, which is the correct
+/// reading of a workflow recovered after its expiry.
+async fn run_until_deadline<F>(
+    executor: &Executor,
+    workflow_id: &str,
+    deadline: Option<Timestamp>,
+    body: F,
+) -> Ended
+where
+    F: Future<Output = std::result::Result<Option<String>, Failure>>,
+{
+    let Some(deadline) = deadline else {
+        return Ended::Body(body.await);
+    };
+    let remaining = deadline
+        .duration_since(Timestamp::now())
+        .unwrap_or(Duration::ZERO);
+
+    // Biased so a body that finished in the same instant keeps its outcome: it did complete, and
+    // recording a completed workflow as cancelled would discard work that was actually done.
+    tokio::select! {
+        biased;
+        outcome = body => Ended::Body(outcome),
+        () = tokio::time::sleep(remaining) => {
+            Ended::Terminal(cancel_at_deadline(executor, workflow_id).await)
+        }
+    }
+}
+
+/// How an execution ended, and so whether its caller has anything left to record.
+enum Ended {
+    /// The body ran to a conclusion. That conclusion is this execution's outcome and is written.
+    Body(std::result::Result<Option<String>, Failure>),
+    /// The deadline fired and the row is already terminal — cancelled here, or finished by another
+    /// execution while this one was working. What it holds is the answer; nothing more is written.
+    Terminal(std::result::Result<Option<String>, Failure>),
+}
+
+/// Cancels a workflow whose deadline has passed, and settles on what the row ends up holding.
+///
+/// **`cancel_workflows` reports which ids actually moved, and that is the whole reason to read
+/// it.** `cancel_batch` leaves a workflow that has already finished alone, so an empty result here
+/// means a rival execution recorded an outcome first — recovery after this process was presumed
+/// dead, or another SDK sharing the system database. That outcome is the workflow's, and this
+/// caller must be told the same thing every other caller reads, not a cancellation that the row
+/// does not record and that `handle.status()` would immediately contradict.
+async fn cancel_at_deadline(
+    executor: &Executor,
+    workflow_id: &str,
+) -> std::result::Result<Option<String>, Failure> {
+    let cancelled = || {
+        Err(Failure::Control(Error::WorkflowCancelled {
+            workflow_id: workflow_id.to_owned(),
+        }))
+    };
+    tracing::info!(
+        workflow_id,
+        "the workflow exceeded its deadline and is cancelled"
+    );
+    // Durable, unlike every other stop this engine performs. Failing to write it is not fatal —
+    // the row stays PENDING and is recovered, where the expired deadline is read again and cancels
+    // immediately — so this logs rather than propagating, and still reports the cancellation it
+    // was unable to record.
+    match executor
+        .sysdb()
+        .cancel_workflows(&[workflow_id], false)
+        .await
+    {
+        Ok(moved) if moved.iter().any(|id| id == workflow_id) => cancelled(),
+        Ok(_) => {
+            tracing::warn!(
+                workflow_id,
+                "the deadline fired on a workflow another execution had already finished; its \
+                 recorded outcome stands"
+            );
+            adopt(executor, workflow_id).await
+        }
+        Err(error) => {
+            tracing::error!(
+                workflow_id,
+                %error,
+                "could not record the deadline cancellation; the row stays PENDING for recovery"
+            );
+            cancelled()
+        }
+    }
 }
 
 /// Runs the body with a context ambient and records what it did.
@@ -346,6 +486,7 @@ async fn execute(
     workflow_id: &str,
     input: Option<String>,
     ctx: Ctx,
+    deadline: Option<Timestamp>,
 ) -> std::result::Result<Option<String>, Failure> {
     let workflow = executor
         .workflows()
@@ -357,7 +498,19 @@ async fn execute(
         })?
         .clone();
 
-    let outcome = Ctx::scope(ctx, workflow(input)).await;
+    let outcome = match run_until_deadline(
+        executor,
+        workflow_id,
+        deadline,
+        Ctx::scope(ctx, workflow(input)),
+    )
+    .await
+    {
+        Ended::Body(outcome) => outcome,
+        // The row is terminal already — this execution has no outcome of its own to write, and a
+        // write behind the one that is there would be refused anyway.
+        Ended::Terminal(settled) => return settled,
+    };
 
     let write = match &outcome {
         Ok(output) => {
@@ -366,14 +519,17 @@ async fn execute(
                 .record_workflow_outcome(workflow_id, Outcome::Output(output.as_deref()))
                 .await
         }
-        // A control signal is not the workflow's outcome, so nothing terminal is written and the
-        // row stays where it was for a later executor to pick up. Warned rather than debug-logged,
-        // because the caller may have dropped its future — this line can be the only evidence.
+        // A control signal is not the workflow's outcome, so this execution writes nothing
+        // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
+        // after a shutdown or a failed write, already CANCELLED when the signal is a cancellation
+        // raised elsewhere and observed by a preemptible step — so the line reports what this
+        // execution did and does not claim a status it has not read. Warned rather than
+        // debug-logged, because the caller may have dropped its future: this can be the only
+        // evidence.
         Err(Failure::Control(control)) => {
             tracing::warn!(
                 error = %control,
-                "a control signal ended this execution: nothing is recorded, and the row stays \
-                 PENDING"
+                "a control signal ended this execution: it records no outcome of its own"
             );
             return outcome;
         }

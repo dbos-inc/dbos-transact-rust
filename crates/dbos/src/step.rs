@@ -1,15 +1,209 @@
 //! Steps: the checkpoints that make a workflow resumable.
 
 use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::context::Ctx;
-use crate::error::{DurableError, Error, Result};
+use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
-use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
+use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
+
+/// A step's retry predicate: given a failure, whether to try again.
+///
+/// Named as a type because it appears in [`StepOptions::should_retry`]'s field, where the bare
+/// `Arc<dyn Fn(..)>` is more punctuation than signature. Callers rarely write it —
+/// [`StepOptions::should_retry`](StepOptions::should_retry) takes the closure and wraps it.
+pub type ShouldRetry<E> = Arc<dyn Fn(&Error<E>) -> bool + Send + Sync>;
+
+/// What a caller may say about a step, beyond its name and body.
+///
+/// A struct rather than a builder, matching [`StartOptions`](crate::StartOptions) and how `sysdb`
+/// spells optional arguments. The common case pays nothing because [`step`] keeps its no-option
+/// form. Deliberately **not** `#[non_exhaustive]`, so `..Default::default()` keeps working as
+/// fields are added.
+///
+/// **The defaults are the three-way majority, not Go's.** Python, TypeScript and Java all use a
+/// one-second base with a 2.0 rate; Go uses 100ms with a five-second cap, which is a different
+/// feature — that one is for a flaky network call, this one is for an upstream that is down.
+///
+/// **The predicate is synchronous**, unlike Python's and TypeScript's, which also accept an
+/// `async` one. Go's `WithStepRetryPredicate` and Java's `StepShouldRetry` are both synchronous, so
+/// this is 2-of-4 rather than a deviation from consensus — and in Rust the two are not equally
+/// priced. An async predicate cannot be stored in a struct field without boxing its future, so
+/// every caller would write `Arc::new(|e| Box::pin(async move { .. }))` to express what is almost
+/// always a pure match on an error. A check that genuinely has to await belongs in the body, which
+/// can return an error the predicate then declines.
+pub struct StepOptions<E = EngineOnly> {
+    /// How many times the body may run before the step is failed. Defaults to **1**: no retrying.
+    ///
+    /// All four references agree that a plain step does not retry, and spell it three different
+    /// ways — Python and TypeScript with a `retries_allowed` boolean beside a count, Go with
+    /// `maxRetries == 0`, Java by flooring `maxAttempts` at 1. The count alone is taken here
+    /// because a boolean beside it can express `retries_allowed: false, max_attempts: 5`, which
+    /// means nothing, and an option that cannot state a contradiction is worth more than one that
+    /// matches a reference's field list.
+    ///
+    /// Zero is treated as one: a step whose body never runs is not a step.
+    pub max_attempts: u32,
+    /// How long to wait after the first failed attempt.
+    pub interval: Duration,
+    /// What the interval is multiplied by after each failure.
+    pub backoff_rate: f64,
+    /// The longest the interval may grow to, however many failures precede it.
+    pub max_interval: Duration,
+    /// The longest **one attempt** may run. `None` lets it run as long as it likes.
+    ///
+    /// On expiry the attempt's future is dropped — which is how Rust stops work, and stops it at
+    /// the next suspension point while running destructors on the way out — and the step fails
+    /// with [`Error::StepTimeout`]. That is an ordinary retryable failure: it is offered to
+    /// [`should_retry`](Self::should_retry) and counts against
+    /// [`max_attempts`](Self::max_attempts), as TypeScript's `timeoutMS` also specifies.
+    ///
+    /// **Each attempt gets its own timeout, and backoff is not charged against it.** Three
+    /// attempts at five seconds may spend fifteen seconds in the body. Python states the same
+    /// layering where it puts the supervisor inside the retry loop.
+    ///
+    /// Before the future is dropped, [`Ctx::cancellation`](crate::Ctx::cancellation) fires, so work
+    /// the runtime cannot reach by dropping a future — a `spawn_blocking` thread, a client holding
+    /// its own cancel handle — can still be told. Ordinary `async` bodies need nothing.
+    ///
+    /// **Unlike Python, this is not restricted to some kinds of step.** py #826 rejects a timeout
+    /// on a sync step because *"Python has no preemption mechanism for sync steps"*; every step
+    /// here is a future, so there is no second case to exclude and no error to raise.
+    pub timeout: Option<Duration>,
+    /// Whether to stop this step as soon as the workflow is seen to be `CANCELLED` elsewhere.
+    ///
+    /// Off by default, and worth turning on for a long step whose work is wasted once the workflow
+    /// is cancelled — a large transfer, a slow report. A cancellation raised in **this** process
+    /// does not need it, since that path stops the workflow directly; what this observes is a
+    /// cancellation raised somewhere else, by Conductor, a client, or another SDK sharing the
+    /// system database.
+    ///
+    /// The cost is a periodic status read per running step, at
+    /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the same
+    /// polling-concurrency cap as every other database-backed wait. Python's `preemptible` does
+    /// the same and hardcodes its interval.
+    ///
+    /// **A preempted step records nothing** and runs again on resume, because a cancellation is a
+    /// control signal rather than the step's result — the step did not fail, it was interrupted.
+    pub preemptible: bool,
+    /// Decides whether a failure is worth retrying. `None` retries every failure.
+    ///
+    /// Returning `false` ends the step immediately with that error, even with attempts left — so a
+    /// 4xx from an API is not hammered three times while a 5xx is. Named for the majority: Python's
+    /// `should_retry`, TypeScript's `shouldRetry` and Java's `StepShouldRetry` agree, and only Go
+    /// spells it `WithStepRetryPredicate`.
+    ///
+    /// **It is evaluated before the backoff sleep**, so declining an error costs no wait. That is
+    /// Go's documented behaviour and the only sensible order: waiting to find out whether to wait
+    /// helps nobody.
+    ///
+    /// **A control signal never reaches it.** Cancellation, shutdown and system-database failures
+    /// end the step before the policy is consulted, so a predicate cannot elect to retry against a
+    /// database that is down, and does not need an arm for a case it will never see. Use
+    /// [`should_retry`](Self::should_retry) rather than writing the `Arc` by hand.
+    pub should_retry: Option<ShouldRetry<E>>,
+}
+
+impl<E> Default for StepOptions<E> {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            interval: Duration::from_secs(1),
+            backoff_rate: 2.0,
+            max_interval: Duration::from_secs(3600),
+            timeout: None,
+            preemptible: false,
+            should_retry: None,
+        }
+    }
+}
+
+/// Hand-written because a closure is not [`Debug`], and deriving would demand `E: Debug` besides.
+impl<E> std::fmt::Debug for StepOptions<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepOptions")
+            .field("max_attempts", &self.max_attempts)
+            .field("interval", &self.interval)
+            .field("backoff_rate", &self.backoff_rate)
+            .field("max_interval", &self.max_interval)
+            .field("timeout", &self.timeout)
+            .field("preemptible", &self.preemptible)
+            .field("should_retry", &self.should_retry.is_some())
+            .finish()
+    }
+}
+
+/// Hand-written because deriving would demand `E: Clone`, which no caller owes.
+impl<E> Clone for StepOptions<E> {
+    fn clone(&self) -> Self {
+        Self {
+            max_attempts: self.max_attempts,
+            interval: self.interval,
+            backoff_rate: self.backoff_rate,
+            max_interval: self.max_interval,
+            timeout: self.timeout,
+            preemptible: self.preemptible,
+            should_retry: self.should_retry.clone(),
+        }
+    }
+}
+
+impl<E> StepOptions<E> {
+    /// Sets [`should_retry`](Self::should_retry), wrapping the closure.
+    ///
+    /// A method beside the struct literal rather than instead of it: the other four fields are
+    /// plain values and read better set directly, while this one would otherwise make every call
+    /// site spell `Some(Arc::new(..))` around a one-line match.
+    ///
+    /// ```no_run
+    /// # #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    /// # #[error("boom")] struct ApiError { status: u16 }
+    /// use dbos::StepOptions;
+    /// let options = StepOptions {
+    ///     max_attempts: 3,
+    ///     ..Default::default()
+    /// }
+    /// .should_retry(|error| match error {
+    ///     dbos::Error::Application(ApiError { status }) => *status >= 500,
+    ///     _ => true,
+    /// });
+    /// ```
+    pub fn should_retry(
+        mut self,
+        predicate: impl Fn(&Error<E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.should_retry = Some(Arc::new(predicate));
+        self
+    }
+
+    /// The wait before the attempt following `failures` failures.
+    ///
+    /// `interval * rate^failures`, capped. Saturating rather than panicking on a nonsensical rate:
+    /// a negative or `NaN` `backoff_rate` yields a non-finite or negative product, and a large one
+    /// yields a product past what a `Duration` can hold — all three go to the cap rather than to a
+    /// constructor that would panic. A retry that waits too long is a misconfiguration; a retry
+    /// that aborts the process is a bug.
+    ///
+    /// **The cap is applied to the `f64`, not to the `Duration` built from it.** Clamping
+    /// afterwards reads the same and is not: `Duration::from_secs_f64` panics on any value that
+    /// overflows a `Duration`, so `interval: 1s, backoff_rate: 1e10` reaches the panic on its
+    /// second failure with the clamp sitting unreachable behind it.
+    fn backoff(&self, failures: u32) -> Duration {
+        let grown = self.interval.as_secs_f64() * self.backoff_rate.powi(failures as i32);
+        if !grown.is_finite() || grown < 0.0 || grown >= self.max_interval.as_secs_f64() {
+            return self.max_interval;
+        }
+        Duration::from_secs_f64(grown)
+    }
+}
 
 /// Runs `body` once per workflow, recording what it returned.
 ///
@@ -51,13 +245,60 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.
+///
+/// **The body is `FnMut` rather than `FnOnce` because a step may be attempted more than once.**
+/// Retries call it again, and a bound that permits exactly one call cannot express that. The cost
+/// to a caller is nothing in the ordinary case — a closure written inline at the call site is
+/// `FnMut` unless it moves a captured value out — and a body that genuinely consumes what it
+/// captured fails to compile here rather than at its second attempt, which is where the mistake
+/// should be reported.
 pub async fn step<T, E, F, Fut>(name: &str, body: F) -> Result<T, E>
 where
     T: Serialize + DeserializeOwned,
     E: DurableError,
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    step_with(name, StepOptions::default(), body).await
+}
+
+/// Runs `body` as a step, retrying it as `options` allows.
+///
+/// [`step`] with a retry policy — one mechanism, and [`step`] is this called with the defaults.
+///
+/// ```no_run
+/// # async fn f() -> dbos::Result<()> {
+/// use dbos::StepOptions;
+/// let charge = dbos::step_with(
+///     "charge_card",
+///     StepOptions { max_attempts: 3, ..Default::default() },
+///     || async { dbos::Result::Ok(42) },
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// **Every attempt shares one checkpoint.** The recorded result is looked for once, before the
+/// first attempt, and written once, after the last; a replay of a step that took three attempts
+/// sees one outcome, and the intermediate failures live only in logs and spans. That is why
+/// `operation_outputs` has no attempt column in any of the five implementations.
+///
+/// **A control signal is never retried.** Cancellation, shutdown, and any system-database failure
+/// end the step immediately with nothing recorded, so the workflow stays `PENDING` and is
+/// recovered — a database blip is not evidence that the body is wrong, and retrying against a
+/// database that is down would burn the whole policy before the first useful attempt.
+///
+/// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
+/// to after the final attempt, rather than the last attempt alone. Python takes its
+/// `step_start_time` in the same place, and Go moved to it in #442.
+pub async fn step_with<T, E, F, Fut>(name: &str, options: StepOptions<E>, body: F) -> Result<T, E>
+where
+    T: Serialize + DeserializeOwned,
+    E: DurableError,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut body = body;
     let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
         tracing::debug!(
             step_name = name,
@@ -70,6 +311,11 @@ where
     let step_id = ctx.next_step_id();
     let executor = ctx.executor();
     let workflow_id = ctx.workflow_id();
+
+    // Before the check, not after it: the recorded duration covers the whole step, including the
+    // round trip that asks whether it has already run. Go moved to this in #442 and Python has
+    // always taken `step_start_time` here.
+    let started_at = Timestamp::now();
 
     let recorded = executor
         .sysdb()
@@ -88,10 +334,83 @@ where
         };
     }
 
-    // The span nests inside the workflow's, so anything the body logs carries both ids.
-    let span = tracing::info_span!("step", step_id, step_name = name);
-    let started_at = Timestamp::now();
-    let outcome = ctx.in_step_scope(body()).instrument(span).await;
+    let attempts = options.max_attempts.max(1);
+    // Only ever pushed to when retrying, so a step at the default of one attempt allocates nothing.
+    let mut failures: Vec<Error<E>> = Vec::new();
+    let outcome = loop {
+        let attempt = failures.len() as u32 + 1;
+        // The span nests inside the workflow's, so anything the body logs carries both ids.
+        let span = tracing::info_span!("step", step_id, step_name = name, attempt);
+        match supervise(&ctx, name, &options, body(), span).await {
+            Ok(value) => break Ok(value),
+            // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
+            // database that is down says nothing about whether the body would succeed. Returning
+            // here leaves the row untouched, so the workflow stays `PENDING` and is recovered.
+            Err(error) if error.control().is_some() => {
+                tracing::debug!(
+                    step_id,
+                    step_name = name,
+                    attempt,
+                    "a control signal ended the step; it is not retried and nothing is checkpointed"
+                );
+                return Err(error);
+            }
+            Err(error) if attempt >= attempts => {
+                if failures.is_empty() {
+                    // No retry policy to report on, so the error is the step's outcome as it
+                    // stands. Wrapping here would put every ordinary failure inside a collection
+                    // of one.
+                    break Err(error);
+                }
+                failures.push(error);
+                break Err(Error::MaxStepRetriesExceeded {
+                    step: name.to_owned(),
+                    attempts,
+                    errors: std::mem::take(&mut failures),
+                });
+            }
+            // Declined by the policy: this failure is the step's outcome, whatever attempts
+            // remain. Checked before the backoff so refusing to retry costs no wait, which is Go's
+            // documented order for the same hook.
+            Err(error)
+                if options
+                    .should_retry
+                    .as_ref()
+                    .is_some_and(|should_retry| !should_retry(&error)) =>
+            {
+                tracing::debug!(
+                    step_id,
+                    step_name = name,
+                    attempt,
+                    error = %error,
+                    "the retry predicate declined this failure; the step is not retried"
+                );
+                if failures.is_empty() {
+                    break Err(error);
+                }
+                failures.push(error);
+                break Err(Error::MaxStepRetriesExceeded {
+                    step: name.to_owned(),
+                    attempts: attempt,
+                    errors: std::mem::take(&mut failures),
+                });
+            }
+            Err(error) => {
+                let backoff = options.backoff(attempt - 1);
+                tracing::warn!(
+                    step_id,
+                    step_name = name,
+                    attempt,
+                    attempts,
+                    backoff_secs = backoff.as_secs_f64(),
+                    error = %error,
+                    "the step failed and will be retried"
+                );
+                failures.push(error);
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    };
 
     // Built once and held, not rebuilt per attempt: `record_step` compares the stored completion
     // time against this one to tell its own retried write from another execution's, and a fresh
@@ -124,19 +443,10 @@ where
             );
         }
         Err(error) => {
-            // A control error is not the step's result. A cancelled workflow that recorded its
-            // cancellation as a step failure would replay as *permanently* failed, having lost the
-            // fact that it was interrupted rather than wrong. Debug rather than warn: the signal
-            // propagates into the workflow's channel, and the recording layer above warns once,
-            // with the durable consequence.
-            if error.control().is_some() {
-                tracing::debug!(
-                    step_id,
-                    step_name = name,
-                    "a control signal ended the step; nothing is checkpointed"
-                );
-                return outcome;
-            }
+            // A control error cannot arrive here: the loop above returns on one without leaving
+            // itself, precisely so that a cancelled workflow's step is not recorded as *failed* and
+            // replayed as permanently so. What reaches this arm is the step's own outcome.
+            debug_assert!(error.control().is_none());
             // The error itself, encoded, not a description of it: a replay gives back the error
             // that failed exactly as it gives back the value that succeeded.
             let encoded = encode(error, "step error")?;
@@ -162,6 +472,140 @@ where
     outcome
 }
 
+/// Runs one attempt under the watchdogs its options ask for.
+///
+/// One place decides whether the attempt completed or blew its deadline, which is the shape
+/// py #826 arrived at when it merged Python's preemption poller and its new step timeout into a
+/// single `_supervise_step`. Preemption joins here rather than beside it.
+///
+/// **Without a timeout this is the body and nothing else** — no timer, no token, no `select!` —
+/// so a step that does not ask for one pays nothing for the option existing.
+///
+/// With one, the attempt races a timer. On expiry the token fires *first* and the body's future is
+/// then dropped, and the order matters: dropping stops the future at its next suspension point, so
+/// anything that would only learn from the token has to be told before it goes. Dropping is also
+/// the half TypeScript cannot do — it abandons a timed-out attempt and discards whatever the
+/// abandoned promise eventually settles to, while a dropped Rust future stops *and* runs its
+/// destructors, returning connections and releasing guards without the body saying so.
+async fn supervise<T, E, Fut>(
+    ctx: &Ctx,
+    name: &str,
+    options: &StepOptions<E>,
+    body: Fut,
+    span: tracing::Span,
+) -> Result<T, E>
+where
+    E: DurableError,
+    Fut: Future<Output = Result<T, E>>,
+{
+    if options.timeout.is_none() && !options.preemptible {
+        return ctx.in_step_scope(None, body).instrument(span).await;
+    }
+
+    let token = CancellationToken::new();
+    let attempt = ctx
+        .in_step_scope(Some(token.clone()), body)
+        .instrument(span);
+
+    // A deadline that never arrives, so the arm can be unconditional rather than duplicating the
+    // whole `select!` for each combination of watchdogs.
+    let deadline = async {
+        match options.timeout {
+            Some(timeout) => tokio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    };
+    let cancelled = async {
+        match options.preemptible {
+            true => observe_cancellation(ctx).await,
+            false => std::future::pending().await,
+        }
+    };
+
+    // `attempt` is passed by value, so losing the race is what drops it — and dropping it is what
+    // stops the body. Taking it by `&mut` under `tokio::pin!` would leave the future alive for the
+    // rest of this scope, and an explicit `drop` of the pinned reference would not touch it.
+    //
+    // **Biased, and the order is the decision.** A completed attempt keeps its outcome whatever
+    // else happened; a cancellation outranks a deadline that arrived in the same instant, because
+    // not checkpointing a cancelled workflow's step is the safer error — a timeout is recorded and
+    // replays as a failure, while a cancellation records nothing and runs again on resume. Getting
+    // the tie wrong this way costs one re-execution; getting it wrong the other way durably fails a
+    // workflow that was never given a chance. Python states the same rule for the same reason.
+    tokio::select! {
+        biased;
+        outcome = attempt => outcome,
+        () = cancelled => {
+            token.cancel();
+            tracing::debug!(
+                step_name = name,
+                "the workflow was cancelled elsewhere; the step is preempted and records nothing"
+            );
+            Err(Error::WorkflowCancelled { workflow_id: ctx.workflow_id().to_owned() })
+        }
+        () = deadline => {
+            // Cancelled before this arm returns, and so before the losing future is dropped at the
+            // end of the `select!`. A body that could only learn from the token — work on another
+            // task, or on a blocking thread — would otherwise never learn at all.
+            token.cancel();
+            let timeout = options.timeout.expect("the deadline arm only fires with a timeout set");
+            tracing::debug!(
+                step_name = name,
+                timeout_ms = timeout.as_millis(),
+                "the step attempt exceeded its timeout and was stopped"
+            );
+            Err(Error::StepTimeout { step: name.to_owned(), timeout })
+        }
+    }
+}
+
+/// Completes once this workflow is observed `CANCELLED`, and never otherwise.
+///
+/// **Reuses `await_workflow_result` rather than adding a status channel**, which is the whole of
+/// what preemption needs from the database. That method already polls the status row, already
+/// reports a cancellation as a *value* rather than an error, already releases its connection
+/// between polls, and already runs under the polling-concurrency cap that stops a fan-out of
+/// waiters from starving the control plane. Python's poller is the same loop over
+/// `get_workflow_status`, with an interval it hardcodes and this one takes from config.
+///
+/// A terminal outcome that is *not* a cancellation means another executor wrote this workflow's
+/// result while this process was still running it. There is nothing to preempt for — the step's
+/// own outcome is no longer wanted either way — so this parks rather than reporting a cancellation
+/// that did not happen, and lets the attempt finish on its own terms.
+async fn observe_cancellation(ctx: &Ctx) {
+    let executor = ctx.executor();
+    let interval = executor.outcome_poll_interval();
+    match executor
+        .sysdb()
+        .await_workflow_result(ctx.workflow_id(), interval)
+        .await
+    {
+        Ok(AwaitedOutcome::Cancelled) => (),
+        // Terminal but not a cancellation: another executor wrote this workflow's outcome while
+        // this process was still running it. There is nothing to preempt for, so park rather than
+        // completing — completing *is* the cancellation signal, and reporting one that did not
+        // happen is worse than not watching.
+        Ok(_) => std::future::pending().await,
+        // **Not retried here, deliberately.** `await_workflow_result` polls in a loop with
+        // `with_retry` inside it, and that policy has no attempt limit for transient or connection
+        // failures — a database that is merely unreachable never reaches this arm, because the
+        // wait blocks until it comes back. What does reach it is the class `sysdb::retry` returns
+        // immediately: `Permanent` and non-backend errors, which will fail again identically. So
+        // this parks too, and the step finishes on its own terms — the same outcome as not having
+        // asked for preemption. Looping here would re-decide a question the layer below owns, and
+        // would turn one unparseable status row into a warning every interval for the life of the
+        // step.
+        Err(error) => {
+            tracing::warn!(
+                workflow_id = ctx.workflow_id(),
+                %error,
+                "could not read status for a preemptible step; it will not be preempted"
+            );
+            std::future::pending().await
+        }
+    }
+}
+
 /// Rebuilds the error a recorded step failed with.
 ///
 /// The same error, not a description of it: an application failure comes back as its own variant
@@ -181,6 +625,65 @@ fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The growth curve, and that the cap is a cap.
+    #[test]
+    fn backoff_grows_geometrically_and_stops_at_the_cap() {
+        let options = StepOptions::<EngineOnly> {
+            interval: Duration::from_secs(1),
+            backoff_rate: 2.0,
+            max_interval: Duration::from_secs(10),
+            ..Default::default()
+        };
+        // The exponent is the number of failures *before* this wait, so the first is un-multiplied.
+        assert_eq!(options.backoff(0), Duration::from_secs(1));
+        assert_eq!(options.backoff(1), Duration::from_secs(2));
+        assert_eq!(options.backoff(2), Duration::from_secs(4));
+        assert_eq!(options.backoff(3), Duration::from_secs(8));
+        assert_eq!(options.backoff(4), Duration::from_secs(10), "capped");
+        assert_eq!(options.backoff(40), Duration::from_secs(10), "still capped");
+    }
+
+    /// A rate that cannot produce a duration yields the cap rather than a panic.
+    ///
+    /// `Duration::from_secs_f64` panics on a negative or non-finite value **and on a finite one
+    /// past `u64::MAX` seconds**, and a step retry is the worst place to discover any of the three:
+    /// it would take the process down on a config typo, mid-workflow. `1e10` is the case a clamp
+    /// applied to the `Duration` rather than to the `f64` misses — `1e20` is finite, positive, and
+    /// still unrepresentable.
+    #[test]
+    fn a_nonsensical_backoff_rate_yields_the_cap() {
+        let cap = Duration::from_secs(30);
+        // An odd exponent, so a negative rate is still negative by the time it is measured.
+        for rate in [-2.0, f64::NAN, f64::INFINITY, 1e10, f64::MAX] {
+            let options = StepOptions::<EngineOnly> {
+                interval: Duration::from_secs(1),
+                backoff_rate: rate,
+                max_interval: cap,
+                ..Default::default()
+            };
+            assert_eq!(options.backoff(3), cap, "rate {rate}");
+        }
+        // The overflow the guard alone does not catch: `1e10^2` is finite and positive, and
+        // `1e20` seconds is past `u64::MAX`.
+        let overflows = StepOptions::<EngineOnly> {
+            interval: Duration::from_secs(1),
+            backoff_rate: 1e10,
+            max_interval: cap,
+            ..Default::default()
+        };
+        assert_eq!(overflows.backoff(2), cap);
+    }
+
+    /// The default is the three-way majority, and it does not retry.
+    #[test]
+    fn the_defaults_match_python_typescript_and_java() {
+        let options = StepOptions::<EngineOnly>::default();
+        assert_eq!(options.max_attempts, 1, "a plain step does not retry");
+        assert_eq!(options.interval, Duration::from_secs(1));
+        assert_eq!(options.backoff_rate, 2.0);
+        assert_eq!(options.max_interval, Duration::from_secs(3600));
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
