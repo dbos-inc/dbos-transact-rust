@@ -597,8 +597,9 @@ pub trait SystemDatabase: Send + Sync {
     /// The step's `completed_at` is stamped at the **wake time**, which is in the future when
     /// the row is written — so a timeline shows an hour's sleep as an hour rather than as an
     /// instant. Nothing in execution or recovery reads that column; it is for step aggregates,
-    /// metrics, and Conductor. Java does the same; Go never projects, so its sleeps look
-    /// instantaneous.
+    /// metrics, and Conductor. **All four references project**: Java and Python always have,
+    /// TypeScript since #1318, and Go was the holdout until #442 added `withCompletedAt(deadline)`
+    /// on 2026-08-17.
     ///
     /// The deadline [`get_event`](Self::get_event) registers is the same checkpoint with the
     /// opposite stamping, since a read that answers in milliseconds under a minute's timeout has
