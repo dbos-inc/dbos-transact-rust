@@ -139,6 +139,7 @@ async fn start_workflow(
             (),
             StartOptions {
                 workflow_id: Some(&task_id),
+                ..Default::default()
             },
         )
         .await?;

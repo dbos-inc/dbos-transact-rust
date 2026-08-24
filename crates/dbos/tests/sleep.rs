@@ -72,6 +72,7 @@ async fn a_replayed_sleep_does_not_start_its_clock_again() {
     let id = "sleeps-once";
     let options = dbos::StartOptions {
         workflow_id: Some(id),
+        ..Default::default()
     };
     // First run: records the wake time three seconds out, and waits it.
     workflow

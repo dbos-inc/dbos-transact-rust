@@ -161,6 +161,15 @@ async fn recover_one(executor: &Arc<Executor>, workflow_id: &str) -> crate::Resu
     );
     // Detached: recovered workflows run concurrently, and the driver moves on. The handle is not
     // awaited by anyone, which is exactly the case the execution layer's own logging covers.
-    spawn_execution(executor, key, workflow_id.to_owned(), row.input);
+    // The stored deadline, so a recovered workflow gets what is *left* of its budget rather than
+    // the whole of it again — and one recovered after its expiry cancels at once instead of
+    // running on unbounded.
+    spawn_execution(
+        executor,
+        key,
+        workflow_id.to_owned(),
+        row.input,
+        initialized.deadline,
+    );
     Ok(())
 }

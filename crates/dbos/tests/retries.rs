@@ -206,6 +206,7 @@ async fn a_retried_step_replays_from_its_single_checkpoint() {
     let id = "replay-me";
     let options = dbos::StartOptions {
         workflow_id: Some(id),
+        ..Default::default()
     };
     workflow
         .run_with(true, options.clone())

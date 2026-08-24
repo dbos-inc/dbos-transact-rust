@@ -301,6 +301,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
             (),
             dbos::StartOptions {
                 workflow_id: Some(id),
+                ..Default::default()
             },
         )
         .await
