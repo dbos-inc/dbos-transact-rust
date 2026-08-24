@@ -51,13 +51,21 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.
+///
+/// **The body is `FnMut` rather than `FnOnce` because a step may be attempted more than once.**
+/// Retries call it again, and a bound that permits exactly one call cannot express that. The cost
+/// to a caller is nothing in the ordinary case — a closure written inline at the call site is
+/// `FnMut` unless it moves a captured value out — and a body that genuinely consumes what it
+/// captured fails to compile here rather than at its second attempt, which is where the mistake
+/// should be reported.
 pub async fn step<T, E, F, Fut>(name: &str, body: F) -> Result<T, E>
 where
     T: Serialize + DeserializeOwned,
     E: DurableError,
-    F: FnOnce() -> Fut,
+    F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    let mut body = body;
     let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
         tracing::debug!(
             step_name = name,

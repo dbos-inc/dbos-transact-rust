@@ -42,9 +42,12 @@ async fn progress_events_survive_recovery_without_republishing() {
             let one = Arc::clone(&one);
             let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
             async move {
-                dbos::step("one", move || async move {
-                    one.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                dbos::step("one", || {
+                    let one = Arc::clone(&one);
+                    async move {
+                        one.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
                 })
                 .await?;
                 dbos::set_event("progress", &1u32).await?;
@@ -169,10 +172,13 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
     // Reads from inside a step: a leaf, so no ids are allocated for the read.
     let in_step = dbos
         .register_workflow("in_step", |publisher_id: String| async move {
-            let answer = dbos::step("read", move || async move {
-                let answer: Option<u32> =
-                    dbos::get_event(&publisher_id, "answer", Duration::ZERO).await?;
-                Ok(answer)
+            let answer = dbos::step("read", || {
+                let publisher_id = publisher_id.clone();
+                async move {
+                    let answer: Option<u32> =
+                        dbos::get_event(&publisher_id, "answer", Duration::ZERO).await?;
+                    Ok(answer)
+                }
             })
             .await?;
             Ok::<_, dbos::Error>(answer)
@@ -313,10 +319,13 @@ async fn reading_through_another_instance_from_inside_a_workflow_is_refused() {
             .register_workflow("reads_in_step", move |()| {
                 let other = other.clone();
                 async move {
-                    let answer = dbos::step("read", move || async move {
-                        let answer: Option<u32> =
-                            other.get_event("wf-1", "answer", Duration::ZERO).await?;
-                        Ok(answer)
+                    let answer = dbos::step("read", || {
+                        let other = other.clone();
+                        async move {
+                            let answer: Option<u32> =
+                                other.get_event("wf-1", "answer", Duration::ZERO).await?;
+                            Ok(answer)
+                        }
                     })
                     .await?;
                     Ok::<_, dbos::Error>(answer)
