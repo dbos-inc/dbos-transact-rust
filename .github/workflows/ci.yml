@@ -114,7 +114,99 @@ jobs:
       - name: Test
         env:
           DBOS_TEST_USE_COCKROACH_DB: ${{ matrix.cockroach }}
-        run: cargo test --all-features
+          DBOS_TEST_TIMINGS: ${{ github.workspace }}/harness-timings.jsonl
+          RUNNER_TEST_LOG: ${{ github.workspace }}/test-output.log
+        # Teed rather than piped away: the summary step reads per-binary wall clock back out
+        # of this, which is the half the harness cannot see. `shell: bash` is what makes that
+        # safe — GitHub runs it with `-eo pipefail`, so a failing `cargo test` still fails the
+        # step instead of being masked by `tee`'s exit code. `set -o pipefail` again below
+        # because that guarantee is worth stating where it is relied on rather than looked up.
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --all-features 2>&1 | tee "$RUNNER_TEST_LOG"
+      - name: Harness timings
+        # What the suite spent before running anything, per test binary. The costs split two
+        # ways and want opposite fixes: starting a server and migrating its baseline are paid
+        # once per binary however many tests it holds, while building and resetting databases
+        # scale with the tests. Reading that split off total suite time is guesswork, and
+        # guessing it wrong is how an afternoon goes into the wrong half.
+        #
+        # `always()` because a red run is when this is most worth having: a suite that failed
+        # slowly and a suite that failed fast are different problems.
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s "$RUNNER_TEST_LOG" ]; then
+            echo "No test output to summarise."
+            exit 0
+          fi
+          # Not the workspace: a developer running this script by hand should not find an
+          # untracked file in their checkout afterwards.
+          WALLS="$(mktemp)"
+          trap 'rm -f "$WALLS"' EXIT
+          # Per-binary wall clock, read back out of cargo's own output: the one number the
+          # harness cannot know, since it is not running when a binary starts or after its
+          # server is dropped. ANSI is stripped because CARGO_TERM_COLOR is `always` here.
+          sed -r 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEST_LOG" | awk '
+            /^[[:space:]]*Running / {
+              bin = $NF; sub(/^.*\//, "", bin); sub(/\)$/, "", bin); sub(/-[0-9a-f]+$/, "", bin); next
+            }
+            /^test result:/ && bin != "" {
+              for (i = 1; i <= NF; i++) if ($i == "in") { t = $(i+1); sub(/s$/, "", t) }
+              for (i = 1; i <= NF; i++) if ($(i+1) == "passed;") n = $i
+              printf "{\"binary\":\"%s\",\"tests\":%s,\"wall_ms\":%.0f}\n", bin, n, t * 1000
+              bin = ""
+            }' > "$WALLS"
+          # `--slurpfile` errors on a missing file, so make sure there is one to read. A run
+          # where the harness wrote nothing still gets a wall-clock table with zeroed setup
+          # columns, which is more useful than a failed summary step.
+          if [ ! -s "$RUNNER_TIMINGS" ]; then
+            echo "No harness records were written; setup columns will read zero."
+            RUNNER_TIMINGS="$(mktemp)"
+            trap 'rm -f "$WALLS" "$RUNNER_TIMINGS"' EXIT
+          fi
+          {
+            echo "### Test timings (${{ matrix.backend }})"
+            echo
+            echo '| binary | tests | total | setup | of which migrate | tests |'
+            echo '|---|--:|--:|--:|--:|--:|'
+            jq -n -r --slurpfile walls "$WALLS" --slurpfile harness "$RUNNER_TIMINGS" '
+              def s: (. / 100 | round) / 10 | tostring + "s";
+              def name: sub("-[0-9a-f]+$"; "");
+              # Grouped, because a binary whose tests all release the server before another
+              # asks for one starts a second: the record count is per server, not per binary.
+              ($harness | group_by(.binary | name) | map({
+                 key: (.[0].binary | name),
+                 value: { servers: length,
+                          setup:   ([.[] | .boot_ms + .ready_ms + .baseline_ms] | add),
+                          migrate: ([.[] | .migrate_ms] | add) }}) | from_entries) as $h
+              | $walls | map(select(.tests > 0)) | .[]
+              | . + ($h[.binary] // {servers: 0, setup: 0, migrate: 0})
+              | "| \(.binary)\(if .servers > 1 then " (\(.servers) servers)" else "" end)"
+              + " | \(.tests) | \(.wall_ms | s) | \(.setup | s) | \(.migrate | s)"
+              + " | \(.wall_ms - .setup | s) |"
+            '
+            echo
+            jq -n -r --slurpfile walls "$WALLS" --slurpfile harness "$RUNNER_TIMINGS" '
+              def s: (. / 100 | round) / 10 | tostring + "s";
+              def total(f): ([.[] | f] | add // 0);
+              ($walls | map(select(.tests > 0))) as $w
+              | ($w | total(.wall_ms)) as $wall
+              | ($harness | total(.boot_ms + .ready_ms + .baseline_ms)) as $setup
+              | "**\($w | length) binaries, \($wall | s) of test time, \($setup | s) of it setup"
+                + " (\((100 * $setup / (if $wall > 0 then $wall else 1 end)) | round)%).**",
+                "",
+                "- container start and readiness: \($harness | total(.boot_ms + .ready_ms) | s)",
+                "- baseline migrations: \($harness | total(.migrate_ms) | s)",
+                "- schema dumps: \($harness | total(.dump_ms) | s)",
+                "- pooled database builds: \($harness | total(.pooled_build_ms) | s) across \($harness | total(.pooled_builds)) builds",
+                "- resets on lease: \($harness | total(.reset_ms) | s) across \($harness | total(.leases)) leases"
+            '
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          RUNNER_TIMINGS: ${{ github.workspace }}/harness-timings.jsonl
+          RUNNER_TEST_LOG: ${{ github.workspace }}/test-output.log
       - name: No containers left behind
         # The harness shares one container by reference count and removes it when the last
         # test drops it. A leak here is silent locally and would accumulate a container per

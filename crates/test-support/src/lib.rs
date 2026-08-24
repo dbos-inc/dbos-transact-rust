@@ -28,12 +28,20 @@
 //! CockroachDB against 0.8s for the schema it ends at, because the corpus creates indexes it
 //! later drops and the end state does none of that work. `Baseline` has the details.
 //!
+//! **Where that time goes is measured rather than inferred.** Starting a container and migrating
+//! the baseline are paid once per test binary; building pooled databases and resetting leased
+//! ones scale with the tests, and the two want opposite fixes — fewer servers against cheaper
+//! ones. Set `DBOS_TEST_TIMINGS` to a path and every server appends a JSON line as it shuts
+//! down, splitting boot from migration and both from the per-test cost. Unset, it reads one
+//! environment variable per server and writes nothing. See [`TIMINGS_ENV`].
+//!
 //! **A crate rather than a module under `tests/`.** A `mod support;` is visible only to the
 //! integration test binaries, so anything it tests has to be `pub` — the crate boundary,
 //! not the design, would decide the public API. As a dev-dependency it is reachable from
 //! `#[cfg(test)]` code in `src/` too, which is where a test of a crate-private thing belongs.
 
 use std::future::Future;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -81,6 +89,18 @@ const CREATE_DATABASE_ATTEMPTS: u32 = 10;
 
 /// How long to wait for a template's last session to go away before trying again.
 const TEMPLATE_RETRY_WAIT: Duration = Duration::from_millis(100);
+
+/// Names a file the harness appends one timing record to per server, or is unset.
+///
+/// Unset — the default, and what a developer gets — reads one environment variable per server
+/// and writes nothing. Set to a path, every server appends a JSON line as it shuts down.
+///
+/// **A file rather than stderr, because libtest captures output per test.** A [`TestServer`]
+/// drops inside whichever test happens to release the last handle, so a printed record would be
+/// swallowed on success and surface only when some unrelated test failed. Appending also puts
+/// every test binary of a run in one file, which is the shape the question this exists to answer
+/// has: the fixed per-binary cost is only interesting summed across a leg.
+pub const TIMINGS_ENV: &str = "DBOS_TEST_TIMINGS";
 
 /// Which database engine the suite is running against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +228,113 @@ async fn dump_schema(pool: &sqlx::PgPool, schema: &str) -> String {
     sql
 }
 
+/// What one server spent getting ready, and what its tests spent on databases.
+///
+/// **The split this exists to make is fixed cost against per-test cost.** Starting the container
+/// and migrating the baseline are paid once per test binary whatever the suite does; building a
+/// pooled database and resetting a leased one scale with the tests. Which of those dominates
+/// decides what is worth optimising, and reading it off total suite time is guesswork — the
+/// three suites that made the case for this all had between two and seven tests and finished
+/// within two seconds of each other, which says the fixed cost is large without saying which
+/// half of it is.
+///
+/// Every field is an atomic because these are written through `&TestServer`: the baseline is
+/// built inside a `OnceCell` initialiser taking `&self`, and pooled databases are built during a
+/// lease, from whichever task got there first.
+struct Timings {
+    /// When the server started coming up, so a record can say how much of its life was setup.
+    created: Instant,
+    /// Starting the container: image pull on a cold host, then the container itself.
+    boot_nanos: AtomicU64,
+    /// Waiting for the server to accept SQL, which for CockroachDB is well after the port opens.
+    ready_nanos: AtomicU64,
+    /// Building the baseline end to end, including the two below.
+    baseline_nanos: AtomicU64,
+    /// The one full corpus run a process makes — the cost a pre-migrated image would remove.
+    migrate_nanos: AtomicU64,
+    /// Dumping the migrated schema. CockroachDB only; PostgreSQL keeps the database as a template.
+    dump_nanos: AtomicU64,
+    /// Pooled databases built from the baseline, and what they cost.
+    pooled_builds: AtomicU64,
+    pooled_build_nanos: AtomicU64,
+    /// Databases handed out, and what emptying them on acquire cost.
+    leases: AtomicU64,
+    reset_nanos: AtomicU64,
+}
+
+impl Timings {
+    fn new() -> Self {
+        Self {
+            created: Instant::now(),
+            boot_nanos: AtomicU64::new(0),
+            ready_nanos: AtomicU64::new(0),
+            baseline_nanos: AtomicU64::new(0),
+            migrate_nanos: AtomicU64::new(0),
+            dump_nanos: AtomicU64::new(0),
+            pooled_builds: AtomicU64::new(0),
+            pooled_build_nanos: AtomicU64::new(0),
+            leases: AtomicU64::new(0),
+            reset_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// Adds an elapsed time to one of the counters above.
+    fn add(counter: &AtomicU64, elapsed: Duration) {
+        counter.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Appends this server's record to [`TIMINGS_ENV`]'s file, or does nothing if it is unset.
+    ///
+    /// Every failure here is ignored on purpose. This is a measurement, and a measurement must
+    /// not be able to fail a test run: an unwritable path is a mistake in how the run was
+    /// invoked, and the cost of getting it wrong should be a missing line rather than a red
+    /// suite that says nothing about the code.
+    fn write(&self, backend: Backend) {
+        let Ok(path) = std::env::var(TIMINGS_ENV) else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+
+        // The test binary's own name, which is what attributes a record to a suite. Falls back
+        // to the whole path, and then to nothing, rather than refusing to write a record.
+        let argv0 = std::env::args().next().unwrap_or_default();
+        let binary = std::path::Path::new(&argv0)
+            .file_name()
+            .map_or_else(|| argv0.clone(), |name| name.to_string_lossy().into_owned());
+
+        let ms = |counter: &AtomicU64| counter.load(Ordering::Relaxed) as f64 / 1e6;
+        let line = format!(
+            r#"{{"binary":"{binary}","backend":"{backend:?}","lifetime_ms":{:.1},"boot_ms":{:.1},"ready_ms":{:.1},"baseline_ms":{:.1},"migrate_ms":{:.1},"dump_ms":{:.1},"pooled_builds":{},"pooled_build_ms":{:.1},"leases":{},"reset_ms":{:.1}}}"#,
+            self.created.elapsed().as_secs_f64() * 1e3,
+            ms(&self.boot_nanos),
+            ms(&self.ready_nanos),
+            ms(&self.baseline_nanos),
+            ms(&self.migrate_nanos),
+            ms(&self.dump_nanos),
+            self.pooled_builds.load(Ordering::Relaxed),
+            ms(&self.pooled_build_nanos),
+            self.leases.load(Ordering::Relaxed),
+            ms(&self.reset_nanos),
+        );
+
+        // Appending, because every test binary of a run writes to the same file and they are
+        // separate processes. One short `O_APPEND` write per server is atomic in practice on
+        // the platforms this runs on, and nothing reads the file until the run is over.
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
 /// A running database server, shared by every test holding an [`Arc`] of it.
 ///
 /// Dropping the last `Arc` removes the container.
@@ -232,8 +359,16 @@ pub struct TestServer {
     /// to push or pop a name, never across an await — and returning one happens in `Drop`,
     /// which cannot await at all.
     idle: std::sync::Mutex<Vec<String>>,
+    /// What this server spent, written out when it shuts down. See [`TIMINGS_ENV`].
+    timings: Timings,
     /// Held to keep the container alive; removal is tied to this field's `Drop`.
     _container: ContainerAsync<GenericImage>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.timings.write(self.backend);
+    }
 }
 
 /// A value created on demand, shared by everyone holding it, and released once nobody is.
@@ -317,6 +452,8 @@ pub async fn raw_database() -> TestDatabase {
 
 impl TestServer {
     async fn start(backend: Backend) -> Self {
+        let timings = Timings::new();
+        let booting = Instant::now();
         let container = match backend {
             Backend::Postgres => {
                 GenericImage::new(POSTGRES_IMAGE.0, POSTGRES_IMAGE.1)
@@ -357,6 +494,7 @@ impl TestServer {
             }
         }
         .expect("failed to start the database container — is Docker running?");
+        Timings::add(&timings.boot_nanos, booting.elapsed());
 
         let host = container
             .get_host()
@@ -375,9 +513,12 @@ impl TestServer {
             permits: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
             baseline: tokio::sync::OnceCell::new(),
             idle: std::sync::Mutex::new(Vec::new()),
+            timings,
             _container: container,
         };
+        let waiting = Instant::now();
         server.await_ready().await;
+        Timings::add(&server.timings.ready_nanos, waiting.elapsed());
         server
     }
 
@@ -508,18 +649,25 @@ impl TestServer {
     async fn baseline(self: &Arc<Self>) -> &Baseline {
         self.baseline
             .get_or_init(|| async {
+                let building = Instant::now();
                 let db = self.create_database().await;
                 let pool = db.pool().await;
+                let migrating = Instant::now();
                 dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
                     .await
                     .expect("failed to migrate the baseline database");
+                Timings::add(&self.timings.migrate_nanos, migrating.elapsed());
                 let baseline = match self.backend {
                     Backend::Postgres => Baseline::Template(db.name.clone()),
                     Backend::Cockroach => {
-                        Baseline::Replay(dump_schema(&pool, DEFAULT_SCHEMA).await)
+                        let dumping = Instant::now();
+                        let sql = dump_schema(&pool, DEFAULT_SCHEMA).await;
+                        Timings::add(&self.timings.dump_nanos, dumping.elapsed());
+                        Baseline::Replay(sql)
                     }
                 };
                 pool.close().await;
+                Timings::add(&self.timings.baseline_nanos, building.elapsed());
                 // `db` drops here. It is not pooled, so nothing hands it back and the database
                 // stays on the server — which is exactly what a template needs.
                 baseline
@@ -530,7 +678,12 @@ impl TestServer {
     /// Creates a database already in the state the migrations leave one in, without running
     /// them.
     async fn create_migrated(self: &Arc<Self>) -> TestDatabase {
-        match self.baseline().await {
+        // Resolved before the clock starts: building the baseline is the fixed cost of the
+        // binary, and charging the first pooled database for it would make the two
+        // indistinguishable — which is the distinction this measurement exists to draw.
+        let baseline = self.baseline().await;
+        let building = Instant::now();
+        let db = match baseline {
             Baseline::Template(template) => self.create_database_from(Some(template)).await,
             Baseline::Replay(schema_sql) => {
                 let db = self.create_database().await;
@@ -548,7 +701,10 @@ impl TestServer {
                 pool.close().await;
                 db
             }
-        }
+        };
+        self.timings.pooled_builds.fetch_add(1, Ordering::Relaxed);
+        Timings::add(&self.timings.pooled_build_nanos, building.elapsed());
+        db
     }
 
     /// Leases a database with the DBOS schema applied, building one if the pool is empty.
@@ -584,7 +740,10 @@ impl TestServer {
         };
         db.pooled = true;
         db.permit = Some(permit);
+        let resetting = Instant::now();
         db.reset().await;
+        Timings::add(&self.timings.reset_nanos, resetting.elapsed());
+        self.timings.leases.fetch_add(1, Ordering::Relaxed);
         db
     }
 
