@@ -441,73 +441,6 @@ mod baseline_cache {
     }
 }
 
-#[cfg(test)]
-mod baseline_cache_tests {
-    use super::baseline_cache::{key, load, store};
-
-    const IMAGE: (&str, &str) = ("cockroachdb/cockroach", "latest-v26.2");
-
-    /// The key must be a function of its inputs and nothing else, or two binaries in one run
-    /// disagree about which file to read.
-    #[test]
-    fn the_same_inputs_give_the_same_key() {
-        assert_eq!(key(IMAGE), key(IMAGE));
-    }
-
-    /// **The server version is part of the schema's identity.** The dump is `SHOW CREATE ALL
-    /// TABLES` output, whose syntax belongs to the server that produced it, so replaying one
-    /// version's into another is exactly the mistake this half of the key exists to prevent.
-    #[test]
-    fn a_different_server_version_gets_a_different_key() {
-        assert_ne!(key(IMAGE), key(("cockroachdb/cockroach", "latest-v25.1")));
-        assert_ne!(key(IMAGE), key(("cockroachdb/cockroach-unstable", IMAGE.1)));
-    }
-
-    /// A cached dump has to come back byte for byte: it is replayed as SQL, so anything less
-    /// is a schema that silently differs from the one the migrations build.
-    #[test]
-    fn a_stored_dump_loads_back_unchanged() {
-        let dir = std::env::temp_dir().join(format!("dbos-cache-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
-        let path = dir.join("baseline.sql");
-        let sql = "CREATE TABLE dbos.t (a INT8);\nINSERT INTO dbos.dbos_migrations VALUES (107);\n";
-
-        assert_eq!(
-            load(&path),
-            None,
-            "nothing is cached before anything is stored"
-        );
-        store(&path, sql);
-        assert_eq!(load(&path).as_deref(), Some(sql));
-
-        // Whitespace-only is treated as absent: a zero-length file is what a torn write or an
-        // out-of-space failure leaves behind, and replaying it would produce an empty schema
-        // that fails much later and much less clearly.
-        store(&path, "   \n");
-        assert_eq!(load(&path), None);
-
-        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
-    }
-
-    /// Writing must not leave the temporary file behind, or the target directory accumulates
-    /// one per process for the life of the checkout.
-    #[test]
-    fn storing_leaves_only_the_cache_file() {
-        let dir = std::env::temp_dir().join(format!("dbos-cache-tidy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
-        let path = dir.join("baseline.sql");
-        store(&path, "CREATE TABLE dbos.t (a INT8);\n");
-
-        let left: Vec<_> = std::fs::read_dir(&dir)
-            .expect("failed to list the test directory")
-            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
-            .collect();
-        assert_eq!(left, vec!["baseline.sql".to_owned()]);
-
-        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
-    }
-}
-
 /// A running database server, shared by every test holding an [`Arc`] of it.
 ///
 /// Dropping the last `Arc` removes the container.
@@ -1139,5 +1072,72 @@ impl TestDatabase {
             .fetch_one(&mut admin)
             .await
             .expect("failed to count connections")
+    }
+}
+
+#[cfg(test)]
+mod baseline_cache_tests {
+    use super::baseline_cache::{key, load, store};
+
+    const IMAGE: (&str, &str) = ("cockroachdb/cockroach", "latest-v26.2");
+
+    /// The key must be a function of its inputs and nothing else, or two binaries in one run
+    /// disagree about which file to read.
+    #[test]
+    fn the_same_inputs_give_the_same_key() {
+        assert_eq!(key(IMAGE), key(IMAGE));
+    }
+
+    /// **The server version is part of the schema's identity.** The dump is `SHOW CREATE ALL
+    /// TABLES` output, whose syntax belongs to the server that produced it, so replaying one
+    /// version's into another is exactly the mistake this half of the key exists to prevent.
+    #[test]
+    fn a_different_server_version_gets_a_different_key() {
+        assert_ne!(key(IMAGE), key(("cockroachdb/cockroach", "latest-v25.1")));
+        assert_ne!(key(IMAGE), key(("cockroachdb/cockroach-unstable", IMAGE.1)));
+    }
+
+    /// A cached dump has to come back byte for byte: it is replayed as SQL, so anything less
+    /// is a schema that silently differs from the one the migrations build.
+    #[test]
+    fn a_stored_dump_loads_back_unchanged() {
+        let dir = std::env::temp_dir().join(format!("dbos-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
+        let path = dir.join("baseline.sql");
+        let sql = "CREATE TABLE dbos.t (a INT8);\nINSERT INTO dbos.dbos_migrations VALUES (107);\n";
+
+        assert_eq!(
+            load(&path),
+            None,
+            "nothing is cached before anything is stored"
+        );
+        store(&path, sql);
+        assert_eq!(load(&path).as_deref(), Some(sql));
+
+        // Whitespace-only is treated as absent: a zero-length file is what a torn write or an
+        // out-of-space failure leaves behind, and replaying it would produce an empty schema
+        // that fails much later and much less clearly.
+        store(&path, "   \n");
+        assert_eq!(load(&path), None);
+
+        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
+    }
+
+    /// Writing must not leave the temporary file behind, or the target directory accumulates
+    /// one per process for the life of the checkout.
+    #[test]
+    fn storing_leaves_only_the_cache_file() {
+        let dir = std::env::temp_dir().join(format!("dbos-cache-tidy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create the test directory");
+        let path = dir.join("baseline.sql");
+        store(&path, "CREATE TABLE dbos.t (a INT8);\n");
+
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("failed to list the test directory")
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(left, vec!["baseline.sql".to_owned()]);
+
+        std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
     }
 }
