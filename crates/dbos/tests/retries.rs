@@ -22,7 +22,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 }
 
 /// Retry options that do not make the suite wait: the policy is under test, not the clock.
-fn fast(max_attempts: u32) -> StepOptions {
+fn fast<E>(max_attempts: u32) -> StepOptions<E> {
     StepOptions {
         max_attempts,
         interval: Duration::from_millis(1),
@@ -225,6 +225,138 @@ async fn a_retried_step_replays_from_its_single_checkpoint() {
         .expect("read failed");
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].output.as_deref(), Some("2"));
+
+    dbos.shutdown().await;
+}
+
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("the api returned {status}")]
+struct ApiError {
+    status: u16,
+}
+
+/// A declined failure ends the step at once, with attempts still left and no backoff waited.
+#[tokio::test]
+async fn a_declined_failure_stops_retrying_immediately() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("predicate-app", &db));
+    let calls = Arc::new(AtomicU32::new(0));
+    let dbos_calls = Arc::clone(&calls);
+    let workflow = dbos
+        .register_workflow("calls_api", move |status: u16| {
+            let calls = Arc::clone(&dbos_calls);
+            async move {
+                // Retry server errors, never client errors. Ten attempts, so a predicate that did
+                // not stop the loop would be obvious in the call count.
+                let options = StepOptions {
+                    max_attempts: 10,
+                    interval: Duration::from_millis(1),
+                    max_interval: Duration::from_millis(2),
+                    ..Default::default()
+                }
+                .should_retry(|error| match error {
+                    Error::Application(ApiError { status }) => *status >= 500,
+                    _ => true,
+                });
+                dbos::step_with("call", options, || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err::<u32, _>(Error::from(ApiError { status }))
+                    }
+                })
+                .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // A 404 is declined on its first failure, so it is reported as itself rather than wrapped.
+    let error = workflow.run(404).await.expect_err("the workflow succeeded");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a declined error is not retried"
+    );
+    assert!(
+        matches!(error, Error::Application(ApiError { status: 404 })),
+        "a lone declined failure is the step's outcome, unwrapped: {error:?}"
+    );
+
+    // A 503 is retried to exhaustion.
+    calls.store(0, Ordering::SeqCst);
+    let error = workflow.run(503).await.expect_err("the workflow succeeded");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        10,
+        "a retryable error uses the policy"
+    );
+    assert!(
+        matches!(error, Error::MaxStepRetriesExceeded { attempts: 10, .. }),
+        "expected exhaustion, got {error:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// Declining after some failures still reports the ones that came before.
+#[tokio::test]
+async fn declining_mid_policy_keeps_the_earlier_failures() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("mid-policy-app", &db));
+    let calls = Arc::new(AtomicU32::new(0));
+    let dbos_calls = Arc::clone(&calls);
+    let workflow = dbos
+        .register_workflow("escalates", move |()| {
+            let calls = Arc::clone(&dbos_calls);
+            async move {
+                let options = StepOptions {
+                    max_attempts: 10,
+                    interval: Duration::from_millis(1),
+                    max_interval: Duration::from_millis(2),
+                    ..Default::default()
+                }
+                .should_retry(|error| match error {
+                    Error::Application(ApiError { status }) => *status >= 500,
+                    _ => true,
+                });
+                dbos::step_with("call", options, || {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        // Two retryable failures, then one that is not.
+                        let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        let status = if attempt <= 2 { 503 } else { 400 };
+                        Err::<u32, _>(Error::from(ApiError { status }))
+                    }
+                })
+                .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let error = workflow.run(()).await.expect_err("the workflow succeeded");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "stopped at the declined failure"
+    );
+    let Error::MaxStepRetriesExceeded {
+        attempts, errors, ..
+    } = error
+    else {
+        panic!("expected MaxStepRetriesExceeded, got {error:?}");
+    };
+    // Three attempts happened, not the ten the policy allowed.
+    assert_eq!(attempts, 3);
+    let seen: Vec<u16> = errors
+        .iter()
+        .map(|e| match e {
+            Error::Application(ApiError { status }) => *status,
+            other => panic!("expected an application error, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(seen, [503, 503, 400]);
 
     dbos.shutdown().await;
 }

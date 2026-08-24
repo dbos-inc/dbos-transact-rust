@@ -1,6 +1,7 @@
 //! Steps: the checkpoints that make a workflow resumable.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -8,9 +9,16 @@ use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
 use crate::context::Ctx;
-use crate::error::{DurableError, Error, Result};
+use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
+
+/// A step's retry predicate: given a failure, whether to try again.
+///
+/// Named as a type because it appears in [`StepOptions::should_retry`]'s field, where the bare
+/// `Arc<dyn Fn(..)>` is more punctuation than signature. Callers rarely write it —
+/// [`StepOptions::should_retry`](StepOptions::should_retry) takes the closure and wraps it.
+pub type ShouldRetry<E> = Arc<dyn Fn(&Error<E>) -> bool + Send + Sync>;
 
 /// What a caller may say about a step, beyond its name and body.
 ///
@@ -22,8 +30,15 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
 /// **The defaults are the three-way majority, not Go's.** Python, TypeScript and Java all use a
 /// one-second base with a 2.0 rate; Go uses 100ms with a five-second cap, which is a different
 /// feature — that one is for a flaky network call, this one is for an upstream that is down.
-#[derive(Debug, Clone)]
-pub struct StepOptions {
+///
+/// **The predicate is synchronous**, unlike Python's and TypeScript's, which also accept an
+/// `async` one. Go's `WithStepRetryPredicate` and Java's `StepShouldRetry` are both synchronous, so
+/// this is 2-of-4 rather than a deviation from consensus — and in Rust the two are not equally
+/// priced. An async predicate cannot be stored in a struct field without boxing its future, so
+/// every caller would write `Arc::new(|e| Box::pin(async move { .. }))` to express what is almost
+/// always a pure match on an error. A check that genuinely has to await belongs in the body, which
+/// can return an error the predicate then declines.
+pub struct StepOptions<E = EngineOnly> {
     /// How many times the body may run before the step is failed. Defaults to **1**: no retrying.
     ///
     /// All four references agree that a plain step does not retry, and spell it three different
@@ -41,20 +56,90 @@ pub struct StepOptions {
     pub backoff_rate: f64,
     /// The longest the interval may grow to, however many failures precede it.
     pub max_interval: Duration,
+    /// Decides whether a failure is worth retrying. `None` retries every failure.
+    ///
+    /// Returning `false` ends the step immediately with that error, even with attempts left — so a
+    /// 4xx from an API is not hammered three times while a 5xx is. Named for the majority: Python's
+    /// `should_retry`, TypeScript's `shouldRetry` and Java's `StepShouldRetry` agree, and only Go
+    /// spells it `WithStepRetryPredicate`.
+    ///
+    /// **It is evaluated before the backoff sleep**, so declining an error costs no wait. That is
+    /// Go's documented behaviour and the only sensible order: waiting to find out whether to wait
+    /// helps nobody.
+    ///
+    /// **A control signal never reaches it.** Cancellation, shutdown and system-database failures
+    /// end the step before the policy is consulted, so a predicate cannot elect to retry against a
+    /// database that is down, and does not need an arm for a case it will never see. Use
+    /// [`should_retry`](Self::should_retry) rather than writing the `Arc` by hand.
+    pub should_retry: Option<ShouldRetry<E>>,
 }
 
-impl Default for StepOptions {
+impl<E> Default for StepOptions<E> {
     fn default() -> Self {
         Self {
             max_attempts: 1,
             interval: Duration::from_secs(1),
             backoff_rate: 2.0,
             max_interval: Duration::from_secs(3600),
+            should_retry: None,
         }
     }
 }
 
-impl StepOptions {
+/// Hand-written because a closure is not [`Debug`], and deriving would demand `E: Debug` besides.
+impl<E> std::fmt::Debug for StepOptions<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepOptions")
+            .field("max_attempts", &self.max_attempts)
+            .field("interval", &self.interval)
+            .field("backoff_rate", &self.backoff_rate)
+            .field("max_interval", &self.max_interval)
+            .field("should_retry", &self.should_retry.is_some())
+            .finish()
+    }
+}
+
+/// Hand-written because deriving would demand `E: Clone`, which no caller owes.
+impl<E> Clone for StepOptions<E> {
+    fn clone(&self) -> Self {
+        Self {
+            max_attempts: self.max_attempts,
+            interval: self.interval,
+            backoff_rate: self.backoff_rate,
+            max_interval: self.max_interval,
+            should_retry: self.should_retry.clone(),
+        }
+    }
+}
+
+impl<E> StepOptions<E> {
+    /// Sets [`should_retry`](Self::should_retry), wrapping the closure.
+    ///
+    /// A method beside the struct literal rather than instead of it: the other four fields are
+    /// plain values and read better set directly, while this one would otherwise make every call
+    /// site spell `Some(Arc::new(..))` around a one-line match.
+    ///
+    /// ```no_run
+    /// # #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    /// # #[error("boom")] struct ApiError { status: u16 }
+    /// use dbos::StepOptions;
+    /// let options = StepOptions {
+    ///     max_attempts: 3,
+    ///     ..Default::default()
+    /// }
+    /// .should_retry(|error| match error {
+    ///     dbos::Error::Application(ApiError { status }) => *status >= 500,
+    ///     _ => true,
+    /// });
+    /// ```
+    pub fn should_retry(
+        mut self,
+        predicate: impl Fn(&Error<E>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.should_retry = Some(Arc::new(predicate));
+        self
+    }
+
     /// The wait before the attempt following `failures` failures.
     ///
     /// `interval * rate^failures`, capped. Saturating rather than panicking on a nonsensical rate:
@@ -156,7 +241,7 @@ where
 /// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
 /// to after the final attempt, rather than the last attempt alone. Python takes its
 /// `step_start_time` in the same place, and Go moved to it in #442.
-pub async fn step_with<T, E, F, Fut>(name: &str, options: StepOptions, body: F) -> Result<T, E>
+pub async fn step_with<T, E, F, Fut>(name: &str, options: StepOptions<E>, body: F) -> Result<T, E>
 where
     T: Serialize + DeserializeOwned,
     E: DurableError,
@@ -231,6 +316,32 @@ where
                 break Err(Error::MaxStepRetriesExceeded {
                     step: name.to_owned(),
                     attempts,
+                    errors: std::mem::take(&mut failures),
+                });
+            }
+            // Declined by the policy: this failure is the step's outcome, whatever attempts
+            // remain. Checked before the backoff so refusing to retry costs no wait, which is Go's
+            // documented order for the same hook.
+            Err(error)
+                if options
+                    .should_retry
+                    .as_ref()
+                    .is_some_and(|should_retry| !should_retry(&error)) =>
+            {
+                tracing::debug!(
+                    step_id,
+                    step_name = name,
+                    attempt,
+                    error = %error,
+                    "the retry predicate declined this failure; the step is not retried"
+                );
+                if failures.is_empty() {
+                    break Err(error);
+                }
+                failures.push(error);
+                break Err(Error::MaxStepRetriesExceeded {
+                    step: name.to_owned(),
+                    attempts: attempt,
                     errors: std::mem::take(&mut failures),
                 });
             }
@@ -334,7 +445,7 @@ mod tests {
     /// The growth curve, and that the cap is a cap.
     #[test]
     fn backoff_grows_geometrically_and_stops_at_the_cap() {
-        let options = StepOptions {
+        let options = StepOptions::<EngineOnly> {
             interval: Duration::from_secs(1),
             backoff_rate: 2.0,
             max_interval: Duration::from_secs(10),
@@ -357,7 +468,7 @@ mod tests {
     fn a_nonsensical_backoff_rate_yields_the_cap() {
         let cap = Duration::from_secs(30);
         for rate in [-2.0, f64::NAN, f64::INFINITY] {
-            let options = StepOptions {
+            let options = StepOptions::<EngineOnly> {
                 interval: Duration::from_secs(1),
                 backoff_rate: rate,
                 max_interval: cap,
@@ -370,7 +481,7 @@ mod tests {
     /// The default is the three-way majority, and it does not retry.
     #[test]
     fn the_defaults_match_python_typescript_and_java() {
-        let options = StepOptions::default();
+        let options = StepOptions::<EngineOnly>::default();
         assert_eq!(options.max_attempts, 1, "a plain step does not retry");
         assert_eq!(options.interval, Duration::from_secs(1));
         assert_eq!(options.backoff_rate, 2.0);

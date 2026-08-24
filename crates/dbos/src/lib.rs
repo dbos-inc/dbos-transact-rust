@@ -62,6 +62,6 @@ pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
-pub use step::{StepOptions, step, step_with};
+pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use workflow::StartOptions;
