@@ -1,6 +1,7 @@
 //! Steps: the checkpoints that make a workflow resumable.
 
 use std::future::Future;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -10,6 +11,64 @@ use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
+
+/// What a caller may say about a step, beyond its name and body.
+///
+/// A struct rather than a builder, matching [`StartOptions`](crate::StartOptions) and how `sysdb`
+/// spells optional arguments. The common case pays nothing because [`step`] keeps its no-option
+/// form. Deliberately **not** `#[non_exhaustive]`, so `..Default::default()` keeps working as
+/// fields are added.
+///
+/// **The defaults are the three-way majority, not Go's.** Python, TypeScript and Java all use a
+/// one-second base with a 2.0 rate; Go uses 100ms with a five-second cap, which is a different
+/// feature — that one is for a flaky network call, this one is for an upstream that is down.
+#[derive(Debug, Clone)]
+pub struct StepOptions {
+    /// How many times the body may run before the step is failed. Defaults to **1**: no retrying.
+    ///
+    /// All four references agree that a plain step does not retry, and spell it three different
+    /// ways — Python and TypeScript with a `retries_allowed` boolean beside a count, Go with
+    /// `maxRetries == 0`, Java by flooring `maxAttempts` at 1. The count alone is taken here
+    /// because a boolean beside it can express `retries_allowed: false, max_attempts: 5`, which
+    /// means nothing, and an option that cannot state a contradiction is worth more than one that
+    /// matches a reference's field list.
+    ///
+    /// Zero is treated as one: a step whose body never runs is not a step.
+    pub max_attempts: u32,
+    /// How long to wait after the first failed attempt.
+    pub interval: Duration,
+    /// What the interval is multiplied by after each failure.
+    pub backoff_rate: f64,
+    /// The longest the interval may grow to, however many failures precede it.
+    pub max_interval: Duration,
+}
+
+impl Default for StepOptions {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            interval: Duration::from_secs(1),
+            backoff_rate: 2.0,
+            max_interval: Duration::from_secs(3600),
+        }
+    }
+}
+
+impl StepOptions {
+    /// The wait before the attempt following `failures` failures.
+    ///
+    /// `interval * rate^failures`, capped. Saturating rather than panicking on a nonsensical rate:
+    /// a negative or `NaN` `backoff_rate` yields a non-finite or negative product, and the clamp
+    /// sends both to the cap rather than to a `Duration` constructor that would panic. A retry that
+    /// waits too long is a misconfiguration; a retry that aborts the process is a bug.
+    fn backoff(&self, failures: u32) -> Duration {
+        let grown = self.interval.as_secs_f64() * self.backoff_rate.powi(failures as i32);
+        if !grown.is_finite() || grown < 0.0 {
+            return self.max_interval;
+        }
+        Duration::from_secs_f64(grown).min(self.max_interval)
+    }
+}
 
 /// Runs `body` once per workflow, recording what it returned.
 ///
@@ -65,6 +124,45 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    step_with(name, StepOptions::default(), body).await
+}
+
+/// Runs `body` as a step, retrying it as `options` allows.
+///
+/// [`step`] with a retry policy — one mechanism, and [`step`] is this called with the defaults.
+///
+/// ```no_run
+/// # async fn f() -> dbos::Result<()> {
+/// use dbos::StepOptions;
+/// let charge = dbos::step_with(
+///     "charge_card",
+///     StepOptions { max_attempts: 3, ..Default::default() },
+///     || async { dbos::Result::Ok(42) },
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// **Every attempt shares one checkpoint.** The recorded result is looked for once, before the
+/// first attempt, and written once, after the last; a replay of a step that took three attempts
+/// sees one outcome, and the intermediate failures live only in logs and spans. That is why
+/// `operation_outputs` has no attempt column in any of the five implementations.
+///
+/// **A control signal is never retried.** Cancellation, shutdown, and any system-database failure
+/// end the step immediately with nothing recorded, so the workflow stays `PENDING` and is
+/// recovered — a database blip is not evidence that the body is wrong, and retrying against a
+/// database that is down would burn the whole policy before the first useful attempt.
+///
+/// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
+/// to after the final attempt, rather than the last attempt alone. Python takes its
+/// `step_start_time` in the same place, and Go moved to it in #442.
+pub async fn step_with<T, E, F, Fut>(name: &str, options: StepOptions, body: F) -> Result<T, E>
+where
+    T: Serialize + DeserializeOwned,
+    E: DurableError,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
     let mut body = body;
     let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
         tracing::debug!(
@@ -78,6 +176,11 @@ where
     let step_id = ctx.next_step_id();
     let executor = ctx.executor();
     let workflow_id = ctx.workflow_id();
+
+    // Before the check, not after it: the recorded duration covers the whole step, including the
+    // round trip that asks whether it has already run. Go moved to this in #442 and Python has
+    // always taken `step_start_time` here.
+    let started_at = Timestamp::now();
 
     let recorded = executor
         .sysdb()
@@ -96,10 +199,57 @@ where
         };
     }
 
-    // The span nests inside the workflow's, so anything the body logs carries both ids.
-    let span = tracing::info_span!("step", step_id, step_name = name);
-    let started_at = Timestamp::now();
-    let outcome = ctx.in_step_scope(body()).instrument(span).await;
+    let attempts = options.max_attempts.max(1);
+    // Only ever pushed to when retrying, so a step at the default of one attempt allocates nothing.
+    let mut failures: Vec<Error<E>> = Vec::new();
+    let outcome = loop {
+        let attempt = failures.len() as u32 + 1;
+        // The span nests inside the workflow's, so anything the body logs carries both ids.
+        let span = tracing::info_span!("step", step_id, step_name = name, attempt);
+        match ctx.in_step_scope(body()).instrument(span).await {
+            Ok(value) => break Ok(value),
+            // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
+            // database that is down says nothing about whether the body would succeed. Returning
+            // here leaves the row untouched, so the workflow stays `PENDING` and is recovered.
+            Err(error) if error.control().is_some() => {
+                tracing::debug!(
+                    step_id,
+                    step_name = name,
+                    attempt,
+                    "a control signal ended the step; it is not retried and nothing is checkpointed"
+                );
+                return Err(error);
+            }
+            Err(error) if attempt >= attempts => {
+                if failures.is_empty() {
+                    // No retry policy to report on, so the error is the step's outcome as it
+                    // stands. Wrapping here would put every ordinary failure inside a collection
+                    // of one.
+                    break Err(error);
+                }
+                failures.push(error);
+                break Err(Error::MaxStepRetriesExceeded {
+                    step: name.to_owned(),
+                    attempts,
+                    errors: std::mem::take(&mut failures),
+                });
+            }
+            Err(error) => {
+                let backoff = options.backoff(attempt - 1);
+                tracing::warn!(
+                    step_id,
+                    step_name = name,
+                    attempt,
+                    attempts,
+                    backoff_secs = backoff.as_secs_f64(),
+                    error = %error,
+                    "the step failed and will be retried"
+                );
+                failures.push(error);
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    };
 
     // Built once and held, not rebuilt per attempt: `record_step` compares the stored completion
     // time against this one to tell its own retried write from another execution's, and a fresh
@@ -132,19 +282,10 @@ where
             );
         }
         Err(error) => {
-            // A control error is not the step's result. A cancelled workflow that recorded its
-            // cancellation as a step failure would replay as *permanently* failed, having lost the
-            // fact that it was interrupted rather than wrong. Debug rather than warn: the signal
-            // propagates into the workflow's channel, and the recording layer above warns once,
-            // with the durable consequence.
-            if error.control().is_some() {
-                tracing::debug!(
-                    step_id,
-                    step_name = name,
-                    "a control signal ended the step; nothing is checkpointed"
-                );
-                return outcome;
-            }
+            // A control error cannot arrive here: the loop above returns on one without leaving
+            // itself, precisely so that a cancelled workflow's step is not recorded as *failed* and
+            // replayed as permanently so. What reaches this arm is the step's own outcome.
+            debug_assert!(error.control().is_none());
             // The error itself, encoded, not a description of it: a replay gives back the error
             // that failed exactly as it gives back the value that succeeded.
             let encoded = encode(error, "step error")?;
@@ -189,6 +330,52 @@ fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The growth curve, and that the cap is a cap.
+    #[test]
+    fn backoff_grows_geometrically_and_stops_at_the_cap() {
+        let options = StepOptions {
+            interval: Duration::from_secs(1),
+            backoff_rate: 2.0,
+            max_interval: Duration::from_secs(10),
+            ..Default::default()
+        };
+        // The exponent is the number of failures *before* this wait, so the first is un-multiplied.
+        assert_eq!(options.backoff(0), Duration::from_secs(1));
+        assert_eq!(options.backoff(1), Duration::from_secs(2));
+        assert_eq!(options.backoff(2), Duration::from_secs(4));
+        assert_eq!(options.backoff(3), Duration::from_secs(8));
+        assert_eq!(options.backoff(4), Duration::from_secs(10), "capped");
+        assert_eq!(options.backoff(40), Duration::from_secs(10), "still capped");
+    }
+
+    /// A rate that cannot produce a duration yields the cap rather than a panic.
+    ///
+    /// `Duration::from_secs_f64` panics on a negative or non-finite value, and a step retry is the
+    /// worst place to discover that: it would take the process down on a config typo, mid-workflow.
+    #[test]
+    fn a_nonsensical_backoff_rate_yields_the_cap() {
+        let cap = Duration::from_secs(30);
+        for rate in [-2.0, f64::NAN, f64::INFINITY] {
+            let options = StepOptions {
+                interval: Duration::from_secs(1),
+                backoff_rate: rate,
+                max_interval: cap,
+                ..Default::default()
+            };
+            assert_eq!(options.backoff(3), cap, "rate {rate}");
+        }
+    }
+
+    /// The default is the three-way majority, and it does not retry.
+    #[test]
+    fn the_defaults_match_python_typescript_and_java() {
+        let options = StepOptions::default();
+        assert_eq!(options.max_attempts, 1, "a plain step does not retry");
+        assert_eq!(options.interval, Duration::from_secs(1));
+        assert_eq!(options.backoff_rate, 2.0);
+        assert_eq!(options.max_interval, Duration::from_secs(3600));
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 

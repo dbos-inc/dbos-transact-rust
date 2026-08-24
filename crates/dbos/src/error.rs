@@ -288,6 +288,27 @@ pub enum Error<E = EngineOnly> {
         message: String,
     },
 
+    /// A step was retried to its limit and every attempt failed.
+    ///
+    /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
+    /// not Java's — Java rethrows the final failure untyped, and `sdk-parity.md` records it as the
+    /// outlier. The first failure is usually the informative one and the last is usually a timeout,
+    /// so keeping only one loses the half that explains the other.
+    ///
+    /// Raised only where retries were actually asked for. A step left at the default
+    /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its one
+    /// attempt failed with, unwrapped: there is no retry policy to report on, and wrapping would
+    /// make every ordinary step failure arrive inside a collection of one.
+    #[error("the step {step} failed on all {attempts} attempts")]
+    MaxStepRetriesExceeded {
+        /// The step's name.
+        step: String,
+        /// How many attempts were made.
+        attempts: u32,
+        /// What each attempt failed with, oldest first.
+        errors: Vec<Error<E>>,
+    },
+
     /// The system database failed.
     ///
     /// Deliberately not a `#[from]`: that impl overlaps the blanket `From<E> for Error<E>` at
@@ -310,7 +331,10 @@ impl<E> Error<E> {
     ///
     /// One match over the engine's variants, kept in a single place so [`lift`](Self::lift) and
     /// any later conversion share the list rather than each carrying a copy of it.
-    fn map_application<E2>(self, f: impl FnOnce(E) -> E2) -> Error<E2> {
+    /// `Fn + Copy` rather than `FnOnce` because
+    /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) nests errors and so recurses. Its
+    /// one caller passes a non-capturing closure, so the tighter bound costs nothing.
+    fn map_application<E2>(self, f: impl Fn(E) -> E2 + Copy) -> Error<E2> {
         match self {
             Error::Application(error) => Error::Application(f(error)),
             Error::NotLaunched { operation } => Error::NotLaunched { operation },
@@ -357,6 +381,18 @@ impl<E> Error<E> {
                 recovery_attempts,
             },
             Error::StepFailed { step, message } => Error::StepFailed { step, message },
+            Error::MaxStepRetriesExceeded {
+                step,
+                attempts,
+                errors,
+            } => Error::MaxStepRetriesExceeded {
+                step,
+                attempts,
+                errors: errors
+                    .into_iter()
+                    .map(|error| error.map_application(f))
+                    .collect(),
+            },
             Error::SystemDatabase(error) => Error::SystemDatabase(error),
         }
     }
