@@ -62,6 +62,105 @@ async fn overlapping_tests_share_one_container() {
     );
 }
 
+/// Every part of a schema that a replay could plausibly get wrong, as sorted text.
+///
+/// Compared as a whole rather than table by table so that a *missing* object fails too, which
+/// is the failure a dump is most likely to have: anything it forgets to emit simply is not
+/// there, and a per-object assertion would never look for it.
+///
+/// Two normalisations, both about names the server generates rather than anything the
+/// migrations asked for. `NOT NULL` reaches `table_constraints` as a `CHECK` row named after
+/// internal object ids, which differ between any two databases — the corpus declares no `CHECK`
+/// constraints of its own, and `is_nullable` below covers what those rows say. CockroachDB then
+/// qualifies `indexdef` with the database name, which is different by definition here.
+const CATALOGUE: &str = "\
+    SELECT 'column|'||table_name||'|'||column_name||'|'||ordinal_position||'|'||data_type \
+                ||'|'||is_nullable||'|'||coalesce(column_default, '-') \
+      FROM information_schema.columns WHERE table_schema = $1 \
+    UNION ALL \
+    SELECT 'constraint|'||table_name||'|'||constraint_name||'|'||constraint_type \
+      FROM information_schema.table_constraints \
+      WHERE table_schema = $1 AND constraint_type <> 'CHECK' \
+    UNION ALL \
+    SELECT 'index|'||tablename||'|'||indexname||'|'||replace(indexdef, current_database()||'.', '') \
+      FROM pg_indexes WHERE schemaname = $1 \
+    UNION ALL \
+    SELECT 'routine|'||routine_name||'|'||coalesce(data_type, '-') \
+      FROM information_schema.routines WHERE routine_schema = $1 \
+    ORDER BY 1";
+
+async fn catalogue(pool: &sqlx::PgPool) -> Vec<String> {
+    sqlx::query_scalar(CATALOGUE)
+        .bind(DEFAULT_SCHEMA)
+        .fetch_all(pool)
+        .await
+        .expect("failed to read the catalogue")
+}
+
+async fn recorded_version(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT version FROM dbos.dbos_migrations")
+        .fetch_one(pool)
+        .await
+        .expect("failed to read the recorded migration version")
+}
+
+/// A pooled database is indistinguishable from one the corpus built.
+///
+/// **This is the assertion the pool's whole design rests on.** Pooled databases are not
+/// migrated; they are built from a baseline derived from one database that was. That trade is
+/// only sound while the two are the same schema, and the ways it could quietly stop being true
+/// — a dump that omits functions, a `TEMPLATE` clone that misses something, a new migration
+/// introducing an object the dump does not emit — all look like passing tests running against
+/// the wrong schema rather than like failures.
+///
+/// It costs one full corpus run on top of the one the pool already makes. That is the price of
+/// the other several this file's binary no longer pays.
+#[tokio::test]
+async fn a_pooled_database_matches_one_the_migrations_built() {
+    let migrated = raw_database().await;
+    let pool = migrated.pool().await;
+    dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
+        .await
+        .expect("failed to migrate the comparison database");
+    let from_migrations = catalogue(&pool).await;
+    let migrated_version = recorded_version(&pool).await;
+    pool.close().await;
+
+    let leased = test_database().await;
+    let pool = leased.pool().await;
+    let from_baseline = catalogue(&pool).await;
+    let leased_version = recorded_version(&pool).await;
+    pool.close().await;
+
+    assert!(
+        !from_migrations.is_empty(),
+        "the comparison database came up empty, so this test would pass on anything",
+    );
+    // Reported as the difference rather than by comparing the two lists directly: they are
+    // around 160 rows each, and a failure that prints both of them in full buries the one line
+    // that changed.
+    let missing: Vec<_> = from_migrations
+        .iter()
+        .filter(|row| !from_baseline.contains(row))
+        .collect();
+    let extra: Vec<_> = from_baseline
+        .iter()
+        .filter(|row| !from_migrations.contains(row))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "a pooled database's schema differs from what the migrations build on {:?}\n\
+         missing from the pooled database: {missing:#?}\n\
+         present only in the pooled database: {extra:#?}",
+        leased.backend(),
+    );
+    assert_eq!(
+        leased_version, migrated_version,
+        "a pooled database records a different migration version than a migrated one, so \
+         anything reading it would try to migrate over the top of a finished schema",
+    );
+}
+
 /// A leased database arrives migrated, which is what `test_database` promises.
 #[tokio::test]
 async fn a_leased_database_is_already_migrated() {
