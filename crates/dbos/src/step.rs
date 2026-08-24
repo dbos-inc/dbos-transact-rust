@@ -8,6 +8,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::Instrument;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
@@ -56,6 +58,26 @@ pub struct StepOptions<E = EngineOnly> {
     pub backoff_rate: f64,
     /// The longest the interval may grow to, however many failures precede it.
     pub max_interval: Duration,
+    /// The longest **one attempt** may run. `None` lets it run as long as it likes.
+    ///
+    /// On expiry the attempt's future is dropped — which is how Rust stops work, and stops it at
+    /// the next suspension point while running destructors on the way out — and the step fails
+    /// with [`Error::StepTimeout`]. That is an ordinary retryable failure: it is offered to
+    /// [`should_retry`](Self::should_retry) and counts against
+    /// [`max_attempts`](Self::max_attempts), as TypeScript's `timeoutMS` also specifies.
+    ///
+    /// **Each attempt gets its own timeout, and backoff is not charged against it.** Three
+    /// attempts at five seconds may spend fifteen seconds in the body. Python states the same
+    /// layering where it puts the supervisor inside the retry loop.
+    ///
+    /// Before the future is dropped, [`Ctx::cancellation`](crate::Ctx::cancellation) fires, so work
+    /// the runtime cannot reach by dropping a future — a `spawn_blocking` thread, a client holding
+    /// its own cancel handle — can still be told. Ordinary `async` bodies need nothing.
+    ///
+    /// **Unlike Python, this is not restricted to some kinds of step.** py #826 rejects a timeout
+    /// on a sync step because *"Python has no preemption mechanism for sync steps"*; every step
+    /// here is a future, so there is no second case to exclude and no error to raise.
+    pub timeout: Option<Duration>,
     /// Decides whether a failure is worth retrying. `None` retries every failure.
     ///
     /// Returning `false` ends the step immediately with that error, even with attempts left — so a
@@ -81,6 +103,7 @@ impl<E> Default for StepOptions<E> {
             interval: Duration::from_secs(1),
             backoff_rate: 2.0,
             max_interval: Duration::from_secs(3600),
+            timeout: None,
             should_retry: None,
         }
     }
@@ -94,6 +117,7 @@ impl<E> std::fmt::Debug for StepOptions<E> {
             .field("interval", &self.interval)
             .field("backoff_rate", &self.backoff_rate)
             .field("max_interval", &self.max_interval)
+            .field("timeout", &self.timeout)
             .field("should_retry", &self.should_retry.is_some())
             .finish()
     }
@@ -107,6 +131,7 @@ impl<E> Clone for StepOptions<E> {
             interval: self.interval,
             backoff_rate: self.backoff_rate,
             max_interval: self.max_interval,
+            timeout: self.timeout,
             should_retry: self.should_retry.clone(),
         }
     }
@@ -291,7 +316,7 @@ where
         let attempt = failures.len() as u32 + 1;
         // The span nests inside the workflow's, so anything the body logs carries both ids.
         let span = tracing::info_span!("step", step_id, step_name = name, attempt);
-        match ctx.in_step_scope(body()).instrument(span).await {
+        match supervise(&ctx, name, options.timeout, body(), span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
@@ -420,6 +445,61 @@ where
         }
     }
     outcome
+}
+
+/// Runs one attempt under the watchdogs its options ask for.
+///
+/// One place decides whether the attempt completed or blew its deadline, which is the shape
+/// py #826 arrived at when it merged Python's preemption poller and its new step timeout into a
+/// single `_supervise_step`. Preemption joins here rather than beside it.
+///
+/// **Without a timeout this is the body and nothing else** — no timer, no token, no `select!` —
+/// so a step that does not ask for one pays nothing for the option existing.
+///
+/// With one, the attempt races a timer. On expiry the token fires *first* and the body's future is
+/// then dropped, and the order matters: dropping stops the future at its next suspension point, so
+/// anything that would only learn from the token has to be told before it goes. Dropping is also
+/// the half TypeScript cannot do — it abandons a timed-out attempt and discards whatever the
+/// abandoned promise eventually settles to, while a dropped Rust future stops *and* runs its
+/// destructors, returning connections and releasing guards without the body saying so.
+async fn supervise<T, E, Fut>(
+    ctx: &Ctx,
+    name: &str,
+    timeout: Option<Duration>,
+    body: Fut,
+    span: tracing::Span,
+) -> Result<T, E>
+where
+    E: DurableError,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let Some(timeout) = timeout else {
+        return ctx.in_step_scope(None, body).instrument(span).await;
+    };
+
+    let token = CancellationToken::new();
+    let attempt = ctx
+        .in_step_scope(Some(token.clone()), body)
+        .instrument(span);
+
+    // `attempt` is passed by value, so losing the race is what drops it — and dropping it is what
+    // stops the body. Taking it by `&mut` under `tokio::pin!` would leave the future alive for the
+    // rest of this scope, and an explicit `drop` of the pinned reference would not touch it.
+    tokio::select! {
+        outcome = attempt => outcome,
+        () = tokio::time::sleep(timeout) => {
+            // Cancelled before this arm returns, and so before the losing future is dropped at the
+            // end of the `select!`. A body that could only learn from the token — work on another
+            // task, or on a blocking thread — would otherwise never learn at all.
+            token.cancel();
+            tracing::debug!(
+                step_name = name,
+                timeout_ms = timeout.as_millis(),
+                "the step attempt exceeded its timeout and was stopped"
+            );
+            Err(Error::StepTimeout { step: name.to_owned(), timeout })
+        }
+    }
 }
 
 /// Rebuilds the error a recorded step failed with.

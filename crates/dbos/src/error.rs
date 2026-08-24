@@ -288,6 +288,26 @@ pub enum Error<E = EngineOnly> {
         message: String,
     },
 
+    /// A step attempt ran past its timeout and was stopped.
+    ///
+    /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
+    /// retried like any other, which is what TypeScript's `StepConfig.timeoutMS` documents. A step
+    /// whose attempts all time out fails with
+    /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) holding one of these per attempt.
+    ///
+    /// The timeout bounds **one attempt**, not the step: three attempts at five seconds may take
+    /// fifteen seconds of body time, plus backoff. Nothing here carries a numeric error code,
+    /// because the portable error shape matches on `name` and makes `code` optional — Python codes
+    /// this error 18 and TypeScript codes it 31, and neither is a value a fifth implementation
+    /// should adopt.
+    #[error("the step {step} exceeded its {}ms timeout", timeout.as_millis())]
+    StepTimeout {
+        /// The step's name.
+        step: String,
+        /// The timeout it exceeded.
+        timeout: std::time::Duration,
+    },
+
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
@@ -381,6 +401,7 @@ impl<E> Error<E> {
                 recovery_attempts,
             },
             Error::StepFailed { step, message } => Error::StepFailed { step, message },
+            Error::StepTimeout { step, timeout } => Error::StepTimeout { step, timeout },
             Error::MaxStepRetriesExceeded {
                 step,
                 attempts,
