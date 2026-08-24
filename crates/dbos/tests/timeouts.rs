@@ -257,3 +257,97 @@ async fn a_step_within_its_timeout_is_unaffected() {
 
     dbos.shutdown().await;
 }
+
+/// A preemptible step stops when the workflow is cancelled by someone else, and records nothing.
+///
+/// The cancellation is written straight to the database, standing in for Conductor, a client, or
+/// another SDK sharing the system database — none of which this process hears from directly.
+#[tokio::test]
+async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
+    let db = test_database().await;
+    let dbos = DBOS::new(Config {
+        migrate: false,
+        // Poll briskly, so the test is not waiting out the one-second default.
+        outcome_poll_interval: Some(Duration::from_millis(20)),
+        ..Config::new("preempt-app", db.url())
+    });
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dbos_entered = Arc::clone(&entered);
+    let workflow = dbos
+        .register_workflow("long_step", move |()| {
+            let entered = Arc::clone(&dbos_entered);
+            async move {
+                let options = StepOptions {
+                    preemptible: true,
+                    ..Default::default()
+                };
+                dbos::step_with("slow", options, || {
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Ok::<u32, dbos::Error>(1)
+                    }
+                })
+                .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "preempt-me";
+    let handle = workflow
+        .start_with(
+            (),
+            dbos::StartOptions {
+                workflow_id: Some(id),
+            },
+        )
+        .await
+        .expect("start failed");
+
+    // Wait until the body is actually running before cancelling it.
+    entered.notified().await;
+
+    let reader = reader(&db).await;
+    reader
+        .cancel_workflows(&[id], false)
+        .await
+        .expect("cancel failed");
+
+    let error = handle.result().await.expect_err("the workflow succeeded");
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "expected a cancellation, got {error:?}"
+    );
+
+    // Nothing checkpointed: a preempted step was interrupted, not wrong, so a resume runs it again.
+    let steps = reader
+        .list_workflow_steps(id, true, None, None)
+        .await
+        .expect("read failed");
+    assert!(
+        steps.is_empty(),
+        "a preempted step must record no outcome, found {steps:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// Preemption is off by default, so an ordinary step is not watched.
+#[tokio::test]
+async fn a_plain_step_is_not_preemptible() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("not-preempt-app", &db));
+    let workflow = dbos
+        .register_workflow("quick", |()| async move {
+            dbos::step("quick", || async { Ok::<u32, dbos::Error>(7) }).await
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    assert_eq!(workflow.run(()).await.expect("the workflow failed"), 7);
+    assert!(!StepOptions::<dbos::Error>::default().preemptible);
+
+    dbos.shutdown().await;
+}

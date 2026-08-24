@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
-use crate::sysdb::types::{Outcome, StepTiming, Timestamp};
+use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
 
 /// A step's retry predicate: given a failure, whether to try again.
 ///
@@ -78,6 +78,22 @@ pub struct StepOptions<E = EngineOnly> {
     /// on a sync step because *"Python has no preemption mechanism for sync steps"*; every step
     /// here is a future, so there is no second case to exclude and no error to raise.
     pub timeout: Option<Duration>,
+    /// Whether to stop this step as soon as the workflow is seen to be `CANCELLED` elsewhere.
+    ///
+    /// Off by default, and worth turning on for a long step whose work is wasted once the workflow
+    /// is cancelled — a large transfer, a slow report. A cancellation raised in **this** process
+    /// does not need it, since that path stops the workflow directly; what this observes is a
+    /// cancellation raised somewhere else, by Conductor, a client, or another SDK sharing the
+    /// system database.
+    ///
+    /// The cost is a periodic status read per running step, at
+    /// [`Config::outcome_poll_interval`](crate::Config::outcome_poll_interval), under the same
+    /// polling-concurrency cap as every other database-backed wait. Python's `preemptible` does
+    /// the same and hardcodes its interval.
+    ///
+    /// **A preempted step records nothing** and runs again on resume, because a cancellation is a
+    /// control signal rather than the step's result — the step did not fail, it was interrupted.
+    pub preemptible: bool,
     /// Decides whether a failure is worth retrying. `None` retries every failure.
     ///
     /// Returning `false` ends the step immediately with that error, even with attempts left — so a
@@ -104,6 +120,7 @@ impl<E> Default for StepOptions<E> {
             backoff_rate: 2.0,
             max_interval: Duration::from_secs(3600),
             timeout: None,
+            preemptible: false,
             should_retry: None,
         }
     }
@@ -118,6 +135,7 @@ impl<E> std::fmt::Debug for StepOptions<E> {
             .field("backoff_rate", &self.backoff_rate)
             .field("max_interval", &self.max_interval)
             .field("timeout", &self.timeout)
+            .field("preemptible", &self.preemptible)
             .field("should_retry", &self.should_retry.is_some())
             .finish()
     }
@@ -132,6 +150,7 @@ impl<E> Clone for StepOptions<E> {
             backoff_rate: self.backoff_rate,
             max_interval: self.max_interval,
             timeout: self.timeout,
+            preemptible: self.preemptible,
             should_retry: self.should_retry.clone(),
         }
     }
@@ -316,7 +335,7 @@ where
         let attempt = failures.len() as u32 + 1;
         // The span nests inside the workflow's, so anything the body logs carries both ids.
         let span = tracing::info_span!("step", step_id, step_name = name, attempt);
-        match supervise(&ctx, name, options.timeout, body(), span).await {
+        match supervise(&ctx, name, &options, body(), span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
@@ -465,7 +484,7 @@ where
 async fn supervise<T, E, Fut>(
     ctx: &Ctx,
     name: &str,
-    timeout: Option<Duration>,
+    options: &StepOptions<E>,
     body: Fut,
     span: tracing::Span,
 ) -> Result<T, E>
@@ -473,31 +492,110 @@ where
     E: DurableError,
     Fut: Future<Output = Result<T, E>>,
 {
-    let Some(timeout) = timeout else {
+    if options.timeout.is_none() && !options.preemptible {
         return ctx.in_step_scope(None, body).instrument(span).await;
-    };
+    }
 
     let token = CancellationToken::new();
     let attempt = ctx
         .in_step_scope(Some(token.clone()), body)
         .instrument(span);
 
+    // A deadline that never arrives, so the arm can be unconditional rather than duplicating the
+    // whole `select!` for each combination of watchdogs.
+    let deadline = async {
+        match options.timeout {
+            Some(timeout) => tokio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    };
+    let cancelled = async {
+        match options.preemptible {
+            true => observe_cancellation(ctx).await,
+            false => std::future::pending().await,
+        }
+    };
+
     // `attempt` is passed by value, so losing the race is what drops it — and dropping it is what
     // stops the body. Taking it by `&mut` under `tokio::pin!` would leave the future alive for the
     // rest of this scope, and an explicit `drop` of the pinned reference would not touch it.
+    //
+    // **Biased, and the order is the decision.** A completed attempt keeps its outcome whatever
+    // else happened; a cancellation outranks a deadline that arrived in the same instant, because
+    // not checkpointing a cancelled workflow's step is the safer error — a timeout is recorded and
+    // replays as a failure, while a cancellation records nothing and runs again on resume. Getting
+    // the tie wrong this way costs one re-execution; getting it wrong the other way durably fails a
+    // workflow that was never given a chance. Python states the same rule for the same reason.
     tokio::select! {
+        biased;
         outcome = attempt => outcome,
-        () = tokio::time::sleep(timeout) => {
+        () = cancelled => {
+            token.cancel();
+            tracing::debug!(
+                step_name = name,
+                "the workflow was cancelled elsewhere; the step is preempted and records nothing"
+            );
+            Err(Error::WorkflowCancelled { workflow_id: ctx.workflow_id().to_owned() })
+        }
+        () = deadline => {
             // Cancelled before this arm returns, and so before the losing future is dropped at the
             // end of the `select!`. A body that could only learn from the token — work on another
             // task, or on a blocking thread — would otherwise never learn at all.
             token.cancel();
+            let timeout = options.timeout.expect("the deadline arm only fires with a timeout set");
             tracing::debug!(
                 step_name = name,
                 timeout_ms = timeout.as_millis(),
                 "the step attempt exceeded its timeout and was stopped"
             );
             Err(Error::StepTimeout { step: name.to_owned(), timeout })
+        }
+    }
+}
+
+/// Completes once this workflow is observed `CANCELLED`, and never otherwise.
+///
+/// **Reuses `await_workflow_result` rather than adding a status channel**, which is the whole of
+/// what preemption needs from the database. That method already polls the status row, already
+/// reports a cancellation as a *value* rather than an error, already releases its connection
+/// between polls, and already runs under the polling-concurrency cap that stops a fan-out of
+/// waiters from starving the control plane. Python's poller is the same loop over
+/// `get_workflow_status`, with an interval it hardcodes and this one takes from config.
+///
+/// A terminal outcome that is *not* a cancellation means another executor wrote this workflow's
+/// result while this process was still running it. There is nothing to preempt for — the step's
+/// own outcome is no longer wanted either way — so this parks rather than reporting a cancellation
+/// that did not happen, and lets the attempt finish on its own terms.
+async fn observe_cancellation(ctx: &Ctx) {
+    let executor = ctx.executor();
+    let interval = executor.outcome_poll_interval();
+    match executor
+        .sysdb()
+        .await_workflow_result(ctx.workflow_id(), interval)
+        .await
+    {
+        Ok(AwaitedOutcome::Cancelled) => (),
+        // Terminal but not a cancellation: another executor wrote this workflow's outcome while
+        // this process was still running it. There is nothing to preempt for, so park rather than
+        // completing — completing *is* the cancellation signal, and reporting one that did not
+        // happen is worse than not watching.
+        Ok(_) => std::future::pending().await,
+        // **Not retried here, deliberately.** `await_workflow_result` polls in a loop with
+        // `with_retry` inside it, and that policy has no attempt limit for transient or connection
+        // failures — a database that is merely unreachable never reaches this arm, because the
+        // wait blocks until it comes back. What does reach it is the class `sysdb::retry` returns
+        // immediately: `Permanent` and non-backend errors, which will fail again identically. So
+        // this parks too, and the step finishes on its own terms — the same outcome as not having
+        // asked for preemption. Looping here would re-decide a question the layer below owns, and
+        // would turn one unparseable status row into a warning every interval for the life of the
+        // step.
+        Err(error) => {
+            tracing::warn!(
+                workflow_id = ctx.workflow_id(),
+                %error,
+                "could not read status for a preemptible step; it will not be preempted"
+            );
+            std::future::pending().await
         }
     }
 }
