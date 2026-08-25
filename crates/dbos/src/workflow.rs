@@ -236,6 +236,17 @@ pub struct StartOptions<'a> {
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
     /// cancelled workflow was interrupted, not wrong.
     pub timeout: Timeout,
+    /// A queue to leave this workflow on, instead of running it here.
+    ///
+    /// The workflow is recorded `ENQUEUED` and **not started**: whichever executor next polls that
+    /// queue claims it and runs it, under whatever limits the queue carries. The handle returned is
+    /// a polling one, because the process that asked is usually not the process that runs it.
+    ///
+    /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto
+    /// one, and a queue registered by a peer is as valid a destination as one registered here.
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is a legitimate destination too, and is
+    /// where `resume` and `fork` put work.
+    pub queue: Option<&'a str>,
 }
 
 /// How long a workflow may take, and — started from inside another one — what it does about the
@@ -498,6 +509,13 @@ where
         // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
         // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
         let deadline = match (options.timeout, &parent) {
+            // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
+            // explicit timeout records the budget and leaves the deadline null for the claim
+            // statement to fill in. The wait in the queue is not part of the budget — a workflow
+            // given five minutes that sits queued for an hour still gets five minutes. Python and
+            // TypeScript both branch on the queue in exactly this spot; the claim statement this
+            // engine already ships does the other half.
+            (Timeout::Explicit(_), _) if options.queue.is_some() => None,
             // **An explicit timeout replaces an inherited deadline**, which is Python's and
             // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
             // use it over any propagated deadline"*. So a child given longer than its parent has
@@ -516,6 +534,12 @@ where
             // parent and the child genuinely share: both `select!`s fire at the same moment, in
             // different tasks and possibly in different processes, with no signal passing between
             // them. A propagated deadline is the cancellation cascade, and needs no other one.
+            // **Inherited even onto a queue**, and this is not an oversight in Python's code: its
+            // `_get_timeout_deadline` branches on the queue only inside the explicit-timeout arm,
+            // and returns the propagated deadline unconditionally otherwise. The difference is
+            // what the two mean. A budget is a promise about how long the *work* may take, so the
+            // queue wait cannot count against it; an inherited deadline is an instant a parent is
+            // already bound by, and a child does not escape it by being queued.
             (Timeout::Inherit, Some(parent)) => parent.deadline,
             (Timeout::Inherit, None) => None,
         };
@@ -540,6 +564,10 @@ where
                     timeout: options.timeout.budget(),
                     deadline,
                     parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
+                    // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
+                    // it: a queue's whole point is that the process which asks is not necessarily
+                    // the one that runs.
+                    queue_name: options.queue,
                     ..NewWorkflow::new(&workflow_id)
                 },
                 Some(MAX_RECOVERY_ATTEMPTS),
@@ -556,6 +584,14 @@ where
             parent
                 .record_launch(&executor, &workflow_id, &self.key().name, started_at)
                 .await?;
+        }
+
+        // **Enqueued, so this process is not the one running it.** A polling handle is the honest
+        // answer even when this executor turns out to dequeue it moments later: nothing local is
+        // waiting on, and the row is the only thing that knows where the workflow got to.
+        if let Some(queue) = options.queue {
+            tracing::debug!(workflow_id, queue, "the workflow is enqueued");
+            return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
 
         // Someone else owns this row — the id was supplied and a previous run has it, or another

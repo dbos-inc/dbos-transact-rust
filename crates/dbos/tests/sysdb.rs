@@ -7538,7 +7538,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
 
 /// Global concurrency counts what every executor has running, not just this one.
 #[tokio::test]
-async fn global_concurrency_counts_across_executors() {
+async fn concurrency_counts_across_executors() {
     let (sys, db) = sysdb().await;
     // Both assertions below are exact counts, so an under-delivering dequeue breaks them: too few
     // started, and then the second executor finds the slack the first one left.

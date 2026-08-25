@@ -802,6 +802,7 @@ async fn a_child_inherits_its_parents_deadline() {
             StartOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
+                ..StartOptions::default()
             },
         )
         .await
@@ -869,6 +870,7 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
             StartOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(60)),
+                ..StartOptions::default()
             },
         )
         .await
@@ -942,6 +944,7 @@ async fn a_child_can_decline_the_inherited_deadline() {
             StartOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
+                ..StartOptions::default()
             },
         )
         .await
@@ -1017,6 +1020,7 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
             StartOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_millis(400)),
+                ..StartOptions::default()
             },
         )
         .await
