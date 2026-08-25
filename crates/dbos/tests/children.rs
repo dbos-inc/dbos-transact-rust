@@ -7,7 +7,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error, StartOptions};
+use dbos::{Config, DBOS, Error, StartOptions, Timeout};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -718,7 +718,7 @@ async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
                     .run_with(
                         (),
                         StartOptions {
-                            timeout: Some(Duration::from_millis(300)),
+                            timeout: Timeout::Explicit(Duration::from_millis(300)),
                             ..StartOptions::default()
                         },
                     )
@@ -804,7 +804,7 @@ async fn a_child_inherits_its_parents_deadline() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                timeout: Some(Duration::from_secs(300)),
+                timeout: Timeout::Explicit(Duration::from_secs(300)),
             },
         )
         .await
@@ -855,7 +855,7 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
                         (),
                         StartOptions {
                             // Longer than what the parent has left.
-                            timeout: Some(Duration::from_secs(3_600)),
+                            timeout: Timeout::Explicit(Duration::from_secs(3_600)),
                             ..StartOptions::default()
                         },
                     )
@@ -871,7 +871,7 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                timeout: Some(Duration::from_secs(60)),
+                timeout: Timeout::Explicit(Duration::from_secs(60)),
             },
         )
         .await
@@ -895,6 +895,95 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
         "the child's own timeout won: it outlives its parent"
     );
     assert_eq!(child_row.timeout, Some(Duration::from_secs(3_600)));
+
+    dbos.shutdown().await;
+}
+
+/// A child can decline the inherited deadline outright, which no `Option<Duration>` could say.
+///
+/// [`Timeout::Inherit`] is a caller who said nothing and [`Timeout::None`] is a caller who decided,
+/// and only the second detaches a child from a parent that has a budget. All four references carry
+/// the same three states — Java's `Timeout.None`, a `null` timeout in TypeScript, Python's
+/// `SetWorkflowTimeout(None)` — and each clears the propagated deadline rather than merely leaving
+/// it unset.
+///
+/// The row is the assertion: no deadline, and no timeout either. A `workflow_timeout_ms` here
+/// would be a budget nobody asked for, and it is the column a queue recomputes a deadline from.
+#[tokio::test]
+async fn a_child_can_decline_the_inherited_deadline() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-no-timeout-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                // Two children under one bounded parent: the first says nothing, the second
+                // declines. Together they are the difference the enum exists for.
+                let inherited = child.run(()).await?;
+                let detached = child
+                    .run_with(
+                        (),
+                        StartOptions {
+                            timeout: Timeout::None,
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await?;
+                Ok::<u32, Error>(inherited + detached)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "one-child-opts-out";
+    let total = parent
+        .run_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Timeout::Explicit(Duration::from_secs(300)),
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(total, 2, "both children ran");
+
+    let reader = reader(&db).await;
+    let parent_deadline = reader
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing")
+        .deadline
+        .expect("the parent has a deadline");
+
+    let inherited = reader
+        .get_workflow(&format!("{id}-0"))
+        .await
+        .expect("read failed")
+        .expect("the first child has no row");
+    assert_eq!(
+        inherited.deadline,
+        Some(parent_deadline),
+        "silence inherits the parent's instant verbatim"
+    );
+
+    let detached = reader
+        .get_workflow(&format!("{id}-2"))
+        .await
+        .expect("read failed")
+        .expect("the second child has no row");
+    assert_eq!(
+        detached.deadline, None,
+        "Timeout::None declined the parent's deadline"
+    );
+    assert_eq!(
+        detached.timeout, None,
+        "and took no budget of its own in its place"
+    );
 
     dbos.shutdown().await;
 }
@@ -930,7 +1019,7 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                timeout: Some(Duration::from_millis(400)),
+                timeout: Timeout::Explicit(Duration::from_millis(400)),
             },
         )
         .await

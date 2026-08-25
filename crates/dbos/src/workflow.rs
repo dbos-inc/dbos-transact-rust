@@ -223,7 +223,8 @@ pub struct StartOptions<'a> {
     /// A caller-supplied id is an idempotency key: starting the same id twice joins the workflow
     /// already running — or already finished — rather than failing the second caller.
     pub workflow_id: Option<&'a str>,
-    /// How long the whole workflow may take. `None` lets it run as long as it likes.
+    /// How long the whole workflow may take, and whether it takes a parent's budget when it names
+    /// none of its own. Defaults to [`Timeout::Inherit`].
     ///
     /// **Durable, and unlike a step timeout it cancels rather than fails.** The budget becomes a
     /// wall-clock deadline stored on the row, so it survives a crash: a workflow recovered with
@@ -234,7 +235,88 @@ pub struct StartOptions<'a> {
     /// A step's [`timeout`](crate::StepOptions::timeout) bounds one attempt and is recorded as a
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
     /// cancelled workflow was interrupted, not wrong.
-    pub timeout: Option<Duration>,
+    pub timeout: Timeout,
+}
+
+/// How long a workflow may take, and — started from inside another one — what it does about the
+/// deadline its parent is under.
+///
+/// **Three states rather than an `Option<Duration>`, because a child has three things to say and
+/// only one of them is silence.** Saying nothing and saying "no limit" are different instructions
+/// once there is a parent budget to inherit, and an `Option` collapses them: `None` would have to
+/// mean both, and inheritance is the more useful default, so an unbounded child would have been
+/// inexpressible.
+///
+/// **All four references carry these three states**, which is why they are an enum here rather
+/// than a convention:
+///
+/// - **Java** is the same shape under the same first name: a sealed `Timeout` permitting
+///   `Timeout.Inherit`, `Timeout.None` and `Timeout.Explicit` (`workflow/Timeout.java`), resolved
+///   at `DBOSContext.resolveTimeoutAndDeadline` — where the `None` case clears the propagated
+///   deadline *and* the timeout, exactly as [`None`](Self::None) does here. This is the one place
+///   Java **is** the model, variant names included; decision 6's "Java is not a model" is about
+///   its user-facing `withDeadline` and the precedence that follows from it, which Rust lacks.
+/// - **TypeScript** spells the three as `number | null | undefined` (`context.ts:31`) and branches
+///   on the middle one under the comment *"Detach child deadline if a null timeout is configured"*
+///   (`dbos.ts:1969`, and again at `enqueue_workflow.ts:92`).
+/// - **Python** reaches them through `SetWorkflowTimeout(None)`, whose `__enter__` clears the
+///   propagated deadline as well as the timeout (`_context.py:568`).
+/// - **Go** gets all three for free, because its deadline rides on a `context` a caller may
+///   decline to pass on.
+///
+/// **The variant names are Java's**, so the two SDKs spell the same three states the same way and
+/// a reader crossing between them has nothing to translate. `Timeout::None` does sit next to the
+/// `Option`s this crate is written in, which is worth a moment's care at a call site and worth
+/// less than the parity.
+///
+/// Outside a workflow there is nothing to inherit, so [`Inherit`](Self::Inherit) and
+/// [`None`](Self::None) mean the same thing there: no deadline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Timeout {
+    /// Say nothing about the budget: a child takes its parent's deadline, a root runs unbounded.
+    ///
+    /// The default, and the reason the default is this rather than [`None`](Self::None):
+    /// a workflow factored out of a parent's body should stay inside the budget that body was
+    /// under, without its call site having to say so.
+    #[default]
+    Inherit,
+    /// Run for as long as it likes, **even under a parent that has a deadline**.
+    ///
+    /// The state an `Option<Duration>` cannot express, and the reason this is an enum: `Inherit`
+    /// is a caller who said nothing, and this is a caller who decided. `Timeout.None` in Java,
+    /// a `null` timeout in TypeScript, `SetWorkflowTimeout(None)` in Python.
+    None,
+    /// A budget, counted from now.
+    ///
+    /// **Replaces an inherited deadline rather than being bounded by it**, even when it is the
+    /// longer of the two — so a child given more time than its parent has left outlives its
+    /// parent. That is Python's and TypeScript's rule and their shared comment (*"If a timeout is
+    /// explicitly specified, use it over any propagated deadline"*), and it is defensible for the
+    /// reason it reads: an explicit timeout on one specific child is a statement about that child.
+    /// Go takes the earlier of the two instead, but not by design — `context.WithTimeout` composes
+    /// as a minimum and nobody wrote a precedence rule.
+    Explicit(Duration),
+}
+
+impl From<Duration> for Timeout {
+    fn from(timeout: Duration) -> Self {
+        Self::Explicit(timeout)
+    }
+}
+
+impl Timeout {
+    /// The budget to record on the row, which only [`Explicit`](Self::Explicit) has.
+    ///
+    /// Neither of the others is a budget: `Inherit` takes an *instant* from its parent and
+    /// `None` takes nothing, and a row's `workflow_timeout_ms` is what a **queue** recomputes
+    /// a deadline from on dequeue. Writing one for either would hand that path a budget the caller
+    /// never asked for.
+    fn budget(self) -> Option<Duration> {
+        match self {
+            Self::Explicit(timeout) => Some(timeout),
+            Self::Inherit | Self::None => Option::None,
+        }
+    }
 }
 
 impl<P, R, E> WorkflowRef<P, R, E>
@@ -365,16 +447,20 @@ where
             // left outlives its parent — an explicit timeout on a specific child is a statement
             // about that child, and the alternative would silently ignore what the caller asked
             // for. Go differs by taking the earlier of the two, but not by design: its deadline
-            // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets the
-            // deadline win, and is not a model here — its user-facing `deadline` is Java's alone
-            // and Rust does not have one.
-            (Some(timeout), _) => Timestamp::now().checked_add(timeout),
+            // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets an
+            // explicitly *set* deadline win, and is not a model there — its user-facing `deadline`
+            // is Java's alone and Rust does not have one.
+            (Timeout::Explicit(timeout), _) => Timestamp::now().checked_add(timeout),
+            // **A deliberate refusal to inherit**, which is why the option is an enum: this is a
+            // caller who decided, and `Inherit` below is a caller who said nothing. Java's
+            // `Timeout.None` clears the propagated deadline in the same words.
+            (Timeout::None, _) => None,
             // **Inherited as an instant, not as a budget**, which is what makes it a deadline the
             // parent and the child genuinely share: both `select!`s fire at the same moment, in
             // different tasks and possibly in different processes, with no signal passing between
             // them. A propagated deadline is the cancellation cascade, and needs no other one.
-            (None, Some(parent)) => parent.deadline,
-            (None, None) => None,
+            (Timeout::Inherit, Some(parent)) => parent.deadline,
+            (Timeout::Inherit, None) => None,
         };
 
         let started_at = Timestamp::now();
@@ -390,7 +476,11 @@ where
                     executor_id: Some(executor.executor_id()),
                     application_name: Some(executor.app_name()),
                     application_version: Some(executor.application_version()),
-                    timeout: options.timeout,
+                    // Only a budget is written: an inherited deadline is an *instant* and has no
+                    // budget behind it, and `Timeout::None` has neither. The column is what a
+                    // queue recomputes a deadline from on dequeue, so filling it in for either
+                    // would hand that path a budget nobody asked for.
+                    timeout: options.timeout.budget(),
                     deadline,
                     parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
                     ..NewWorkflow::new(&workflow_id)
