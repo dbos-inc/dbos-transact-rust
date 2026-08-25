@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::WorkflowStatus;
+use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{Config, DBOS, Error, StartOptions, Timeout};
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -1047,6 +1047,105 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
             row.status
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    dbos.shutdown().await;
+}
+
+/// A recorded await that belongs to a *different* workflow is refused, not adopted.
+///
+/// The other half of the launch position's own check, and the reason both exist: `check_step`
+/// compares the step name, which leaves open whose outcome the row actually holds. For a child
+/// the two cannot disagree — the handle's id came out of the launch row moments earlier — so this
+/// plants the disagreement directly, which is what a parent awaiting a handle it did not itself
+/// start could otherwise reach by changing its code.
+#[tokio::test]
+async fn a_recorded_await_of_another_workflow_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("stale-await-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+
+    // The launch happens first, so its row is on disk before the gate; the await is what waits.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(Some(rx)));
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            let gate = Arc::clone(&gate);
+            async move {
+                let handle = child.start(()).await.map_err(Error::lift)?;
+                let rx = gate.lock().unwrap().take().expect("the parent runs once");
+                let _ = rx.await;
+                handle.result().await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "awaits-the-wrong-one";
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+
+    let reader = reader(&db).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let steps = reader
+            .list_workflow_steps(id, false, None, None)
+            .await
+            .expect("read failed");
+        if !steps.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the parent never recorded its launch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // An await recorded at the position this parent is about to reach, naming a workflow that is
+    // not the one it holds a handle to.
+    reader
+        .record_child_result(
+            id,
+            1,
+            "somebody-elses-workflow",
+            Outcome::Output(Some("7")),
+            None,
+            None,
+        )
+        .await
+        .expect("planting the await failed");
+    tx.send(()).expect("the parent is waiting on the gate");
+
+    let error = handle.result().await.expect_err("the parent succeeded");
+    match &error {
+        Error::SystemDatabase(dbos::sysdb::Error::UnexpectedStep {
+            step_id,
+            expected,
+            recorded,
+            ..
+        }) => {
+            assert_eq!(*step_id, 1, "the await position");
+            assert!(
+                expected.contains("awaits-the-wrong-one-0"),
+                "says which workflow it was awaiting: {expected}"
+            );
+            assert!(
+                recorded.contains("somebody-elses-workflow"),
+                "and whose outcome it found: {recorded}"
+            );
+        }
+        other => panic!("expected an unexpected-step refusal, got {other:?}"),
     }
 
     dbos.shutdown().await;

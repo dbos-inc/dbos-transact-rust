@@ -115,7 +115,7 @@ where
             Err(wrong) => return Err(wrong.lift()),
         };
         if let Some(recorded) = awaiting
-            .recorded(&self.executor)
+            .recorded(&self.executor, &self.workflow_id)
             .await
             .map_err(Error::lift)?
         {
@@ -173,6 +173,9 @@ where
     }
 
     /// Turns a recorded await back into what the parent returned the first time.
+    ///
+    /// Which workflow the row belongs to was settled by [`Awaiting::recorded`] before this sees
+    /// it, so what is left here is the outcome alone.
     fn interpret(recorded: StepRecord, workflow_id: String) -> Result<R, E> {
         match recorded.error {
             None => decode(recorded.output.as_deref(), "result"),
@@ -245,15 +248,39 @@ impl Awaiting {
     async fn recorded(
         &self,
         executor: &Executor,
+        awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
         let Some((workflow_id, step_id)) = self.checkpoint() else {
             return Ok(None);
         };
-        executor
+        let Some(recorded) = executor
             .sysdb()
             .check_child_result(workflow_id, step_id)
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::SystemDatabase)?
+        else {
+            return Ok(None);
+        };
+        // The mirror of the launch's own check, and the second half of one rule.
+        // `check_child_result` compares the step *name*, which leaves the question of whose
+        // outcome this is. For a child it cannot differ — the handle's id was read out of the
+        // launch row moments earlier — but a workflow may also await a handle it did not start,
+        // and there the recorded row is the only thing that knows which workflow answered.
+        // Adopting some other workflow's outcome as this one's is what this refuses, and every
+        // implementation writes the id needed to refuse it (Python's `record_get_result` stores
+        // the awaited id as `child_workflow_id` too, `_sys_db.py:2851`).
+        if recorded.child_workflow_id.as_deref() != Some(awaited_workflow_id) {
+            return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+                workflow_id: workflow_id.to_owned(),
+                step_id,
+                expected: format!("an await of {awaited_workflow_id}"),
+                recorded: match &recorded.child_workflow_id {
+                    Some(other) => format!("an await of {other}"),
+                    None => "an await of no workflow at all".to_owned(),
+                },
+            }));
+        }
+        Ok(Some(recorded))
     }
 
     /// Records a *decided* outcome, and only that.
