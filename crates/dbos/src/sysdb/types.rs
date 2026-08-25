@@ -1939,6 +1939,106 @@ impl ForkOptions<'_> {
     }
 }
 
+/// The `DBOS.*` step names the engine records for its own operations.
+///
+/// **Here rather than in a backend, because they are stored contract.** Each of these lands in
+/// `operation_outputs.function_name`, where a replay compares it, Conductor renders it, and another
+/// SDK's step listing has to agree with it — so they belong beside the row shapes rather than beside
+/// the SQL of whichever backend happens to write them. A second backend that redeclared them could
+/// drift from this one silently, and nothing would notice until a workflow crossed between the two.
+///
+/// **Public because a caller may legitimately need to name one** — filtering a step listing to the
+/// engine's own operations, or grouping by them — and retyping a string the engine already owns is
+/// how the two come apart.
+///
+/// **Not for asserting the contract, though.** A test that checks a recorded name against the
+/// constant the writer used cannot notice the constant changing, which is exactly the change worth
+/// noticing: these are cross-SDK strings, and renaming one silently breaks a workflow that crosses
+/// implementations. Those assertions keep their literals on purpose.
+///
+/// Each name's own doc says how far it is actually agreed, and three of them are **not** cross-SDK
+/// contract: the references disagree on `sendBulk` and `debounceDelayedWorkflow`, and
+/// `upsertSchedule` is this crate's own coinage.
+pub mod step_names {
+    /// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT`].
+    pub const SLEEP: &str = "DBOS.sleep";
+
+    /// The step names `send_messages` records, chosen by how many messages it was given.
+    ///
+    /// `"DBOS.send"` is unanimous — all four implementations record exactly that for a single send,
+    /// and a workflow replayed by another must find the name it expects or raise `UnexpectedStep`.
+    ///
+    /// The batch name is not: Python writes `DBOS.send_bulk` and Java `DBOS.sendBulk`, while
+    /// TypeScript and Go have no batch send to name. Java's spelling is taken because the rest of
+    /// this constant family is camelCase already — `DBOS.setEvent`, `DBOS.getEvent` — so
+    /// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
+    ///
+    /// One system-database method serves both API surfaces, so the batch size stands in for which
+    /// one the caller reached for. A single send always carries exactly one message; anything else,
+    /// including an empty batch, came from the bulk API.
+    ///
+    /// A workflow whose message count changes between runs will flip names and be caught as
+    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep). That is nondeterminism in the
+    /// workflow, and catching it is the point of recording the name at all.
+    pub const SEND: &str = "DBOS.send";
+    pub const SEND_BULK: &str = "DBOS.sendBulk";
+
+    /// The step names a stream write records, chosen by whether the value is the closing sentinel.
+    ///
+    /// Python and Java both derive them the same way, from the same two strings. Deriving rather
+    /// than passing means a close is always recorded as a close, whichever entry point reached it.
+    pub const WRITE_STREAM: &str = "DBOS.writeStream";
+    pub const CLOSE_STREAM: &str = "DBOS.closeStream";
+
+    /// The step name `set_event` records, which a replay compares against.
+    ///
+    /// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
+    /// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
+    pub const SET_EVENT: &str = "DBOS.setEvent";
+
+    /// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT`]: all four
+    /// implementations record exactly `"DBOS.getEvent"`.
+    pub const GET_EVENT: &str = "DBOS.getEvent";
+
+    /// What every implementation names the step a parent writes when it awaits a child.
+    ///
+    /// Python's `function_name="DBOS.getResult"`, Go's `StepName`, and TypeScript's and Java's the
+    /// same. Written by
+    /// [`record_child_result`](crate::sysdb::SystemDatabase::record_child_result) and read back by
+    /// [`check_child_result`](crate::sysdb::SystemDatabase::check_child_result), which is the only
+    /// reason both of those exist rather than the caller passing a name.
+    pub const GET_RESULT: &str = "DBOS.getResult";
+
+    /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT`].
+    pub const RECV: &str = "DBOS.recv";
+
+    /// The step a debounce records when a workflow does the bouncing.
+    ///
+    /// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations disagree
+    /// on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's, which is the
+    /// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
+    /// only crosses one by enqueue, so this is a convention rather than a wire format.
+    pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
+
+    /// The step names the schedule methods record, which a replay compares against.
+    ///
+    /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause
+    /// and resume are two names there because they are two API calls; they reach one method here, so
+    /// the name follows the status being set rather than the method being called.
+    ///
+    /// **`DBOS.upsertSchedule` is the exception**: TypeScript has no such method — its upsert is
+    /// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is this
+    /// crate's, camelCased from Python's by analogy with the seven that are verbatim.
+    pub const CREATE_SCHEDULE: &str = "DBOS.createSchedule";
+    pub const UPSERT_SCHEDULE: &str = "DBOS.upsertSchedule";
+    pub const GET_SCHEDULE: &str = "DBOS.getSchedule";
+    pub const LIST_SCHEDULES: &str = "DBOS.listSchedules";
+    pub const UPDATE_SCHEDULE: &str = "DBOS.updateSchedule";
+    pub const PAUSE_SCHEDULE: &str = "DBOS.pauseSchedule";
+    pub const RESUME_SCHEDULE: &str = "DBOS.resumeSchedule";
+    pub const DELETE_SCHEDULE: &str = "DBOS.deleteSchedule";
+}
+
 /// One message to deliver to a workflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message<'a> {

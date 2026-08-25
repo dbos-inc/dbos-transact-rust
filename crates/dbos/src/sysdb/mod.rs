@@ -56,6 +56,7 @@ pub use error::{BackendError, BackendErrorKind, Error};
 
 use std::time::Duration;
 
+use types::step_names;
 use types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EncodedValue,
     EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule,
@@ -1215,14 +1216,20 @@ pub trait SystemDatabase: Send + Sync {
     /// Reads back a recorded child-workflow await, or `None` if the parent has not got this far.
     ///
     /// The replay gate for [`record_child_result`](Self::record_child_result), and the reason a
-    /// parent that already learned its child's outcome does not wait for it a second time. It is
-    /// [`check_step`](Self::check_step) under the name that method records, and takes no step name
-    /// for the same reason that one does not.
+    /// parent that already learned its child's outcome does not wait for it a second time. It takes
+    /// no step name for the same reason that one does not.
+    ///
+    /// Provided rather than implemented: it is [`check_step`](Self::check_step) under a name that
+    /// is stored contract rather than a backend's to choose, so a backend has nothing of its own to
+    /// add and no opportunity to disagree about the name.
     async fn check_child_result(
         &self,
         parent_workflow_id: &str,
         step_id: i32,
-    ) -> Result<Option<StepRecord>, Error>;
+    ) -> Result<Option<StepRecord>, Error> {
+        self.check_step(parent_workflow_id, step_id, step_names::GET_RESULT)
+            .await
+    }
 
     /// Records what a child workflow returned, as a step of the parent that awaited it.
     ///
