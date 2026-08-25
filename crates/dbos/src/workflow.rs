@@ -295,6 +295,7 @@ where
         Ok(Some(Parent {
             workflow_id: ctx.workflow_id().to_owned(),
             step_id: ctx.next_step_id(),
+            deadline: ctx.deadline(),
         }))
     }
 
@@ -357,9 +358,24 @@ where
         //
         // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
         // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
-        let deadline = options
-            .timeout
-            .and_then(|timeout| Timestamp::now().checked_add(timeout));
+        let deadline = match (options.timeout, &parent) {
+            // **An explicit timeout replaces an inherited deadline**, which is Python's and
+            // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
+            // use it over any propagated deadline"*. So a child given longer than its parent has
+            // left outlives its parent — an explicit timeout on a specific child is a statement
+            // about that child, and the alternative would silently ignore what the caller asked
+            // for. Go differs by taking the earlier of the two, but not by design: its deadline
+            // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets the
+            // deadline win, and is not a model here — its user-facing `deadline` is Java's alone
+            // and Rust does not have one.
+            (Some(timeout), _) => Timestamp::now().checked_add(timeout),
+            // **Inherited as an instant, not as a budget**, which is what makes it a deadline the
+            // parent and the child genuinely share: both `select!`s fire at the same moment, in
+            // different tasks and possibly in different processes, with no signal passing between
+            // them. A propagated deadline is the cancellation cascade, and needs no other one.
+            (None, Some(parent)) => parent.deadline,
+            (None, None) => None,
+        };
 
         let started_at = Timestamp::now();
         let initialized = executor
@@ -428,6 +444,8 @@ where
 struct Parent {
     workflow_id: String,
     step_id: i32,
+    /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
+    deadline: Option<Timestamp>,
 }
 
 impl Parent {

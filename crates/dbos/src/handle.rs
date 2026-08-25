@@ -110,19 +110,17 @@ where
     pub async fn result(self) -> Result<R, E> {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run.
-        let checkpoint = match Awaiting::of(&self.executor) {
-            Ok(checkpoint) => checkpoint,
+        let awaiting = match Awaiting::of(&self.executor) {
+            Ok(awaiting) => awaiting,
             Err(wrong) => return Err(wrong.lift()),
         };
-        if let Some(checkpoint) = &checkpoint
-            && let Some(recorded) = checkpoint
-                .recorded(&self.executor)
-                .await
-                .map_err(Error::lift)?
+        if let Some(recorded) = awaiting
+            .recorded(&self.executor)
+            .await
+            .map_err(Error::lift)?
         {
             tracing::debug!(
                 workflow_id = self.workflow_id,
-                step_id = checkpoint.step_id,
                 "the child's outcome was already recorded; the parent does not wait again"
             );
             return Self::interpret(recorded, self.workflow_id);
@@ -145,12 +143,10 @@ where
         // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
         // the parent's row exactly as the child's own row holds them, so nothing is re-encoded and
         // nothing can drift between the two copies.
-        if let Some(checkpoint) = &checkpoint {
-            checkpoint
-                .record(&self.executor, &self.workflow_id, &outcome, started_at)
-                .await
-                .map_err(Error::lift)?;
-        }
+        awaiting
+            .record(&self.executor, &self.workflow_id, &outcome, started_at)
+            .await
+            .map_err(Error::lift)?;
 
         match outcome {
             Ok(output) => decode(output.as_deref(), "result"),
@@ -167,7 +163,9 @@ where
             // so reporting it here would read as the wrong workflow having been stopped. Every
             // reference raises a separate awaited-cancelled error for exactly this, and it is
             // recorded like any other outcome: the child is over, and the parent has learned so.
-            Err(Failure::Control(Error::WorkflowCancelled { workflow_id })) => {
+            Err(Failure::Control(Error::WorkflowCancelled { workflow_id }))
+                if awaiting.inside_a_workflow() =>
+            {
                 Err(Error::AwaitedWorkflowCancelled { workflow_id })
             }
             Err(Failure::Control(control)) => Err(control.lift()),
@@ -188,24 +186,29 @@ where
     }
 }
 
-/// The parent awaiting a child, and the step id its await occupies.
+/// Where the caller awaiting this handle stands, which decides two independent things: whether the
+/// outcome is checkpointed, and how a cancelled *awaited* workflow is reported.
 ///
-/// `None` when there is no parent to record against, which covers three cases that all mean the
-/// same thing here: awaiting from outside any workflow, awaiting from inside a *step* (a step is a
-/// leaf, and an id-allocating call inside one would shift every later step onto the wrong replay
-/// slot — `get_event` degrades the same way), and awaiting a handle that is not a child at all.
-/// The last of those is not distinguished on purpose: a workflow awaiting some *other* workflow it
-/// did not start is still learning an outcome it should not have to learn twice, and Python and Go
-/// both checkpoint it.
-struct Awaiting {
-    workflow_id: String,
-    step_id: i32,
+/// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
+/// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
+/// either, and Python and Go checkpoint that case too.
+enum Awaiting {
+    /// Not inside a workflow. Nothing is recorded, and a cancelled workflow is reported as
+    /// [`Error::WorkflowCancelled`] — there is no *other* workflow here to confuse it with.
+    Outside,
+    /// Inside a step. The awaited-cancelled distinction applies, because there is a workflow to
+    /// confuse it with, but nothing is checkpointed: a step is a leaf, and an id-allocating call
+    /// inside one would shift every later step onto the wrong replay slot. `get_event` degrades
+    /// the same way.
+    InsideAStep,
+    /// Inside a workflow at a step boundary: this await is a step of that workflow.
+    Checkpointed { workflow_id: String, step_id: i32 },
 }
 
 impl Awaiting {
-    fn of(executor: &Arc<Executor>) -> std::result::Result<Option<Self>, Error> {
-        let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
-            return Ok(None);
+    fn of(executor: &Arc<Executor>) -> std::result::Result<Self, Error> {
+        let Some(ctx) = Ctx::current() else {
+            return Ok(Self::Outside);
         };
         // The step id would come from this workflow's counter while the write went through the
         // handle's own system database — the split `get_event` refuses for the same reason.
@@ -214,19 +217,41 @@ impl Awaiting {
                 operation: "awaiting a workflow's result".into(),
             });
         }
-        Ok(Some(Self {
+        if ctx.in_step() {
+            return Ok(Self::InsideAStep);
+        }
+        Ok(Self::Checkpointed {
             workflow_id: ctx.workflow_id().to_owned(),
             step_id: ctx.next_step_id(),
-        }))
+        })
+    }
+
+    /// Whether a cancelled *awaited* workflow has to be distinguished from this caller being
+    /// cancelled — true wherever there is a caller for it to be confused with.
+    fn inside_a_workflow(&self) -> bool {
+        !matches!(self, Self::Outside)
+    }
+
+    fn checkpoint(&self) -> Option<(&str, i32)> {
+        match self {
+            Self::Checkpointed {
+                workflow_id,
+                step_id,
+            } => Some((workflow_id.as_str(), *step_id)),
+            _ => None,
+        }
     }
 
     async fn recorded(
         &self,
         executor: &Executor,
     ) -> std::result::Result<Option<StepRecord>, Error> {
+        let Some((workflow_id, step_id)) = self.checkpoint() else {
+            return Ok(None);
+        };
         executor
             .sysdb()
-            .check_child_result(&self.workflow_id, self.step_id)
+            .check_child_result(workflow_id, step_id)
             .await
             .map_err(Error::SystemDatabase)
     }
@@ -251,6 +276,9 @@ impl Awaiting {
         settled: &std::result::Result<Option<String>, Failure>,
         started_at: Timestamp,
     ) -> std::result::Result<(), Error> {
+        let Some((workflow_id, step_id)) = self.checkpoint() else {
+            return Ok(());
+        };
         let cancelled;
         let outcome = match settled {
             Ok(output) => Outcome::Output(output.as_deref()),
@@ -272,8 +300,8 @@ impl Awaiting {
         executor
             .sysdb()
             .record_child_result(
-                &self.workflow_id,
-                self.step_id,
+                workflow_id,
+                step_id,
                 child_workflow_id,
                 outcome,
                 Some(executor.serializer().name()),

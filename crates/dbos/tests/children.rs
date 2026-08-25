@@ -778,3 +778,187 @@ async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
 
     dbos.shutdown().await;
 }
+
+/// A child with no budget of its own inherits its parent's deadline, as the same instant.
+///
+/// Not "the same duration again": the child's row carries the parent's deadline verbatim, so a
+/// parent an hour into a two-hour budget hands its child one hour, not two.
+#[tokio::test]
+async fn a_child_inherits_its_parents_deadline() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("inherit-deadline-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move { child.run(()).await }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "hands-down-its-deadline";
+    parent
+        .run_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Some(Duration::from_secs(300)),
+            },
+        )
+        .await
+        .expect("the parent failed");
+
+    let reader = reader(&db).await;
+    let parent_row = reader
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    let child_row = reader
+        .get_workflow(&format!("{id}-0"))
+        .await
+        .expect("read failed")
+        .expect("the child has no row");
+    assert!(parent_row.deadline.is_some(), "the parent has a deadline");
+    assert_eq!(
+        child_row.deadline, parent_row.deadline,
+        "the same instant, not a fresh budget"
+    );
+    assert!(
+        child_row.timeout.is_none(),
+        "the child was given no timeout of its own; it has a deadline because its parent had one"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A child's own timeout replaces the inherited deadline, even when it is the longer of the two.
+///
+/// Python and TypeScript carry this rule and its comment identically: *"If a timeout is explicitly
+/// specified, use it over any propagated deadline"*. The visible consequence is that such a child
+/// **outlives its parent** — which is the point of asking for a timeout on one specific child.
+#[tokio::test]
+async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-timeout-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                child
+                    .run_with(
+                        (),
+                        StartOptions {
+                            // Longer than what the parent has left.
+                            timeout: Some(Duration::from_secs(3_600)),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "child-asks-for-more";
+    parent
+        .run_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Some(Duration::from_secs(60)),
+            },
+        )
+        .await
+        .expect("the parent failed");
+
+    let reader = reader(&db).await;
+    let parent_deadline = reader
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing")
+        .deadline
+        .expect("the parent has a deadline");
+    let child_row = reader
+        .get_workflow(&format!("{id}-0"))
+        .await
+        .expect("read failed")
+        .expect("the child has no row");
+    assert!(
+        child_row.deadline.expect("the child has a deadline") > parent_deadline,
+        "the child's own timeout won: it outlives its parent"
+    );
+    assert_eq!(child_row.timeout, Some(Duration::from_secs(3_600)));
+
+    dbos.shutdown().await;
+}
+
+/// **The propagated deadline is the cascade.** A parent that runs out of time and the child that
+/// inherited its deadline are cancelled at the same instant, independently.
+///
+/// Nothing signals the child. It holds the same instant, its own `select!` fires on it, and it
+/// writes its own `CANCELLED`. That is why this slice adds no cancellation cascade: for deadlines
+/// there is nothing left for one to do. (An explicit `cancel` with children is a different
+/// question, and belongs with the management surface.)
+#[tokio::test]
+async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("deadline-cascade-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<u32, Error>(1)
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move { child.run(()).await }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "runs-out-of-time";
+    let error = parent
+        .run_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Some(Duration::from_millis(400)),
+            },
+        )
+        .await
+        .expect_err("the parent succeeded");
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "the parent was cancelled by its own deadline, got {error:?}"
+    );
+
+    // The child cancels itself on the same instant, with nothing telling it to.
+    let reader = reader(&db).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = reader
+            .get_workflow(&format!("{id}-0"))
+            .await
+            .expect("read failed")
+            .expect("the child has no row");
+        if row.status == WorkflowStatus::Cancelled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child was not cancelled by the deadline it inherited; status {:?}",
+            row.status
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    dbos.shutdown().await;
+}
