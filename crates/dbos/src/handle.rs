@@ -141,8 +141,13 @@ where
         };
 
         // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
-        // the parent's row exactly as the child's own row holds them, so nothing is re-encoded and
-        // nothing can drift between the two copies.
+        // the parent's row exactly as the child's own row holds them, so the two copies cannot
+        // disagree about what the child returned.
+        //
+        // The *label* beside them is this executor's serializer rather than the one that wrote
+        // the bytes, which `adopt` does not carry back. Nothing reads it to choose a decoder while
+        // there is one encoding, so it costs nothing yet; it becomes a real question when a second
+        // serializer does, and it is that change's to answer.
         awaiting
             .record(&self.executor, &self.workflow_id, &outcome, started_at)
             .await
@@ -283,19 +288,45 @@ impl Awaiting {
         Ok(Some(recorded))
     }
 
-    /// Records a *decided* outcome, and only that.
+    /// Records a *settled* outcome, and only that.
     ///
-    /// A success, a failure and a cancellation are all things the child is finished doing, and the
-    /// parent may safely be replayed straight past them. The signals deliberately left unrecorded
-    /// are the ones that are not the child's outcome at all:
+    /// A success, a failure and a cancellation are all things the child is finished doing and
+    /// cannot take back, so the parent may safely be replayed straight past them. What is left
+    /// unrecorded is whatever a replay must not be pinned to:
     ///
     /// - **the parent being interrupted** — shutdown aborted the task, nothing is decided, and a
     ///   recovered parent must await again (Go says the same in its own words: *"nothing is
     ///   checkpointed, so a resume re-executes the await"*);
-    /// - **the child being parked** at `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, which is not terminal —
-    ///   it can be resumed, and a parent holding "parked" as the answer could never see that;
     /// - **a system-database failure**, which is a statement about the substrate rather than about
-    ///   the child.
+    ///   the child;
+    /// - **the child being parked** at `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, which is the one that
+    ///   needs an argument, below.
+    ///
+    /// **A parked child still fails its parent** — all four implementations let that error out of
+    /// the await, and none treats it as something a parent can wait out. What is withheld is only
+    /// the *checkpoint*: parking is the one non-terminal verdict a workflow can carry, so freezing
+    /// it into the parent's replay would outlive its own truth. A parent resumed after its child
+    /// was resumed re-asks the child's row and sees what the child actually did; a parent holding
+    /// a recorded "parked" would replay that answer forever. It is the same argument as the
+    /// interrupted-await bullet above, one step further out.
+    ///
+    /// **Rust follows Go here, against the other three.** Go filters this case out of its await
+    /// checkpoint deliberately and says so — *"either the workflow result proper (no dlq, no raw
+    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go:419`). Python,
+    /// TypeScript and Java all record it, because in all three the await runs inside the generic
+    /// step wrapper and that wrapper checkpoints whatever exception it caught.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 20. Two implementations pin a parked child's verdict into
+    /// the parent's replay and two do not, and none of the four argues for its side — the split
+    /// falls exactly along "Go's await path filters on purpose" versus "a step wrapper records by
+    /// default", which is not a decision anyone made twice. It is worth settling before v1,
+    /// because it changes what a resumed parent sees. The same item covers a second half: Python
+    /// and TypeScript raise a distinct *awaited* error here
+    /// (`DBOSAwaitedWorkflowMaxRecoveryAttemptsExceeded`,
+    /// `DBOSAwaitedWorkflowExceededMaxRecoveryAttempts`) while Go and Java reuse the error a
+    /// workflow gets for its own parking — a two-two split the *cancellation* case does not have,
+    /// where all four separate the two meanings and Rust followed them into
+    /// [`Error::AwaitedWorkflowCancelled`].
     async fn record(
         &self,
         executor: &Executor,

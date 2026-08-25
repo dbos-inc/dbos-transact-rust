@@ -332,6 +332,9 @@ where
     /// so a process that dies mid-run leaves a `PENDING` row a later executor recovers. Awaiting
     /// is a convenience over the durable run rather than the thing that makes it durable: drop
     /// this future and the workflow carries on.
+    ///
+    /// Called from inside a running workflow this runs a **child** of it, and takes two of the
+    /// parent's step ids rather than one — see [`start_with`](Self::start_with).
     pub async fn run(&self, input: P) -> Result<R, E> {
         self.run_with(input, StartOptions::default()).await
     }
@@ -382,6 +385,9 @@ where
     }
 
     /// Starts this workflow durably and returns a handle to it, without waiting.
+    ///
+    /// Called from inside a running workflow this starts a **child** of it — see
+    /// [`start_with`](Self::start_with) for what that records and what it costs.
     pub async fn start(&self, input: P) -> Result<WorkflowHandle<R, E>> {
         self.start_with(input, StartOptions::default()).await
     }
@@ -393,6 +399,57 @@ where
     /// existing run rather than this being an error: the id is an idempotency key, and honouring
     /// it is the promise (decision 13). The error is the engine's own channel, because a start
     /// fails only in the engine's terms; the *workflow's* failures come out of the handle.
+    ///
+    /// # Child workflows
+    ///
+    /// **Called from inside a running workflow, this starts a *child* of it.** The ambient context
+    /// is what decides, so there is no separate `start_child` and factoring a workflow body out
+    /// into its own workflow does not change how its call sites are written. What changes is what
+    /// the engine records:
+    ///
+    /// - **The child's id is `{parent_id}-{step_id}`**, taken from the parent's step counter,
+    ///   unless [`workflow_id`](StartOptions::workflow_id) assigns one. Derived rather than random
+    ///   so that a parent recovered mid-run re-derives the same id, finds the child it already
+    ///   started, and adopts it instead of starting a second one.
+    /// - **The launch is a checkpoint of the parent.** A replayed parent gets a handle to the
+    ///   recorded child without starting anything — whether that child is still running, finished
+    ///   while the parent was dead, or is itself awaiting recovery.
+    /// - **Awaiting the handle is a second checkpoint**, recorded as `DBOS.getResult` (see
+    ///   [`WorkflowHandle::result`]). So [`run`](Self::run) spends two step ids, and a parent that
+    ///   calls it twice has children `{parent}-0` and `{parent}-2`.
+    /// - **The child inherits the parent's deadline** as the same instant. A
+    ///   [`Timeout::Explicit`] of its own replaces that deadline — even a longer one, so such a
+    ///   child outlives its parent — and [`Timeout::None`] declines it outright, which is the
+    ///   only way to say "no limit" under a parent that has one.
+    /// - **Starting a workflow from inside a step is [`Error::InsideStep`].** A step is a leaf, and
+    ///   an id-allocating call inside one would shift every later step onto the wrong replay slot.
+    ///
+    /// A child is a durable workflow in its own right rather than a piece of the parent's future:
+    /// it keeps running if that future is dropped, and it recovers on its own.
+    ///
+    /// ## Fanning out
+    ///
+    /// Children **run** concurrently — each is its own task — but a parent must **launch** them
+    /// one at a time and **await** them one at a time, because every call takes a step id from the
+    /// parent's counter and concurrent allocation is nondeterministic. So start in one loop and
+    /// collect in another, which costs nothing in wall-clock: the parent takes about as long as
+    /// the slowest child rather than the sum.
+    ///
+    /// ```no_run
+    /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
+    /// let mut handles = Vec::new();
+    /// for n in 0..3 {
+    ///     handles.push(child.start(n).await?);
+    /// }
+    /// let mut total = 0;
+    /// for handle in handles {
+    ///     total += handle.result().await?;
+    /// }
+    /// # Ok(total) }
+    /// ```
+    ///
+    /// A `join!` over the launches — or over the awaits — is the same trap a `join!` over
+    /// [`step`](crate::step)s is, and is unsound for the same reason.
     pub async fn start_with(
         &self,
         input: P,
@@ -575,6 +632,15 @@ impl Parent {
     }
 
     /// Records the launch, so the replay above finds it.
+    ///
+    /// **The step name is the workflow's bare name**, not the `name`/`class_name`/`config_name`
+    /// triple that identifies it — and that is four of four rather than a narrowing, including
+    /// both references that also carry a class and a config. Python records
+    /// `get_dbos_func_name(func)` and hands the other two to `_init_workflow` separately
+    /// (`_core.py:1428`); Java records `workflowName` beside a `className` on the status row
+    /// (`DBOSExecutor.java:2035`); Go has one name to record. The qualification belongs to the
+    /// child's own row, which the `init_workflow` call above fills in — this column is the
+    /// *parent's* step listing, where the name is what a reader is looking for.
     async fn record_launch(
         &self,
         executor: &Executor,
