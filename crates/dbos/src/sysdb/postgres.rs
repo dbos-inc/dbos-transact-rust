@@ -1450,12 +1450,14 @@ impl PostgresSystemDatabase {
         }
     }
 
-    /// [`record_step`](SystemDatabase::record_step) against a caller's connection.
+    /// The one statement behind every recorded step, against a caller's connection.
     ///
-    /// One argument over clippy's threshold, and deliberately: it is the trait method's own
-    /// parameter list plus the connection. Grouping them into a struct here would mean either a
-    /// type used in one place or changing the public signature to match, and that signature was
-    /// chosen so a caller does not allocate.
+    /// Two trait methods reach it and its parameter list is their union, which is why it runs two
+    /// over clippy's threshold: [`record_step`](SystemDatabase::record_step) passes no child id,
+    /// and [`record_child_result`](SystemDatabase::record_child_result) passes the child whose
+    /// outcome the parent is adopting. Both public signatures stay a parameter shorter than this
+    /// one, which is the trade — the alternative is a struct that would exist for one call each and
+    /// would have to be built by callers chosen so they do not allocate.
     #[allow(clippy::too_many_arguments)]
     async fn record_step_on(
         &self,
