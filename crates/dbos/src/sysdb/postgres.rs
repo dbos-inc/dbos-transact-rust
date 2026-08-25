@@ -79,6 +79,7 @@ use super::retry::{RetryPolicy, with_retry};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
     DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
@@ -970,9 +971,6 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
     })
 }
 
-/// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`].
-const SLEEP_STEP_NAME: &str = "DBOS.sleep";
-
 /// Which of the two things a checkpointed sleep is.
 ///
 /// Both write the same row under the same name and both return the same instant. What differs is
@@ -1009,33 +1007,6 @@ enum SleepKind {
 /// chose. Python does the same for the same value; Java uses the workflow's serializer.
 const PORTABLE_JSON: &str = "portable_json";
 
-/// The step names `send_messages` records, chosen by how many messages it was given.
-///
-/// `"DBOS.send"` is unanimous — all four implementations record exactly that for a single send,
-/// and a workflow replayed by another must find the name it expects or raise `UnexpectedStep`.
-///
-/// The batch name is not: Python writes `DBOS.send_bulk` and Java `DBOS.sendBulk`, while
-/// TypeScript and Go have no batch send to name. Java's spelling is taken because the rest of
-/// this constant family is camelCase already — `DBOS.setEvent`, `DBOS.getEvent` — so
-/// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
-///
-/// One system-database method serves both API surfaces, so the batch size stands in for which
-/// one the caller reached for. A single send always carries exactly one message; anything else,
-/// including an empty batch, came from the bulk API.
-///
-/// A workflow whose message count changes between runs will flip names and be caught as
-/// [`Error::UnexpectedStep`]. That is nondeterminism in the workflow, and catching it is the
-/// point of recording the name at all.
-const SEND_STEP_NAME: &str = "DBOS.send";
-const SEND_BULK_STEP_NAME: &str = "DBOS.sendBulk";
-
-/// The step names a stream write records, chosen by whether the value is the closing sentinel.
-///
-/// Python and Java both derive them the same way, from the same two strings. Deriving rather
-/// than passing means a close is always recorded as a close, whichever entry point reached it.
-const WRITE_STREAM_STEP_NAME: &str = "DBOS.writeStream";
-const CLOSE_STREAM_STEP_NAME: &str = "DBOS.closeStream";
-
 /// How many times a stream write retries onto a fresh offset before giving up.
 ///
 /// A collision means another writer took the offset this one computed, and the retry recomputes
@@ -1043,33 +1014,6 @@ const CLOSE_STREAM_STEP_NAME: &str = "DBOS.closeStream";
 /// are finite. Python loops forever with a 100ms sleep; a bound turns a pathological case into an
 /// error a caller can see rather than a call that never returns.
 const STREAM_OFFSET_ATTEMPTS: u32 = 16;
-
-/// The step name `set_event` records, which a replay compares against.
-///
-/// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
-/// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
-const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
-
-/// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`]: all four
-/// implementations record exactly `"DBOS.getEvent"`.
-const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
-
-/// A cross-SDK constant: what every implementation names the step a parent writes when it awaits a
-/// child — Python's `function_name="DBOS.getResult"`, Go's `StepName`, and TypeScript's and Java's
-/// the same. Written by `record_child_result` and read back by `check_child_result`, which is the
-/// only reason both of those exist rather than the caller passing a name.
-const GET_RESULT_STEP_NAME: &str = "DBOS.getResult";
-
-/// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT_STEP_NAME`].
-const RECV_STEP_NAME: &str = "DBOS.recv";
-
-/// The step a debounce records when a workflow does the bouncing.
-///
-/// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations disagree
-/// on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's, which is the
-/// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
-/// only crosses one by enqueue, so this is a convention rather than a wire format.
-const DEBOUNCE_STEP_NAME: &str = "DBOS.debounceDelayedWorkflow";
 
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
@@ -1081,24 +1025,6 @@ const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_m
 const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
      schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name, \
      application_name";
-
-/// The step names the schedule methods record, which a replay compares against.
-///
-/// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause
-/// and resume are two names there because they are two API calls; they reach one method here, so
-/// the name follows the status being set rather than the method being called.
-///
-/// **`DBOS.upsertSchedule` is the exception**: TypeScript has no such method — its upsert is
-/// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is this
-/// crate's, camelCased from Python's by analogy with the seven that are verbatim.
-const CREATE_SCHEDULE_STEP_NAME: &str = "DBOS.createSchedule";
-const UPSERT_SCHEDULE_STEP_NAME: &str = "DBOS.upsertSchedule";
-const GET_SCHEDULE_STEP_NAME: &str = "DBOS.getSchedule";
-const LIST_SCHEDULES_STEP_NAME: &str = "DBOS.listSchedules";
-const UPDATE_SCHEDULE_STEP_NAME: &str = "DBOS.updateSchedule";
-const PAUSE_SCHEDULE_STEP_NAME: &str = "DBOS.pauseSchedule";
-const RESUME_SCHEDULE_STEP_NAME: &str = "DBOS.resumeSchedule";
-const DELETE_SCHEDULE_STEP_NAME: &str = "DBOS.deleteSchedule";
 
 /// Escapes the wildcards in a `LIKE` prefix so the caller's string matches itself.
 ///
@@ -1749,7 +1675,7 @@ impl PostgresSystemDatabase {
             // A replay wakes at the *original* instant. Starting the clock again would make a
             // workflow that crashed fifty minutes into an hour sleep another full hour.
             if let Some(step) = self
-                .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                .check_step_on(&mut conn, workflow_id, step_id, step_names::SLEEP)
                 .await?
             {
                 tracing::debug!(workflow_id, step_id, "replaying sleep");
@@ -1780,7 +1706,7 @@ impl PostgresSystemDatabase {
                     &mut conn,
                     workflow_id,
                     step_id,
-                    SLEEP_STEP_NAME,
+                    step_names::SLEEP,
                     Outcome::Output(Some(&recorded)),
                     Some(PORTABLE_JSON),
                     Some(timing),
@@ -1794,7 +1720,7 @@ impl PostgresSystemDatabase {
                 // Python swallows this and returns its own, which two runs would disagree about.
                 Err(Error::StepAlreadyRecorded { .. }) => {
                     let step = self
-                        .check_step_on(&mut conn, workflow_id, step_id, SLEEP_STEP_NAME)
+                        .check_step_on(&mut conn, workflow_id, step_id, step_names::SLEEP)
                         .await?
                         .ok_or_else(|| {
                             Error::Malformed(
@@ -3395,9 +3321,9 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // Which API surface the caller reached for, inferred from the batch size.
         let step_name = if messages.len() == 1 {
-            SEND_STEP_NAME
+            step_names::SEND
         } else {
-            SEND_BULK_STEP_NAME
+            step_names::SEND_BULK
         };
 
         let notifications_table = self.tables.notifications.as_str();
@@ -3600,7 +3526,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // `None` a timeout produced — taking a message on replay would deliver, to one workflow,
         // two messages it only ever recorded one of.
         if let Some(step) = self
-            .check_step(workflow_id, step_id, RECV_STEP_NAME)
+            .check_step(workflow_id, step_id, step_names::RECV)
             .await?
         {
             tracing::debug!(
@@ -3700,7 +3626,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // answer. Same transaction as the write, so there is no window between deciding to
             // take a message and taking it.
             if let Some(step) = self
-                .check_step_on(&mut tx, workflow_id, step_id, RECV_STEP_NAME)
+                .check_step_on(&mut tx, workflow_id, step_id, step_names::RECV)
                 .await?
             {
                 tx.commit().await?;
@@ -3744,7 +3670,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 &mut tx,
                 workflow_id,
                 step_id,
-                RECV_STEP_NAME,
+                step_names::RECV,
                 Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
                 message.as_ref().and_then(|m| m.serialization.as_deref()),
                 Some(timing),
@@ -3775,9 +3701,9 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         // Derived, not passed: a close is recorded as a close whichever entry point reached it.
         let step_name = if value == STREAM_CLOSED {
-            CLOSE_STREAM_STEP_NAME
+            step_names::CLOSE_STREAM
         } else {
-            WRITE_STREAM_STEP_NAME
+            step_names::WRITE_STREAM
         };
         // Fixed before the retry, as every step token is.
         let timing = StepTiming {
@@ -3962,15 +3888,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn check_child_result(
-        &self,
-        parent_workflow_id: &str,
-        step_id: i32,
-    ) -> Result<Option<StepRecord>, Error> {
-        self.check_step(parent_workflow_id, step_id, GET_RESULT_STEP_NAME)
-            .await
-    }
-
     async fn record_child_result(
         &self,
         parent_workflow_id: &str,
@@ -3987,7 +3904,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 &mut conn,
                 parent_workflow_id,
                 step_id,
-                GET_RESULT_STEP_NAME,
+                step_names::GET_RESULT,
                 outcome,
                 serialization,
                 timing,
@@ -4065,7 +3982,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // A replay that already published this key must not publish it again — and must not
             // be told it failed either.
             if self
-                .check_step_on(&mut tx, workflow_id, step_id, SET_EVENT_STEP_NAME)
+                .check_step_on(&mut tx, workflow_id, step_id, step_names::SET_EVENT)
                 .await?
                 .is_some()
             {
@@ -4107,7 +4024,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 &mut tx,
                 workflow_id,
                 step_id,
-                SET_EVENT_STEP_NAME,
+                step_names::SET_EVENT,
                 Outcome::Output(None),
                 None,
                 Some(timing),
@@ -4149,7 +4066,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // arrived late change a decision the workflow has already taken.
         if let Some(caller) = caller
             && let Some(step) = self
-                .check_step(caller.workflow_id, caller.step_id, GET_EVENT_STEP_NAME)
+                .check_step(caller.workflow_id, caller.step_id, step_names::GET_EVENT)
                 .await?
         {
             tracing::debug!(
@@ -4273,7 +4190,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     &mut tx,
                     caller.workflow_id,
                     caller.step_id,
-                    GET_EVENT_STEP_NAME,
+                    step_names::GET_EVENT,
                 )
                 .await?
             {
@@ -4298,7 +4215,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 &mut tx,
                 caller.workflow_id,
                 caller.step_id,
-                GET_EVENT_STEP_NAME,
+                step_names::GET_EVENT,
                 Outcome::Output(found.map(|v| v.value.as_str())),
                 found.and_then(|v| v.serialization.as_deref()),
                 Some(timing),
@@ -5413,7 +5330,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // may since have started.
                 self.run_transactional_step(
                     caller,
-                    DEBOUNCE_STEP_NAME,
+                    step_names::DEBOUNCE,
                     timing,
                     |mut tx| async move {
                         // The cap is what stops a steady stream of requests postponing the workflow
@@ -5559,7 +5476,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "create_schedule", move || async move {
             self.run_transactional_step(
                 caller,
-                CREATE_SCHEDULE_STEP_NAME,
+                step_names::CREATE_SCHEDULE,
                 timing,
                 |mut tx| async move {
                     // A peer holding the name is a collision this layer cannot resolve; this
@@ -5649,7 +5566,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "upsert_schedule", move || async move {
             self.run_transactional_step(
                 caller,
-                UPSERT_SCHEDULE_STEP_NAME,
+                step_names::UPSERT_SCHEDULE,
                 timing,
                 |mut tx| async move {
                     self.upsert_schedule_on(&mut tx, schedule, schedule_id)
@@ -5678,7 +5595,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // schedule on replay, whatever an operator changed in between.
             self.run_transactional_step(
                 caller,
-                GET_SCHEDULE_STEP_NAME,
+                step_names::GET_SCHEDULE,
                 timing,
                 |mut tx| async move {
                     let row = sqlx::query(AssertSqlSafe(format!(
@@ -5739,7 +5656,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "list_schedules", move || async move {
             self.run_transactional_step(
                 caller,
-                LIST_SCHEDULES_STEP_NAME,
+                step_names::LIST_SCHEDULES,
                 timing,
                 |mut tx| async move {
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
@@ -5814,7 +5731,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "update_schedule", move || async move {
             self.run_transactional_step(
                 caller,
-                UPDATE_SCHEDULE_STEP_NAME,
+                step_names::UPDATE_SCHEDULE,
                 timing,
                 |mut tx| async move {
                     // An empty update still has to say whether the schedule exists, so it becomes
@@ -5882,8 +5799,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Pause and resume are two API calls in the references and two step names with them, so a
         // replay of one is not mistaken for the other.
         let step_name = match status {
-            ScheduleStatus::Active => RESUME_SCHEDULE_STEP_NAME,
-            ScheduleStatus::Paused => PAUSE_SCHEDULE_STEP_NAME,
+            ScheduleStatus::Active => step_names::RESUME_SCHEDULE,
+            ScheduleStatus::Paused => step_names::PAUSE_SCHEDULE,
         };
         let timing = StepTiming {
             started_at: Timestamp::now(),
@@ -5956,7 +5873,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "delete_schedule", move || async move {
             self.run_transactional_step(
                 caller,
-                DELETE_SCHEDULE_STEP_NAME,
+                step_names::DELETE_SCHEDULE,
                 timing,
                 |mut tx| async move {
                     sqlx::query(AssertSqlSafe(format!(
