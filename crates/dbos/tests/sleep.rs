@@ -70,7 +70,7 @@ async fn a_replayed_sleep_does_not_start_its_clock_again() {
     dbos.launch().await.expect("launch failed");
 
     let id = "sleeps-once";
-    let options = dbos::StartOptions {
+    let options = dbos::RunOptions {
         workflow_id: Some(id),
         ..Default::default()
     };

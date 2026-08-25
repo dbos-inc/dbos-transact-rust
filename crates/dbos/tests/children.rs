@@ -7,7 +7,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
-use dbos::{Config, DBOS, Error, StartOptions, Timeout};
+use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -54,9 +54,9 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
     let total = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
-                ..StartOptions::default()
+                ..RunOptions::default()
             },
         )
         .await
@@ -304,9 +304,9 @@ async fn children_launched_in_a_loop_run_concurrently() {
     let total = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some("fans-out"),
-                ..StartOptions::default()
+                ..RunOptions::default()
             },
         )
         .await
@@ -356,9 +356,9 @@ async fn a_child_that_is_never_awaited_is_still_recorded() {
     parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
-                ..StartOptions::default()
+                ..RunOptions::default()
             },
         )
         .await
@@ -426,9 +426,9 @@ async fn a_child_cannot_be_started_from_inside_a_step() {
     let error = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some("spawns-in-a-step"),
-                ..StartOptions::default()
+                ..RunOptions::default()
             },
         )
         .await
@@ -456,9 +456,9 @@ async fn an_assigned_child_id_wins_over_the_derived_one() {
                 child
                     .run_with(
                         (),
-                        StartOptions {
+                        RunOptions {
                             workflow_id: Some("i-named-this-one"),
-                            ..StartOptions::default()
+                            ..RunOptions::default()
                         },
                     )
                     .await
@@ -472,9 +472,9 @@ async fn an_assigned_child_id_wins_over_the_derived_one() {
         parent
             .run_with(
                 (),
-                StartOptions {
+                RunOptions {
                     workflow_id: Some(id),
-                    ..StartOptions::default()
+                    ..RunOptions::default()
                 },
             )
             .await
@@ -514,9 +514,9 @@ async fn a_workflow_started_outside_a_workflow_has_no_parent() {
     let id = "a-root";
     root.run_with(
         (),
-        StartOptions {
+        RunOptions {
             workflow_id: Some(id),
-            ..StartOptions::default()
+            ..RunOptions::default()
         },
     )
     .await
@@ -558,9 +558,9 @@ async fn awaiting_a_child_is_recorded_as_a_step() {
         parent
             .run_with(
                 (),
-                StartOptions {
+                RunOptions {
                     workflow_id: Some(id),
-                    ..StartOptions::default()
+                    ..RunOptions::default()
                 },
             )
             .await
@@ -714,9 +714,9 @@ async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
                 child
                     .run_with(
                         (),
-                        StartOptions {
+                        RunOptions {
                             timeout: Timeout::Explicit(Duration::from_millis(300)),
-                            ..StartOptions::default()
+                            ..RunOptions::default()
                         },
                     )
                     .await
@@ -729,9 +729,9 @@ async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
     let error = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
-                ..StartOptions::default()
+                ..RunOptions::default()
             },
         )
         .await
@@ -799,10 +799,9 @@ async fn a_child_inherits_its_parents_deadline() {
     parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
-                ..StartOptions::default()
             },
         )
         .await
@@ -851,10 +850,10 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
                 child
                     .run_with(
                         (),
-                        StartOptions {
+                        RunOptions {
                             // Longer than what the parent has left.
                             timeout: Timeout::Explicit(Duration::from_secs(3_600)),
-                            ..StartOptions::default()
+                            ..RunOptions::default()
                         },
                     )
                     .await
@@ -867,10 +866,9 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
     parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(60)),
-                ..StartOptions::default()
             },
         )
         .await
@@ -925,9 +923,9 @@ async fn a_child_can_decline_the_inherited_deadline() {
                 let detached = child
                     .run_with(
                         (),
-                        StartOptions {
+                        RunOptions {
                             timeout: Timeout::None,
-                            ..StartOptions::default()
+                            ..RunOptions::default()
                         },
                     )
                     .await?;
@@ -941,10 +939,9 @@ async fn a_child_can_decline_the_inherited_deadline() {
     let total = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
-                ..StartOptions::default()
             },
         )
         .await
@@ -1017,10 +1014,9 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
     let error = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_millis(400)),
-                ..StartOptions::default()
             },
         )
         .await
@@ -1190,9 +1186,9 @@ async fn a_child_started_through_another_instance_is_refused() {
     let error = parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
-                ..StartOptions::default()
+                ..RunOptions::default()
             },
         )
         .await
@@ -1269,9 +1265,9 @@ async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
         parent
             .run_with(
                 (),
-                StartOptions {
+                RunOptions {
                     workflow_id: Some(id),
-                    ..StartOptions::default()
+                    ..RunOptions::default()
                 },
             )
             .await

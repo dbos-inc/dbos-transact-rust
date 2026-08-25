@@ -72,4 +72,4 @@ pub use sleep::sleep;
 #[cfg(feature = "engine")]
 pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
-pub use workflow::{StartOptions, Timeout};
+pub use workflow::{RunOptions, StartOptions, Timeout};

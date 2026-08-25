@@ -209,7 +209,7 @@ impl Drop for PanicLog<'_> {
     }
 }
 
-/// What a caller may say about a start, beyond the input.
+/// What a caller may say about a run, beyond the input.
 ///
 /// A struct rather than a builder, matching how `sysdb` spells optional arguments; the common case
 /// pays nothing because [`run`](WorkflowRef::run) and [`start`](WorkflowRef::start) keep their
@@ -217,7 +217,7 @@ impl Drop for PanicLog<'_> {
 /// `..Default::default()` form this type is built around. Adding a field stays non-breaking for
 /// every caller who wrote it.
 #[derive(Debug, Clone, Default)]
-pub struct StartOptions<'a> {
+pub struct RunOptions<'a> {
     /// The workflow's id, in place of a generated one.
     ///
     /// A caller-supplied id is an idempotency key: starting the same id twice joins the workflow
@@ -236,6 +236,27 @@ pub struct StartOptions<'a> {
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
     /// cancelled workflow was interrupted, not wrong.
     pub timeout: Timeout,
+}
+
+/// What a caller may say about a start, beyond the input.
+///
+/// [`RunOptions`] plus a [`queue`](Self::queue), and that one extra field is why the two are
+/// separate types. Enqueueing means some *other* executor runs the workflow, at some later time;
+/// running means this process executes it and waits. There is no coherent reading of the two
+/// together — a queued `run_with` could only block on work this process is not doing, or silently
+/// ignore the queue — so the signature refuses it rather than the body, and no `run_with` caller
+/// has to read about a field they cannot use.
+///
+/// Every `RunOptions` [converts](RunOptions) into one of these, because
+/// [`run_with`](WorkflowRef::run_with) *is* [`start_with`](WorkflowRef::start_with) plus an await.
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions<'a> {
+    /// The workflow's id, in place of a generated one, and an idempotency key — see
+    /// [`RunOptions::workflow_id`].
+    pub workflow_id: Option<&'a str>,
+    /// How long the whole workflow may take, and what it does about a parent's budget — see
+    /// [`RunOptions::timeout`].
+    pub timeout: Timeout,
     /// A queue to leave this workflow on, instead of running it here.
     ///
     /// The workflow is recorded `ENQUEUED` and **not started**: whichever executor next polls that
@@ -247,6 +268,17 @@ pub struct StartOptions<'a> {
     /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is a legitimate destination too, and is
     /// where `resume` and `fork` put work.
     pub queue: Option<&'a str>,
+}
+
+impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
+    /// A run is a start that nobody queued.
+    fn from(options: RunOptions<'a>) -> Self {
+        Self {
+            workflow_id: options.workflow_id,
+            timeout: options.timeout,
+            queue: None,
+        }
+    }
 }
 
 /// How long a workflow may take, and — started from inside another one — what it does about the
@@ -347,12 +379,15 @@ where
     /// Called from inside a running workflow this runs a **child** of it, and takes two of the
     /// parent's step ids rather than one — see [`start_with`](Self::start_with).
     pub async fn run(&self, input: P) -> Result<R, E> {
-        self.run_with(input, StartOptions::default()).await
+        self.run_with(input, RunOptions::default()).await
     }
 
     /// [`run`](Self::run), with something to say about how it starts.
-    pub async fn run_with(&self, input: P, options: StartOptions<'_>) -> Result<R, E> {
-        self.start_with(input, options)
+    ///
+    /// Takes [`RunOptions`] rather than [`StartOptions`]: a workflow cannot be both queued and
+    /// waited for here, so there is no queue to name.
+    pub async fn run_with(&self, input: P, options: RunOptions<'_>) -> Result<R, E> {
+        self.start_with(input, options.into())
             .await
             .map_err(Error::lift)?
             .result()

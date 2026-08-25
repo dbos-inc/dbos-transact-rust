@@ -7,7 +7,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
-use dbos::{Config, DBOS, Error, StartOptions, Timeout};
+use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -39,10 +39,9 @@ async fn a_workflow_past_its_deadline_is_cancelled() {
     let error = workflow
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_millis(100)),
-                ..StartOptions::default()
             },
         )
         .await
@@ -78,10 +77,9 @@ async fn a_workflow_within_its_deadline_is_unaffected() {
     let value = workflow
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(30)),
-                ..StartOptions::default()
             },
         )
         .await

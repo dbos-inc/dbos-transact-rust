@@ -204,7 +204,7 @@ async fn a_retried_step_replays_from_its_single_checkpoint() {
     dbos.launch().await.expect("launch failed");
 
     let id = "replay-me";
-    let options = dbos::StartOptions {
+    let options = dbos::RunOptions {
         workflow_id: Some(id),
         ..Default::default()
     };

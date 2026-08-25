@@ -8,7 +8,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error, QueueConflict, QueueOptions, StartOptions, Timeout};
+use dbos::{Config, DBOS, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -420,10 +420,9 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
     parent
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
-                ..StartOptions::default()
             },
         )
         .await
