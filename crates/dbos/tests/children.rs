@@ -117,12 +117,12 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
     // First process: two children finish, the third blocks until shutdown kills the parent.
     {
         let dbos = DBOS::new(config("recover-children-app", &db));
-        let bodies = Arc::clone(&bodies);
+        let counted = Arc::clone(&bodies);
         let child = dbos
             .register_workflow("child", move |n: u32| {
-                let bodies = Arc::clone(&bodies);
+                let counted = Arc::clone(&counted);
                 async move {
-                    bodies.fetch_add(1, Ordering::SeqCst);
+                    counted.fetch_add(1, Ordering::SeqCst);
                     if n == 2 {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                     }
@@ -154,22 +154,19 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
             .await
             .expect("start failed");
 
-        // Wait until the first two children are recorded, so the crash lands mid-parent.
-        let reader = reader(&db).await;
+        // Wait until the third child's body has entered, so the crash lands mid-parent: two
+        // children finished, one in flight.
+        //
+        // On the counter rather than on the parent's step count, which is the tempting version
+        // and is racy. The launch row is written *before* the child is spawned — that ordering is
+        // what makes a crash in the gap adoptable — so a parent showing five steps can have a
+        // third child that has not been polled once, and shutdown would abort it before it
+        // counted. Waiting on the thing the next assertion reads leaves no window between them.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let steps = reader
-                .list_workflow_steps(id, false, None, None)
-                .await
-                .expect("read failed");
-            // Two children launched and awaited, and the third launched: five steps, with the
-            // third child's await still outstanding.
-            if steps.len() >= 5 {
-                break;
-            }
+        while bodies.load(Ordering::SeqCst) < 3 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the parent never got as far as its third child; steps: {steps:?}"
+                "the parent never got as far as its third child"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -190,7 +187,7 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
     let ran_before = bodies.load(Ordering::SeqCst);
     assert_eq!(
         ran_before, 3,
-        "three bodies entered, the third still blocked"
+        "three bodies entered, the third still blocked when the process died"
     );
 
     // Second process: recovery re-runs the parent, which must adopt rather than re-launch.
@@ -1048,6 +1045,260 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // And the parent, cancelled *while awaiting*, checkpointed nothing for that await. The wait
+    // was interrupted rather than answered, so a resumed parent asks the child's then-settled row
+    // again instead of replaying a verdict it never actually received. Go states the same rule in
+    // its own words at the same point.
+    let steps = reader
+        .list_workflow_steps(id, false, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(
+        steps.len(),
+        1,
+        "the launch, and nothing for the interrupted await: {steps:?}"
+    );
+    assert_eq!(steps[0].step_name, "child", "the launch");
+
+    dbos.shutdown().await;
+}
+
+/// A launch position that already holds a *plain* step is an error, not a second child.
+///
+/// **Stricter than every reference, deliberately.** Python falls through and starts a fresh child,
+/// and Go's `CheckChildWorkflow` returns nothing for such a row; both then collide on the write a
+/// moment later, so both end up loud rather than wrong — but only after creating and orphaning a
+/// child workflow. Refusing before anything is created leaves nothing behind to clean up.
+///
+/// The situation is a parent whose code changed under it: `step("child")` at position 0 became
+/// `child.run(())`. Planted directly here rather than staged across two processes, because the
+/// database is the whole of what the replay reads and the gate is what makes the write land in
+/// the same place a crash would have left it.
+#[tokio::test]
+async fn a_launch_position_holding_a_plain_step_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("stale-launch-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+
+    // The parent waits before its first step id is allocated, which is the window the plain step
+    // is planted in. Nothing before this is a step, so the launch still lands on position 0.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(Some(rx)));
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            let gate = Arc::clone(&gate);
+            async move {
+                let rx = gate.lock().unwrap().take().expect("the parent runs once");
+                let _ = rx.await;
+                child.run(()).await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "changed-under-itself";
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+
+    // The row exists as soon as `start_with` returns, which is what this write needs.
+    let reader = reader(&db).await;
+    reader
+        .record_step(id, 0, "child", Outcome::Output(Some("1")), None, None)
+        .await
+        .expect("planting the step failed");
+    tx.send(()).expect("the parent is waiting on the gate");
+
+    let error = handle.result().await.expect_err("the parent succeeded");
+    match &error {
+        Error::SystemDatabase(dbos::sysdb::Error::UnexpectedStep {
+            step_id,
+            expected,
+            recorded,
+            ..
+        }) => {
+            assert_eq!(*step_id, 0, "the launch position");
+            assert!(
+                expected.contains("child workflow launch"),
+                "says what it wanted: {expected}"
+            );
+            assert!(
+                recorded.contains("plain step"),
+                "and what it found: {recorded}"
+            );
+        }
+        other => panic!("expected an unexpected-step refusal, got {other:?}"),
+    }
+
+    // The point of refusing early: nothing was created to be orphaned.
+    assert!(
+        reader
+            .get_workflow(&format!("{id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "no child row was created before the refusal"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A `WorkflowRef` from another instance cannot start a child of this workflow.
+///
+/// The second place [`Error::WrongInstance`] is reachable from, and the reason it exists: the step
+/// id would come from this workflow's counter while the launch record went through the other
+/// instance's system database, landing where the workflow that allocated it cannot see it.
+/// `DBOS::get_event` refuses the same combination for the same reason, and is where the variant
+/// was first raised.
+#[tokio::test]
+async fn a_child_started_through_another_instance_is_refused() {
+    let db = test_database().await;
+    let other = DBOS::new(config("other-instance-app", &db));
+    let owner = DBOS::new(config("owner-instance-app", &db));
+
+    let child = other
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = {
+        let child = child.clone();
+        owner
+            .register_workflow("parent", move |()| {
+                let child = child.clone();
+                async move { child.run(()).await }
+            })
+            .unwrap()
+    };
+    other.launch().await.expect("launch failed");
+    owner.launch().await.expect("launch failed");
+
+    let id = "borrows-another-instance";
+    let error = parent
+        .run_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect_err("the parent succeeded");
+    assert!(
+        matches!(&error, Error::WrongInstance { operation } if operation.contains("workflow")),
+        "expected a wrong-instance refusal, got {error:?}"
+    );
+
+    // Refused before anything was written: no child, and no launch on the parent.
+    let reader = reader(&db).await;
+    assert!(
+        reader
+            .get_workflow(&format!("{id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "no child row"
+    );
+    assert!(
+        reader
+            .list_workflow_steps(id, false, None, None)
+            .await
+            .expect("read failed")
+            .is_empty(),
+        "and no launch recorded against the parent"
+    );
+
+    owner.shutdown().await;
+    other.shutdown().await;
+}
+
+/// Awaiting a child from inside a step checkpoints nothing of its own, and is not an error.
+///
+/// The asymmetry with *starting* a child is deliberate, and both halves follow from a step being a
+/// leaf. A launch inside a step allocates ids that would shift every later step onto the wrong
+/// replay slot, and there is no undurable version of it to fall back to, so it raises
+/// [`Error::InsideStep`]. An await has such a version: the enclosing step's own checkpoint already
+/// stands for whatever its body did, including the waiting, so the await simply runs plainly.
+/// `DBOS::get_event` degrades in exactly the same way.
+#[tokio::test]
+async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("await-in-step-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(41) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                // Started at a step boundary, where a launch has to happen...
+                let handle = child.start(()).await.map_err(Error::lift)?;
+                // ...and awaited from inside a step, where there is no id to allocate. The handle
+                // is not `Clone` and `result` consumes it, so it reaches the retryable closure
+                // through a slot it takes from once.
+                let slot = Arc::new(std::sync::Mutex::new(Some(handle)));
+                let value = dbos::step("collect", move || {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let handle = slot.lock().unwrap().take().expect("the step runs once");
+                        handle.result().await
+                    }
+                })
+                .await?;
+                Ok::<u32, Error>(value)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "collects-inside-a-step";
+    assert_eq!(
+        parent
+            .run_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(id),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("the parent failed"),
+        41
+    );
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(id, true, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 2, "the launch and the step: {steps:?}");
+    assert_eq!(steps[0].step_name, "child", "the launch");
+    assert_eq!(
+        steps[0].child_workflow_id.as_deref(),
+        Some("collects-inside-a-step-0")
+    );
+    assert_eq!(
+        steps[1].step_name, "collect",
+        "the enclosing step, under its own name"
+    );
+    assert_eq!(
+        steps[1].output.as_deref(),
+        Some("41"),
+        "which carries the child's value"
+    );
+    assert!(
+        steps.iter().all(|step| step.step_name != "DBOS.getResult"),
+        "the await added no checkpoint of its own: {steps:?}"
+    );
 
     dbos.shutdown().await;
 }
