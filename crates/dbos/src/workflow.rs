@@ -649,6 +649,8 @@ where
             workflow_id.clone(),
             input,
             initialized.deadline,
+            // A fresh start is not a dequeue, so it holds no queue's slot.
+            None,
         );
         Ok(WorkflowHandle::local(executor, workflow_id, task))
     }
@@ -741,12 +743,18 @@ impl Parent {
 ///
 /// The span travels with the task, so everything the workflow logs — the engine's own events and
 /// the application's — carries the workflow id without threading it anywhere.
+///
+/// `slot` is carried, never read: a dequeued workflow holds its place in its queue's local running
+/// tally for exactly as long as this task lives, so the release happens on a return, a panic, or
+/// shutdown aborting it, without anything having to watch for the end. Every other submitter
+/// passes `None`.
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
     deadline: Option<Timestamp>,
+    slot: Option<crate::dequeue::Slot>,
 ) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
@@ -754,6 +762,7 @@ pub(crate) fn spawn_execution(
         {
             let executor = Arc::clone(executor);
             async move {
+                let _slot = slot;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline);
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,

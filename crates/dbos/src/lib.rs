@@ -28,6 +28,8 @@ mod context;
 #[cfg(feature = "engine")]
 mod dbos;
 #[cfg(feature = "engine")]
+mod dequeue;
+#[cfg(feature = "engine")]
 mod dispatch;
 #[cfg(feature = "engine")]
 mod error;

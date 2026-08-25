@@ -24,6 +24,11 @@ use crate::error::{Error, Result};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{NewQueue, OnExistingQueue, QueueRecord};
 
+/// How often a queue is polled when nothing says otherwise.
+///
+/// One second in every implementation, and the floor a contended worker backs off from.
+pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A registered queue, as the database holds it.
 ///
 /// Returned by [`DBOS::register_queue`], and **read back from the row rather than echoed from the
@@ -140,7 +145,7 @@ impl Default for QueueOptions {
         Self {
             concurrency: None,
             worker_concurrency: None,
-            polling_interval: Duration::from_secs(1),
+            polling_interval: DEFAULT_POLLING_INTERVAL,
             on_conflict: QueueConflict::default(),
         }
     }
@@ -222,7 +227,7 @@ impl DBOS {
     /// **After [`launch`](DBOS::launch), unlike a workflow.** A workflow is registered *before*
     /// launch because the executor keeps a snapshot of the registry; a queue is a row, so
     /// registering one is a write and needs a launched instance to write it. The queue runner
-    /// notices it on its next reconcile, which is the same mechanism that lets a queue's limits be
+    /// notices it on its next sweep, which is the same mechanism that lets a queue's limits be
     /// changed at runtime — see the Queues tab of the starter app, whose whole point is that
     /// `worker_concurrency` can be adjusted without a restart.
     ///

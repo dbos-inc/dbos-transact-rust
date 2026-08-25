@@ -315,7 +315,19 @@ impl DBOS {
         // Installed first, recovered second: the recovery task runs against the same executor the
         // application sees, and an application call racing it is exactly the case the pre-listed
         // recovery set makes safe.
-        crate::recovery::spawn(executor, pending);
+        crate::recovery::spawn(Arc::clone(&executor), pending);
+        // The dequeue loop starts unconditionally, because a queue this process never registered
+        // is still one it should dequeue from: the worker set is rebuilt from the `queues` table
+        // on every supervisor sweep, not from this instance's `register_queue` calls. A queue another
+        // *process of this application* registered is therefore picked up, as is one registered
+        // against this instance after launch, without a restart.
+        //
+        // Another *application's* queue is not, and that is the boundary: the search scopes to
+        // this application's rows plus the unclaimed ones, so a peer application's backlog is
+        // never taken. Sharing a backlog is what a fleet of one application does; reaching into
+        // another's would be the same redirection that makes registering over its queue name an
+        // error.
+        crate::dequeue::spawn(executor);
         Ok(())
     }
 

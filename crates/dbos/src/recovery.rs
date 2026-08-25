@@ -98,5 +98,5 @@ async fn recover_one(executor: &Arc<Executor>, workflow_id: &str) -> crate::Resu
         tracing::debug!(workflow_id, "the row is gone; nothing to recover");
         return Ok(());
     };
-    dispatch(executor, row, Submission::Recovery).await
+    dispatch(executor, row, Submission::Recovery, None).await
 }

@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use crate::dbos::Executor;
+use crate::dequeue::Slot;
 use crate::error::Error;
 use crate::registry::WorkflowKey;
 use crate::sysdb;
@@ -33,6 +34,10 @@ use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution};
 /// then found no registration would have burned an attempt and re-stamped the executor on a
 /// workflow this process cannot run.
 ///
+/// `slot` is the dequeue's place in its queue's local running tally, and is `None` for
+/// recovery. It travels into the spawned execution so the tally is released when the workflow's
+/// task ends — and is dropped here, releasing it immediately, on every path that does not spawn.
+///
 /// Returning `Ok(())` covers every reason not to run that is not a fault: no name, no
 /// registration, a row already claimed, a row already finished, a parked row. The caller logs a
 /// genuine `Err` and moves on to the next id — a sweep must not strand every workflow behind one
@@ -41,6 +46,7 @@ pub(crate) async fn dispatch(
     executor: &Arc<Executor>,
     row: WorkflowRecord,
     submission: Submission,
+    slot: Option<Slot>,
 ) -> crate::Result<()> {
     let workflow_id = row.workflow_id;
     let Some(name) = row.name else {
@@ -112,6 +118,13 @@ pub(crate) async fn dispatch(
     // The stored deadline, so a workflow gets what is *left* of its budget rather than the whole
     // of it again — and one submitted after its expiry cancels at once instead of running on
     // unbounded.
-    spawn_execution(executor, key, workflow_id, row.input, initialized.deadline);
+    spawn_execution(
+        executor,
+        key,
+        workflow_id,
+        row.input,
+        initialized.deadline,
+        slot,
+    );
     Ok(())
 }
