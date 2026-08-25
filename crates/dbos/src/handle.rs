@@ -13,10 +13,12 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
+use crate::context::Ctx;
 use crate::dbos::Executor;
+use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
-use crate::serialization::decode;
-use crate::sysdb::types::WorkflowStatus;
+use crate::serialization::{decode, encode};
+use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus};
 use crate::workflow::adopt;
 
 /// A running — or finished — workflow, by id.
@@ -99,7 +101,32 @@ where
     /// workflow's own error with the fidelity the type parameter exists for. A failure that is
     /// not ours to decode — a row another SDK wrote — degrades to
     /// [`WorkflowFailed`](Error::WorkflowFailed) carrying the message.
+    ///
+    /// **Awaited from inside the workflow that started it, this is a durable step.** The parent
+    /// records what the child returned, so a replayed parent continues from a value it already has
+    /// rather than waiting again on a workflow that may since have been forked or deleted — and the
+    /// wait costs one row read instead of a poll to completion. All four implementations record it,
+    /// under the same name, `DBOS.getResult`.
     pub async fn result(self) -> Result<R, E> {
+        // Allocated before anything can fail, and before the check it gates: the position of this
+        // await in the parent has to be the same on the replay as it was on the run.
+        let awaiting = match Awaiting::of(&self.executor) {
+            Ok(awaiting) => awaiting,
+            Err(wrong) => return Err(wrong.lift()),
+        };
+        if let Some(recorded) = awaiting
+            .recorded(&self.executor, &self.workflow_id)
+            .await
+            .map_err(Error::lift)?
+        {
+            tracing::debug!(
+                workflow_id = self.workflow_id,
+                "the child's outcome was already recorded; the parent does not wait again"
+            );
+            return Self::interpret(recorded, self.workflow_id);
+        }
+
+        let started_at = Timestamp::now();
         let outcome = match self.provenance {
             Provenance::Local(task) => match task.await {
                 Ok(outcome) => outcome,
@@ -113,6 +140,19 @@ where
             Provenance::Polling => adopt(&self.executor, &self.workflow_id).await,
         };
 
+        // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
+        // the parent's row exactly as the child's own row holds them, so the two copies cannot
+        // disagree about what the child returned.
+        //
+        // The *label* beside them is this executor's serializer rather than the one that wrote
+        // the bytes, which `adopt` does not carry back. Nothing reads it to choose a decoder while
+        // there is one encoding, so it costs nothing yet; it becomes a real question when a second
+        // serializer does, and it is that change's to answer.
+        awaiting
+            .record(&self.executor, &self.workflow_id, &outcome, started_at)
+            .await
+            .map_err(Error::lift)?;
+
         match outcome {
             Ok(output) => decode(output.as_deref(), "result"),
             // The workflow's own failure, decoded back into the caller's error type — the same
@@ -120,11 +160,216 @@ where
             // the same error.
             Err(Failure::Recorded(encoded)) => Err(decode::<_, E>(Some(&encoded), "error")
                 .unwrap_or_else(|_| Error::WorkflowFailed {
-                    workflow_id: self.workflow_id,
+                    workflow_id: self.workflow_id.clone(),
                     message: encoded,
                 })),
+            // **A cancelled child is not a cancelled parent.** `WorkflowCancelled` means the
+            // workflow *asking* is being cancelled — the step-replay check refusing to run it —
+            // so reporting it here would read as the wrong workflow having been stopped. Every
+            // reference raises a separate awaited-cancelled error for exactly this, and it is
+            // recorded like any other outcome: the child is over, and the parent has learned so.
+            Err(Failure::Control(Error::WorkflowCancelled { workflow_id }))
+                if awaiting.inside_a_workflow() =>
+            {
+                Err(Error::AwaitedWorkflowCancelled { workflow_id })
+            }
             Err(Failure::Control(control)) => Err(control.lift()),
         }
+    }
+
+    /// Turns a recorded await back into what the parent returned the first time.
+    ///
+    /// Which workflow the row belongs to was settled by [`Awaiting::recorded`] before this sees
+    /// it, so what is left here is the outcome alone.
+    fn interpret(recorded: StepRecord, workflow_id: String) -> Result<R, E> {
+        match recorded.error {
+            None => decode(recorded.output.as_deref(), "result"),
+            Some(encoded) => Err(decode::<_, E>(Some(&encoded), "error").unwrap_or_else(|_| {
+                Error::WorkflowFailed {
+                    workflow_id,
+                    message: encoded,
+                }
+            })),
+        }
+    }
+}
+
+/// Where the caller awaiting this handle stands, which decides two independent things: whether the
+/// outcome is checkpointed, and how a cancelled *awaited* workflow is reported.
+///
+/// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
+/// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
+/// either, and Python and Go checkpoint that case too.
+enum Awaiting {
+    /// Not inside a workflow. Nothing is recorded, and a cancelled workflow is reported as
+    /// [`Error::WorkflowCancelled`] — there is no *other* workflow here to confuse it with.
+    Outside,
+    /// Inside a step. The awaited-cancelled distinction applies, because there is a workflow to
+    /// confuse it with, but nothing is checkpointed: a step is a leaf, and an id-allocating call
+    /// inside one would shift every later step onto the wrong replay slot. `get_event` degrades
+    /// the same way.
+    InsideAStep,
+    /// Inside a workflow at a step boundary: this await is a step of that workflow.
+    Checkpointed { workflow_id: String, step_id: i32 },
+}
+
+impl Awaiting {
+    fn of(executor: &Arc<Executor>) -> std::result::Result<Self, Error> {
+        let Some(ctx) = Ctx::current() else {
+            return Ok(Self::Outside);
+        };
+        // The step id would come from this workflow's counter while the write went through the
+        // handle's own system database — the split `get_event` refuses for the same reason.
+        if !Arc::ptr_eq(ctx.executor(), executor) {
+            return Err(Error::WrongInstance {
+                operation: "awaiting a workflow's result".into(),
+            });
+        }
+        if ctx.in_step() {
+            return Ok(Self::InsideAStep);
+        }
+        Ok(Self::Checkpointed {
+            workflow_id: ctx.workflow_id().to_owned(),
+            step_id: ctx.next_step_id(),
+        })
+    }
+
+    /// Whether a cancelled *awaited* workflow has to be distinguished from this caller being
+    /// cancelled — true wherever there is a caller for it to be confused with.
+    fn inside_a_workflow(&self) -> bool {
+        !matches!(self, Self::Outside)
+    }
+
+    fn checkpoint(&self) -> Option<(&str, i32)> {
+        match self {
+            Self::Checkpointed {
+                workflow_id,
+                step_id,
+            } => Some((workflow_id.as_str(), *step_id)),
+            _ => None,
+        }
+    }
+
+    async fn recorded(
+        &self,
+        executor: &Executor,
+        awaited_workflow_id: &str,
+    ) -> std::result::Result<Option<StepRecord>, Error> {
+        let Some((workflow_id, step_id)) = self.checkpoint() else {
+            return Ok(None);
+        };
+        let Some(recorded) = executor
+            .sysdb()
+            .check_child_result(workflow_id, step_id)
+            .await
+            .map_err(Error::SystemDatabase)?
+        else {
+            return Ok(None);
+        };
+        // The mirror of the launch's own check, and the second half of one rule.
+        // `check_child_result` compares the step *name*, which leaves the question of whose
+        // outcome this is. For a child it cannot differ — the handle's id was read out of the
+        // launch row moments earlier — but a workflow may also await a handle it did not start,
+        // and there the recorded row is the only thing that knows which workflow answered.
+        // Adopting some other workflow's outcome as this one's is what this refuses, and every
+        // implementation writes the id needed to refuse it (Python's `record_get_result` stores
+        // the awaited id as `child_workflow_id` too, `_sys_db.py:2851`).
+        if recorded.child_workflow_id.as_deref() != Some(awaited_workflow_id) {
+            return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+                workflow_id: workflow_id.to_owned(),
+                step_id,
+                expected: format!("an await of {awaited_workflow_id}"),
+                recorded: match &recorded.child_workflow_id {
+                    Some(other) => format!("an await of {other}"),
+                    None => "an await of no workflow at all".to_owned(),
+                },
+            }));
+        }
+        Ok(Some(recorded))
+    }
+
+    /// Records a *settled* outcome, and only that.
+    ///
+    /// A success, a failure and a cancellation are all things the child is finished doing and
+    /// cannot take back, so the parent may safely be replayed straight past them. What is left
+    /// unrecorded is whatever a replay must not be pinned to:
+    ///
+    /// - **the parent being interrupted** — shutdown aborted the task, nothing is decided, and a
+    ///   recovered parent must await again (Go says the same in its own words: *"nothing is
+    ///   checkpointed, so a resume re-executes the await"*);
+    /// - **a system-database failure**, which is a statement about the substrate rather than about
+    ///   the child;
+    /// - **the child being parked** at `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, which is the one that
+    ///   needs an argument, below.
+    ///
+    /// **A parked child still fails its parent** — all four implementations let that error out of
+    /// the await, and none treats it as something a parent can wait out. What is withheld is only
+    /// the *checkpoint*: parking is the one non-terminal verdict a workflow can carry, so freezing
+    /// it into the parent's replay would outlive its own truth. A parent resumed after its child
+    /// was resumed re-asks the child's row and sees what the child actually did; a parent holding
+    /// a recorded "parked" would replay that answer forever. It is the same argument as the
+    /// interrupted-await bullet above, one step further out.
+    ///
+    /// **Rust follows Go here, against the other three.** Go filters this case out of its await
+    /// checkpoint deliberately and says so — *"either the workflow result proper (no dlq, no raw
+    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go:419`). Python,
+    /// TypeScript and Java all record it, because in all three the await runs inside the generic
+    /// step wrapper and that wrapper checkpoints whatever exception it caught.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 20. Two implementations pin a parked child's verdict into
+    /// the parent's replay and two do not, and none of the four argues for its side — the split
+    /// falls exactly along "Go's await path filters on purpose" versus "a step wrapper records by
+    /// default", which is not a decision anyone made twice. It is worth settling before v1,
+    /// because it changes what a resumed parent sees. The same item covers a second half: Python
+    /// and TypeScript raise a distinct *awaited* error here
+    /// (`DBOSAwaitedWorkflowMaxRecoveryAttemptsExceeded`,
+    /// `DBOSAwaitedWorkflowExceededMaxRecoveryAttempts`) while Go and Java reuse the error a
+    /// workflow gets for its own parking — a two-two split the *cancellation* case does not have,
+    /// where all four separate the two meanings and Rust followed them into
+    /// [`Error::AwaitedWorkflowCancelled`].
+    async fn record(
+        &self,
+        executor: &Executor,
+        child_workflow_id: &str,
+        settled: &std::result::Result<Option<String>, Failure>,
+        started_at: Timestamp,
+    ) -> std::result::Result<(), Error> {
+        let Some((workflow_id, step_id)) = self.checkpoint() else {
+            return Ok(());
+        };
+        let cancelled;
+        let outcome = match settled {
+            Ok(output) => Outcome::Output(output.as_deref()),
+            Err(Failure::Recorded(encoded)) => Outcome::Error(encoded),
+            // Cancellation is the one control-shaped signal that *is* a decided outcome, and it is
+            // rewritten on the way in for the same reason it is rewritten on the way out: the row
+            // has to say the awaited workflow was cancelled, not this one.
+            Err(Failure::Control(Error::WorkflowCancelled { workflow_id })) => {
+                cancelled = encode(
+                    &Error::<EngineOnly>::AwaitedWorkflowCancelled {
+                        workflow_id: workflow_id.clone(),
+                    },
+                    "error",
+                )?;
+                Outcome::Error(&cancelled)
+            }
+            Err(Failure::Control(_)) => return Ok(()),
+        };
+        executor
+            .sysdb()
+            .record_child_result(
+                workflow_id,
+                step_id,
+                child_workflow_id,
+                outcome,
+                Some(executor.serializer().name()),
+                Some(StepTiming {
+                    started_at,
+                    completed_at: Timestamp::now(),
+                }),
+            )
+            .await
+            .map_err(Error::SystemDatabase)
     }
 }
 

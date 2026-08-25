@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use tokio_util::sync::CancellationToken;
 
 use crate::dbos::Executor;
+use crate::sysdb::types::Timestamp;
 
 tokio::task_local! {
     /// Set while a workflow body runs, and read by everything the body calls.
@@ -45,6 +46,18 @@ pub struct Ctx {
 /// The parts of a workflow that outlive any one call within it.
 struct WorkflowState {
     workflow_id: String,
+    /// When this workflow must stop, if it was given a budget.
+    ///
+    /// **The instant the database holds, not the timeout its caller offered.** A recovered
+    /// workflow reads the deadline stored on its row, so a workflow given an hour that crashed
+    /// after fifty minutes has ten left — and a child that inherits this inherits what is left
+    /// rather than a fresh hour.
+    ///
+    /// Here rather than passed down to the one place that watches it, because a **child workflow**
+    /// has to read it at launch: an inherited deadline is how a parent's budget reaches work the
+    /// parent is not itself running, and the child's `select!` fires on the same instant with no
+    /// signal passing between them.
+    deadline: Option<Timestamp>,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
     /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
@@ -82,11 +95,16 @@ impl WorkflowState {
 
 impl Ctx {
     /// A context for a workflow about to run.
-    pub(crate) fn new(executor: Arc<Executor>, workflow_id: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        executor: Arc<Executor>,
+        workflow_id: impl Into<String>,
+        deadline: Option<Timestamp>,
+    ) -> Self {
         Self {
             executor,
             workflow: Arc::new(WorkflowState {
                 workflow_id: workflow_id.into(),
+                deadline,
                 next_step_id: AtomicI32::new(0),
                 in_step: AtomicBool::new(false),
             }),
@@ -109,6 +127,11 @@ impl Ctx {
     /// The id of the workflow this context belongs to.
     pub fn workflow_id(&self) -> &str {
         &self.workflow.workflow_id
+    }
+
+    /// When this workflow must stop, if it has a deadline at all.
+    pub(crate) fn deadline(&self) -> Option<Timestamp> {
+        self.workflow.deadline
     }
 
     /// Runs `future` with `ctx` ambient.
@@ -218,6 +241,7 @@ mod tests {
     fn state() -> WorkflowState {
         WorkflowState {
             workflow_id: "wf-1".to_owned(),
+            deadline: None,
             next_step_id: AtomicI32::new(0),
             in_step: AtomicBool::new(false),
         }
@@ -269,20 +293,27 @@ mod tests {
     /// A real `Ctx` needs a real `Executor`, which needs a database. These live here rather than
     /// in `tests/` because `Ctx::new` and `Ctx::scope` are crate-internal — entering a context is
     /// something the engine does, never something a caller does.
-    async fn ctx(workflow_id: &str) -> (Ctx, crate::DBOS, dbos_test_support::TestDatabase) {
+    async fn ctx(
+        workflow_id: &str,
+        deadline: Option<Timestamp>,
+    ) -> (Ctx, crate::DBOS, dbos_test_support::TestDatabase) {
         let db = dbos_test_support::test_database().await;
         let dbos = crate::DBOS::new(crate::Config {
             migrate: false,
             ..crate::Config::new("ctx-test", db.url())
         });
         dbos.launch().await.expect("launch failed");
-        let ctx = Ctx::new(dbos.executor("test").expect("launched"), workflow_id);
+        let ctx = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            workflow_id,
+            deadline,
+        );
         (ctx, dbos, db)
     }
 
     #[tokio::test]
     async fn a_context_is_ambient_within_its_scope_and_gone_outside_it() {
-        let (ctx, dbos, _db) = ctx("wf-42").await;
+        let (ctx, dbos, _db) = ctx("wf-42", None).await;
 
         assert!(Ctx::current().is_none(), "nothing before");
         Ctx::scope(ctx, async {
@@ -300,13 +331,47 @@ mod tests {
         dbos.shutdown().await;
     }
 
+    /// The deadline reaches everything the workflow calls, including from inside a step.
+    ///
+    /// It lives on the shared `WorkflowState` rather than on the `Ctx`, and the difference shows up
+    /// exactly here: `in_step_scope` builds a *new* `Ctx` to carry the attempt's cancellation
+    /// token, so anything held on the `Ctx` itself would be silently dropped at every step
+    /// boundary. A child workflow launched after a step has run must still inherit the budget its
+    /// parent has left.
+    #[tokio::test]
+    async fn the_deadline_travels_with_the_context_and_survives_a_step_scope() {
+        let deadline = Timestamp::from_epoch_ms(1_700_000_000_000);
+        let (ctx, dbos, _db) = ctx("wf-deadline", Some(deadline)).await;
+
+        let inner = ctx.clone();
+        Ctx::scope(ctx, async move {
+            assert_eq!(
+                Ctx::current().expect("inside").deadline(),
+                Some(deadline),
+                "the body reads the deadline its row carries"
+            );
+            inner
+                .in_step_scope(None, async {
+                    assert_eq!(
+                        Ctx::current().expect("inside a step").deadline(),
+                        Some(deadline),
+                        "a step's rebinding shares the workflow state, so the deadline comes with it"
+                    );
+                })
+                .await;
+        })
+        .await;
+
+        dbos.shutdown().await;
+    }
+
     #[tokio::test]
     async fn the_context_does_not_cross_a_spawn() {
         // Documented rather than discovered: a spawned task is a new task with an empty
         // task-local map. That is the correct default — the spawned work is not part of the
         // durable workflow — and adopting the parent's counter would let two tasks allocate the
         // same step id.
-        let (ctx, dbos, _db) = ctx("wf-42").await;
+        let (ctx, dbos, _db) = ctx("wf-42", None).await;
 
         let spawned_saw = Ctx::scope(ctx, async {
             tokio::spawn(async { Ctx::current().map(|c| c.workflow_id().to_owned()) })
@@ -321,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_clone_shares_one_step_counter() {
-        let (ctx, dbos, _db) = ctx("wf-42").await;
+        let (ctx, dbos, _db) = ctx("wf-42", None).await;
         let clone = ctx.clone();
 
         assert_eq!(ctx.next_step_id(), 0);

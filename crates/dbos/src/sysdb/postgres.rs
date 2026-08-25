@@ -679,6 +679,7 @@ impl PostgresSystemDatabase {
                 Outcome::Output(Some(&recorded)),
                 Some(PORTABLE_JSON),
                 Some(timing),
+                None,
             )
             .await?;
         }
@@ -1052,6 +1053,12 @@ const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 /// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`]: all four
 /// implementations record exactly `"DBOS.getEvent"`.
 const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
+
+/// A cross-SDK constant: what every implementation names the step a parent writes when it awaits a
+/// child — Python's `function_name="DBOS.getResult"`, Go's `StepName`, and TypeScript's and Java's
+/// the same. Written by `record_child_result` and read back by `check_child_result`, which is the
+/// only reason both of those exist rather than the caller passing a name.
+const GET_RESULT_STEP_NAME: &str = "DBOS.getResult";
 
 /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT_STEP_NAME`].
 const RECV_STEP_NAME: &str = "DBOS.recv";
@@ -1449,12 +1456,14 @@ impl PostgresSystemDatabase {
         }
     }
 
-    /// [`record_step`](SystemDatabase::record_step) against a caller's connection.
+    /// The one statement behind every recorded step, against a caller's connection.
     ///
-    /// One argument over clippy's threshold, and deliberately: it is the trait method's own
-    /// parameter list plus the connection. Grouping them into a struct here would mean either a
-    /// type used in one place or changing the public signature to match, and that signature was
-    /// chosen so a caller does not allocate.
+    /// Two trait methods reach it and its parameter list is their union, which is why it runs two
+    /// over clippy's threshold: [`record_step`](SystemDatabase::record_step) passes no child id,
+    /// and [`record_child_result`](SystemDatabase::record_child_result) passes the child whose
+    /// outcome the parent is adopting. Both public signatures stay a parameter shorter than this
+    /// one, which is the trade — the alternative is a struct that would exist for one call each and
+    /// would have to be built by callers chosen so they do not allocate.
     #[allow(clippy::too_many_arguments)]
     async fn record_step_on(
         &self,
@@ -1465,6 +1474,9 @@ impl PostgresSystemDatabase {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        // The workflow this step's result was adopted from, for a parent awaiting a child.
+        // `None` for a step that did its own work.
+        child_workflow_id: Option<&str>,
     ) -> Result<(), Error> {
         if workflow_id.is_empty() {
             return Err(Error::InvalidInput {
@@ -1515,8 +1527,8 @@ impl PostgresSystemDatabase {
             let stored: Option<Option<i64>> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, output, \
                  error, serialization, started_at_epoch_ms, completed_at_epoch_ms, \
-                 application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 application_name, child_workflow_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
                  ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
                  SET completed_at_epoch_ms = {steps_table}.completed_at_epoch_ms \
                  RETURNING completed_at_epoch_ms"
@@ -1533,6 +1545,7 @@ impl PostgresSystemDatabase {
             // and the conflict update leaves an existing row's owner alone for the same reason
             // the completion timestamp is left alone.
             .bind(application_name)
+            .bind(child_workflow_id)
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1771,6 +1784,7 @@ impl PostgresSystemDatabase {
                     Outcome::Output(Some(&recorded)),
                     Some(PORTABLE_JSON),
                     Some(timing),
+                    None,
                 )
                 .await
             {
@@ -3501,6 +3515,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     Outcome::Output(None),
                     None,
                     Some(timing),
+                    None,
                 )
                 .await?;
             }
@@ -3733,6 +3748,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
                 message.as_ref().and_then(|m| m.serialization.as_deref()),
                 Some(timing),
+                None,
             )
             .await?;
             tx.commit().await?;
@@ -3836,6 +3852,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                         Outcome::Output(None),
                         None,
                         Some(timing),
+                        None,
                     )
                     .await?;
                 }
@@ -3938,6 +3955,43 @@ impl SystemDatabase for PostgresSystemDatabase {
                 outcome,
                 serialization,
                 timing,
+                None,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn check_child_result(
+        &self,
+        parent_workflow_id: &str,
+        step_id: i32,
+    ) -> Result<Option<StepRecord>, Error> {
+        self.check_step(parent_workflow_id, step_id, GET_RESULT_STEP_NAME)
+            .await
+    }
+
+    async fn record_child_result(
+        &self,
+        parent_workflow_id: &str,
+        step_id: i32,
+        child_workflow_id: &str,
+        outcome: Outcome<'_>,
+        serialization: Option<&str>,
+        timing: Option<StepTiming>,
+    ) -> Result<(), Error> {
+        let pool = &self.pool;
+        with_retry(&self.retry, "record_child_result", move || async move {
+            let mut conn = pool.acquire().await?;
+            self.record_step_on(
+                &mut conn,
+                parent_workflow_id,
+                step_id,
+                GET_RESULT_STEP_NAME,
+                outcome,
+                serialization,
+                timing,
+                Some(child_workflow_id),
             )
             .await
         })
@@ -4057,6 +4111,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Outcome::Output(None),
                 None,
                 Some(timing),
+                None,
             )
             .await?;
 
@@ -4247,6 +4302,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Outcome::Output(found.map(|v| v.value.as_str())),
                 found.and_then(|v| v.serialization.as_deref()),
                 Some(timing),
+                None,
             )
             .await?;
             tx.commit().await?;

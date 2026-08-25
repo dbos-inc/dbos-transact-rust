@@ -267,6 +267,24 @@ pub enum Error<E = EngineOnly> {
         workflow_id: String,
     },
 
+    /// A workflow this one was **waiting on** was cancelled.
+    ///
+    /// Not [`WorkflowCancelled`](Self::WorkflowCancelled), and the distinction is the whole reason
+    /// this variant exists: that one means *this* workflow is being cancelled and must stop, while
+    /// this one means the workflow it awaited will never produce a result. A parent told the first
+    /// when its child was cancelled would stop itself, which is not what happened and not what any
+    /// implementation does — Python raises `DBOSAwaitedWorkflowCancelledError` "because the
+    /// awaiting workflow is not being cancelled", and Go's `AwaitedWorkflowCancelledError` is the
+    /// same error under the same reasoning.
+    ///
+    /// It is the awaited workflow's *outcome*, so it is recorded like one: a replayed parent is
+    /// told the same thing without waiting again.
+    #[error("the workflow {workflow_id} this one was awaiting was cancelled")]
+    AwaitedWorkflowCancelled {
+        /// The awaited workflow that was cancelled — the child, not the caller.
+        workflow_id: String,
+    },
+
     /// The workflow was recovered too many times and is parked.
     #[error("the workflow {workflow_id} exceeded {recovery_attempts} recovery attempts")]
     MaxRecoveryAttemptsExceeded {
@@ -393,6 +411,9 @@ impl<E> Error<E> {
                 message,
             },
             Error::WorkflowCancelled { workflow_id } => Error::WorkflowCancelled { workflow_id },
+            Error::AwaitedWorkflowCancelled { workflow_id } => {
+                Error::AwaitedWorkflowCancelled { workflow_id }
+            }
             Error::MaxRecoveryAttemptsExceeded {
                 workflow_id,
                 recovery_attempts,
