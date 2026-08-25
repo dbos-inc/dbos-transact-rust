@@ -72,10 +72,10 @@ use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use self::listener::Listener;
 use self::notifier::Notifier;
+use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
 use super::notify::{EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key};
 use super::retry::{RetryPolicy, with_retry};
-use super::{GET_RESULT_STEP_NAME, PARTITIONED_DEQUEUE_SWEEP_CAP};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1053,6 +1053,12 @@ const SET_EVENT_STEP_NAME: &str = "DBOS.setEvent";
 /// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT_STEP_NAME`]: all four
 /// implementations record exactly `"DBOS.getEvent"`.
 const GET_EVENT_STEP_NAME: &str = "DBOS.getEvent";
+
+/// A cross-SDK constant: what every implementation names the step a parent writes when it awaits a
+/// child — Python's `function_name="DBOS.getResult"`, Go's `StepName`, and TypeScript's and Java's
+/// the same. Written by `record_child_result` and read back by `check_child_result`, which is the
+/// only reason both of those exist rather than the caller passing a name.
+const GET_RESULT_STEP_NAME: &str = "DBOS.getResult";
 
 /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT_STEP_NAME`].
 const RECV_STEP_NAME: &str = "DBOS.recv";
@@ -3954,6 +3960,15 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await
         })
         .await
+    }
+
+    async fn check_child_result(
+        &self,
+        parent_workflow_id: &str,
+        step_id: i32,
+    ) -> Result<Option<StepRecord>, Error> {
+        self.check_step(parent_workflow_id, step_id, GET_RESULT_STEP_NAME)
+            .await
     }
 
     async fn record_child_result(

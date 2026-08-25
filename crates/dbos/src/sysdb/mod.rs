@@ -1215,17 +1215,14 @@ pub trait SystemDatabase: Send + Sync {
     /// Reads back a recorded child-workflow await, or `None` if the parent has not got this far.
     ///
     /// The replay gate for [`record_child_result`](Self::record_child_result), and the reason a
-    /// parent that already learned its child's outcome does not wait for it a second time. Provided
-    /// rather than implemented, because it is [`check_step`](Self::check_step) under the one name
-    /// every implementation records these under — a backend has nothing of its own to add.
+    /// parent that already learned its child's outcome does not wait for it a second time. It is
+    /// [`check_step`](Self::check_step) under the name that method records, and takes no step name
+    /// for the same reason that one does not.
     async fn check_child_result(
         &self,
         parent_workflow_id: &str,
         step_id: i32,
-    ) -> Result<Option<StepRecord>, Error> {
-        self.check_step(parent_workflow_id, step_id, GET_RESULT_STEP_NAME)
-            .await
-    }
+    ) -> Result<Option<StepRecord>, Error>;
 
     /// Records what a child workflow returned, as a step of the parent that awaited it.
     ///
@@ -1243,7 +1240,9 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// The step name is not a parameter for the same reason it is not one on
     /// [`record_sleep`](Self::record_sleep): `"DBOS.getResult"` is what all four implementations
-    /// write, and a caller that could choose would be choosing wrong.
+    /// write — Python's `_sys_db.py`, Go's `StepName`, TypeScript's and Java's the same — so a step
+    /// listing reads alike whichever SDK ran the parent, which is what Conductor renders. A caller
+    /// that could choose would be choosing wrong.
     async fn record_child_result(
         &self,
         parent_workflow_id: &str,
@@ -1254,10 +1253,3 @@ pub trait SystemDatabase: Send + Sync {
         timing: Option<StepTiming>,
     ) -> Result<(), Error>;
 }
-
-/// What every implementation names the step a parent writes when it awaits a child.
-///
-/// Python (`_sys_db.py`, `function_name="DBOS.getResult"`), TypeScript, Go (`StepName:
-/// "DBOS.getResult"`) and Java all record exactly this, so a step listing reads the same whichever
-/// SDK ran the parent — which is what Conductor renders.
-pub(crate) const GET_RESULT_STEP_NAME: &str = "DBOS.getResult";
