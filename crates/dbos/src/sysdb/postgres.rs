@@ -1015,6 +1015,22 @@ const PORTABLE_JSON: &str = "portable_json";
 /// error a caller can see rather than a call that never returns.
 const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 
+/// The database's clock, in epoch milliseconds, as a SQL expression.
+///
+/// **Used wherever one executor's timestamp is compared against another's.** A rate limit stamps
+/// `started_at_epoch_ms` on the row it claims and the next dequeue measures its window back from
+/// now; if the two executors read their own clocks, a host running fast writes starts that a peer
+/// judges to be outside its window and both admit a full allowance. One clock, so the window
+/// means the same thing everywhere. Python spells it `_now_ms_sql` and TypeScript inlines it.
+///
+/// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
+/// and the stamp taken later in the same transaction agree on one instant.
+///
+/// The `::bigint` is not decoration: `EXTRACT` yields `numeric`, and comparing a `BIGINT` column
+/// against a `numeric` casts the column, which costs it its index — and the column this is
+/// compared against is the dequeue's own.
+const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
+
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
@@ -1527,14 +1543,17 @@ impl PostgresSystemDatabase {
 
     /// Cancels one batch, returning the ids that were still running.
     ///
-    /// Not retried in here, and not reading its own clock. Both belong to the trait method that
-    /// owns the whole operation: a retry that restarted only this statement would leave the
-    /// cascade around it half-walked, and a per-level clock would give one cancellation as many
-    /// `completed_at` values as the tree has depth.
+    /// Not retried in here: that belongs to the trait method that owns the whole operation, since
+    /// a retry restarting only this statement would leave the cascade around it half-walked.
+    ///
+    /// The clock is per level, so a deep tree's `completed_at` values span the walk rather than
+    /// sharing one instant. Every other implementation does the same — Python and TypeScript put
+    /// `now()` in this statement, Java reads its own inside the equivalent of this method — and
+    /// nothing reads the column to decide anything.
     ///
     /// The terminal-status guard is what makes cancellation safe to repeat: a workflow that has
     /// already succeeded keeps its result rather than being overwritten with `CANCELLED`.
-    async fn cancel_batch<S>(&self, workflow_ids: &[S], now: i64) -> Result<Vec<String>, Error>
+    async fn cancel_batch<S>(&self, workflow_ids: &[S]) -> Result<Vec<String>, Error>
     where
         S: AsRef<str> + Sync,
     {
@@ -1574,13 +1593,12 @@ impl PostgresSystemDatabase {
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
              deduplication_id = NULL, started_at_epoch_ms = NULL, \
-             updated_at = $2, completed_at = $2 \
+             updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
              WHERE workflow_uuid = ANY($1) \
                AND status NOT IN ('SUCCESS', 'ERROR', 'CANCELLED') \
              RETURNING workflow_uuid"
         )))
         .bind(ids)
-        .bind(now)
         .fetch_all(&self.pool)
         .await?;
         Ok(cancelled)
@@ -2103,7 +2121,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                        THEN {workflow_table}.recovery_attempts + $31 \
                        ELSE {workflow_table}.recovery_attempts \
                    END, \
-                   updated_at = EXCLUDED.updated_at, \
+                   updated_at = {NOW_MS_SQL}, \
                    executor_id = CASE \
                        WHEN EXCLUDED.status = 'ENQUEUED' OR EXCLUDED.status = 'DELAYED' \
                        THEN {workflow_table}.executor_id \
@@ -2506,9 +2524,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         outcome: Outcome<'_>,
     ) -> Result<OutcomeWrite, Error> {
         let workflow_table = &self.tables.workflow_status;
-        // Stamped once, outside the retry: a retried attempt is recording the outcome it
-        // already had, and re-reading the clock would move `completed_at` forward each time.
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         let (output, error) = outcome.columns();
 
@@ -2523,14 +2538,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             // held forever and nothing could ever be submitted under it again.
             let updated = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} SET status = $2, output = $3, error = $4, \
-                 updated_at = $5, completed_at = $5, deduplication_id = NULL \
+                 updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}, \
+                 deduplication_id = NULL \
                  WHERE workflow_uuid = $1 AND status = 'PENDING'"
             )))
             .bind(workflow_id)
             .bind(outcome.status().as_str())
             .bind(output)
             .bind(error)
-            .bind(now)
             .execute(pool)
             .await?
             .rows_affected();
@@ -2654,12 +2669,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             // `status = 'DELAYED'` is the guard: a released workflow is running or queued, and
             // pushing its delay out would not recall it.
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET delay_until_epoch_ms = $2, updated_at = $3 \
+                "UPDATE {workflow_table} \
+                 SET delay_until_epoch_ms = $2, updated_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = $1 AND status = 'DELAYED'"
             )))
             .bind(workflow_id)
             .bind(delay_until)
-            .bind(now.as_epoch_ms())
             .execute(pool)
             .await?;
             Ok(())
@@ -2707,7 +2722,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             "update_workflow_attributes",
             move || async move {
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} SET attributes = $2::jsonb, updated_at = $3 \
+                    "UPDATE {workflow_table} \
+                     SET attributes = $2::jsonb, updated_at = {NOW_MS_SQL} \
                      WHERE workflow_uuid = $1"
                 )))
                 .bind(workflow_id)
@@ -2768,8 +2784,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         let application_name = self.application_name.as_deref();
 
         with_retry(&self.retry, "reenqueue_for_recovery", move || async move {
-            // Per attempt, as every sweep's clock is: a retry should stamp when it ran.
-            let now = Timestamp::now().as_epoch_ms();
             // `started_at_epoch_ms` is cleared because the row has not started yet — leaving the
             // dead run's start time would make the queue wait look like execution.
             //
@@ -2780,17 +2794,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                 "UPDATE {workflow_table} \
                  SET status = 'ENQUEUED', \
                      started_at_epoch_ms = NULL, \
-                     updated_at = $1, \
-                     queue_name = COALESCE(NULLIF(queue_name, ''), $2) \
+                     updated_at = {NOW_MS_SQL}, \
+                     queue_name = COALESCE(NULLIF(queue_name, ''), $1) \
                  WHERE status = 'PENDING' \
-                   AND executor_id = ANY($3) \
-                   AND application_version = $4 \
-                   AND ($5::text IS NULL \
-                        OR application_name = $5 \
+                   AND executor_id = ANY($2) \
+                   AND application_version = $3 \
+                   AND ($4::text IS NULL \
+                        OR application_name = $4 \
                         OR application_name IS NULL) \
                  RETURNING workflow_uuid"
             )))
-            .bind(now)
             .bind(recovery_queue)
             .bind(executor_ids)
             .bind(application_version)
@@ -2864,9 +2877,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         // what it did. The walk itself restarts from the roots each attempt, since there is no
         // way to know how far the last one got.
         //
-        // `now` is read once for the whole cascade, so every workflow cancelled by one call
-        // shares a `completed_at` however deep the tree goes.
-        let now = Timestamp::now().as_epoch_ms();
         // Not for concurrency — nothing else touches this. It is how an accumulator outlives a
         // retry while the closure stays `FnMut` returning a `Send` future, which is what
         // `with_retry` requires. A plain `&mut Vec` would make the future borrow the closure.
@@ -2882,7 +2892,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // back from the database already allocated.
             // Awaited before locking: a guard held across an await would make this future
             // non-`Send`, which `with_retry` requires.
-            let roots = self.cancel_batch(workflow_ids, now).await?;
+            let roots = self.cancel_batch(workflow_ids).await?;
             collected.lock().expect("cancelled ids").extend(roots);
             if !cancel_children {
                 return Ok(());
@@ -2896,7 +2906,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // Terminates because `seen` only grows and a workflow enters a frontier at most once.
             while !frontier.is_empty() {
-                let level = self.cancel_batch(&frontier, now).await?;
+                let level = self.cancel_batch(&frontier).await?;
                 collected.lock().expect("cancelled ids").extend(level);
                 let children = self.direct_children(&frontier).await?;
                 frontier = children
@@ -2927,8 +2937,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         let workflow_table = &self.tables.workflow_status;
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
-        // Read once, outside the retry, so a second attempt writes the same `updated_at`.
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "resume_workflows", move || async move {
@@ -2958,13 +2966,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
                  recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
                  deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
-                 updated_at = $3 \
+                 updated_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
                  RETURNING workflow_uuid"
             )))
             .bind(workflow_ids)
             .bind(queue)
-            .bind(now)
             .fetch_all(pool)
             .await?;
             tracing::debug!(
@@ -4820,7 +4827,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         // queue-wide starts would leave a per-partition window counting nothing, and the limit it
         // measures unenforceable.
         let rate_limited = limits.rate_limit.is_some() || limits.partition_rate_limit.is_some();
-        // Fixed for the run, unlike the window it is subtracted from, which is read per attempt.
+        // The window's width, which the database subtracts from its own clock — see
+        // [`NOW_MS_SQL`]. Fixed for the run, since only the instant it is subtracted from moves.
+        //
         // Saturating: a period longer than `i64` milliseconds can hold opens the window before
         // the epoch, which counts every start there has ever been — the right answer for a limit
         // whose window never closes.
@@ -4833,9 +4842,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         let partition_rate_limit_period_ms = period_ms(limits.partition_rate_limit);
 
         with_retry(&self.retry, "start_queued_workflows", move || async move {
-            // Per attempt: a retry after a serialization failure is a fresh sweep, and it should
-            // measure its rate-limit window from now rather than replay a stale one.
-            let now = Timestamp::now();
             let mut tx = pool.begin().await?;
 
             // Read committed otherwise: with no shared budget nothing here reads a total, so a
@@ -4894,12 +4900,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "SELECT count(*) FROM {workflow_table} \
                      WHERE queue_name = $2 AND rate_limited = TRUE \
                        AND status NOT IN ('ENQUEUED', 'DELAYED') \
-                       AND started_at_epoch_ms > $3 \
+                       AND started_at_epoch_ms > {NOW_MS_SQL} - $3 \
                        AND {owner_predicate}"
                 )))
                 .bind(application_name)
                 .bind(&queue.name)
-                .bind(now.as_epoch_ms() - rate_limit_period_ms)
+                .bind(rate_limit_period_ms)
                 .fetch_one(&mut *tx)
                 .await?;
                 max_tasks = narrow(max_tasks, (i64::from(limit.limit) - recent_starts).max(0));
@@ -4909,14 +4915,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "SELECT count(*) FROM {workflow_table} \
                      WHERE queue_name = $3 AND rate_limited = TRUE \
                        AND status NOT IN ('ENQUEUED', 'DELAYED') \
-                       AND started_at_epoch_ms > $4 \
+                       AND started_at_epoch_ms > {NOW_MS_SQL} - $4 \
                        AND queue_partition_key = $2 \
                        AND {owner_predicate}"
                 )))
                 .bind(application_name)
                 .bind(key)
                 .bind(&queue.name)
-                .bind(now.as_epoch_ms() - partition_rate_limit_period_ms)
+                .bind(partition_rate_limit_period_ms)
                 .fetch_one(&mut *tx)
                 .await?;
                 max_tasks = narrow(
@@ -5065,22 +5071,21 @@ impl SystemDatabase for PostgresSystemDatabase {
                 let flipped: HashSet<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $2, application_version = $3, \
-                         started_at_epoch_ms = $4, rate_limited = $5, \
+                         started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = $4, \
                          application_name = COALESCE(application_name, $1), \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN $4 + workflow_timeout_ms \
+                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
                              ELSE workflow_deadline_epoch_ms \
                          END \
-                     WHERE workflow_uuid = ANY($6::text[]) AND status = 'ENQUEUED' \
+                     WHERE workflow_uuid = ANY($5::text[]) AND status = 'ENQUEUED' \
                        AND {owner_predicate} \
                      RETURNING workflow_uuid"
                 )))
                 .bind(application_name)
                 .bind(executor_id)
                 .bind(application_version)
-                .bind(now.as_epoch_ms())
                 .bind(rate_limited)
                 .bind(candidates.as_slice())
                 .fetch_all(&mut *tx)
@@ -5203,7 +5208,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "start_queued_partitioned_workflows",
             move || async move {
-                let now = Timestamp::now();
                 let mut tx = pool.begin().await?;
 
                 let is_latest = self
@@ -5327,12 +5331,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
-                         started_at_epoch_ms = $6, rate_limited = FALSE, \
+                         started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
                          application_name = COALESCE(application_name, $4), \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN $6 + workflow_timeout_ms \
+                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
                              ELSE workflow_deadline_epoch_ms \
                          END \
                      WHERE {claim_predicate} RETURNING workflow_uuid"
@@ -5342,7 +5346,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(application_version)
                 .bind(application_name)
                 .bind(executor_id)
-                .bind(now.as_epoch_ms())
                 .fetch_all(&mut *tx)
                 .await?;
 
@@ -5626,13 +5629,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                                      THEN debounce_deadline_epoch_ms \
                                      ELSE $4 \
                                  END, \
-                                 inputs = $5, serialization = $6, updated_at = $7, \
-                                 application_name = COALESCE(application_name, $8) \
+                                 inputs = $5, serialization = $6, \
+                                 updated_at = {NOW_MS_SQL}, \
+                                 application_name = COALESCE(application_name, $7) \
                              WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
-                               AND class_name IS NOT DISTINCT FROM $9 \
-                               AND config_name IS NOT DISTINCT FROM $10 \
+                               AND class_name IS NOT DISTINCT FROM $8 \
+                               AND config_name IS NOT DISTINCT FROM $9 \
                                AND status = 'DELAYED' AND is_debounced = TRUE \
-                               AND ($8::text IS NULL OR application_name = $8 \
+                               AND ($7::text IS NULL OR application_name = $7 \
                                     OR application_name IS NULL) \
                              RETURNING workflow_uuid"
                         )))
@@ -5642,7 +5646,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(request.delay_until.as_epoch_ms())
                         .bind(request.inputs)
                         .bind(request.serialization)
-                        .bind(Timestamp::now().as_epoch_ms())
                         .bind(application_name)
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL the
                         // enqueue stored rather than matching nothing, as `=` would.
