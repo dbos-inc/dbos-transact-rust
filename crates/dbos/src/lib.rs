@@ -78,4 +78,4 @@ pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use sysdb::types::Change;
 #[cfg(feature = "engine")]
-pub use workflow::{RunOptions, StartOptions, Timeout};
+pub use workflow::{Enqueue, RunOptions, StartOptions, Timeout};

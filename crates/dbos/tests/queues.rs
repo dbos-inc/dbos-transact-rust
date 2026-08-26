@@ -11,7 +11,7 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewQueue, OnExistingQueue, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Change, Config, DBOS, Error, QueueChange, QueueConflict, QueueOptions, RunOptions,
+    Change, Config, DBOS, Enqueue, Error, QueueChange, QueueConflict, QueueOptions, RunOptions,
     StartOptions, Timeout,
 };
 
@@ -330,7 +330,7 @@ async fn worker_concurrency_bounds_what_one_process_runs_at_once() {
                     (),
                     StartOptions {
                         workflow_id: Some(&format!("fanned-out-{n}")),
-                        queue: Some("demo-queue"),
+                        queue: Some(Enqueue::new("demo-queue")),
                         ..StartOptions::default()
                     },
                 )
@@ -379,7 +379,7 @@ async fn an_enqueued_workflow_is_dispatched_by_the_runner() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some("demo-queue"),
+                queue: Some(Enqueue::new("demo-queue")),
                 ..StartOptions::default()
             },
         )
@@ -429,7 +429,7 @@ async fn a_queue_registered_after_launch_is_dequeued_from() {
             (),
             StartOptions {
                 workflow_id: Some("enqueued-late"),
-                queue: Some("late-queue"),
+                queue: Some(Enqueue::new("late-queue")),
                 ..StartOptions::default()
             },
         )
@@ -465,7 +465,7 @@ async fn an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some("unpolled-queue"),
+                queue: Some(Enqueue::new("unpolled-queue")),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
             },
         )
@@ -530,7 +530,7 @@ async fn a_queue_this_process_never_registered_is_dequeued_from() {
             (),
             StartOptions {
                 workflow_id: Some("on-a-queue-nobody-here-registered"),
-                queue: Some("written-by-someone-else"),
+                queue: Some(Enqueue::new("written-by-someone-else")),
                 ..StartOptions::default()
             },
         )
@@ -568,7 +568,7 @@ async fn listen_queues_narrows_what_this_process_dequeues() {
             (),
             StartOptions {
                 workflow_id: Some("on-the-listened-queue"),
-                queue: Some("fast"),
+                queue: Some(Enqueue::new("fast")),
                 ..StartOptions::default()
             },
         )
@@ -579,7 +579,7 @@ async fn listen_queues_narrows_what_this_process_dequeues() {
             (),
             StartOptions {
                 workflow_id: Some("on-the-other-queue"),
-                queue: Some("slow"),
+                queue: Some(Enqueue::new("slow")),
                 ..StartOptions::default()
             },
         )
@@ -626,7 +626,7 @@ async fn listen_queues_never_excludes_the_internal_queue() {
             (),
             StartOptions {
                 workflow_id: Some("internal-under-a-filter"),
-                queue: Some(INTERNAL_QUEUE),
+                queue: Some(Enqueue::new(INTERNAL_QUEUE)),
                 ..StartOptions::default()
             },
         )
@@ -662,7 +662,7 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
             (),
             StartOptions {
                 workflow_id: Some("never-drained"),
-                queue: Some("ignored"),
+                queue: Some(Enqueue::new("ignored")),
                 ..StartOptions::default()
             },
         )
@@ -676,7 +676,7 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
             (),
             StartOptions {
                 workflow_id: Some("still-internal"),
-                queue: Some(INTERNAL_QUEUE),
+                queue: Some(Enqueue::new(INTERNAL_QUEUE)),
                 ..StartOptions::default()
             },
         )
@@ -745,7 +745,7 @@ async fn updating_a_queue_changes_what_a_running_worker_honours() {
                     (),
                     StartOptions {
                         workflow_id: Some(&format!("fanned-{n}")),
-                        queue: Some("demo-queue"),
+                        queue: Some(Enqueue::new("demo-queue")),
                         ..StartOptions::default()
                     },
                 )
@@ -944,7 +944,7 @@ async fn a_stored_row_cannot_redefine_the_internal_queue() {
             (),
             StartOptions {
                 workflow_id: Some("on-the-internal-queue"),
-                queue: Some(INTERNAL_QUEUE),
+                queue: Some(Enqueue::new(INTERNAL_QUEUE)),
                 ..StartOptions::default()
             },
         )
@@ -1004,7 +1004,7 @@ async fn another_applications_queue_is_not_dequeued_from() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some("belongs-to-a-peer"),
+                queue: Some(Enqueue::new("belongs-to-a-peer")),
                 ..StartOptions::default()
             },
         )
@@ -1059,7 +1059,7 @@ async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some("demo-queue"),
+                queue: Some(Enqueue::new("demo-queue")),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
             },
         )
@@ -1111,7 +1111,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
                     .start_with(
                         (),
                         StartOptions {
-                            queue: Some("unpolled-queue"),
+                            queue: Some(Enqueue::new("unpolled-queue")),
                             ..StartOptions::default()
                         },
                     )

@@ -263,11 +263,35 @@ pub struct StartOptions<'a> {
     /// queue claims it and runs it, under whatever limits the queue carries. The handle returned is
     /// a polling one, because the process that asked is usually not the process that runs it.
     ///
-    /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto
-    /// one, and a queue registered by a peer is as valid a destination as one registered here.
-    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is a legitimate destination too, and is
-    /// where `resume` and `fork` put work.
-    pub queue: Option<&'a str>,
+    /// An [`Enqueue`] rather than a name, so that what an enqueue may ask for has somewhere to
+    /// live that a workflow running here does not.
+    pub queue: Option<Enqueue<'a>>,
+}
+
+/// A queue to leave a workflow on.
+///
+/// **A type rather than the bare `&str` it wraps**, because a queue is about to be more than an
+/// address: a deduplication id, a priority, a partition key and a delay each mean nothing without
+/// a queue, and each is coming. Owning them from here is what will make them unstatable without
+/// one — Go checks all four at start and returns `InvalidOptionError` for each
+/// (`workflow.go:1178`–`1199`), which is four runtime errors describing states its type system
+/// allowed it to build.
+///
+/// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
+/// and a queue registered by a peer is as valid a destination as one registered here.
+/// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is a legitimate destination too, and is where
+/// `resume` and `fork` put work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enqueue<'a> {
+    /// The queue's name, which is its address.
+    pub name: &'a str,
+}
+
+impl<'a> Enqueue<'a> {
+    /// An enqueue onto `name` — what `queue: Some(name)` meant before this type existed.
+    pub fn new(name: &'a str) -> Self {
+        Self { name }
+    }
 }
 
 impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
@@ -502,6 +526,8 @@ where
         options: StartOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         let executor = self.dbos().executor("start a workflow")?;
+        // Borrowed rather than moved, because `options` is read again below.
+        let enqueue = options.queue.as_ref();
         // **The ambient context is what makes this a child.** Every reference overloads the same
         // call rather than adding a `start_child`, so factoring a workflow body out into its own
         // workflow does not change how its call sites are written — and a workflow started from
@@ -602,7 +628,7 @@ where
                     // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
                     // it: a queue's whole point is that the process which asks is not necessarily
                     // the one that runs.
-                    queue_name: options.queue,
+                    queue_name: enqueue.map(|enqueue| enqueue.name),
                     ..NewWorkflow::new(&workflow_id)
                 },
                 Some(MAX_RECOVERY_ATTEMPTS),
@@ -624,8 +650,12 @@ where
         // **Enqueued, so this process is not the one running it.** A polling handle is the honest
         // answer even when this executor turns out to dequeue it moments later: nothing local is
         // waiting on, and the row is the only thing that knows where the workflow got to.
-        if let Some(queue) = options.queue {
-            tracing::debug!(workflow_id, queue, "the workflow is enqueued");
+        if let Some(enqueue) = enqueue {
+            tracing::debug!(
+                workflow_id,
+                queue = enqueue.name,
+                "the workflow is enqueued"
+            );
             return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
 
