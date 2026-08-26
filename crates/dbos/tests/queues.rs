@@ -3,8 +3,8 @@
 //! Nothing here dequeues — the runner arrives with the next commit — so these assert the row and
 //! the handle, which is exactly what a workflow left on a queue *is* until someone polls for it.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
@@ -1158,6 +1158,399 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
         child_row.timeout.is_none(),
         "it inherited an instant, not a budget"
     );
+
+    dbos.shutdown().await;
+}
+
+/// **The four queue-only options are refused only where nesting could not rule them out.**
+///
+/// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
+/// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less
+/// value to hang them on. Go returns `InvalidOptionError` for each of those four
+/// (`workflow.go:1178`–`1199`). What is left is the pair no shape can express.
+#[tokio::test]
+async fn an_incoherent_enqueue_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-validation-app", &db));
+    let workflow = dbos
+        .register_workflow("checked", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    let cases = [
+        (
+            "a deduplication id beside a partition key",
+            Enqueue {
+                deduplication_id: Some("key"),
+                partition_key: Some("shard-1"),
+                ..Enqueue::new("demo-queue")
+            },
+            "`deduplication_id` and `partition_key` cannot both be set",
+        ),
+        (
+            "the unprioritised sentinel spelled as a priority",
+            Enqueue {
+                priority: Some(0),
+                ..Enqueue::new("demo-queue")
+            },
+            "`priority` must be at least 1",
+        ),
+        (
+            "a priority past what the column holds",
+            Enqueue {
+                priority: Some(i32::MAX as u32 + 1),
+                ..Enqueue::new("demo-queue")
+            },
+            "`priority` must be at most 2147483647",
+        ),
+    ];
+
+    for (what, enqueue, expected) in cases {
+        let error = match workflow
+            .start_with(
+                (),
+                StartOptions {
+                    queue: Some(enqueue),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("{what} was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains(expected)),
+            "{what}: expected a refusal mentioning {expected:?}, got {error:?}"
+        );
+    }
+
+    // Refused before anything is written: a bad enqueue costs a round trip, not a row.
+    assert!(
+        reader(&db)
+            .await
+            .list_workflows(&dbos::sysdb::types::WorkflowFilter {
+                queue_names: vec!["demo-queue"],
+                ..Default::default()
+            })
+            .await
+            .expect("list failed")
+            .is_empty(),
+        "a refused enqueue wrote a row anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A delay holds the workflow `DELAYED` until it expires, then the supervisor releases it.**
+///
+/// The status is not the caller's to choose — `NewWorkflow::initial_status` derives it from the
+/// queue-and-delay pair — so what is asserted is that the row starts `DELAYED`, that nothing runs
+/// it early, and that it still runs.
+#[tokio::test]
+async fn a_delayed_enqueue_waits_before_it_is_dequeued() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-delay-app", &db));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let workflow = dbos
+        .register_workflow("delayed", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(7)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("held-back"),
+                queue: Some(Enqueue {
+                    delay: Some(Duration::from_secs(3)),
+                    ..Enqueue::new("demo-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    assert_eq!(
+        handle.status().await.expect("status failed"),
+        WorkflowStatus::Delayed,
+        "a delayed enqueue must not be ENQUEUED yet"
+    );
+    // Comfortably inside the delay, and after several supervisor sweeps: the row is not eligible,
+    // so no worker may have taken it.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "the workflow ran before its delay expired"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(20), handle.result())
+        .await
+        .expect("the delayed workflow was never released")
+        .expect("the workflow failed");
+    assert_eq!(result, 7);
+
+    dbos.shutdown().await;
+}
+
+/// **A deduplication id is unique among a queue's *waiting* workflows, and freed when one ends.**
+///
+/// The key deduplicates a backlog rather than a history, which is the half worth asserting: the
+/// same key enqueued again after the first finished is a new workflow, not a duplicate.
+#[tokio::test]
+async fn a_deduplication_id_admits_one_waiting_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-dedup-app", &db));
+    let workflow = dbos
+        .register_workflow("deduped", |()| async move { Ok::<u32, Error>(3) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    // Delayed, so the first workflow is still holding the key when the second arrives rather than
+    // racing the runner to finish before it.
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    let held = Enqueue {
+        deduplication_id: Some("order-42"),
+        delay: Some(Duration::from_secs(3)),
+        ..Enqueue::new("demo-queue")
+    };
+    let first = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("dedup-first"),
+                queue: Some(held.clone()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the first enqueue failed");
+
+    let error = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("dedup-second"),
+                queue: Some(held),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect_err("a second workflow took a held deduplication key");
+    assert!(
+        format!("{error}").contains("order-42"),
+        "the refusal must name the key, got {error:?}"
+    );
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), first.result())
+            .await
+            .expect("the first workflow never ran")
+            .expect("the workflow failed"),
+        3
+    );
+
+    // Finishing released the key, so the same one is enqueueable again.
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("dedup-third"),
+                queue: Some(Enqueue {
+                    deduplication_id: Some("order-42"),
+                    ..Enqueue::new("demo-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the key was not released when the holder finished");
+
+    dbos.shutdown().await;
+}
+
+/// **Priority orders a queue's backlog, lower first, and the unprioritised sort ahead of all.**
+///
+/// One worker at a time, and every workflow enqueued before the runner can drain any of them, so
+/// what is measured is the order the dequeue chose rather than the order they were submitted.
+#[tokio::test]
+async fn priority_orders_the_backlog_lower_first() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-priority-app", &db));
+    let order: Arc<Mutex<Vec<String>>> = Arc::default();
+    let workflow = dbos
+        .register_workflow("ordered", {
+            let order = Arc::clone(&order);
+            move |name: String| {
+                let order = Arc::clone(&order);
+                async move {
+                    order.lock().unwrap().push(name.clone());
+                    Ok::<String, Error>(name)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions {
+            worker_concurrency: Some(1),
+            ..QueueOptions::default()
+        },
+    )
+    .await
+    .expect("registration failed");
+
+    // Held back as a group, so the whole backlog exists before anything is eligible — otherwise
+    // the first one enqueued is simply the first one available, whatever its priority.
+    let delay = Some(Duration::from_secs(3));
+    let submitted = [
+        ("low", Some(9)),
+        ("high", Some(1)),
+        ("none", None),
+        ("mid", Some(5)),
+    ];
+    let mut handles = Vec::new();
+    for (name, priority) in submitted {
+        handles.push(
+            workflow
+                .start_with(
+                    name.to_owned(),
+                    StartOptions {
+                        workflow_id: Some(name),
+                        queue: Some(Enqueue {
+                            priority,
+                            delay,
+                            ..Enqueue::new("demo-queue")
+                        }),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+                .expect("enqueue failed"),
+        );
+    }
+
+    for handle in handles {
+        tokio::time::timeout(Duration::from_secs(30), handle.result())
+            .await
+            .expect("a prioritised workflow never ran")
+            .expect("the workflow failed");
+    }
+
+    assert_eq!(
+        order.lock().unwrap().as_slice(),
+        ["none", "high", "mid", "low"],
+        "the backlog did not run in priority order"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A partition key is recorded even on a queue that is not partitioned.**
+///
+/// The column is the workflow's, not the queue's, so it is written wherever the caller names one —
+/// which matters because partitioning can be turned on later, and because a peer implementation
+/// may own the queue. Nothing dequeues by it here: an unpartitioned queue's dequeue names no
+/// partition, so this asserts the row rather than a run.
+#[tokio::test]
+async fn a_partition_key_is_recorded_on_the_row() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-partition-app", &db));
+    let workflow = dbos
+        .register_workflow("partitioned", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("sharded"),
+                queue: Some(Enqueue {
+                    partition_key: Some("tenant-7"),
+                    priority: Some(4),
+                    ..Enqueue::new("demo-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let row = reader(&db)
+        .await
+        .get_workflow("sharded")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.queue_name.as_deref(), Some("demo-queue"));
+    assert_eq!(row.queue_partition_key.as_deref(), Some("tenant-7"));
+    assert_eq!(row.priority, 4);
+
+    dbos.shutdown().await;
+}
+
+/// A workflow that names no priority stores the sentinel, which is what makes `None` mean
+/// "unprioritised" rather than "priority zero" — and what an unqueued workflow stores too.
+#[tokio::test]
+async fn an_unprioritised_workflow_stores_the_sentinel() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-sentinel-app", &db));
+    let workflow = dbos
+        .register_workflow("plain", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("no-priority"),
+                queue: Some(Enqueue {
+                    delay: Some(Duration::from_secs(30)),
+                    ..Enqueue::new("demo-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let row = reader(&db)
+        .await
+        .get_workflow("no-priority")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.priority, 0);
+    assert_eq!(row.deduplication_id, None);
+    assert_eq!(row.queue_partition_key, None);
 
     dbos.shutdown().await;
 }
