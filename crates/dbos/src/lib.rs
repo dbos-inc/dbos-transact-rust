@@ -42,6 +42,8 @@ mod handle;
 #[cfg(feature = "engine")]
 mod identity;
 #[cfg(feature = "engine")]
+mod management;
+#[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
@@ -75,6 +77,8 @@ pub use event::{get_event, set_event};
 pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
 pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, EXECUTOR_ID_ENV};
+#[cfg(feature = "engine")]
+pub use management::{ForkFrom, ForkOptions};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
