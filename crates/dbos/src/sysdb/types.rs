@@ -1399,6 +1399,13 @@ pub struct QueueUpdate {
     pub priority_enabled: Change<bool>,
     /// See [`QueueRecord::partition_queue`].
     pub partition_queue: Change<bool>,
+    /// See [`QueueRecord::partition_concurrency`].
+    pub partition_concurrency: Change<Option<i32>>,
+    /// See [`QueueRecord::partition_worker_concurrency`].
+    pub partition_worker_concurrency: Change<Option<i32>>,
+    /// See [`QueueRecord::partition_rate_limit`]. One field for both columns, so an update cannot
+    /// leave half a limit behind.
+    pub partition_rate_limit: Change<Option<RateLimit>>,
     /// See [`QueueRecord::polling_interval`].
     pub polling_interval: Change<Duration>,
 }
@@ -1422,6 +1429,18 @@ impl QueueUpdate {
                 .set()
                 .unwrap_or(record.priority_enabled),
             partition_queue: self.partition_queue.set().unwrap_or(record.partition_queue),
+            partition_concurrency: self
+                .partition_concurrency
+                .set()
+                .unwrap_or(record.partition_concurrency),
+            partition_worker_concurrency: self
+                .partition_worker_concurrency
+                .set()
+                .unwrap_or(record.partition_worker_concurrency),
+            partition_rate_limit: self
+                .partition_rate_limit
+                .set()
+                .unwrap_or(record.partition_rate_limit),
             polling_interval: self
                 .polling_interval
                 .set()
@@ -1438,6 +1457,9 @@ impl QueueUpdate {
             && self.rate_limit.is_leave()
             && self.priority_enabled.is_leave()
             && self.partition_queue.is_leave()
+            && self.partition_concurrency.is_leave()
+            && self.partition_worker_concurrency.is_leave()
+            && self.partition_rate_limit.is_leave()
             && self.polling_interval.is_leave()
     }
 }
@@ -1596,11 +1618,39 @@ pub struct QueueRecord {
     /// Whether dequeue order honours a workflow's priority.
     pub priority_enabled: bool,
     /// Whether the queue is partitioned, so a dequeue names the partition it wants.
+    ///
+    /// Stored rather than derived, because it is how the implementations that predate the
+    /// per-partition limits say the same thing: under the deprecated flag every queue-wide limit
+    /// applies per partition instead. A row with any partition limit set is partitioned whatever
+    /// this column says.
     pub partition_queue: bool,
+    /// Workflows one partition may have running at once, across all executors.
+    ///
+    /// Setting any of the three partition limits is what partitions a queue. Each applies within
+    /// one partition rather than to the queue as a whole, so they sit beside the queue-wide
+    /// limits rather than replacing them: both are enforced, and neither is allowed to exceed
+    /// its queue-wide counterpart.
+    pub partition_concurrency: Option<i32>,
+    /// Workflows one executor may have running at once within one partition.
+    pub partition_worker_concurrency: Option<i32>,
+    /// How fast workflows may start within one partition, or `None` for unthrottled.
+    pub partition_rate_limit: Option<RateLimit>,
     /// How often an idle executor asks this queue for work.
     pub polling_interval: Duration,
     /// The application that owns the queue, or `None` if it is unclaimed.
     pub application_name: Option<String>,
+}
+
+impl QueueRecord {
+    /// Whether any per-partition limit is set, which is what partitions a queue.
+    ///
+    /// The [`partition_queue`](Self::partition_queue) column can say so too, and for a row written
+    /// by an implementation that predates these limits it is the only thing that does.
+    pub fn has_partition_limits(&self) -> bool {
+        self.partition_concurrency.is_some()
+            || self.partition_worker_concurrency.is_some()
+            || self.partition_rate_limit.is_some()
+    }
 }
 
 /// A queue to register, as the caller supplies it.
@@ -1621,6 +1671,12 @@ pub struct NewQueue<'a> {
     pub priority_enabled: bool,
     /// See [`QueueRecord::partition_queue`].
     pub partition_queue: bool,
+    /// See [`QueueRecord::partition_concurrency`].
+    pub partition_concurrency: Option<i32>,
+    /// See [`QueueRecord::partition_worker_concurrency`].
+    pub partition_worker_concurrency: Option<i32>,
+    /// See [`QueueRecord::partition_rate_limit`].
+    pub partition_rate_limit: Option<RateLimit>,
     /// See [`QueueRecord::polling_interval`].
     pub polling_interval: Duration,
     /// The application to register the queue for; `None` means the writing handle's own.
@@ -1637,6 +1693,9 @@ impl<'a> NewQueue<'a> {
             rate_limit: None,
             priority_enabled: false,
             partition_queue: false,
+            partition_concurrency: None,
+            partition_worker_concurrency: None,
+            partition_rate_limit: None,
             polling_interval: Duration::from_secs(1),
             application_name: None,
         }

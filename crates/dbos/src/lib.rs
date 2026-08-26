@@ -76,6 +76,6 @@ pub use sleep::sleep;
 #[cfg(feature = "engine")]
 pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
-pub use sysdb::types::Change;
+pub use sysdb::types::{Change, RateLimit};
 #[cfg(feature = "engine")]
 pub use workflow::{Enqueue, RunOptions, StartOptions, Timeout};

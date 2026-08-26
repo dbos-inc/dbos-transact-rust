@@ -361,6 +361,7 @@ sources![
         "107_application_versions_unclaimed_key.sql",
         Applies::Always
     ),
+    (108, "108_add_queue_partition_limits.sql", Applies::Always),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -410,7 +411,7 @@ pub const LOCAL_MIGRATIONS: u32 = 47;
 pub const SHARED_MIGRATION_BASE: u32 = 100;
 
 /// The highest migration defined here, and the version a fully migrated database records.
-pub const SHARED_MIGRATIONS: u32 = 107;
+pub const SHARED_MIGRATIONS: u32 = 108;
 
 /// Which SQL dialect the system database speaks.
 ///
@@ -622,13 +623,16 @@ mod tests {
             }
         }
 
-        // And the shared series is not padding: each of its migrations carries SQL, and every
-        // one of them so far is about the column the series was opened to add.
+        // And the shared series is not padding: every one of its migrations carries DDL.
+        //
+        // 100 to 107 are all about `application_name`, the column the series was opened to add;
+        // 108 is the first that is not, so the assertion is what the padding check needs — that
+        // the shared numbers do work — rather than what they happen to work on.
         for version in SHARED_MIGRATION_BASE..=SHARED_MIGRATIONS {
             let m = &migrations[version as usize - 1];
             assert_eq!(m.version, version);
             assert!(
-                m.sql.contains("application_name"),
+                m.sql.contains("ALTER TABLE") || m.sql.contains("CREATE"),
                 "migration {version} should carry the shared series' work",
             );
         }
@@ -636,9 +640,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 61 files: 60 the runner applies, plus the migration-10 probe, which is bound
+        // 62 files: 61 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 60);
+        assert_eq!(SOURCES.len(), 61);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -714,7 +718,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 59, "expected 59 files to carry a numbered header");
+        assert_eq!(checked, 60, "expected 60 files to carry a numbered header");
     }
 
     #[test]

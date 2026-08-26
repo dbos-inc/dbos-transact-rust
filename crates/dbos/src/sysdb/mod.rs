@@ -924,13 +924,15 @@ pub trait SystemDatabase: Send + Sync {
     /// `UpdateQueueConfig` takes; Python and TypeScript read and write separately, and two
     /// operators changing different limits at once can leave a pair neither asked for.
     ///
-    /// **The transaction does not leave this layer.** `validate` is handed the merged record and
-    /// says yes or no; it does no I/O of its own and never sees a connection. It must also be free
+    /// **The transaction does not leave this layer.** `validate` is handed the row as stored and
+    /// the row as the update would leave it, and says yes or no; it does no I/O of its own and
+    /// never sees a connection. Both, because some rules are about the transition rather than the
+    /// destination — whether a limit may be set at all can depend on what the row already is. It must also be free
     /// of side effects, because a retried attempt calls it again against the row that attempt
     /// read. Callers with nothing to check pass a closure that always succeeds.
     ///
-    /// `validate` sees [`QueueUpdate::apply_to`]'s result rather than the update, because a limit
-    /// is rarely wrong on its own and usually wrong only beside another already stored. It refuses
+    /// The second argument is [`QueueUpdate::apply_to`]'s result rather than the update, because a
+    /// limit is rarely wrong on its own and usually wrong only beside another already stored. It refuses
     /// by returning an error, and [`Error::InvalidInput`] is the variant for that — the caller is
     /// expected to recognise its own refusal coming back.
     ///
@@ -952,7 +954,9 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         name: &str,
         update: &QueueUpdate,
-        validate: &(dyn for<'r> Fn(&'r QueueRecord) -> Result<(), Error> + Send + Sync),
+        validate: &(
+             dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
+         ),
     ) -> Result<QueueRecord, Error>;
 
     /// Extends a debounced workflow's delay and replaces its inputs, or reports who holds the key.

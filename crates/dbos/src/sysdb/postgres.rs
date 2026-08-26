@@ -1018,8 +1018,9 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
-     rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, \
-     application_name";
+     rate_limit_period_sec, priority_enabled, partition_queue, partition_concurrency, \
+     partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec, \
+     polling_interval_sec, application_name";
 
 /// Every column of a schedule row, in the order [`schedule_from_row`] reads them.
 const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
@@ -1077,41 +1078,51 @@ fn schedule_from_row(row: &sqlx::postgres::PgRow) -> Result<ScheduleRecord, Erro
 }
 
 fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
-    // The two periods are `DOUBLE PRECISION` seconds, not the integer milliseconds used
-    // elsewhere. A stored value that is negative, infinite or NaN is not a duration any caller
-    // can act on, so it is reported rather than clamped.
+    // The periods are `DOUBLE PRECISION` seconds, not the integer milliseconds used elsewhere. A
+    // stored value that is negative, infinite or NaN is not a duration any caller can act on, so
+    // it is reported rather than clamped.
     let period = |column: &str, value: Option<f64>| match value {
         None => Ok(None),
         Some(secs) => duration_from_secs(secs)
             .map(Some)
             .ok_or_else(|| Error::Malformed(format!("{column} is not a duration: {secs}"))),
     };
+    // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and no
+    // SDK can write it — all four reject an unpaired limit at their public surface. Read as *no
+    // limit* rather than reported, matching TypeScript (`wfqueue.ts:118`), so a hand-edited row
+    // does not make a peer and this implementation disagree about what the same queue is.
+    //
+    // One reader for both pairs, so the queue-wide limit and the per-partition one cannot come to
+    // disagree about what half a limit means.
+    //
+    // TODO(dbos-team): UPSTREAM item 4. Reading it away means a queue whose limit was half
+    // written runs unthrottled and says nothing, which is a silent safety failure rather
+    // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
+    // NULL))` in a future shared migration would make the question moot for everyone.
+    let rate_limit = |max_column: &str, period_column: &str| -> Result<Option<RateLimit>, Error> {
+        Ok(
+            match (
+                row.try_get::<Option<i32>, _>(max_column)?,
+                period(period_column, row.try_get(period_column)?)?,
+            ) {
+                (Some(limit), Some(period)) => Some(RateLimit { limit, period }),
+                _ => None,
+            },
+        )
+    };
     Ok(QueueRecord {
         name: row.try_get("name")?,
         concurrency: row.try_get("concurrency")?,
         worker_concurrency: row.try_get("worker_concurrency")?,
-        // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist,
-        // and no SDK can write it — all four reject an unpaired limit at their public surface.
-        // Read as *no limit* rather than reported, matching TypeScript
-        // (`wfqueue.ts:118`), so a hand-edited row does not make a peer and this
-        // implementation disagree about what the same queue is.
-        //
-        // TODO(dbos-team): UPSTREAM item 4. Reading it away means a queue whose limit was half
-        // written runs unthrottled and says nothing, which is a silent safety failure rather
-        // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
-        // NULL))` in a future shared migration would make the question moot for everyone.
-        rate_limit: match (
-            row.try_get::<Option<i32>, _>("rate_limit_max")?,
-            period(
-                "rate_limit_period_sec",
-                row.try_get("rate_limit_period_sec")?,
-            )?,
-        ) {
-            (Some(limit), Some(period)) => Some(RateLimit { limit, period }),
-            _ => None,
-        },
+        rate_limit: rate_limit("rate_limit_max", "rate_limit_period_sec")?,
         priority_enabled: row.try_get("priority_enabled")?,
         partition_queue: row.try_get("partition_queue")?,
+        partition_concurrency: row.try_get("partition_concurrency")?,
+        partition_worker_concurrency: row.try_get("partition_worker_concurrency")?,
+        partition_rate_limit: rate_limit(
+            "partition_rate_limit_max",
+            "partition_rate_limit_period_sec",
+        )?,
         polling_interval: period("polling_interval_sec", row.try_get("polling_interval_sec")?)?
             .ok_or_else(|| Error::Malformed("polling_interval_sec is null".to_owned()))?,
         application_name: row.try_get("application_name")?,
@@ -4663,6 +4674,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                    rate_limit_period_sec = EXCLUDED.rate_limit_period_sec, \
                    priority_enabled = EXCLUDED.priority_enabled, \
                    partition_queue = EXCLUDED.partition_queue, \
+                   partition_concurrency = EXCLUDED.partition_concurrency, \
+                   partition_worker_concurrency = EXCLUDED.partition_worker_concurrency, \
+                   partition_rate_limit_max = EXCLUDED.partition_rate_limit_max, \
+                   partition_rate_limit_period_sec = EXCLUDED.partition_rate_limit_period_sec, \
                    polling_interval_sec = EXCLUDED.polling_interval_sec, \
                    updated_at = EXCLUDED.updated_at, \
                    application_name = COALESCE({queues_table}.application_name, EXCLUDED.application_name)"
@@ -4698,9 +4713,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {queues_table} \
                  (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, \
-                  priority_enabled, partition_queue, polling_interval_sec, updated_at, \
+                  priority_enabled, partition_queue, partition_concurrency, \
+                  partition_worker_concurrency, partition_rate_limit_max, \
+                  partition_rate_limit_period_sec, polling_interval_sec, updated_at, \
                   application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) {on_conflict}"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 {on_conflict}"
             )))
             .bind(queue.name)
             .bind(queue.concurrency)
@@ -4709,6 +4727,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
             .bind(queue.priority_enabled)
             .bind(queue.partition_queue)
+            .bind(queue.partition_concurrency)
+            .bind(queue.partition_worker_concurrency)
+            .bind(queue.partition_rate_limit.map(|r| r.limit))
+            .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
             .bind(queue.polling_interval.as_secs_f64())
             .bind(Timestamp::now().as_epoch_ms())
             .bind(owner.as_deref())
@@ -5305,7 +5327,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         name: &str,
         update: &QueueUpdate,
-        validate: &(dyn for<'r> Fn(&'r QueueRecord) -> Result<(), Error> + Send + Sync),
+        validate: &(
+             dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
+         ),
     ) -> Result<QueueRecord, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
@@ -5341,7 +5365,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // The caller's verdict on the row as it would be, delivered while this transaction
             // still holds it. Rolling back is what makes a refusal mean something: nothing was
             // written, and nothing else moved the row while it was being judged.
-            validate(&update.apply_to(&stored))?;
+            let merged = update.apply_to(&stored);
+            validate(&stored, &merged)?;
 
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE ");
             q.push(queues_table).push(" SET ");
@@ -5358,7 +5383,34 @@ impl SystemDatabase for PostgresSystemDatabase {
             assign!(update.concurrency.set(), "concurrency");
             assign!(update.worker_concurrency.set(), "worker_concurrency");
             assign!(update.priority_enabled.set(), "priority_enabled");
-            assign!(update.partition_queue.set(), "partition_queue");
+            // **The flag and the limits are two spellings of one fact**, so the column is never
+            // written disagreeing with them. Three cases, and exactly one of them assigns:
+            //
+            // - the update names the flag, and is taken at its word — which is the only way a row
+            //   in the deprecated shape gets written at all;
+            // - it names no flag but moves a per-partition limit, so the flag is rewritten to
+            //   match what the row will hold;
+            // - it touches neither, and the column is left alone — a row a peer wrote with the
+            //   deprecated flag and no limits keeps what it says.
+            match update.partition_queue.set() {
+                Some(flag) => {
+                    set.push("partition_queue = ");
+                    set.push_bind_unseparated(flag);
+                }
+                None if !(update.partition_concurrency.is_leave()
+                    && update.partition_worker_concurrency.is_leave()
+                    && update.partition_rate_limit.is_leave()) =>
+                {
+                    set.push("partition_queue = ");
+                    set.push_bind_unseparated(merged.has_partition_limits());
+                }
+                None => {}
+            }
+            assign!(update.partition_concurrency.set(), "partition_concurrency");
+            assign!(
+                update.partition_worker_concurrency.set(),
+                "partition_worker_concurrency"
+            );
             assign!(
                 update.polling_interval.set().map(|d| d.as_secs_f64()),
                 "polling_interval_sec"
@@ -5369,6 +5421,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 set.push("rate_limit_max = ");
                 set.push_bind_unseparated(limit.map(|l| l.limit));
                 set.push("rate_limit_period_sec = ");
+                set.push_bind_unseparated(limit.map(|l| l.period.as_secs_f64()));
+            }
+            if let Some(limit) = update.partition_rate_limit.set() {
+                set.push("partition_rate_limit_max = ");
+                set.push_bind_unseparated(limit.map(|l| l.limit));
+                set.push("partition_rate_limit_period_sec = ");
                 set.push_bind_unseparated(limit.map(|l| l.period.as_secs_f64()));
             }
             set.push("updated_at = ");

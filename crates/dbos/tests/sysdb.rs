@@ -8160,7 +8160,7 @@ async fn an_update_changes_only_what_it_names() {
             worker_concurrency: Change::Set(None),
             ..QueueUpdate::default()
         },
-        &|_| Ok(()),
+        &|_, _| Ok(()),
     )
     .await
     .unwrap();
@@ -8205,7 +8205,7 @@ async fn an_update_moves_a_rate_limit_whole() {
             })),
             ..QueueUpdate::default()
         },
-        &|_| Ok(()),
+        &|_, _| Ok(()),
     )
     .await
     .unwrap();
@@ -8224,7 +8224,7 @@ async fn an_update_moves_a_rate_limit_whole() {
             rate_limit: Change::Set(None),
             ..QueueUpdate::default()
         },
-        &|_| Ok(()),
+        &|_, _| Ok(()),
     )
     .await
     .unwrap();
@@ -8259,7 +8259,7 @@ async fn an_empty_update_is_a_no_op() {
             .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    sys.update_queue("orders", &QueueUpdate::default(), &|_| Ok(()))
+    sys.update_queue("orders", &QueueUpdate::default(), &|_, _| Ok(()))
         .await
         .unwrap();
 
@@ -8299,7 +8299,7 @@ async fn a_refused_update_writes_nothing() {
                 concurrency: Change::Set(Some(4)),
                 ..QueueUpdate::default()
             },
-            &|merged| {
+            &|_, merged| {
                 // The row as it would be, not the row as it is — which is the whole reason the
                 // caller is handed something rather than asked to look the queue up itself.
                 assert_eq!(
@@ -8346,7 +8346,7 @@ async fn updating_a_queue_that_is_not_registered_is_refused() {
                 concurrency: Change::Set(Some(4)),
                 ..QueueUpdate::default()
             },
-            &|_| Ok(()),
+            &|_, _| Ok(()),
         )
         .await
         .unwrap_err();

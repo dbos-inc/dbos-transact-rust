@@ -11,8 +11,8 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewQueue, OnExistingQueue, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Change, Config, DBOS, Enqueue, Error, QueueChange, QueueConflict, QueueOptions, RunOptions,
-    StartOptions, Timeout,
+    Change, Config, DBOS, Enqueue, Error, QueueChange, QueueConflict, QueueOptions, RateLimit,
+    RunOptions, StartOptions, Timeout,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -1551,6 +1551,291 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
     assert_eq!(row.priority, 0);
     assert_eq!(row.deduplication_id, None);
     assert_eq!(row.queue_partition_key, None);
+
+    dbos.shutdown().await;
+}
+/// A rate limit and priority ordering are stored, reported, and changeable at runtime.
+///
+/// The dequeue already honoured both — `start_queued_workflows` counts a window's starts and
+/// orders by priority — so what was missing was only the way to ask for them.
+#[tokio::test]
+async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-limits-app", &db));
+    dbos.launch().await.expect("launch failed");
+
+    let limit = RateLimit {
+        limit: 5,
+        period: Duration::from_secs(30),
+    };
+    let queue = dbos
+        .register_queue(
+            "limited-queue",
+            QueueOptions {
+                rate_limit: Some(limit),
+                priority_enabled: true,
+                ..QueueOptions::default()
+            },
+        )
+        .await
+        .expect("registration failed");
+    assert_eq!(queue.rate_limit(), Some(limit));
+    assert!(queue.priority_enabled());
+    assert!(!queue.is_partitioned());
+
+    // Changed at runtime, like every other limit: cleared, and priority turned back off.
+    let updated = dbos
+        .update_queue(
+            "limited-queue",
+            QueueChange {
+                rate_limit: Change::Set(None),
+                priority_enabled: Change::Set(false),
+                ..QueueChange::default()
+            },
+        )
+        .await
+        .expect("update failed");
+    assert_eq!(updated.rate_limit(), None);
+    assert!(!updated.priority_enabled());
+
+    dbos.shutdown().await;
+}
+
+/// A queue configuration no dequeue could honour is refused at registration.
+///
+/// The partitioned cases are the ones worth catching here rather than at poll time: the sweep
+/// answers `InvalidInput` for each, and a worker polling once a second would turn that into an
+/// error per tick for as long as the row existed.
+#[tokio::test]
+async fn an_unhonourable_queue_configuration_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-limit-validation-app", &db));
+    dbos.launch().await.expect("launch failed");
+
+    let cases = [
+        (
+            "a rate limit admitting nothing",
+            QueueOptions {
+                rate_limit: Some(RateLimit {
+                    limit: 0,
+                    period: Duration::from_secs(1),
+                }),
+                ..QueueOptions::default()
+            },
+            "`rate_limit.limit` must be at least 1",
+        ),
+        (
+            "a rate limit over no window",
+            QueueOptions {
+                rate_limit: Some(RateLimit {
+                    limit: 1,
+                    period: Duration::ZERO,
+                }),
+                ..QueueOptions::default()
+            },
+            "`rate_limit.period` cannot be zero",
+        ),
+        (
+            "no workflows at all per partition",
+            QueueOptions {
+                partition_concurrency: Some(0),
+                ..QueueOptions::default()
+            },
+            "`partition_concurrency` must be at least 1",
+        ),
+        (
+            "a per-partition rate limit over no window",
+            QueueOptions {
+                partition_rate_limit: Some(RateLimit {
+                    limit: 1,
+                    period: Duration::ZERO,
+                }),
+                ..QueueOptions::default()
+            },
+            "`partition_rate_limit.period` cannot be zero",
+        ),
+        (
+            "a partition allowed more than the whole queue",
+            QueueOptions {
+                concurrency: Some(2),
+                partition_concurrency: Some(4),
+                ..QueueOptions::default()
+            },
+            "`concurrency` must be greater than or equal to `partition_concurrency`",
+        ),
+        (
+            "a partition's worker limit above the partition's own",
+            QueueOptions {
+                partition_concurrency: Some(2),
+                partition_worker_concurrency: Some(4),
+                ..QueueOptions::default()
+            },
+            "`partition_concurrency` must be greater than or equal to \
+             `partition_worker_concurrency`",
+        ),
+        (
+            "a partition's worker limit above this process's own",
+            QueueOptions {
+                worker_concurrency: Some(2),
+                partition_worker_concurrency: Some(4),
+                ..QueueOptions::default()
+            },
+            "`worker_concurrency` must be greater than or equal to \
+             `partition_worker_concurrency`",
+        ),
+    ];
+
+    for (what, options, expected) in cases {
+        let error = match dbos.register_queue("checked-queue", options).await {
+            Ok(_) => panic!("{what} was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains(expected)),
+            "{what}: expected a refusal mentioning {expected:?}, got {error:?}"
+        );
+    }
+
+    assert!(
+        reader(&db)
+            .await
+            .get_queue("checked-queue")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "a refused registration wrote a row anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// Per-partition limits sit beside the queue-wide ones, and partitioning is derived from them.
+///
+/// There is no `partition_queue` switch on this surface: setting a partition limit is the
+/// statement that partitions exist, and the stored flag — which is what an implementation still
+/// reading it sees — follows the limits in both directions.
+#[tokio::test]
+async fn per_partition_limits_partition_a_queue() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-partition-limits-app", &db));
+    dbos.launch().await.expect("launch failed");
+
+    let queue = dbos
+        .register_queue(
+            "sharded",
+            QueueOptions {
+                concurrency: Some(60),
+                worker_concurrency: Some(10),
+                partition_concurrency: Some(4),
+                partition_worker_concurrency: Some(2),
+                ..QueueOptions::default()
+            },
+        )
+        .await
+        .expect("registration failed");
+    assert!(queue.is_partitioned(), "a partition limit partitions it");
+    assert_eq!(queue.concurrency(), Some(60), "both scopes are kept");
+    assert_eq!(queue.partition_concurrency(), Some(4));
+    assert_eq!(queue.partition_worker_concurrency(), Some(2));
+
+    let stored = reader(&db)
+        .await
+        .get_queue("sharded")
+        .await
+        .expect("read failed")
+        .expect("no row");
+    assert!(
+        stored.partition_queue,
+        "the derived flag is written for implementations that still read it"
+    );
+
+    // Clearing the last partition limit un-partitions the queue, flag included.
+    let updated = dbos
+        .update_queue(
+            "sharded",
+            QueueChange {
+                partition_concurrency: Change::Set(None),
+                partition_worker_concurrency: Change::Set(None),
+                ..QueueChange::default()
+            },
+        )
+        .await
+        .expect("update failed");
+    assert!(!updated.is_partitioned());
+    assert_eq!(
+        updated.concurrency(),
+        Some(60),
+        "the queue-wide limits are untouched"
+    );
+    let stored = reader(&db)
+        .await
+        .get_queue("sharded")
+        .await
+        .expect("read failed")
+        .expect("no row");
+    assert!(
+        !stored.partition_queue,
+        "the flag follows the limits back off"
+    );
+}
+
+/// A row a peer wrote with the deprecated flag is read as the per-partition limits it means.
+///
+/// Under `partition_queue` every queue-wide limit applies per partition, so that is where they are
+/// reported — matching Python's `_resolve_limits` and TypeScript's `resolveQueueLimits`. Go and
+/// Java still write rows in this shape.
+#[tokio::test]
+async fn a_legacy_partitioned_row_is_read_as_per_partition_limits() {
+    let db = test_database().await;
+    let sys = reader(&db).await;
+    sys.upsert_queue(
+        &NewQueue {
+            concurrency: Some(1),
+            worker_concurrency: Some(1),
+            partition_queue: true,
+            ..NewQueue::new("legacy")
+        },
+        OnExistingQueue::Update,
+    )
+    .await
+    .expect("write failed");
+
+    let dbos = DBOS::new(config("queue-legacy-app", &db));
+    dbos.launch().await.expect("launch failed");
+    let queue = dbos
+        .queue("legacy")
+        .await
+        .expect("read failed")
+        .expect("no queue");
+
+    assert!(queue.is_partitioned());
+    assert_eq!(
+        queue.partition_concurrency(),
+        Some(1),
+        "the flag re-scopes the queue-wide limit rather than adding to it"
+    );
+    assert_eq!(queue.partition_worker_concurrency(), Some(1));
+    assert_eq!(
+        queue.concurrency(),
+        None,
+        "nothing is enforced queue-wide on a legacy row"
+    );
+
+    // Adding a per-partition limit to such a row is refused rather than leaving two answers in it.
+    let error = dbos
+        .update_queue(
+            "legacy",
+            QueueChange {
+                partition_concurrency: Change::Set(Some(4)),
+                ..QueueChange::default()
+            },
+        )
+        .await
+        .expect_err("the update was accepted");
+    assert!(
+        matches!(&error, Error::Config(message) if message.contains("deprecated `partition_queue`")),
+        "got {error:?}"
+    );
 
     dbos.shutdown().await;
 }
