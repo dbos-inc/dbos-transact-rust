@@ -69,13 +69,14 @@ impl Queue {
     /// **Reports the limits resolved, not as the row spells them.** For a queue this crate
     /// registered the two are the same. For one a peer wrote with the deprecated `partition_queue`
     /// flag they are not: that flag means every queue-wide limit applies per partition, so
-    /// [`resolve_limits`] moves them into the partition fields and the receipt says what the queue
+    /// [`QueueRecord::resolved_limits`] moves them into the partition fields and the receipt says
+    /// what the queue
     /// actually does rather than which columns happen to hold it.
     fn from_record(record: QueueRecord) -> Self {
         let name = record.name.clone();
         let polling_interval = record.polling_interval;
         let priority_enabled = record.priority_enabled;
-        let limits = resolve_limits(&record);
+        let limits = record.resolved_limits();
         Self {
             name,
             concurrency: limits.concurrency,
@@ -147,6 +148,39 @@ impl Queue {
 /// Every field defaults to "no limit", which is what every implementation's bare registration
 /// means. A queue with no limits still does something worth having: it is a place work can be left
 /// for a fleet to pick up, rather than run by whoever asked.
+///
+/// # The four concurrency limits
+///
+/// They are one idea crossed two ways — over **scope**, the whole queue or one partition key, and
+/// over **reach**, the whole fleet or this process alone:
+///
+/// |                       | whole queue                       | one partition                               |
+/// |-----------------------|-----------------------------------|---------------------------------------------|
+/// | **every executor**    | [`concurrency`][g]         | [`partition_concurrency`][p]                |
+/// | **this process only** | [`worker_concurrency`][w]         | [`partition_worker_concurrency`][pw]        |
+///
+/// [g]: Self::concurrency
+/// [p]: Self::partition_concurrency
+/// [w]: Self::worker_concurrency
+/// [pw]: Self::partition_worker_concurrency
+///
+/// **`worker_` is the whole of what says "this process"**, and its absence says every executor.
+/// The fleet-wide pair is counted in the database against `PENDING` rows, which is what makes a
+/// queue carrying either run its claim at `REPEATABLE READ`; the per-process pair is answered from
+/// a local tally without a round trip, which is why it is the cheap limit.
+///
+/// **Every limit set is enforced, and the tightest wins.** They are not alternatives: a queue can
+/// say "sixty at a time overall, four per customer, and no more than two of those in any one
+/// process" by setting three of the four. A limit narrower in scope may not exceed the one that
+/// contains it — a per-partition allowance above the queue-wide one could never bind — and that is
+/// refused at registration rather than stored.
+///
+/// The rate limits pair the same way: [`rate_limit`](Self::rate_limit) governs the queue,
+/// [`partition_rate_limit`](Self::partition_rate_limit) governs one key, and both are counted in
+/// the database over a trailing window.
+///
+/// Setting any per-partition limit is what **partitions** the queue; there is no separate switch.
+/// See [`partition_concurrency`](Self::partition_concurrency).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueOptions {
     /// How many of this queue's workflows may run at once across every executor.
@@ -202,14 +236,13 @@ pub struct QueueOptions {
     /// [`Enqueue::partition_key`](crate::Enqueue::partition_key); work sharing a key contends for
     /// these limits, work under different keys does not.
     ///
-    /// **Beside the queue-wide limits rather than instead of them.** Both are enforced, so a queue
-    /// can say "sixty at a time overall, four per customer" in one registration. A partition limit
-    /// above its queue-wide counterpart is refused, because the queue-wide one would be the only
-    /// one that ever bound.
-    ///
     /// `partition_concurrency: Some(1)` is the one-workflow-per-key ordering that the deprecated
     /// `partition_queue` flag meant in the other implementations — see [`QueueRecord`] on how a
-    /// row written by one of them is read here.
+    /// row written by one of them is read here. It is also the only shape the batched sweep can
+    /// dequeue; see [`SystemDatabase::start_queued_partitioned_workflows`].
+    ///
+    /// [`SystemDatabase::start_queued_partitioned_workflows`]:
+    ///     crate::sysdb::SystemDatabase::start_queued_partitioned_workflows
     pub partition_concurrency: Option<i32>,
     /// How many of this queue's workflows may run at once within one partition, in **this**
     /// process.
@@ -477,55 +510,6 @@ fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, 
     Ok(())
 }
 
-/// Every limit on a queue, resolved to the scope it is actually enforced at.
-///
-/// The queue-wide fields are `None` for a legacy-partitioned row, which is the whole reason this
-/// type exists rather than the dequeue reading [`QueueRecord`] directly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ResolvedLimits {
-    pub(crate) concurrency: Option<i32>,
-    pub(crate) worker_concurrency: Option<i32>,
-    pub(crate) rate_limit: Option<RateLimit>,
-    pub(crate) partition_concurrency: Option<i32>,
-    pub(crate) partition_worker_concurrency: Option<i32>,
-    pub(crate) partition_rate_limit: Option<RateLimit>,
-}
-
-/// A row written with the deprecated flag and no per-partition limits.
-///
-/// Nothing this crate registers is one — partitioning here *is* the limits — but Go and Java still
-/// write them, and a database is shared.
-fn is_legacy_partitioned(record: &QueueRecord) -> bool {
-    record.partition_queue && !record.has_partition_limits()
-}
-
-/// Resolves a stored row's limits to the scope each is enforced at.
-///
-/// **The deprecated flag re-scopes rather than adds.** Under `partition_queue`, `concurrency`,
-/// `worker_concurrency` and the rate limit all apply *per partition* — so they move into the
-/// partition fields and the queue-wide ones are dropped, leaving nothing enforced queue-wide. That
-/// is what the flag has always meant; Python spells it `_resolve_limits` and TypeScript
-/// `resolveQueueLimits`, both returning exactly this, and reading such a row any other way would
-/// either over-admit or strand a peer's backlog.
-pub(crate) fn resolve_limits(record: &QueueRecord) -> ResolvedLimits {
-    if is_legacy_partitioned(record) {
-        return ResolvedLimits {
-            partition_concurrency: record.concurrency,
-            partition_worker_concurrency: record.worker_concurrency,
-            partition_rate_limit: record.rate_limit,
-            ..ResolvedLimits::default()
-        };
-    }
-    ResolvedLimits {
-        concurrency: record.concurrency,
-        worker_concurrency: record.worker_concurrency,
-        rate_limit: record.rate_limit,
-        partition_concurrency: record.partition_concurrency,
-        partition_worker_concurrency: record.partition_worker_concurrency,
-        partition_rate_limit: record.partition_rate_limit,
-    }
-}
-
 impl DBOS {
     /// Registers a queue, or reports the one already registered under this name.
     ///
@@ -719,7 +703,7 @@ impl DBOS {
             // Asked of the row as stored, not as merged: a change that clears the last partition
             // limit leaves a row that *looks* legacy — flag still set, no limits — and refusing
             // that would make un-partitioning impossible.
-            if touches_partition && is_legacy_partitioned(stored) {
+            if touches_partition && stored.is_legacy_partitioned() {
                 return Err(SysdbError::InvalidInput {
                     field: "partition_concurrency".into(),
                     detail: "this queue is registered with the deprecated `partition_queue` flag, \
@@ -728,7 +712,7 @@ impl DBOS {
                         .to_owned(),
                 });
             }
-            let limits = resolve_limits(merged);
+            let limits = merged.resolved_limits();
             let options = QueueOptions {
                 concurrency: limits.concurrency,
                 worker_concurrency: limits.worker_concurrency,

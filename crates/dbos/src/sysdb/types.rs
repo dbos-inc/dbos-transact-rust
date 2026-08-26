@@ -1641,6 +1641,35 @@ pub struct QueueRecord {
     pub application_name: Option<String>,
 }
 
+/// Every limit on a queue, resolved to the scope it is actually enforced at.
+///
+/// The queue-wide fields are `None` for a legacy-partitioned row, which is the whole reason this
+/// type exists rather than the dequeue reading [`QueueRecord`]'s columns directly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolvedLimits {
+    /// See [`QueueRecord::concurrency`].
+    pub concurrency: Option<i32>,
+    /// See [`QueueRecord::worker_concurrency`].
+    pub worker_concurrency: Option<i32>,
+    /// See [`QueueRecord::rate_limit`].
+    pub rate_limit: Option<RateLimit>,
+    /// See [`QueueRecord::partition_concurrency`].
+    pub partition_concurrency: Option<i32>,
+    /// See [`QueueRecord::partition_worker_concurrency`].
+    pub partition_worker_concurrency: Option<i32>,
+    /// See [`QueueRecord::partition_rate_limit`].
+    pub partition_rate_limit: Option<RateLimit>,
+}
+
+impl ResolvedLimits {
+    /// Whether the queue is partitioned, which any per-partition limit makes it.
+    pub fn is_partitioned(&self) -> bool {
+        self.partition_concurrency.is_some()
+            || self.partition_worker_concurrency.is_some()
+            || self.partition_rate_limit.is_some()
+    }
+}
+
 impl QueueRecord {
     /// Whether any per-partition limit is set, which is what partitions a queue.
     ///
@@ -1650,6 +1679,44 @@ impl QueueRecord {
         self.partition_concurrency.is_some()
             || self.partition_worker_concurrency.is_some()
             || self.partition_rate_limit.is_some()
+    }
+
+    /// A row written with the deprecated flag and no per-partition limits.
+    ///
+    /// Nothing this crate registers is one — partitioning here *is* the limits — but Go and Java
+    /// still write them, and a database is shared.
+    pub fn is_legacy_partitioned(&self) -> bool {
+        self.partition_queue && !self.has_partition_limits()
+    }
+
+    /// This row's limits, each at the scope it is actually enforced at.
+    ///
+    /// **The deprecated flag re-scopes rather than adds.** Under `partition_queue`, `concurrency`,
+    /// `worker_concurrency` and the rate limit all apply *per partition* — so they move into the
+    /// partition fields and the queue-wide ones are dropped, leaving nothing enforced queue-wide.
+    /// That is what the flag has always meant; Python spells it `_resolve_limits` and TypeScript
+    /// `resolveQueueLimits`, both returning exactly this, and reading such a row any other way
+    /// would either over-admit or strand a peer's backlog.
+    ///
+    /// **Everything that enforces a limit reads it through here**, never off the columns: the
+    /// dequeue included, since a legacy row's `concurrency` is not a queue-wide number.
+    pub fn resolved_limits(&self) -> ResolvedLimits {
+        if self.is_legacy_partitioned() {
+            return ResolvedLimits {
+                partition_concurrency: self.concurrency,
+                partition_worker_concurrency: self.worker_concurrency,
+                partition_rate_limit: self.rate_limit,
+                ..ResolvedLimits::default()
+            };
+        }
+        ResolvedLimits {
+            concurrency: self.concurrency,
+            worker_concurrency: self.worker_concurrency,
+            rate_limit: self.rate_limit,
+            partition_concurrency: self.partition_concurrency,
+            partition_worker_concurrency: self.partition_worker_concurrency,
+            partition_rate_limit: self.partition_rate_limit,
+        }
     }
 }
 

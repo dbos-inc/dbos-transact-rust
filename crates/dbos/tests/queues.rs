@@ -1839,3 +1839,203 @@ async fn a_legacy_partitioned_row_is_read_as_per_partition_limits() {
 
     dbos.shutdown().await;
 }
+
+/// **A partitioned queue runs one workflow per key at a time, and different keys concurrently.**
+///
+/// This is the batched read side: `partition_concurrency: 1` and nothing else is the one shape
+/// `start_queued_partitioned_workflows` can sweep, so this exercises it. It claims every
+/// partition's head-of-line workflow in one transaction, admitting a head only while no `PENDING`
+/// row holds that partition — the mutual exclusion is the data's, not a count's.
+///
+/// Two keys with two workflows each. The assertion is both halves of what partitioning means: no
+/// key ever has two bodies live at once, and the two keys do overlap — otherwise a queue that
+/// simply ran everything serially would pass.
+#[tokio::test]
+async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("partition-runner-app", &db));
+
+    // Per-key live counts, their high-water marks, and the peak across keys.
+    let live: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+    let per_key_peak = Arc::new(AtomicUsize::new(0));
+    let overlap_peak = Arc::new(AtomicUsize::new(0));
+    let workflow = dbos
+        .register_workflow("sharded", {
+            let live = Arc::clone(&live);
+            let per_key_peak = Arc::clone(&per_key_peak);
+            let overlap_peak = Arc::clone(&overlap_peak);
+            move |key: String| {
+                let live = Arc::clone(&live);
+                let per_key_peak = Arc::clone(&per_key_peak);
+                let overlap_peak = Arc::clone(&overlap_peak);
+                async move {
+                    {
+                        let mut live = live.lock().unwrap();
+                        let mine = live.entry(key.clone()).or_default();
+                        *mine += 1;
+                        per_key_peak.fetch_max(*mine, Ordering::SeqCst);
+                        overlap_peak.fetch_max(live.len(), Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let mut live = live.lock().unwrap();
+                    if let Some(mine) = live.get_mut(&key) {
+                        *mine -= 1;
+                        if *mine == 0 {
+                            live.remove(&key);
+                        }
+                    }
+                    Ok::<String, Error>(key)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let queue = dbos
+        .register_queue(
+            "partitioned-queue",
+            QueueOptions {
+                partition_concurrency: Some(1),
+                ..QueueOptions::default()
+            },
+        )
+        .await
+        .expect("registration failed");
+    assert!(queue.is_partitioned());
+    assert_eq!(
+        queue.concurrency(),
+        None,
+        "nothing queue-wide, which is what keeps this on the batched sweep"
+    );
+
+    let mut handles = Vec::new();
+    for key in ["tenant-a", "tenant-b"] {
+        for n in 0..2 {
+            handles.push(
+                workflow
+                    .start_with(
+                        key.to_owned(),
+                        StartOptions {
+                            workflow_id: Some(&format!("{key}-{n}")),
+                            queue: Some(Enqueue {
+                                partition_key: Some(key),
+                                ..Enqueue::new("partitioned-queue")
+                            }),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await
+                    .expect("enqueue failed"),
+            );
+        }
+    }
+
+    for handle in handles {
+        tokio::time::timeout(Duration::from_secs(30), handle.result())
+            .await
+            .expect("a partitioned workflow never ran")
+            .expect("the workflow failed");
+    }
+
+    assert_eq!(
+        per_key_peak.load(Ordering::SeqCst),
+        1,
+        "two workflows sharing a partition key ran at once"
+    );
+    assert_eq!(
+        overlap_peak.load(Ordering::SeqCst),
+        2,
+        "the two partitions never overlapped, so nothing was gained by partitioning"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A partitioned queue carrying limits the sweep cannot honour is walked partition by partition.
+///
+/// `partition_concurrency: 2` needs counting, so this takes the other path — and the assertion is
+/// that the limit is real on it: two workflows sharing a key do overlap, three never do.
+#[tokio::test]
+async fn a_counted_partitioned_queue_runs_its_limit_per_key() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("partition-counted-app", &db));
+
+    let live: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+    let per_key_peak = Arc::new(AtomicUsize::new(0));
+    let workflow = dbos
+        .register_workflow("sharded", {
+            let live = Arc::clone(&live);
+            let per_key_peak = Arc::clone(&per_key_peak);
+            move |key: String| {
+                let live = Arc::clone(&live);
+                let per_key_peak = Arc::clone(&per_key_peak);
+                async move {
+                    {
+                        let mut live = live.lock().unwrap();
+                        let mine = live.entry(key.clone()).or_default();
+                        *mine += 1;
+                        per_key_peak.fetch_max(*mine, Ordering::SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let mut live = live.lock().unwrap();
+                    if let Some(mine) = live.get_mut(&key) {
+                        *mine -= 1;
+                        if *mine == 0 {
+                            live.remove(&key);
+                        }
+                    }
+                    Ok::<String, Error>(key)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    dbos.register_queue(
+        "counted-queue",
+        QueueOptions {
+            partition_concurrency: Some(2),
+            ..QueueOptions::default()
+        },
+    )
+    .await
+    .expect("registration failed");
+
+    let mut handles = Vec::new();
+    for key in ["tenant-a", "tenant-b"] {
+        for n in 0..3 {
+            handles.push(
+                workflow
+                    .start_with(
+                        key.to_owned(),
+                        StartOptions {
+                            workflow_id: Some(&format!("{key}-{n}")),
+                            queue: Some(Enqueue {
+                                partition_key: Some(key),
+                                ..Enqueue::new("counted-queue")
+                            }),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await
+                    .expect("enqueue failed"),
+            );
+        }
+    }
+
+    for handle in handles {
+        tokio::time::timeout(Duration::from_secs(30), handle.result())
+            .await
+            .expect("a partitioned workflow never ran")
+            .expect("the workflow failed");
+    }
+
+    assert_eq!(
+        per_key_peak.load(Ordering::SeqCst),
+        2,
+        "the per-partition limit was not what bounded a key: got {}",
+        per_key_peak.load(Ordering::SeqCst)
+    );
+
+    dbos.shutdown().await;
+}

@@ -847,13 +847,24 @@ pub trait SystemDatabase: Send + Sync {
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
-    /// Three limits narrow what is taken, in this order:
+    /// Limits narrow what is taken, rate limits first — a queue already at one returns nothing
+    /// without selecting anything — then the concurrency limits, whose tightest budget wins:
     ///
-    /// - **Rate limit.** Starts in the window are counted first, and a queue already at its limit
-    ///   returns nothing without selecting anything.
+    /// - **Rate limit**, against the starts in the trailing window.
     /// - **Worker concurrency**, against `local_running_count` — what this process is already
     ///   running, which it knows without asking the database.
     /// - **Global concurrency**, against the `PENDING` count across every executor.
+    ///
+    /// **`partition_key` narrows the selection and adds a second scope; it does not move the
+    /// first.** Given one, the three per-partition limits apply as well, counted within that key
+    /// alone — `partition_local_running_count` is this process's share of it — while the three
+    /// above go on counting the whole queue. A queue can therefore hold both, and the caller
+    /// sweeping one partition still cannot spend a budget that belongs to the queue.
+    ///
+    /// Which limit sits at which scope is [`QueueRecord::resolved_limits`]'s answer, not the
+    /// columns': a row a peer wrote with the deprecated `partition_queue` flag keeps its
+    /// per-partition numbers in the queue-wide columns, and enforcing those queue-wide would admit
+    /// one workflow for the whole queue where the flag promised one per key.
     ///
     /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
     /// `NOWAIT`, so every executor sees a consistent count rather than a partial one; without
@@ -871,6 +882,7 @@ pub trait SystemDatabase: Send + Sync {
         application_version: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
+        partition_local_running_count: i64,
     ) -> Result<Vec<String>, Error>;
 
     /// The partitions of a queue that currently have work waiting.
@@ -887,11 +899,23 @@ pub trait SystemDatabase: Send + Sync {
     /// partition in a single transaction, so a queue with a thousand partitions costs one sweep
     /// rather than a thousand polls.
     ///
-    /// **Only valid for a partitioned queue with concurrency 1 and no rate limit**, which is
-    /// [`Error::InvalidInput`] otherwise. That restriction is what makes the sweep safe without
-    /// per-partition counting: every worker ranks each partition's head identically, and the
-    /// `PENDING` gate admits at most one row per partition, so concurrency 1 is enforced by the
-    /// data rather than by a count.
+    /// **Only valid for a queue whose one limit is partition concurrency 1**, which is
+    /// [`Error::InvalidInput`] otherwise — no queue-wide concurrency, and neither rate limit. That
+    /// restriction is what makes the sweep safe without counting: every worker ranks each
+    /// partition's head identically, and the `PENDING` gate admits at most one row per partition,
+    /// so the limit is enforced by the data rather than by a count. Anything else a queue can
+    /// carry has to be counted within each key, which is what walking the partitions one at a time
+    /// through [`start_queued_workflows`](Self::start_queued_workflows) is for. TypeScript splits
+    /// the same two ways, on the same four conditions.
+    ///
+    /// `partition_worker_concurrency` is deliberately not among them: it is at least 1, and a
+    /// partition already capped at one workflow across the whole fleet cannot exceed one in any
+    /// single process, so it could never bind here.
+    ///
+    /// `max_tasks` is the caller's own remaining budget — its worker concurrency less what it is
+    /// already running — and bounds the sweep alongside
+    /// [`PARTITIONED_DEQUEUE_SWEEP_CAP`], so a process near its limit does not claim heads it must
+    /// immediately sit on. `None` is unbounded; `Some(0)` returns without a query.
     ///
     /// At most [`PARTITIONED_DEQUEUE_SWEEP_CAP`]
     /// partitions per sweep; the rest arrive on later polls.
@@ -900,6 +924,7 @@ pub trait SystemDatabase: Send + Sync {
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        max_tasks: Option<i64>,
     ) -> Result<Vec<String>, Error>;
 
     /// Reads one queue by name, or `None` if it is not registered.

@@ -31,7 +31,7 @@ use crate::dispatch::dispatch;
 use crate::queue::DEFAULT_POLLING_INTERVAL;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
-use crate::sysdb::types::{Applications, QueueRecord, Submission, WorkflowFilter};
+use crate::sysdb::types::{Applications, QueueRecord, ResolvedLimits, Submission, WorkflowFilter};
 use crate::workflow::spawn_tracked;
 
 /// How often the supervisor rebuilds the queue set and transitions delayed workflows.
@@ -61,45 +61,68 @@ const JITTER: (f64, f64) = (0.95, 1.05);
 /// says which executor claimed it, but not whether that executor's task is still alive — and
 /// asking would be a second round trip on the hot path.
 ///
-/// Per queue in this slice, per queue *and partition* when partitions are dequeued: Python passes
-/// both counts, and the partition one is meaningless until then.
+/// **Keyed by queue and by queue-and-partition**, because the two worker-concurrency limits are
+/// enforced at different scopes and both are answered locally. A workflow on a partitioned queue
+/// is counted under both keys, so neither count has to be derived from the other.
 #[derive(Default)]
-pub(crate) struct Running(Mutex<HashMap<String, i64>>);
+pub(crate) struct Running(Mutex<HashMap<Key, i64>>);
+
+/// What a local tally is kept under: a queue, or a partition of one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Key {
+    Queue(String),
+    Partition(String, String),
+}
 
 impl Running {
     /// Counts one workflow as running on `queue` until the returned slot is dropped.
-    fn claim(self: &Arc<Self>, queue: &str) -> Slot {
-        *self
-            .0
-            .lock()
-            .expect("the running tally is poisoned")
-            .entry(queue.to_owned())
-            .or_default() += 1;
+    ///
+    /// A partition key counts it twice — once for the queue, once for the partition — and the
+    /// slot releases both together.
+    fn claim(self: &Arc<Self>, queue: &str, partition: Option<&str>) -> Slot {
+        let mut keys = vec![Key::Queue(queue.to_owned())];
+        if let Some(partition) = partition {
+            keys.push(Key::Partition(queue.to_owned(), partition.to_owned()));
+        }
+        let mut counts = self.0.lock().expect("the running tally is poisoned");
+        for key in &keys {
+            *counts.entry(key.clone()).or_default() += 1;
+        }
+        drop(counts);
         Slot {
             running: Arc::clone(self),
-            queue: queue.to_owned(),
+            keys,
         }
     }
 
-    /// What this process is running from `queue` right now.
+    /// What this process is running from `queue` right now, across every partition.
     fn count(&self, queue: &str) -> i64 {
+        self.get(&Key::Queue(queue.to_owned()))
+    }
+
+    /// What this process is running from one partition of `queue` right now.
+    fn count_for_partition(&self, queue: &str, partition: &str) -> i64 {
+        self.get(&Key::Partition(queue.to_owned(), partition.to_owned()))
+    }
+
+    fn get(&self, key: &Key) -> i64 {
         self.0
             .lock()
             .expect("the running tally is poisoned")
-            .get(queue)
+            .get(key)
             .copied()
             .unwrap_or(0)
     }
 }
 
-/// One workflow's place in a queue's local tally, released when the workflow's task ends.
+/// One workflow's place in the local tallies, released when the workflow's task ends.
 ///
 /// Held by the spawned execution rather than by the runner, which is what makes the release
 /// correct without anything having to observe the workflow finishing: the task owns it, so it
 /// goes when the task does — whether that is a return, a panic, or shutdown aborting it.
 pub(crate) struct Slot {
     running: Arc<Running>,
-    queue: String,
+    keys: Vec<Key>,
 }
 
 impl Drop for Slot {
@@ -111,10 +134,12 @@ impl Drop for Slot {
             // failure, and the panic that poisoned it is already reported.
             Err(_) => return,
         };
-        if let Some(count) = counts.get_mut(&self.queue) {
-            *count -= 1;
-            if *count <= 0 {
-                counts.remove(&self.queue);
+        for key in &self.keys {
+            if let Some(count) = counts.get_mut(key) {
+                *count -= 1;
+                if *count <= 0 {
+                    counts.remove(key);
+                }
             }
         }
     }
@@ -319,41 +344,174 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
     }
 }
 
+/// How many more workflows this process may start from a queue, or `None` for unlimited.
+///
+/// Local by construction: worker concurrency is the limit a process can answer without asking the
+/// database. A per-partition worker limit of zero pauses this worker outright — nothing this crate
+/// registers can hold one, since validation wants at least 1, but a peer's row can.
+fn worker_budget(limits: &ResolvedLimits, running: i64) -> Option<i64> {
+    if limits.partition_worker_concurrency.is_some_and(|w| w <= 0) {
+        return Some(0);
+    }
+    limits
+        .worker_concurrency
+        .map(|worker| (i64::from(worker) - running).max(0))
+}
+
 /// One dequeue and the dispatch of whatever it claimed. Reports whether it met contention.
+///
+/// **Three shapes, which is the split TypeScript makes.** An unpartitioned queue is one claim. A
+/// partitioned queue whose only limit is one-at-a-time-per-key is a single batched sweep, which is
+/// what keeps a thousand partitions costing one round trip rather than a thousand. Any other
+/// partitioned queue walks its partitions one at a time, because the limits it carries have to be
+/// counted within each key — and in a shuffled order, so a queue with more partitions than budget
+/// does not starve the ones sorting last.
 async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<Running>) -> bool {
-    if queue.partition_queue {
-        // A partitioned queue is dequeued one head-of-line workflow per partition, through
-        // `start_queued_partitioned_workflows`, and that sweep is 4b's. Dequeuing it here with no
-        // partition key would select nothing, so the worker idles rather than pretending.
-        tracing::debug!("the queue is partitioned; its dequeue arrives with partition support");
+    let limits = queue.resolved_limits();
+
+    if !limits.is_partitioned() {
+        return match executor
+            .sysdb()
+            .start_queued_workflows(
+                queue,
+                executor.executor_id(),
+                executor.application_version(),
+                None,
+                running.count(&queue.name),
+                0,
+            )
+            .await
+        {
+            Ok(claimed) => {
+                dispatch_claimed(executor, queue, None, running, claimed).await;
+                false
+            }
+            Err(error) => report_dequeue_error(&error),
+        };
+    }
+
+    // Snapshot once. Dispatch is asynchronous, so re-reading between partitions would count this
+    // poll's own claims twice — once in the tally and once in `claimed`.
+    let already_running = running.count(&queue.name);
+    let budget = worker_budget(&limits, already_running);
+    if budget == Some(0) {
         return false;
     }
 
-    let claimed = match executor
-        .sysdb()
-        .start_queued_workflows(
-            queue,
-            executor.executor_id(),
-            executor.application_version(),
-            None,
-            running.count(&queue.name),
-        )
-        .await
+    // The batched path, and the only one that does not count: see
+    // `start_queued_partitioned_workflows` for why these four conditions are the whole of its
+    // precondition.
+    if limits.partition_concurrency == Some(1)
+        && limits.concurrency.is_none()
+        && limits.rate_limit.is_none()
+        && limits.partition_rate_limit.is_none()
     {
-        Ok(claimed) => claimed,
-        Err(error) if is_contention(&error) => {
-            // Not a failure at this layer: a peer holds the rows this dequeue wanted to lock,
-            // which is the system working. It costs an interval, and says nothing louder.
-            tracing::debug!(error = %error, "a peer is mid-dequeue; backing off");
-            return true;
-        }
-        Err(error) => {
-            tracing::warn!(error = %error, "could not dequeue from the queue");
-            return false;
-        }
+        return match executor
+            .sysdb()
+            .start_queued_partitioned_workflows(
+                queue,
+                executor.executor_id(),
+                executor.application_version(),
+                budget,
+            )
+            .await
+        {
+            Ok(claimed) => {
+                // The sweep returns one head per partition and does not say which; each claimed
+                // row carries its own key, so the tally is credited from the rows themselves.
+                dispatch_claimed(executor, queue, None, running, claimed).await;
+                false
+            }
+            Err(error) => report_dequeue_error(&error),
+        };
+    }
+
+    let partitions = match executor.sysdb().get_queue_partitions(&queue.name).await {
+        Ok(partitions) => shuffled(partitions),
+        Err(error) => return report_dequeue_error(&error),
     };
+
+    let mut claimed_here = 0i64;
+    for partition in partitions {
+        if worker_budget(&limits, already_running + claimed_here) == Some(0) {
+            break;
+        }
+        let claimed = match executor
+            .sysdb()
+            .start_queued_workflows(
+                queue,
+                executor.executor_id(),
+                executor.application_version(),
+                Some(&partition),
+                already_running + claimed_here,
+                running.count_for_partition(&queue.name, &partition),
+            )
+            .await
+        {
+            Ok(claimed) => claimed,
+            // A peer holds this partition's rows. Skipping just this key is the point of walking
+            // them separately — one contended partition is not a reason to back the whole queue
+            // off, and the next poll shuffles into a different order anyway.
+            Err(error) if is_contention(&error) => {
+                tracing::debug!(
+                    partition,
+                    "a peer is mid-dequeue on this partition; skipping it"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, partition, "could not dequeue from the partition");
+                continue;
+            }
+        };
+        claimed_here += i64::try_from(claimed.len()).unwrap_or(i64::MAX);
+        dispatch_claimed(executor, queue, Some(&partition), running, claimed).await;
+    }
+    false
+}
+
+/// Turns a failed dequeue into the "was it contention" answer the caller backs off on.
+fn report_dequeue_error(error: &sysdb::Error) -> bool {
+    if is_contention(error) {
+        // Not a failure at this layer: a peer holds the rows this dequeue wanted to lock, which
+        // is the system working. It costs an interval, and says nothing louder.
+        tracing::debug!(error = %error, "a peer is mid-dequeue; backing off");
+        return true;
+    }
+    tracing::warn!(error = %error, "could not dequeue from the queue");
+    false
+}
+
+/// Fisher-Yates, so a walk visits partitions in a different order each poll.
+///
+/// Starvation is the reason rather than fairness in the abstract: a worker whose budget runs out
+/// part way through would otherwise always spend it on whichever keys sort first, and the tail of
+/// a large partition set would never be reached. TypeScript shuffles here for the same reason.
+///
+/// Seeded from a v4 UUID for the reason [`jitter`] draws one: the randomness comes from a
+/// dependency this crate already has rather than one added for two uses. Seeded once per walk and
+/// advanced by xorshift, so a large partition set does not cost an entropy draw per swap.
+fn shuffled(mut keys: Vec<String>) -> Vec<String> {
+    let mut state = (uuid::Uuid::new_v4().as_u128() as u64) | 1;
+    for i in (1..keys.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        keys.swap(i, (state % (i as u64 + 1)) as usize);
+    }
+    keys
+}
+
+/// Reads the claimed workflows in one round trip and starts each, crediting the local tally.
+async fn dispatch_claimed(
+    executor: &Arc<Executor>,
+    queue: &QueueRecord,
+    partition: Option<&str>,
+    running: &Arc<Running>,
+    claimed: Vec<String>,
+) {
     if claimed.is_empty() {
-        return false;
+        return;
     }
 
     // **One round trip for the whole batch**, which is why the claim returns ids rather than
@@ -378,7 +536,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
                 claimed = claimed.len(),
                 "could not read the claimed workflows; they stay PENDING for recovery"
             );
-            return false;
+            return;
         }
     };
     if rows.len() != claimed.len() {
@@ -392,10 +550,12 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
     tracing::debug!(workflows = rows.len(), "dequeued workflows");
     for row in rows {
         let workflow_id = row.workflow_id.clone();
-        // Claimed before the dispatch, so the next iteration's `local_running_count` includes it
-        // even if this one is still starting. `dispatch` drops the slot itself if it does not
-        // spawn.
-        let slot = running.claim(&queue.name);
+        // The row's own key rather than the one being swept, so the batched path — which names no
+        // partition and claims across all of them — still credits each tally correctly.
+        let partition = partition.or(row.queue_partition_key.as_deref());
+        // Claimed before the dispatch, so the next iteration's counts include it even if this one
+        // is still starting. `dispatch` drops the slot itself if it does not spawn.
+        let slot = running.claim(&queue.name, partition);
         if let Err(error) = dispatch(executor, row, Submission::Dequeue, Some(slot)).await {
             tracing::warn!(
                 workflow_id,
@@ -404,7 +564,6 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
             );
         }
     }
-    false
 }
 
 /// Whether a failed dequeue means a peer was mid-dequeue rather than something being wrong.
