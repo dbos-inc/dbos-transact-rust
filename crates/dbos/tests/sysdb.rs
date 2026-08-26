@@ -2415,6 +2415,167 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
     );
 }
 
+/// **Recovery's write: a `PENDING` row goes back to `ENQUEUED`, keeping its own queue.**
+///
+/// Only a workflow that was never queued lands on the recovery queue. One enqueued onto `orders`
+/// belongs to `orders` — putting it on the internal queue instead would move it out from under
+/// whatever limits it was enqueued against.
+#[tokio::test]
+async fn reenqueue_for_recovery_returns_workflows_to_their_own_queues() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    for (id, queue) in [("wf-was-queued", Some("orders")), ("wf-never-queued", None)] {
+        let wf = NewWorkflow {
+            executor_id: Some("alpha"),
+            application_version: Some("v1"),
+            queue_name: queue,
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    // The queued one is `ENQUEUED` already; claim it so both start from `PENDING`, which is the
+    // state recovery is about.
+    let queue = sys.get_queue("orders").await.unwrap().unwrap();
+    let claimed = sys
+        .start_queued_workflows(&queue, "alpha", "v1", None, 0)
+        .await
+        .unwrap();
+    assert_eq!(claimed, ["wf-was-queued"]);
+
+    let mut moved = sys
+        .reenqueue_for_recovery(&["alpha"], "v1", INTERNAL_QUEUE)
+        .await
+        .unwrap();
+    moved.sort();
+    assert_eq!(moved, ["wf-never-queued", "wf-was-queued"]);
+
+    let was_queued = sys.get_workflow("wf-was-queued").await.unwrap().unwrap();
+    assert_eq!(was_queued.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        was_queued.queue_name.as_deref(),
+        Some("orders"),
+        "a workflow that came off a queue goes back to that queue"
+    );
+    assert!(
+        was_queued.started_at.is_none(),
+        "the dead run's start time would make the queue wait look like execution"
+    );
+
+    let never_queued = sys.get_workflow("wf-never-queued").await.unwrap().unwrap();
+    assert_eq!(never_queued.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        never_queued.queue_name.as_deref(),
+        Some(INTERNAL_QUEUE),
+        "a workflow that was never queued lands on the recovery queue"
+    );
+}
+
+/// **A repeat is harmless, which is the point of the executor predicate.**
+///
+/// Once a live executor has claimed a re-enqueued workflow, the claim stamps its own id, so a
+/// second sweep naming the dead executor matches nothing. Without this, a duplicate recovery
+/// request would tear a running workflow off its runner and offer it to the fleet again.
+#[tokio::test]
+async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        executor_id: Some("dead"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-taken-over")
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.reenqueue_for_recovery(&["dead"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap(),
+        ["wf-taken-over"],
+    );
+
+    // A live executor claims it off the internal queue.
+    let internal = NewQueue::new(INTERNAL_QUEUE);
+    sys.upsert_queue(&internal, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let queue = sys.get_queue(INTERNAL_QUEUE).await.unwrap().unwrap();
+    assert_eq!(
+        sys.start_queued_workflows(&queue, "live", "v1", None, 0)
+            .await
+            .unwrap(),
+        ["wf-taken-over"],
+    );
+
+    // The dead executor's sweep runs again, and finds nothing of its own.
+    assert!(
+        sys.reenqueue_for_recovery(&["dead"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a repeat sweep tore a running workflow off its executor"
+    );
+    assert_eq!(
+        sys.get_workflow("wf-taken-over")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Pending,
+        "the workflow the live executor is running was disturbed"
+    );
+}
+
+/// Scoped like the sweep it replaces: another executor's, another version's, and finished work
+/// are all left alone.
+#[tokio::test]
+async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
+    let (sys, _db) = sysdb().await;
+    for (id, executor, version) in [
+        ("wf-mine", "alpha", "v1"),
+        ("wf-theirs", "beta", "v1"),
+        ("wf-old-code", "alpha", "v0"),
+    ] {
+        let wf = NewWorkflow {
+            executor_id: Some(executor),
+            application_version: Some(version),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    let done = NewWorkflow {
+        executor_id: Some("alpha"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-finished")
+    };
+    sys.init_workflow(&done, None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_workflow_outcome("wf-finished", Outcome::Output(None))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.reenqueue_for_recovery(&["alpha"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap(),
+        ["wf-mine"],
+    );
+    assert!(
+        sys.reenqueue_for_recovery(&[], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap()
+            .is_empty(),
+        "naming no executors moved something",
+    );
+}
+
 /// A delay can be moved while the workflow is held, and not after it is released.
 #[tokio::test]
 async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {

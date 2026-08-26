@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
+use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{Config, DBOS, Error};
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -226,6 +226,71 @@ async fn an_unregistered_workflow_is_skipped_and_the_rest_recover() {
         ghost_row.status,
         WorkflowStatus::Pending,
         "skipped, not failed: it waits for a launch that knows its code"
+    );
+
+    second.shutdown().await;
+}
+
+/// **Recovery goes through the queue, and the row proves it.**
+///
+/// A workflow cut down mid-flight comes back on [`INTERNAL_QUEUE`] rather than being executed by
+/// the process that found it. That is what makes a repeat sweep harmless, lets any executor on
+/// the version pick the work up, and turns "how many at once" into the queue's question.
+#[tokio::test]
+async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
+    let db = test_database().await;
+    let reader = reader(&db).await;
+
+    let entered = Arc::new(AtomicU32::new(0));
+    let build = |db: &TestDatabase| {
+        let dbos = DBOS::new(config("recovery-reenqueue-app", db));
+        let entered = Arc::clone(&entered);
+        let workflow = dbos
+            .register_workflow("held", move |()| {
+                let entered = Arc::clone(&entered);
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    // Long enough that shutdown catches it mid-flight.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Ok::<u32, Error>(1)
+                }
+            })
+            .unwrap();
+        (dbos, workflow)
+    };
+
+    let id = "cut-down-mid-flight";
+    let (first, workflow) = build(&db);
+    first.launch().await.expect("launch failed");
+    workflow
+        .start_with(
+            (),
+            dbos::StartOptions {
+                workflow_id: Some(id),
+                ..dbos::StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    await_status(&reader, id, WorkflowStatus::Pending).await;
+    // Aborts the task without writing anything durable, so the row stays PENDING.
+    first.shutdown().await;
+    assert_eq!(entered.load(Ordering::SeqCst), 1);
+
+    // The relaunch re-enqueues rather than running it here; the dequeue loop then picks it up.
+    let (second, _workflow) = build(&db);
+    second.launch().await.expect("relaunch failed");
+
+    let row = await_status(&reader, id, WorkflowStatus::Pending).await;
+    assert_eq!(
+        row.queue_name.as_deref(),
+        Some(INTERNAL_QUEUE),
+        "recovery ran the workflow in place instead of returning it to a queue"
+    );
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        2,
+        "the workflow did not run again after being recovered"
     );
 
     second.shutdown().await;

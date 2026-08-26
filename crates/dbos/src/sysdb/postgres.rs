@@ -2743,6 +2743,54 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn reenqueue_for_recovery(
+        &self,
+        executor_ids: &[&str],
+        application_version: &str,
+        recovery_queue: &str,
+    ) -> Result<Vec<String>, Error> {
+        if executor_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let application_name = self.application_name.as_deref();
+
+        with_retry(&self.retry, "reenqueue_for_recovery", move || async move {
+            // Per attempt, as every sweep's clock is: a retry should stamp when it ran.
+            let now = Timestamp::now().as_epoch_ms();
+            // `started_at_epoch_ms` is cleared because the row has not started yet — leaving the
+            // dead run's start time would make the queue wait look like execution.
+            //
+            // `NULLIF` is Go's, and it is for rows this implementation did not write: older
+            // versions stored "not queued" as the empty string rather than NULL, and without it
+            // such a row would keep `''` as its queue name and never be polled by anything.
+            let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "UPDATE {workflow_table} \
+                 SET status = 'ENQUEUED', \
+                     started_at_epoch_ms = NULL, \
+                     updated_at = $1, \
+                     queue_name = COALESCE(NULLIF(queue_name, ''), $2) \
+                 WHERE status = 'PENDING' \
+                   AND executor_id = ANY($3) \
+                   AND application_version = $4 \
+                   AND ($5::text IS NULL \
+                        OR application_name = $5 \
+                        OR application_name IS NULL) \
+                 RETURNING workflow_uuid"
+            )))
+            .bind(now)
+            .bind(recovery_queue)
+            .bind(executor_ids)
+            .bind(application_version)
+            .bind(application_name)
+            .fetch_all(pool)
+            .await?;
+            Ok(ids)
+        })
+        .await
+    }
+
     async fn transition_delayed_workflows(&self) -> Result<u64, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);

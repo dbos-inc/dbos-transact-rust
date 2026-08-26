@@ -242,6 +242,31 @@ pub trait SystemDatabase: Send + Sync {
         application_version: &str,
     ) -> Result<Vec<String>, Error>;
 
+    /// Returns this executor's abandoned workflows to a queue, so any peer may run them.
+    ///
+    /// **Recovery's whole write.** A `PENDING` row whose executor is gone goes back to `ENQUEUED`
+    /// and is dispatched by whichever executor next polls its queue, rather than being executed by
+    /// the process that found it. Python, TypeScript and Go all recover this way; it is what makes
+    /// a recovery sweep idempotent, lets a fleet share one backlog, and turns "how many at once"
+    /// into a question the queue answers.
+    ///
+    /// A workflow already on a queue goes back to **its own** queue; only one that was never
+    /// queued lands on `recovery_queue`, which callers set to [`INTERNAL_QUEUE`].
+    ///
+    /// **`executor_ids` is what makes a repeat harmless.** Once any live executor dequeues one of
+    /// these rows, the claim stamps its own executor id, so a second sweep naming the dead
+    /// executor matches nothing rather than tearing a running workflow off its runner. Scoped by
+    /// application version and application for the reasons
+    /// [`get_pending_workflows`](Self::get_pending_workflows) gives.
+    ///
+    /// Returns the ids that actually moved. An empty `executor_ids` moves nothing.
+    async fn reenqueue_for_recovery(
+        &self,
+        executor_ids: &[&str],
+        application_version: &str,
+        recovery_queue: &str,
+    ) -> Result<Vec<String>, Error>;
+
     /// Releases delayed workflows whose time has come, returning how many moved.
     ///
     /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
