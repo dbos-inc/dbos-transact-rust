@@ -68,12 +68,14 @@ pub use event::{get_event, set_event};
 #[cfg(feature = "engine")]
 pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
-pub use queue::{Queue, QueueConflict, QueueOptions};
+pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]
 pub use step::{ShouldRetry, StepOptions, step, step_with};
+#[cfg(feature = "engine")]
+pub use sysdb::types::Change;
 #[cfg(feature = "engine")]
 pub use workflow::{RunOptions, StartOptions, Timeout};

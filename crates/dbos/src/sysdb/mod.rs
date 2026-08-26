@@ -917,13 +917,43 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Changes the fields of a registered queue that an update names, leaving the rest.
     ///
-    /// A no-op when the update names nothing, which is what both references do rather than
-    /// treating it as an error — a caller assembling an update from optional inputs should not
-    /// have to check whether any survived.
+    /// **Read, check and write in one transaction**, which is what `validate` is for. The row is
+    /// read under `FOR UPDATE`, the update is applied to it, the result is handed to `validate`,
+    /// and the write lands before the lock is released — so a limit judged against a row that has
+    /// since moved cannot be stored. Go manages the same thing with the `mutate` callback its
+    /// `UpdateQueueConfig` takes; Python and TypeScript read and write separately, and two
+    /// operators changing different limits at once can leave a pair neither asked for.
+    ///
+    /// **The transaction does not leave this layer.** `validate` is handed the merged record and
+    /// says yes or no; it does no I/O of its own and never sees a connection. It must also be free
+    /// of side effects, because a retried attempt calls it again against the row that attempt
+    /// read. Callers with nothing to check pass a closure that always succeeds.
+    ///
+    /// `validate` sees [`QueueUpdate::apply_to`]'s result rather than the update, because a limit
+    /// is rarely wrong on its own and usually wrong only beside another already stored. It refuses
+    /// by returning an error, and [`Error::InvalidInput`] is the variant for that — the caller is
+    /// expected to recognise its own refusal coming back.
+    ///
+    /// An update naming nothing writes nothing, `updated_at` included, and is not validated: the
+    /// stored row stands unexamined, which is what both references do rather than treating an
+    /// empty update as an error. A caller assembling one from optional inputs should not have to
+    /// check whether any survived.
+    ///
+    /// [`Error::NotRegistered`] if the name matches nothing, like
+    /// [`update_schedule`](Self::update_schedule) — the row has to be read to check against it, so
+    /// its absence is known here rather than inferred from a row count.
+    ///
+    /// Returns the row as written, which spares the caller a read back that a later transaction
+    /// would have answered anyway.
     ///
     /// Unscoped, like the other reads and writes addressed by queue name. Ownership is not
     /// updatable: see [`QueueUpdate`].
-    async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error>;
+    async fn update_queue(
+        &self,
+        name: &str,
+        update: &QueueUpdate,
+        validate: &(dyn for<'r> Fn(&'r QueueRecord) -> Result<(), Error> + Send + Sync),
+    ) -> Result<QueueRecord, Error>;
 
     /// Extends a debounced workflow's delay and replaces its inputs, or reports who holds the key.
     ///
@@ -986,9 +1016,12 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Removes a queue from the registry.
     ///
-    /// Only the registration. Workflows already enqueued keep their `queue_name` and are still
-    /// dequeued by an executor that knows the queue, because a queue is a declaration in code
-    /// first and a row second.
+    /// Only the registration. Workflows already enqueued keep their `queue_name`.
+    ///
+    /// Whether anything still dequeues them depends on the layer above: an implementation that
+    /// also keeps queues declared in code carries on polling one it declared, while this crate's
+    /// engine builds its worker set from these rows alone, so deleting the row strands the backlog
+    /// until the queue is registered again.
     async fn delete_queue(&self, name: &str) -> Result<(), Error>;
 
     /// Registers a schedule, failing if the name is taken.

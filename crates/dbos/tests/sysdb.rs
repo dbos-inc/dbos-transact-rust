@@ -8160,6 +8160,7 @@ async fn an_update_changes_only_what_it_names() {
             worker_concurrency: Change::Set(None),
             ..QueueUpdate::default()
         },
+        &|_| Ok(()),
     )
     .await
     .unwrap();
@@ -8204,6 +8205,7 @@ async fn an_update_moves_a_rate_limit_whole() {
             })),
             ..QueueUpdate::default()
         },
+        &|_| Ok(()),
     )
     .await
     .unwrap();
@@ -8222,6 +8224,7 @@ async fn an_update_moves_a_rate_limit_whole() {
             rate_limit: Change::Set(None),
             ..QueueUpdate::default()
         },
+        &|_| Ok(()),
     )
     .await
     .unwrap();
@@ -8256,7 +8259,7 @@ async fn an_empty_update_is_a_no_op() {
             .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    sys.update_queue("orders", &QueueUpdate::default())
+    sys.update_queue("orders", &QueueUpdate::default(), &|_| Ok(()))
         .await
         .unwrap();
 
@@ -8267,6 +8270,90 @@ async fn an_empty_update_is_a_no_op() {
             .await
             .unwrap();
     assert_eq!(before, after, "an empty update records no write");
+}
+
+/// A refusal rolls the transaction back, so the row the validator judged is the row that stays.
+///
+/// The point of validating inside the write's transaction rather than before it: nothing lands,
+/// and nothing else moved the row while it was being judged.
+#[tokio::test]
+async fn a_refused_update_writes_nothing() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    let before: i64 =
+        sqlx::query_scalar(r#"SELECT "updated_at" FROM "dbos"."queues" WHERE "name" = $1"#)
+            .bind("orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let error = sys
+        .update_queue(
+            "orders",
+            &QueueUpdate {
+                concurrency: Change::Set(Some(4)),
+                ..QueueUpdate::default()
+            },
+            &|merged| {
+                // The row as it would be, not the row as it is — which is the whole reason the
+                // caller is handed something rather than asked to look the queue up itself.
+                assert_eq!(
+                    merged.concurrency,
+                    Some(4),
+                    "the merged row is what is judged"
+                );
+                Err(Error::InvalidInput {
+                    field: "concurrency".into(),
+                    detail: "refused by the caller".to_owned(),
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidInput { field, .. } if field == "concurrency"),
+        "the caller's own refusal comes back, got {error:?}"
+    );
+
+    let read = sys.get_queue("orders").await.unwrap().unwrap();
+    assert_eq!(read.concurrency, None, "the refused write did not land");
+    let after: i64 =
+        sqlx::query_scalar(r#"SELECT "updated_at" FROM "dbos"."queues" WHERE "name" = $1"#)
+            .bind("orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "not even `updated_at` moved");
+}
+
+/// A name that matches nothing is refused rather than passing for success.
+///
+/// The row has to be read to validate against it, so its absence is known here rather than
+/// inferred from a row count — the same answer `update_schedule` gives.
+#[tokio::test]
+async fn updating_a_queue_that_is_not_registered_is_refused() {
+    let (sys, _db) = sysdb().await;
+
+    let error = sys
+        .update_queue(
+            "orders",
+            &QueueUpdate {
+                concurrency: Change::Set(Some(4)),
+                ..QueueUpdate::default()
+            },
+            &|_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::NotRegistered { kind, name } if kind == "Queue" && name == "orders"),
+        "got {error:?}"
+    );
 }
 
 /// The lookup answers who holds a key, so a losing enqueue can adopt the winner.

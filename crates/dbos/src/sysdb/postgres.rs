@@ -5301,18 +5301,48 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error> {
-        // Nothing to change is not an error: an update assembled from optional inputs may name
-        // no field, and both references return without touching the row — including its
-        // `updated_at`, which would otherwise record a write that changed nothing.
-        if update.is_empty() {
-            return Ok(());
-        }
-
+    async fn update_queue(
+        &self,
+        name: &str,
+        update: &QueueUpdate,
+        validate: &(dyn for<'r> Fn(&'r QueueRecord) -> Result<(), Error> + Send + Sync),
+    ) -> Result<QueueRecord, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
 
         with_retry(&self.retry, "update_queue", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // `FOR UPDATE` rather than a stricter isolation level: the row is held for the rest of
+            // the transaction, so a peer planning against the same queue waits here instead of
+            // racing to the `UPDATE` and having its whole attempt thrown away. Go takes the other
+            // route — repeatable read, and a retry on the serialization failure that follows.
+            let row = sqlx::query(AssertSqlSafe(format!(
+                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
+            )))
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(stored) = row.as_ref().map(queue_from_row).transpose()? else {
+                return Err(Error::NotRegistered {
+                    kind: "Queue".into(),
+                    name: name.to_owned(),
+                });
+            };
+
+            // Nothing to change leaves the row alone — including its `updated_at`, which would
+            // otherwise record a write that changed nothing. Unvalidated on purpose: a caller who
+            // asked for nothing is not asking to have the stored row judged.
+            if update.is_empty() {
+                tx.commit().await?;
+                return Ok(stored);
+            }
+
+            // The caller's verdict on the row as it would be, delivered while this transaction
+            // still holds it. Rolling back is what makes a refusal mean something: nothing was
+            // written, and nothing else moved the row while it was being judged.
+            validate(&update.apply_to(&stored))?;
+
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE ");
             q.push(queues_table).push(" SET ");
             let mut set = q.separated(", ");
@@ -5345,8 +5375,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             set.push_bind_unseparated(Timestamp::now().as_epoch_ms());
 
             q.push(" WHERE name = ").push_bind(name);
-            q.build().execute(pool).await?;
-            Ok(())
+            q.push(" RETURNING ").push(QUEUE_COLUMNS);
+            let row = q.build().fetch_one(&mut *tx).await?;
+            let written = queue_from_row(&row)?;
+
+            tx.commit().await?;
+            Ok(written)
         })
         .await
     }

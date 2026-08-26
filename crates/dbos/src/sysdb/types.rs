@@ -1404,6 +1404,33 @@ pub struct QueueUpdate {
 }
 
 impl QueueUpdate {
+    /// This update applied to a record, giving the row as it would be after the write.
+    ///
+    /// What a caller's validation is handed: a limit is rarely wrong on its own and usually wrong
+    /// only beside another, so the merged result is the only thing worth checking.
+    pub fn apply_to(&self, record: &QueueRecord) -> QueueRecord {
+        QueueRecord {
+            name: record.name.clone(),
+            concurrency: self.concurrency.set().unwrap_or(record.concurrency),
+            worker_concurrency: self
+                .worker_concurrency
+                .set()
+                .unwrap_or(record.worker_concurrency),
+            rate_limit: self.rate_limit.set().unwrap_or(record.rate_limit),
+            priority_enabled: self
+                .priority_enabled
+                .set()
+                .unwrap_or(record.priority_enabled),
+            partition_queue: self.partition_queue.set().unwrap_or(record.partition_queue),
+            polling_interval: self
+                .polling_interval
+                .set()
+                .unwrap_or(record.polling_interval),
+            // Not updatable: the name is the queue's address, and ownership moves only by rename.
+            application_name: record.application_name.clone(),
+        }
+    }
+
     /// Whether this would change nothing.
     pub fn is_empty(&self) -> bool {
         self.concurrency.is_leave()

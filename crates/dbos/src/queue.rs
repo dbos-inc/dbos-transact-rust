@@ -17,12 +17,16 @@
 //! The one queue with no row is [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE), which is the
 //! engine's own: `resume` and `fork` put work there, and it is not a queue anybody registers.
 
+use std::borrow::Cow;
+use std::result::Result as StdResult;
 use std::time::Duration;
 
 use crate::dbos::DBOS;
 use crate::error::{Error, Result};
-use crate::sysdb::INTERNAL_QUEUE;
-use crate::sysdb::types::{NewQueue, OnExistingQueue, QueueRecord};
+use crate::sysdb::types::{
+    Applications, Change, NewQueue, OnExistingQueue, QueueRecord, QueueUpdate,
+};
+use crate::sysdb::{Error as SysdbError, INTERNAL_QUEUE};
 
 /// How often a queue is polled when nothing says otherwise.
 ///
@@ -151,6 +155,25 @@ impl Default for QueueOptions {
     }
 }
 
+/// A change to a registered queue's limits, naming only what moves.
+///
+/// Every field defaults to [`Change::Leave`], so `..Default::default()` narrows an update rather
+/// than widening it — an update assembled from optional inputs cannot accidentally clear a limit
+/// it never mentioned. `Change::Set(None)` clears one deliberately; `Change::Set(Some(n))` sets it.
+///
+/// This is what the starter app's Apply button writes, and the reason a queue's configuration is a
+/// row rather than a constant beside the workflows using it: the next sweep publishes it, and
+/// every worker in the fleet picks it up on its next pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueChange {
+    /// How many of this queue's workflows may run at once across every executor.
+    pub concurrency: Change<Option<i32>>,
+    /// How many may run at once in one process.
+    pub worker_concurrency: Change<Option<i32>>,
+    /// How often this queue is polled when it is quiet.
+    pub polling_interval: Change<Duration>,
+}
+
 /// What registering a queue that already exists does to the stored limits.
 ///
 /// **Never to its owner.** A name already held by another application is
@@ -193,30 +216,51 @@ pub enum QueueConflict {
 ///   check and Java does not. The pair is incoherent rather than merely useless: the smaller number
 ///   wins in the dequeue, so the configuration does not say what it appears to say.
 fn validate(name: &str, options: &QueueOptions) -> Result<()> {
-    let refuse = |message: String| Err(Error::Config(format!("queue `{name}`: {message}")));
+    validate_fields(options)
+        .map_err(|(_, detail)| Error::Config(format!("queue `{name}`: {detail}")))
+}
+
+/// The rules themselves, naming the field that failed beside the message.
+///
+/// Split from [`validate`] because the two callers need the failure shaped differently: a
+/// registration turns it into [`Error::Config`], and [`DBOS::update_queue`] hands it to the system
+/// database as [`SysdbError::InvalidInput`], which names the field separately. The rules and
+/// their wording live here once so the two paths cannot drift.
+fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, String)> {
+    let refuse = |field: &'static str, message: String| Err((Cow::Borrowed(field), message));
 
     if let Some(global) = options.concurrency
         && global < 1
     {
-        return refuse(format!("`concurrency` must be at least 1, got {global}"));
+        return refuse(
+            "concurrency",
+            format!("`concurrency` must be at least 1, got {global}"),
+        );
     }
     if let Some(worker) = options.worker_concurrency
         && worker < 1
     {
-        return refuse(format!(
-            "`worker_concurrency` must be at least 1, got {worker}"
-        ));
+        return refuse(
+            "worker_concurrency",
+            format!("`worker_concurrency` must be at least 1, got {worker}"),
+        );
     }
     if let (Some(worker), Some(global)) = (options.worker_concurrency, options.concurrency)
         && worker > global
     {
-        return refuse(format!(
-            "`concurrency` must be greater than or equal to `worker_concurrency`, \
-             got {global} and {worker}"
-        ));
+        return refuse(
+            "worker_concurrency",
+            format!(
+                "`concurrency` must be greater than or equal to `worker_concurrency`, \
+                 got {global} and {worker}"
+            ),
+        );
     }
     if options.polling_interval.is_zero() {
-        return refuse("`polling_interval` cannot be zero".to_owned());
+        return refuse(
+            "polling_interval",
+            "`polling_interval` cannot be zero".to_owned(),
+        );
     }
     Ok(())
 }
@@ -318,5 +362,137 @@ impl DBOS {
             tracing::info!(queue = name, "registered a queue");
         }
         Ok(Queue::from_record(record))
+    }
+}
+
+impl DBOS {
+    /// The queue registered under this name, or `None` if there is none.
+    ///
+    /// Reads the row, so it reports what this executor's dequeues will actually honour — including
+    /// changes a peer made since this process registered it.
+    pub async fn queue(&self, name: &str) -> Result<Option<Queue>> {
+        let executor = self.executor("read a queue")?;
+        Ok(executor
+            .sysdb()
+            .get_queue(name)
+            .await
+            .map_err(Error::SystemDatabase)?
+            .map(Queue::from_record))
+    }
+
+    /// Every queue this application can dequeue from.
+    ///
+    /// Its own, plus the unclaimed ones. A peer application's queues are not listed: they are not
+    /// this one's to poll, and reporting them would suggest otherwise.
+    ///
+    /// [`INTERNAL_QUEUE`] is **not** among them. It has no row, takes no limits, and is not a
+    /// queue anybody registered.
+    pub async fn list_queues(&self) -> Result<Vec<Queue>> {
+        let executor = self.executor("list queues")?;
+        Ok(executor
+            .sysdb()
+            .list_queues(&Applications::Unset)
+            .await
+            .map_err(Error::SystemDatabase)?
+            .into_iter()
+            .filter(|queue| queue.name != INTERNAL_QUEUE)
+            .map(Queue::from_record)
+            .collect())
+    }
+
+    /// Changes a registered queue's limits, leaving what the change does not name.
+    ///
+    /// **This is the "without restarting the app" half of the queue design.** Every worker re-reads
+    /// its queue's row on every pass, so a limit written here takes effect across the whole fleet
+    /// within a poll — no redeploy, no restart, and no per-process disagreement about what the
+    /// limit is.
+    ///
+    /// The merged result is validated the way a registration is, so an update cannot leave the
+    /// queue in a state [`register_queue`](Self::register_queue) would have refused.
+    ///
+    /// **The read, the merge, the validation and the write are one transaction.** The stored row
+    /// is read under a row lock, the change is merged onto it, the result is validated, and the
+    /// write lands before the lock is released — so two operators changing different limits at the
+    /// same instant cannot store a pair neither asked for. The second waits for the first and
+    /// validates against what it actually wrote. Go manages the same thing through
+    /// `UpdateQueueConfig`; Python and TypeScript read and write separately and can store an
+    /// incoherent pair.
+    pub async fn update_queue(&self, name: &str, change: QueueChange) -> Result<Queue> {
+        let executor = self.executor("update a queue")?;
+        if name == INTERNAL_QUEUE {
+            return Err(Error::Config(format!(
+                "the queue name `{name}` is reserved for the engine's internal queue"
+            )));
+        }
+
+        // Runs inside the system database's transaction, against the row it has locked, and is
+        // handed the row as the update would leave it. It reads nothing itself and may be called
+        // more than once: a retried attempt judges again, against the row that attempt read.
+        //
+        // The merged row rather than the change, because a limit is rarely wrong on its own:
+        // `worker_concurrency` is always fine by itself and only becomes wrong beside the
+        // `concurrency` already stored.
+        let validate = |merged: &QueueRecord| -> StdResult<(), SysdbError> {
+            let options = QueueOptions {
+                concurrency: merged.concurrency,
+                worker_concurrency: merged.worker_concurrency,
+                polling_interval: merged.polling_interval,
+                on_conflict: QueueConflict::default(),
+            };
+            validate_fields(&options)
+                .map_err(|(field, detail)| SysdbError::InvalidInput { field, detail })
+        };
+
+        let update = QueueUpdate {
+            concurrency: change.concurrency,
+            worker_concurrency: change.worker_concurrency,
+            polling_interval: change.polling_interval,
+            ..QueueUpdate::default()
+        };
+
+        // The row as written, so there is no read back to do: it left the transaction that wrote
+        // it, which is a stronger guarantee than re-reading afterwards ever was.
+        let record = executor
+            .sysdb()
+            .update_queue(name, &update, &validate)
+            .await
+            .map_err(|error| match error {
+                // The refusal `validate` handed down, restored to the shape a registration's would
+                // have taken: the caller made an API mistake, not the database.
+                SysdbError::InvalidInput { detail, .. } => {
+                    Error::Config(format!("queue `{name}`: {detail}"))
+                }
+                SysdbError::NotRegistered { .. } => {
+                    Error::Config(format!("no queue named `{name}` is registered"))
+                }
+                other => Error::SystemDatabase(other),
+            })?;
+        tracing::info!(queue = name, "updated the queue's limits");
+        Ok(Queue::from_record(record))
+    }
+
+    /// Removes a queue's registration.
+    ///
+    /// Removing one that is not registered is not an error: the end state is what was asked for.
+    ///
+    /// **Workflows already enqueued on it are not touched.** They keep the queue name they were
+    /// given and stop being dequeued, because a worker only exists for a queue that has a row —
+    /// so deleting a queue with a backlog strands that backlog until the queue is registered
+    /// again. That is the same behaviour in every implementation, and it is why deleting is not
+    /// how you pause a queue.
+    pub async fn delete_queue(&self, name: &str) -> Result<()> {
+        let executor = self.executor("delete a queue")?;
+        if name == INTERNAL_QUEUE {
+            return Err(Error::Config(format!(
+                "the queue name `{name}` is reserved for the engine's internal queue"
+            )));
+        }
+        executor
+            .sysdb()
+            .delete_queue(name)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        tracing::info!(queue = name, "deleted the queue");
+        Ok(())
     }
 }

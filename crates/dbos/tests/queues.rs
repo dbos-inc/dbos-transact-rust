@@ -10,7 +10,10 @@ use std::time::Duration;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewQueue, OnExistingQueue, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
-use dbos::{Config, DBOS, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout};
+use dbos::{
+    Change, Config, DBOS, Error, QueueChange, QueueConflict, QueueOptions, RunOptions,
+    StartOptions, Timeout,
+};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -692,6 +695,214 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
         WorkflowStatus::Enqueued,
         "an empty listen set drained a registered queue"
     );
+
+    dbos.shutdown().await;
+}
+
+/// **A limit changed at runtime takes effect without a restart, which is the tab's whole point.**
+///
+/// The queue starts with `worker_concurrency: 1`, so a fan-out runs one at a time. Raising it to
+/// three mid-flight is picked up by the worker on its next pass, and the rest run three at once.
+#[tokio::test]
+async fn updating_a_queue_changes_what_a_running_worker_honours() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-update-limits-app", &db));
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let workflow = dbos
+        .register_workflow("held", {
+            let live = Arc::clone(&live);
+            let peak = Arc::clone(&peak);
+            move |()| {
+                let live = Arc::clone(&live);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions {
+            worker_concurrency: Some(1),
+            ..QueueOptions::default()
+        },
+    )
+    .await
+    .expect("registration failed");
+
+    let mut handles = Vec::new();
+    for n in 0..6 {
+        handles.push(
+            workflow
+                .start_with(
+                    (),
+                    StartOptions {
+                        workflow_id: Some(&format!("fanned-{n}")),
+                        queue: Some("demo-queue"),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+                .expect("enqueue failed"),
+        );
+    }
+
+    // One at a time to begin with.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "the queue exceeded a worker_concurrency of 1"
+    );
+
+    let updated = dbos
+        .update_queue(
+            "demo-queue",
+            QueueChange {
+                worker_concurrency: Change::Set(Some(3)),
+                ..QueueChange::default()
+            },
+        )
+        .await
+        .expect("update failed");
+    assert_eq!(updated.worker_concurrency(), Some(3));
+
+    for handle in handles {
+        handle.result().await.expect("the workflow failed");
+    }
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        3,
+        "the raised limit was not picked up by the running worker"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// An update is validated as a whole, against what is already stored.
+///
+/// `worker_concurrency` on its own is always fine; it is only wrong beside the
+/// `concurrency` the row already holds, which is why the merged result is what gets checked.
+#[tokio::test]
+async fn an_update_cannot_leave_a_queue_incoherent() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-update-invalid-app", &db));
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions {
+            concurrency: Some(2),
+            worker_concurrency: Some(2),
+            ..QueueOptions::default()
+        },
+    )
+    .await
+    .expect("registration failed");
+
+    let error = dbos
+        .update_queue(
+            "demo-queue",
+            QueueChange {
+                worker_concurrency: Change::Set(Some(5)),
+                ..QueueChange::default()
+            },
+        )
+        .await
+        .expect_err("an incoherent update was accepted");
+    assert!(
+        matches!(&error, Error::Config(message)
+            if message.contains("must be greater than or equal to `worker_concurrency`")),
+        "expected a refusal about the pair, got {error:?}"
+    );
+    assert_eq!(
+        dbos.queue("demo-queue")
+            .await
+            .expect("read failed")
+            .expect("the queue is missing")
+            .worker_concurrency(),
+        Some(2),
+        "the refused update was written anyway"
+    );
+
+    // Raising both together is coherent, and accepted.
+    let updated = dbos
+        .update_queue(
+            "demo-queue",
+            QueueChange {
+                concurrency: Change::Set(Some(5)),
+                worker_concurrency: Change::Set(Some(5)),
+                ..QueueChange::default()
+            },
+        )
+        .await
+        .expect("a coherent update was refused");
+    assert_eq!(updated.concurrency(), Some(5));
+
+    dbos.shutdown().await;
+}
+
+/// Reading, listing and deleting a queue, and the internal queue's absence from all three.
+#[tokio::test]
+async fn the_queue_registry_can_be_read_and_deleted() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-registry-app", &db));
+    dbos.launch().await.expect("launch failed");
+    for name in ["alpha", "beta"] {
+        dbos.register_queue(name, QueueOptions::default())
+            .await
+            .expect("registration failed");
+    }
+
+    assert!(
+        dbos.queue("nothing-here")
+            .await
+            .expect("read failed")
+            .is_none()
+    );
+    let mut names: Vec<String> = dbos
+        .list_queues()
+        .await
+        .expect("list failed")
+        .into_iter()
+        .map(|queue| queue.name().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["alpha", "beta"],
+        "the internal queue is not a queue anybody registered"
+    );
+
+    dbos.delete_queue("alpha").await.expect("delete failed");
+    assert!(dbos.queue("alpha").await.expect("read failed").is_none());
+    // Deleting what is not there is the end state asked for, not an error.
+    dbos.delete_queue("alpha")
+        .await
+        .expect("second delete failed");
+
+    for name in [INTERNAL_QUEUE] {
+        assert!(
+            matches!(
+                dbos.delete_queue(name).await,
+                Err(Error::Config(message)) if message.contains("reserved")
+            ),
+            "the internal queue was deletable"
+        );
+        assert!(
+            matches!(
+                dbos.update_queue(name, QueueChange::default()).await,
+                Err(Error::Config(message)) if message.contains("reserved")
+            ),
+            "the internal queue was updatable"
+        );
+    }
 
     dbos.shutdown().await;
 }
