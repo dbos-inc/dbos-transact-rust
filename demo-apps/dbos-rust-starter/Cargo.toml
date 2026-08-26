@@ -1,6 +1,7 @@
-# The Workflows tab of the DBOS starter app, and the acceptance test for the execution engine:
-# launch a workflow, crash the process, restart, and watch it resume at the step after the last
-# one that finished.
+# The Workflows and Queues tabs of the DBOS starter app, and the acceptance test for the
+# execution engine: launch a workflow, crash the process, restart, and watch it resume at the step
+# after the last one that finished — then fan five workflows onto a queue that runs three at a
+# time, and change that limit without restarting.
 [package]
 name = "dbos-rust-starter"
 description = "DBOS Rust starter app"
@@ -16,5 +17,15 @@ dbos = { path = "../../crates/dbos" }
 
 axum = "0.8"
 # `signal` for the Ctrl-C that ends the serve loop, so `shutdown` is reached rather than skipped.
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+# `sync` for the mutex guarding the queue demo's handles, which is held across an await.
+tokio = { version = "1", features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+# Derives only, for the Queues tab's JSON request and response bodies.
+serde = { version = "1", features = ["derive"] }
 tracing-subscriber = "0.3"
