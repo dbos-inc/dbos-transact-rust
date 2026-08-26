@@ -538,6 +538,164 @@ async fn a_queue_this_process_never_registered_is_dequeued_from() {
     dbos.shutdown().await;
 }
 
+/// **`listen_queues` narrows what this process dequeues from, and nothing else changes.**
+///
+/// Both queues have rows and both hold work; only the listened one is drained. The other's
+/// workflow stays `ENQUEUED` for a peer that does listen to it — which is the point, and why this
+/// is a split of one application's fleet rather than a way to disable a queue.
+#[tokio::test]
+async fn listen_queues_narrows_what_this_process_dequeues() {
+    let db = test_database().await;
+    let dbos = DBOS::new(Config {
+        listen_queues: Some(vec!["fast".to_owned()]),
+        ..config("listen-queues-app", &db)
+    });
+    let workflow = dbos
+        .register_workflow("either", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    for name in ["fast", "slow"] {
+        dbos.register_queue(name, QueueOptions::default())
+            .await
+            .expect("registration failed");
+    }
+
+    let listened = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("on-the-listened-queue"),
+                queue: Some("fast"),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("on-the-other-queue"),
+                queue: Some("slow"),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    assert_eq!(listened.result().await.expect("the workflow failed"), 1);
+
+    // By now several sweeps have run; the unlistened queue has not been touched.
+    assert_eq!(
+        reader(&db)
+            .await
+            .get_workflow("on-the-other-queue")
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Enqueued,
+        "a queue this process does not listen to was drained anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// The internal queue is dequeued from whatever `listen_queues` says.
+///
+/// `resume`, `fork` and recovery all put work there, so a filter that excluded it would strand
+/// them silently. Here the filter names one unrelated queue, and a workflow enqueued onto the
+/// internal queue still runs.
+#[tokio::test]
+async fn listen_queues_never_excludes_the_internal_queue() {
+    let db = test_database().await;
+    let dbos = DBOS::new(Config {
+        listen_queues: Some(vec!["something-else".to_owned()]),
+        ..config("listen-internal-app", &db)
+    });
+    let workflow = dbos
+        .register_workflow("internal", |()| async move { Ok::<u32, Error>(4) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("internal-under-a-filter"),
+                queue: Some(INTERNAL_QUEUE),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    assert_eq!(handle.result().await.expect("the workflow failed"), 4);
+
+    dbos.shutdown().await;
+}
+
+/// An empty list listens to nothing, which is a setting rather than a mistake.
+///
+/// Distinct from `None`, which is every queue. Go's empty set means "all"; Rust's `Option` carries
+/// that meaning instead, so an empty slice can mean what it says. The internal queue still runs,
+/// as it always does.
+#[tokio::test]
+async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
+    let db = test_database().await;
+    let dbos = DBOS::new(Config {
+        listen_queues: Some(Vec::new()),
+        ..config("listen-none-app", &db)
+    });
+    let workflow = dbos
+        .register_workflow("nothing", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("ignored", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("never-drained"),
+                queue: Some("ignored"),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    // The internal queue proves the loop is running at all, rather than the assertion below
+    // passing because nothing works.
+    let internal = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("still-internal"),
+                queue: Some(INTERNAL_QUEUE),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    assert_eq!(internal.result().await.expect("the workflow failed"), 1);
+
+    assert_eq!(
+        reader(&db)
+            .await
+            .get_workflow("never-drained")
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Enqueued,
+        "an empty listen set drained a registered queue"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **A stored row for the internal queue is ignored, not honoured.**
 ///
 /// `register_queue` refuses the name, but nothing else does — every peer implementation's client

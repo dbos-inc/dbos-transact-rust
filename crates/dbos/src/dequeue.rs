@@ -197,6 +197,12 @@ async fn supervise(executor: Arc<Executor>) {
 /// behaviour and the only safe one: publishing an empty set would stop every worker, and the next
 /// tick would start them all again.
 ///
+/// **[`Config::listen_queues`](crate::Config::listen_queues) narrows it here, after the read.**
+/// Intersecting rather than querying for the named queues is what makes the filter dynamic for
+/// free: a listened queue registered after launch appears the moment its row does, and one deleted
+/// disappears, without the filter needing to know either happened. The internal queue is added
+/// before the filter and never subject to it.
+///
 /// `warned_internal` is the supervisor's, so the warning about a stored internal-queue row is
 /// emitted once for the life of the executor rather than on every sweep.
 async fn refresh_queue_set(
@@ -221,6 +227,7 @@ async fn refresh_queue_set(
     // first, and a stored row under the name is skipped below rather than allowed to replace it.
     let mut current: HashMap<String, QueueRecord> =
         HashMap::from([(INTERNAL_QUEUE.to_owned(), internal_queue())]);
+    let listened = executor.listen_queues();
     for queue in listed {
         if queue.name == INTERNAL_QUEUE {
             // **Skipped, and said out loud once.** Rust's `register_queue` refuses this name, but
@@ -236,6 +243,11 @@ async fn refresh_queue_set(
                      limits are ignored. Delete the row: it can only throttle `resume` and `fork`"
                 );
             }
+            continue;
+        }
+        if let Some(listened) = listened
+            && !listened.contains(&queue.name)
+        {
             continue;
         }
         current.insert(queue.name.clone(), queue);

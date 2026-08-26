@@ -20,6 +20,7 @@ pub struct Executor {
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
     app_name: String,
+    listen_queues: Option<Vec<String>>,
     tasks: Tasks,
     outcome_poll_interval: std::time::Duration,
 }
@@ -102,6 +103,7 @@ impl Executor {
             runtime: tokio::runtime::Handle::current(),
             workflows,
             app_name: config.app_name.clone(),
+            listen_queues: config.listen_queues.clone(),
             tasks: Tasks::default(),
             outcome_poll_interval: config.outcome_poll_interval(),
         };
@@ -126,6 +128,14 @@ impl Executor {
     /// The workflows this executor started and has not seen finish.
     pub(crate) fn tasks(&self) -> &Tasks {
         &self.tasks
+    }
+
+    /// Which queues this executor dequeues from, or `None` for all of them.
+    ///
+    /// Captured at launch: it is configuration, not a knob. The *set* it narrows is still rebuilt
+    /// from the table on every sweep, which is where the dynamic behaviour lives.
+    pub(crate) fn listen_queues(&self) -> Option<&[String]> {
+        self.listen_queues.as_deref()
     }
 
     /// How often an adopting caller asks whether the run that won has finished.
