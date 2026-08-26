@@ -141,6 +141,51 @@ async fn tolerates_a_database_ahead_of_this_build() {
     assert_eq!(version(&pool).await, ahead);
 }
 
+/// A database short of the ceiling is refused at launch rather than one column at a time.
+///
+/// The bar is the whole corpus, because everything in it is something some statement names. A
+/// peer that migrated to the version before this build's ceiling and stopped — which is what an
+/// implementation that has not ported the newest shared migration leaves behind — must be
+/// reported here, not discovered later as a missing column on whichever query touches it first.
+#[tokio::test]
+async fn verify_refuses_a_database_short_of_the_ceiling() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    runner::run(&pool, SCHEMA, true).await.unwrap();
+
+    let behind = i64::from(SHARED_MIGRATIONS) - 1;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "UPDATE {}.dbos_migrations SET version = {behind}",
+        quote_identifier(SCHEMA)
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = runner::verify(&pool, SCHEMA)
+        .await
+        .expect_err("a database short of the ceiling passed");
+    assert!(
+        matches!(
+            error,
+            runner::MigrateError::Outdated { recorded, required }
+                if recorded == behind && required == i64::from(SHARED_MIGRATIONS)
+        ),
+        "got {error:?}"
+    );
+}
+
+/// A fully migrated database passes, which is what makes the check above mean something.
+#[tokio::test]
+async fn verify_accepts_a_fully_migrated_database() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    runner::run(&pool, SCHEMA, true).await.unwrap();
+    runner::verify(&pool, SCHEMA)
+        .await
+        .expect("a fully migrated database was refused");
+}
+
 /// Empty migrations consume their version numbers.
 ///
 /// With notifications off, migrations 39, 43, and 44 do nothing — but the final version must

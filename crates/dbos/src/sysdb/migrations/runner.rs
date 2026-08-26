@@ -7,7 +7,7 @@
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use super::{
-    Dialect, LOCAL_MIGRATIONS, Migration, RenderError, build_migrations, quote_identifier,
+    Dialect, Migration, RenderError, SHARED_MIGRATIONS, build_migrations, quote_identifier,
 };
 
 /// How many times a migration is retried before giving up.
@@ -332,8 +332,16 @@ pub async fn run(
 /// A database *ahead* of this build passes. That is the same rule [`apply`] follows, and it is
 /// what lets implementations at different versions share one database: the schema only ever
 /// gains, so a newer one still has everything these queries name.
+///
+/// **The bar is [`SHARED_MIGRATIONS`], not this implementation's own history.** Everything the
+/// corpus defines is something some statement here names — `QUEUE_COLUMNS` selects
+/// `application_name` from migration 101 and the per-partition limits from 108 — so a database
+/// that stopped short of the ceiling is one this build cannot read, whatever it can parse. The
+/// distinction matters now that the shared series has a migration the other implementations have
+/// not ported: a peer that migrated to 107 and stopped leaves a database that would pass any
+/// lower bar and then fail on the first queue read.
 pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
-    let required = i64::from(LOCAL_MIGRATIONS);
+    let required = i64::from(SHARED_MIGRATIONS);
     let recorded = match recorded_version(pool, schema).await {
         Ok(version) => version,
         // No table, or no schema at all. Both mean nothing has migrated this database, which is
