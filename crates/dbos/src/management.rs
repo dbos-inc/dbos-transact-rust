@@ -6,11 +6,10 @@
 //! admin endpoint rather than a host that can run the work — it may not even have the code. The
 //! surface is shaped by that: nothing here runs a workflow.
 //!
-//! [`resume`](DBOS::resume) and [`fork`](DBOS::fork) were **inert until the engine had a dequeue
-//! loop**, which is why the whole slice arrives after queues. Each writes an `ENQUEUED` row and
-//! leaves it for whichever executor next polls that queue, which is what every reference does — so
-//! both hand back a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this
-//! process is very probably not the one doing the work.
+//! [`resume`](DBOS::resume) and [`fork`](DBOS::fork) each write an `ENQUEUED` row and leave it for
+//! whichever executor next polls that queue, which is what every reference does — so both hand back
+//! a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process is very
+//! probably not the one doing the work.
 //!
 //! # Naming
 //!
@@ -56,10 +55,10 @@
 //!
 //! **It does not record itself as a step.** Python routes every one of these through
 //! `call_function_as_step`, so a management call made *from inside a workflow* is checkpointed and
-//! replays instead of running twice. Rust has no such mechanism yet, and building one is a wider
-//! change than this slice — it would also cover `send`, `recv` and `get_event`. Until then, calling
-//! these from inside a workflow body re-runs them on every replay. Calling them from an operator's
-//! tool, which is what they are for, is unaffected.
+//! replays instead of running twice; TypeScript's `runInternalStep` and Go's `RunAsStep` are the
+//! same mechanism. Rust has no equivalent, so calling these from inside a workflow body re-runs
+//! them on every replay. Calling them from an operator's tool, which is what they are for, is
+//! unaffected.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -182,9 +181,11 @@ impl DBOS {
     ///
     /// So the check buys nothing here. A mistyped id is reported at the first use, with the error
     /// a check would have raised, one round trip later and only for callers who use it — and this
-    /// stays a plain function, so mapping a listing to handles costs nothing. The flag itself will
-    /// want revisiting when the client arrives, where awaiting an id whose row another process has
-    /// not committed yet is the case it exists for.
+    /// stays a plain function, so mapping a listing to handles costs nothing.
+    ///
+    /// The case the flag exists for is the other one: awaiting an id whose row another process has
+    /// written but not yet committed. Rust reports that as a missing workflow rather than waiting
+    /// for it.
     ///
     /// It is not the same line [`resume`](Self::resume) draws, and deliberately: a resume is a
     /// write that would otherwise silently do nothing.
