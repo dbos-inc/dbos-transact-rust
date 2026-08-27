@@ -548,7 +548,22 @@ async fn dispatch_claimed(
     }
 
     tracing::debug!(workflows = rows.len(), "dequeued workflows");
-    for row in rows {
+
+    // **Dispatched in claim order, not in the order the read came back.** The claim sorts its
+    // batch into dequeue order and says so, because that order is what `priority` is for; the
+    // read that follows is a `list_workflows`, which sorts by `created_at`. Walking the rows as
+    // they arrive would therefore undo the sort — and `dispatch` awaits a round trip apiece, so
+    // on a prioritised queue the workflow that ranked first would start last, one round trip per
+    // row late. Indexing the rows and walking the claimed ids is how Python keeps the order too.
+    let mut by_id: HashMap<String, _> = rows
+        .into_iter()
+        .map(|row| (row.workflow_id.clone(), row))
+        .collect();
+    for id in &claimed {
+        // A claimed id with no row was counted in the warning above; there is nothing to start.
+        let Some(row) = by_id.remove(id) else {
+            continue;
+        };
         let workflow_id = row.workflow_id.clone();
         // The row's own key rather than the one being swept, so the batched path — which names no
         // partition and claims across all of them — still credits each tally correctly.
