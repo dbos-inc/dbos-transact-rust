@@ -1409,6 +1409,42 @@ impl QueueUpdate {
     /// What a caller's validation is handed: a limit is rarely wrong on its own and usually wrong
     /// only beside another, so the merged result is the only thing worth checking.
     pub fn apply_to(&self, record: &QueueRecord) -> QueueRecord {
+        let partition_concurrency = self
+            .partition_concurrency
+            .set()
+            .unwrap_or(record.partition_concurrency);
+        let partition_worker_concurrency = self
+            .partition_worker_concurrency
+            .set()
+            .unwrap_or(record.partition_worker_concurrency);
+        let partition_rate_limit = self
+            .partition_rate_limit
+            .set()
+            .unwrap_or(record.partition_rate_limit);
+        // **The flag follows the limits**, so the merged row carries the flag the write will
+        // store rather than the one the stored row happened to have. Three cases, and they are
+        // the three the `UPDATE` assigns by: an update naming the flag is taken at its word; one
+        // moving any per-partition limit has the flag rewritten to match what the row will hold;
+        // one touching neither keeps what the row says, which is how a peer's
+        // flag-without-limits row survives an unrelated update.
+        //
+        // Derived here rather than only in the `UPDATE` so that a validator is handed the row it
+        // will actually get. An update clearing the last partition limit would otherwise be
+        // judged against a row that still looked legacy-partitioned, and so through the
+        // re-scoping in [`QueueRecord::resolved_limits`] — which points a refusal at the wrong
+        // field even where the verdict comes out the same.
+        let partition_queue = match self.partition_queue.set() {
+            Some(flag) => flag,
+            None if !(self.partition_concurrency.is_leave()
+                && self.partition_worker_concurrency.is_leave()
+                && self.partition_rate_limit.is_leave()) =>
+            {
+                partition_concurrency.is_some()
+                    || partition_worker_concurrency.is_some()
+                    || partition_rate_limit.is_some()
+            }
+            None => record.partition_queue,
+        };
         QueueRecord {
             name: record.name.clone(),
             concurrency: self.concurrency.set().unwrap_or(record.concurrency),
@@ -1421,19 +1457,10 @@ impl QueueUpdate {
                 .priority_enabled
                 .set()
                 .unwrap_or(record.priority_enabled),
-            partition_queue: self.partition_queue.set().unwrap_or(record.partition_queue),
-            partition_concurrency: self
-                .partition_concurrency
-                .set()
-                .unwrap_or(record.partition_concurrency),
-            partition_worker_concurrency: self
-                .partition_worker_concurrency
-                .set()
-                .unwrap_or(record.partition_worker_concurrency),
-            partition_rate_limit: self
-                .partition_rate_limit
-                .set()
-                .unwrap_or(record.partition_rate_limit),
+            partition_queue,
+            partition_concurrency,
+            partition_worker_concurrency,
+            partition_rate_limit,
             polling_interval: self
                 .polling_interval
                 .set()

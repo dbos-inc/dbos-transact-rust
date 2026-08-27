@@ -5539,27 +5539,20 @@ impl SystemDatabase for PostgresSystemDatabase {
             assign!(update.worker_concurrency.set(), "worker_concurrency");
             assign!(update.priority_enabled.set(), "priority_enabled");
             // **The flag and the limits are two spellings of one fact**, so the column is never
-            // written disagreeing with them. Three cases, and exactly one of them assigns:
+            // written disagreeing with them. `apply_to` has already resolved which of the three
+            // cases this update is — the flag named outright, the flag rewritten to match a
+            // moved per-partition limit, or neither touched — so the value to store is the
+            // merged row's, and the only question left here is whether to assign at all.
             //
-            // - the update names the flag, and is taken at its word — which is the only way a row
-            //   in the deprecated shape gets written at all;
-            // - it names no flag but moves a per-partition limit, so the flag is rewritten to
-            //   match what the row will hold;
-            // - it touches neither, and the column is left alone — a row a peer wrote with the
-            //   deprecated flag and no limits keeps what it says.
-            match update.partition_queue.set() {
-                Some(flag) => {
-                    set.push("partition_queue = ");
-                    set.push_bind_unseparated(flag);
-                }
-                None if !(update.partition_concurrency.is_leave()
-                    && update.partition_worker_concurrency.is_leave()
-                    && update.partition_rate_limit.is_leave()) =>
-                {
-                    set.push("partition_queue = ");
-                    set.push_bind_unseparated(merged.has_partition_limits());
-                }
-                None => {}
+            // Assigning nothing when neither is touched is what lets a row a peer wrote with the
+            // deprecated flag and no limits keep what it says.
+            if !(update.partition_queue.is_leave()
+                && update.partition_concurrency.is_leave()
+                && update.partition_worker_concurrency.is_leave()
+                && update.partition_rate_limit.is_leave())
+            {
+                set.push("partition_queue = ");
+                set.push_bind_unseparated(merged.partition_queue);
             }
             assign!(update.partition_concurrency.set(), "partition_concurrency");
             assign!(
