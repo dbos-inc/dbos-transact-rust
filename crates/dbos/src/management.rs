@@ -512,25 +512,55 @@ impl DBOS {
     /// Replaces a workflow's attributes, or clears them with `None`.
     ///
     /// **A replacement, not a merge**, in every implementation — so a caller adding one key must
-    /// send the others back with it. `attributes` is encoded JSON and must be a JSON *object*:
-    /// the column is queried with `@>` containment by [`WorkflowFilter::attributes`], and
-    /// containment against a bare scalar or an array does not mean what a caller would read it to
-    /// mean.
+    /// send the others back with it.
+    ///
+    /// **A map, not encoded JSON.** The other three take one — Python `Dict[str, Any]`, Go
+    /// `map[string]any`, Java `Map<String, Object>` — and encode it in their system database layer.
+    /// Rust's cannot: it handles every payload as an opaque string so a host across an FFI boundary
+    /// can hand over bytes it already has, which is why `validate_attributes` checks the object
+    /// shape down there *"rather than falling out of the type"*. Here it falls out of the type.
+    /// This is the layer that encodes, and it is the only one that can.
+    ///
+    /// The object shape is not decoration: [`WorkflowFilter::attributes`] queries the column with
+    /// `@>` containment, and containment against a stored array or scalar silently never matches.
+    ///
+    /// `serde_json::Value::as_object` is the usual way in — and note that it answers `None` for a
+    /// value that is not an object, which **clears** rather than refusing. Build a
+    /// `serde_json::Map` directly when the attributes are assembled at runtime.
     ///
     /// **Named for what three of the four call it.** Python's is `update_workflow_attributes` and
     /// Java's `updateWorkflowAttributes`; TypeScript has no attributes method at all; and Go's
     /// method is `SetWorkflowAttributes` while the step it records is `DBOS.updateWorkflowAttributes`
     /// — so Go disagrees with itself, and the stored name is the half that other implementations
     /// read.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// let tags = serde_json::json!({ "tenant": "acme", "tier": "gold" });
+    /// dbos.update_workflow_attributes("an-order", tags.as_object()).await?;
+    /// dbos.update_workflow_attributes("an-order", None).await?; // and cleared
+    /// # Ok(()) }
+    /// ```
     pub async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
-        attributes: Option<&str>,
+        attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<()> {
         let executor = self.executor("update a workflow's attributes")?;
+        // Plain JSON, never the configured [`Serializer`](crate::Serializer): the column is read by
+        // `@>` containment and by every other implementation, so what a workflow chose for its own
+        // payloads has no say in it.
+        let encoded = attributes
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| Error::Serialization {
+                what: "attributes".into(),
+                message: error.to_string(),
+                source: Some(error),
+            })?;
         executor
             .sysdb()
-            .update_workflow_attributes(workflow_id, attributes)
+            .update_workflow_attributes(workflow_id, encoded.as_deref())
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(workflow_id, "updated the workflow's attributes");

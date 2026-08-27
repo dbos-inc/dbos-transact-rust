@@ -931,7 +931,8 @@ async fn attributes_are_replaced_and_can_be_searched() {
         .await
         .expect("the workflow failed");
 
-    dbos.update_workflow_attributes(id, Some(r#"{"tenant":"acme","tier":"gold"}"#))
+    let tags = serde_json::json!({ "tenant": "acme", "tier": "gold" });
+    dbos.update_workflow_attributes(id, tags.as_object())
         .await
         .expect("update failed");
 
@@ -952,7 +953,8 @@ async fn attributes_are_replaced_and_can_be_searched() {
     );
 
     // A replacement, not a merge: the key that is not sent again is gone.
-    dbos.update_workflow_attributes(id, Some(r#"{"tenant":"acme"}"#))
+    let fewer = serde_json::json!({ "tenant": "acme" });
+    dbos.update_workflow_attributes(id, fewer.as_object())
         .await
         .expect("update failed");
     let after_replacement = dbos
