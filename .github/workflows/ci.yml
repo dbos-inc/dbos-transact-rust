@@ -91,6 +91,14 @@ jobs:
   test:
     name: Test (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    # The three files the steps below hand between them: cargo's own output, the harness's
+    # records, and the JUnit XML derived from the first. Named once here because four steps
+    # refer to them and a path that drifts between two of them fails silently — an empty
+    # summary and an artifact with nothing in it both look like a run that had nothing to say.
+    env:
+      RUNNER_TEST_LOG: ${{ github.workspace }}/test-output.log
+      RUNNER_TIMINGS: ${{ github.workspace }}/harness-timings.jsonl
+      RUNNER_TEST_RESULTS: ${{ github.workspace }}/test-results
     # Both legs run in well under ten minutes, so this is a hang guard rather than a budget.
     # Without it a single stuck test burns GitHub's six-hour default before saying anything:
     # `with_retry` has no attempt limit by design, so any error it classes as transient or
@@ -114,8 +122,7 @@ jobs:
       - name: Test
         env:
           DBOS_TEST_USE_COCKROACH_DB: ${{ matrix.cockroach }}
-          DBOS_TEST_TIMINGS: ${{ github.workspace }}/harness-timings.jsonl
-          RUNNER_TEST_LOG: ${{ github.workspace }}/test-output.log
+          DBOS_TEST_TIMINGS: ${{ env.RUNNER_TIMINGS }}
         # Teed rather than piped away: the summary step reads per-binary wall clock back out
         # of this, which is the half the harness cannot see. `shell: bash` is what makes that
         # safe — GitHub runs it with `-eo pipefail`, so a failing `cargo test` still fails the
@@ -125,6 +132,32 @@ jobs:
         run: |
           set -o pipefail
           cargo test --all-features 2>&1 | tee "$RUNNER_TEST_LOG"
+      - name: Test results as JUnit
+        id: junit
+        # libtest on stable writes neither JUnit nor JSON, and `cargo-nextest`, which writes
+        # JUnit natively, runs every test in its own process — under which this suite's
+        # container sharing degrades to one container per test, since the reference count that
+        # does the sharing is a `static` inside one process. So the XML is derived from the log
+        # the step above already teed, rather than from a second run under another runner.
+        if: always()
+        shell: bash
+        run: |
+          python3 .github/scripts/junit-from-cargo-test.py "$RUNNER_TEST_LOG" "$RUNNER_TEST_RESULTS"
+          # Counted rather than assumed: a run that died before any binary reported leaves no
+          # XML, and `test-summary` errors on a glob that matches nothing. Skipping it there
+          # keeps the real failure — the test step's — as the reason the job is red.
+          count=$(ls -1 "$RUNNER_TEST_RESULTS"/*.xml 2>/dev/null | wc -l)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Test summary
+        uses: test-summary/action@v2
+        if: always() && steps.junit.outputs.count != '0'
+        with:
+          paths: ${{ env.RUNNER_TEST_RESULTS }}/*.xml
+          # Passing tests are the job's own green tick; what a person opens a red run to read
+          # is which ones failed and what was skipped. Java's workflow shows the same two.
+          show: "fail, skip"
+
       - name: Harness timings
         # What the suite spent before running anything, per test binary. The costs split two
         # ways and want opposite fixes: starting a server and migrating its baseline are paid
@@ -207,9 +240,20 @@ jobs:
           # exposes no API for it, so a summary that goes only there cannot be fetched,
           # diffed against last week's run, or read by anything but a browser.
           } | tee -a "$GITHUB_STEP_SUMMARY"
-        env:
-          RUNNER_TIMINGS: ${{ github.workspace }}/harness-timings.jsonl
-          RUNNER_TEST_LOG: ${{ github.workspace }}/test-output.log
+      - name: Upload ${{ matrix.backend }} test results
+        uses: actions/upload-artifact@v7
+        # The summary above is rendered and lossy; these are what it was rendered from. A
+        # failure that needs the surrounding output, or a timing question the table does not
+        # answer, is answered from here without re-running the suite.
+        if: always()
+        with:
+          name: test-results-${{ matrix.backend }}
+          path: |
+            ${{ env.RUNNER_TEST_RESULTS }}/
+            ${{ env.RUNNER_TEST_LOG }}
+            ${{ env.RUNNER_TIMINGS }}
+          if-no-files-found: warn
+
       - name: No containers left behind
         # The harness shares one container by reference count and removes it when the last
         # test drops it. A leak here is silent locally and would accumulate a container per
