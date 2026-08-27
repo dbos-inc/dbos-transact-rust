@@ -1,21 +1,93 @@
-//! Resuming and forking: putting a workflow back on a queue for the fleet to run.
+//! The management surface: listing workflows, and cancelling, resuming, forking and deleting them.
 //!
-//! Both operations were **inert until the engine had a dequeue loop**, which is why they arrive
-//! now rather than earlier. Neither runs a workflow; each writes an `ENQUEUED` row and leaves it
-//! for whichever executor next polls that queue. That is what every reference does, and for the
-//! same reason: the process asking is usually an operator's tool, not a host that can run the
-//! workflow — it may not even have the code.
+//! **The operator's half of the API.** Everything here addresses a workflow by id rather than by
+//! calling it, and the process doing the addressing is usually a tool, a Conductor session, or an
+//! admin endpoint rather than a host that can run the work — it may not even have the code. The
+//! surface is shaped by that: nothing here runs a workflow.
 //!
-//! So both return a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because
-//! this process is very probably not the one doing the work.
+//! [`resume`](DBOS::resume) and [`fork`](DBOS::fork) were **inert until the engine had a dequeue
+//! loop**, which is why the whole slice arrives after queues. Each writes an `ENQUEUED` row and
+//! leaves it for whichever executor next polls that queue, which is what every reference does — so
+//! both hand back a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this
+//! process is very probably not the one doing the work.
+//!
+//! # Naming
+//!
+//! A method names its noun exactly when the verb would otherwise be ambiguous in this crate. A
+//! queue can be deleted and so can a workflow, so [`delete`](DBOS::delete) sits beside
+//! [`delete_queue`](DBOS::delete_queue) and both say what they take; nothing but a workflow can be
+//! cancelled, resumed or forked, so those are bare verbs. Listing always says what it lists.
+//!
+//! The references spell every one of these `*_workflow`/`*_workflows`, because their entry point is
+//! a bare `DBOS` class rather than a handle you already hold. The concepts are theirs and the
+//! spelling is this crate's, which is the same trade [`ForkFrom`] makes against
+//! `fork_from_failure`.
+//!
+//! # Bulk forms
+//!
+//! Every operation has one, suffixed `_all`, and the singular form is a caller with one id. The
+//! bulk form is the primitive: the system database cancels, deletes and forks in batches because a
+//! partially applied batch is worse than a slow one, and the singular methods are wrappers that
+//! pass a one-element slice.
+//!
+//! Cascading to descendants lives on the bulk form alone — `cancel_all(&["one"],
+//! Children::Include)` is how one workflow and its tree are cancelled. The singular form is the
+//! common case, and the common case is one workflow.
+//!
+//! # Two things this surface deliberately does not do
+//!
+//! **It does not stop a workflow already running in this process.** Cancelling writes `CANCELLED`
+//! and the running execution finds out by reading, not by being interrupted: a preemptible step
+//! polls the status and abandons its attempt, and any other step finishes before the workflow's own
+//! terminal write is refused by the status gate on `record_workflow_outcome`. That is what makes
+//! cancelling work at all across a fleet, where the executor running the workflow is usually not the
+//! one being asked to cancel it.
+//!
+//! That also keeps this crate clear of go #426, where shutdown's context cancellation reached the
+//! *durable* cancel path and marked in-flight workflows `CANCELLED` instead of leaving them
+//! `PENDING` for recovery. Rust's shutdown aborts tasks and says so — see `Tasks::abort_all`,
+//! whose rows stay `PENDING` — and durable cancellation is only ever this module writing to the
+//! database. The two paths never meet, so there is no shutdown cause to tag.
+//!
+//! **It does not record itself as a step.** Python routes every one of these through
+//! `call_function_as_step`, so a management call made *from inside a workflow* is checkpointed and
+//! replays instead of running twice. Rust has no such mechanism yet, and building one is a wider
+//! change than this slice — it would also cover `send`, `recv` and `get_event`. Until then, calling
+//! these from inside a workflow body re-runs them on every replay. Calling them from an operator's
+//! tool, which is what they are for, is unaffected.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::dbos::DBOS;
+use crate::dbos::{DBOS, Executor};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
-use crate::sysdb::types::{Fork, ForkOptions as SysForkOptions, ForkPoint};
+use crate::sysdb::types::{
+    Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowFilter, WorkflowRecord,
+};
+
+/// Whether an operation reaches a workflow's descendants.
+///
+/// One type for [`cancel_all`](DBOS::cancel_all) and [`delete_all`](DBOS::delete_all), which the
+/// references keep apart as `cancel_children` and `delete_children` booleans. It is the same
+/// question in both, and a bare `true` at a call site says neither which question it answers nor
+/// which way.
+///
+/// [`Skip`](Self::Skip) is the default in all four implementations, and the reason is worth
+/// knowing: a workflow's children are workflows in their own right, some of them started by code
+/// that has no idea it was called from another workflow. Reaching them is a decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Children {
+    /// The workflows named, and nothing else.
+    #[default]
+    Skip,
+    /// The workflows named, and everything descended from them at any depth.
+    ///
+    /// The walk is the system database's, and the two operations walk differently on purpose:
+    /// cancelling interleaves level by level so a parent cannot spawn behind the sweep, while
+    /// deleting collects the whole tree first, because a deleted parent cannot spawn at all.
+    Include,
+}
 
 /// Where a fork picks up.
 ///
@@ -66,6 +138,68 @@ pub struct ForkOptions<'a> {
 }
 
 impl DBOS {
+    /// Stops a workflow, and any executor running it.
+    ///
+    /// The row goes to `CANCELLED`, which is terminal: awaiting the workflow raises
+    /// [`Error::WorkflowCancelled`] rather than returning a value, and an executor still running it
+    /// finds out at its next read — see the module documentation for why cancelling reads rather
+    /// than interrupts.
+    ///
+    /// **A cancelled workflow can be resumed.** [`resume`](Self::resume) puts it back on a queue
+    /// with its recorded steps intact, so cancelling is a pause an operator can undo, unlike
+    /// [`delete`](Self::delete). That is why cancelling is the graceful form and deleting is not.
+    ///
+    /// Cancelling a workflow that has already finished does nothing and is not an error, and
+    /// neither is cancelling an id with no row: a cancel that finds nothing has the end state it
+    /// asked for. [`resume`](Self::resume) draws the opposite line for the opposite reason.
+    ///
+    /// Children are left alone — [`cancel_all`](Self::cancel_all) with [`Children::Include`] is how
+    /// a tree is cancelled.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// dbos.cancel("runaway-workflow").await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn cancel(&self, workflow_id: &str) -> Result<()> {
+        self.cancel_all(&[workflow_id], Children::Skip).await?;
+        Ok(())
+    }
+
+    /// Cancels workflows, and optionally everything descended from them.
+    ///
+    /// Returns the ids that actually moved, which is a subset: one already finished is left where
+    /// it is, and with [`Children::Include`] the list also carries the descendants that were
+    /// cancelled, which the caller never named.
+    ///
+    /// The cascade is a **level-by-level walk that interleaves with the cancelling**, so a child
+    /// spawned while the sweep is running is still caught — the parent is stopped before its
+    /// children are looked up. Python and Java do the same; Go collects the whole subtree first and
+    /// can miss a workflow spawned during the walk.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// // One workflow and its whole tree.
+    /// dbos.cancel_all(&["fan-out-root"], dbos::Children::Include).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn cancel_all(
+        &self,
+        workflow_ids: &[&str],
+        children: Children,
+    ) -> Result<Vec<String>> {
+        let executor = self.executor("cancel a workflow")?;
+        let cancelled = executor
+            .sysdb()
+            .cancel_workflows(workflow_ids, children == Children::Include)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        if !cancelled.is_empty() {
+            tracing::info!(cancelled = cancelled.len(), "cancelled workflows");
+        }
+        Ok(cancelled)
+    }
+
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
     ///
     /// **Resuming is a fresh start, not a retry.** The recovery-attempt count and the deadline are
@@ -97,6 +231,35 @@ impl DBOS {
             Arc::clone(executor.connection()),
             workflow_id.to_owned(),
         ))
+    }
+
+    /// Resumes workflows, handing back one handle per id, in the order given.
+    ///
+    /// One handle per id *asked for*, not per row that moved. A workflow that had already finished
+    /// is not re-enqueued, and its handle simply reports the outcome it already had — which is what
+    /// [`resume`](Self::resume) promises for one workflow, kept for many.
+    ///
+    /// Every id must exist. The whole batch is one statement, so an id with no row behind it fails
+    /// the call and nothing is enqueued, rather than resuming the ones that happened to be spelled
+    /// correctly.
+    pub async fn resume_all<R, E>(
+        &self,
+        workflow_ids: &[&str],
+    ) -> Result<Vec<WorkflowHandle<R, E>>> {
+        let executor = self.executor("resume a workflow")?;
+        executor
+            .sysdb()
+            .resume_workflows(workflow_ids, None)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        tracing::info!(
+            count = workflow_ids.len(),
+            "resumed workflows onto their queues"
+        );
+        Ok(workflow_ids
+            .iter()
+            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), (*id).to_owned()))
+            .collect())
     }
 
     /// Forks a workflow from `from`, enqueueing the fork and handing back a handle to it.
@@ -142,55 +305,8 @@ impl DBOS {
         options: ForkOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         let executor = self.executor("fork a workflow")?;
-        let sys_options = SysForkOptions {
-            application_version: options.application_version,
-            queue_name: options.queue,
-            queue_partition_key: None,
-            timeout: options.timeout,
-            replacement_children: &[],
-        };
-
-        // Two system-database calls rather than one, because the two halves of `ForkFrom` are two
-        // different questions. A named step is an address and needs no lookup; the other three are
-        // searches through the source's own history, and `fork_from` is where that search lives.
-        let forked = match from {
-            ForkFrom::Beginning | ForkFrom::Step(_) => {
-                let start_step = match from {
-                    ForkFrom::Step(step) => step,
-                    _ => 0,
-                };
-                executor
-                    .sysdb()
-                    .fork_workflows(
-                        &[Fork {
-                            source_id: workflow_id,
-                            forked_id: options.forked_id,
-                            start_step,
-                        }],
-                        &sys_options,
-                    )
-                    .await
-            }
-            ForkFrom::LastFailure => {
-                executor
-                    .sysdb()
-                    .fork_from(&[workflow_id], ForkPoint::LastFailure, &sys_options)
-                    .await
-            }
-            ForkFrom::LastStep => {
-                executor
-                    .sysdb()
-                    .fork_from(&[workflow_id], ForkPoint::LastStep, &sys_options)
-                    .await
-            }
-            ForkFrom::StepNamed(name) => {
-                executor
-                    .sysdb()
-                    .fork_from(&[workflow_id], ForkPoint::StepNamed(name), &sys_options)
-                    .await
-            }
-        }
-        .map_err(Error::SystemDatabase)?;
+        let forked =
+            fork_batch(&executor, &[workflow_id], from, options.forked_id, &options).await?;
 
         let forked_id = forked.into_iter().next().ok_or_else(|| {
             Error::Config(format!("forking `{workflow_id}` produced no workflow"))
@@ -201,4 +317,202 @@ impl DBOS {
             forked_id,
         ))
     }
+
+    /// Forks workflows from the same point, handing back a handle to each fork in the order given.
+    ///
+    /// The batch is the system database's primitive rather than a loop over
+    /// [`fork_with`](Self::fork_with), and the difference is visible: every source must exist and
+    /// must have something at the fork point, or the call fails and **no fork is written**. A
+    /// half-applied batch would leave forks whose siblings never existed, which for a fan-out being
+    /// re-run against fixed code is worse than forking nothing.
+    ///
+    /// `from` applies to every source, and each source's own history decides where that lands —
+    /// [`ForkFrom::LastFailure`] forks each from wherever *it* failed, not from a step number
+    /// worked out once.
+    ///
+    /// [`ForkOptions::forked_id`] is refused here: one id cannot name many forks, and generating
+    /// them silently would hand back a fork under an id the caller did not ask for. Every other
+    /// option applies to the whole batch, which is what makes
+    /// [`application_version`](ForkOptions::application_version) useful — re-running a fan-out
+    /// against the deployment that fixes it is the case this method exists for.
+    pub async fn fork_all<R, E>(
+        &self,
+        workflow_ids: &[&str],
+        from: ForkFrom<'_>,
+        options: ForkOptions<'_>,
+    ) -> Result<Vec<WorkflowHandle<R, E>>> {
+        if options.forked_id.is_some() {
+            return Err(Error::Config(
+                "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
+                    .to_owned(),
+            ));
+        }
+        let executor = self.executor("fork a workflow")?;
+        let forked = fork_batch(&executor, workflow_ids, from, None, &options).await?;
+        tracing::info!(count = forked.len(), "forked workflows onto their queues");
+        Ok(forked
+            .into_iter()
+            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), id))
+            .collect())
+    }
+
+    /// Removes a workflow and everything recorded against it.
+    ///
+    /// Steps, events, messages and streams go with the row — the schema cascades — so this is not
+    /// a status change and there is nothing left to resume. [`cancel`](Self::cancel) is the form
+    /// that stops a workflow and keeps it.
+    ///
+    /// **No status guard, deliberately.** A running workflow is deleted like any other: naming an
+    /// id is an operator saying *this one, now*, and refusing would leave no way to clear a
+    /// workflow that is wedged. All four implementations behave the same way — Go's comment on the
+    /// same statement reads "Delete all matching workflows regardless of their state".
+    ///
+    /// The executor running a deleted workflow finds its row gone at the next step boundary and
+    /// fails with `NonExistentWorkflow`, rather than stopping cleanly. Cancel first if that matters.
+    ///
+    /// Deleting an id with no row is not an error, and children are left alone —
+    /// [`delete_all`](Self::delete_all) with [`Children::Include`] is how a tree goes.
+    pub async fn delete(&self, workflow_id: &str) -> Result<()> {
+        self.delete_all(&[workflow_id], Children::Skip).await?;
+        Ok(())
+    }
+
+    /// Deletes workflows, and optionally everything descended from them.
+    ///
+    /// Returns how many rows went, descendants included.
+    ///
+    /// Unlike [`cancel_all`](Self::cancel_all), the tree is collected first and deleted in one
+    /// statement rather than level by level. Cancelling has to interleave so a parent cannot spawn
+    /// behind the walk; a deleted parent cannot spawn at all.
+    pub async fn delete_all(&self, workflow_ids: &[&str], children: Children) -> Result<u64> {
+        let executor = self.executor("delete a workflow")?;
+        let deleted = executor
+            .sysdb()
+            .delete_workflows(workflow_ids, children == Children::Include)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        if deleted > 0 {
+            tracing::info!(deleted, "deleted workflows");
+        }
+        Ok(deleted)
+    }
+
+    /// Reads the workflows matching a filter, oldest first unless the filter says otherwise.
+    ///
+    /// **Every filter is one `WHERE` clause**, not a scan the caller narrows afterwards, so
+    /// `WorkflowFilter::default()` returns the whole table. A caller that means to page should say
+    /// so with [`WorkflowFilter::limit`] — and should know that `created_at` is a millisecond
+    /// stamp shared by everything a fan-out creates in the same instant, so a page boundary
+    /// falling inside a tie is not stable. That is `UPSTREAM` item 23, and it is four
+    /// implementations wide.
+    ///
+    /// The filter defaults to **this application's workflows plus unclaimed ones**, not to every
+    /// application sharing the database; [`Applications::Any`](crate::sysdb::types::Applications)
+    /// is the operator's cross-application view. Naming ids explicitly widens it on its own, since
+    /// a workflow id is a global address rather than a search.
+    ///
+    /// There is no separate `list_queued_workflows` as Python and TypeScript have.
+    /// [`WorkflowFilter::queues_only`] is that method, and it composes with every other filter
+    /// instead of being a second entry point that repeats them.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
+    ///
+    /// let stuck = dbos.list_workflows(&WorkflowFilter {
+    ///     status: vec![WorkflowStatus::Pending],
+    ///     limit: Some(100),
+    ///     load_input: false,
+    ///     ..WorkflowFilter::default()
+    /// }).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn list_workflows(&self, filter: &WorkflowFilter<'_>) -> Result<Vec<WorkflowRecord>> {
+        let executor = self.executor("list workflows")?;
+        executor
+            .sysdb()
+            .list_workflows(filter)
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+
+    /// Reads one workflow's steps, in execution order.
+    ///
+    /// Outputs and errors come with them. This is a single workflow's own history, bounded by what
+    /// that workflow did, so there is no paging here as there is on
+    /// [`list_workflows`](Self::list_workflows) — the system database layer carries limit and
+    /// offset for the caller that has a workflow long enough to need them.
+    ///
+    /// A step whose [`child_workflow_id`](StepRecord::child_workflow_id) is set was a child
+    /// workflow call rather than a step body, which is how a tree is walked from a listing.
+    ///
+    /// An id with no row returns no steps rather than failing, the same as an id whose workflow
+    /// has not reached its first step.
+    pub async fn list_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
+        let executor = self.executor("list a workflow's steps")?;
+        executor
+            .sysdb()
+            .list_workflow_steps(workflow_id, true, None, None)
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+}
+
+/// The two system-database calls a fork picks between, and the rule for picking.
+///
+/// The halves of [`ForkFrom`] are two different questions. A named step is an address and needs no
+/// lookup; the other three are searches through each source's own history, and `fork_from` is where
+/// that search lives. Shared by [`DBOS::fork_with`] and [`DBOS::fork_all`] so the rule is written
+/// once — the batch form is the primitive, and the single form is a batch of one.
+async fn fork_batch(
+    executor: &Executor,
+    workflow_ids: &[&str],
+    from: ForkFrom<'_>,
+    forked_id: Option<&str>,
+    options: &ForkOptions<'_>,
+) -> Result<Vec<String>> {
+    let sys_options = SysForkOptions {
+        application_version: options.application_version,
+        queue_name: options.queue,
+        queue_partition_key: None,
+        timeout: options.timeout,
+        replacement_children: &[],
+    };
+
+    match from {
+        ForkFrom::Beginning | ForkFrom::Step(_) => {
+            let start_step = match from {
+                ForkFrom::Step(step) => step,
+                _ => 0,
+            };
+            let forks: Vec<Fork<'_>> = workflow_ids
+                .iter()
+                .map(|source_id| Fork {
+                    source_id,
+                    forked_id,
+                    start_step,
+                })
+                .collect();
+            executor.sysdb().fork_workflows(&forks, &sys_options).await
+        }
+        ForkFrom::LastFailure => {
+            executor
+                .sysdb()
+                .fork_from(workflow_ids, ForkPoint::LastFailure, &sys_options)
+                .await
+        }
+        ForkFrom::LastStep => {
+            executor
+                .sysdb()
+                .fork_from(workflow_ids, ForkPoint::LastStep, &sys_options)
+                .await
+        }
+        ForkFrom::StepNamed(name) => {
+            executor
+                .sysdb()
+                .fork_from(workflow_ids, ForkPoint::StepNamed(name), &sys_options)
+                .await
+        }
+    }
+    .map_err(Error::SystemDatabase)
 }
