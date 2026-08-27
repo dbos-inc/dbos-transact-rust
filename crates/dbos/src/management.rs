@@ -424,13 +424,15 @@ impl DBOS {
         from: ForkFrom<'_>,
         options: ForkOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
+        // The launch check first, as every other method on this surface does: an unlaunched
+        // instance should say so whatever else is wrong with the call.
+        let executor = self.executor("fork a workflow")?;
         if options.forked_id.is_some() {
             return Err(Error::Config(
                 "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
                     .to_owned(),
             ));
         }
-        let executor = self.executor("fork a workflow")?;
         let forked = fork_batch(&executor, workflow_ids, from, None, &options).await?;
         tracing::info!(count = forked.len(), "forked workflows onto their queues");
         Ok(forked
