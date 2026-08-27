@@ -2471,10 +2471,22 @@ impl SystemDatabase for PostgresSystemDatabase {
                 q.push_bind(attributes).push("::jsonb");
             }
 
+            // **`workflow_uuid` totalizes the order**, which `created_at` alone does not: it is a
+            // millisecond stamp, and a fan-out creates far more than one workflow inside a
+            // millisecond. Rows sharing one then come back in whatever order the plan produces,
+            // and since `limit` and `offset` page through *this* order, a boundary that falls
+            // inside a tie can hand the same row to two pages and skip another entirely. The id
+            // is what makes a page boundary mean the same thing on the second query as on the
+            // first. Migration 46 added the same trailing column to the partition dequeue's index
+            // for the same reason, and the dequeue's own `ORDER BY` names it.
+            //
+            // Python, TypeScript and Go all sort on `created_at` alone and carry the same
+            // ambiguity. Sorting more strictly cannot disagree with them: it settles an order
+            // they leave unspecified rather than choosing a different one.
             q.push(if filter.sort_desc {
-                " ORDER BY created_at DESC"
+                " ORDER BY created_at DESC, workflow_uuid DESC"
             } else {
-                " ORDER BY created_at ASC"
+                " ORDER BY created_at ASC, workflow_uuid ASC"
             });
             if let Some(limit) = filter.limit {
                 q.push(" LIMIT ").push_bind(limit);

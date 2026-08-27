@@ -1357,6 +1357,74 @@ async fn every_filter_narrows() {
     }
 }
 
+/// Workflows sharing a `created_at` still order and page deterministically.
+///
+/// `created_at` is a millisecond stamp and a fan-out fills one easily, so the sort has to be a
+/// total order on its own: `limit` and `offset` page through *this* order, and a boundary landing
+/// inside a tie would hand one row to two pages and drop another. `workflow_uuid` is what breaks
+/// it, in whichever direction the sort runs.
+///
+/// The tie is written rather than raced for. Left to timing it depends entirely on how fast the
+/// inserts are — reliable on a machine quick enough to seed several rows inside one millisecond,
+/// and unreachable on one that is not, which is the shape of a test that passes locally and fails
+/// in CI.
+#[tokio::test]
+async fn a_created_at_tie_still_orders_and_pages() {
+    use dbos::sysdb::types::WorkflowFilter as F;
+    let (sys, db) = seeded().await;
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_status SET created_at = 7000 \
+         WHERE workflow_uuid IN ('wf-a', 'wf-b', 'wf-c', 'wf-d')",
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("tie update failed");
+
+    let only_wf = F {
+        workflow_id_prefixes: vec!["wf-"],
+        ..F::default()
+    };
+    assert_eq!(
+        ids(&sys, &only_wf).await,
+        ["wf-a", "wf-b", "wf-c", "wf-d"],
+        "a tie should fall back to the id, ascending"
+    );
+    assert_eq!(
+        ids(
+            &sys,
+            &F {
+                sort_desc: true,
+                ..only_wf.clone()
+            }
+        )
+        .await,
+        ["wf-d", "wf-c", "wf-b", "wf-a"],
+        "a tie should fall back to the id, descending too"
+    );
+
+    // The two halves of one listing, taken as two queries: every row once, in order.
+    let first = ids(
+        &sys,
+        &F {
+            limit: Some(2),
+            ..only_wf.clone()
+        },
+    )
+    .await;
+    let second = ids(
+        &sys,
+        &F {
+            limit: Some(2),
+            offset: Some(2),
+            ..only_wf.clone()
+        },
+    )
+    .await;
+    assert_eq!(first, ["wf-a", "wf-b"]);
+    assert_eq!(second, ["wf-c", "wf-d"]);
+}
+
 /// Ordering, limit, and offset page through the results.
 #[tokio::test]
 async fn results_are_ordered_and_pageable() {
