@@ -413,10 +413,9 @@ pub struct NewWorkflow<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long to hold the workflow before it becomes eligible to dequeue.
     ///
-    /// A duration, not an instant: the wall-clock time is added to the database's clock by the
-    /// `INSERT` itself, which is the same clock the supervisor's release sweep compares the
-    /// column against. Letting the caller compute `now + delay` would put the skew between an
-    /// enqueuer and a supervisor into the release time.
+    /// A duration, not an instant: the wall-clock time is stamped by the database layer against
+    /// the same clock it writes `created_at` with. Letting the caller compute `now + delay`
+    /// would put its clock skew into the row.
     pub delay: Option<Duration>,
     /// Marks `deduplication_id` as a debounce key to clear on the `DELAYED` → `ENQUEUED` move.
     pub is_debounced: bool,
@@ -1144,15 +1143,23 @@ pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error>
 pub enum WorkflowDelay {
     /// Wait this long from now.
     ///
-    /// Added to the database's clock by the `UPDATE` itself, for the same reason
-    /// [`NewWorkflow::delay`] is a duration: the caller's skew should not decide when the
-    /// supervisor releases the workflow.
+    /// Resolved against the database layer's clock, for the same reason
+    /// [`NewWorkflow::delay`] is: the caller's skew should not reach the row.
     For(Duration),
     /// Wait until this instant.
-    ///
-    /// The caller's instant by definition, so it is stored as given. A caller that means "in a
-    /// minute" should say so with [`For`](Self::For) rather than resolve it itself.
     Until(Timestamp),
+}
+
+impl WorkflowDelay {
+    /// The instant this delay expires, resolved against `now` if it is relative.
+    pub(crate) fn resolve(self, now: Timestamp) -> Timestamp {
+        match self {
+            WorkflowDelay::For(d) => {
+                Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64)
+            }
+            WorkflowDelay::Until(t) => t,
+        }
+    }
 }
 
 /// Why a workflow is being submitted, which decides whether it may claim a row someone holds.
