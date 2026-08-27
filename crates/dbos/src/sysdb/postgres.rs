@@ -2078,6 +2078,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // workflow a second late — and a hundred-millisecond delay would be off by an order of
         // magnitude. The `ON CONFLICT` arm below does not rewrite the column, but that only
         // covers the lost-acknowledgement case, where the first attempt did commit.
+        //
+        // TODO(dbos-team): UPSTREAM item 22. The skew is worth closing, but in all four at once
+        // and against the database's clock — read once outside the retry, which is the part the
+        // attempt above got wrong.
         let now = Timestamp::now();
         let delay_until = workflow
             .delay
@@ -2482,8 +2486,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             // this query does not fix — and `limit`/`offset` page through that order. Adding
             // `workflow_uuid` as a tiebreaker would settle it, and is deliberately not done here:
             // a listing that pages differently from every other implementation is a worse problem
-            // than one that pages ambiguously in the same way they do. It is a shared gap, and
-            // wants settling in all four rather than in this one.
+            // than one that pages ambiguously in the same way they do.
+            //
+            // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this order, so a
+            // boundary inside a tie hands one workflow to two pages and skips another. Worth
+            // fixing in all four, and only there.
             q.push(if filter.sort_desc {
                 " ORDER BY created_at DESC"
             } else {
