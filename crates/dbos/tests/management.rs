@@ -12,7 +12,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
 use dbos::{
-    Children, Config, DBOS, EngineOnly, Enqueue, Error, ForkFrom, ForkOptions, StartOptions,
+    Children, Config, DBOS, EngineOnly, Enqueue, Error, ForkFrom, ForkOptions, ResumeOptions,
+    StartOptions,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -252,7 +253,8 @@ async fn the_management_surface_needs_a_launched_instance() {
     );
     refused!(
         "resumed workflows",
-        dbos.resume_all::<u32, EngineOnly>(&["x"]).await
+        dbos.resume_all::<u32, EngineOnly>(&["x"], ResumeOptions::default())
+            .await
     );
     refused!(
         "forked a workflow",
@@ -670,7 +672,7 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     }
 
     let handles = dbos
-        .resume_all::<u32, EngineOnly>(&ids)
+        .resume_all::<u32, EngineOnly>(&ids, ResumeOptions::default())
         .await
         .expect("bulk resume failed");
     assert_eq!(
@@ -723,6 +725,68 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
     assert!(
         matches!(&error, Error::Config(message) if message.contains("forked_id")),
         "expected a configuration refusal, got {error:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A resume can name the queue it goes back on**, which is how a backlog is resumed without
+/// flooding the fleet — the internal queue takes no limits.
+///
+/// All four references offer this and Rust was the only one that did not. The proof is the row's
+/// own `queue_name` after the resume, not just that the workflow ran.
+#[tokio::test]
+async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("resume-queue-app", &db));
+    let workflow = dbos
+        .register_workflow("re-queued", |()| async move { Ok::<u32, Error>(4) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "recovery",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    let id = "parked";
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(Enqueue::new("a-queue-with-no-runner")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    dbos.cancel(id).await.expect("cancel failed");
+
+    let handle = dbos
+        .resume_with::<u32, EngineOnly>(
+            id,
+            ResumeOptions {
+                queue: Some("recovery"),
+            },
+        )
+        .await
+        .expect("resume failed");
+    assert_eq!(handle.result().await.expect("the workflow failed"), 4);
+
+    assert_eq!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .queue_name
+            .as_deref(),
+        Some("recovery"),
+        "the resume ignored the queue it was given",
     );
 
     dbos.shutdown().await;
