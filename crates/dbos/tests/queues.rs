@@ -1410,19 +1410,18 @@ async fn priority_orders_the_backlog_lower_first() {
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue(
-        "demo-queue",
-        QueueOptions {
-            worker_concurrency: Some(1),
-            ..QueueOptions::default()
-        },
-    )
-    .await
-    .expect("registration failed");
 
-    // Held back as a group, so the whole backlog exists before anything is eligible — otherwise
-    // the first one enqueued is simply the first one available, whatever its priority.
-    let delay = Some(Duration::from_secs(3));
+    // **Enqueued before the queue is registered, which is what holds the backlog back.** A worker
+    // exists only for a queue that has a row, so until `register_queue` below there is nothing
+    // polling `demo-queue` and the four rows accumulate untouched — otherwise the first one
+    // enqueued is simply the first one available, whatever its priority.
+    //
+    // A delay on each enqueue was the previous way of arranging this, and it does not hold: the
+    // delay is relative to its own enqueue, so four sequential enqueues get four deadlines
+    // staggered by a round trip apiece, and the release sweep runs on its own second-granularity
+    // tick. A tick landing inside that stagger releases the earliest-enqueued row on its own,
+    // which then runs first however low its priority — reliably enough to fail on CockroachDB,
+    // where the round trips are slow enough to widen the window.
     let submitted = [
         ("low", Some(9)),
         ("high", Some(1)),
@@ -1439,7 +1438,6 @@ async fn priority_orders_the_backlog_lower_first() {
                         workflow_id: Some(name),
                         queue: Some(Enqueue {
                             priority,
-                            delay,
                             ..Enqueue::new("demo-queue")
                         }),
                         ..StartOptions::default()
@@ -1449,6 +1447,18 @@ async fn priority_orders_the_backlog_lower_first() {
                 .expect("enqueue failed"),
         );
     }
+
+    // The backlog is complete, so registering the queue is what starts its worker: the supervisor
+    // picks the row up on its next pass and every row is already there to be ranked.
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions {
+            worker_concurrency: Some(1),
+            ..QueueOptions::default()
+        },
+    )
+    .await
+    .expect("registration failed");
 
     for handle in handles {
         tokio::time::timeout(Duration::from_secs(30), handle.result())
