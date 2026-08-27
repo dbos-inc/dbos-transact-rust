@@ -265,6 +265,20 @@ async fn the_management_surface_needs_a_launched_instance() {
         dbos.fork_all::<u32, EngineOnly>(&["x"], ForkFrom::Beginning, ForkOptions::default())
             .await
     );
+    // The launch check outranks the option check, so a call that is wrong in both ways still
+    // reports the launch.
+    refused!(
+        "forked workflows with an id it should have refused",
+        dbos.fork_all::<u32, EngineOnly>(
+            &["x"],
+            ForkFrom::Beginning,
+            ForkOptions {
+                forked_id: Some("one-id-for-many"),
+                ..ForkOptions::default()
+            },
+        )
+        .await
+    );
     refused!("cancelled a workflow", dbos.cancel("x").await);
     refused!(
         "cancelled workflows",
