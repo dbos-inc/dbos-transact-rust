@@ -1074,6 +1074,13 @@ async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
         sys.init_workflow(wf, None, Submission::Fresh)
             .await
             .expect("seed insert failed");
+        // **A millisecond apart, deliberately.** `created_at` is a millisecond stamp and a
+        // listing orders by it alone, so seeds inserted inside one millisecond tie — and tied
+        // rows come back in an order the query does not fix, which is how an ordering assertion
+        // over this fixture passes on a machine where a round trip is milliseconds and fails on
+        // one where it is not. Waiting is a lower bound rather than a hope: the next insert
+        // cannot be stamped in the same millisecond as this one, whatever the hardware.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
     // Columns no caller can set at creation.
@@ -1101,25 +1108,6 @@ async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
             .execute(&mut conn)
             .await
             .expect("seed update failed");
-    }
-
-    // **Distinct creation stamps, written rather than timed.** `created_at` is a millisecond
-    // stamp and the inserts above are a round trip apart, so on hardware quick enough to seed
-    // several rows inside one millisecond they tie — and a listing orders by `created_at` alone,
-    // so tied rows come back in an order the query does not fix. Left to timing, any test that
-    // asserts an order over this fixture is one that passes locally and fails in CI.
-    //
-    // Seed order, a second apart, and below the completion stamps written above so a row is never
-    // finished before it exists. The values matter only in being distinct and increasing.
-    for (index, wf) in seeds.iter().enumerate() {
-        sqlx::query(sqlx::AssertSqlSafe(
-            "UPDATE dbos.workflow_status SET created_at = $2 WHERE workflow_uuid = $1",
-        ))
-        .bind(wf.workflow_id)
-        .bind(1000 + index as i64 * 1000)
-        .execute(&mut conn)
-        .await
-        .expect("seed stamp failed");
     }
 
     (sys, db)
@@ -1386,8 +1374,8 @@ async fn results_are_ordered_and_pageable() {
         ..F::default()
     };
 
-    // `seeded` writes the creation stamps a second apart in seed order, so oldest-first is
-    // insertion order and nothing here depends on how fast the seeds were inserted.
+    // `seeded` waits between its inserts, so the creation stamps are distinct and in seed
+    // order — oldest-first is insertion order, however fast the machine seeds.
     let ascending = ids(&sys, &only_wf).await;
     assert_eq!(ascending, ["wf-a", "wf-b", "wf-c", "wf-d"]);
 
