@@ -1683,6 +1683,38 @@ async fn an_unhonourable_queue_configuration_is_refused() {
             "`worker_concurrency` must be greater than or equal to \
              `partition_worker_concurrency`",
         ),
+        (
+            "a partition allowed to start faster than the whole queue",
+            QueueOptions {
+                rate_limit: Some(RateLimit {
+                    limit: 10,
+                    period: Duration::from_secs(1),
+                }),
+                partition_rate_limit: Some(RateLimit {
+                    limit: 100,
+                    period: Duration::from_secs(1),
+                }),
+                ..QueueOptions::default()
+            },
+            "`rate_limit` must allow at least the rate `partition_rate_limit` does",
+        ),
+        (
+            // The counts alone say the opposite — 5 is below 10 — so only comparing the two as
+            // rates catches this one.
+            "a partition faster than the queue over a different window",
+            QueueOptions {
+                rate_limit: Some(RateLimit {
+                    limit: 10,
+                    period: Duration::from_secs(60),
+                }),
+                partition_rate_limit: Some(RateLimit {
+                    limit: 5,
+                    period: Duration::from_secs(1),
+                }),
+                ..QueueOptions::default()
+            },
+            "`rate_limit` must allow at least the rate `partition_rate_limit` does",
+        ),
     ];
 
     for (what, options, expected) in cases {
@@ -1705,6 +1737,26 @@ async fn an_unhonourable_queue_configuration_is_refused() {
             .is_none(),
         "a refused registration wrote a row anyway"
     );
+
+    // The other side of the rate comparison: a larger count over a longer window is the *slower*
+    // rate, and slower is what a per-partition limit is allowed to be. Registering it is the
+    // assertion — the pair the counts would refuse is the pair the rates accept.
+    dbos.register_queue(
+        "checked-queue",
+        QueueOptions {
+            rate_limit: Some(RateLimit {
+                limit: 10,
+                period: Duration::from_secs(1),
+            }),
+            partition_rate_limit: Some(RateLimit {
+                limit: 100,
+                period: Duration::from_secs(60),
+            }),
+            ..QueueOptions::default()
+        },
+    )
+    .await
+    .expect("a slower per-partition rate should be honoured");
 
     dbos.shutdown().await;
 }
