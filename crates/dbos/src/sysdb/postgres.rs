@@ -5095,6 +5095,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $2, application_version = $3, \
                          started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = $4, \
+                         updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $1), \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
@@ -5375,6 +5376,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
                          started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
+                         updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $4), \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
