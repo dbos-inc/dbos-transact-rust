@@ -5255,11 +5255,31 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // `chosen`, so a sweep the budget cuts short probes only the partitions it will
                 // actually claim from rather than probing every one and discarding the excess.
                 //
+                // **So the limit bounds partitions probed, not heads returned**, and the two stop
+                // agreeing when a chosen partition holds no row this executor may take: the
+                // version predicate is in the `LATERAL`, not in `chosen`, so such a partition
+                // spends a slot and produces nothing. During a rolling deploy a worker can
+                // therefore come back short of its budget and run below its worker concurrency.
+                // It is bounded and it heals — `sweep_order` is `random()` in exactly the case
+                // the budget binds, so no partition is masked twice running, and a short sweep
+                // reports no contention, so the poller scales *back* towards the queue's interval
+                // rather than backing off.
+                //
+                // TODO(dbos-team): UPSTREAM item 21. Python and TypeScript place the `LIMIT` and
+                // the version predicate exactly here too, so this is upstream behaviour rather
+                // than a port's slip, and the fix worth having — `application_version` in
+                // `idx_workflow_status_partition_dequeue_v2` — is a shared migration in any case.
+                //
                 // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
                 // loop instead of a slower per-row subplan. `workflow_uuid` totalizes the head
                 // order, so every worker picks the same head under a `created_at` tie, and the
-                // index's trailing `workflow_uuid` keeps the probe a pure top-1. The `NOT EXISTS`
-                // on `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
+                // index's trailing `workflow_uuid` keeps the probe a pure top-1 — **for a
+                // partition whose head is eligible.** Where the version predicate rejects every
+                // row the probe is not a top-1 at all: `application_version` is not in the index,
+                // so it walks that partition's entries and heap-checks each to return nothing.
+                // That cost is paid whatever the `LIMIT` bounds, and it is why the index, rather
+                // than the `LIMIT`, is what item 21 proposes moving. The `NOT EXISTS` on
+                // `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
                 // owner's row.
                 //
                 // **No `--` comments inside this string.** The `\` continuations strip the
