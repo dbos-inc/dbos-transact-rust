@@ -1,4 +1,5 @@
-//! The management surface: listing workflows, and cancelling, resuming, forking and deleting them.
+//! The management surface: finding workflows, and cancelling, resuming, forking, delaying and
+//! deleting them.
 //!
 //! **The operator's half of the API.** Everything here addresses a workflow by id rather than by
 //! calling it, and the process doing the addressing is usually a tool, a Conductor session, or an
@@ -25,8 +26,12 @@
 //!
 //! # Bulk forms
 //!
-//! Every operation has one, suffixed `_all`, and the singular form is a caller with one id. The
-//! bulk form is the primitive: the system database cancels, deletes and forks in batches because a
+//! Every operation that has one in the references has one here, suffixed `_all`, and the singular
+//! form is a caller with one id. [`retrieve_workflow`](DBOS::retrieve_workflow),
+//! [`set_workflow_delay`](DBOS::set_workflow_delay) and
+//! [`update_workflow_attributes`](DBOS::update_workflow_attributes) have none, in this crate or in
+//! any reference: each addresses one row and none of them is worth a round trip to batch.
+//! The bulk form is the primitive: the system database cancels, deletes and forks in batches because a
 //! partially applied batch is worse than a slow one, and the singular methods are wrappers that
 //! pass a one-element slice.
 //!
@@ -63,7 +68,8 @@ use crate::dbos::{DBOS, Executor};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::sysdb::types::{
-    Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowFilter, WorkflowRecord,
+    Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord,
 };
 
 /// Whether an operation reaches a workflow's descendants.
@@ -155,6 +161,48 @@ pub struct ForkOptions<'a> {
 }
 
 impl DBOS {
+    /// A handle to a workflow this process did not start.
+    ///
+    /// The way a listing becomes something to act on: [`list_workflows`](Self::list_workflows)
+    /// hands back rows, and this turns one of their ids into a handle that can be awaited. The
+    /// handle is a **polling** one — see the module documentation — because the workflow is
+    /// running somewhere else, if it is running at all.
+    ///
+    /// **The id is not checked, and the call does no I/O.** The references split two-two — Python
+    /// verifies the row and raises `DBOSNonExistentWorkflowError`, Go reads it as part of the call,
+    /// while TypeScript and Java hand back a handle either way, Java's doc saying "the workflow
+    /// exists or not; `getStatus()` can be used to tell the difference".
+    ///
+    /// **The split is downstream of a choice this crate made differently.** All four give their
+    /// `await_workflow_result` a `fail_if_missing` flag that is **off by default**, so awaiting an
+    /// id with no row *polls for a workflow that does not exist yet* — which is why Python and Go
+    /// check up front, and why a mistyped id handed to TypeScript's `retrieveWorkflow` waits
+    /// forever. Rust has no such flag: `await_workflow_result` reports `NonExistentWorkflow` and
+    /// its own comment says why — *"waiting for a workflow to finish, not for one to exist"*.
+    ///
+    /// So the check buys nothing here. A mistyped id is reported at the first use, with the error
+    /// a check would have raised, one round trip later and only for callers who use it — and this
+    /// stays a plain function, so mapping a listing to handles costs nothing. The flag itself will
+    /// want revisiting when the client arrives, where awaiting an id whose row another process has
+    /// not committed yet is the case it exists for.
+    ///
+    /// It is not the same line [`resume`](Self::resume) draws, and deliberately: a resume is a
+    /// write that would otherwise silently do nothing.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// let handle = dbos.retrieve_workflow::<u32, dbos::EngineOnly>("started-elsewhere")?;
+    /// let status = handle.status().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
+        let executor = self.executor("retrieve a workflow")?;
+        Ok(WorkflowHandle::polling(
+            Arc::clone(executor.connection()),
+            workflow_id.to_owned(),
+        ))
+    }
+
     /// Stops a workflow, and any executor running it.
     ///
     /// The row goes to `CANCELLED`, which is terminal: awaiting the workflow raises
@@ -430,6 +478,63 @@ impl DBOS {
             tracing::info!(deleted, "deleted workflows");
         }
         Ok(deleted)
+    }
+
+    /// Holds a queued workflow back, or lets it go sooner.
+    ///
+    /// **Only a `DELAYED` row moves.** A workflow that has already been released is running or
+    /// queued, and pushing its delay out would not recall it — so this is a way to reschedule work
+    /// that is still waiting, not a way to pause work that has started.
+    /// [`cancel`](Self::cancel) is the one that stops something.
+    ///
+    /// [`WorkflowDelay::For`] is resolved against the **database's** clock rather than this
+    /// process's, the same as the delay on an enqueue: a caller's skew should not reach the row,
+    /// where a whole fleet reads it.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// use std::time::Duration;
+    /// // Not before the hour is up.
+    /// dbos.set_workflow_delay("scheduled-report", dbos::WorkflowDelay::For(Duration::from_secs(3600))).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
+        let executor = self.executor("delay a workflow")?;
+        executor
+            .sysdb()
+            .set_workflow_delay(workflow_id, delay)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        tracing::info!(workflow_id, "moved the workflow's release time");
+        Ok(())
+    }
+
+    /// Replaces a workflow's attributes, or clears them with `None`.
+    ///
+    /// **A replacement, not a merge**, in every implementation — so a caller adding one key must
+    /// send the others back with it. `attributes` is encoded JSON and must be a JSON *object*:
+    /// the column is queried with `@>` containment by [`WorkflowFilter::attributes`], and
+    /// containment against a bare scalar or an array does not mean what a caller would read it to
+    /// mean.
+    ///
+    /// **Named for what three of the four call it.** Python's is `update_workflow_attributes` and
+    /// Java's `updateWorkflowAttributes`; TypeScript has no attributes method at all; and Go's
+    /// method is `SetWorkflowAttributes` while the step it records is `DBOS.updateWorkflowAttributes`
+    /// — so Go disagrees with itself, and the stored name is the half that other implementations
+    /// read.
+    pub async fn update_workflow_attributes(
+        &self,
+        workflow_id: &str,
+        attributes: Option<&str>,
+    ) -> Result<()> {
+        let executor = self.executor("update a workflow's attributes")?;
+        executor
+            .sysdb()
+            .update_workflow_attributes(workflow_id, attributes)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        tracing::info!(workflow_id, "updated the workflow's attributes");
+        Ok(())
     }
 
     /// Reads the workflows matching a filter, oldest first unless the filter says otherwise.

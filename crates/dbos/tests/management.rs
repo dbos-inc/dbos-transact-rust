@@ -791,3 +791,197 @@ async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
 
     dbos.shutdown().await;
 }
+
+/// **A handle for a workflow this process did not start**, which is what makes a listing useful.
+#[tokio::test]
+async fn a_workflow_can_be_retrieved_by_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("retrieve-app", &db));
+    let workflow = dbos
+        .register_workflow("retrievable", |()| async move { Ok::<u32, Error>(6) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "already-run";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    // Nothing is read until the handle is used, so this is the id and nothing else.
+    let handle = dbos
+        .retrieve_workflow::<u32, EngineOnly>(id)
+        .expect("retrieve failed");
+    assert_eq!(handle.workflow_id(), id);
+    assert_eq!(
+        handle.status().await.expect("status failed"),
+        WorkflowStatus::Success
+    );
+    assert_eq!(handle.result().await.expect("the workflow failed"), 6);
+
+    // An id with no row is handed back too, and says so at the first use rather than waiting for a
+    // workflow that will never exist.
+    let missing = dbos
+        .retrieve_workflow::<u32, EngineOnly>("never-existed")
+        .expect("retrieve failed");
+    assert!(
+        matches!(
+            missing.result().await,
+            Err(Error::WorkflowNotFound { workflow_id }) if workflow_id == "never-existed"
+        ),
+        "awaiting a workflow with no row should report it, not wait for it"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A delay can be moved while the workflow is still `DELAYED`, and the move is what decides when
+/// the supervisor releases it.
+#[tokio::test]
+async fn a_delayed_workflow_can_be_released_sooner() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("delay-app", &db));
+    let ran = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("delayable", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(2)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "delayed-work",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    // Far enough out that the test is not racing the supervisor.
+    let id = "held-back";
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(Enqueue {
+                    delay: Some(std::time::Duration::from_secs(3600)),
+                    ..Enqueue::new("delayed-work")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Delayed,
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+    // Bring it forward to now, and the supervisor releases it on its next pass.
+    dbos.set_workflow_delay(id, dbos::WorkflowDelay::For(std::time::Duration::ZERO))
+        .await
+        .expect("delay failed");
+    assert_eq!(handle.result().await.expect("the workflow failed"), 2);
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    dbos.shutdown().await;
+}
+
+/// Attributes are replaced rather than merged, cleared by `None`, and searchable by containment.
+#[tokio::test]
+async fn attributes_are_replaced_and_can_be_searched() {
+    use dbos::sysdb::types::WorkflowFilter;
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("attributes-app", &db));
+    let workflow = dbos
+        .register_workflow("tagged", |()| async move { Ok::<u32, Error>(0) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "carries-tags";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    dbos.update_workflow_attributes(id, Some(r#"{"tenant":"acme","tier":"gold"}"#))
+        .await
+        .expect("update failed");
+
+    // Containment, not equality: one key out of two matches.
+    let found = dbos
+        .list_workflows(&WorkflowFilter {
+            attributes: Some(r#"{"tenant":"acme"}"#),
+            ..WorkflowFilter::default()
+        })
+        .await
+        .expect("listing failed");
+    assert_eq!(
+        found
+            .iter()
+            .map(|w| w.workflow_id.as_str())
+            .collect::<Vec<_>>(),
+        [id],
+    );
+
+    // A replacement, not a merge: the key that is not sent again is gone.
+    dbos.update_workflow_attributes(id, Some(r#"{"tenant":"acme"}"#))
+        .await
+        .expect("update failed");
+    let after_replacement = dbos
+        .list_workflows(&WorkflowFilter {
+            attributes: Some(r#"{"tier":"gold"}"#),
+            ..WorkflowFilter::default()
+        })
+        .await
+        .expect("listing failed");
+    assert!(
+        after_replacement.is_empty(),
+        "the replaced attributes were merged instead"
+    );
+
+    // And `None` clears them.
+    dbos.update_workflow_attributes(id, None)
+        .await
+        .expect("clear failed");
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .attributes
+            .is_none(),
+        "clearing left the attributes behind"
+    );
+
+    dbos.shutdown().await;
+}
