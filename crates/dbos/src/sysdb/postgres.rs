@@ -2712,9 +2712,6 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         validate_attributes(attributes)?;
         let workflow_table = &self.tables.workflow_status;
-        // Read once, outside the retry: a second attempt is the same write, and re-reading the
-        // clock would date the row to whenever the connection came back.
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(
@@ -2728,7 +2725,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 )))
                 .bind(workflow_id)
                 .bind(attributes)
-                .bind(now)
                 .execute(pool)
                 .await?;
                 Ok(())
