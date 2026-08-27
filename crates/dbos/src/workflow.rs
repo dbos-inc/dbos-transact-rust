@@ -209,7 +209,7 @@ impl Drop for PanicLog<'_> {
     }
 }
 
-/// What a caller may say about a start, beyond the input.
+/// What a caller may say about a run, beyond the input.
 ///
 /// A struct rather than a builder, matching how `sysdb` spells optional arguments; the common case
 /// pays nothing because [`run`](WorkflowRef::run) and [`start`](WorkflowRef::start) keep their
@@ -217,7 +217,7 @@ impl Drop for PanicLog<'_> {
 /// `..Default::default()` form this type is built around. Adding a field stays non-breaking for
 /// every caller who wrote it.
 #[derive(Debug, Clone, Default)]
-pub struct StartOptions<'a> {
+pub struct RunOptions<'a> {
     /// The workflow's id, in place of a generated one.
     ///
     /// A caller-supplied id is an idempotency key: starting the same id twice joins the workflow
@@ -236,6 +236,208 @@ pub struct StartOptions<'a> {
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
     /// cancelled workflow was interrupted, not wrong.
     pub timeout: Timeout,
+}
+
+/// What a caller may say about a start, beyond the input.
+///
+/// [`RunOptions`] plus a [`queue`](Self::queue), and that one extra field is why the two are
+/// separate types. Enqueueing means some *other* executor runs the workflow, at some later time;
+/// running means this process executes it and waits. There is no coherent reading of the two
+/// together — a queued `run_with` could only block on work this process is not doing, or silently
+/// ignore the queue — so the signature refuses it rather than the body, and no `run_with` caller
+/// has to read about a field they cannot use.
+///
+/// Every `RunOptions` [converts](RunOptions) into one of these, because
+/// [`run_with`](WorkflowRef::run_with) *is* [`start_with`](WorkflowRef::start_with) plus an await.
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions<'a> {
+    /// The workflow's id, in place of a generated one, and an idempotency key — see
+    /// [`RunOptions::workflow_id`].
+    pub workflow_id: Option<&'a str>,
+    /// How long the whole workflow may take, and what it does about a parent's budget — see
+    /// [`RunOptions::timeout`].
+    pub timeout: Timeout,
+    /// A queue to leave this workflow on, instead of running it here.
+    ///
+    /// The workflow is recorded `ENQUEUED` and **not started**: whichever executor next polls that
+    /// queue claims it and runs it, under whatever limits the queue carries. The handle returned is
+    /// a polling one, because the process that asked is usually not the process that runs it.
+    ///
+    /// Everything an enqueue can ask for lives in [`Enqueue`] rather than beside this field, which
+    /// is what makes the four queue-only options unstatable without a queue — see that type.
+    pub queue: Option<Enqueue<'a>>,
+}
+
+/// A queue to leave a workflow on, and what to ask of it.
+///
+/// **The queue-only options are nested here rather than sitting beside
+/// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
+/// id, a priority, a partition key and a delay each mean nothing without a queue: Go checks all
+/// four at start and returns `InvalidOptionError` for each
+/// (`workflow.go:1178`–`1199`), which is four runtime errors describing states its type system
+/// allowed it to build. Owning them from the queue makes the same four unrepresentable — there is
+/// no queue-less value here to hang them on. Two rules survive as refusals at start, because no
+/// shape can take them:
+///
+/// - **A [`deduplication_id`](Self::deduplication_id) and a [`partition_key`](Self::partition_key)
+///   cannot both be set.** Go refuses the same pair (`workflow.go:1201`), and it is not a policy
+///   choice: a partitioned queue's sweep claims one head-of-line workflow per partition and leans
+///   on the `PENDING` gate to hold concurrency at one, while a deduplication key is enforced by a
+///   partial unique index over `(queue_name, deduplication_id)` that knows nothing about
+///   partitions.
+/// - **A [`priority`](Self::priority) must be between 1 and [`i32::MAX`].** `0` is the stored
+///   sentinel for unprioritised, so accepting it would give that state a second spelling that
+///   reads like a real priority.
+///
+/// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts:324`), which
+/// is the nearest precedent; Go and Python keep them flat on their options struct.
+///
+/// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
+/// and a queue registered by a peer is as valid a destination as one registered here.
+/// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is a legitimate destination too, and is where
+/// `resume` and `fork` put work.
+///
+/// ```no_run
+/// # async fn f(workflow: &dbos::WorkflowRef<(), String>) -> dbos::Result<()> {
+/// workflow.start_with((), dbos::StartOptions {
+///     queue: Some(dbos::Enqueue {
+///         deduplication_id: Some("order-42"),
+///         ..dbos::Enqueue::new("demo-queue")
+///     }),
+///     ..Default::default()
+/// }).await?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enqueue<'a> {
+    /// The queue's name, which is its address.
+    pub name: &'a str,
+    /// A key no two waiting workflows on this queue may share.
+    ///
+    /// The key is held only while the workflow is waiting — it is cleared when the workflow
+    /// finishes — so it deduplicates a *backlog*, not a history: enqueueing the same key again
+    /// after the first one completed is a new workflow, not a duplicate.
+    ///
+    /// A second enqueue under a held key is refused. Adopting the winner instead is what the
+    /// references' deduplication *policy* selects, which this slice does not carry yet.
+    ///
+    /// **Mutually exclusive with [`partition_key`](Self::partition_key)**: a start naming both is
+    /// refused, for the reason this type's own documentation gives.
+    pub deduplication_id: Option<&'a str>,
+    /// Dequeue order among this queue's waiting workflows, **lower first**.
+    ///
+    /// Only honoured by a queue registered with priority enabled; on any other queue it is stored
+    /// and ignored, which is what every reference does rather than refusing it.
+    ///
+    /// **`None` is not "priority zero".** The column's `0` is the references' sentinel for
+    /// *unprioritised*, and it sorts ahead of every explicit priority — TypeScript says so in as
+    /// many words (*"starting from 1 ~ 2,147,483,647. Default 0 (highest priority)"*). Letting a
+    /// caller write `Some(0)` would spell one state two ways, so the range starts at 1 and `None`
+    /// is the only way to say "unprioritised".
+    pub priority: Option<u32>,
+    /// Which partition of a partitioned queue this workflow belongs to.
+    ///
+    /// A partitioned queue runs at most one workflow per partition at a time, so the key is the
+    /// unit of ordering: work sharing a key runs in sequence, and work under different keys runs
+    /// concurrently.
+    ///
+    /// **Mutually exclusive with [`deduplication_id`](Self::deduplication_id)**: a start naming
+    /// both is refused.
+    pub partition_key: Option<&'a str>,
+    /// How long to hold the workflow before it may be dequeued at all.
+    ///
+    /// The row goes in `DELAYED` rather than `ENQUEUED` and the supervisor moves it across when
+    /// the delay expires — [`NewWorkflow::initial_status`](crate::sysdb::types::NewWorkflow::initial_status)
+    /// derives that from this field's presence.
+    ///
+    /// **A duration, not an instant**, and the wall-clock moment is stamped by the database rather
+    /// than computed here: the system database writes it against the same clock it writes
+    /// `created_at` with, so a caller's clock skew never reaches the row.
+    pub delay: Option<Duration>,
+}
+
+impl<'a> Enqueue<'a> {
+    /// A plain enqueue onto `name`, asking for nothing else — what `queue: Some(name)` meant
+    /// before the options existed.
+    pub fn new(name: &'a str) -> Self {
+        Self {
+            name,
+            deduplication_id: None,
+            priority: None,
+            partition_key: None,
+            delay: None,
+        }
+    }
+
+    /// Rejects an enqueue no queue could honour.
+    ///
+    /// **Only what the shape could not rule out.** Nesting these options under the queue already
+    /// makes "a delay with no queue" and its three siblings unbuildable, so what is left is the
+    /// pair of rules that are about the options themselves:
+    ///
+    /// - **A deduplication id and a partition key cannot both be set.** Go refuses the same pair
+    ///   (`workflow.go:1201`) and it is not a policy choice: the two ask the dequeue for
+    ///   incompatible things. A partitioned queue's sweep claims one head-of-line workflow per
+    ///   partition and relies on the `PENDING` gate to hold concurrency at one, while a
+    ///   deduplication key is enforced by a partial unique index over `(queue_name,
+    ///   deduplication_id)` that knows nothing about partitions.
+    /// - **A priority must be at least 1.** `0` is the stored sentinel for unprioritised, so
+    ///   accepting it would give that state a second spelling that reads like a real priority;
+    ///   the references' documented range starts at 1 for the same reason. The ceiling is
+    ///   [`i32::MAX`] because the column is a signed 32-bit integer.
+    ///
+    /// Naming the queue in the message rather than only the field, because a start that fails
+    /// validation says nothing else about which enqueue it was.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let refuse = |message: String| {
+            Err(Error::Config(format!(
+                "enqueue onto `{}`: {message}",
+                self.name
+            )))
+        };
+
+        if self.deduplication_id.is_some() && self.partition_key.is_some() {
+            return refuse(
+                "`deduplication_id` and `partition_key` cannot both be set: a partitioned \
+                 queue's dequeue and a deduplication key enforce different things"
+                    .to_owned(),
+            );
+        }
+        if let Some(priority) = self.priority {
+            if priority == 0 {
+                return refuse(
+                    "`priority` must be at least 1; use `None` for an unprioritised workflow"
+                        .to_owned(),
+                );
+            }
+            if priority > i32::MAX as u32 {
+                return refuse(format!(
+                    "`priority` must be at most {}, got {priority}",
+                    i32::MAX
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored priority: the sentinel `0` when unprioritised.
+    ///
+    /// Infallible because [`validate`](Self::validate) has already ruled out everything that would
+    /// not fit, which is why this takes no `Result` and the cast cannot wrap.
+    pub(crate) fn stored_priority(&self) -> i32 {
+        self.priority.map_or(0, |priority| priority as i32)
+    }
+}
+
+impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
+    /// A run is a start that nobody queued.
+    fn from(options: RunOptions<'a>) -> Self {
+        Self {
+            workflow_id: options.workflow_id,
+            timeout: options.timeout,
+            queue: None,
+        }
+    }
 }
 
 /// How long a workflow may take, and — started from inside another one — what it does about the
@@ -336,12 +538,15 @@ where
     /// Called from inside a running workflow this runs a **child** of it, and takes two of the
     /// parent's step ids rather than one — see [`start_with`](Self::start_with).
     pub async fn run(&self, input: P) -> Result<R, E> {
-        self.run_with(input, StartOptions::default()).await
+        self.run_with(input, RunOptions::default()).await
     }
 
     /// [`run`](Self::run), with something to say about how it starts.
-    pub async fn run_with(&self, input: P, options: StartOptions<'_>) -> Result<R, E> {
-        self.start_with(input, options)
+    ///
+    /// Takes [`RunOptions`] rather than [`StartOptions`]: a workflow cannot be both queued and
+    /// waited for here, so there is no queue to name.
+    pub async fn run_with(&self, input: P, options: RunOptions<'_>) -> Result<R, E> {
+        self.start_with(input, options.into())
             .await
             .map_err(Error::lift)?
             .result()
@@ -456,6 +661,13 @@ where
         options: StartOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         let executor = self.dbos().executor("start a workflow")?;
+        // Borrowed rather than moved, because `options` is read again below, and **validated
+        // before anything is written**: an enqueue no queue could honour should cost a round trip,
+        // not a row. `queue::validate` refuses a queue's configuration in the same spot.
+        let enqueue = options.queue.as_ref();
+        if let Some(enqueue) = enqueue {
+            enqueue.validate()?;
+        }
         // **The ambient context is what makes this a child.** Every reference overloads the same
         // call rather than adding a `start_child`, so factoring a workflow body out into its own
         // workflow does not change how its call sites are written — and a workflow started from
@@ -498,6 +710,13 @@ where
         // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
         // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
         let deadline = match (options.timeout, &parent) {
+            // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
+            // explicit timeout records the budget and leaves the deadline null for the claim
+            // statement to fill in. The wait in the queue is not part of the budget — a workflow
+            // given five minutes that sits queued for an hour still gets five minutes. Python and
+            // TypeScript both branch on the queue in exactly this spot; the claim statement this
+            // engine already ships does the other half.
+            (Timeout::Explicit(_), _) if options.queue.is_some() => None,
             // **An explicit timeout replaces an inherited deadline**, which is Python's and
             // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
             // use it over any propagated deadline"*. So a child given longer than its parent has
@@ -516,6 +735,12 @@ where
             // parent and the child genuinely share: both `select!`s fire at the same moment, in
             // different tasks and possibly in different processes, with no signal passing between
             // them. A propagated deadline is the cancellation cascade, and needs no other one.
+            // **Inherited even onto a queue**, and this is not an oversight in Python's code: its
+            // `_get_timeout_deadline` branches on the queue only inside the explicit-timeout arm,
+            // and returns the propagated deadline unconditionally otherwise. The difference is
+            // what the two mean. A budget is a promise about how long the *work* may take, so the
+            // queue wait cannot count against it; an inherited deadline is an instant a parent is
+            // already bound by, and a child does not escape it by being queued.
             (Timeout::Inherit, Some(parent)) => parent.deadline,
             (Timeout::Inherit, None) => None,
         };
@@ -540,6 +765,17 @@ where
                     timeout: options.timeout.budget(),
                     deadline,
                     parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
+                    // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
+                    // it: a queue's whole point is that the process which asks is not necessarily
+                    // the one that runs. A `delay` makes it `DELAYED` instead, which
+                    // `initial_status` derives rather than this call stating.
+                    queue_name: enqueue.map(|enqueue| enqueue.name),
+                    deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
+                    // Zero when unprioritised, and zero when there is no queue at all: the column
+                    // is `NOT NULL`, and a workflow that was never enqueued has no order to keep.
+                    priority: enqueue.map_or(0, Enqueue::stored_priority),
+                    queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
+                    delay: enqueue.and_then(|enqueue| enqueue.delay),
                     ..NewWorkflow::new(&workflow_id)
                 },
                 Some(MAX_RECOVERY_ATTEMPTS),
@@ -556,6 +792,18 @@ where
             parent
                 .record_launch(&executor, &workflow_id, &self.key().name, started_at)
                 .await?;
+        }
+
+        // **Enqueued, so this process is not the one running it.** A polling handle is the honest
+        // answer even when this executor turns out to dequeue it moments later: nothing local is
+        // waiting on, and the row is the only thing that knows where the workflow got to.
+        if let Some(enqueue) = enqueue {
+            tracing::debug!(
+                workflow_id,
+                queue = enqueue.name,
+                "the workflow is enqueued"
+            );
+            return Ok(WorkflowHandle::polling(executor, workflow_id));
         }
 
         // Someone else owns this row — the id was supplied and a previous run has it, or another
@@ -578,6 +826,8 @@ where
             workflow_id.clone(),
             input,
             initialized.deadline,
+            // A fresh start is not a dequeue, so it holds no queue's slot.
+            None,
         );
         Ok(WorkflowHandle::local(executor, workflow_id, task))
     }
@@ -670,12 +920,18 @@ impl Parent {
 ///
 /// The span travels with the task, so everything the workflow logs — the engine's own events and
 /// the application's — carries the workflow id without threading it anywhere.
+///
+/// `slot` is carried, never read: a dequeued workflow holds its place in its queue's local running
+/// tally for exactly as long as this task lives, so the release happens on a return, a panic, or
+/// shutdown aborting it, without anything having to watch for the end. Every other submitter
+/// passes `None`.
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
     deadline: Option<Timestamp>,
+    slot: Option<crate::dequeue::Slot>,
 ) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
@@ -683,6 +939,7 @@ pub(crate) fn spawn_execution(
         {
             let executor = Arc::clone(executor);
             async move {
+                let _slot = slot;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline);
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,

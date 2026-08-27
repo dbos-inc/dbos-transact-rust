@@ -7,7 +7,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
-use dbos::{Config, DBOS, Error, StartOptions, Timeout};
+use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -39,7 +39,7 @@ async fn a_workflow_past_its_deadline_is_cancelled() {
     let error = workflow
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_millis(100)),
             },
@@ -77,7 +77,7 @@ async fn a_workflow_within_its_deadline_is_unaffected() {
     let value = workflow
         .run_with(
             (),
-            StartOptions {
+            RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(30)),
             },
@@ -122,6 +122,7 @@ async fn a_recovered_workflow_keeps_the_deadline_it_already_had() {
                 StartOptions {
                     workflow_id: Some(id),
                     timeout: Timeout::Explicit(Duration::from_millis(400)),
+                    ..StartOptions::default()
                 },
             )
             .await
@@ -215,6 +216,7 @@ async fn shutdown_does_not_durably_cancel_a_workflow_that_has_a_deadline() {
                 workflow_id: Some(id),
                 // Generous, so the deadline is nowhere near firing when shutdown arrives.
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
+                ..StartOptions::default()
             },
         )
         .await
@@ -261,6 +263,7 @@ async fn a_deadline_that_loses_to_a_recorded_outcome_reports_that_outcome() {
             StartOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_millis(600)),
+                ..StartOptions::default()
             },
         )
         .await

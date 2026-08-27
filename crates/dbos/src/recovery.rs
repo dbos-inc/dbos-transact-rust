@@ -1,175 +1,62 @@
-//! Recovery on launch: resuming what a previous process abandoned.
+//! Recovery on launch: returning what a previous process abandoned to its queue.
 //!
-//! The list of abandoned workflows is taken **before `launch` returns** — by
-//! [`Executor::start`](crate::dbos::Executor), not here — and that ordering is load-bearing: a
-//! workflow the application starts the instant launch returns is `PENDING` too, indistinguishable
-//! from one a dead process left behind, so a list taken any later would claim it and run it a
-//! second time alongside the caller still running it. Only the *execution* of the list is
-//! backgrounded, which is what this module does.
+//! **Recovery is a re-enqueue, and that is the whole of it.** A `PENDING` row whose executor is
+//! gone goes back to `ENQUEUED`, and whichever executor next polls its queue runs it. This module
+//! is one write.
+//!
+//! It used to be otherwise: the sweep read the abandoned rows and executed them here, in the
+//! process that found them, which was Java's shape and only Java's — `sdk-parity.md` divergence
+//! 12, and go #433's conclusion. Python, TypeScript and Go all re-enqueue. That shape was not a
+//! preference; it was what was available before the engine had queues, and this module carried a
+//! section arguing against itself for as long as it lasted.
+//!
+//! Three things the re-enqueue buys, none of which was reachable before:
+//!
+//! - **A repeat costs nothing.** The queue's atomic `ENQUEUED` → `PENDING` claim admits exactly
+//!   one runner, and the `executor_ids` predicate means a second sweep naming the dead executor
+//!   matches nothing once a live one has taken the row. Executing here was held together by
+//!   `init_workflow`'s ownership guard instead, which is a narrower promise.
+//! - **The fleet shares the backlog.** A re-enqueued workflow can be picked up by any executor on
+//!   the version. One recovered in place ran in place, so an executor returning to a large backlog
+//!   worked through all of it alone.
+//! - **Concurrency stops being this module's problem.** The old sweep spawned every pending
+//!   workflow at once, unbounded, so a process that died holding a backlog contended with itself
+//!   for its own connection pool on the next launch. A queue owns that question now — though note
+//!   that none of the four references gives [`INTERNAL_QUEUE`] a concurrency default, so the
+//!   answer for a workflow that was never queued is still "all of them", by choice rather than by
+//!   oversight.
+//!
+//! **Synchronous, inside `launch`.** Not backgrounded, because it is now one statement rather than
+//! a list of workflows to run — and because doing it before `launch` returns is what keeps it from
+//! touching a workflow the application starts the instant it does. Such a workflow is `PENDING`
+//! under this executor's id too, and indistinguishable from an abandoned one; a sweep running any
+//! later would tear it off its runner and offer it to the fleet. Go orders it the same way, and
+//! for the second reason as well: it re-enqueues before the queue runner starts, so recovered work
+//! is not racing a dequeue pass that is already in flight.
 
-use std::sync::Arc;
+use crate::error::{Error, Result};
+use crate::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 
-use tracing::Instrument;
-
-use crate::dbos::Executor;
-use crate::error::Error;
-use crate::registry::WorkflowKey;
-use crate::sysdb;
-use crate::sysdb::types::{NewWorkflow, Submission};
-use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
-
-/// Runs the recovery list in the background, one submission at a time.
+/// Returns this executor's abandoned workflows to their queues.
 ///
-/// The driver is registered with the executor's task set, so shutdown aborts a recovery still in
-/// flight the same way it aborts the workflows themselves — everything it managed to submit stays
-/// `PENDING` for the next launch, which is recovery's own contract applied to itself.
-///
-/// Per-workflow failures are logged, never propagated: recovery is a sweep, and one bad row must
-/// not strand every workflow behind it.
-///
-/// # This should become a re-enqueue
-///
-/// Executing here, in the process that found the row, is **Java's shape and only Java's**.
-/// Python, TypeScript and Go re-enqueue every recovered workflow instead — non-queued ones onto
-/// the internal queue — through one `reenqueue_for_recovery` / `ReenqueueForRecovery` call, and
-/// let the queue dispatch them. `sdk-parity.md` divergence 12 records the split and calls Java the
-/// odd one out.
-///
-/// Three things that buys, and none of them is available to this module today:
-///
-/// - **Idempotence.** The queue's atomic `ENQUEUED` → `PENDING` dequeue admits exactly one runner,
-///   so a duplicate recovery request costs nothing. Here, two executors that both believe they own
-///   a row are held apart by `init_workflow`'s guard instead, which is a narrower promise.
-/// - **The fleet shares the work.** A re-enqueued workflow can be picked up by any executor on the
-///   version; one recovered here runs here, so an executor that comes back to a large backlog
-///   works through all of it alone.
-/// - **Concurrency stops being this module's problem.** The sweep below spawns every pending
-///   workflow at once, unbounded, and a process that died holding a large backlog will contend for
-///   its own connection pool on the next launch. A queue owns that question — and note the other
-///   three do not answer it either: their internal queue carries no default limit, so the bound is
-///   a knob on the queue rather than something recovery decides.
-///
-/// This is not the shape to keep, but it is the only one available until the engine has queues:
-/// `sysdb` has `INTERNAL_QUEUE`, `start_queued_workflows` and `clear_queue_assignment`, and no
-/// `reenqueue_for_recovery` at all. When queues land, this module should lose its executor and its
-/// `spawn_execution` call and become that one write.
-pub(crate) fn spawn(executor: Arc<Executor>, pending: Vec<String>) {
-    if pending.is_empty() {
-        tracing::debug!("no workflows to recover");
-        return;
-    }
-    tracing::info!(
-        workflows = pending.len(),
-        "recovering workflows a previous run left PENDING"
-    );
-    spawn_tracked(
-        &executor,
-        {
-            let executor = Arc::clone(&executor);
-            async move {
-                for workflow_id in pending {
-                    if let Err(error) = recover_one(&executor, &workflow_id).await {
-                        tracing::warn!(
-                            workflow_id,
-                            error = %error,
-                            "could not recover the workflow; it stays PENDING for a later launch"
-                        );
-                    }
-                }
-            }
-        }
-        .instrument(tracing::info_span!("recovery")),
-    );
-}
-
-/// Resubmits one abandoned workflow, if this executor still can and should.
-///
-/// The registry is consulted *before* the row is claimed: an `init_workflow` that succeeded and
-/// then found no registration would have burned a recovery attempt and re-stamped the executor on
-/// a workflow this process cannot run.
-async fn recover_one(executor: &Arc<Executor>, workflow_id: &str) -> crate::Result<()> {
-    let row = executor
-        .sysdb()
-        .get_workflow(workflow_id)
+/// Called by [`Executor::start`](crate::dbos::Executor) before `launch` returns, and reports what
+/// moved rather than handles: this process may run none of them.
+pub(crate) async fn reenqueue(
+    sysdb: &impl SystemDatabase,
+    executor_id: &str,
+    application_version: &str,
+) -> Result<Vec<String>> {
+    let recovered = sysdb
+        .reenqueue_for_recovery(&[executor_id], application_version, INTERNAL_QUEUE)
         .await
         .map_err(Error::SystemDatabase)?;
-    let Some(row) = row else {
-        tracing::debug!(workflow_id, "the row is gone; nothing to recover");
-        return Ok(());
-    };
-    let Some(name) = row.name else {
-        tracing::warn!(workflow_id, "the row names no workflow; skipped");
-        return Ok(());
-    };
-
-    let key = WorkflowKey::from_row(name, row.class_name.as_deref(), row.config_name.as_deref());
-    if !executor.workflows().contains_key(&key) {
-        // Logged and skipped, never fatal: the code that knew this workflow was removed or
-        // renamed, and the row waits for a launch that recognises it.
-        tracing::warn!(
-            workflow_id,
-            workflow = %key,
-            "no workflow is registered under the row's name; it stays PENDING"
+    if recovered.is_empty() {
+        tracing::debug!("no workflows to recover");
+    } else {
+        tracing::info!(
+            workflows = recovered.len(),
+            "re-enqueued workflows a previous run left PENDING"
         );
-        return Ok(());
     }
-
-    let initialized = match executor
-        .sysdb()
-        .init_workflow(
-            &NewWorkflow {
-                name: Some(&key.name),
-                class_name: key.class_name.as_deref(),
-                config_name: key.config_name.as_deref(),
-                input: row.input.as_deref(),
-                // The row's own, not this executor's default: a recovery must not rewrite how a
-                // payload it did not encode is described.
-                serialization: row.serialization.as_deref(),
-                executor_id: Some(executor.executor_id()),
-                application_name: Some(executor.app_name()),
-                application_version: Some(executor.application_version()),
-                ..NewWorkflow::new(workflow_id)
-            },
-            Some(MAX_RECOVERY_ATTEMPTS),
-            Submission::Recovery,
-        )
-        .await
-    {
-        Ok(initialized) => initialized,
-        // Parked, not failed to recover: the row is now MAX_RECOVERY_ATTEMPTS_EXCEEDED and no
-        // later launch will pick it up, which deserves its own line rather than the generic one.
-        Err(error @ sysdb::Error::MaxRecoveryAttemptsExceeded { .. }) => {
-            tracing::warn!(workflow_id, error = %error, "the workflow is parked");
-            return Ok(());
-        }
-        Err(error) => return Err(Error::SystemDatabase(error)),
-    };
-
-    if !initialized.should_execute {
-        tracing::debug!(
-            workflow_id,
-            "another executor claimed the workflow, or it already finished"
-        );
-        return Ok(());
-    }
-
-    tracing::debug!(
-        workflow_id,
-        workflow = %key,
-        attempt = initialized.recovery_attempts,
-        "recovering the workflow"
-    );
-    // Detached: recovered workflows run concurrently, and the driver moves on. The handle is not
-    // awaited by anyone, which is exactly the case the execution layer's own logging covers.
-    // The stored deadline, so a recovered workflow gets what is *left* of its budget rather than
-    // the whole of it again — and one recovered after its expiry cancels at once instead of
-    // running on unbounded.
-    spawn_execution(
-        executor,
-        key,
-        workflow_id.to_owned(),
-        row.input,
-        initialized.deadline,
-    );
-    Ok(())
+    Ok(recovered)
 }

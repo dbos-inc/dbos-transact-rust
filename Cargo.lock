@@ -486,6 +486,7 @@ version = "0.1.2"
 dependencies = [
  "axum",
  "dbos",
+ "serde",
  "tokio",
  "tracing-subscriber",
 ]

@@ -1015,11 +1015,28 @@ const PORTABLE_JSON: &str = "portable_json";
 /// error a caller can see rather than a call that never returns.
 const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 
+/// The database's clock, in epoch milliseconds, as a SQL expression.
+///
+/// **Used wherever one executor's timestamp is compared against another's.** A rate limit stamps
+/// `started_at_epoch_ms` on the row it claims and the next dequeue measures its window back from
+/// now; if the two executors read their own clocks, a host running fast writes starts that a peer
+/// judges to be outside its window and both admit a full allowance. One clock, so the window
+/// means the same thing everywhere. Python spells it `_now_ms_sql` and TypeScript inlines it.
+///
+/// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
+/// and the stamp taken later in the same transaction agree on one instant.
+///
+/// The `::bigint` is not decoration: `EXTRACT` yields `numeric`, and comparing a `BIGINT` column
+/// against a `numeric` casts the column, which costs it its index — and the column this is
+/// compared against is the dequeue's own.
+const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
+
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
-     rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec, \
-     application_name";
+     rate_limit_period_sec, priority_enabled, partition_queue, partition_concurrency, \
+     partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec, \
+     polling_interval_sec, application_name";
 
 /// Every column of a schedule row, in the order [`schedule_from_row`] reads them.
 const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
@@ -1077,41 +1094,51 @@ fn schedule_from_row(row: &sqlx::postgres::PgRow) -> Result<ScheduleRecord, Erro
 }
 
 fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
-    // The two periods are `DOUBLE PRECISION` seconds, not the integer milliseconds used
-    // elsewhere. A stored value that is negative, infinite or NaN is not a duration any caller
-    // can act on, so it is reported rather than clamped.
+    // The periods are `DOUBLE PRECISION` seconds, not the integer milliseconds used elsewhere. A
+    // stored value that is negative, infinite or NaN is not a duration any caller can act on, so
+    // it is reported rather than clamped.
     let period = |column: &str, value: Option<f64>| match value {
         None => Ok(None),
         Some(secs) => duration_from_secs(secs)
             .map(Some)
             .ok_or_else(|| Error::Malformed(format!("{column} is not a duration: {secs}"))),
     };
+    // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and no
+    // SDK can write it — all four reject an unpaired limit at their public surface. Read as *no
+    // limit* rather than reported, matching TypeScript (`wfqueue.ts:118`), so a hand-edited row
+    // does not make a peer and this implementation disagree about what the same queue is.
+    //
+    // One reader for both pairs, so the queue-wide limit and the per-partition one cannot come to
+    // disagree about what half a limit means.
+    //
+    // TODO(dbos-team): UPSTREAM item 4. Reading it away means a queue whose limit was half
+    // written runs unthrottled and says nothing, which is a silent safety failure rather
+    // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
+    // NULL))` in a future shared migration would make the question moot for everyone.
+    let rate_limit = |max_column: &str, period_column: &str| -> Result<Option<RateLimit>, Error> {
+        Ok(
+            match (
+                row.try_get::<Option<i32>, _>(max_column)?,
+                period(period_column, row.try_get(period_column)?)?,
+            ) {
+                (Some(limit), Some(period)) => Some(RateLimit { limit, period }),
+                _ => None,
+            },
+        )
+    };
     Ok(QueueRecord {
         name: row.try_get("name")?,
         concurrency: row.try_get("concurrency")?,
         worker_concurrency: row.try_get("worker_concurrency")?,
-        // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist,
-        // and no SDK can write it — all four reject an unpaired limit at their public surface.
-        // Read as *no limit* rather than reported, matching TypeScript
-        // (`wfqueue.ts:118`), so a hand-edited row does not make a peer and this
-        // implementation disagree about what the same queue is.
-        //
-        // TODO(dbos-team): UPSTREAM item 4. Reading it away means a queue whose limit was half
-        // written runs unthrottled and says nothing, which is a silent safety failure rather
-        // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
-        // NULL))` in a future shared migration would make the question moot for everyone.
-        rate_limit: match (
-            row.try_get::<Option<i32>, _>("rate_limit_max")?,
-            period(
-                "rate_limit_period_sec",
-                row.try_get("rate_limit_period_sec")?,
-            )?,
-        ) {
-            (Some(limit), Some(period)) => Some(RateLimit { limit, period }),
-            _ => None,
-        },
+        rate_limit: rate_limit("rate_limit_max", "rate_limit_period_sec")?,
         priority_enabled: row.try_get("priority_enabled")?,
         partition_queue: row.try_get("partition_queue")?,
+        partition_concurrency: row.try_get("partition_concurrency")?,
+        partition_worker_concurrency: row.try_get("partition_worker_concurrency")?,
+        partition_rate_limit: rate_limit(
+            "partition_rate_limit_max",
+            "partition_rate_limit_period_sec",
+        )?,
         polling_interval: period("polling_interval_sec", row.try_get("polling_interval_sec")?)?
             .ok_or_else(|| Error::Malformed("polling_interval_sec is null".to_owned()))?,
         application_name: row.try_get("application_name")?,
@@ -1516,14 +1543,17 @@ impl PostgresSystemDatabase {
 
     /// Cancels one batch, returning the ids that were still running.
     ///
-    /// Not retried in here, and not reading its own clock. Both belong to the trait method that
-    /// owns the whole operation: a retry that restarted only this statement would leave the
-    /// cascade around it half-walked, and a per-level clock would give one cancellation as many
-    /// `completed_at` values as the tree has depth.
+    /// Not retried in here: that belongs to the trait method that owns the whole operation, since
+    /// a retry restarting only this statement would leave the cascade around it half-walked.
+    ///
+    /// The clock is per level, so a deep tree's `completed_at` values span the walk rather than
+    /// sharing one instant. Every other implementation does the same — Python and TypeScript put
+    /// `now()` in this statement, Java reads its own inside the equivalent of this method — and
+    /// nothing reads the column to decide anything.
     ///
     /// The terminal-status guard is what makes cancellation safe to repeat: a workflow that has
     /// already succeeded keeps its result rather than being overwritten with `CANCELLED`.
-    async fn cancel_batch<S>(&self, workflow_ids: &[S], now: i64) -> Result<Vec<String>, Error>
+    async fn cancel_batch<S>(&self, workflow_ids: &[S]) -> Result<Vec<String>, Error>
     where
         S: AsRef<str> + Sync,
     {
@@ -1563,13 +1593,12 @@ impl PostgresSystemDatabase {
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
              deduplication_id = NULL, started_at_epoch_ms = NULL, \
-             updated_at = $2, completed_at = $2 \
+             updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
              WHERE workflow_uuid = ANY($1) \
                AND status NOT IN ('SUCCESS', 'ERROR', 'CANCELLED') \
              RETURNING workflow_uuid"
         )))
         .bind(ids)
-        .bind(now)
         .fetch_all(&self.pool)
         .await?;
         Ok(cancelled)
@@ -2030,8 +2059,29 @@ impl SystemDatabase for PostgresSystemDatabase {
         // says the same: "generated outside of the DB retry loop, in case commit acks get lost".
         let owner_xid = uuid::Uuid::new_v4().to_string();
         // One clock reading for every timestamp this row gets, so `delay_until` cannot disagree
-        // with `created_at`, and a retry cannot push the delay further out each time. This is
-        // also why `delay` crosses the API as a duration.
+        // with `created_at`, and a retry cannot push the delay further out each time — which is
+        // also why `delay` crosses the API as a duration rather than an instant.
+        //
+        // **This process's clock rather than the database's, and deliberately.** Both columns
+        // are read by *other* processes and compared against *their* clocks: `created_at` is the
+        // dequeue's FIFO order across the whole fleet, and `delay_until_epoch_ms` is what the
+        // supervisor's `transition_delayed_workflows` releases on. So an enqueuer running fast
+        // does reach them — but that is a gap every implementation shares rather than one this
+        // port should close on its own. Python resolves the delay in `_context.py` and stamps
+        // `created_at` from `time.time()`, Go computes `time.Now().Add(delay)` in `workflow.go`,
+        // and TypeScript does the same; all three bind an absolute instant.
+        //
+        // Moving this one onto `now()` was tried and backed out, because it trades a skew they
+        // all have for a drift only this one would have. `NOW_MS_SQL` is re-read on every
+        // attempt, and `with_retry` starts at a one-second backoff with no attempt limit, so an
+        // insert that lost its first attempt to a serialization failure would release its
+        // workflow a second late — and a hundred-millisecond delay would be off by an order of
+        // magnitude. The `ON CONFLICT` arm below does not rewrite the column, but that only
+        // covers the lost-acknowledgement case, where the first attempt did commit.
+        //
+        // TODO(dbos-team): UPSTREAM item 22. The skew is worth closing, but in all four at once
+        // and against the database's clock — read once outside the retry, which is the part the
+        // attempt above got wrong.
         let now = Timestamp::now();
         let delay_until = workflow
             .delay
@@ -2092,7 +2142,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                        THEN {workflow_table}.recovery_attempts + $31 \
                        ELSE {workflow_table}.recovery_attempts \
                    END, \
-                   updated_at = EXCLUDED.updated_at, \
+                   updated_at = {NOW_MS_SQL}, \
                    executor_id = CASE \
                        WHEN EXCLUDED.status = 'ENQUEUED' OR EXCLUDED.status = 'DELAYED' \
                        THEN {workflow_table}.executor_id \
@@ -2431,6 +2481,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                 q.push_bind(attributes).push("::jsonb");
             }
 
+            // `created_at` alone, which is what Python, TypeScript and Go all order by. It is a
+            // millisecond stamp, so rows created inside one millisecond are returned in an order
+            // this query does not fix — and `limit`/`offset` page through that order. Adding
+            // `workflow_uuid` as a tiebreaker would settle it, and is deliberately not done here:
+            // a listing that pages differently from every other implementation is a worse problem
+            // than one that pages ambiguously in the same way they do.
+            //
+            // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this order, so a
+            // boundary inside a tie hands one workflow to two pages and skips another. Worth
+            // fixing in all four, and only there.
             q.push(if filter.sort_desc {
                 " ORDER BY created_at DESC"
             } else {
@@ -2495,9 +2555,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         outcome: Outcome<'_>,
     ) -> Result<OutcomeWrite, Error> {
         let workflow_table = &self.tables.workflow_status;
-        // Stamped once, outside the retry: a retried attempt is recording the outcome it
-        // already had, and re-reading the clock would move `completed_at` forward each time.
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         let (output, error) = outcome.columns();
 
@@ -2512,14 +2569,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             // held forever and nothing could ever be submitted under it again.
             let updated = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} SET status = $2, output = $3, error = $4, \
-                 updated_at = $5, completed_at = $5, deduplication_id = NULL \
+                 updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}, \
+                 deduplication_id = NULL \
                  WHERE workflow_uuid = $1 AND status = 'PENDING'"
             )))
             .bind(workflow_id)
             .bind(outcome.status().as_str())
             .bind(output)
             .bind(error)
-            .bind(now)
             .execute(pool)
             .await?
             .rows_affected();
@@ -2634,7 +2691,9 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         let workflow_table = &self.tables.workflow_status;
         // Resolved once, outside the retry, so a relative delay does not creep further out with
-        // each attempt.
+        // each attempt. Go's `resolveDelayUntil` collapses its two options to one absolute
+        // `time.Time` before the write for the same reason; see `init_workflow` on why the
+        // caller's clock is the one that resolves it.
         let now = Timestamp::now();
         let delay_until = delay.resolve(now).as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
@@ -2643,12 +2702,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             // `status = 'DELAYED'` is the guard: a released workflow is running or queued, and
             // pushing its delay out would not recall it.
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET delay_until_epoch_ms = $2, updated_at = $3 \
+                "UPDATE {workflow_table} \
+                 SET delay_until_epoch_ms = $2, updated_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = $1 AND status = 'DELAYED'"
             )))
             .bind(workflow_id)
             .bind(delay_until)
-            .bind(now.as_epoch_ms())
             .execute(pool)
             .await?;
             Ok(())
@@ -2686,9 +2745,6 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         validate_attributes(attributes)?;
         let workflow_table = &self.tables.workflow_status;
-        // Read once, outside the retry: a second attempt is the same write, and re-reading the
-        // clock would date the row to whenever the connection came back.
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(
@@ -2696,12 +2752,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             "update_workflow_attributes",
             move || async move {
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} SET attributes = $2::jsonb, updated_at = $3 \
+                    "UPDATE {workflow_table} \
+                     SET attributes = $2::jsonb, updated_at = {NOW_MS_SQL} \
                      WHERE workflow_uuid = $1"
                 )))
                 .bind(workflow_id)
                 .bind(attributes)
-                .bind(now)
                 .execute(pool)
                 .await?;
                 Ok(())
@@ -2743,6 +2799,51 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn reenqueue_for_recovery(
+        &self,
+        executor_ids: &[&str],
+        application_version: &str,
+        recovery_queue: &str,
+    ) -> Result<Vec<String>, Error> {
+        if executor_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let application_name = self.application_name.as_deref();
+
+        with_retry(&self.retry, "reenqueue_for_recovery", move || async move {
+            // `started_at_epoch_ms` is cleared because the row has not started yet — leaving the
+            // dead run's start time would make the queue wait look like execution.
+            //
+            // `NULLIF` is Go's, and it is for rows this implementation did not write: older
+            // versions stored "not queued" as the empty string rather than NULL, and without it
+            // such a row would keep `''` as its queue name and never be polled by anything.
+            let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "UPDATE {workflow_table} \
+                 SET status = 'ENQUEUED', \
+                     started_at_epoch_ms = NULL, \
+                     updated_at = {NOW_MS_SQL}, \
+                     queue_name = COALESCE(NULLIF(queue_name, ''), $1) \
+                 WHERE status = 'PENDING' \
+                   AND executor_id = ANY($2) \
+                   AND application_version = $3 \
+                   AND ($4::text IS NULL \
+                        OR application_name = $4 \
+                        OR application_name IS NULL) \
+                 RETURNING workflow_uuid"
+            )))
+            .bind(recovery_queue)
+            .bind(executor_ids)
+            .bind(application_version)
+            .bind(application_name)
+            .fetch_all(pool)
+            .await?;
+            Ok(ids)
+        })
+        .await
+    }
+
     async fn transition_delayed_workflows(&self) -> Result<u64, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
@@ -2758,6 +2859,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // The clock is read per attempt on purpose: this is a sweep, not a write a caller
                 // is holding an identity for, and a retry should release whatever has since come
                 // due rather than replay a stale cutoff.
+                //
+                // The supervisor's own clock, matching Python's `now_ms`, so this compares a
+                // reading taken here against a stamp some other process wrote. See
+                // `init_workflow` on why that skew is left where every implementation has it.
                 let now = Timestamp::now().as_epoch_ms();
                 // Clearing the debounce key belongs in this statement, not a second one. The id
                 // is held only while the workflow is DELAYED; once released the workflow is
@@ -2805,9 +2910,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         // what it did. The walk itself restarts from the roots each attempt, since there is no
         // way to know how far the last one got.
         //
-        // `now` is read once for the whole cascade, so every workflow cancelled by one call
-        // shares a `completed_at` however deep the tree goes.
-        let now = Timestamp::now().as_epoch_ms();
         // Not for concurrency — nothing else touches this. It is how an accumulator outlives a
         // retry while the closure stays `FnMut` returning a `Send` future, which is what
         // `with_retry` requires. A plain `&mut Vec` would make the future borrow the closure.
@@ -2823,7 +2925,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // back from the database already allocated.
             // Awaited before locking: a guard held across an await would make this future
             // non-`Send`, which `with_retry` requires.
-            let roots = self.cancel_batch(workflow_ids, now).await?;
+            let roots = self.cancel_batch(workflow_ids).await?;
             collected.lock().expect("cancelled ids").extend(roots);
             if !cancel_children {
                 return Ok(());
@@ -2837,7 +2939,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // Terminates because `seen` only grows and a workflow enters a frontier at most once.
             while !frontier.is_empty() {
-                let level = self.cancel_batch(&frontier, now).await?;
+                let level = self.cancel_batch(&frontier).await?;
                 collected.lock().expect("cancelled ids").extend(level);
                 let children = self.direct_children(&frontier).await?;
                 frontier = children
@@ -2868,8 +2970,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         let workflow_table = &self.tables.workflow_status;
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
-        // Read once, outside the retry, so a second attempt writes the same `updated_at`.
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "resume_workflows", move || async move {
@@ -2899,13 +2999,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
                  recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
                  deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
-                 updated_at = $3 \
+                 updated_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
                  RETURNING workflow_uuid"
             )))
             .bind(workflow_ids)
             .bind(queue)
-            .bind(now)
             .fetch_all(pool)
             .await?;
             tracing::debug!(
@@ -4615,6 +4714,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                    rate_limit_period_sec = EXCLUDED.rate_limit_period_sec, \
                    priority_enabled = EXCLUDED.priority_enabled, \
                    partition_queue = EXCLUDED.partition_queue, \
+                   partition_concurrency = EXCLUDED.partition_concurrency, \
+                   partition_worker_concurrency = EXCLUDED.partition_worker_concurrency, \
+                   partition_rate_limit_max = EXCLUDED.partition_rate_limit_max, \
+                   partition_rate_limit_period_sec = EXCLUDED.partition_rate_limit_period_sec, \
                    polling_interval_sec = EXCLUDED.polling_interval_sec, \
                    updated_at = EXCLUDED.updated_at, \
                    application_name = COALESCE({queues_table}.application_name, EXCLUDED.application_name)"
@@ -4650,9 +4753,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {queues_table} \
                  (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, \
-                  priority_enabled, partition_queue, polling_interval_sec, updated_at, \
+                  priority_enabled, partition_queue, partition_concurrency, \
+                  partition_worker_concurrency, partition_rate_limit_max, \
+                  partition_rate_limit_period_sec, polling_interval_sec, updated_at, \
                   application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) {on_conflict}"
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 {on_conflict}"
             )))
             .bind(queue.name)
             .bind(queue.concurrency)
@@ -4661,6 +4767,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
             .bind(queue.priority_enabled)
             .bind(queue.partition_queue)
+            .bind(queue.partition_concurrency)
+            .bind(queue.partition_worker_concurrency)
+            .bind(queue.partition_rate_limit.map(|r| r.limit))
+            .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
             .bind(queue.polling_interval.as_secs_f64())
             .bind(Timestamp::now().as_epoch_ms())
             .bind(owner.as_deref())
@@ -4692,6 +4802,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         application_version: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
+        partition_local_running_count: i64,
     ) -> Result<Vec<String>, Error> {
         // Refused rather than matched, because no row can hold it: `NewWorkflow` and
         // `ForkOptions` both reject an empty partition key on the way in. Accepting it here would
@@ -4724,72 +4835,150 @@ impl SystemDatabase for PostgresSystemDatabase {
         let owner_predicate =
             "($1::text IS NULL OR application_name = $1 OR application_name IS NULL)";
         // No partition asked for means every partition, so a null parameter drops the clause
-        // rather than matching rows whose key is null.
+        // rather than matching rows whose key is null. Only the *per-partition* limits and the
+        // selection wear it: a queue-wide limit counts the whole queue whichever partition this
+        // call is sweeping, which is what makes the two scopes independent.
         let partition_predicate = "($2::text IS NULL OR queue_partition_key = $2)";
-        // Fixed for the run, unlike the window it is subtracted from, which is read per attempt.
+        // **Read through `resolved_limits`, never off the columns.** A row a peer wrote with the
+        // deprecated flag holds its per-partition numbers in the queue-wide columns, and enforcing
+        // those queue-wide would admit one workflow for the whole queue instead of one per key.
+        let limits = queue.resolved_limits();
+        // Whether any limit here is a budget peer executors spend from as well. Worker
+        // concurrency is not one: it is answered from this process's own running count.
+        let has_shared_budget = limits.concurrency.is_some()
+            || limits.partition_concurrency.is_some()
+            || limits.rate_limit.is_some()
+            || limits.partition_rate_limit.is_some();
+        // Whether that budget is shared across partitions too, which is a second hazard and needs
+        // a stronger answer. Two calls sweeping different keys read the same queue-wide total and
+        // then write disjoint rows, so no snapshot conflict fires under repeatable read and each
+        // spends the whole budget — write skew, which only serialisable catches.
+        let has_write_skew = partition_key.is_some()
+            && (limits.concurrency.is_some() || limits.rate_limit.is_some());
+        // Marks the rows a limited queue started, which is what the windows below count and why
+        // cancelling clears it. A limit at either scope makes a start countable: flagging only
+        // queue-wide starts would leave a per-partition window counting nothing, and the limit it
+        // measures unenforceable.
+        let rate_limited = limits.rate_limit.is_some() || limits.partition_rate_limit.is_some();
+        // The window's width, which the database subtracts from its own clock — see
+        // [`NOW_MS_SQL`]. Fixed for the run, since only the instant it is subtracted from moves.
+        //
         // Saturating: a period longer than `i64` milliseconds can hold opens the window before
         // the epoch, which counts every start there has ever been — the right answer for a limit
         // whose window never closes.
-        let rate_limit_period_ms = queue.rate_limit.map_or(0, |limit| {
-            i64::try_from(limit.period.as_millis()).unwrap_or(i64::MAX)
-        });
+        let period_ms = |limit: Option<RateLimit>| {
+            limit.map_or(0, |limit| {
+                i64::try_from(limit.period.as_millis()).unwrap_or(i64::MAX)
+            })
+        };
+        let rate_limit_period_ms = period_ms(limits.rate_limit);
+        let partition_rate_limit_period_ms = period_ms(limits.partition_rate_limit);
 
         with_retry(&self.retry, "start_queued_workflows", move || async move {
-            // Per attempt: a retry after a serialization failure is a fresh sweep, and it should
-            // measure its rate-limit window from now rather than replay a stale one.
-            let now = Timestamp::now();
             let mut tx = pool.begin().await?;
 
-            // Both limits are counts that must not move underneath this transaction. Without
-            // either, nothing here reads a total, so the weaker isolation costs nothing.
-            if queue.concurrency.is_some() || queue.rate_limit.is_some() {
-                sqlx::raw_sql(AssertSqlSafe(
-                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-                ))
+            // Read committed otherwise: with no shared budget nothing here reads a total, so a
+            // stronger isolation would buy a retry rate and nothing else.
+            if has_shared_budget {
+                let isolation = if has_write_skew {
+                    "SERIALIZABLE"
+                } else {
+                    "REPEATABLE READ"
+                };
+                sqlx::raw_sql(AssertSqlSafe(format!(
+                    "SET TRANSACTION ISOLATION LEVEL {isolation}"
+                )))
                 .execute(&mut *tx)
                 .await?;
             }
 
-            // Starts already made in this window, counted before anything is selected so a queue
-            // at its limit does no work at all. `rate_limited` marks the rows a limited queue
-            // started, which is why cancelling clears it.
-            let mut recent_starts = 0i64;
-            if let Some(limit) = queue.rate_limit {
-                let window_opened = now.as_epoch_ms() - rate_limit_period_ms;
-                recent_starts = sqlx::query_scalar(AssertSqlSafe(format!(
+            // How many this executor may take under every limit the queue carries: the tightest
+            // of them, and `None` when it carries none. Deliberately not a capturing closure, so
+            // the early returns between the groups below can read `max_tasks` while it is live.
+            let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
+                Some(current.map_or(available, |taken: i64| taken.min(available)))
+            };
+            let mut max_tasks: Option<i64> = None;
+
+            // Worker concurrency first, because it costs no query. Answered from what this
+            // process is already running rather than from the database, which cannot see a
+            // running workflow that has not written a step yet.
+            if let Some(worker_concurrency) = limits.worker_concurrency {
+                max_tasks = narrow(
+                    max_tasks,
+                    (i64::from(worker_concurrency) - local_running_count).max(0),
+                );
+            }
+            if let Some(worker_concurrency) = limits.partition_worker_concurrency
+                && partition_key.is_some()
+            {
+                max_tasks = narrow(
+                    max_tasks,
+                    (i64::from(worker_concurrency) - partition_local_running_count).max(0),
+                );
+            }
+            if max_tasks == Some(0) {
+                tx.commit().await?;
+                return Ok(Vec::new());
+            }
+
+            // Then the rate limits, read as slots left in a rolling window rather than as a yes
+            // or no: bounding the claim by what is left means a backlogged queue locks only the
+            // rows it can actually start, which matters because the lock below may be `NOWAIT`.
+            //
+            // Twice over when a partition is named: the queue-wide window counts the whole queue,
+            // the per-partition one only this key, and the tighter of the two governs.
+            if let Some(limit) = limits.rate_limit {
+                let recent_starts: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {workflow_table} \
+                     WHERE queue_name = $2 AND rate_limited = TRUE \
+                       AND status NOT IN ('ENQUEUED', 'DELAYED') \
+                       AND started_at_epoch_ms > {NOW_MS_SQL} - $3 \
+                       AND {owner_predicate}"
+                )))
+                .bind(application_name)
+                .bind(&queue.name)
+                .bind(rate_limit_period_ms)
+                .fetch_one(&mut *tx)
+                .await?;
+                max_tasks = narrow(max_tasks, (i64::from(limit.limit) - recent_starts).max(0));
+            }
+            if let (Some(limit), Some(key)) = (limits.partition_rate_limit, partition_key) {
+                let partition_starts: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT count(*) FROM {workflow_table} \
                      WHERE queue_name = $3 AND rate_limited = TRUE \
                        AND status NOT IN ('ENQUEUED', 'DELAYED') \
-                       AND started_at_epoch_ms > $4 \
-                       AND {owner_predicate} AND {partition_predicate}"
+                       AND started_at_epoch_ms > {NOW_MS_SQL} - $4 \
+                       AND queue_partition_key = $2 \
+                       AND {owner_predicate}"
                 )))
                 .bind(application_name)
-                .bind(partition_key)
+                .bind(key)
                 .bind(&queue.name)
-                .bind(window_opened)
+                .bind(partition_rate_limit_period_ms)
                 .fetch_one(&mut *tx)
                 .await?;
-                if recent_starts >= i64::from(limit.limit) {
-                    tx.commit().await?;
-                    return Ok(Vec::new());
-                }
+                max_tasks = narrow(
+                    max_tasks,
+                    (i64::from(limit.limit) - partition_starts).max(0),
+                );
+            }
+            if max_tasks == Some(0) {
+                tx.commit().await?;
+                return Ok(Vec::new());
             }
 
-            // How many this executor may take. `None` is unlimited, which is what a queue with
-            // neither concurrency limit allows.
-            let mut max_tasks: Option<i64> = None;
-            if let Some(worker_concurrency) = queue.worker_concurrency {
-                // Answered from what this process is already running rather than from the
-                // database, which cannot see a running workflow that has not written a step yet.
-                max_tasks = Some((i64::from(worker_concurrency) - local_running_count).max(0));
-            }
-            if let Some(concurrency) = queue.concurrency {
+            // Then the concurrency limits, each a count minus what is already pending at that
+            // limit's scope. Last because each is a query, and a call the cheaper limits have
+            // already closed never reaches them.
+            if let Some(concurrency) = limits.concurrency {
+                // Unscoped whichever partition is being swept: a queue-wide limit governs the
+                // queue, and counting only this key would let every other key spend it again.
                 let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT count(*) FROM {workflow_table} \
-                     WHERE queue_name = $3 AND status = 'PENDING' AND {owner_predicate} AND {partition_predicate}"
+                     WHERE queue_name = $2 AND status = 'PENDING' AND {owner_predicate}"
                 )))
                 .bind(application_name)
-                .bind(partition_key)
                 .bind(&queue.name)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -4803,8 +4992,35 @@ impl SystemDatabase for PostgresSystemDatabase {
                         "pending workflows exceed the queue's global concurrency limit"
                     );
                 }
-                let available = (i64::from(concurrency) - running).max(0);
-                max_tasks = Some(max_tasks.map_or(available, |t| t.min(available)));
+                max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
+            }
+            if let (Some(concurrency), Some(key)) = (limits.partition_concurrency, partition_key) {
+                // Its own query rather than one grouped with the queue-wide count: this predicate
+                // rides `idx_workflow_status_partition_dequeue_v2`, which a queue-wide scan loses.
+                let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {workflow_table} \
+                     WHERE queue_name = $3 AND status = 'PENDING' \
+                       AND queue_partition_key = $2 AND {owner_predicate}"
+                )))
+                .bind(application_name)
+                .bind(key)
+                .bind(&queue.name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if running > i64::from(concurrency) {
+                    tracing::warn!(
+                        queue = %queue.name,
+                        partition = %key,
+                        running,
+                        concurrency,
+                        "pending workflows exceed the partition's concurrency limit"
+                    );
+                }
+                max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
+            }
+            if max_tasks == Some(0) {
+                tx.commit().await?;
+                return Ok(Vec::new());
             }
 
             let is_latest = self
@@ -4812,28 +5028,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
             let version_predicate = version_predicate(is_latest, 3);
 
-            // TODO(dbos-team): UPSTREAM item 7, `SKIP LOCKED` on CockroachDB.
-            //
-            // CockroachDB resolves write intents *asynchronously* after a commit, and
-            // `SKIP LOCKED` skips a row whose intent is still unresolved rather than waiting for
-            // it. A workflow enqueued moments ago therefore looks locked, so a dequeue comes back
-            // short and the row waits for the next poll. Measured on a single-node CockroachDB:
-            // **13 of 40** enqueue-then-dequeue rounds returned fewer rows than were enqueued,
-            // and the skipped rows always appeared in the following round. A 250ms pause, or any
-            // read of the rows, drops that to zero — a plain read resolves the intent.
-            //
-            // Not Rust-specific. Python passes `skip_locked` unconditionally, Java's `QueuesDAO`
-            // has the same `SKIP LOCKED`/`NOWAIT` split with no CockroachDB branch, and Go has no
-            // CockroachDB dialect at all. Java's suite runs on CockroachDB and does not see it
-            // because its assertions have slack — `StaticQueuesTest` enqueues four and asserts
-            // two, so a skipped row still satisfies the count.
-            //
-            // The cost is a polling interval of latency and an under-filled concurrency
-            // allowance, not lost work. Left as is because the alternative — plain `FOR UPDATE`
-            // on CockroachDB — serialises dequeues across executors there, and that trade is the
-            // team's to make rather than this port's. The tests read rows back before asserting
-            // an exact dequeue; see `settle` in the integration tests.
-            //
             // TODO(dbos-team): UPSTREAM item 7. `SKIP LOCKED` under-delivers on CockroachDB;
             // settle before changing it.
             //
@@ -4857,23 +5051,24 @@ impl SystemDatabase for PostgresSystemDatabase {
             // skippable, so reading it first only narrows the window. A point-read barrier was
             // tried in the tests and CI kept failing, at a lower rate.
             //
-            // Not Rust-specific, and nobody else varies the SQL. Python passes `skip_locked`
-            // unconditionally; TypeScript picks the mode from `queue.concurrency` alone; Java
-            // concatenates the literal in `QueuesDAO` and keeps its CockroachDB handling in
-            // `MigrationManager`. Go alone has the seam — `type CockroachDialect struct{
-            // PostgresDialect }` overrides only `Name` and `SupportsListenNotify`, inheriting
-            // `LockSkipLocked`, so its fix is one line. Java's suite runs on CockroachDB and does
-            // not catch this: all fifteen of its dequeue assertions check a limit being enforced
-            // (`assertEquals(0, ...)` or `assertEquals(2, ...)` against four enqueued) rather
-            // than a count being complete. See `UPSTREAM.md`.
+            // Not Rust-specific, and nobody else varies the SQL. Python passes its two flags
+            // straight through; TypeScript concatenates the mode; Java concatenates the literal
+            // in `QueuesDAO` and keeps its CockroachDB handling in `MigrationManager`. Go alone
+            // has the seam — `type CockroachDialect struct{ PostgresDialect }` overrides only
+            // `Name` and `SupportsListenNotify`, inheriting `LockSkipLocked`, so its fix is one
+            // line. Java's suite runs on CockroachDB and does not catch this: all fifteen of its
+            // dequeue assertions check a limit being enforced (`assertEquals(0, ...)` or
+            // `assertEquals(2, ...)` against four enqueued) rather than a count being complete.
+            // See `UPSTREAM.md`.
             //
             // Until then the affected integration tests are skipped on CockroachDB.
             //
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
-            // unlimited queue scale across executors. `NOWAIT` instead when a total matters:
-            // stepping over locked rows would count a population this executor cannot see, so
-            // failing the poll and retrying on the next tick is the honest outcome.
-            let lock = if queue.concurrency.is_some() {
+            // unlimited queue scale across executors. `NOWAIT` instead whenever a shared budget
+            // is in play — a rate limit as much as a concurrency limit, since both are totals:
+            // stepping over locked rows would leave this call counting a population it cannot
+            // see, and let a peer spend the same budget against its own pre-claim snapshot.
+            let lock = if has_shared_budget {
                 "FOR UPDATE NOWAIT"
             } else {
                 "FOR UPDATE SKIP LOCKED"
@@ -4895,46 +5090,49 @@ impl SystemDatabase for PostgresSystemDatabase {
             .fetch_all(&mut *tx)
             .await?;
 
-            // One statement per workflow rather than one for the batch, because the rate limit
-            // has to stop mid-way: the window fills as these start.
-            let mut started = Vec::with_capacity(candidates.len());
-            for id in &candidates {
-                if let Some(limit) = queue.rate_limit
-                    && recent_starts + started.len() as i64 >= i64::from(limit.limit)
-                {
-                    break;
-                }
-                // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
-                // already moved the row, and re-dispatching it would run the workflow twice.
-                // `COALESCE` claims an unclaimed row, which is what drains work a nameless
-                // client enqueued; a nameless dequeuer leaves ownership untouched.
-                let claimed = sqlx::query(AssertSqlSafe(format!(
+            // One statement for the batch rather than one per workflow: every limit above has
+            // already bounded `max_tasks`, so nothing is left to stop this part-way through.
+            //
+            // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
+            // already moved the row, and re-dispatching it would run the workflow twice.
+            // `COALESCE` claims an unclaimed row, which is what drains work a nameless client
+            // enqueued; a nameless dequeuer leaves ownership untouched. `RETURNING` then reports
+            // exactly the rows this statement flipped, so one a peer won is simply absent.
+            let started: Vec<String> = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                let flipped: HashSet<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
-                     SET status = 'PENDING', executor_id = $3, application_version = $4, \
-                         started_at_epoch_ms = $5, rate_limited = $6, \
+                     SET status = 'PENDING', executor_id = $2, application_version = $3, \
+                         started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = $4, \
+                         updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $1), \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN $5 + workflow_timeout_ms \
+                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
                              ELSE workflow_deadline_epoch_ms \
                          END \
-                     WHERE workflow_uuid = $7 AND status = 'ENQUEUED' AND {owner_predicate}"
+                     WHERE workflow_uuid = ANY($5::text[]) AND status = 'ENQUEUED' \
+                       AND {owner_predicate} \
+                     RETURNING workflow_uuid"
                 )))
                 .bind(application_name)
-                .bind(partition_key)
                 .bind(executor_id)
                 .bind(application_version)
-                .bind(now.as_epoch_ms())
-                .bind(queue.rate_limit.is_some())
-                .bind(id)
-                .execute(&mut *tx)
+                .bind(rate_limited)
+                .bind(candidates.as_slice())
+                .fetch_all(&mut *tx)
                 .await?
-                .rows_affected();
-                if claimed > 0 {
-                    started.push(id.clone());
-                }
-            }
+                .into_iter()
+                .collect();
+                // Reported in dequeue order, which `RETURNING` does not promise: the caller
+                // dispatches in the order it is handed, and priority is the point of the sort.
+                candidates
+                    .into_iter()
+                    .filter(|id| flipped.contains(id))
+                    .collect()
+            };
 
             tx.commit().await?;
             if !started.is_empty() {
@@ -4987,23 +5185,54 @@ impl SystemDatabase for PostgresSystemDatabase {
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        max_tasks: Option<i64>,
     ) -> Result<Vec<String>, Error> {
         // The sweep admits one row per partition and counts nothing, so it is only correct where
-        // "one at a time" is what the queue means. A rate limit would need the counting this
-        // deliberately does without.
-        if !queue.partition_queue || queue.concurrency != Some(1) || queue.rate_limit.is_some() {
+        // "one at a time per key" is the whole of what the queue means. Either rate limit, or a
+        // queue-wide concurrency, would need the counting this deliberately does without.
+        //
+        // `partition_worker_concurrency` is not in the list, and does not need to be: it is at
+        // least 1, and a partition already capped at one workflow across the fleet cannot exceed
+        // one in this process. It could never bind here, so allowing it costs nothing.
+        let limits = queue.resolved_limits();
+        if limits.partition_concurrency != Some(1)
+            || limits.concurrency.is_some()
+            || limits.rate_limit.is_some()
+            || limits.partition_rate_limit.is_some()
+        {
             return Err(Error::InvalidInput {
                 field: "queue".into(),
                 detail: format!(
-                    "a partitioned sweep needs a partitioned queue with concurrency 1 and no \
-                     rate limit, but {:?} is partitioned={} concurrency={:?} rate_limited={}",
+                    "a partitioned sweep needs partition concurrency 1 and no other limit, but \
+                     {:?} has partition_concurrency={:?} concurrency={:?} rate_limited={} \
+                     partition_rate_limited={}",
                     queue.name,
-                    queue.partition_queue,
-                    queue.concurrency,
-                    queue.rate_limit.is_some(),
+                    limits.partition_concurrency,
+                    limits.concurrency,
+                    limits.rate_limit.is_some(),
+                    limits.partition_rate_limit.is_some(),
                 ),
             });
         }
+        // Nothing to take is not a sweep worth making.
+        if max_tasks == Some(0) {
+            return Ok(Vec::new());
+        }
+        // This worker's own budget bounds the sweep alongside the cap, so a process near its
+        // worker concurrency does not claim heads it must immediately sit on.
+        let cap = i64::from(PARTITIONED_DEQUEUE_SWEEP_CAP);
+        let sweep_limit = max_tasks.map_or(cap, |budget| budget.min(cap));
+        // **Random when the budget is what binds, key order when it is not.** An unbounded sweep
+        // reaches every partition, so ordering by key is free and makes the claim deterministic.
+        // A sweep the caller's budget cuts short does not reach every partition, and taking the
+        // lowest keys every time would leave the tail of a large partition set permanently unserved
+        // under sustained load. TypeScript switches on the same condition; the walk in `dequeue`
+        // shuffles for the same reason.
+        let sweep_order = if sweep_limit < cap {
+            "random()"
+        } else {
+            "partitions.pk ASC"
+        };
 
         let workflow_table = self.tables.workflow_status.as_str();
         let pool = &self.pool;
@@ -5013,7 +5242,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "start_queued_partitioned_workflows",
             move || async move {
-                let now = Timestamp::now();
                 let mut tx = pool.begin().await?;
 
                 let is_latest = self
@@ -5034,11 +5262,35 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // a partition identically — which is what lets the guarded flip below admit at
                 // most one row per partition without anyone counting.
                 //
+                // **Partitions are chosen before their heads are looked up.** The `LIMIT` sits in
+                // `chosen`, so a sweep the budget cuts short probes only the partitions it will
+                // actually claim from rather than probing every one and discarding the excess.
+                //
+                // **So the limit bounds partitions probed, not heads returned**, and the two stop
+                // agreeing when a chosen partition holds no row this executor may take: the
+                // version predicate is in the `LATERAL`, not in `chosen`, so such a partition
+                // spends a slot and produces nothing. During a rolling deploy a worker can
+                // therefore come back short of its budget and run below its worker concurrency.
+                // It is bounded and it heals — `sweep_order` is `random()` in exactly the case
+                // the budget binds, so no partition is masked twice running, and a short sweep
+                // reports no contention, so the poller scales *back* towards the queue's interval
+                // rather than backing off.
+                //
+                // TODO(dbos-team): UPSTREAM item 21. Python and TypeScript place the `LIMIT` and
+                // the version predicate exactly here too, so this is upstream behaviour rather
+                // than a port's slip, and the fix worth having — `application_version` in
+                // `idx_workflow_status_partition_dequeue_v2` — is a shared migration in any case.
+                //
                 // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
                 // loop instead of a slower per-row subplan. `workflow_uuid` totalizes the head
                 // order, so every worker picks the same head under a `created_at` tie, and the
-                // index's trailing `workflow_uuid` keeps the probe a pure top-1. The `NOT EXISTS`
-                // on `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
+                // index's trailing `workflow_uuid` keeps the probe a pure top-1 — **for a
+                // partition whose head is eligible.** Where the version predicate rejects every
+                // row the probe is not a top-1 at all: `application_version` is not in the index,
+                // so it walks that partition's entries and heap-checks each to return nothing.
+                // That cost is paid whatever the `LIMIT` bounds, and it is why the index, rather
+                // than the `LIMIT`, is what item 21 proposes moving. The `NOT EXISTS` on
+                // `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
                 // owner's row.
                 //
                 // **No `--` comments inside this string.** The `\` continuations strip the
@@ -5054,25 +5306,30 @@ impl SystemDatabase for PostgresSystemDatabase {
                                  WHERE {eligible_predicate} AND queue_partition_key > partitions.pk) \
                         FROM partitions WHERE partitions.pk IS NOT NULL) \
                      ) \
-                     SELECT head.workflow_uuid FROM partitions \
+                     , chosen AS ( \
+                       SELECT partitions.pk FROM partitions \
+                        WHERE partitions.pk IS NOT NULL \
+                          AND NOT EXISTS ( \
+                            SELECT 1 FROM {workflow_table} \
+                             WHERE queue_name = $1 AND status = 'PENDING' \
+                               AND queue_partition_key IS NOT NULL \
+                               AND queue_partition_key = partitions.pk \
+                          ) \
+                        ORDER BY {sweep_order} LIMIT $4 \
+                     ) \
+                     SELECT head.workflow_uuid FROM chosen \
                      JOIN LATERAL ( \
                        SELECT workflow_uuid FROM {workflow_table} \
-                        WHERE {eligible_predicate} AND queue_partition_key = partitions.pk \
+                        WHERE {eligible_predicate} AND queue_partition_key = chosen.pk \
                           AND {version_predicate} \
                         ORDER BY priority ASC, created_at ASC, workflow_uuid ASC LIMIT 1 \
                      ) head ON TRUE \
-                     WHERE partitions.pk IS NOT NULL \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM {workflow_table} \
-                          WHERE queue_name = $1 AND status = 'PENDING' \
-                            AND queue_partition_key IS NOT NULL \
-                            AND queue_partition_key = partitions.pk \
-                       ) \
-                     ORDER BY partitions.pk ASC LIMIT {PARTITIONED_DEQUEUE_SWEEP_CAP}"
+                     ORDER BY chosen.pk ASC"
                 )))
                 .bind(&queue.name)
                 .bind(application_name)
                 .bind(application_version)
+                .bind(sweep_limit)
                 .fetch_all(&mut *tx)
                 .await?;
                 if candidates.is_empty() {
@@ -5128,12 +5385,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                 let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
-                         started_at_epoch_ms = $6, rate_limited = FALSE, \
+                         started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
+                         updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $4), \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN $6 + workflow_timeout_ms \
+                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
                              ELSE workflow_deadline_epoch_ms \
                          END \
                      WHERE {claim_predicate} RETURNING workflow_uuid"
@@ -5143,7 +5401,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(application_version)
                 .bind(application_name)
                 .bind(executor_id)
-                .bind(now.as_epoch_ms())
                 .fetch_all(&mut *tx)
                 .await?;
 
@@ -5253,18 +5510,51 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error> {
-        // Nothing to change is not an error: an update assembled from optional inputs may name
-        // no field, and both references return without touching the row — including its
-        // `updated_at`, which would otherwise record a write that changed nothing.
-        if update.is_empty() {
-            return Ok(());
-        }
-
+    async fn update_queue(
+        &self,
+        name: &str,
+        update: &QueueUpdate,
+        validate: &(
+             dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
+         ),
+    ) -> Result<QueueRecord, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
 
         with_retry(&self.retry, "update_queue", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // `FOR UPDATE` rather than a stricter isolation level: the row is held for the rest of
+            // the transaction, so a peer planning against the same queue waits here instead of
+            // racing to the `UPDATE` and having its whole attempt thrown away. Go takes the other
+            // route — repeatable read, and a retry on the serialization failure that follows.
+            let row = sqlx::query(AssertSqlSafe(format!(
+                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
+            )))
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(stored) = row.as_ref().map(queue_from_row).transpose()? else {
+                return Err(Error::NotRegistered {
+                    kind: "Queue".into(),
+                    name: name.to_owned(),
+                });
+            };
+
+            // Nothing to change leaves the row alone — including its `updated_at`, which would
+            // otherwise record a write that changed nothing. Unvalidated on purpose: a caller who
+            // asked for nothing is not asking to have the stored row judged.
+            if update.is_empty() {
+                tx.commit().await?;
+                return Ok(stored);
+            }
+
+            // The caller's verdict on the row as it would be, delivered while this transaction
+            // still holds it. Rolling back is what makes a refusal mean something: nothing was
+            // written, and nothing else moved the row while it was being judged.
+            let merged = update.apply_to(&stored);
+            validate(&stored, &merged)?;
+
             let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("UPDATE ");
             q.push(queues_table).push(" SET ");
             let mut set = q.separated(", ");
@@ -5280,7 +5570,27 @@ impl SystemDatabase for PostgresSystemDatabase {
             assign!(update.concurrency.set(), "concurrency");
             assign!(update.worker_concurrency.set(), "worker_concurrency");
             assign!(update.priority_enabled.set(), "priority_enabled");
-            assign!(update.partition_queue.set(), "partition_queue");
+            // **The flag and the limits are two spellings of one fact**, so the column is never
+            // written disagreeing with them. `apply_to` has already resolved which of the three
+            // cases this update is — the flag named outright, the flag rewritten to match a
+            // moved per-partition limit, or neither touched — so the value to store is the
+            // merged row's, and the only question left here is whether to assign at all.
+            //
+            // Assigning nothing when neither is touched is what lets a row a peer wrote with the
+            // deprecated flag and no limits keep what it says.
+            if !(update.partition_queue.is_leave()
+                && update.partition_concurrency.is_leave()
+                && update.partition_worker_concurrency.is_leave()
+                && update.partition_rate_limit.is_leave())
+            {
+                set.push("partition_queue = ");
+                set.push_bind_unseparated(merged.partition_queue);
+            }
+            assign!(update.partition_concurrency.set(), "partition_concurrency");
+            assign!(
+                update.partition_worker_concurrency.set(),
+                "partition_worker_concurrency"
+            );
             assign!(
                 update.polling_interval.set().map(|d| d.as_secs_f64()),
                 "polling_interval_sec"
@@ -5293,12 +5603,22 @@ impl SystemDatabase for PostgresSystemDatabase {
                 set.push("rate_limit_period_sec = ");
                 set.push_bind_unseparated(limit.map(|l| l.period.as_secs_f64()));
             }
+            if let Some(limit) = update.partition_rate_limit.set() {
+                set.push("partition_rate_limit_max = ");
+                set.push_bind_unseparated(limit.map(|l| l.limit));
+                set.push("partition_rate_limit_period_sec = ");
+                set.push_bind_unseparated(limit.map(|l| l.period.as_secs_f64()));
+            }
             set.push("updated_at = ");
             set.push_bind_unseparated(Timestamp::now().as_epoch_ms());
 
             q.push(" WHERE name = ").push_bind(name);
-            q.build().execute(pool).await?;
-            Ok(())
+            q.push(" RETURNING ").push(QUEUE_COLUMNS);
+            let row = q.build().fetch_one(&mut *tx).await?;
+            let written = queue_from_row(&row)?;
+
+            tx.commit().await?;
+            Ok(written)
         })
         .await
     }
@@ -5357,13 +5677,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                                      THEN debounce_deadline_epoch_ms \
                                      ELSE $4 \
                                  END, \
-                                 inputs = $5, serialization = $6, updated_at = $7, \
-                                 application_name = COALESCE(application_name, $8) \
+                                 inputs = $5, serialization = $6, \
+                                 updated_at = {NOW_MS_SQL}, \
+                                 application_name = COALESCE(application_name, $7) \
                              WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
-                               AND class_name IS NOT DISTINCT FROM $9 \
-                               AND config_name IS NOT DISTINCT FROM $10 \
+                               AND class_name IS NOT DISTINCT FROM $8 \
+                               AND config_name IS NOT DISTINCT FROM $9 \
                                AND status = 'DELAYED' AND is_debounced = TRUE \
-                               AND ($8::text IS NULL OR application_name = $8 \
+                               AND ($7::text IS NULL OR application_name = $7 \
                                     OR application_name IS NULL) \
                              RETURNING workflow_uuid"
                         )))
@@ -5373,7 +5694,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(request.delay_until.as_epoch_ms())
                         .bind(request.inputs)
                         .bind(request.serialization)
-                        .bind(Timestamp::now().as_epoch_ms())
                         .bind(application_name)
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL the
                         // enqueue stored rather than matching nothing, as `=` would.

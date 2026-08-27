@@ -153,6 +153,28 @@ pub struct Config {
     /// the database, never something a caller means.
     pub outcome_poll_interval: Option<Duration>,
 
+    /// Which queues this process dequeues from. `None` is all of them.
+    ///
+    /// **Configuration rather than a runtime call**, which is PLAN §4.13's decision: Go takes a
+    /// replace-the-set API, Python a pre-launch call, TypeScript and Java configuration, and Rust
+    /// follows the latter pair. The supervisor intersects this with what it reads from the
+    /// `queues` table on every sweep, so the dynamic half — a queue registered later, or deleted
+    /// — comes for free without a second way to change the set.
+    ///
+    /// What it is for: splitting one application's queues across differently-shaped processes.
+    /// A worker fleet sized for slow media jobs and one sized for fast API calls share a database
+    /// and a code base, and neither should drain the other's backlog.
+    ///
+    /// `Some(vec![])` listens to **nothing**, and is not the same as `None`. It is a real setting
+    /// — a process that enqueues and never runs anything — and is the one place this differs from
+    /// Go, whose empty set means "all". An empty *slice* is unambiguous in Rust where a nil-versus-
+    /// empty distinction in Go is a trap, so the option carries the meaning instead.
+    ///
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is always dequeued from, whatever this
+    /// says. It is where `resume`, `fork` and recovery put work, so filtering it out would strand
+    /// them with no way to notice.
+    pub listen_queues: Option<Vec<String>>,
+
     /// How long a written key waits for company before a wakeup is pushed for it.
     ///
     /// `None` is ten milliseconds, as in Python, TypeScript and Go. `Some(Duration::ZERO)` is
@@ -177,6 +199,7 @@ impl Config {
             migrate: true,
             polling_concurrency: None,
             outcome_poll_interval: None,
+            listen_queues: None,
             notification_coalesce: None,
         }
     }

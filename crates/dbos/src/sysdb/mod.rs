@@ -242,6 +242,31 @@ pub trait SystemDatabase: Send + Sync {
         application_version: &str,
     ) -> Result<Vec<String>, Error>;
 
+    /// Returns this executor's abandoned workflows to a queue, so any peer may run them.
+    ///
+    /// **Recovery's whole write.** A `PENDING` row whose executor is gone goes back to `ENQUEUED`
+    /// and is dispatched by whichever executor next polls its queue, rather than being executed by
+    /// the process that found it. Python, TypeScript and Go all recover this way; it is what makes
+    /// a recovery sweep idempotent, lets a fleet share one backlog, and turns "how many at once"
+    /// into a question the queue answers.
+    ///
+    /// A workflow already on a queue goes back to **its own** queue; only one that was never
+    /// queued lands on `recovery_queue`, which callers set to [`INTERNAL_QUEUE`].
+    ///
+    /// **`executor_ids` is what makes a repeat harmless.** Once any live executor dequeues one of
+    /// these rows, the claim stamps its own executor id, so a second sweep naming the dead
+    /// executor matches nothing rather than tearing a running workflow off its runner. Scoped by
+    /// application version and application for the reasons
+    /// [`get_pending_workflows`](Self::get_pending_workflows) gives.
+    ///
+    /// Returns the ids that actually moved. An empty `executor_ids` moves nothing.
+    async fn reenqueue_for_recovery(
+        &self,
+        executor_ids: &[&str],
+        application_version: &str,
+        recovery_queue: &str,
+    ) -> Result<Vec<String>, Error>;
+
     /// Releases delayed workflows whose time has come, returning how many moved.
     ///
     /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
@@ -822,13 +847,24 @@ pub trait SystemDatabase: Send + Sync {
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
-    /// Three limits narrow what is taken, in this order:
+    /// Limits narrow what is taken, rate limits first — a queue already at one returns nothing
+    /// without selecting anything — then the concurrency limits, whose tightest budget wins:
     ///
-    /// - **Rate limit.** Starts in the window are counted first, and a queue already at its limit
-    ///   returns nothing without selecting anything.
+    /// - **Rate limit**, against the starts in the trailing window.
     /// - **Worker concurrency**, against `local_running_count` — what this process is already
     ///   running, which it knows without asking the database.
     /// - **Global concurrency**, against the `PENDING` count across every executor.
+    ///
+    /// **`partition_key` narrows the selection and adds a second scope; it does not move the
+    /// first.** Given one, the three per-partition limits apply as well, counted within that key
+    /// alone — `partition_local_running_count` is this process's share of it — while the three
+    /// above go on counting the whole queue. A queue can therefore hold both, and the caller
+    /// sweeping one partition still cannot spend a budget that belongs to the queue.
+    ///
+    /// Which limit sits at which scope is [`QueueRecord::resolved_limits`]'s answer, not the
+    /// columns': a row a peer wrote with the deprecated `partition_queue` flag keeps its
+    /// per-partition numbers in the queue-wide columns, and enforcing those queue-wide would admit
+    /// one workflow for the whole queue where the flag promised one per key.
     ///
     /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
     /// `NOWAIT`, so every executor sees a consistent count rather than a partial one; without
@@ -846,6 +882,7 @@ pub trait SystemDatabase: Send + Sync {
         application_version: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
+        partition_local_running_count: i64,
     ) -> Result<Vec<String>, Error>;
 
     /// The partitions of a queue that currently have work waiting.
@@ -862,11 +899,23 @@ pub trait SystemDatabase: Send + Sync {
     /// partition in a single transaction, so a queue with a thousand partitions costs one sweep
     /// rather than a thousand polls.
     ///
-    /// **Only valid for a partitioned queue with concurrency 1 and no rate limit**, which is
-    /// [`Error::InvalidInput`] otherwise. That restriction is what makes the sweep safe without
-    /// per-partition counting: every worker ranks each partition's head identically, and the
-    /// `PENDING` gate admits at most one row per partition, so concurrency 1 is enforced by the
-    /// data rather than by a count.
+    /// **Only valid for a queue whose one limit is partition concurrency 1**, which is
+    /// [`Error::InvalidInput`] otherwise — no queue-wide concurrency, and neither rate limit. That
+    /// restriction is what makes the sweep safe without counting: every worker ranks each
+    /// partition's head identically, and the `PENDING` gate admits at most one row per partition,
+    /// so the limit is enforced by the data rather than by a count. Anything else a queue can
+    /// carry has to be counted within each key, which is what walking the partitions one at a time
+    /// through [`start_queued_workflows`](Self::start_queued_workflows) is for. TypeScript splits
+    /// the same two ways, on the same four conditions.
+    ///
+    /// `partition_worker_concurrency` is deliberately not among them: it is at least 1, and a
+    /// partition already capped at one workflow across the whole fleet cannot exceed one in any
+    /// single process, so it could never bind here.
+    ///
+    /// `max_tasks` is the caller's own remaining budget — its worker concurrency less what it is
+    /// already running — and bounds the sweep alongside
+    /// [`PARTITIONED_DEQUEUE_SWEEP_CAP`], so a process near its limit does not claim heads it must
+    /// immediately sit on. `None` is unbounded; `Some(0)` returns without a query.
     ///
     /// At most [`PARTITIONED_DEQUEUE_SWEEP_CAP`]
     /// partitions per sweep; the rest arrive on later polls.
@@ -875,6 +924,7 @@ pub trait SystemDatabase: Send + Sync {
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        max_tasks: Option<i64>,
     ) -> Result<Vec<String>, Error>;
 
     /// Reads one queue by name, or `None` if it is not registered.
@@ -892,13 +942,47 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Changes the fields of a registered queue that an update names, leaving the rest.
     ///
-    /// A no-op when the update names nothing, which is what both references do rather than
-    /// treating it as an error — a caller assembling an update from optional inputs should not
-    /// have to check whether any survived.
+    /// **Read, check and write in one transaction**, which is what `validate` is for. The row is
+    /// read under `FOR UPDATE`, the update is applied to it, the result is handed to `validate`,
+    /// and the write lands before the lock is released — so a limit judged against a row that has
+    /// since moved cannot be stored. Go manages the same thing with the `mutate` callback its
+    /// `UpdateQueueConfig` takes; Python and TypeScript read and write separately, and two
+    /// operators changing different limits at once can leave a pair neither asked for.
+    ///
+    /// **The transaction does not leave this layer.** `validate` is handed the row as stored and
+    /// the row as the update would leave it, and says yes or no; it does no I/O of its own and
+    /// never sees a connection. Both, because some rules are about the transition rather than the
+    /// destination — whether a limit may be set at all can depend on what the row already is. It must also be free
+    /// of side effects, because a retried attempt calls it again against the row that attempt
+    /// read. Callers with nothing to check pass a closure that always succeeds.
+    ///
+    /// The second argument is [`QueueUpdate::apply_to`]'s result rather than the update, because a
+    /// limit is rarely wrong on its own and usually wrong only beside another already stored. It refuses
+    /// by returning an error, and [`Error::InvalidInput`] is the variant for that — the caller is
+    /// expected to recognise its own refusal coming back.
+    ///
+    /// An update naming nothing writes nothing, `updated_at` included, and is not validated: the
+    /// stored row stands unexamined, which is what both references do rather than treating an
+    /// empty update as an error. A caller assembling one from optional inputs should not have to
+    /// check whether any survived.
+    ///
+    /// [`Error::NotRegistered`] if the name matches nothing, like
+    /// [`update_schedule`](Self::update_schedule) — the row has to be read to check against it, so
+    /// its absence is known here rather than inferred from a row count.
+    ///
+    /// Returns the row as written, which spares the caller a read back that a later transaction
+    /// would have answered anyway.
     ///
     /// Unscoped, like the other reads and writes addressed by queue name. Ownership is not
     /// updatable: see [`QueueUpdate`].
-    async fn update_queue(&self, name: &str, update: &QueueUpdate) -> Result<(), Error>;
+    async fn update_queue(
+        &self,
+        name: &str,
+        update: &QueueUpdate,
+        validate: &(
+             dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
+         ),
+    ) -> Result<QueueRecord, Error>;
 
     /// Extends a debounced workflow's delay and replaces its inputs, or reports who holds the key.
     ///
@@ -961,9 +1045,12 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Removes a queue from the registry.
     ///
-    /// Only the registration. Workflows already enqueued keep their `queue_name` and are still
-    /// dequeued by an executor that knows the queue, because a queue is a declaration in code
-    /// first and a row second.
+    /// Only the registration. Workflows already enqueued keep their `queue_name`.
+    ///
+    /// Whether anything still dequeues them depends on the layer above: an implementation that
+    /// also keeps queues declared in code carries on polling one it declared, while this crate's
+    /// engine builds its worker set from these rows alone, so deleting the row strands the backlog
+    /// until the queue is registered again.
     async fn delete_queue(&self, name: &str) -> Result<(), Error>;
 
     /// Registers a schedule, failing if the name is taken.

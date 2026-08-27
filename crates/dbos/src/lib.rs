@@ -28,11 +28,17 @@ mod context;
 #[cfg(feature = "engine")]
 mod dbos;
 #[cfg(feature = "engine")]
+mod dequeue;
+#[cfg(feature = "engine")]
+mod dispatch;
+#[cfg(feature = "engine")]
 mod error;
 #[cfg(feature = "engine")]
 mod event;
 #[cfg(feature = "engine")]
 mod handle;
+#[cfg(feature = "engine")]
+mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
 #[cfg(feature = "engine")]
@@ -62,10 +68,14 @@ pub use event::{get_event, set_event};
 #[cfg(feature = "engine")]
 pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
+pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
+#[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]
 pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
-pub use workflow::{StartOptions, Timeout};
+pub use sysdb::types::{Change, RateLimit};
+#[cfg(feature = "engine")]
+pub use workflow::{Enqueue, RunOptions, StartOptions, Timeout};

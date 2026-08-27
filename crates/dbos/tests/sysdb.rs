@@ -1074,6 +1074,13 @@ async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
         sys.init_workflow(wf, None, Submission::Fresh)
             .await
             .expect("seed insert failed");
+        // **A millisecond apart, deliberately.** `created_at` is a millisecond stamp and a
+        // listing orders by it alone, so seeds inserted inside one millisecond tie — and tied
+        // rows come back in an order the query does not fix, which is how an ordering assertion
+        // over this fixture passes on a machine where a round trip is milliseconds and fails on
+        // one where it is not. Waiting is a lower bound rather than a hope: the next insert
+        // cannot be stamped in the same millisecond as this one, whatever the hardware.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
     // Columns no caller can set at creation.
@@ -1367,7 +1374,8 @@ async fn results_are_ordered_and_pageable() {
         ..F::default()
     };
 
-    // Seeded in order, and `created_at` is stamped at insert, so oldest-first is insertion order.
+    // `seeded` waits between its inserts, so the creation stamps are distinct and in seed
+    // order — oldest-first is insertion order, however fast the machine seeds.
     let ascending = ids(&sys, &only_wf).await;
     assert_eq!(ascending, ["wf-a", "wf-b", "wf-c", "wf-d"]);
 
@@ -2412,6 +2420,167 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
         pending,
         ["wf-mine"],
         "another executor's work, another version's work, and finished work are all excluded",
+    );
+}
+
+/// **Recovery's write: a `PENDING` row goes back to `ENQUEUED`, keeping its own queue.**
+///
+/// Only a workflow that was never queued lands on the recovery queue. One enqueued onto `orders`
+/// belongs to `orders` — putting it on the internal queue instead would move it out from under
+/// whatever limits it was enqueued against.
+#[tokio::test]
+async fn reenqueue_for_recovery_returns_workflows_to_their_own_queues() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    for (id, queue) in [("wf-was-queued", Some("orders")), ("wf-never-queued", None)] {
+        let wf = NewWorkflow {
+            executor_id: Some("alpha"),
+            application_version: Some("v1"),
+            queue_name: queue,
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    // The queued one is `ENQUEUED` already; claim it so both start from `PENDING`, which is the
+    // state recovery is about.
+    let queue = sys.get_queue("orders").await.unwrap().unwrap();
+    let claimed = sys
+        .start_queued_workflows(&queue, "alpha", "v1", None, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(claimed, ["wf-was-queued"]);
+
+    let mut moved = sys
+        .reenqueue_for_recovery(&["alpha"], "v1", INTERNAL_QUEUE)
+        .await
+        .unwrap();
+    moved.sort();
+    assert_eq!(moved, ["wf-never-queued", "wf-was-queued"]);
+
+    let was_queued = sys.get_workflow("wf-was-queued").await.unwrap().unwrap();
+    assert_eq!(was_queued.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        was_queued.queue_name.as_deref(),
+        Some("orders"),
+        "a workflow that came off a queue goes back to that queue"
+    );
+    assert!(
+        was_queued.started_at.is_none(),
+        "the dead run's start time would make the queue wait look like execution"
+    );
+
+    let never_queued = sys.get_workflow("wf-never-queued").await.unwrap().unwrap();
+    assert_eq!(never_queued.status, WorkflowStatus::Enqueued);
+    assert_eq!(
+        never_queued.queue_name.as_deref(),
+        Some(INTERNAL_QUEUE),
+        "a workflow that was never queued lands on the recovery queue"
+    );
+}
+
+/// **A repeat is harmless, which is the point of the executor predicate.**
+///
+/// Once a live executor has claimed a re-enqueued workflow, the claim stamps its own id, so a
+/// second sweep naming the dead executor matches nothing. Without this, a duplicate recovery
+/// request would tear a running workflow off its runner and offer it to the fleet again.
+#[tokio::test]
+async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        executor_id: Some("dead"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-taken-over")
+    };
+    sys.init_workflow(&wf, None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.reenqueue_for_recovery(&["dead"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap(),
+        ["wf-taken-over"],
+    );
+
+    // A live executor claims it off the internal queue.
+    let internal = NewQueue::new(INTERNAL_QUEUE);
+    sys.upsert_queue(&internal, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let queue = sys.get_queue(INTERNAL_QUEUE).await.unwrap().unwrap();
+    assert_eq!(
+        sys.start_queued_workflows(&queue, "live", "v1", None, 0, 0)
+            .await
+            .unwrap(),
+        ["wf-taken-over"],
+    );
+
+    // The dead executor's sweep runs again, and finds nothing of its own.
+    assert!(
+        sys.reenqueue_for_recovery(&["dead"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a repeat sweep tore a running workflow off its executor"
+    );
+    assert_eq!(
+        sys.get_workflow("wf-taken-over")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Pending,
+        "the workflow the live executor is running was disturbed"
+    );
+}
+
+/// Scoped like the sweep it replaces: another executor's, another version's, and finished work
+/// are all left alone.
+#[tokio::test]
+async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
+    let (sys, _db) = sysdb().await;
+    for (id, executor, version) in [
+        ("wf-mine", "alpha", "v1"),
+        ("wf-theirs", "beta", "v1"),
+        ("wf-old-code", "alpha", "v0"),
+    ] {
+        let wf = NewWorkflow {
+            executor_id: Some(executor),
+            application_version: Some(version),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None, Submission::Fresh)
+            .await
+            .unwrap();
+    }
+    let done = NewWorkflow {
+        executor_id: Some("alpha"),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-finished")
+    };
+    sys.init_workflow(&done, None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_workflow_outcome("wf-finished", Outcome::Output(None))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sys.reenqueue_for_recovery(&["alpha"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap(),
+        ["wf-mine"],
+    );
+    assert!(
+        sys.reenqueue_for_recovery(&[], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap()
+            .is_empty(),
+        "naming no executors moved something",
     );
 }
 
@@ -7421,7 +7590,7 @@ async fn a_dequeue_starts_workflows_in_order() {
     enqueue(&sys, "wf-also-high", "orders", 1, None).await;
 
     let started = sys
-        .start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        .start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -7437,7 +7606,7 @@ async fn a_dequeue_starts_workflows_in_order() {
 
     // Nothing is left to take.
     assert!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap()
             .is_empty()
@@ -7467,7 +7636,7 @@ async fn a_dequeue_sets_the_deadline_from_the_timeout() {
     enqueue(&sys, "wf-untimed", "orders", 0, None).await;
 
     let before = Timestamp::now();
-    sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+    sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
         .await
         .unwrap();
 
@@ -7512,7 +7681,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
     }
 
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap()
             .len(),
@@ -7520,7 +7689,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         "a free worker takes its whole allowance",
     );
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 1)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 1, 0)
             .await
             .unwrap()
             .len(),
@@ -7528,7 +7697,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         "one already running leaves room for one",
     );
     assert!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 2)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 2, 0)
             .await
             .unwrap()
             .is_empty(),
@@ -7538,7 +7707,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
 
 /// Global concurrency counts what every executor has running, not just this one.
 #[tokio::test]
-async fn global_concurrency_counts_across_executors() {
+async fn concurrency_counts_across_executors() {
     let (sys, db) = sysdb().await;
     // Both assertions below are exact counts, so an under-delivering dequeue breaks them: too few
     // started, and then the second executor finds the slack the first one left.
@@ -7560,7 +7729,7 @@ async fn global_concurrency_counts_across_executors() {
 
     // A different executor takes the first two, and they are still PENDING.
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-other", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-other", "v1", None, 0, 0)
             .await
             .unwrap()
             .len(),
@@ -7568,7 +7737,7 @@ async fn global_concurrency_counts_across_executors() {
     );
     // This one is told nothing is available, even with nothing running locally.
     assert!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap()
             .is_empty(),
@@ -7600,7 +7769,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
     }
 
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap()
             .len(),
@@ -7608,7 +7777,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
         "the window allows two",
     );
     assert!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap()
             .is_empty(),
@@ -7617,13 +7786,57 @@ async fn a_rate_limit_bounds_starts_per_window() {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap()
             .len(),
         2,
         "a fresh window allows two more",
     );
+}
+
+/// A per-partition rate limit bounds each key's own window, and the keys do not share it.
+///
+/// The regression this guards: a queue limited only per partition has no queue-wide rate limit,
+/// so a claim that decides `rate_limited` from the queue-wide column alone flags nothing, the
+/// window counts nothing, and the limit admits everything forever.
+#[tokio::test]
+async fn a_partition_rate_limit_bounds_each_key_separately() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let queue = NewQueue {
+        partition_rate_limit: Some(RateLimit {
+            limit: 2,
+            period: std::time::Duration::from_millis(400),
+        }),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    for partition in ["a", "b"] {
+        for i in 0..3 {
+            enqueue_partitioned(&sys, &format!("wf-{partition}-{i}"), "orders", partition).await;
+        }
+    }
+
+    let dequeue = async |partition: &str| {
+        sys.start_queued_workflows(&registered, "exec-1", "v1", Some(partition), 0, 0)
+            .await
+            .unwrap()
+            .len()
+    };
+
+    assert_eq!(dequeue("a").await, 2, "the window allows two");
+    assert_eq!(dequeue("a").await, 0, "and no more until it passes");
+    assert_eq!(dequeue("b").await, 2, "another key has its own window");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(dequeue("a").await, 1, "a fresh window allows the last one");
 }
 
 /// A dequeue takes only this application's workflows, and claims the unclaimed ones.
@@ -7660,7 +7873,7 @@ async fn a_dequeue_claims_what_it_starts() {
     enqueue(&anonymous, "wf-nobody", "orders", 0, None).await;
 
     let mut started = alpha
-        .start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        .start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
         .await
         .unwrap();
     started.sort();
@@ -7711,14 +7924,14 @@ async fn unversioned_work_goes_to_the_latest_version() {
 
     // An executor on a superseded version leaves it alone.
     assert!(
-        sys.start_queued_workflows(&registered, "exec-old", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-old", "v1", None, 0, 0)
             .await
             .unwrap()
             .is_empty(),
         "only the latest version adopts unversioned work",
     );
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-new", "v2", None, 0)
+        sys.start_queued_workflows(&registered, "exec-new", "v2", None, 0, 0)
             .await
             .unwrap(),
         ["wf-unversioned"],
@@ -7741,7 +7954,7 @@ async fn an_empty_partition_key_is_refused() {
     let registered = sys.get_queue("orders").await.unwrap().unwrap();
 
     let result = sys
-        .start_queued_workflows(&registered, "exec-1", "v1", Some(""), 0)
+        .start_queued_workflows(&registered, "exec-1", "v1", Some(""), 0, 0)
         .await;
     assert!(
         matches!(
@@ -7754,7 +7967,7 @@ async fn an_empty_partition_key_is_refused() {
     // And absent still means every partition.
     enqueue(&sys, "wf-1", "orders", 0, None).await;
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap(),
         ["wf-1"],
@@ -7812,6 +8025,200 @@ async fn enqueue_partitioned(sys: &PostgresSystemDatabase, id: &str, queue: &str
         .unwrap();
 }
 
+/// A per-partition concurrency limit is counted within its key, not across the queue.
+#[tokio::test]
+async fn partition_concurrency_bounds_a_dequeue() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let queue = NewQueue {
+        partition_concurrency: Some(2),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    for partition in ["alpha", "beta"] {
+        for n in 0..3 {
+            enqueue_partitioned(&sys, &format!("wf-{partition}-{n}"), "orders", partition).await;
+        }
+    }
+
+    // Two from the partition asked for, and the other partition's three are untouched by it.
+    let alpha = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some("alpha"), 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(alpha.len(), 2, "the partition's limit, not the queue's");
+
+    let beta = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some("beta"), 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        beta.len(),
+        2,
+        "a full partition does not spend another partition's budget"
+    );
+
+    // Alpha is at its limit now, so a second call for it takes nothing.
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", Some("alpha"), 0, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+    );
+}
+
+/// Both scopes are enforced together: the queue-wide limit bounds the sum of the partitions.
+///
+/// The point of carrying both. A per-partition limit says how much any one key may take; the
+/// queue-wide one says how much the queue may take altogether, and the second partition here is
+/// bounded by what the first left rather than by its own allowance.
+#[tokio::test]
+async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let queue = NewQueue {
+        concurrency: Some(3),
+        partition_concurrency: Some(2),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    for partition in ["alpha", "beta"] {
+        for n in 0..3 {
+            enqueue_partitioned(&sys, &format!("wf-{partition}-{n}"), "orders", partition).await;
+        }
+    }
+
+    let alpha = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some("alpha"), 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(alpha.len(), 2, "its own per-partition allowance");
+
+    // Beta's allowance is 2, but the queue has only one left of its 3.
+    let beta = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some("beta"), 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        beta.len(),
+        1,
+        "the queue-wide limit counts every partition's PENDING rows, not just this key's"
+    );
+
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", Some("beta"), 0, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the queue is at its limit whichever partition asks"
+    );
+}
+
+/// The two worker limits are answered locally, each at its own scope.
+#[tokio::test]
+async fn both_worker_limits_are_counted_at_their_own_scope() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let queue = NewQueue {
+        worker_concurrency: Some(3),
+        partition_worker_concurrency: Some(2),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+    for n in 0..4 {
+        enqueue_partitioned(&sys, &format!("wf-{n}"), "orders", "alpha").await;
+    }
+
+    // Nothing running: the per-partition worker limit is the tighter of the two.
+    let claimed = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some("alpha"), 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2, "bounded by partition_worker_concurrency");
+
+    // One already running in this partition leaves it one, even though the queue-wide worker
+    // limit would still allow three.
+    let claimed = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", Some("alpha"), 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1, "the partition-local count is subtracted");
+
+    // Three already running queue-wide leaves nothing, whatever the partition has room for.
+    assert!(
+        sys.start_queued_workflows(&registered, "exec-1", "v1", Some("alpha"), 3, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the queue-wide worker limit still binds"
+    );
+}
+
+/// A sweep bounded by the caller's budget spreads over the partitions instead of taking the
+/// lowest keys every time.
+///
+/// **The starvation guard.** An unbounded sweep reaches every partition, so key order costs
+/// nothing. One the budget cuts short does not, and ordering by key would leave the tail of a
+/// large partition set permanently unserved under sustained load — so the bounded sweep probes in
+/// random order. Asserting randomness directly would be flaky; what is asserted is the property
+/// that matters, that repeated bounded sweeps do not all start from the same key.
+#[tokio::test]
+async fn a_bounded_sweep_does_not_always_take_the_lowest_keys() {
+    let (sys, db) = sysdb().await;
+    if skip_dequeue_completeness(&db) {
+        return;
+    }
+    let queue = partitioned_queue(&sys, "orders").await;
+
+    // Twelve partitions, one workflow each, and a budget of one. Every sweep can claim exactly
+    // one head, and the claimed row leaves its partition ineligible for the next.
+    for n in 0..12 {
+        enqueue_partitioned(&sys, &format!("wf-{n:02}"), "orders", &format!("p-{n:02}")).await;
+    }
+
+    let mut first_of_each = Vec::new();
+    for _ in 0..6 {
+        let claimed = sys
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1", Some(1))
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "the budget bounds the sweep to one head");
+        first_of_each.push(claimed[0].clone());
+    }
+
+    // Ordered by key, this would be exactly wf-00..wf-05. The guard is that it is not.
+    let in_key_order: Vec<String> = (0..6).map(|n| format!("wf-{n:02}")).collect();
+    assert_ne!(
+        first_of_each, in_key_order,
+        "a bounded sweep took the partitions in key order, which starves the tail"
+    );
+    assert_eq!(
+        first_of_each
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        6,
+        "each sweep claimed a partition the previous ones had not"
+    );
+}
+
 /// The partitions of a queue are the distinct keys with work waiting, each once.
 #[tokio::test]
 async fn queue_partitions_are_the_keys_with_work() {
@@ -7848,7 +8255,7 @@ async fn a_sweep_takes_one_head_per_partition() {
     }
 
     let mut started = sys
-        .start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+        .start_queued_partitioned_workflows(&queue, "exec-1", "v1", None)
         .await
         .unwrap();
     started.sort();
@@ -7860,7 +8267,7 @@ async fn a_sweep_takes_one_head_per_partition() {
 
     // The PENDING head gates its partition, so a second sweep takes nothing.
     assert!(
-        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1", None)
             .await
             .unwrap()
             .is_empty(),
@@ -7872,7 +8279,7 @@ async fn a_sweep_takes_one_head_per_partition() {
         .await
         .unwrap();
     assert_eq!(
-        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+        sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1", None)
             .await
             .unwrap(),
         ["wf-alpha-1"],
@@ -7906,6 +8313,27 @@ async fn a_sweep_refuses_an_unsuitable_queue() {
             }),
             ..NewQueue::new("limited")
         },
+        // The same three in the shape a queue registered here has: a per-partition limit above
+        // one has to be counted, ...
+        NewQueue {
+            partition_concurrency: Some(2),
+            ..NewQueue::new("wide-partition")
+        },
+        // ... a queue-wide limit beside it is a second population to count, ...
+        NewQueue {
+            concurrency: Some(4),
+            partition_concurrency: Some(1),
+            ..NewQueue::new("also-global")
+        },
+        // ... and a per-partition rate limit is a window, which the sweep never opens.
+        NewQueue {
+            partition_concurrency: Some(1),
+            partition_rate_limit: Some(RateLimit {
+                limit: 5,
+                period: std::time::Duration::from_secs(1),
+            }),
+            ..NewQueue::new("partition-limited")
+        },
     ];
 
     for queue in unsuitable {
@@ -7914,7 +8342,7 @@ async fn a_sweep_refuses_an_unsuitable_queue() {
             .unwrap();
         let registered = sys.get_queue(queue.name).await.unwrap().unwrap();
         let result = sys
-            .start_queued_partitioned_workflows(&registered, "exec-1", "v1")
+            .start_queued_partitioned_workflows(&registered, "exec-1", "v1", None)
             .await;
         assert!(
             matches!(
@@ -7961,7 +8389,7 @@ async fn a_sweep_stays_within_an_application() {
     );
     assert_eq!(
         alpha
-            .start_queued_partitioned_workflows(&queue, "exec-1", "v1")
+            .start_queued_partitioned_workflows(&queue, "exec-1", "v1", None)
             .await
             .unwrap(),
         ["wf-alpha"],
@@ -7999,6 +8427,7 @@ async fn an_update_changes_only_what_it_names() {
             worker_concurrency: Change::Set(None),
             ..QueueUpdate::default()
         },
+        &|_, _| Ok(()),
     )
     .await
     .unwrap();
@@ -8043,6 +8472,7 @@ async fn an_update_moves_a_rate_limit_whole() {
             })),
             ..QueueUpdate::default()
         },
+        &|_, _| Ok(()),
     )
     .await
     .unwrap();
@@ -8061,6 +8491,7 @@ async fn an_update_moves_a_rate_limit_whole() {
             rate_limit: Change::Set(None),
             ..QueueUpdate::default()
         },
+        &|_, _| Ok(()),
     )
     .await
     .unwrap();
@@ -8095,7 +8526,7 @@ async fn an_empty_update_is_a_no_op() {
             .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    sys.update_queue("orders", &QueueUpdate::default())
+    sys.update_queue("orders", &QueueUpdate::default(), &|_, _| Ok(()))
         .await
         .unwrap();
 
@@ -8106,6 +8537,90 @@ async fn an_empty_update_is_a_no_op() {
             .await
             .unwrap();
     assert_eq!(before, after, "an empty update records no write");
+}
+
+/// A refusal rolls the transaction back, so the row the validator judged is the row that stays.
+///
+/// The point of validating inside the write's transaction rather than before it: nothing lands,
+/// and nothing else moved the row while it was being judged.
+#[tokio::test]
+async fn a_refused_update_writes_nothing() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+
+    let before: i64 =
+        sqlx::query_scalar(r#"SELECT "updated_at" FROM "dbos"."queues" WHERE "name" = $1"#)
+            .bind("orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let error = sys
+        .update_queue(
+            "orders",
+            &QueueUpdate {
+                concurrency: Change::Set(Some(4)),
+                ..QueueUpdate::default()
+            },
+            &|_, merged| {
+                // The row as it would be, not the row as it is — which is the whole reason the
+                // caller is handed something rather than asked to look the queue up itself.
+                assert_eq!(
+                    merged.concurrency,
+                    Some(4),
+                    "the merged row is what is judged"
+                );
+                Err(Error::InvalidInput {
+                    field: "concurrency".into(),
+                    detail: "refused by the caller".to_owned(),
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidInput { field, .. } if field == "concurrency"),
+        "the caller's own refusal comes back, got {error:?}"
+    );
+
+    let read = sys.get_queue("orders").await.unwrap().unwrap();
+    assert_eq!(read.concurrency, None, "the refused write did not land");
+    let after: i64 =
+        sqlx::query_scalar(r#"SELECT "updated_at" FROM "dbos"."queues" WHERE "name" = $1"#)
+            .bind("orders")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "not even `updated_at` moved");
+}
+
+/// A name that matches nothing is refused rather than passing for success.
+///
+/// The row has to be read to validate against it, so its absence is known here rather than
+/// inferred from a row count — the same answer `update_schedule` gives.
+#[tokio::test]
+async fn updating_a_queue_that_is_not_registered_is_refused() {
+    let (sys, _db) = sysdb().await;
+
+    let error = sys
+        .update_queue(
+            "orders",
+            &QueueUpdate {
+                concurrency: Change::Set(Some(4)),
+                ..QueueUpdate::default()
+            },
+            &|_, _| Ok(()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::NotRegistered { kind, name } if kind == "Queue" && name == "orders"),
+        "got {error:?}"
+    );
 }
 
 /// The lookup answers who holds a key, so a losing enqueue can adopt the winner.
@@ -8176,7 +8691,7 @@ async fn finishing_releases_the_deduplication_key() {
     // key assertion below then fails for a reason that has nothing to do with deduplication.
     let registered = sys.get_queue("orders").await.unwrap().unwrap();
     assert_eq!(
-        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0)
+        sys.start_queued_workflows(&registered, "exec-1", "v1", None, 0, 0)
             .await
             .unwrap(),
         ["wf-first"],

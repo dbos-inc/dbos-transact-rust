@@ -20,6 +20,7 @@ pub struct Executor {
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
     app_name: String,
+    listen_queues: Option<Vec<String>>,
     tasks: Tasks,
     outcome_poll_interval: std::time::Duration,
 }
@@ -31,11 +32,11 @@ impl Executor {
     /// executor's own fields, so the executor is what sets them up. [`DBOS::launch`] is left with
     /// what is actually its business — deciding whether to build one at all, and installing it.
     ///
-    /// Also returns the recovery list — the workflows a previous run of this executor id and
-    /// application version left `PENDING`. Listed *here*, before launch returns, because the
-    /// decision about what is abandoned must predate anything the application starts: a workflow
-    /// started the instant launch returns is `PENDING` too, and a list taken any later would claim
-    /// it and run it twice. Only the execution of the list is backgrounded.
+    /// Also **recovers**, returning the ids it re-enqueued. Done *here*, before launch returns,
+    /// because what counts as abandoned must be decided before the application can start anything:
+    /// a workflow started the instant launch returns is `PENDING` under this executor's id too,
+    /// and a sweep running any later would tear it off its runner and offer it to the fleet. It is
+    /// one write rather than a list of workflows to run, so nothing about it is backgrounded.
     async fn start(config: &Config, workflows: Snapshot) -> Result<(Self, Vec<String>)> {
         config.validate()?;
 
@@ -77,8 +78,8 @@ impl Executor {
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        let pending = match prepare(&sysdb, &executor_id, &application_version).await {
-            Ok(pending) => pending,
+        let recovered = match prepare(&sysdb, &executor_id, &application_version).await {
+            Ok(recovered) => recovered,
             Err(error) => {
                 sysdb.close().await;
                 return Err(error);
@@ -102,10 +103,11 @@ impl Executor {
             runtime: tokio::runtime::Handle::current(),
             workflows,
             app_name: config.app_name.clone(),
+            listen_queues: config.listen_queues.clone(),
             tasks: Tasks::default(),
             outcome_poll_interval: config.outcome_poll_interval(),
         };
-        Ok((executor, pending))
+        Ok((executor, recovered))
     }
 
     /// The system database this executor is running against.
@@ -126,6 +128,14 @@ impl Executor {
     /// The workflows this executor started and has not seen finish.
     pub(crate) fn tasks(&self) -> &Tasks {
         &self.tasks
+    }
+
+    /// Which queues this executor dequeues from, or `None` for all of them.
+    ///
+    /// Captured at launch: it is configuration, not a knob. The *set* it narrows is still rebuilt
+    /// from the table on every sweep, which is where the dynamic behaviour lives.
+    pub(crate) fn listen_queues(&self) -> Option<&[String]> {
+        self.listen_queues.as_deref()
     }
 
     /// How often an adopting caller asks whether the run that won has finished.
@@ -301,7 +311,7 @@ impl DBOS {
         // Freezing the registry and reading it are one act, so a registration cannot land between
         // the two and be handed back a `WorkflowRef` for a workflow this executor will not have.
         let workflows = self.0.registry.snapshot();
-        let (executor, pending) = match Executor::start(&self.0.config, workflows).await {
+        let (executor, recovered) = match Executor::start(&self.0.config, workflows).await {
             Ok(started) => started,
             Err(error) => {
                 // Nothing was installed, so nothing holds the snapshot and registration is open
@@ -312,10 +322,27 @@ impl DBOS {
         };
         let executor = Arc::new(executor);
         *self.write_executor() = Some(Arc::clone(&executor));
-        // Installed first, recovered second: the recovery task runs against the same executor the
-        // application sees, and an application call racing it is exactly the case the pre-listed
-        // recovery set makes safe.
-        crate::recovery::spawn(executor, pending);
+        // Recovery already happened, inside `Executor::start`: it is one write now, and doing it
+        // before launch returns is what keeps it clear of workflows the application starts next.
+        // What is left is to start polling, which is also what will run the re-enqueued work.
+        if !recovered.is_empty() {
+            tracing::debug!(
+                workflows = recovered.len(),
+                "recovered workflows are on their queues"
+            );
+        }
+        // The dequeue loop starts unconditionally, because a queue this process never registered
+        // is still one it should dequeue from: the worker set is rebuilt from the `queues` table
+        // on every supervisor sweep, not from this instance's `register_queue` calls. A queue another
+        // *process of this application* registered is therefore picked up, as is one registered
+        // against this instance after launch, without a restart.
+        //
+        // Another *application's* queue is not, and that is the boundary: the search scopes to
+        // this application's rows plus the unclaimed ones, so a peer application's backlog is
+        // never taken. Sharing a backlog is what a fleet of one application does; reaching into
+        // another's would be the same redirection that makes registering over its queue name an
+        // error.
+        crate::dequeue::spawn(executor);
         Ok(())
     }
 
@@ -387,7 +414,7 @@ impl std::fmt::Debug for DBOS {
     }
 }
 
-/// Registers this version and lists what a previous run of this executor abandoned.
+/// Registers this version and returns what a previous run of this executor abandoned to its queue.
 ///
 /// One function rather than two calls inline so that [`Executor::start`] has a single error path
 /// to close the system database on; see the comment at its call site. Everything between the
@@ -399,10 +426,7 @@ async fn prepare(
     application_version: &str,
 ) -> Result<Vec<String>> {
     register_version(sysdb, application_version).await?;
-    sysdb
-        .get_pending_workflows(executor_id, application_version)
-        .await
-        .map_err(Error::SystemDatabase)
+    crate::recovery::reenqueue(sysdb, executor_id, application_version).await
 }
 
 /// Registers this version and warns if it is not the one a rolling deploy would prefer.

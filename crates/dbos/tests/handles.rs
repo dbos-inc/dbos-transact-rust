@@ -7,7 +7,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error, StartOptions};
+use dbos::{Config, DBOS, Error, RunOptions, StartOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -111,7 +111,7 @@ async fn a_polling_handle_returns_the_typed_error_the_run_recorded() {
     let checkout = dbos.register_workflow("checkout", checkout).unwrap();
     dbos.launch().await.expect("launch failed");
 
-    let options = || StartOptions {
+    let options = || RunOptions {
         workflow_id: Some("order-1"),
         ..Default::default()
     };
@@ -129,7 +129,7 @@ async fn a_polling_handle_returns_the_typed_error_the_run_recorded() {
 
     // The same id again, after the run finished: this start owns nothing and polls the row.
     let joined = checkout
-        .start_with((), options())
+        .start_with((), options().into())
         .await
         .expect("start failed");
     assert_eq!(
