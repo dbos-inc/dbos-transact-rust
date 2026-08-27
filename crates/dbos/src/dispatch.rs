@@ -77,6 +77,12 @@ pub(crate) async fn dispatch(
                 // The row's own, not this executor's default: a submission from a row must not
                 // rewrite how a payload it did not encode is described.
                 serialization: row.serialization.as_deref(),
+                // The queue the row is already on. Omitting it does not mean "leave the queue
+                // alone" — `init_workflow` reads it as `None` and warns that the workflow is
+                // being submitted onto a different queue, which for every dequeued row is both
+                // untrue and unavoidable. Passing the row's own value is what lets that warning
+                // go on meaning a genuine requeue.
+                queue_name: row.queue_name.as_deref(),
                 executor_id: Some(executor.executor_id()),
                 application_name: Some(executor.app_name()),
                 application_version: Some(executor.application_version()),
