@@ -115,6 +115,23 @@ pub enum ForkFrom<'a> {
     StepNamed(&'a str),
 }
 
+/// Where a resumed workflow goes.
+///
+/// A struct for one field, because it is the field every reference has and none of them stopped
+/// there — and because `resume_all(&ids, None)` says nothing at a call site about what was
+/// declined.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeOptions<'a> {
+    /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
+    ///
+    /// A named queue is how a resumed workflow is made to wait its turn: the internal queue takes
+    /// no limits, so resuming a large backlog onto it re-enqueues everything and then dequeues
+    /// everything. Sending it to a queue with a concurrency limit is the way to resume a backlog
+    /// without flooding the fleet — and, with an `application_version`-eligible executor pool, the
+    /// way to steer resumed work at a particular deployment.
+    pub queue: Option<&'a str>,
+}
+
 /// What a fork inherits, and where it goes.
 ///
 /// Every field defaults to "the same as the source", which is what a caller who says nothing
@@ -220,17 +237,32 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub async fn resume<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
-        let executor = self.executor("resume a workflow")?;
-        executor
-            .sysdb()
-            .resume_workflows(&[workflow_id], None)
+        self.resume_with(workflow_id, ResumeOptions::default())
             .await
-            .map_err(Error::SystemDatabase)?;
-        tracing::info!(workflow_id, "resumed the workflow onto its queue");
-        Ok(WorkflowHandle::polling(
-            Arc::clone(executor.connection()),
-            workflow_id.to_owned(),
-        ))
+    }
+
+    /// Resumes a workflow onto a queue of the caller's choosing.
+    ///
+    /// [`resume`](Self::resume) for the common case, which is the engine's internal queue.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// // Back on a limited queue, so a resumed backlog does not flood the fleet.
+    /// let handle = dbos.resume_with::<u32, dbos::EngineOnly>(
+    ///     "stalled-workflow",
+    ///     dbos::ResumeOptions { queue: Some("recovery") },
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn resume_with<R, E>(
+        &self,
+        workflow_id: &str,
+        options: ResumeOptions<'_>,
+    ) -> Result<WorkflowHandle<R, E>> {
+        self.resume_all(&[workflow_id], options)
+            .await?
+            .pop()
+            .ok_or_else(|| Error::Config(format!("resuming `{workflow_id}` produced no handle")))
     }
 
     /// Resumes workflows, handing back one handle per id, in the order given.
@@ -241,15 +273,18 @@ impl DBOS {
     ///
     /// Every id must exist. The whole batch is one statement, so an id with no row behind it fails
     /// the call and nothing is enqueued, rather than resuming the ones that happened to be spelled
-    /// correctly.
+    /// correctly. Python and Java draw the same line on the batch; **Go deliberately does not**,
+    /// and says so — its `ResumeWorkflows` skips a missing id where its `ResumeWorkflow` refuses
+    /// one. Following Python here keeps the batch and the single form answering the same way.
     pub async fn resume_all<R, E>(
         &self,
         workflow_ids: &[&str],
+        options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let executor = self.executor("resume a workflow")?;
         executor
             .sysdb()
-            .resume_workflows(workflow_ids, None)
+            .resume_workflows(workflow_ids, options.queue)
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(
