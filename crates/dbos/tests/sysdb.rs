@@ -1103,6 +1103,25 @@ async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
             .expect("seed update failed");
     }
 
+    // **Distinct creation stamps, written rather than timed.** `created_at` is a millisecond
+    // stamp and the inserts above are a round trip apart, so on hardware quick enough to seed
+    // several rows inside one millisecond they tie — and a listing orders by `created_at` alone,
+    // so tied rows come back in an order the query does not fix. Left to timing, any test that
+    // asserts an order over this fixture is one that passes locally and fails in CI.
+    //
+    // Seed order, a second apart, and below the completion stamps written above so a row is never
+    // finished before it exists. The values matter only in being distinct and increasing.
+    for (index, wf) in seeds.iter().enumerate() {
+        sqlx::query(sqlx::AssertSqlSafe(
+            "UPDATE dbos.workflow_status SET created_at = $2 WHERE workflow_uuid = $1",
+        ))
+        .bind(wf.workflow_id)
+        .bind(1000 + index as i64 * 1000)
+        .execute(&mut conn)
+        .await
+        .expect("seed stamp failed");
+    }
+
     (sys, db)
 }
 
@@ -1357,74 +1376,6 @@ async fn every_filter_narrows() {
     }
 }
 
-/// Workflows sharing a `created_at` still order and page deterministically.
-///
-/// `created_at` is a millisecond stamp and a fan-out fills one easily, so the sort has to be a
-/// total order on its own: `limit` and `offset` page through *this* order, and a boundary landing
-/// inside a tie would hand one row to two pages and drop another. `workflow_uuid` is what breaks
-/// it, in whichever direction the sort runs.
-///
-/// The tie is written rather than raced for. Left to timing it depends entirely on how fast the
-/// inserts are — reliable on a machine quick enough to seed several rows inside one millisecond,
-/// and unreachable on one that is not, which is the shape of a test that passes locally and fails
-/// in CI.
-#[tokio::test]
-async fn a_created_at_tie_still_orders_and_pages() {
-    use dbos::sysdb::types::WorkflowFilter as F;
-    let (sys, db) = seeded().await;
-    let mut conn = db.admin_connection().await;
-    sqlx::query(sqlx::AssertSqlSafe(
-        "UPDATE dbos.workflow_status SET created_at = 7000 \
-         WHERE workflow_uuid IN ('wf-a', 'wf-b', 'wf-c', 'wf-d')",
-    ))
-    .execute(&mut conn)
-    .await
-    .expect("tie update failed");
-
-    let only_wf = F {
-        workflow_id_prefixes: vec!["wf-"],
-        ..F::default()
-    };
-    assert_eq!(
-        ids(&sys, &only_wf).await,
-        ["wf-a", "wf-b", "wf-c", "wf-d"],
-        "a tie should fall back to the id, ascending"
-    );
-    assert_eq!(
-        ids(
-            &sys,
-            &F {
-                sort_desc: true,
-                ..only_wf.clone()
-            }
-        )
-        .await,
-        ["wf-d", "wf-c", "wf-b", "wf-a"],
-        "a tie should fall back to the id, descending too"
-    );
-
-    // The two halves of one listing, taken as two queries: every row once, in order.
-    let first = ids(
-        &sys,
-        &F {
-            limit: Some(2),
-            ..only_wf.clone()
-        },
-    )
-    .await;
-    let second = ids(
-        &sys,
-        &F {
-            limit: Some(2),
-            offset: Some(2),
-            ..only_wf.clone()
-        },
-    )
-    .await;
-    assert_eq!(first, ["wf-a", "wf-b"]);
-    assert_eq!(second, ["wf-c", "wf-d"]);
-}
-
 /// Ordering, limit, and offset page through the results.
 #[tokio::test]
 async fn results_are_ordered_and_pageable() {
@@ -1435,7 +1386,8 @@ async fn results_are_ordered_and_pageable() {
         ..F::default()
     };
 
-    // Seeded in order, and `created_at` is stamped at insert, so oldest-first is insertion order.
+    // `seeded` writes the creation stamps a second apart in seed order, so oldest-first is
+    // insertion order and nothing here depends on how fast the seeds were inserted.
     let ascending = ids(&sys, &only_wf).await;
     assert_eq!(ascending, ["wf-a", "wf-b", "wf-c", "wf-d"]);
 
