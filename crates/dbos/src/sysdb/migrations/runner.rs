@@ -337,9 +337,9 @@ pub async fn run(
 /// corpus defines is something some statement here names — `QUEUE_COLUMNS` selects
 /// `application_name` from migration 101 and the per-partition limits from 108 — so a database
 /// that stopped short of the ceiling is one this build cannot read, whatever it can parse. The
-/// distinction matters now that the shared series has a migration the other implementations have
-/// not ported: a peer that migrated to 107 and stopped leaves a database that would pass any
-/// lower bar and then fail on the first queue read.
+/// distinction matters now that the shared series has a migration **Go** has not ported — Python
+/// and TypeScript both define 108, Go's table stops at 107 — so a peer that migrated to 107 and
+/// stopped leaves a database that would pass any lower bar and then fail on the first queue read.
 pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
     let required = i64::from(SHARED_MIGRATIONS);
     let recorded = match recorded_version(pool, schema).await {
