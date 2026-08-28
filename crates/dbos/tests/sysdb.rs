@@ -4963,7 +4963,7 @@ async fn connecting_without_migrating_refuses_a_schema_that_is_not_ready() {
     // Not the version number itself, which moves with every migration added — only that the
     // message names where the database is and what to do about it.
     assert!(
-        message.contains("migration 0") && message.contains("Migrate it"),
+        message.contains("migration 0") && message.contains("migration enabled"),
         "the message should say how far the database got and what to do, got: {message}"
     );
 

@@ -122,6 +122,14 @@ pub enum MigrateError {
         source: sqlx::Error,
     },
     /// The schema is older than this build needs, and migrating was not asked for.
+    ///
+    /// **The message names DBOS Rust rather than "DBOS"**, because five implementations share one
+    /// schema and the reader's next question is whose requirement is unmet: a database migrated by
+    /// a peer that stops short of what this build reads is exactly the case
+    /// [`verify`] exists to catch. It also names no flag, because the two
+    /// callers do not have the same one — an instance can be launched with
+    /// [`Config::migrate`](crate::Config::migrate), and a [`Client`](crate::Client) has no such
+    /// field at all — so the advice is the remedy rather than the knob.
     Outdated {
         /// The version the database records. `0` means nothing has ever migrated it.
         recorded: i64,
@@ -140,8 +148,9 @@ impl std::fmt::Display for MigrateError {
             }
             MigrateError::Outdated { recorded, required } => write!(
                 f,
-                "the system database is at migration {recorded}, but this build needs \
-                 {required}. Migrate it, or launch with migration enabled."
+                "the system database is not up to date for this version of DBOS Rust: it is at \
+                 migration {recorded}, and this build needs {required}. Bring it up to date by \
+                 launching a DBOS instance with migration enabled, or by migrating out of band."
             ),
         }
     }
