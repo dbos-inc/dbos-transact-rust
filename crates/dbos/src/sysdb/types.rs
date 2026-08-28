@@ -186,7 +186,14 @@ pub fn duration_from_secs(secs: f64) -> Option<Duration> {
 ///
 /// Stored as text and shared with every other DBOS implementation, so the spellings are a wire
 /// format rather than an internal choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The serde representation is those same spellings, which is what the rename on the derive is
+/// for: a status that round-trips through a checkpoint — see [`DBOS::list_workflows`] — must
+/// come back as what [`as_str`](Self::as_str) would have written.
+///
+/// [`DBOS::list_workflows`]: crate::DBOS::list_workflows
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkflowStatus {
     /// Claimed by an executor and running.
     Pending,
@@ -261,7 +268,12 @@ impl fmt::Display for WorkflowStatus {
 /// was not, which is the kind of loss this layer should report rather than absorb.
 ///
 /// Every payload field holds encoded text — see the module documentation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because a listing made from inside a workflow is checkpointed and
+/// replays from what it recorded, so the rows have to round-trip. Nothing else reads that
+/// encoding — it is the engine talking to its own replay, not a format other implementations
+/// share.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowRecord {
     /// Primary key, and the identity a caller uses everywhere else.
     pub workflow_id: String,
@@ -951,7 +963,10 @@ impl Default for WorkflowFilter<'_> {
 /// distinction, and the reason is that "function" is what these were called before steps had a
 /// name of their own — the columns cannot be renamed without a migration every SDK must agree
 /// on, but the Rust API need not inherit the old word.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde-able for the same reason as [`WorkflowRecord`]: a step listing taken from inside a
+/// workflow is itself a checkpointed step, and replays from what it recorded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepRecord {
     /// The workflow the step belongs to.
     pub workflow_id: String,

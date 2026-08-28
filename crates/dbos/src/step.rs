@@ -472,6 +472,105 @@ where
     outcome
 }
 
+/// Runs an engine call as a checkpointed step of the workflow that is asking.
+///
+/// The mechanism every other implementation puts under its management surface — Python's
+/// `call_function_as_step`, TypeScript's `runInternalStep`, Go's `RunAsStep`. A management call
+/// made from inside a workflow body is recorded against that workflow, so a replay reads back
+/// what the first execution did instead of doing it again: a fork keeps the id it was given
+/// rather than generating a second one, a cancel is issued once, a listing replays the rows it
+/// saw.
+///
+/// Outside a workflow, and inside a step, the body runs plainly — the same rule [`step_with`]
+/// follows, and for the same reasons: there is no step sequence to checkpoint against, and a step
+/// is a leaf whose own checkpoint stands for everything its body did.
+///
+/// **Narrower than [`step_with`] in three ways, each deliberate.**
+///
+/// It does not retry. These are single system-database statements, and `sysdb` already decides
+/// which of its failures are worth another attempt; a retry policy here would be a second one
+/// layered over it, with a checkpoint in between.
+///
+/// Its name is the engine's, not a caller's. The recorded name is the cross-SDK spelling —
+/// `DBOS.forkWorkflow`, `DBOS.cancelWorkflow` — so a step listing reads the same whichever
+/// implementation wrote it, and so a workflow whose steps were recorded by one SDK replays
+/// against the name another SDK checks.
+///
+/// **A failure records nothing.** The step id is spent and no row is written, so a replay makes
+/// the call again. Python's `call_function_as_step` does the same — it records only after `fn()`
+/// returns — and it is the right way round for these: what fails here is the database being
+/// unreachable, not the operation being wrong, and a recorded failure would make a blip
+/// permanent for the life of the workflow.
+///
+/// `FnOnce`, where [`step`] takes `FnMut`: with no retry there is no second call to make.
+pub(crate) async fn internal_step<T, F, Fut>(name: &str, body: F) -> Result<T>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
+        tracing::debug!(
+            step_name = name,
+            "the call runs plainly, not as a checkpoint: it is outside a workflow, or inside a \
+             step"
+        );
+        return body().await;
+    };
+
+    let step_id = ctx.next_step_id();
+    let executor = ctx.executor();
+    let workflow_id = ctx.workflow_id();
+
+    // Before the check, as in `step_with`: the recorded duration covers the round trip that asks
+    // whether the call has already been made.
+    let started_at = Timestamp::now();
+
+    let recorded = executor
+        .sysdb()
+        .check_step(workflow_id, step_id, name)
+        .await
+        .map_err(Error::SystemDatabase)?;
+    if let Some(recorded) = recorded {
+        tracing::debug!(
+            step_id,
+            step_name = name,
+            "the call replays from its checkpoint; it is not made again"
+        );
+        return match recorded.error {
+            // Nothing here writes one, but another implementation's `call_function_as_step` shares
+            // this table and its own rules, and a workflow's steps are read by whoever replays it.
+            Some(error) => Err(revive(&error, name)),
+            None => decode(recorded.output.as_deref(), "internal step result"),
+        };
+    }
+
+    let result = body().await?;
+
+    let output = encode(&result, "internal step result")?;
+    executor
+        .sysdb()
+        .record_step(
+            workflow_id,
+            step_id,
+            name,
+            Outcome::Output(Some(&output)),
+            Some(executor.serializer().name()),
+            Some(StepTiming {
+                started_at,
+                completed_at: Timestamp::now(),
+            }),
+        )
+        .await
+        .map_err(Error::SystemDatabase)?;
+    tracing::debug!(
+        step_id,
+        step_name = name,
+        "the call was made; its result is recorded"
+    );
+    Ok(result)
+}
+
 /// Runs one attempt under the watchdogs its options ask for.
 ///
 /// One place decides whether the attempt completed or blew its deadline, which is the shape

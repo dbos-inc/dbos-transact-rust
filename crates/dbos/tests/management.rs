@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::WorkflowStatus;
+use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
 use dbos::{
     Children, Config, DBOS, EngineOnly, Enqueue, Error, ForkFrom, ForkOptions, ResumeOptions,
     StartOptions,
@@ -998,6 +998,178 @@ async fn attributes_are_replaced_and_can_be_searched() {
             .is_none(),
         "clearing left the attributes behind"
     );
+
+    dbos.shutdown().await;
+}
+
+/// **A management call made from inside a workflow is a step of that workflow.**
+///
+/// The mechanism the other implementations put under their own management surface — Python's
+/// `call_function_as_step`, TypeScript's `runInternalStep`, Go's `RunAsStep` — and the recorded
+/// names are theirs, so a step listing reads the same whichever SDK wrote it.
+#[tokio::test]
+async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-step-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("operator", {
+            let dbos = dbos.clone();
+            move |id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    dbos.cancel(&id).await?;
+                    let rows = dbos
+                        .list_workflows(&WorkflowFilter {
+                            workflow_ids: vec![&id],
+                            ..WorkflowFilter::default()
+                        })
+                        .await?;
+                    Ok::<usize, Error>(rows.len())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // The target sits on a queue nothing polls, so it is there to be cancelled.
+    let target_id = "cancelled-from-inside";
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(target_id),
+                queue: Some(Enqueue::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let operator_id = "the-operator";
+    let seen = operator
+        .run_with(
+            target_id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(operator_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator workflow failed");
+    assert_eq!(
+        seen, 1,
+        "the listing did not see the workflow it filtered on"
+    );
+
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow(target_id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Cancelled,
+    );
+
+    let steps = reader
+        .list_workflow_steps(operator_id, true, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "DBOS.cancelWorkflow"), (1, "DBOS.listWorkflows")],
+        "the management calls were not checkpointed under the cross-SDK names",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A replayed fork hands back the id it recorded rather than forking again.**
+///
+/// The case that makes this more than bookkeeping: a fork generates a new workflow id, so a
+/// replay without a checkpoint would write a second fork under a second id — work run twice, and
+/// an id the first execution never saw.
+#[tokio::test]
+async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-replay-app", &db));
+    let ran = Arc::new(AtomicU32::new(0));
+    let target = dbos
+        .register_workflow("forked_target", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(7)
+                }
+            }
+        })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("forking_operator", {
+            let dbos = dbos.clone();
+            move |source: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let fork = dbos
+                        .fork::<u32, EngineOnly>(&source, ForkFrom::Beginning)
+                        .await?;
+                    Ok::<String, Error>(fork.workflow_id().to_owned())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let source_id = "the-source";
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(source_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the source failed");
+
+    let options = dbos::RunOptions {
+        workflow_id: Some("the-forker"),
+        ..Default::default()
+    };
+    let first = operator
+        .run_with(source_id.to_owned(), options.clone())
+        .await
+        .expect("the first run failed");
+    // A second execution under the same id replays the fork from its checkpoint.
+    let replayed = operator
+        .run_with(source_id.to_owned(), options)
+        .await
+        .expect("the replay failed");
+    assert_eq!(
+        first, replayed,
+        "the replay forked again instead of replaying the id it recorded",
+    );
+
+    let forks: Vec<String> = reader(&db)
+        .await
+        .list_workflows(&WorkflowFilter::default())
+        .await
+        .expect("read failed")
+        .into_iter()
+        .filter(|row| row.forked_from.as_deref() == Some(source_id))
+        .map(|row| row.workflow_id)
+        .collect();
+    assert_eq!(forks, [first], "the source was forked more than once");
 
     dbos.shutdown().await;
 }
