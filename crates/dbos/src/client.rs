@@ -237,9 +237,12 @@ impl ClientConfig {
 /// Cheap to clone — it is an `Arc` internally — so a clone is another handle to the same
 /// connection rather than a second one. Clone it into whatever holds application state.
 ///
-/// Dropping the last clone leaves the pool to its own teardown, which closes the connections but
-/// says nothing about when; [`close`](Self::close) is how a client is put away deliberately, and is
-/// what a process that connects repeatedly wants.
+/// Dropping the last clone stops the listener and the notifier and leaves the pool to its own
+/// teardown, which closes the connections but says nothing about when. That is a safety net —
+/// without it the listener would hold a `LISTEN` connection for the life of the process — and not a
+/// shutdown: nothing waits for either task, and whatever the notifier had inside its coalescing
+/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client is
+/// put away deliberately, and is what a process that connects repeatedly wants.
 #[derive(Clone, Debug)]
 pub struct Client(Arc<Connection>);
 
@@ -265,7 +268,12 @@ impl Client {
     /// Idempotent, and safe to call while clones are still alive: what it closes is the pool they
     /// share, so a later call through one of them fails as an unreachable database rather than
     /// doing something surprising. `Drop` cannot do this — closing is asynchronous — which is the
-    /// same reason [`DBOS::shutdown`](crate::DBOS::shutdown) is a method rather than a destructor.
+    /// same reason [`DBOS::shutdown`](crate::DBOS::shutdown) is a method rather than a destructor;
+    /// dropping the last clone stops the tasks but waits for nothing.
+    ///
+    /// What this adds over the drop is the waiting: the notifier's queued wakeups go out, the
+    /// pool's connections are closed, and the listener has *ended* rather than merely been told to,
+    /// so afterwards nothing of this client is still running.
     pub async fn close(&self) {
         self.0.close().await;
         tracing::info!(

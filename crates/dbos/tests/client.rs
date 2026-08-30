@@ -660,6 +660,54 @@ async fn a_client_manages_queues() {
     client.close().await;
 }
 
+/// A client that is dropped rather than closed lets go of its connections.
+///
+/// Dropping is the ordinary end of a client — it is a value in someone's application state, not
+/// something with a lifecycle — and it used to leak: the listener task holds its own clone of the
+/// pool, so the pool could not close itself, and the listener's only way out of its loop is that
+/// close. One abandoned client meant a `LISTEN` connection and two tasks for the life of the
+/// process.
+#[tokio::test]
+async fn a_dropped_client_releases_its_connections() {
+    // Tagged so this counts its own connections and not another test's, on a shared server.
+    const TAG: &str = "dbos-client-drop-probe";
+
+    let db = test_database().await;
+    let client = Client::connect(ClientConfig {
+        app_name: Some("client-drop".to_owned()),
+        ..ClientConfig::new(format!("{}?application_name={TAG}", db.url()))
+    })
+    .await
+    .expect("connect failed");
+
+    // One call, so the pool has actually connected and the listener has had a reason to.
+    assert!(
+        client
+            .queue("nothing")
+            .await
+            .expect("read failed")
+            .is_none()
+    );
+    assert!(db.connection_count(TAG).await > 0);
+
+    drop(client);
+
+    // The server drops a session shortly after its client goes away, so this is a bounded wait
+    // rather than a single look. A leak never converges.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let open = db.connection_count(TAG).await;
+        if open == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{open} connections from a dropped client are still open"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// A client cannot ask for the conflict policy that needs an application version.
 ///
 /// It has none — it runs none of the application's code — so "update if I am the latest version"

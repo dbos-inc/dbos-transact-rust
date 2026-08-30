@@ -571,6 +571,36 @@ impl PostgresSystemDatabase {
     }
 }
 
+impl Drop for PostgresSystemDatabase {
+    /// Stops the two tasks a handle that was never closed would otherwise leave running.
+    ///
+    /// **A safety net, not the shutdown.** [`close`](SystemDatabase::close) is still what a caller
+    /// wants — it flushes the notifier's window, closes the pool, and waits for both tasks, so that
+    /// afterwards nothing of this handle is running. A destructor can do none of that, because all
+    /// of it is asynchronous.
+    ///
+    /// Without this, dropping a handle instead of closing it leaks both tasks *and* a connection
+    /// for the life of the process: the tasks hold `Arc`s carrying their own clones of the pool, so
+    /// the pool cannot reach zero handles and close itself, and the listener's only way out of its
+    /// loop is that close — it would go on holding a `LISTEN` connection with nobody left to
+    /// deliver to. Dropping rather than closing is the ordinary end of a
+    /// [`Client`](crate::Client), which is a value in someone's application state rather than
+    /// something with a lifecycle of its own.
+    fn drop(&mut self) {
+        // The notifier ends itself on the flag, flushing what it had queued on the way out, so it
+        // needs no abort — and aborting it would be the one way to lose that flush.
+        self.notifier.stop();
+
+        // The listener has no such flag: it stops when the pool closes, and closing a pool is
+        // asynchronous. Aborting drops the task's `Arc<Listener>`, which is what releases its pool
+        // clone and hands the `LISTEN` connection back for the pool's own teardown to close.
+        let task = self.listener_task.lock().expect("listener lock").take();
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+}
+
 /// The `WHERE` selecting the rows a rename moves.
 ///
 /// Unclaimed rows are matched only when the source asks for them — the one place in this feature
