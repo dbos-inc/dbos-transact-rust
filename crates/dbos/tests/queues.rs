@@ -1295,10 +1295,13 @@ async fn an_incoherent_enqueue_is_refused() {
     assert!(
         reader(&db)
             .await
-            .list_workflows(&dbos::sysdb::types::WorkflowFilter {
-                queue_names: vec!["demo-queue"],
-                ..Default::default()
-            })
+            .list_workflows(
+                &dbos::sysdb::types::WorkflowFilter {
+                    queue_names: vec!["demo-queue"],
+                    ..Default::default()
+                },
+                None
+            )
             .await
             .expect("list failed")
             .is_empty(),

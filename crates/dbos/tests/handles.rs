@@ -84,7 +84,7 @@ async fn starting_a_taken_id_joins_the_existing_run() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let [row] = &rows[..] else {

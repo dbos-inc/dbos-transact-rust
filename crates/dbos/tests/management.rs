@@ -1076,7 +1076,7 @@ async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
     );
 
     let steps = reader
-        .list_workflow_steps(operator_id, true, None, None)
+        .list_workflow_steps(operator_id, true, None, None, None)
         .await
         .expect("read failed");
     let recorded: Vec<(i32, &str)> = steps
@@ -1162,7 +1162,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
 
     let forks: Vec<String> = reader(&db)
         .await
-        .list_workflows(&WorkflowFilter::default())
+        .list_workflows(&WorkflowFilter::default(), None)
         .await
         .expect("read failed")
         .into_iter()

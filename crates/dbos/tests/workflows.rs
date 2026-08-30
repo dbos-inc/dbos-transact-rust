@@ -50,7 +50,7 @@ async fn a_workflow_runs_and_records_its_output() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let [row] = &rows[..] else {
@@ -118,7 +118,7 @@ async fn a_started_workflow_carries_the_attributes_it_was_given() {
     );
 
     let child = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed")
         .into_iter()
@@ -144,7 +144,7 @@ async fn a_zero_argument_workflow_records_no_input() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -195,7 +195,7 @@ async fn an_application_error_type_round_trips_as_itself() {
     // And so does a caller adopting the finished workflow, which reads it back out of the column.
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(rows[0].status, WorkflowStatus::Error);
@@ -259,7 +259,7 @@ async fn a_foreign_error_is_converted_at_the_boundary() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(rows[0].status, WorkflowStatus::Error);
@@ -305,7 +305,7 @@ async fn a_database_failure_is_not_the_workflows_outcome() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -342,11 +342,11 @@ async fn a_workflow_records_the_steps_it_took() {
 
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let steps = reader
-        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     let seen: Vec<(i32, &str, Option<&str>)> = steps
@@ -398,11 +398,11 @@ async fn a_step_error_type_round_trips_as_itself() {
 
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let steps = reader
-        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     let recorded: Error<ChargeError> = serde_json::from_str(
@@ -445,7 +445,7 @@ async fn a_panicking_workflow_leaves_its_row_pending() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -485,7 +485,7 @@ async fn the_row_exists_before_the_body_starts() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -541,7 +541,7 @@ async fn shutdown_cancels_a_running_workflow_and_leaves_it_pending() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -587,7 +587,7 @@ async fn dropping_the_future_does_not_stop_the_workflow() {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let rows = reader
-            .list_workflows(&Default::default())
+            .list_workflows(&Default::default(), None)
             .await
             .expect("read failed");
         if rows[0].status == WorkflowStatus::Success {

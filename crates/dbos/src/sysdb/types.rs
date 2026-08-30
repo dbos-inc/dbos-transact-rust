@@ -2219,6 +2219,56 @@ pub mod step_names {
     /// only crosses one by enqueue, so this is a convention rather than a wire format.
     pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
 
+    /// The step names the management surface records, which a replay compares against.
+    ///
+    /// Every one of these is written by a management call made *from inside a workflow* —
+    /// [`DBOS::cancel`](crate::DBOS::cancel) and its neighbours — and is what another execution
+    /// of that workflow looks the recorded answer up by. Four are unanimous across the
+    /// implementations: `resumeWorkflow`, `setWorkflowDelay`, `listWorkflows` and
+    /// `forkWorkflow`. The rest are worth their reasons.
+    ///
+    /// **The singular name covers the bulk form too.** Python, TypeScript and Java record the
+    /// singular whatever the batch size; Go pluralizes, and inconsistently — `DBOS.cancelWorkflow`
+    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one.
+    /// Three of four decides it, and one name per operation is worth having on its own: the
+    /// singular forms here *are* the bulk ones with a single id, so a workflow that switches
+    /// between [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all)
+    /// between runs still replays instead of raising [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
+    ///
+    /// **[`LIST_WORKFLOW_STEPS`] follows the three, not Go**, which records
+    /// `DBOS.getWorkflowSteps` where Python, TypeScript and Java all say `listWorkflowSteps`.
+    ///
+    /// **[`UPDATE_WORKFLOW_ATTRIBUTES`] is what Go's method records, not what it is called**: Go
+    /// spells the method `SetWorkflowAttributes` and the step `DBOS.updateWorkflowAttributes`, so
+    /// the step name is the half Python and Java agree with. TypeScript has no attributes method
+    /// at all.
+    ///
+    /// **There is no `DBOS.listQueuedWorkflows`.** Python and TypeScript record one because they
+    /// have a second entry point for it; here
+    /// [`WorkflowFilter::queues_only`](super::WorkflowFilter::queues_only) is that method, so a
+    /// queues-only listing records [`LIST_WORKFLOWS`] like any other.
+    ///
+    /// **Nothing names a retrieve.** Python and Go check the row and so record `DBOS.getStatus`
+    /// and `DBOS.retrieveWorkflow`; [`retrieve_workflow`](crate::DBOS::retrieve_workflow) does no
+    /// I/O, and a call that reads nothing has nothing to replay.
+    ///
+    /// All of these are recorded from down here rather than by the engine, because each
+    /// checkpoint commits in the same transaction as the operation it records — see
+    /// [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    ///
+    /// **[`FORK_WORKFLOW`] covers every fork point.** Java splits its from-failure batch out as
+    /// `DBOS.forkFromFailure`; Go keeps one name whatever the fork point, and so does this,
+    /// because [`fork_from`](crate::sysdb::SystemDatabase::fork_from) resolves all four
+    /// [`ForkPoint`](super::ForkPoint)s through one method.
+    pub const CANCEL_WORKFLOW: &str = "DBOS.cancelWorkflow";
+    pub const RESUME_WORKFLOW: &str = "DBOS.resumeWorkflow";
+    pub const DELETE_WORKFLOW: &str = "DBOS.deleteWorkflow";
+    pub const FORK_WORKFLOW: &str = "DBOS.forkWorkflow";
+    pub const SET_WORKFLOW_DELAY: &str = "DBOS.setWorkflowDelay";
+    pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.updateWorkflowAttributes";
+    pub const LIST_WORKFLOWS: &str = "DBOS.listWorkflows";
+    pub const LIST_WORKFLOW_STEPS: &str = "DBOS.listWorkflowSteps";
+
     /// The step names the schedule methods record, which a replay compares against.
     ///
     /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause

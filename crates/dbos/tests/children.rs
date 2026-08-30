@@ -94,7 +94,7 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
             "the child's row points back at its parent"
         );
         let steps = reader
-            .list_workflow_steps(id, false, None, None)
+            .list_workflow_steps(id, false, None, None, None)
             .await
             .expect("read failed");
         let step = steps
@@ -204,7 +204,7 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
         "the derived child id names no row: the insert lost the key",
     );
     let steps = reader
-        .list_workflow_steps(id, false, None, None)
+        .list_workflow_steps(id, false, None, None, None)
         .await
         .expect("read failed");
     let launch = steps
@@ -397,7 +397,7 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
         "the recovered parent started no fourth child: {children:?}"
     );
     let steps = reader
-        .list_workflow_steps(id, false, None, None)
+        .list_workflow_steps(id, false, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -519,7 +519,7 @@ async fn a_child_that_is_never_awaited_is_still_recorded() {
 
     let reader = reader(&db).await;
     let steps = reader
-        .list_workflow_steps(id, false, None, None)
+        .list_workflow_steps(id, false, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1, "the launch is recorded: {steps:?}");
@@ -723,7 +723,7 @@ async fn awaiting_a_child_is_recorded_as_a_step() {
 
     let steps = reader(&db)
         .await
-        .list_workflow_steps(id, true, None, None)
+        .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 2, "one launch, one await: {steps:?}");
@@ -782,7 +782,7 @@ async fn a_replayed_parent_reads_the_recorded_outcome_rather_than_waiting_again(
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let steps = reader
-                .list_workflow_steps(id, false, None, None)
+                .list_workflow_steps(id, false, None, None, None)
                 .await
                 .expect("read failed");
             if steps.len() == 2 {
@@ -799,7 +799,7 @@ async fn a_replayed_parent_reads_the_recorded_outcome_rather_than_waiting_again(
 
     // The child is gone. Only the parent's recorded copy of its result is left.
     reader
-        .delete_workflows(&[&format!("{id}-0")], false)
+        .delete_workflows(&[&format!("{id}-0")], false, None)
         .await
         .expect("delete failed");
     assert!(
@@ -901,7 +901,7 @@ async fn a_cancelled_child_is_an_awaited_cancellation_in_the_parent() {
 
     let reader = reader(&db).await;
     let steps = reader
-        .list_workflow_steps(id, true, None, None)
+        .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
     let await_step = steps
@@ -1208,7 +1208,7 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
     // again instead of replaying a verdict it never actually received. Go states the same rule in
     // its own words at the same point.
     let steps = reader
-        .list_workflow_steps(id, false, None, None)
+        .list_workflow_steps(id, false, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -1367,7 +1367,7 @@ async fn a_child_started_through_another_instance_is_refused() {
     );
     assert!(
         reader
-            .list_workflow_steps(id, false, None, None)
+            .list_workflow_steps(id, false, None, None, None)
             .await
             .expect("read failed")
             .is_empty(),
@@ -1434,7 +1434,7 @@ async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
 
     let steps = reader(&db)
         .await
-        .list_workflow_steps(id, true, None, None)
+        .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 2, "the launch and the step: {steps:?}");
@@ -1508,7 +1508,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let steps = reader
-            .list_workflow_steps(id, false, None, None)
+            .list_workflow_steps(id, false, None, None, None)
             .await
             .expect("read failed");
         if !steps.is_empty() {

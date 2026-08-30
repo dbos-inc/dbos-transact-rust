@@ -76,11 +76,11 @@ async fn a_step_that_fails_twice_succeeds_on_the_third_attempt() {
     // One checkpoint for the whole sequence, holding the attempt that succeeded.
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let steps = reader
-        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1, "the attempts share one step id");
@@ -226,7 +226,7 @@ async fn a_retried_step_replays_from_its_single_checkpoint() {
     // The step is recorded, so a second execution under the same id must not enter the body again.
     let reader = reader(&db).await;
     let recorded = reader
-        .list_workflow_steps(id, true, None, None)
+        .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(recorded.len(), 1);

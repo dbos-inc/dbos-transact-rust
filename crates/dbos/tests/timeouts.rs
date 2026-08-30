@@ -56,11 +56,11 @@ async fn a_step_that_hangs_is_stopped_at_its_timeout() {
     // Recorded as the step's outcome, so a replay fails the same way rather than hanging again.
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let steps = reader
-        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1);
@@ -318,7 +318,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
 
     let reader = reader(&db).await;
     reader
-        .cancel_workflows(&[id], false)
+        .cancel_workflows(&[id], false, None)
         .await
         .expect("cancel failed");
 
@@ -330,7 +330,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
 
     // Nothing checkpointed: a preempted step was interrupted, not wrong, so a resume runs it again.
     let steps = reader
-        .list_workflow_steps(id, true, None, None)
+        .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
     assert!(
