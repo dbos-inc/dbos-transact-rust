@@ -138,11 +138,16 @@ pub struct ClientConfig {
 
     /// Whether to use LISTEN/NOTIFY rather than polling.
     ///
-    /// On, so a client waiting on a result or an event is woken rather than polling. Go's client
-    /// starts its listener for exactly this reason. Python defaults its client's off — a client
-    /// there is often a short-lived script, and the listener is a thread and a held connection —
-    /// and this differs from Python deliberately: the wait is the operation most worth making cheap,
-    /// and a client that never waits pays only the connection.
+    /// On, so [`get_event`](crate::Client::get_event) is woken rather than polling. That is the one
+    /// wait it serves here: a workflow's *outcome* is announced on no channel, in this
+    /// implementation or any other — Python's `await_workflow_result` polls too — so a result wait
+    /// looks again every [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this is
+    /// set to.
+    ///
+    /// Go's client starts its listener for the same reason. Python defaults its client's off — a
+    /// client there is often a short-lived script, and the listener is a thread and a held
+    /// connection — and this differs from Python deliberately: an event wait is the operation most
+    /// worth making cheap, and a client that never waits on one pays only the connection.
     pub use_listen_notify: bool,
 
     /// How many polling reads may run at once.
@@ -152,8 +157,10 @@ pub struct ClientConfig {
 
     /// How often a caller waiting on a workflow asks whether it has finished.
     ///
-    /// `None` is one second. Every wait a client makes is this kind — it owns none of the workflows
-    /// it watches — so this is the interval that decides how promptly it learns of an outcome.
+    /// `None` is one second. Every wait a client makes on an outcome is this kind — it owns none of
+    /// the workflows it watches — so this is the interval that decides how promptly it learns of
+    /// one, and, an outcome having no channel to be announced on,
+    /// [`use_listen_notify`](Self::use_listen_notify) does not shorten it.
     pub outcome_poll_interval: Option<Duration>,
 
     /// How long a written key waits for company before a wakeup is pushed for it.
