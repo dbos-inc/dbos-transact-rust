@@ -708,11 +708,22 @@ pub struct EnqueueOptions<'a> {
 
     /// The version of the application's code that must run this workflow.
     ///
-    /// **`None` means any version, and it is the right default for a client.** A version pins the
-    /// row: only an executor running exactly that code will dequeue it, so a stale value here is a
-    /// workflow that waits forever. Name one when a deployment is being pinned deliberately —
-    /// draining work to a version that is still up during a rollback, say — and otherwise let the
-    /// fleet take it.
+    /// **`None` records no version, which is the right default for a client**, and is not quite the
+    /// same as *any* version: an unversioned row is dequeued by an executor running the **latest
+    /// registered** version, and by no other. That is what keeps a rolling deploy from handing new
+    /// work to the code being replaced, and it is the same rule an application's own unversioned
+    /// rows follow.
+    ///
+    /// The case worth knowing is a rollback. A version's timestamp is what makes it the latest, and
+    /// re-registering one that already exists does not move it — so redeploying an earlier version
+    /// leaves the version that was rolled back from still holding the title, and unversioned work
+    /// waits for executors that are gone. Promoting the version being rolled back to, which is what
+    /// an operator's rollback does, is what releases it.
+    ///
+    /// Naming a version instead pins the row: only an executor running exactly that code will
+    /// dequeue it, so a stale value here is a workflow that waits forever. Name one when a
+    /// deployment is being pinned deliberately — draining work to a version that is still up during
+    /// a rollback, say — and otherwise let the fleet take it.
     pub app_version: Option<&'a str>,
 
     /// How long the whole workflow may take, once it starts.
