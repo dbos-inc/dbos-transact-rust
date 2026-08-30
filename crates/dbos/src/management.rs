@@ -123,8 +123,10 @@ pub enum Children {
     /// The workflows named, and everything descended from them at any depth.
     ///
     /// The walk is the system database's, and the two operations walk differently on purpose:
-    /// cancelling interleaves level by level so a parent cannot spawn behind the sweep, while
-    /// deleting collects the whole tree first, because a deleted parent cannot spawn at all.
+    /// cancelling interleaves level by level, which narrows the window a parent can spawn behind
+    /// the sweep in, while deleting collects the whole tree first — the cascade does in one
+    /// statement what cancelling needs one per level for. Neither closes the window: a child
+    /// committed after the walk has passed its level survives, in both.
     Include,
 }
 
@@ -179,8 +181,20 @@ pub struct ResumeOptions<'a> {
 pub struct ForkOptions<'a> {
     /// The id the fork gets. `None` generates one.
     ///
-    /// Ignored unless [`ForkFrom`] names a step outright: a caller who is not choosing the step is
-    /// not choosing the id either, which is the rule the system database enforces.
+    /// **Only with a fork point that names its step** — [`ForkFrom::Beginning`] and
+    /// [`ForkFrom::Step`]. The three searched points resolve the step inside the write and always
+    /// generate the id; naming one alongside them is an [`Error::Config`] rather than a value
+    /// quietly discarded.
+    ///
+    /// That line is every implementation's, drawn by having no parameter to pass an id through:
+    /// Python's `fork_from_failure`, TypeScript's `forkFromFailure` and Go's `ForkFromDBInput`
+    /// take none, and Java gives the family a separate `ForkFromFailureOptions` with no
+    /// `forkedWorkflowId` at all. This crate merges both halves into one [`ForkFrom`] and one
+    /// options struct, so what is missing there has to be refused here.
+    ///
+    /// [`fork_all`](DBOS::fork_all) refuses it whatever the fork point: one id cannot name many
+    /// forks. Go carries it per-source on its `ForkWorkflowSpec` instead, which is the same
+    /// difference — its id sits beside each source id, and this one sits beside the batch.
     pub forked_id: Option<&'a str>,
     /// The version the fork runs under. `None` inherits the source's.
     ///
@@ -414,7 +428,8 @@ impl DBOS {
     /// [`ForkOptions::application_version`] exists.
     ///
     /// The source is not modified beyond being marked as forked from; the fork gets its own id,
-    /// generated unless [`ForkOptions::forked_id`] names one.
+    /// generated unless [`ForkOptions::forked_id`] names one — which only the fork points that
+    /// name their step accept, as in every other implementation.
     ///
     /// **Enqueued, never started.** The handle is a polling one — see the module documentation.
     ///
@@ -510,6 +525,10 @@ impl DBOS {
     ///
     /// Deleting an id with no row is not an error, and children are left alone —
     /// [`delete_all`](Self::delete_all) with [`Children::Include`] is how a tree goes.
+    ///
+    /// **A workflow cannot delete itself.** Called from inside the workflow it names, this fails
+    /// with [`Error::SystemDatabase`] carrying `InvalidInput` and nothing is deleted; see
+    /// [`delete_all`](Self::delete_all) for why.
     pub async fn delete(&self, workflow_id: &str) -> Result<()> {
         self.delete_all(&[workflow_id], Children::Skip).await?;
         Ok(())
@@ -520,8 +539,22 @@ impl DBOS {
     /// Returns how many rows went, descendants included.
     ///
     /// Unlike [`cancel_all`](Self::cancel_all), the tree is collected first and deleted in one
-    /// statement rather than level by level. Cancelling has to interleave so a parent cannot spawn
-    /// behind the walk; a deleted parent cannot spawn at all.
+    /// statement rather than level by level — the schema's cascade does what cancelling needs a
+    /// statement per level for.
+    ///
+    /// **A tree that is still running can outlive the walk.** A child committed after the walk
+    /// has read its parent's level is not in the target set, and survives with
+    /// `parent_workflow_id` naming a row that is gone. Interleaving would not fix it and neither
+    /// would a wider transaction; [`cancel_all`](Self::cancel_all) with [`Children::Include`]
+    /// first, then deleting, is how a tree is stopped before it is removed.
+    ///
+    /// **A workflow cannot delete itself, or an ancestor it would go down with.** From inside a
+    /// workflow this call is a step, and the step's checkpoint is written in the same transaction
+    /// as the delete — against a row the cascade has just removed. Rather than let that fail as a
+    /// foreign key violation, a target set containing the calling workflow is refused whole:
+    /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is deleted. Deleting the
+    /// caller's own tree from outside it, or deleting an unrelated tree from inside a workflow,
+    /// is unaffected.
     pub async fn delete_all(&self, workflow_ids: &[&str], children: Children) -> Result<u64> {
         let executor = self.executor("delete a workflow")?;
         let ctx = calling_workflow();
@@ -547,9 +580,13 @@ impl DBOS {
     /// that is still waiting, not a way to pause work that has started.
     /// [`cancel`](Self::cancel) is the one that stops something.
     ///
-    /// [`WorkflowDelay::For`] is resolved against the **database's** clock rather than this
-    /// process's, the same as the delay on an enqueue: a caller's skew should not reach the row,
-    /// where a whole fleet reads it.
+    /// [`WorkflowDelay::For`] is resolved against **this process's** clock, once, before the write
+    /// — the same as the delay on an enqueue, and the same as Go's `resolveDelayUntil`. The
+    /// workflow is then released by whichever supervisor next runs, against *its* clock, so a
+    /// skewed operator host moves a release time the whole fleet honours. That is `UPSTREAM`
+    /// item 22, it is four implementations wide, and the database's clock is the answer to it —
+    /// in all four at once, rather than here alone at the cost of a round trip none of them
+    /// spends.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -716,6 +753,27 @@ async fn fork_batch(
         timeout: options.timeout,
         replacement_children: &[],
     };
+
+    // A chosen id belongs to the half of the surface that names its step. **Every reference draws
+    // the same line**, by giving the search half no parameter to pass one through: Python's
+    // `fork_from_failure` (`_sys_db.py:1680`) and TypeScript's `forkFromFailure`
+    // (`system_database.ts:2004`) generate a UUID per source and take no id; Go's `ForkFromDBInput`
+    // (`system_database.go:2773`) has no id field and leaves `ForkedWorkflowIDs` unset; Java splits
+    // the options type outright, `ForkFromFailureOptions` carrying only the version, queue and
+    // partition key where its `ForkOptions` leads with `forkedWorkflowId`.
+    //
+    // Java's split makes the mistake unrepresentable, which is the better shape and not one this
+    // crate can have: [`ForkFrom`] is one enum and [`ForkOptions`] is one struct, deliberately —
+    // see the module documentation on the naming. So the field exists on a call it cannot serve,
+    // and saying so is the merged shape's version of Java's missing field. It was silently dropped
+    // before, which is the one behaviour no reference has.
+    if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
+        return Err(Error::Config(
+            "ForkOptions::forked_id needs a fork point that names its step: use ForkFrom::Step, \
+             or ForkFrom::Beginning, and let the searched fork points generate the id"
+                .to_owned(),
+        ));
+    }
 
     let ctx = calling_workflow();
     let caller = ctx.as_ref().map(caller_for);

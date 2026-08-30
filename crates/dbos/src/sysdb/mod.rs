@@ -316,8 +316,23 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
-    /// The cascade is one transaction, so a parent cannot spawn behind the walk at all, and a
-    /// failure partway through leaves the tree untouched rather than half-cancelled.
+    /// **The cascade is one transaction, which buys atomicity and not exclusion.** A failure
+    /// partway through leaves the tree untouched rather than half-cancelled — that is the part it
+    /// buys. It does not stop a child being spawned behind the walk: at READ COMMITTED these
+    /// writes are invisible to the workflows they cancel until the commit, and nothing constrains
+    /// `parent_workflow_id`, so a parent that has not yet learned it is cancelled can commit a new
+    /// child after the walk has read its level. That child keeps running.
+    ///
+    /// What bounds the window is the interleaving: each level is read after the level above it is
+    /// written, so the deeper the tree the later the last read, and a child committed before that
+    /// read is caught. Only the commit actually stops a parent, at its next step boundary.
+    ///
+    /// **Python and Java get more from the same order than this does**, and the difference is the
+    /// transaction. Python commits each level (`_sys_db.py:1129`, a `with self.engine.begin()` per
+    /// level, its child reads outside any transaction), so a parent reading its own status between
+    /// levels finds `CANCELLED` and stops spawning mid-walk. Wrapping the cascade to commit it with
+    /// the step checkpoint — which is what this whole surface does — trades that visibility for
+    /// atomicity. Worth knowing before treating either half as free.
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
@@ -354,8 +369,10 @@ pub trait SystemDatabase: Send + Sync {
     /// `ON DELETE CASCADE` on every child table, so one `DELETE` is the whole operation.
     ///
     /// Unlike [`cancel_workflows`](Self::cancel_workflows), the descendants are collected first
-    /// and deleted in one statement rather than level by level. Cancelling interleaves so a
-    /// parent cannot spawn behind the walk; a deleted parent cannot spawn at all.
+    /// and deleted in one statement rather than level by level: the cascade does the work that
+    /// cancelling needs a statement per level for. Interleaving would buy nothing here, because
+    /// what stops a parent spawning is the delete itself, and that is one statement whichever
+    /// order the tree was read in.
     ///
     /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
     /// Go have it, and this follows them.
@@ -382,8 +399,13 @@ pub trait SystemDatabase: Send + Sync {
     /// surface takes it.
     ///
     /// The descendants are collected *before* the transaction, unlike
-    /// [`cancel_workflows`](Self::cancel_workflows)'s cascade: a deleted parent cannot spawn, so
-    /// there is no race for the transaction to close, and the delete itself is one statement.
+    /// [`cancel_workflows`](Self::cancel_workflows)'s cascade, because there is no race a
+    /// transaction could close: a parent stops spawning when its row goes, which is after the
+    /// walk rather than during it, and moving the walk inside would not change that at READ
+    /// COMMITTED. A child committed between the walk and the delete survives its parent, with
+    /// `parent_workflow_id` naming a row that is gone — nothing constrains that column. Deleting
+    /// a tree that is still running is inherently that: [`cancel_workflows`](Self::cancel_workflows)
+    /// first is what makes it a tree that has stopped.
     async fn delete_workflows(
         &self,
         workflow_ids: &[&str],

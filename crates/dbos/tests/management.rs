@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
@@ -744,6 +745,86 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
     dbos.shutdown().await;
 }
 
+/// A searched fork point resolves its step inside the write and generates the id with it, so a
+/// chosen one is refused rather than dropped on the floor.
+///
+/// The line every reference draws by omission — Python's `fork_from_failure`, TypeScript's
+/// `forkFromFailure` and Go's `ForkFromDBInput` take no id, and Java's `ForkFromFailureOptions`
+/// has no field for one. Merging both halves into one `ForkFrom` is what makes it sayable here,
+/// and this is what it costs.
+#[tokio::test]
+async fn forking_from_a_searched_point_refuses_a_chosen_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("searched-fork-id-app", &db));
+    let workflow = dbos
+        .register_workflow("forkable", |()| async move {
+            dbos::step("only", || async { Ok::<u32, Error>(1) }).await
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "has-a-step";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    for from in [
+        ForkFrom::LastFailure,
+        ForkFrom::LastStep,
+        ForkFrom::StepNamed("only"),
+    ] {
+        let error = dbos
+            .fork_with::<u32, EngineOnly>(
+                id,
+                from,
+                ForkOptions {
+                    forked_id: Some("chosen"),
+                    ..ForkOptions::default()
+                },
+            )
+            .await
+            .expect_err("a chosen id was accepted for a searched fork point");
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains("forked_id")),
+            "expected a configuration refusal for {from:?}, got {error:?}"
+        );
+    }
+
+    // Nothing was written under the id that was refused, and nothing was forked at all.
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow("chosen")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "a fork was written under the refused id",
+    );
+
+    // The half that does name its step still honours it.
+    let handle = dbos
+        .fork_with::<u32, EngineOnly>(
+            id,
+            ForkFrom::Beginning,
+            ForkOptions {
+                forked_id: Some("chosen"),
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("forking from the beginning refused a chosen id");
+    assert_eq!(handle.workflow_id(), "chosen");
+
+    dbos.shutdown().await;
+}
+
 /// **A resume can name the queue it goes back on**, which is how a backlog is resumed without
 /// flooding the fleet — the internal queue takes no limits.
 ///
@@ -1097,22 +1178,106 @@ async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
 /// The case that makes this more than bookkeeping: a fork generates a new workflow id, so a
 /// replay without a checkpoint would write a second fork under a second id — work run twice, and
 /// an id the first execution never saw.
+///
+/// Replay has to come from recovery. Running the operator a second time under its own id is not
+/// one: the row is `SUCCESS` by then, the submission does not claim it, and the second call joins
+/// the finished row and hands back its output without ever entering the function — which passes
+/// whether or not the fork is checkpointed. So the operator is killed mid-flight instead, after
+/// the fork is recorded, and the next launch is what replays it.
 #[tokio::test]
 async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("management-replay-app", &db));
-    let ran = Arc::new(AtomicU32::new(0));
-    let target = dbos
-        .register_workflow("forked_target", {
-            let ran = Arc::clone(&ran);
-            move |()| {
-                let ran = Arc::clone(&ran);
-                async move {
-                    ran.fetch_add(1, Ordering::SeqCst);
-                    Ok::<u32, Error>(7)
+    let reader = reader(&db).await;
+    let source_id = "the-source";
+    let operator_id = "the-forker";
+
+    let forks_of_source = || async {
+        let mut ids: Vec<String> = reader
+            .list_workflows(&WorkflowFilter::default(), None)
+            .await
+            .expect("read failed")
+            .into_iter()
+            .filter(|row| row.forked_from.as_deref() == Some(source_id))
+            .map(|row| row.workflow_id)
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // First process: the operator forks, its fork is checkpointed, and it is killed before it can
+    // finish — so the row is left mid-flight for recovery to pick up.
+    {
+        let dbos = DBOS::new(config("management-replay-app", &db));
+        let target = dbos
+            .register_workflow("forked_target", |()| async move { Ok::<u32, Error>(7) })
+            .unwrap();
+        let operator = dbos
+            .register_workflow("forking_operator", {
+                let dbos = dbos.clone();
+                move |source: String| {
+                    let dbos = dbos.clone();
+                    async move {
+                        let fork = dbos
+                            .fork::<u32, EngineOnly>(&source, ForkFrom::Beginning)
+                            .await?;
+                        let forked_id = fork.workflow_id().to_owned();
+                        // Long enough that shutdown lands after the fork is recorded.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        Ok::<String, Error>(forked_id)
+                    }
                 }
+            })
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+
+        target
+            .run_with(
+                (),
+                dbos::RunOptions {
+                    workflow_id: Some(source_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the source failed");
+        operator
+            .start_with(
+                source_id.to_owned(),
+                StartOptions {
+                    workflow_id: Some(operator_id),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("start failed");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let steps = reader
+                .list_workflow_steps(operator_id, false, None, None, None)
+                .await
+                .expect("read failed");
+            if !steps.is_empty() {
+                assert_eq!(steps[0].step_name, "DBOS.forkWorkflow");
+                break;
             }
-        })
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fork was never recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        dbos.shutdown().await;
+    }
+
+    let first = forks_of_source().await;
+    assert_eq!(first.len(), 1, "the first execution forked once: {first:?}");
+
+    // Second process: recovery replays the operator, which must take the id off its checkpoint
+    // rather than forking the source a second time.
+    let dbos = DBOS::new(config("management-replay-app", &db));
+    let target = dbos
+        .register_workflow("forked_target", |()| async move { Ok::<u32, Error>(7) })
         .unwrap();
     let operator = dbos
         .register_workflow("forking_operator", {
@@ -1129,47 +1294,147 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
+    drop((target, operator));
 
-    let source_id = "the-source";
-    target
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let output = loop {
+        let row = reader
+            .get_workflow(operator_id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing");
+        if row.status == WorkflowStatus::Success {
+            break row.output.expect("a successful workflow has an output");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replayed operator did not finish; status {:?}",
+            row.status
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert!(
+        output.contains(&first[0]),
+        "the replay returned {output} rather than the id it recorded, {}",
+        first[0],
+    );
+    assert_eq!(
+        forks_of_source().await,
+        first,
+        "the replay forked the source a second time",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A workflow cannot delete itself, and is told so rather than failing on a foreign key.**
+///
+/// From inside a workflow the delete is a step, and the step's checkpoint lands in
+/// `operation_outputs` in the same transaction — pointed by migration 1's foreign key at the
+/// `workflow_status` row the cascade has just removed. The refusal is what keeps that from
+/// surfacing as a constraint violation with the delete rolled back under it.
+#[tokio::test]
+async fn a_workflow_cannot_delete_itself() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("self-delete-app", &db));
+    let deleter = dbos
+        .register_workflow("self-deleter", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    dbos.delete(&own_id).await?;
+                    Ok::<(), Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "deletes-itself";
+    let error = deleter
         .run_with(
-            (),
+            id.to_owned(),
             dbos::RunOptions {
-                workflow_id: Some(source_id),
+                workflow_id: Some(id),
                 ..Default::default()
             },
         )
         .await
-        .expect("the source failed");
-
-    let options = dbos::RunOptions {
-        workflow_id: Some("the-forker"),
-        ..Default::default()
-    };
-    let first = operator
-        .run_with(source_id.to_owned(), options.clone())
-        .await
-        .expect("the first run failed");
-    // A second execution under the same id replays the fork from its checkpoint.
-    let replayed = operator
-        .run_with(source_id.to_owned(), options)
-        .await
-        .expect("the replay failed");
-    assert_eq!(
-        first, replayed,
-        "the replay forked again instead of replaying the id it recorded",
+        .expect_err("the workflow deleted itself");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot delete itself"),
+        "the refusal did not reach the caller: {message}",
     );
 
-    let forks: Vec<String> = reader(&db)
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .is_some(),
+        "the row went even though the delete was refused",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **Nor an ancestor, when the tree it names is the one it is standing in.**
+///
+/// The caller is not named in the call at all — it arrives in the target set from the descendant
+/// walk — so the check has to be on the expanded set rather than on the ids the caller passed.
+#[tokio::test]
+async fn a_workflow_cannot_delete_an_ancestors_tree() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("ancestor-delete-app", &db));
+    let child = dbos
+        .register_workflow("deleting-child", {
+            let dbos = dbos.clone();
+            move |root: String| {
+                let dbos = dbos.clone();
+                async move { dbos.delete_all(&[&root], Children::Include).await }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("deleted-parent", {
+            move |root: String| {
+                let child = child.clone();
+                async move { child.run(root).await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let root = "the-ancestor";
+    let error = parent
+        .run_with(
+            root.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(root),
+                ..Default::default()
+            },
+        )
         .await
-        .list_workflows(&WorkflowFilter::default(), None)
-        .await
-        .expect("read failed")
-        .into_iter()
-        .filter(|row| row.forked_from.as_deref() == Some(source_id))
-        .map(|row| row.workflow_id)
-        .collect();
-    assert_eq!(forks, [first], "the source was forked more than once");
+        .expect_err("the child deleted the tree it was in");
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot delete itself"),
+        "the refusal did not reach the caller: {message}",
+    );
+
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(root)
+            .await
+            .expect("read failed")
+            .is_some(),
+        "the ancestor went even though the delete was refused",
+    );
 
     dbos.shutdown().await;
 }

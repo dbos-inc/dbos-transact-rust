@@ -1158,8 +1158,13 @@ pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error>
 pub enum WorkflowDelay {
     /// Wait this long from now.
     ///
-    /// Resolved against the database layer's clock, for the same reason
-    /// [`NewWorkflow::delay`] is: the caller's skew should not reach the row.
+    /// Resolved by the system database layer rather than by the caller, for the same reason
+    /// [`NewWorkflow::delay`] is a duration: `now + delay` computed at a call site is one more
+    /// place for the two to disagree.
+    ///
+    /// The clock is **this process's**, not the database's, which leaves the stamp out by whatever
+    /// this host and the releasing supervisor's disagree by — UPSTREAM item 22, shared with all
+    /// four implementations.
     For(Duration),
     /// Wait until this instant.
     Until(Timestamp),

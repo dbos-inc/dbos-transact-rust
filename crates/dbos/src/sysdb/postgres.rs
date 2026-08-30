@@ -3056,6 +3056,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         // each attempt. Go's `resolveDelayUntil` collapses its two options to one absolute
         // `time.Time` before the write for the same reason; see `init_workflow` on why the
         // caller's clock is the one that resolves it.
+        //
+        // A relative delay is stamped by *this* process, and released by whichever supervisor
+        // next runs, against *its* clock — so a skewed operator host moves a release time the
+        // whole fleet honours. That is UPSTREAM item 22, anchored on `init_workflow` and shared
+        // with all four implementations: Go's `resolveDelayUntil` reads `time.Now()`, Python and
+        // TypeScript the same. Closing it here alone would cost a round trip that none of them
+        // spends, so the clock stays this one and the gap stays the team's to close.
         let now = Timestamp::now();
         let delay_until = delay.resolve(now).as_epoch_ms();
         let workflow_table = workflow_table.as_str();
@@ -3271,9 +3278,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                 |mut tx| async move {
                     // One statement per *level*, not per workflow: `cancel_batch` takes the whole
                     // frontier and matches it with `= ANY($1)`, so the round trips scale with the
-                    // depth of the tree rather than its size. Cancelling the level before asking
-                    // for its children is the ordering that stops a parent spawning behind the
-                    // walk — and inside one transaction a parent cannot spawn behind it at all.
+                    // depth of the tree rather than its size.
+                    //
+                    // Cancelling a level before reading its children narrows the window a child
+                    // can be spawned in; it does not close it. Inside this transaction the writes
+                    // are invisible to the workflows being cancelled until it commits, so a parent
+                    // still running can commit a child after `direct_children` has passed its
+                    // level. Each level's read simply takes a later snapshot than the last. See
+                    // the trait method, which sets this against Python's per-level commit.
                     let mut cancelled = self.cancel_batch(&mut tx, workflow_ids).await?;
                     if !cancel_children {
                         return Ok((tx, cancelled));
@@ -3396,8 +3408,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         // borrowed, so `targets` copies pointers rather than strings.
         //
         // Collected before the transaction rather than inside it, unlike the cascade in
-        // `cancel_workflows`: this is a read, and a deleted parent cannot spawn, so there is no
-        // race for the transaction to close. What it costs is that a replay walks the tree again before finding its
+        // `cancel_workflows`: this is a read, and moving it inside would close no race. A parent
+        // stops spawning when its row goes, which is after the walk either way, and at READ
+        // COMMITTED a statement inside the transaction sees concurrent commits just as one
+        // outside does. A child born between the walk and the delete outlives its parent —
+        // `parent_workflow_id` has no constraint on it — which is what cancelling first avoids.
+        //
+        // What the placement costs is that a replay walks the tree again before finding its
         // checkpoint and throwing the answer away — reads, and only when a workflow is the one
         // deleting.
         let mut children: Vec<String> = Vec::new();
@@ -3410,6 +3427,36 @@ impl SystemDatabase for PostgresSystemDatabase {
         targets.extend(children.iter().map(String::as_str));
         targets.sort_unstable();
         targets.dedup();
+
+        // A workflow cannot delete itself, and cannot delete an ancestor whose tree it is inside.
+        // The checkpoint for this step is written to `operation_outputs` in the same transaction as
+        // the delete, and migration 1's foreign key points it at the `workflow_status` row the
+        // cascade has just removed — so the insert violates the key and takes the delete down with
+        // it. Refused here, before either statement runs, because the alternative is a foreign key
+        // violation surfacing as a backend error with nothing in it a caller could act on.
+        //
+        // Only the caller's own id is checked, not its ancestry: an ancestor is a target only when
+        // it was named with `delete_children`, and then the walk above has already put the caller
+        // in `targets`. A parent deleted on its own leaves this workflow's row alone.
+        //
+        // TODO(dbos-team): UPSTREAM item 25. The other three implementations write the same
+        // checkpoint against the same foreign key and none of them refuses the call, so a
+        // self-delete from inside a workflow fails there too — Python and TypeScript with the
+        // delete already committed and the checkpoint failing behind it, which is worse than this.
+        // Whether a workflow may delete itself at all is the cross-implementation question; this
+        // refusal is the conservative reading, and is Rust alone until the four agree.
+        if let Some((caller_id, _)) = caller
+            && targets.contains(&caller_id)
+        {
+            return Err(Error::InvalidInput {
+                field: "workflow_ids".into(),
+                detail: format!(
+                    "workflow {caller_id} cannot delete itself: the step checkpoint for the delete \
+                     is written in the same transaction and would outlive the row it references"
+                ),
+            });
+        }
+
         let workflow_table = self.tables.workflow_status.as_str();
         let targets = targets.as_slice();
         let timing = StepTiming {
