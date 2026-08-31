@@ -13,13 +13,12 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
+use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::dbos::Executor;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus};
-use crate::workflow::adopt;
 
 /// A running — or finished — workflow, by id.
 ///
@@ -28,7 +27,7 @@ use crate::workflow::adopt;
 /// runtime error (Go returns *"workflow result channel is already closed"* at the same point).
 /// Dropping a handle does not stop the workflow — it only stops watching.
 pub struct WorkflowHandle<R, E = crate::EngineOnly> {
-    executor: Arc<Executor>,
+    conn: Arc<Connection>,
     workflow_id: String,
     provenance: Provenance,
     /// `fn() -> (R, E)`: the handle holds neither, it only names them — which keeps it `Send`,
@@ -47,12 +46,12 @@ enum Provenance {
 impl<R, E> WorkflowHandle<R, E> {
     /// A handle over the task this process spawned.
     pub(crate) fn local(
-        executor: Arc<Executor>,
+        conn: Arc<Connection>,
         workflow_id: String,
         task: JoinHandle<std::result::Result<Option<String>, Failure>>,
     ) -> Self {
         Self {
-            executor,
+            conn,
             workflow_id,
             provenance: Provenance::Local(task),
             types: PhantomData,
@@ -60,9 +59,14 @@ impl<R, E> WorkflowHandle<R, E> {
     }
 
     /// A handle over a workflow some other execution owns.
-    pub(crate) fn polling(executor: Arc<Executor>, workflow_id: String) -> Self {
+    ///
+    /// **Takes a connection rather than an executor**, because watching a workflow is reading its
+    /// row, and reading a row needs no process that could run it. That is also what will let a
+    /// client hand one of these back: Java's builds the same thing — a small handle class over the
+    /// system database alone.
+    pub(crate) fn polling(conn: Arc<Connection>, workflow_id: String) -> Self {
         Self {
-            executor,
+            conn,
             workflow_id,
             provenance: Provenance::Polling,
             types: PhantomData,
@@ -77,7 +81,7 @@ impl<R, E> WorkflowHandle<R, E> {
     /// The workflow's status, as its row records it right now.
     pub async fn status(&self) -> Result<WorkflowStatus> {
         let row = self
-            .executor
+            .conn
             .sysdb()
             .get_workflow(&self.workflow_id)
             .await
@@ -110,12 +114,12 @@ where
     pub async fn result(self) -> Result<R, E> {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run.
-        let awaiting = match Awaiting::of(&self.executor) {
+        let awaiting = match Awaiting::of(&self.conn) {
             Ok(awaiting) => awaiting,
             Err(wrong) => return Err(wrong.lift()),
         };
         if let Some(recorded) = awaiting
-            .recorded(&self.executor, &self.workflow_id)
+            .recorded(&self.conn, &self.workflow_id)
             .await
             .map_err(Error::lift)?
         {
@@ -137,7 +141,7 @@ where
                 })),
                 Err(join) => std::panic::resume_unwind(join.into_panic()),
             },
-            Provenance::Polling => adopt(&self.executor, &self.workflow_id).await,
+            Provenance::Polling => self.conn.adopt(&self.workflow_id).await,
         };
 
         // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
@@ -149,7 +153,7 @@ where
         // there is one encoding, so it costs nothing yet; it becomes a real question when a second
         // serializer does, and it is that change's to answer.
         awaiting
-            .record(&self.executor, &self.workflow_id, &outcome, started_at)
+            .record(&self.conn, &self.workflow_id, &outcome, started_at)
             .await
             .map_err(Error::lift)?;
 
@@ -214,13 +218,16 @@ enum Awaiting {
 }
 
 impl Awaiting {
-    fn of(executor: &Arc<Executor>) -> std::result::Result<Self, Error> {
+    fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
         let Some(ctx) = Ctx::current() else {
             return Ok(Self::Outside);
         };
         // The step id would come from this workflow's counter while the write went through the
-        // handle's own system database — the split `get_event` refuses for the same reason.
-        if !Arc::ptr_eq(ctx.executor(), executor) {
+        // handle's own system database — the split `get_event` refuses for the same reason. The
+        // comparison is of *connections* rather than of executors, because the database is what the
+        // two halves would disagree about, and it is the one thing every handle has, however it
+        // was come by.
+        if !Arc::ptr_eq(ctx.executor().connection(), conn) {
             return Err(Error::WrongInstance {
                 operation: "awaiting a workflow's result".into(),
             });
@@ -252,13 +259,13 @@ impl Awaiting {
 
     async fn recorded(
         &self,
-        executor: &Executor,
+        conn: &Connection,
         awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
         let Some((workflow_id, step_id)) = self.checkpoint() else {
             return Ok(None);
         };
-        let Some(recorded) = executor
+        let Some(recorded) = conn
             .sysdb()
             .check_child_result(workflow_id, step_id)
             .await
@@ -329,7 +336,7 @@ impl Awaiting {
     /// [`Error::AwaitedWorkflowCancelled`].
     async fn record(
         &self,
-        executor: &Executor,
+        conn: &Connection,
         child_workflow_id: &str,
         settled: &std::result::Result<Option<String>, Failure>,
         started_at: Timestamp,
@@ -355,14 +362,13 @@ impl Awaiting {
             }
             Err(Failure::Control(_)) => return Ok(()),
         };
-        executor
-            .sysdb()
+        conn.sysdb()
             .record_child_result(
                 workflow_id,
                 step_id,
                 child_workflow_id,
                 outcome,
-                Some(executor.serializer().name()),
+                Some(conn.serializer().name()),
                 Some(StepTiming {
                     started_at,
                     completed_at: Timestamp::now(),

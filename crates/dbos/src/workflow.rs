@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use tokio::task::AbortHandle;
 use tracing::Instrument;
 
+use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::dbos::Executor;
 use crate::error::{DurableError, Error, Failure, Result};
@@ -686,7 +687,10 @@ where
                 workflow_id = child,
                 "the child workflow was already started; the handle joins it"
             );
-            return Ok(WorkflowHandle::polling(executor, child));
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                child,
+            ));
         }
 
         let workflow_id = match (options.workflow_id, &parent) {
@@ -803,7 +807,10 @@ where
                 queue = enqueue.name,
                 "the workflow is enqueued"
             );
-            return Ok(WorkflowHandle::polling(executor, workflow_id));
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                workflow_id,
+            ));
         }
 
         // Someone else owns this row — the id was supplied and a previous run has it, or another
@@ -814,7 +821,10 @@ where
                 workflow_id,
                 "the workflow is already owned; the handle joins the existing run"
             );
-            return Ok(WorkflowHandle::polling(executor, workflow_id));
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                workflow_id,
+            ));
         }
 
         // The deadline the *database* holds, not the one this caller offered: `init_workflow`
@@ -829,7 +839,11 @@ where
             // A fresh start is not a dequeue, so it holds no queue's slot.
             None,
         );
-        Ok(WorkflowHandle::local(executor, workflow_id, task))
+        Ok(WorkflowHandle::local(
+            Arc::clone(executor.connection()),
+            workflow_id,
+            task,
+        ))
     }
 }
 
@@ -1039,7 +1053,7 @@ async fn cancel_at_deadline(
                 "the deadline fired on a workflow another execution had already finished; its \
                  recorded outcome stands"
             );
-            adopt(executor, workflow_id).await
+            executor.connection().adopt(workflow_id).await
         }
         Err(error) => {
             tracing::error!(
@@ -1141,34 +1155,40 @@ async fn execute(
                 workflow_id,
                 "another execution recorded this workflow's outcome first"
             );
-            adopt(executor, workflow_id).await
+            executor.connection().adopt(workflow_id).await
         }
     }
 }
 
-/// Reads back the outcome of a workflow this caller does not own.
-pub(crate) async fn adopt(
-    executor: &Executor,
-    workflow_id: &str,
-) -> std::result::Result<Option<String>, Failure> {
-    let outcome = executor
-        .sysdb()
-        .await_workflow_result(workflow_id, executor.outcome_poll_interval())
-        .await
-        .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
-    match outcome {
-        AwaitedOutcome::Succeeded { output, .. } => Ok(output),
-        // Handed back encoded, for the caller to decode into its own error type — the adopting
-        // caller knows what that is and this function does not.
-        AwaitedOutcome::Failed { error, .. } => Err(Failure::Recorded(error)),
-        AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
-            workflow_id: workflow_id.to_owned(),
-        })),
-        AwaitedOutcome::Parked { recovery_attempts } => {
-            Err(Failure::Control(Error::MaxRecoveryAttemptsExceeded {
+impl Connection {
+    /// Reads back the outcome of a workflow this caller does not own.
+    ///
+    /// On the connection rather than on an executor because that is all it needs — a row read and
+    /// the interval to re-ask at — and so every `WorkflowHandle` polls through here, however it was
+    /// come by.
+    pub(crate) async fn adopt(
+        &self,
+        workflow_id: &str,
+    ) -> std::result::Result<Option<String>, Failure> {
+        let outcome = self
+            .sysdb()
+            .await_workflow_result(workflow_id, self.outcome_poll_interval())
+            .await
+            .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
+        match outcome {
+            AwaitedOutcome::Succeeded { output, .. } => Ok(output),
+            // Handed back encoded, for the caller to decode into its own error type — the adopting
+            // caller knows what that is and this function does not.
+            AwaitedOutcome::Failed { error, .. } => Err(Failure::Recorded(error)),
+            AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
                 workflow_id: workflow_id.to_owned(),
-                recovery_attempts,
-            }))
+            })),
+            AwaitedOutcome::Parked { recovery_attempts } => {
+                Err(Failure::Control(Error::MaxRecoveryAttemptsExceeded {
+                    workflow_id: workflow_id.to_owned(),
+                    recovery_attempts,
+                }))
+            }
         }
     }
 }
