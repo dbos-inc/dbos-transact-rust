@@ -338,7 +338,7 @@ mod tests {
     use crate::Config;
 
     fn dbos() -> DBOS {
-        DBOS::new(Config::new("registry-test", "1.0.0", "postgres://unused"))
+        DBOS::new(Config::new("registry-test", "postgres://unused"))
     }
 
     async fn takes_nothing(_: ()) -> Result<String> {

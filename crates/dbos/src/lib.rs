@@ -38,6 +38,8 @@ mod event;
 #[cfg(feature = "engine")]
 mod handle;
 #[cfg(feature = "engine")]
+mod identity;
+#[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
@@ -56,7 +58,10 @@ mod workflow;
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
 // because it *is* the brand — nobody writes `tokio::TOKIO`.
 #[cfg(feature = "engine")]
-pub use config::{APP_VERSION_ENV, Config, DATABASE_URL_ENV, Serializer};
+pub use config::{
+    APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, Config, DATABASE_URL_ENV,
+    EXECUTOR_ID_ENV, Serializer,
+};
 #[cfg(feature = "engine")]
 pub use context::Ctx;
 #[cfg(feature = "engine")]

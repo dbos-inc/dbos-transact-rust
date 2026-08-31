@@ -21,14 +21,15 @@ async fn launched(app_name: &str) -> (DBOS, TestDatabase) {
     (dbos, db)
 }
 
-/// The version every instance in this file launches with: required now that DBOS computes none,
-/// and shared so that a relaunch recovers what the previous launch left behind.
+/// The version every instance in this file launches with: DBOS computes none, so a launch without
+/// one fails — and sharing it is what lets a relaunch recover what the previous launch left.
 const APP_VERSION: &str = "1.0.0";
 
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
-        ..Config::new(app_name, APP_VERSION, db.url())
+        app_version: Some(APP_VERSION.to_owned()),
+        ..Config::new(app_name, db.url())
     }
 }
 
@@ -150,7 +151,7 @@ async fn shutting_down_twice_is_idempotent() {
 async fn an_explicit_application_version_is_used_as_given() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
-        app_version: "v1.2.3".to_owned(),
+        app_version: Some("v1.2.3".to_owned()),
         ..config("pinned-app", &db)
     });
     dbos.launch().await.expect("launch failed");
@@ -186,11 +187,11 @@ async fn an_explicit_executor_id_is_used_as_given() {
 async fn two_applications_sharing_a_database_own_their_own_versions() {
     let db = test_database().await;
     let one = DBOS::new(Config {
-        app_version: "one-v1".to_owned(),
+        app_version: Some("one-v1".to_owned()),
         ..config("app-one", &db)
     });
     let two = DBOS::new(Config {
-        app_version: "two-v1".to_owned(),
+        app_version: Some("two-v1".to_owned()),
         ..config("app-two", &db)
     });
     one.launch().await.expect("launch failed");
@@ -280,7 +281,7 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
 
     let db = test_database().await;
     let holder = DBOS::new(Config {
-        app_version: CONTESTED.to_owned(),
+        app_version: Some(CONTESTED.to_owned()),
         ..config("version-holder", &db)
     });
     holder.launch().await.expect("launch failed");
@@ -289,7 +290,7 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
     // happens after the connect and before the executor exists.
     for attempt in 1..=3 {
         let loser = DBOS::new(Config {
-            app_version: CONTESTED.to_owned(),
+            app_version: Some(CONTESTED.to_owned()),
             database_url: format!("{}?application_name={TAG}", db.url()),
             ..config("version-loser", &db)
         });

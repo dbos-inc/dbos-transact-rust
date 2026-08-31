@@ -9,11 +9,35 @@ use crate::sysdb::DEFAULT_SCHEMA;
 /// The same name every implementation reads.
 pub const DATABASE_URL_ENV: &str = "DBOS_DATABASE_URL";
 
-/// Environment variable overriding the application version.
+/// Environment variable carrying the application version.
 ///
 /// Two underscores, matching Python, TypeScript, Go and Java — the odd spelling is a cross-SDK
 /// constant, not a typo to tidy.
 pub const APP_VERSION_ENV: &str = "DBOS__APPVERSION";
+
+/// Environment variable saying this process is running on DBOS Cloud.
+///
+/// Read as Java reads it — `Boolean.parseBoolean`, so a case-insensitive `true` and nothing else.
+/// It decides which side of every identity question wins: on DBOS Cloud the deployment is the
+/// authority, and off it the application is.
+pub const CLOUD_ENV: &str = "DBOS__CLOUD";
+
+/// Environment variable carrying the DBOS Cloud application id.
+///
+/// Read only from the environment: the id is a deployment's, never an application's to choose, so
+/// there is no configuration field beside it.
+pub const APP_ID_ENV: &str = "DBOS__APPID";
+
+/// Environment variable naming the application on DBOS Cloud.
+///
+/// One underscore, unlike the rest — the cross-SDK spelling again, not a typo. It is read only
+/// when [`CLOUD_ENV`] says this is DBOS Cloud, where it replaces [`Config::app_name`].
+pub const CLOUD_APP_NAME_ENV: &str = "DBOS_APP_NAME";
+
+/// Environment variable identifying the VM this process runs on.
+///
+/// A deployment's way of naming an executor, and what [`Config::executor_id`] falls back to.
+pub const EXECUTOR_ID_ENV: &str = "DBOS__VMID";
 
 /// How payloads are encoded on their way into the system database.
 ///
@@ -75,7 +99,7 @@ impl Serializer {
 ///
 /// ```no_run
 /// # use dbos::Config;
-/// let config = Config { max_connections: 20, ..Config::from_env("my-app", "1.0.0") };
+/// let config = Config { max_connections: 20, ..Config::from_env("my-app") };
 /// ```
 ///
 /// **Deliberately not `#[non_exhaustive]`.** That attribute forbids struct-literal construction
@@ -108,30 +132,35 @@ pub struct Config {
 
     /// Identifies this process among the executors sharing the database.
     ///
-    /// `None` is `"local"`, matching Go and Python. Unlike them, no environment variable is read
-    /// for it — `DBOS__VMID` is a deployment's way of naming a VM, and reading it here would make
-    /// the value depend on where the process happens to run.
+    /// Resolved like [`app_version`](Self::app_version) and with the same precedence: this wins
+    /// over [`EXECUTOR_ID_ENV`](crate::EXECUTOR_ID_ENV) off DBOS Cloud and loses to it on, and
+    /// when neither says anything the executor is `"local"` — the default every implementation
+    /// shares.
     pub executor_id: Option<String>,
 
     /// The version of the application's code.
     ///
-    /// **Required, and never computed.** A workflow is only recovered by an executor running the
-    /// version that started it, which is what makes a rolling deploy safe — so the value decides
-    /// which processes may pick up which work, and an application is the only thing that knows
-    /// when its code changed in a way that matters.
+    /// **Nothing computes one.** The other implementations fall back to a hash of the
+    /// application's code, and that is the mistake this does not repeat: in Rust the only thing to
+    /// hash is the executable, and a Rust build is not reproducible, so the version would move
+    /// under a rebuild that changed nothing — stranding the previous run's `PENDING` rows with an
+    /// executor that no longer exists, after hashing tens of megabytes at every launch to get
+    /// there. A version has to come from somewhere, so [`launch`](crate::DBOS::launch) fails when
+    /// neither this nor `DBOS__APPVERSION` gives it one.
     ///
-    /// The other implementations default it to a hash of the application's code, and that is the
-    /// mistake this does not repeat. In Rust there is nothing to hash but the executable, and a
-    /// Rust build is not reproducible: the same source compiles to a different binary, so the
-    /// version would change under a rebuild that changed nothing, stranding the previous run's
-    /// `PENDING` rows with an executor that no longer exists. Hashing tens of megabytes on every
-    /// launch to arrive at that is the second cost.
+    /// `None` here therefore means "whatever the environment says", not "work it out". The
+    /// precedence is Java's, resolved at launch: this wins over
+    /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV), except on DBOS Cloud
+    /// ([`CLOUD_ENV`](crate::CLOUD_ENV)), where the deployment's variable wins over whatever the
+    /// application was built believing.
     ///
-    /// `env!("CARGO_PKG_VERSION")` is the obvious value for an application that ships as a crate;
-    /// a deployment that ships per commit usually wants the commit sha, baked in at build time or
-    /// handed to it in the environment. [`from_env`](Self::from_env) reads `DBOS__APPVERSION`,
-    /// which is what a DBOS deployment sets.
-    pub app_version: String,
+    /// What to put here: `env!("CARGO_PKG_VERSION")` for an application that ships as a crate, or
+    /// the commit sha for a deployment that ships per commit. A workflow is only recovered by an
+    /// executor running the version that started it, which is what makes a rolling deploy safe —
+    /// so the value should change exactly when the code changed in a way that matters. To make
+    /// that a *default* the environment can still override, overlay it on
+    /// [`from_env`](Self::from_env) with `get_or_insert_with` rather than assigning it.
+    pub app_version: Option<String>,
 
     /// How payloads are encoded.
     pub serializer: Serializer,
@@ -192,16 +221,15 @@ pub struct Config {
 }
 
 impl Config {
-    /// A configuration with the defaults every implementation shares, for version `app_version` of
-    /// an application named `app_name`, reaching the database at `database_url`.
-    pub fn new(
-        app_name: impl Into<String>,
-        app_version: impl Into<String>,
-        database_url: impl Into<String>,
-    ) -> Self {
+    /// A configuration with the defaults every implementation shares, for an application named
+    /// `app_name`, reaching the database at `database_url`.
+    ///
+    /// Leaves [`app_version`](Self::app_version) unset, which means launch takes it from
+    /// `DBOS__APPVERSION` and fails if that is unset too.
+    pub fn new(app_name: impl Into<String>, database_url: impl Into<String>) -> Self {
         Self {
             app_name: app_name.into(),
-            app_version: app_version.into(),
+            app_version: None,
             database_url: database_url.into(),
             max_connections: 10,
             schema: DEFAULT_SCHEMA.to_owned(),
@@ -216,43 +244,50 @@ impl Config {
         }
     }
 
-    /// [`Config::new`], taking the database URL from `DBOS_DATABASE_URL` and preferring the
-    /// application version in `DBOS__APPVERSION` over `app_version` when that variable is set to
-    /// something non-empty.
+    /// [`Config::new`], taking the database URL from [`DATABASE_URL_ENV`] and the application
+    /// version from [`APP_VERSION_ENV`], each left as `Config::new` leaves it when the variable is
+    /// unset or empty.
     ///
-    /// The version is still a parameter rather than a bare environment read: a process launched
-    /// without `DBOS__APPVERSION` — every `cargo run` — must still have a version, and the
-    /// application is what knows it. The variable is how a deployment overrides that.
+    /// Reading the version here is what lets an application carry a built-in default the
+    /// environment can still override, which is the usual shape:
+    ///
+    /// ```no_run
+    /// # use dbos::Config;
+    /// let mut config = Config::from_env("my-app");
+    /// config.app_version.get_or_insert_with(|| env!("CARGO_PKG_VERSION").to_owned());
+    /// ```
+    ///
+    /// Without it that default would win over `DBOS__APPVERSION` off DBOS Cloud, since
+    /// [`app_version`](Self::app_version) outranks the environment there. It duplicates no
+    /// decision: launch falls back to the same variable for a configuration that leaves the field
+    /// unset, so a `Config` written by hand and one from here resolve to the same identity.
+    ///
+    /// The remaining identity variables — `DBOS__VMID`, `DBOS__CLOUD`, `DBOS__APPID` and
+    /// `DBOS_APP_NAME` — are *not* read here. Nothing would be gained: no application overlays a
+    /// default on them, and launch reads them as Java does.
     ///
     /// A missing or empty `DBOS_DATABASE_URL` leaves [`database_url`](Self::database_url) empty
     /// rather than failing here, so that a caller who sets it afterwards is not forced through an
     /// error path. [`launch`](crate::DBOS::launch) is where an empty URL is reported, which is also
     /// where it would have failed anyway.
-    pub fn from_env(app_name: impl Into<String>, app_version: impl Into<String>) -> Self {
-        let url = std::env::var(DATABASE_URL_ENV).unwrap_or_default();
-        let version = std::env::var(APP_VERSION_ENV)
-            .ok()
-            .filter(|v| !v.is_empty());
-        match version {
-            Some(version) => Self::new(app_name, version, url),
-            None => Self::new(app_name, app_version, url),
+    pub fn from_env(app_name: impl Into<String>) -> Self {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Self {
+            app_version: var(APP_VERSION_ENV),
+            ..Self::new(app_name, var(DATABASE_URL_ENV).unwrap_or_default())
         }
     }
 
     /// Checks what can be checked before anything is connected.
+    ///
+    /// Not the identity — the name, version and executor id are resolved against the environment
+    /// at launch, and [`identity`](crate::identity) is what validates the values that resolution
+    /// arrives at rather than the ones the configuration happened to carry.
     pub(crate) fn validate(&self) -> crate::Result<()> {
         if self.database_url.is_empty() {
             return Err(crate::Error::Config(format!(
                 "no database URL: set `database_url`, or the {DATABASE_URL_ENV} environment \
                  variable if the configuration came from `Config::from_env`"
-            )));
-        }
-        validate_app_name(&self.app_name)?;
-        if self.app_version.is_empty() {
-            return Err(crate::Error::Config(format!(
-                "`app_version` cannot be empty: give one to `Config::new`, or set the \
-                 {APP_VERSION_ENV} environment variable if the configuration came from \
-                 `Config::from_env`"
             )));
         }
         if self.schema.is_empty() {
@@ -283,30 +318,6 @@ impl Config {
 /// The interval every implementation polls a workflow's outcome at.
 const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The rule the other implementations share: 3–30 characters of lowercase letters, digits, dashes
-/// and underscores.
-///
-/// Checked rather than trusted because the name is an ownership key: a row stamped with a name no
-/// other executor spells the same way is a row nothing claims.
-fn validate_app_name(name: &str) -> crate::Result<()> {
-    let bad = |why: &str| Err(crate::Error::Config(format!("`app_name` {why}: {name:?}")));
-    match name.chars().count() {
-        0 => return bad("cannot be empty"),
-        1..=2 => return bad("must be at least 3 characters"),
-        31.. => return bad("must be at most 30 characters"),
-        _ => {}
-    }
-    if let Some(c) = name
-        .chars()
-        .find(|c| !matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
-    {
-        return bad(&format!(
-            "may contain only lowercase letters, digits, dashes and underscores, but has {c:?}"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,29 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn an_app_name_is_held_to_the_rule_every_implementation_shares() {
-        for ok in ["abc", "my-app", "my_app_2", &"a".repeat(30)] {
-            assert!(validate_app_name(ok).is_ok(), "{ok:?} should be accepted");
-        }
-        for bad in [
-            "",
-            "ab",
-            &"a".repeat(31),
-            "My-App",
-            "my app",
-            "my.app",
-            "café",
-        ] {
-            assert!(
-                validate_app_name(bad).is_err(),
-                "{bad:?} should be rejected"
-            );
-        }
-    }
-
-    #[test]
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
-        let err = Config::new("app", "1.0.0", "").validate().unwrap_err();
+        let err = Config::new("app", "").validate().unwrap_err();
         assert!(err.to_string().contains(DATABASE_URL_ENV), "{err}");
     }
 
@@ -347,7 +337,7 @@ mod tests {
     fn a_zero_outcome_poll_interval_is_a_busy_loop_and_is_refused() {
         let config = |outcome_poll_interval| Config {
             outcome_poll_interval,
-            ..Config::new("app", "1.0.0", "postgres://x")
+            ..Config::new("app", "postgres://x")
         };
         assert_eq!(
             config(None).outcome_poll_interval(),
@@ -367,21 +357,10 @@ mod tests {
     }
 
     #[test]
-    fn a_version_is_required_because_nothing_computes_one() {
-        let err = Config {
-            app_version: String::new(),
-            ..Config::new("app", "1.0.0", "postgres://x")
-        }
-        .validate()
-        .unwrap_err();
-        assert!(err.to_string().contains("app_version"), "{err}");
-    }
-
-    #[test]
     fn functional_update_is_the_documented_way_to_adjust_a_config() {
         let config = Config {
             max_connections: 20,
-            ..Config::new("app", "1.0.0", "postgres://x")
+            ..Config::new("app", "postgres://x")
         };
         assert_eq!(config.max_connections, 20);
         assert_eq!(config.app_name, "app");

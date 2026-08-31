@@ -49,12 +49,14 @@ const ENQUEUE_BATCH: usize = 5;
 /// from the standard libpq variables, such as PGUSER and PGPASSWORD.
 const DEFAULT_DATABASE_URL: &str = "postgres://localhost:5432/dbos_rust_starter";
 
-/// The version this build of the application is, which `DBOS__APPVERSION` overrides.
+/// The version this build of the application is, when nothing in the environment says otherwise.
 ///
-/// Every application has to give one — DBOS computes none — and recovery only resumes workflows
-/// stamped with the running executor's own version, so the crate's version is the natural answer:
-/// it changes when a release says the code changed, not when the compiler happens to emit
-/// different bytes.
+/// Something has to give one — DBOS computes none — and recovery only resumes workflows stamped
+/// with the running executor's own version, so the crate's version is the natural answer: it
+/// changes when a release says the code changed, not when the compiler happens to emit different
+/// bytes. It is a default rather than a decision: `Config::from_env` reads `DBOS__APPVERSION`
+/// first, so this only applies when that is unset, and on DBOS Cloud the deployment's version
+/// wins regardless.
 const DEFAULT_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A durable workflow, resilient to any failure: if the program is crashed, interrupted, or
@@ -122,10 +124,14 @@ struct App {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let mut config = Config::from_env("dbos-rust-starter", DEFAULT_APP_VERSION);
+    let mut config = Config::from_env("dbos-rust-starter");
     if config.database_url.is_empty() {
         config.database_url = DEFAULT_DATABASE_URL.to_owned();
     }
+    // A default, not an override: `from_env` has already taken `DBOS__APPVERSION` if it was set.
+    config
+        .app_version
+        .get_or_insert_with(|| DEFAULT_APP_VERSION.to_owned());
     let dbos = DBOS::new(config);
     let example = dbos.register_workflow("ExampleWorkflow", example_workflow)?;
     let enqueued = dbos.register_workflow("EnqueuedWorkflow", enqueued_workflow)?;

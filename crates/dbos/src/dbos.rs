@@ -3,6 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::config::{Config, Serializer};
+use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, Snapshot};
 use crate::sysdb::{SystemDatabase, postgres};
 use crate::workflow::Tasks;
@@ -16,6 +17,7 @@ pub struct Executor {
     sysdb: Box<dyn SystemDatabase>,
     executor_id: String,
     app_version: String,
+    app_id: String,
     serializer: Serializer,
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
@@ -47,11 +49,14 @@ impl Executor {
             );
         }
 
-        let executor_id = config
-            .executor_id
-            .clone()
-            .unwrap_or_else(|| "local".to_owned());
-        let app_version = config.app_version.clone();
+        // The name, the version and the executor id are the deployment's business as much as the
+        // configuration's, and one place reconciles them.
+        let Identity {
+            app_name,
+            app_version,
+            executor_id,
+            app_id,
+        } = crate::identity::resolve(config, &Environment::read())?;
 
         let sysdb = postgres::PostgresSystemDatabase::connect(&postgres::Config {
             url: &config.database_url,
@@ -61,7 +66,7 @@ impl Executor {
             settings: postgres::Settings {
                 schema: &config.schema,
                 executor_id: Some(&executor_id),
-                application_name: Some(&config.app_name),
+                application_name: Some(&app_name),
                 polling_concurrency: config.polling_concurrency,
                 notification_coalesce: config.notification_coalesce,
                 ..postgres::Settings::default()
@@ -83,23 +88,19 @@ impl Executor {
             }
         };
 
-        tracing::info!(
-            app_name = config.app_name,
-            executor_id,
-            app_version,
-            "DBOS launched"
-        );
+        tracing::info!(app_name, executor_id, app_version, "DBOS launched");
 
         let executor = Self {
             sysdb: Box::new(sysdb),
             executor_id,
             app_version,
+            app_id,
             serializer: config.serializer.clone(),
             // Decision 20: the runtime is the executor's, taken here. `start` is `async`, so a
             // runtime is necessarily current.
             runtime: tokio::runtime::Handle::current(),
             workflows,
-            app_name: config.app_name.clone(),
+            app_name,
             listen_queues: config.listen_queues.clone(),
             tasks: Tasks::default(),
             outcome_poll_interval: config.outcome_poll_interval(),
@@ -151,6 +152,14 @@ impl Executor {
     /// same boundary every other schema word stops at.
     pub fn app_version(&self) -> &str {
         &self.app_version
+    }
+
+    /// This application's DBOS Cloud id, empty when the process is not running on DBOS Cloud.
+    ///
+    /// Read from [`APP_ID_ENV`](crate::APP_ID_ENV) and from nowhere else: an id is issued to a
+    /// deployment rather than chosen by an application, so there is no configuration field for it.
+    pub fn app_id(&self) -> &str {
+        &self.app_id
     }
 
     /// How payloads are encoded.
@@ -377,6 +386,11 @@ impl DBOS {
         Ok(self.executor("app_version")?.app_version().to_owned())
     }
 
+    /// This application's DBOS Cloud id, empty off DBOS Cloud.
+    pub fn app_id(&self) -> Result<String> {
+        Ok(self.executor("app_id")?.app_id().to_owned())
+    }
+
     /// The running executor, or [`Error::NotLaunched`] naming the operation that wanted it.
     ///
     /// Java's `ensureLaunched(caller)`, and for its reason: the useful half of the error is which
@@ -465,7 +479,10 @@ mod tests {
     use super::*;
 
     fn config() -> Config {
-        Config::new("test-app", "1.0.0", "postgres://localhost/nothing")
+        Config {
+            app_version: Some("1.0.0".to_owned()),
+            ..Config::new("test-app", "postgres://localhost/nothing")
+        }
     }
 
     #[tokio::test]
@@ -515,7 +532,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_config_is_refused_before_anything_is_connected() {
-        let dbos = DBOS::new(Config::new("No", "1.0.0", "postgres://localhost/nothing"));
+        let dbos = DBOS::new(Config {
+            app_version: Some("1.0.0".to_owned()),
+            ..Config::new("No", "postgres://localhost/nothing")
+        });
         let err = dbos.launch().await.unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
         assert!(!dbos.is_launched());
@@ -543,11 +563,7 @@ mod tests {
 
     #[test]
     fn debug_does_not_print_the_database_url() {
-        let dbos = DBOS::new(Config::new(
-            "test-app",
-            "1.0.0",
-            "postgres://user:hunter2@host/db",
-        ));
+        let dbos = DBOS::new(Config::new("test-app", "postgres://user:hunter2@host/db"));
         let shown = format!("{dbos:?}");
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(shown.contains("test-app"), "{shown}");
