@@ -47,11 +47,13 @@ button, reached deliberately.
 
 ## The application version
 
-The app runs as its crate version, `CARGO_PKG_VERSION`, unless `DBOS__APPVERSION` is set — the
-config leaves the version alone when the environment supplied one. DBOS requires a version and
-computes none: recovery only resumes workflows stamped with the running executor's own version,
-which is the right rule in production, where changed code may contain a changed workflow — and it
-means the value has to be something outside the compiler's control. The crate version is that: it
-changes when a release says the code changed, so every `cargo run` of one build is the same
-version, and the crash button's `PENDING` workflows are still this executor's to recover after a
-rebuild.
+The app runs as its crate version, `CARGO_PKG_VERSION`. DBOS requires a version and computes
+none: recovery only resumes workflows stamped with the running executor's own version, which is
+the right rule in production, where changed code may contain a changed workflow — and it means the
+value has to be something outside the compiler's control. The crate version is that: it changes
+when a release says the code changed, so every `cargo run` of one build is the same version, and
+the crash button's `PENDING` workflows are still this executor's to recover after a rebuild.
+
+Because the app names its version, `DBOS__APPVERSION` does not override it — an application that
+wants the environment to decide leaves `Config::app_version` as `None` instead, and launch fails
+if nothing then supplies one. On DBOS Cloud the deployment's version wins either way.

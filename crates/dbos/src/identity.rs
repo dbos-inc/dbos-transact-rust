@@ -11,14 +11,46 @@
 //! It is also the last moment where an unanswerable question is still cheap to report: nothing is
 //! connected yet.
 //!
+//! The variables themselves are named here rather than in [`config`](crate::config), which reads
+//! only `DBOS_DATABASE_URL`. The `DBOS__` spelling marks them as DBOS Cloud's to set — an end user
+//! may, but the layer that reads them is this one.
+//!
 //! The one departure from Java is the version. Java hashes the application's code when nothing
 //! supplies one; nothing here does, and a missing version is an error — see
 //! [`Config::app_version`].
 
-use crate::config::{
-    APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, Config, EXECUTOR_ID_ENV,
-};
+use crate::config::Config;
 use crate::{Error, Result};
+
+/// Environment variable carrying the application version.
+///
+/// Two underscores, matching Python, TypeScript, Go and Java — the odd spelling is a cross-SDK
+/// constant, not a typo to tidy.
+pub const APP_VERSION_ENV: &str = "DBOS__APPVERSION";
+
+/// Environment variable saying this process is running on DBOS Cloud.
+///
+/// Read as Java reads it — `Boolean.parseBoolean`, so a case-insensitive `true` and nothing else.
+/// It decides which side of every identity question wins: on DBOS Cloud the deployment is the
+/// authority, and off it the application is.
+pub const CLOUD_ENV: &str = "DBOS__CLOUD";
+
+/// Environment variable carrying the DBOS Cloud application id.
+///
+/// Read only from the environment: the id is a deployment's, never an application's to choose, so
+/// there is no configuration field beside it.
+pub const APP_ID_ENV: &str = "DBOS__APPID";
+
+/// Environment variable naming the application on DBOS Cloud.
+///
+/// One underscore, unlike the rest — the cross-SDK spelling again, not a typo. It is read only
+/// when [`CLOUD_ENV`] says this is DBOS Cloud, where it replaces [`Config::app_name`].
+pub const CLOUD_APP_NAME_ENV: &str = "DBOS_APP_NAME";
+
+/// Environment variable identifying the VM this process runs on.
+///
+/// A deployment's way of naming an executor, and what [`Config::executor_id`] falls back to.
+pub const EXECUTOR_ID_ENV: &str = "DBOS__VMID";
 
 /// The default every implementation shares for a process nothing named.
 const DEFAULT_EXECUTOR_ID: &str = "local";

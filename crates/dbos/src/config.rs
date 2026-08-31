@@ -9,36 +9,6 @@ use crate::sysdb::DEFAULT_SCHEMA;
 /// The same name every implementation reads.
 pub const DATABASE_URL_ENV: &str = "DBOS_DATABASE_URL";
 
-/// Environment variable carrying the application version.
-///
-/// Two underscores, matching Python, TypeScript, Go and Java — the odd spelling is a cross-SDK
-/// constant, not a typo to tidy.
-pub const APP_VERSION_ENV: &str = "DBOS__APPVERSION";
-
-/// Environment variable saying this process is running on DBOS Cloud.
-///
-/// Read as Java reads it — `Boolean.parseBoolean`, so a case-insensitive `true` and nothing else.
-/// It decides which side of every identity question wins: on DBOS Cloud the deployment is the
-/// authority, and off it the application is.
-pub const CLOUD_ENV: &str = "DBOS__CLOUD";
-
-/// Environment variable carrying the DBOS Cloud application id.
-///
-/// Read only from the environment: the id is a deployment's, never an application's to choose, so
-/// there is no configuration field beside it.
-pub const APP_ID_ENV: &str = "DBOS__APPID";
-
-/// Environment variable naming the application on DBOS Cloud.
-///
-/// One underscore, unlike the rest — the cross-SDK spelling again, not a typo. It is read only
-/// when [`CLOUD_ENV`] says this is DBOS Cloud, where it replaces [`Config::app_name`].
-pub const CLOUD_APP_NAME_ENV: &str = "DBOS_APP_NAME";
-
-/// Environment variable identifying the VM this process runs on.
-///
-/// A deployment's way of naming an executor, and what [`Config::executor_id`] falls back to.
-pub const EXECUTOR_ID_ENV: &str = "DBOS__VMID";
-
 /// How payloads are encoded on their way into the system database.
 ///
 /// One variant for now. A workflow is only ever replayed by the SDK that wrote it — workflows
@@ -157,9 +127,10 @@ pub struct Config {
     /// What to put here: `env!("CARGO_PKG_VERSION")` for an application that ships as a crate, or
     /// the commit sha for a deployment that ships per commit. A workflow is only recovered by an
     /// executor running the version that started it, which is what makes a rolling deploy safe —
-    /// so the value should change exactly when the code changed in a way that matters. To make
-    /// that a *default* the environment can still override, overlay it on
-    /// [`from_env`](Self::from_env) with `get_or_insert_with` rather than assigning it.
+    /// so the value should change exactly when the code changed in a way that matters.
+    ///
+    /// Setting this at all is what takes the choice away from `DBOS__APPVERSION`: the variable
+    /// applies only where the field is `None`. On DBOS Cloud the deployment wins either way.
     pub app_version: Option<String>,
 
     /// How payloads are encoded.
@@ -244,38 +215,23 @@ impl Config {
         }
     }
 
-    /// [`Config::new`], taking the database URL from [`DATABASE_URL_ENV`] and the application
-    /// version from [`APP_VERSION_ENV`], each left as `Config::new` leaves it when the variable is
-    /// unset or empty.
+    /// [`Config::new`], taking the database URL from [`DATABASE_URL_ENV`].
     ///
-    /// Reading the version here is what lets an application carry a built-in default the
-    /// environment can still override, which is the usual shape:
-    ///
-    /// ```no_run
-    /// # use dbos::Config;
-    /// let mut config = Config::from_env("my-app");
-    /// config.app_version.get_or_insert_with(|| env!("CARGO_PKG_VERSION").to_owned());
-    /// ```
-    ///
-    /// Without it that default would win over `DBOS__APPVERSION` off DBOS Cloud, since
-    /// [`app_version`](Self::app_version) outranks the environment there. It duplicates no
-    /// decision: launch falls back to the same variable for a configuration that leaves the field
-    /// unset, so a `Config` written by hand and one from here resolve to the same identity.
-    ///
-    /// The remaining identity variables — `DBOS__VMID`, `DBOS__CLOUD`, `DBOS__APPID` and
-    /// `DBOS_APP_NAME` — are *not* read here. Nothing would be gained: no application overlays a
-    /// default on them, and launch reads them as Java does.
+    /// That variable and no other. The identity variables — `DBOS__APPVERSION`, `DBOS__VMID`,
+    /// `DBOS__CLOUD` and `DBOS__APPID` — carry two underscores because they are DBOS Cloud's to
+    /// set, and `DBOS_APP_NAME` is a deployment's too; an end user *may* set them, but a
+    /// configuration is not the layer that reads them. Launch is, as in Java, so that a `Config`
+    /// written by hand and one from here resolve to the same identity.
     ///
     /// A missing or empty `DBOS_DATABASE_URL` leaves [`database_url`](Self::database_url) empty
     /// rather than failing here, so that a caller who sets it afterwards is not forced through an
     /// error path. [`launch`](crate::DBOS::launch) is where an empty URL is reported, which is also
     /// where it would have failed anyway.
     pub fn from_env(app_name: impl Into<String>) -> Self {
-        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        Self {
-            app_version: var(APP_VERSION_ENV),
-            ..Self::new(app_name, var(DATABASE_URL_ENV).unwrap_or_default())
-        }
+        Self::new(
+            app_name,
+            std::env::var(DATABASE_URL_ENV).unwrap_or_default(),
+        )
     }
 
     /// Checks what can be checked before anything is connected.
