@@ -1,12 +1,12 @@
 //! Workflow events: a key/value a workflow publishes and anyone may read.
 //!
-//! Three surfaces, split by where the caller stands. [`set_event`] and [`get_event`] are free
+//! Four surfaces, split by where the caller stands. [`set_event`] and [`get_event`] are free
 //! functions like [`step`](crate::step), callable only from inside a workflow: they take the
 //! executor and the step-id sequence from the ambient context, so a workflow body needs no
 //! handle to anything. [`DBOS::get_event`] is the instance method for the other reader — an HTTP
 //! handler polling for progress, outside any workflow, where there is nothing ambient to take an
-//! executor from. A fourth is coming: the same reader from outside the application altogether,
-//! where there is not even an instance, which is why the read itself belongs to the connection.
+//! executor from — and [`Client::get_event`](crate::Client::get_event) is that same reader from
+//! outside the application altogether, where there is not even an instance.
 //!
 //! **The free reader is not just symmetry.** The registry lives on the instance, so a registered
 //! closure that captures a [`DBOS`] is stored inside the very `Arc` it holds a strong reference
@@ -166,6 +166,35 @@ impl DBOS {
     }
 }
 
+impl crate::Client {
+    /// Reads a key a workflow published, waiting up to `timeout` for it to appear.
+    ///
+    /// **The reader a client is built for.** An application publishes progress under a key with
+    /// [`set_event`] and anything outside it — an HTTP handler answering "how far along is my
+    /// order?", a test waiting for a workflow to reach a known point — reads it here. Nothing
+    /// about it is checkpointed, because a client has no workflow to checkpoint against and no
+    /// replay to protect: the read is exactly one wait on the database.
+    ///
+    /// `Ok(None)` means the key was not there when the deadline passed — absence is a value, not
+    /// an error, and `Duration::ZERO` makes this a poll: look once, do not wait.
+    ///
+    /// The wait is woken by a notification rather than polled, when the client was connected with
+    /// [`ClientConfig::use_listen_notify`](crate::ClientConfig::use_listen_notify) left on.
+    pub async fn get_event<T: DeserializeOwned>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        // No caller, and there is no case where there could be one: a client is not a workflow, so
+        // unlike `DBOS::get_event` there is no ambient context to reconcile with this handle's
+        // executor and no `WrongInstance` to refuse.
+        self.connection()
+            .read_event(workflow_id, key, timeout, None)
+            .await
+    }
+}
+
 /// Where the caller stands, for `sysdb` to checkpoint the read against.
 ///
 /// Field order is the contract: the read's id first, the deadline's second, matching what every
@@ -186,8 +215,8 @@ impl Connection {
     /// failure is an engine variant either way, and `E` only says which channel it travels in.
     ///
     /// On the connection because a read is all it is: the free [`get_event`] reaches it through the
-    /// ambient context's and [`DBOS::get_event`] through its executor's, and a caller that has a
-    /// connection and nothing else will reach it through the only one it has.
+    /// ambient context's, [`DBOS::get_event`] through its executor's, and
+    /// [`Client::get_event`](crate::Client::get_event) through the only one it has.
     pub(crate) async fn read_event<T: DeserializeOwned, E>(
         &self,
         workflow_id: &str,

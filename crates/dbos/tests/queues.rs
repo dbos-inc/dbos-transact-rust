@@ -128,7 +128,7 @@ async fn declining_to_update_reports_what_is_stored() {
             "demo-queue",
             QueueOptions {
                 worker_concurrency: Some(99),
-                on_conflict: QueueConflict::NeverUpdate,
+                on_conflict: Some(QueueConflict::NeverUpdate),
                 ..QueueOptions::default()
             },
         )

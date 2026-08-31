@@ -257,14 +257,14 @@ impl Config {
 }
 
 /// The interval every implementation polls a workflow's outcome at.
-const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The rule the other implementations share: 3–30 characters of lowercase letters, digits, dashes
 /// and underscores.
 ///
 /// Checked rather than trusted because the name is an ownership key: a row stamped with a name no
 /// other executor spells the same way is a row nothing claims.
-fn validate_app_name(name: &str) -> crate::Result<()> {
+pub(crate) fn validate_app_name(name: &str) -> crate::Result<()> {
     let bad = |why: &str| Err(crate::Error::Config(format!("`app_name` {why}: {name:?}")));
     match name.chars().count() {
         0 => return bad("cannot be empty"),

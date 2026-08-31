@@ -60,10 +60,10 @@ impl<R, E> WorkflowHandle<R, E> {
 
     /// A handle over a workflow some other execution owns.
     ///
-    /// **Takes a connection rather than an executor**, because watching a workflow is reading its
-    /// row, and reading a row needs no process that could run it. That is also what will let a
-    /// client hand one of these back: Java's builds the same thing — a small handle class over the
-    /// system database alone.
+    /// **Takes a connection rather than an executor**, which is what lets a
+    /// [`Client`](crate::Client) hand one back: watching a workflow is reading its row, and reading
+    /// a row needs no process that could run it. Java's client builds the same thing — a small
+    /// handle class over the system database alone.
     pub(crate) fn polling(conn: Arc<Connection>, workflow_id: String) -> Self {
         Self {
             conn,
@@ -224,9 +224,9 @@ impl Awaiting {
         };
         // The step id would come from this workflow's counter while the write went through the
         // handle's own system database — the split `get_event` refuses for the same reason. The
-        // comparison is of *connections* rather than of executors, because the database is what the
-        // two halves would disagree about, and it is the one thing every handle has, however it
-        // was come by.
+        // comparison is of *databases* rather than of executors, because the database is what the
+        // two halves would disagree about, and it is the thing a handle from a
+        // [`Client`](crate::Client) has in common with one from a running executor.
         if !Arc::ptr_eq(ctx.executor().connection(), conn) {
             return Err(Error::WrongInstance {
                 operation: "awaiting a workflow's result".into(),

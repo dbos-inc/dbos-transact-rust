@@ -8,8 +8,8 @@
 //! # Status
 //!
 //! Under construction. The system database layer landed first and the execution engine is
-//! being built on it; the lifecycle, registration, workflows, steps, events, recovery and
-//! queues are here, with the client and the scheduler arriving next.
+//! being built on it; the lifecycle, registration, workflows, steps, events, recovery, queues
+//! and the client are here, with the scheduler arriving next.
 //!
 //! # Cargo features
 //!
@@ -21,6 +21,8 @@
 
 pub mod sysdb;
 
+#[cfg(feature = "engine")]
+mod client;
 #[cfg(feature = "engine")]
 mod config;
 #[cfg(feature = "engine")]
@@ -57,6 +59,8 @@ mod workflow;
 // Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
 // because it *is* the brand — nobody writes `tokio::TOKIO`.
+#[cfg(feature = "engine")]
+pub use client::{Client, ClientConfig, Duplication, EnqueueOptions, Forks, Message};
 #[cfg(feature = "engine")]
 pub use config::{APP_VERSION_ENV, Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]

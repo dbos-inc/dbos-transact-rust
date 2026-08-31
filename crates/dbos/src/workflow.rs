@@ -1164,8 +1164,9 @@ impl Connection {
     /// Reads back the outcome of a workflow this caller does not own.
     ///
     /// On the connection rather than on an executor because that is all it needs — a row read and
-    /// the interval to re-ask at — and so every `WorkflowHandle` polls through here, however it was
-    /// come by.
+    /// the interval to re-ask at — and because both surfaces reach it: a `WorkflowHandle` polls
+    /// through here whether it came from a running application or from a
+    /// [`Client`](crate::Client).
     pub(crate) async fn adopt(
         &self,
         workflow_id: &str,

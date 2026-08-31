@@ -259,8 +259,15 @@ pub struct QueueOptions {
     /// a faster rate than that one does — the two periods need not match, so it is the rates that
     /// are compared and not the counts.
     pub partition_rate_limit: Option<RateLimit>,
-    /// What to do when the queue is already registered.
-    pub on_conflict: QueueConflict,
+    /// What to do when the queue is already registered, or `None` for the caller's own default.
+    ///
+    /// **The default depends on who is registering**, because the useful policy does. An
+    /// application gets [`QueueConflict::UpdateIfLatestVersion`], which is what makes a rolling
+    /// deploy behave; a [`Client`](crate::Client) gets [`QueueConflict::AlwaysUpdate`], because it
+    /// runs none of the application's code and so has no version to be the latest of — the policy
+    /// it cannot ask for is the one an application defaults to. Python's client defaults the same
+    /// way for the same reason.
+    pub on_conflict: Option<QueueConflict>,
 }
 
 impl Default for QueueOptions {
@@ -274,7 +281,7 @@ impl Default for QueueOptions {
             partition_concurrency: None,
             partition_worker_concurrency: None,
             partition_rate_limit: None,
-            on_conflict: QueueConflict::default(),
+            on_conflict: None,
         }
     }
 }
@@ -325,18 +332,27 @@ pub struct QueueChange {
 /// [`Error::SystemDatabase`] carrying `RegisteredByAnother` in every mode, because the name is the
 /// queue's address across every application sharing the database — taking it would redirect a
 /// peer's work.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// **No context-free default.** Which policy a bare registration should get depends on whether the
+/// caller has an application version at all, so the choice lives in
+/// [`QueueOptions::on_conflict`]'s `None` rather than in a `Default` impl here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueConflict {
     /// Overwrite only if this process is running the **latest registered application version**.
     ///
-    /// The default, and the one that makes a rolling deploy behave. Two versions of an application
-    /// run side by side during a deploy, and both register their queues at startup; without this,
-    /// the old version's registration would keep reverting the new version's limits for as long as
-    /// it lived. An application with no registered versions yet is the latest by default, since it
-    /// is the first.
-    #[default]
+    /// An application's default, and the one that makes a rolling deploy behave. Two versions of an
+    /// application run side by side during a deploy, and both register their queues at startup;
+    /// without this, the old version's registration would keep reverting the new version's limits
+    /// for as long as it lived. An application with no registered versions yet is the latest by
+    /// default, since it is the first.
+    ///
+    /// **A client cannot ask for this**, having no version to be the latest of; it is refused
+    /// rather than guessed at. See [`Client::register_queue`](crate::Client::register_queue).
     UpdateIfLatestVersion,
     /// Always overwrite the stored limits.
+    ///
+    /// A [`Client`](crate::Client)'s default: an operator registering a queue from outside the
+    /// application means the limits it names to take effect.
     AlwaysUpdate,
     /// Leave the stored limits alone.
     ///
@@ -632,20 +648,21 @@ impl DBOS {
 }
 
 // The five operations below are methods on `Connection` rather than on a `DBOS` instance, because
-// a queue is a row and writing it needs nothing an executor has: a launched instance reaches them
-// through `DBOS::register_queue` and the rest, and the client that is coming will reach the same
-// five under the same names. The impl block lives here, next to the types it speaks in, which is
-// where this crate already puts `impl DBOS`. The public methods differ only in how they come by a
-// connection, and in the application version only one of them has.
+// a queue is a row and both handles that can reach the database may write it: a launched instance
+// through `DBOS::register_queue` and the rest, and a `Client` through the same five names. The
+// impl block lives here, next to the types it speaks in, which is where this crate already puts
+// `impl DBOS`. The public methods differ only in how they come by a connection, and in the
+// application version only one of them has.
 
 impl Connection {
     /// Registers a queue, or reports the one already registered under this name.
     ///
-    /// `app_version` is the caller's own, and `None` says it has none — which a client,
-    /// running none of the application's code, will be. It exists as a parameter rather than as
-    /// something read off the handle precisely so that such a caller can call this: only
-    /// [`QueueConflict::UpdateIfLatestVersion`] consults it, and that policy is refused when there
-    /// is nothing to consult.
+    /// `app_version` is the caller's own, and `None` says it has none — which is what a
+    /// [`Client`](crate::Client) is. It exists as a parameter rather than as something read off the
+    /// handle precisely so that a client can call this: only
+    /// [`QueueConflict::UpdateIfLatestVersion`] consults it, and that policy is refused when there is
+    /// nothing to consult. It also settles an unstated
+    /// [`on_conflict`](QueueOptions::on_conflict), for the same reason.
     pub(crate) async fn register_queue(
         &self,
         name: &str,
@@ -659,7 +676,16 @@ impl Connection {
         }
         validate(name, &options)?;
 
-        let on_existing = match options.on_conflict {
+        // **The unstated policy follows the caller's version**, which is the same fact the policies
+        // themselves turn on: a caller with a version is an application mid-deploy, and wants the
+        // latest-version check; one without is a client, which cannot ask for that check at all,
+        // and whose registration is an operator saying what the limits should be.
+        let on_conflict = options.on_conflict.unwrap_or(match app_version {
+            Some(_) => QueueConflict::UpdateIfLatestVersion,
+            None => QueueConflict::AlwaysUpdate,
+        });
+
+        let on_existing = match on_conflict {
             QueueConflict::AlwaysUpdate => OnExistingQueue::Update,
             QueueConflict::NeverUpdate => OnExistingQueue::Leave,
             // **Resolved here rather than in the database**, because it is a question about *this
@@ -668,8 +694,8 @@ impl Connection {
             // is authoritative.
             QueueConflict::UpdateIfLatestVersion => {
                 // **A handle with no application version cannot answer this question**, which is
-                // the case a client is: it runs none of the application's code, so there is no
-                // version of it to weigh against the registered ones. Python
+                // the case a [`Client`](crate::Client) is: it runs none of the application's code,
+                // so there is no version of it to weigh against the registered ones. Python
                 // refuses the same combination in the same words — *"does not support
                 // on_conflict='update_if_latest_version' because clients are not associated with
                 // an application version"* — rather than picking a side quietly, and the two
@@ -821,7 +847,8 @@ impl Connection {
                 partition_concurrency: limits.partition_concurrency,
                 partition_worker_concurrency: limits.partition_worker_concurrency,
                 partition_rate_limit: limits.partition_rate_limit,
-                on_conflict: QueueConflict::default(),
+                // Nothing is being registered here; this shape exists only to be validated.
+                on_conflict: None,
             };
             validate_fields(&options)
                 .map_err(|(field, detail)| SysdbError::InvalidInput { field, detail })

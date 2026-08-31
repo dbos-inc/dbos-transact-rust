@@ -14,12 +14,12 @@ use crate::{Error, Result};
 /// Everything that needs a database or a runtime lives here rather than on the instance, so that
 /// "not launched" is one absent value rather than a scatter of `Option`s.
 ///
-/// **The connection is held rather than embedded**, which is the split the client will rest on.
-/// Every other field here exists because this process *runs* workflows: the id, version and
-/// application name a claim stamps, the runtime they are spawned onto, the registry snapshot they
-/// are resolved through, the task set shutdown reaches. A client runs none, so it will hold the
-/// connection alone, and everything either surface does that needs no executor is a method on
-/// that rather than on this type.
+/// **The connection is held rather than embedded**, which is the split a [`Client`](crate::Client)
+/// rests on. Every other field here exists because this process *runs* workflows: the id, version
+/// and application name a claim stamps, the runtime they are spawned onto, the registry snapshot
+/// they are resolved through, the task set shutdown reaches. A client runs none, so it holds the
+/// connection alone, and everything both surfaces do is a method on that rather than on this
+/// type.
 pub struct Executor {
     conn: Arc<Connection>,
     executor_id: String,
@@ -102,8 +102,8 @@ impl Executor {
     /// The connection this executor talks through, which is all a caller needs to read or write a
     /// row.
     ///
-    /// Handed out rather than proxied so that an operation needing no executor can be a method on
-    /// the connection, reachable by anything else holding one — see that module.
+    /// Handed out rather than proxied so that everything both surfaces do can be a method on the
+    /// connection and be called by a [`Client`](crate::Client) too — see that module.
     pub(crate) fn connection(&self) -> &Arc<Connection> {
         &self.conn
     }
@@ -120,13 +120,12 @@ impl Executor {
 
     /// Names the application whose rows this executor owns.
     ///
-    /// **Its own, and not an [`Option`].** The connection reports a name that may be absent,
-    /// because a connection opened from outside an application may speak for every application at
-    /// once. An executor may not: [`Config::app_name`](crate::Config::app_name) is required and
+    /// **Its own, and not an [`Option`].** The connection reports a name that may be absent, because
+    /// the one a [`Client`](crate::Client) opens may speak for every application at once. An executor may not: [`Config::app_name`](crate::Config::app_name) is required and
     /// validated before anything connects, the name mixes into the application version, and it is
     /// the ownership key on every row this process writes. Holding it here rather than unwrapping
-    /// the connection's is what keeps that a fact of the type instead of an invariant each caller
-    /// has to remember.
+    /// the database's is what keeps that a fact of the type instead of an invariant each caller has
+    /// to remember.
     pub fn app_name(&self) -> &str {
         &self.app_name
     }
