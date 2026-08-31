@@ -4222,6 +4222,21 @@ async fn a_second_receiver_on_one_topic_is_refused() {
 /// whatever it took when its step write conflicts. Two messages are queued so that a loser going
 /// back for a *different* one would be visible as a second consumed row.
 ///
+/// **The loser has two legal outcomes, and which one it gets is a matter of timing.** Its
+/// transaction opens with a `check_step` of its own: if the winner has committed by then, it
+/// adopts that answer and returns the same message. If it has not, the loser reads no step, goes
+/// on to the consuming `UPDATE`, and its own step write conflicts — `StepAlreadyRecorded`, with
+/// the consumption rolled back alongside it. `recv` reports that conflict rather than adopting,
+/// deliberately and for the reasons written where it is raised, so both outcomes are accepted
+/// here. Requiring the first was this test's flake: it held on an idle machine and failed on a
+/// loaded one, which is where CI runs. Nothing is lost by accepting both, because the adopting
+/// path has a test of its own that pins it without a race —
+/// `a_recv_defers_to_a_rival_that_recorded_first`, which records the rival's step during the wait
+/// rather than hoping the scheduler lands it there.
+///
+/// What holds either way is the count, and that is what the test is named for: one message
+/// consumed between the two, and one answer, whether it was delivered once or twice.
+///
 /// **What this does not pin:** the `consumed = FALSE` predicate itself. Removing it and re-running
 /// this test passes, because the transaction covers the same case — verified by mutation. The
 /// predicate stays for the reasons given where it is written, but no test here can tell it apart,
@@ -4262,14 +4277,29 @@ async fn two_receivers_cannot_take_the_same_message() {
             tokio::time::timeout(RECHECK * 20, handle)
                 .await
                 .expect("a racing receiver never finished")
-                .unwrap()
-                .expect("losing the race is not a failure"),
+                .unwrap(),
         );
     }
 
-    assert_eq!(
-        answers[0], answers[1],
-        "both executions of one workflow must report the message its one recorded step holds",
+    let (delivered, refused): (Vec<_>, Vec<_>) = answers.iter().partition(|answer| answer.is_ok());
+    // The winner always records its step, so only its rival can be turned away — and only on that
+    // write, the conflict whose rollback un-takes whatever it had consumed.
+    assert!(
+        refused.len() <= 1
+            && refused
+                .iter()
+                .all(|answer| matches!(answer, Err(Error::StepAlreadyRecorded { step_id: 0, .. }))),
+        "at most one execution may lose the race, and only on its step write: {answers:?}",
+    );
+    let mut received = delivered.iter().map(|answer| answer.as_ref().unwrap());
+    let first_answer = received.next().expect("nobody received the message");
+    assert!(
+        first_answer.is_some(),
+        "a message was waiting, so the execution that recorded the step must hold it",
+    );
+    assert!(
+        received.all(|answer| answer == first_answer),
+        "an execution that adopted the recorded step must report what that step holds: {answers:?}",
     );
     let notifications = first.get_all_notifications("wf-receiver").await.unwrap();
     assert_eq!(
