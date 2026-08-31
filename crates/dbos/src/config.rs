@@ -123,7 +123,7 @@ pub struct Config {
     /// between a crash and a restart and the new binary hashes differently, so the previous run's
     /// `PENDING` rows are left for an executor that no longer exists. Set this — or
     /// `DBOS__APPVERSION`, which [`from_env`](Self::from_env) reads — to pin it while developing.
-    pub application_version: Option<String>,
+    pub app_version: Option<String>,
 
     /// How payloads are encoded.
     pub serializer: Serializer,
@@ -193,7 +193,7 @@ impl Config {
             max_connections: 10,
             schema: DEFAULT_SCHEMA.to_owned(),
             executor_id: None,
-            application_version: None,
+            app_version: None,
             serializer: Serializer::default(),
             use_listen_notify: true,
             migrate: true,
@@ -217,7 +217,7 @@ impl Config {
             .ok()
             .filter(|v| !v.is_empty());
         Self {
-            application_version: version,
+            app_version: version,
             ..Self::new(app_name, url)
         }
     }

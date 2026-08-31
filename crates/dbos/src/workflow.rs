@@ -757,7 +757,7 @@ where
                     serialization: Some(executor.serializer().name()),
                     executor_id: Some(executor.executor_id()),
                     application_name: Some(executor.app_name()),
-                    application_version: Some(executor.application_version()),
+                    application_version: Some(executor.app_version()),
                     // Only a budget is written: an inherited deadline is an *instant* and has no
                     // budget behind it, and `Timeout::None` has neither. The column is what a
                     // queue recomputes a deadline from on dequeue, so filling it in for either

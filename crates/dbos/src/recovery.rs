@@ -44,10 +44,10 @@ use crate::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 pub(crate) async fn reenqueue(
     sysdb: &impl SystemDatabase,
     executor_id: &str,
-    application_version: &str,
+    app_version: &str,
 ) -> Result<Vec<String>> {
     let recovered = sysdb
-        .reenqueue_for_recovery(&[executor_id], application_version, INTERNAL_QUEUE)
+        .reenqueue_for_recovery(&[executor_id], app_version, INTERNAL_QUEUE)
         .await
         .map_err(Error::SystemDatabase)?;
     if recovered.is_empty() {

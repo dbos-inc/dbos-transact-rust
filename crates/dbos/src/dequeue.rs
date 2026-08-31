@@ -375,7 +375,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
             .start_queued_workflows(
                 queue,
                 executor.executor_id(),
-                executor.application_version(),
+                executor.app_version(),
                 None,
                 running.count(&queue.name),
                 0,
@@ -411,7 +411,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
             .start_queued_partitioned_workflows(
                 queue,
                 executor.executor_id(),
-                executor.application_version(),
+                executor.app_version(),
                 budget,
             )
             .await
@@ -441,7 +441,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
             .start_queued_workflows(
                 queue,
                 executor.executor_id(),
-                executor.application_version(),
+                executor.app_version(),
                 Some(&partition),
                 already_running + claimed_here,
                 running.count_for_partition(&queue.name, &partition),

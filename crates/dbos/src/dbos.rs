@@ -15,7 +15,7 @@ use crate::{Error, Result};
 pub struct Executor {
     sysdb: Box<dyn SystemDatabase>,
     executor_id: String,
-    application_version: String,
+    app_version: String,
     serializer: Serializer,
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
@@ -51,9 +51,9 @@ impl Executor {
             .executor_id
             .clone()
             .unwrap_or_else(|| "local".to_owned());
-        let application_version = match &config.application_version {
+        let app_version = match &config.app_version {
             Some(version) => version.clone(),
-            None => compute_application_version(&config.app_name).await?,
+            None => compute_app_version(&config.app_name).await?,
         };
 
         let sysdb = postgres::PostgresSystemDatabase::connect(&postgres::Config {
@@ -78,7 +78,7 @@ impl Executor {
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        let recovered = match prepare(&sysdb, &executor_id, &application_version).await {
+        let recovered = match prepare(&sysdb, &executor_id, &app_version).await {
             Ok(recovered) => recovered,
             Err(error) => {
                 sysdb.close().await;
@@ -89,14 +89,14 @@ impl Executor {
         tracing::info!(
             app_name = config.app_name,
             executor_id,
-            application_version,
+            app_version,
             "DBOS launched"
         );
 
         let executor = Self {
             sysdb: Box::new(sysdb),
             executor_id,
-            application_version,
+            app_version,
             serializer: config.serializer.clone(),
             // Decision 20: the runtime is the executor's, taken here. `start` is `async`, so a
             // runtime is necessarily current.
@@ -144,8 +144,16 @@ impl Executor {
     }
 
     /// The version of the application's code, as workflow rows record it.
-    pub fn application_version(&self) -> &str {
-        &self.application_version
+    ///
+    /// **`app_` here, `application_` in `sysdb`**, and the two meet at exactly this call: the
+    /// engine names the pair [`app_name`](Self::app_name) and `app_version`, matching
+    /// [`APP_VERSION_ENV`] and the `DBOS__APPVERSION` every implementation reads, while `sysdb`
+    /// spells them `application_name` and `application_version` because those are the columns'
+    /// own names. The conversion happens where a value crosses into a `sysdb` type —
+    /// `NewWorkflow { application_version: Some(executor.app_version()), .. }` — which is the
+    /// same boundary every other schema word stops at.
+    pub fn app_version(&self) -> &str {
+        &self.app_version
     }
 
     /// How payloads are encoded.
@@ -211,7 +219,7 @@ impl std::fmt::Debug for Executor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Executor")
             .field("executor_id", &self.executor_id)
-            .field("application_version", &self.application_version)
+            .field("app_version", &self.app_version)
             .finish_non_exhaustive()
     }
 }
@@ -368,11 +376,8 @@ impl DBOS {
     }
 
     /// The version of the application's code, as workflow rows record it.
-    pub fn application_version(&self) -> Result<String> {
-        Ok(self
-            .executor("application_version")?
-            .application_version()
-            .to_owned())
+    pub fn app_version(&self) -> Result<String> {
+        Ok(self.executor("app_version")?.app_version().to_owned())
     }
 
     /// The running executor, or [`Error::NotLaunched`] naming the operation that wanted it.
@@ -423,10 +428,10 @@ impl std::fmt::Debug for DBOS {
 async fn prepare(
     sysdb: &impl SystemDatabase,
     executor_id: &str,
-    application_version: &str,
+    app_version: &str,
 ) -> Result<Vec<String>> {
-    register_version(sysdb, application_version).await?;
-    crate::recovery::reenqueue(sysdb, executor_id, application_version).await
+    register_version(sysdb, app_version).await?;
+    crate::recovery::reenqueue(sysdb, executor_id, app_version).await
 }
 
 /// Registers this version and warns if it is not the one a rolling deploy would prefer.
@@ -447,7 +452,7 @@ async fn register_version(sysdb: &impl SystemDatabase, version: &str) -> Result<
     {
         Some(latest) if latest.version_name != version => {
             tracing::warn!(
-                application_version = version,
+                app_version = version,
                 latest_version = latest.version_name,
                 "this executor is not running the latest registered application version: it will \
                  recover and dequeue only work stamped with its own version"
@@ -467,7 +472,7 @@ async fn register_version(sysdb: &impl SystemDatabase, version: &str) -> Result<
 /// is what makes recovery safe across a deploy. It is also why development wants
 /// `DBOS__APPVERSION`: a rebuild changes the hash, so a crash and a restart around one leave the
 /// earlier run's `PENDING` rows to an executor that no longer exists.
-async fn compute_application_version(app_name: &str) -> Result<String> {
+async fn compute_app_version(app_name: &str) -> Result<String> {
     let app_name = app_name.to_owned();
     // Reading a binary is blocking and it can be tens of megabytes; launching is exactly the moment
     // where a stalled runtime is least visible.
@@ -511,7 +516,7 @@ async fn compute_application_version(app_name: &str) -> Result<String> {
 fn version_error(verb: &str, cause: &std::io::Error) -> Error {
     Error::Config(format!(
         "could not {verb} the running executable to compute the application version ({cause}); \
-         set `application_version`, or the {APP_VERSION_ENV} environment variable"
+         set `app_version`, or the {APP_VERSION_ENV} environment variable"
     ))
 }
 
@@ -527,12 +532,12 @@ mod tests {
     async fn nothing_is_launched_until_launch() {
         let dbos = DBOS::new(config());
         assert!(!dbos.is_launched());
-        let err = dbos.application_version().unwrap_err();
+        let err = dbos.app_version().unwrap_err();
         assert!(
             matches!(
                 err,
                 Error::NotLaunched {
-                    operation: std::borrow::Cow::Borrowed("application_version")
+                    operation: std::borrow::Cow::Borrowed("app_version")
                 }
             ),
             "{err}"
@@ -578,8 +583,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_version_is_the_executable_hash_and_it_is_stable_across_calls() {
-        let once = compute_application_version("test-app").await.unwrap();
-        let twice = compute_application_version("test-app").await.unwrap();
+        let once = compute_app_version("test-app").await.unwrap();
+        let twice = compute_app_version("test-app").await.unwrap();
         assert_eq!(once, twice);
         assert_eq!(once.len(), 64, "a SHA-256 in hex");
         assert!(once.chars().all(|c| c.is_ascii_hexdigit()));
@@ -589,8 +594,8 @@ mod tests {
     async fn the_application_name_mixes_into_the_version() {
         // Two applications shipping one binary must not share a version, or each would treat the
         // other's abandoned workflows as its own to recover.
-        let one = compute_application_version("app-one").await.unwrap();
-        let other = compute_application_version("app-two").await.unwrap();
+        let one = compute_app_version("app-one").await.unwrap();
+        let other = compute_app_version("app-two").await.unwrap();
         assert_ne!(one, other);
     }
 
