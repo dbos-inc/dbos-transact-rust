@@ -231,17 +231,6 @@ pub trait SystemDatabase: Send + Sync {
         attributes: Option<&str>,
     ) -> Result<(), Error>;
 
-    /// Workflows this executor left `PENDING`, which recovery picks up.
-    ///
-    /// Scoped by application version as well as executor: a workflow started under different code
-    /// must not be resumed by an executor running this version, because its recorded steps may no
-    /// longer line up.
-    async fn get_pending_workflows(
-        &self,
-        executor_id: &str,
-        application_version: &str,
-    ) -> Result<Vec<String>, Error>;
-
     /// Returns this executor's abandoned workflows to a queue, so any peer may run them.
     ///
     /// **Recovery's whole write.** A `PENDING` row whose executor is gone goes back to `ENQUEUED`
@@ -255,9 +244,15 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **`executor_ids` is what makes a repeat harmless.** Once any live executor dequeues one of
     /// these rows, the claim stamps its own executor id, so a second sweep naming the dead
-    /// executor matches nothing rather than tearing a running workflow off its runner. Scoped by
-    /// application version and application for the reasons
-    /// [`get_pending_workflows`](Self::get_pending_workflows) gives.
+    /// executor matches nothing rather than tearing a running workflow off its runner.
+    ///
+    /// **Scoped by application version and by application.** A workflow started under different
+    /// code must not be resumed by an executor running this version, because its recorded steps
+    /// may no longer line up. And `executor_id` defaults to `"local"` — Rust follows Go here — so
+    /// two applications running on one machine present the same executor to this query; unscoped,
+    /// each would re-enqueue the other's workflows and go on to run functions it has never heard
+    /// of. Migration 7's `owner_xid` does not help, because a recovery sweep is looking for
+    /// workflows whose owner is *gone*.
     ///
     /// Returns the ids that actually moved. An empty `executor_ids` moves nothing.
     async fn reenqueue_for_recovery(

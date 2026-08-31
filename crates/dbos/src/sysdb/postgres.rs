@@ -2101,8 +2101,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // The executor re-stamp is guarded on ownership, which is a deliberate divergence.
             // On conflict the upsert would otherwise hand `executor_id` to whoever submitted
             // last — including a duplicate `Fresh` submission of a workflow another executor is
-            // running. That misdirects recovery: `get_pending_workflows` keys on `executor_id`,
-            // so the real owner's sweep stops finding the workflow and the submitter's starts,
+            // running. That misdirects recovery: the sweep keys on `executor_id`, so the real
+            // owner's sweep stops finding the workflow and the submitter's starts,
             // and the second execution is only caught later, at its first step.
             //
             // Java and TypeScript prevent it by letting the write land and rolling the
@@ -2763,39 +2763,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                 Ok(())
             },
         )
-        .await
-    }
-
-    async fn get_pending_workflows(
-        &self,
-        executor_id: &str,
-        application_version: &str,
-    ) -> Result<Vec<String>, Error> {
-        let workflow_table = &self.tables.workflow_status;
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
-        let application_name = self.application_name.as_deref();
-        // Correctness, not tidiness. `executor_id` defaults to `"local"` — Rust follows Go here —
-        // so two applications running on one machine present the same executor to this query.
-        // Without the scope each would recover the other's workflows: it would find them, decide
-        // they are its own to restart, and run functions it has never heard of. Migration 7's
-        // `owner_xid` does not help, because a recovery sweep is looking for workflows whose
-        // owner is *gone*.
-
-        with_retry(&self.retry, "get_pending_workflows", move || async move {
-            let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT workflow_uuid FROM {workflow_table} \
-                 WHERE status = 'PENDING' AND executor_id = $1 AND application_version = $2 \
-                   AND ($3::text IS NULL \
-                        OR application_name = $3 \
-                        OR application_name IS NULL)"
-            )))
-            .bind(executor_id)
-            .bind(application_version)
-            .bind(application_name)
-            .fetch_all(pool)
-            .await?;
-            Ok(ids)
-        })
         .await
     }
 
