@@ -45,7 +45,7 @@ async fn launching_resolves_an_identity() {
         "the default every SDK shares"
     );
 
-    let version = dbos.application_version().expect("launched");
+    let version = dbos.app_version().expect("launched");
     assert_eq!(version.len(), 64, "a SHA-256 in hex: {version}");
 
     dbos.shutdown().await;
@@ -55,7 +55,7 @@ async fn launching_resolves_an_identity() {
 #[tokio::test]
 async fn launching_registers_the_application_version() {
     let (dbos, db) = launched("version-app").await;
-    let version = dbos.application_version().expect("launched");
+    let version = dbos.app_version().expect("launched");
 
     let latest = reader(&db)
         .await
@@ -73,13 +73,13 @@ async fn launching_registers_the_application_version() {
 #[tokio::test]
 async fn relaunching_registers_the_same_version_once() {
     let (dbos, db) = launched("relaunch-app").await;
-    let version = dbos.application_version().expect("launched");
+    let version = dbos.app_version().expect("launched");
     dbos.shutdown().await;
     assert!(!dbos.is_launched(), "shutdown drops the executor");
 
     dbos.launch().await.expect("relaunch failed");
     assert_eq!(
-        dbos.application_version().expect("launched"),
+        dbos.app_version().expect("launched"),
         version,
         "same binary, same version"
     );
@@ -105,7 +105,7 @@ async fn an_instance_outlives_the_executor_it_launched() {
     let first = dbos.executor_id().expect("launched");
     dbos.shutdown().await;
 
-    let err = dbos.application_version().unwrap_err();
+    let err = dbos.app_version().unwrap_err();
     assert!(matches!(err, Error::NotLaunched { .. }), "{err}");
 
     dbos.launch().await.expect("relaunch failed");
@@ -118,12 +118,12 @@ async fn an_instance_outlives_the_executor_it_launched() {
 #[tokio::test]
 async fn launching_twice_is_idempotent() {
     let (dbos, _db) = launched("idempotent-app").await;
-    let version = dbos.application_version().expect("launched");
+    let version = dbos.app_version().expect("launched");
 
     dbos.launch()
         .await
         .expect("a second launch should be a no-op, not an error");
-    assert_eq!(dbos.application_version().expect("launched"), version);
+    assert_eq!(dbos.app_version().expect("launched"), version);
 
     dbos.shutdown().await;
 }
@@ -143,12 +143,12 @@ async fn shutting_down_twice_is_idempotent() {
 async fn an_explicit_application_version_is_used_as_given() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
-        application_version: Some("v1.2.3".to_owned()),
+        app_version: Some("v1.2.3".to_owned()),
         ..config("pinned-app", &db)
     });
     dbos.launch().await.expect("launch failed");
 
-    assert_eq!(dbos.application_version().expect("launched"), "v1.2.3");
+    assert_eq!(dbos.app_version().expect("launched"), "v1.2.3");
     let latest = reader(&db)
         .await
         .get_latest_application_version(Some("pinned-app"))
@@ -179,11 +179,11 @@ async fn an_explicit_executor_id_is_used_as_given() {
 async fn two_applications_sharing_a_database_own_their_own_versions() {
     let db = test_database().await;
     let one = DBOS::new(Config {
-        application_version: Some("one-v1".to_owned()),
+        app_version: Some("one-v1".to_owned()),
         ..config("app-one", &db)
     });
     let two = DBOS::new(Config {
-        application_version: Some("two-v1".to_owned()),
+        app_version: Some("two-v1".to_owned()),
         ..config("app-two", &db)
     });
     one.launch().await.expect("launch failed");
@@ -273,7 +273,7 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
 
     let db = test_database().await;
     let holder = DBOS::new(Config {
-        application_version: Some(CONTESTED.to_owned()),
+        app_version: Some(CONTESTED.to_owned()),
         ..config("version-holder", &db)
     });
     holder.launch().await.expect("launch failed");
@@ -282,7 +282,7 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
     // happens after the connect and before the executor exists.
     for attempt in 1..=3 {
         let loser = DBOS::new(Config {
-            application_version: Some(CONTESTED.to_owned()),
+            app_version: Some(CONTESTED.to_owned()),
             database_url: format!("{}?application_name={TAG}", db.url()),
             ..config("version-loser", &db)
         });

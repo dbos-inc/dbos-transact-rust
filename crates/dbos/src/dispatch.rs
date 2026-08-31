@@ -85,7 +85,7 @@ pub(crate) async fn dispatch(
                 queue_name: row.queue_name.as_deref(),
                 executor_id: Some(executor.executor_id()),
                 application_name: Some(executor.app_name()),
-                application_version: Some(executor.application_version()),
+                application_version: Some(executor.app_version()),
                 ..NewWorkflow::new(&workflow_id)
             },
             Some(MAX_RECOVERY_ATTEMPTS),

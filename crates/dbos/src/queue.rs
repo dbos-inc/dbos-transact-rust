@@ -582,7 +582,7 @@ impl DBOS {
                     // The first registration of the first version: this process is the latest
                     // because it is the only one.
                     None => OnExistingQueue::Update,
-                    Some(latest) if latest.version_name == executor.application_version() => {
+                    Some(latest) if latest.version_name == executor.app_version() => {
                         OnExistingQueue::Update
                     }
                     // An older version registering behind a newer one. Leaving the row alone is
@@ -590,7 +590,7 @@ impl DBOS {
                     Some(latest) => {
                         tracing::debug!(
                             queue = name,
-                            version = executor.application_version(),
+                            version = executor.app_version(),
                             latest = latest.version_name,
                             "an older version registered this queue; its stored limits stand"
                         );

@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.database_url = DEFAULT_DATABASE_URL.to_owned();
     }
     config
-        .application_version
+        .app_version
         .get_or_insert_with(|| DEFAULT_APP_VERSION.to_owned());
     let dbos = DBOS::new(config);
     let example = dbos.register_workflow("ExampleWorkflow", example_workflow)?;
