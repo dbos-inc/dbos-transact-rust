@@ -8,8 +8,8 @@
 //! # Status
 //!
 //! Under construction. The system database layer landed first and the execution engine is
-//! being built on it; the lifecycle, registration, workflows, steps, events and recovery are
-//! here, with queues, the scheduler and the client arriving next.
+//! being built on it; the lifecycle, registration, workflows, steps, events, recovery and
+//! queues are here, with the client and the scheduler arriving next.
 //!
 //! # Cargo features
 //!
@@ -23,6 +23,8 @@ pub mod sysdb;
 
 #[cfg(feature = "engine")]
 mod config;
+#[cfg(feature = "engine")]
+mod connection;
 #[cfg(feature = "engine")]
 mod context;
 #[cfg(feature = "engine")]

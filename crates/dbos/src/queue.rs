@@ -21,6 +21,7 @@ use std::borrow::Cow;
 use std::result::Result as StdResult;
 use std::time::Duration;
 
+use crate::connection::Connection;
 use crate::dbos::DBOS;
 use crate::error::{Error, Result};
 use crate::sysdb::types::{
@@ -558,107 +559,21 @@ impl DBOS {
     /// ```
     pub async fn register_queue(&self, name: &str, options: QueueOptions) -> Result<Queue> {
         let executor = self.executor("register a queue")?;
-        if name == INTERNAL_QUEUE {
-            return Err(Error::Config(format!(
-                "the queue name `{name}` is reserved for the engine's internal queue"
-            )));
-        }
-        validate(name, &options)?;
-
-        let on_existing = match options.on_conflict {
-            QueueConflict::AlwaysUpdate => OnExistingQueue::Update,
-            QueueConflict::NeverUpdate => OnExistingQueue::Leave,
-            // **Resolved here rather than in the database**, because it is a question about *this
-            // process* — whether the version it is running is the one a new registration should
-            // speak for. The system database has no opinion about which of two live deployments
-            // is authoritative.
-            QueueConflict::UpdateIfLatestVersion => {
-                let latest = executor
-                    .sysdb()
-                    .get_latest_application_version(Some(executor.app_name()))
-                    .await
-                    .map_err(Error::SystemDatabase)?;
-                match latest {
-                    // The first registration of the first version: this process is the latest
-                    // because it is the only one.
-                    None => OnExistingQueue::Update,
-                    Some(latest) if latest.version_name == executor.app_version() => {
-                        OnExistingQueue::Update
-                    }
-                    // An older version registering behind a newer one. Leaving the row alone is
-                    // what keeps a rolling deploy from flapping.
-                    Some(latest) => {
-                        tracing::debug!(
-                            queue = name,
-                            version = executor.app_version(),
-                            latest = latest.version_name,
-                            "an older version registered this queue; its stored limits stand"
-                        );
-                        OnExistingQueue::Leave
-                    }
-                }
-            }
-        };
-
-        let created = executor
-            .sysdb()
-            .upsert_queue(
-                &NewQueue {
-                    concurrency: options.concurrency,
-                    worker_concurrency: options.worker_concurrency,
-                    polling_interval: options.polling_interval,
-                    rate_limit: options.rate_limit,
-                    priority_enabled: options.priority_enabled,
-                    // **Derived, never asked for.** Partitioning here *is* the per-partition
-                    // limits, so the column is written to agree with them — which is also what
-                    // makes the row legible to an implementation that still reads the flag.
-                    partition_queue: options.partition_concurrency.is_some()
-                        || options.partition_worker_concurrency.is_some()
-                        || options.partition_rate_limit.is_some(),
-                    partition_concurrency: options.partition_concurrency,
-                    partition_worker_concurrency: options.partition_worker_concurrency,
-                    partition_rate_limit: options.partition_rate_limit,
-                    application_name: Some(executor.app_name()),
-                    ..NewQueue::new(name)
-                },
-                on_existing,
-            )
+        executor
+            .connection()
+            .register_queue(name, options, Some(executor.app_version()))
             .await
-            .map_err(Error::SystemDatabase)?;
-
-        // Read back rather than echo: with `Leave`, and with a row a peer wrote, what this
-        // executor will actually dequeue under is the row, not the request.
-        let record = executor
-            .sysdb()
-            .get_queue(name)
-            .await
-            .map_err(Error::SystemDatabase)?
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "queue `{name}` is missing from the database after registering it"
-                ))
-            })?;
-
-        if created {
-            tracing::info!(queue = name, "registered a queue");
-        }
-        Ok(Queue::from_record(record))
     }
-}
 
-impl DBOS {
     /// The queue registered under this name, or `None` if there is none.
     ///
     /// Reads the row, so it reports what this executor's dequeues will actually honour — including
     /// changes a peer made since this process registered it.
     pub async fn queue(&self, name: &str) -> Result<Option<Queue>> {
-        let executor = self.executor("read a queue")?;
-        Ok(executor
-            .sysdb()
-            .get_queue(name)
+        self.executor("read a queue")?
+            .connection()
+            .queue(name)
             .await
-            .map_err(Error::SystemDatabase)?
-            .map(Queue::from_record))
     }
 
     /// Every queue this application can dequeue from.
@@ -669,16 +584,10 @@ impl DBOS {
     /// [`INTERNAL_QUEUE`] is **not** among them. It has no row, takes no limits, and is not a
     /// queue anybody registered.
     pub async fn list_queues(&self) -> Result<Vec<Queue>> {
-        let executor = self.executor("list queues")?;
-        Ok(executor
-            .sysdb()
-            .list_queues(&Applications::Unset)
+        self.executor("list queues")?
+            .connection()
+            .list_queues()
             .await
-            .map_err(Error::SystemDatabase)?
-            .into_iter()
-            .filter(|queue| queue.name != INTERNAL_QUEUE)
-            .map(Queue::from_record)
-            .collect())
     }
 
     /// Changes a registered queue's limits, leaving what the change does not name.
@@ -699,7 +608,172 @@ impl DBOS {
     /// `UpdateQueueConfig`; Python and TypeScript read and write separately and can store an
     /// incoherent pair.
     pub async fn update_queue(&self, name: &str, change: QueueChange) -> Result<Queue> {
-        let executor = self.executor("update a queue")?;
+        self.executor("update a queue")?
+            .connection()
+            .update_queue(name, change)
+            .await
+    }
+
+    /// Removes a queue's registration.
+    ///
+    /// Removing one that is not registered is not an error: the end state is what was asked for.
+    ///
+    /// **Workflows already enqueued on it are not touched.** They keep the queue name they were
+    /// given and stop being dequeued, because a worker only exists for a queue that has a row —
+    /// so deleting a queue with a backlog strands that backlog until the queue is registered
+    /// again. That is the same behaviour in every implementation, and it is why deleting is not
+    /// how you pause a queue.
+    pub async fn delete_queue(&self, name: &str) -> Result<()> {
+        self.executor("delete a queue")?
+            .connection()
+            .delete_queue(name)
+            .await
+    }
+}
+
+// The five operations below are methods on `Connection` rather than on a `DBOS` instance, because
+// a queue is a row and writing it needs nothing an executor has: a launched instance reaches them
+// through `DBOS::register_queue` and the rest, and the client that is coming will reach the same
+// five under the same names. The impl block lives here, next to the types it speaks in, which is
+// where this crate already puts `impl DBOS`. The public methods differ only in how they come by a
+// connection, and in the application version only one of them has.
+
+impl Connection {
+    /// Registers a queue, or reports the one already registered under this name.
+    ///
+    /// `app_version` is the caller's own, and `None` says it has none — which a client,
+    /// running none of the application's code, will be. It exists as a parameter rather than as
+    /// something read off the handle precisely so that such a caller can call this: only
+    /// [`QueueConflict::UpdateIfLatestVersion`] consults it, and that policy is refused when there
+    /// is nothing to consult.
+    pub(crate) async fn register_queue(
+        &self,
+        name: &str,
+        options: QueueOptions,
+        app_version: Option<&str>,
+    ) -> Result<Queue> {
+        if name == INTERNAL_QUEUE {
+            return Err(Error::Config(format!(
+                "the queue name `{name}` is reserved for the engine's internal queue"
+            )));
+        }
+        validate(name, &options)?;
+
+        let on_existing = match options.on_conflict {
+            QueueConflict::AlwaysUpdate => OnExistingQueue::Update,
+            QueueConflict::NeverUpdate => OnExistingQueue::Leave,
+            // **Resolved here rather than in the database**, because it is a question about *this
+            // process* — whether the version it is running is the one a new registration should
+            // speak for. The system database has no opinion about which of two live deployments
+            // is authoritative.
+            QueueConflict::UpdateIfLatestVersion => {
+                // **A handle with no application version cannot answer this question**, which is
+                // the case a client is: it runs none of the application's code, so there is no
+                // version of it to weigh against the registered ones. Python
+                // refuses the same combination in the same words — *"does not support
+                // on_conflict='update_if_latest_version' because clients are not associated with
+                // an application version"* — rather than picking a side quietly, and the two
+                // wrong guesses are both bad: updating lets a tool revert a running deployment's
+                // limits, and leaving makes an operator's deliberate change vanish.
+                let Some(version) = app_version else {
+                    return Err(Error::Config(format!(
+                        "registering queue `{name}`: `QueueConflict::UpdateIfLatestVersion` needs \
+                             an application version to compare against, and a client has none; ask \
+                             for `AlwaysUpdate` or `NeverUpdate`"
+                    )));
+                };
+                let latest = self
+                    .sysdb()
+                    .get_latest_application_version(self.app_name())
+                    .await
+                    .map_err(Error::SystemDatabase)?;
+                match latest {
+                    // The first registration of the first version: this process is the latest
+                    // because it is the only one.
+                    None => OnExistingQueue::Update,
+                    Some(latest) if latest.version_name == version => OnExistingQueue::Update,
+                    // An older version registering behind a newer one. Leaving the row alone is
+                    // what keeps a rolling deploy from flapping.
+                    Some(latest) => {
+                        tracing::debug!(
+                            queue = name,
+                            version,
+                            latest = latest.version_name,
+                            "an older version registered this queue; its stored limits stand"
+                        );
+                        OnExistingQueue::Leave
+                    }
+                }
+            }
+        };
+
+        let created = self
+            .sysdb()
+            .upsert_queue(
+                &NewQueue {
+                    concurrency: options.concurrency,
+                    worker_concurrency: options.worker_concurrency,
+                    polling_interval: options.polling_interval,
+                    rate_limit: options.rate_limit,
+                    priority_enabled: options.priority_enabled,
+                    // **Derived, never asked for.** Partitioning here *is* the per-partition
+                    // limits, so the column is written to agree with them — which is also what
+                    // makes the row legible to an implementation that still reads the flag.
+                    partition_queue: options.partition_concurrency.is_some()
+                        || options.partition_worker_concurrency.is_some()
+                        || options.partition_rate_limit.is_some(),
+                    partition_concurrency: options.partition_concurrency,
+                    partition_worker_concurrency: options.partition_worker_concurrency,
+                    partition_rate_limit: options.partition_rate_limit,
+                    application_name: self.app_name(),
+                    ..NewQueue::new(name)
+                },
+                on_existing,
+            )
+            .await
+            .map_err(Error::SystemDatabase)?;
+
+        // Read back rather than echo: with `Leave`, and with a row a peer wrote, what this
+        // executor will actually dequeue under is the row, not the request.
+        let record = self
+            .sysdb()
+            .get_queue(name)
+            .await
+            .map_err(Error::SystemDatabase)?
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "queue `{name}` is missing from the database after registering it"
+                ))
+            })?;
+
+        if created {
+            tracing::info!(queue = name, "registered a queue");
+        }
+        Ok(Queue::from_record(record))
+    }
+    /// The queue registered under this name, or `None` if there is none.
+    pub(crate) async fn queue(&self, name: &str) -> Result<Option<Queue>> {
+        Ok(self
+            .sysdb()
+            .get_queue(name)
+            .await
+            .map_err(Error::SystemDatabase)?
+            .map(Queue::from_record))
+    }
+    /// Every queue this handle's application can dequeue from, its own plus the unclaimed ones.
+    pub(crate) async fn list_queues(&self) -> Result<Vec<Queue>> {
+        Ok(self
+            .sysdb()
+            .list_queues(&Applications::Unset)
+            .await
+            .map_err(Error::SystemDatabase)?
+            .into_iter()
+            .filter(|queue| queue.name != INTERNAL_QUEUE)
+            .map(Queue::from_record)
+            .collect())
+    }
+    /// Changes a registered queue's limits, leaving what the change does not name.
+    pub(crate) async fn update_queue(&self, name: &str, change: QueueChange) -> Result<Queue> {
         if name == INTERNAL_QUEUE {
             return Err(Error::Config(format!(
                 "the queue name `{name}` is reserved for the engine's internal queue"
@@ -732,8 +806,8 @@ impl DBOS {
                 return Err(SysdbError::InvalidInput {
                     field: "partition_concurrency".into(),
                     detail: "this queue is registered with the deprecated `partition_queue` flag, \
-                             under which its queue-wide limits already apply per partition; \
-                             re-register it with the per-partition limits instead"
+                                 under which its queue-wide limits already apply per partition; \
+                                 re-register it with the per-partition limits instead"
                         .to_owned(),
                 });
             }
@@ -771,7 +845,7 @@ impl DBOS {
 
         // The row as written, so there is no read back to do: it left the transaction that wrote
         // it, which is a stronger guarantee than re-reading afterwards ever was.
-        let record = executor
+        let record = self
             .sysdb()
             .update_queue(name, &update, &validate)
             .await
@@ -789,25 +863,14 @@ impl DBOS {
         tracing::info!(queue = name, "updated the queue's limits");
         Ok(Queue::from_record(record))
     }
-
     /// Removes a queue's registration.
-    ///
-    /// Removing one that is not registered is not an error: the end state is what was asked for.
-    ///
-    /// **Workflows already enqueued on it are not touched.** They keep the queue name they were
-    /// given and stop being dequeued, because a worker only exists for a queue that has a row —
-    /// so deleting a queue with a backlog strands that backlog until the queue is registered
-    /// again. That is the same behaviour in every implementation, and it is why deleting is not
-    /// how you pause a queue.
-    pub async fn delete_queue(&self, name: &str) -> Result<()> {
-        let executor = self.executor("delete a queue")?;
+    pub(crate) async fn delete_queue(&self, name: &str) -> Result<()> {
         if name == INTERNAL_QUEUE {
             return Err(Error::Config(format!(
                 "the queue name `{name}` is reserved for the engine's internal queue"
             )));
         }
-        executor
-            .sysdb()
+        self.sysdb()
             .delete_queue(name)
             .await
             .map_err(Error::SystemDatabase)?;

@@ -5,7 +5,8 @@
 //! executor and the step-id sequence from the ambient context, so a workflow body needs no
 //! handle to anything. [`DBOS::get_event`] is the instance method for the other reader — an HTTP
 //! handler polling for progress, outside any workflow, where there is nothing ambient to take an
-//! executor from.
+//! executor from. A fourth is coming: the same reader from outside the application altogether,
+//! where there is not even an instance, which is why the read itself belongs to the connection.
 //!
 //! **The free reader is not just symmetry.** The registry lives on the instance, so a registered
 //! closure that captures a [`DBOS`] is stored inside the very `Arc` it holds a strong reference
@@ -25,8 +26,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
+use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::dbos::Executor;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::GetEventCaller;
@@ -111,7 +112,10 @@ where
         });
     };
     let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
-    read(ctx.executor(), workflow_id, key, timeout, caller).await
+    ctx.executor()
+        .connection()
+        .read_event(workflow_id, key, timeout, caller)
+        .await
 }
 
 impl DBOS {
@@ -155,7 +159,10 @@ impl DBOS {
             });
         }
         let caller = ctx.as_ref().map(caller_for);
-        read(&executor, workflow_id, key, timeout, caller).await
+        executor
+            .connection()
+            .read_event(workflow_id, key, timeout, caller)
+            .await
     }
 }
 
@@ -171,25 +178,31 @@ fn caller_for(ctx: &Ctx) -> GetEventCaller<'_> {
     }
 }
 
-/// The read itself, shared by both surfaces.
-///
-/// `sysdb` owns the blocking wait and the replay skip, so what is left here is decoding what it
-/// found. Generic over the caller's error channel for the same reason [`decode`] is: the failure
-/// is an engine variant either way, and `E` only says which channel it travels in.
-async fn read<T: DeserializeOwned, E>(
-    executor: &Executor,
-    workflow_id: &str,
-    key: &str,
-    timeout: Duration,
-    caller: Option<GetEventCaller<'_>>,
-) -> Result<Option<T>, E> {
-    match executor
-        .sysdb()
-        .get_event(workflow_id, key, timeout, caller)
-        .await
-        .map_err(Error::SystemDatabase)?
-    {
-        None => Ok(None),
-        Some(found) => decode(Some(&found.value), "event value").map(Some),
+impl Connection {
+    /// The read itself, shared by every surface that has one.
+    ///
+    /// `sysdb` owns the blocking wait and the replay skip, so what is left here is decoding what it
+    /// found. Generic over the caller's error channel for the same reason [`decode`] is: the
+    /// failure is an engine variant either way, and `E` only says which channel it travels in.
+    ///
+    /// On the connection because a read is all it is: the free [`get_event`] reaches it through the
+    /// ambient context's and [`DBOS::get_event`] through its executor's, and a caller that has a
+    /// connection and nothing else will reach it through the only one it has.
+    pub(crate) async fn read_event<T: DeserializeOwned, E>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        timeout: Duration,
+        caller: Option<GetEventCaller<'_>>,
+    ) -> Result<Option<T>, E> {
+        match self
+            .sysdb()
+            .get_event(workflow_id, key, timeout, caller)
+            .await
+            .map_err(Error::SystemDatabase)?
+        {
+            None => Ok(None),
+            Some(found) => decode(Some(&found.value), "event value").map(Some),
+        }
     }
 }
