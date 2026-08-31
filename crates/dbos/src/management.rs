@@ -168,7 +168,7 @@ pub struct ResumeOptions<'a> {
     /// A named queue is how a resumed workflow is made to wait its turn: the internal queue takes
     /// no limits, so resuming a large backlog onto it re-enqueues everything and then dequeues
     /// everything. Sending it to a queue with a concurrency limit is the way to resume a backlog
-    /// without flooding the fleet — and, with an `application_version`-eligible executor pool, the
+    /// without flooding the fleet — and, with an `app_version`-eligible executor pool, the
     /// way to steer resumed work at a particular deployment.
     pub queue: Option<&'a str>,
 }
@@ -200,7 +200,7 @@ pub struct ForkOptions<'a> {
     ///
     /// **This is what forking is usually for.** A workflow that failed against broken code is
     /// forked onto the fixed deployment, and only executors running that version will dequeue it.
-    pub application_version: Option<&'a str>,
+    pub app_version: Option<&'a str>,
     /// The queue the fork is enqueued on. `None` is the engine's internal queue.
     pub queue: Option<&'a str>,
     /// How long the fork may run once it starts.
@@ -425,7 +425,7 @@ impl DBOS {
     /// steps replay rather than run, so the fork arrives at the fork point in the state the
     /// original was in, and carries on from a moment that has already happened. Re-running failed
     /// work against fixed code is what it is for, which is why
-    /// [`ForkOptions::application_version`] exists.
+    /// [`ForkOptions::app_version`] exists.
     ///
     /// The source is not modified beyond being marked as forked from; the fork gets its own id,
     /// generated unless [`ForkOptions::forked_id`] names one — which only the fork points that
@@ -445,7 +445,7 @@ impl DBOS {
     /// let handle = dbos.fork_with::<u32, dbos::EngineOnly>(
     ///     "failed-workflow",
     ///     dbos::ForkFrom::LastFailure,
-    ///     dbos::ForkOptions { application_version: Some("v2"), ..Default::default() },
+    ///     dbos::ForkOptions { app_version: Some("v2"), ..Default::default() },
     /// ).await?;
     /// # Ok(()) }
     /// ```
@@ -484,7 +484,7 @@ impl DBOS {
     /// [`ForkOptions::forked_id`] is refused here: one id cannot name many forks, and generating
     /// them silently would hand back a fork under an id the caller did not ask for. Every other
     /// option applies to the whole batch, which is what makes
-    /// [`application_version`](ForkOptions::application_version) useful — re-running a fan-out
+    /// [`app_version`](ForkOptions::app_version) useful — re-running a fan-out
     /// against the deployment that fixes it is the case this method exists for.
     pub async fn fork_all<R, E>(
         &self,
@@ -747,7 +747,7 @@ async fn fork_batch(
     options: &ForkOptions<'_>,
 ) -> Result<Vec<String>> {
     let sys_options = SysForkOptions {
-        application_version: options.application_version,
+        application_version: options.app_version,
         queue_name: options.queue,
         queue_partition_key: None,
         timeout: options.timeout,
