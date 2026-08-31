@@ -1261,6 +1261,22 @@ async fn ids(
         .collect()
 }
 
+/// The filter a recovery sweep is keyed on: this executor's `PENDING` rows at this version.
+///
+/// There is no dedicated query for it. `Applications::Unset` supplies the application scope,
+/// which is the part that matters — `executor_id` defaults to `"local"`, so two applications on
+/// one machine present the same executor here.
+fn pending<'a>(executor_id: &'a str, application_version: &'a str) -> WorkflowFilter<'a> {
+    WorkflowFilter {
+        status: vec![WorkflowStatus::Pending],
+        executor_ids: vec![executor_id],
+        application_versions: vec![application_version],
+        load_input: false,
+        load_output: false,
+        ..WorkflowFilter::default()
+    }
+}
+
 /// Every filter narrows to what it claims to.
 ///
 /// One test rather than twenty-odd, because the value here is coverage of the *set*: the filters
@@ -2550,9 +2566,9 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
         .await
         .unwrap();
 
-    let pending = sys.get_pending_workflows("alpha", "v1").await.unwrap();
+    let found = ids(&sys, &pending("alpha", "v1")).await;
     assert_eq!(
-        pending,
+        found,
         ["wf-mine"],
         "another executor's work, another version's work, and finished work are all excluded",
     );
@@ -2988,7 +3004,7 @@ async fn authenticated_roles_are_encoded_by_this_layer() {
 /// A duplicate submission does not take the executor stamp from the executor that owns the work.
 ///
 /// The upsert would otherwise hand `executor_id` to whoever submitted last. That misdirects
-/// recovery: `get_pending_workflows` keys on `executor_id`, so the owner's sweep would stop
+/// recovery: the recovery sweep keys on `executor_id`, so the owner's sweep would stop
 /// finding the workflow and the submitter's would start.
 ///
 /// A deliberate divergence — Java and TypeScript reach this outcome by rolling their transaction
@@ -3030,15 +3046,10 @@ async fn a_duplicate_submission_does_not_steal_the_executor_stamp() {
     );
     // Which is what keeps recovery pointed at the right executor.
     assert_eq!(
-        sys.get_pending_workflows("executor-a", "v1").await.unwrap(),
+        ids(&sys, &pending("executor-a", "v1")).await,
         ["wf-owned-elsewhere"],
     );
-    assert!(
-        sys.get_pending_workflows("executor-b", "v1")
-            .await
-            .unwrap()
-            .is_empty(),
-    );
+    assert!(ids(&sys, &pending("executor-b", "v1")).await.is_empty());
 
     // Recovery and dequeue *are* being told they own it, so they claim the stamp.
     let recovering = NewWorkflow {
@@ -6597,7 +6608,7 @@ async fn recovery_does_not_reach_across_applications() {
             .unwrap();
     }
 
-    let mut found = alpha.get_pending_workflows("local", "v1").await.unwrap();
+    let mut found = ids(&alpha, &pending("local", "v1")).await;
     found.sort();
     assert_eq!(
         found,
@@ -6606,10 +6617,7 @@ async fn recovery_does_not_reach_across_applications() {
     );
 
     // A handle with no application of its own is not scoped to anything, so it sees all three.
-    let mut all = anonymous
-        .get_pending_workflows("local", "v1")
-        .await
-        .unwrap();
+    let mut all = ids(&anonymous, &pending("local", "v1")).await;
     all.sort();
     assert_eq!(all, ["wf-alpha", "wf-beta", "wf-nobody"]);
 }
@@ -7108,8 +7116,7 @@ async fn a_workflow_can_be_enqueued_for_another_application() {
     }
 
     // And alpha's recovery sweep leaves beta's workflow alone, even though alpha wrote it.
-    let pending = alpha.get_pending_workflows("local", "v1").await.unwrap();
-    assert_eq!(pending, ["wf-for-alpha"]);
+    assert_eq!(ids(&alpha, &pending("local", "v1")).await, ["wf-for-alpha"]);
 }
 
 /// Two applications racing to claim one unclaimed version: exactly one gets it.
