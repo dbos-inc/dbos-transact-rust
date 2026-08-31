@@ -8,10 +8,14 @@ use dbos::{Config, DBOS};
 
 use dbos_test_support::{TestDatabase, test_database};
 
+/// The version every instance in this file launches with: required now that DBOS computes none,
+/// and shared so that a relaunch recovers what the previous launch left behind.
+const APP_VERSION: &str = "1.0.0";
+
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
-        ..Config::new(app_name, db.url())
+        ..Config::new(app_name, APP_VERSION, db.url())
     }
 }
 

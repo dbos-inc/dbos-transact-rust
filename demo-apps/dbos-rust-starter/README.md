@@ -47,9 +47,10 @@ button, reached deliberately.
 
 ## The application version
 
-The app pins its application version to `0.1.0` (override with `DBOS__APPVERSION`). DBOS defaults
-the version to a hash of the running executable, and recovery only resumes workflows stamped with
-its own version — the right rule in production, where a changed binary may contain a changed
-workflow. For this demo it would be a trap: rebuild between the crash and the restart and the old
-build's `PENDING` workflows wait for a binary that no longer exists, which looks exactly like
-broken recovery. Pinning makes every `cargo run` the same version.
+The app runs as its crate version, `CARGO_PKG_VERSION` (override with `DBOS__APPVERSION`). DBOS
+requires a version and computes none: recovery only resumes workflows stamped with the running
+executor's own version, which is the right rule in production, where changed code may contain a
+changed workflow — and it means the value has to be something the application controls. The crate
+version is that: it changes when a release says the code changed, so every `cargo run` of one
+build is the same version, and the crash button's `PENDING` workflows are still this executor's to
+recover after a rebuild.

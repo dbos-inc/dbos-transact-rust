@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::config::{APP_VERSION_ENV, Config, Serializer};
+use crate::config::{Config, Serializer};
 use crate::registry::{Registry, Snapshot};
 use crate::sysdb::{SystemDatabase, postgres};
 use crate::workflow::Tasks;
@@ -51,10 +51,7 @@ impl Executor {
             .executor_id
             .clone()
             .unwrap_or_else(|| "local".to_owned());
-        let app_version = match &config.app_version {
-            Some(version) => version.clone(),
-            None => compute_app_version(&config.app_name).await?,
-        };
+        let app_version = config.app_version.clone();
 
         let sysdb = postgres::PostgresSystemDatabase::connect(&postgres::Config {
             url: &config.database_url,
@@ -147,9 +144,9 @@ impl Executor {
     ///
     /// **`app_` here, `application_` in `sysdb`**, and the two meet at exactly this call: the
     /// engine names the pair [`app_name`](Self::app_name) and `app_version`, matching
-    /// [`APP_VERSION_ENV`] and the `DBOS__APPVERSION` every implementation reads, while `sysdb`
-    /// spells them `application_name` and `application_version` because those are the columns'
-    /// own names. The conversion happens where a value crosses into a `sysdb` type —
+    /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV) and the `DBOS__APPVERSION` every
+    /// implementation reads, while `sysdb` spells them `application_name` and
+    /// `application_version` because those are the columns' own names. The conversion happens where a value crosses into a `sysdb` type —
     /// `NewWorkflow { application_version: Some(executor.app_version()), .. }` — which is the
     /// same boundary every other schema word stops at.
     pub fn app_version(&self) -> &str {
@@ -463,69 +460,12 @@ async fn register_version(sysdb: &impl SystemDatabase, version: &str) -> Result<
     Ok(())
 }
 
-/// The SHA-256 of the running executable, with the application name mixed in.
-///
-/// Go's rule, plus §4.14's application name — without which two applications shipping one binary
-/// would share a version, and each would treat the other's workflows as its own to recover.
-///
-/// Hashing the *binary* is the strictest reading of "the code that started this workflow", and it
-/// is what makes recovery safe across a deploy. It is also why development wants
-/// `DBOS__APPVERSION`: a rebuild changes the hash, so a crash and a restart around one leave the
-/// earlier run's `PENDING` rows to an executor that no longer exists.
-async fn compute_app_version(app_name: &str) -> Result<String> {
-    let app_name = app_name.to_owned();
-    // Reading a binary is blocking and it can be tens of megabytes; launching is exactly the moment
-    // where a stalled runtime is least visible.
-    tokio::task::spawn_blocking(move || {
-        use sha2::Digest as _;
-
-        use std::io::Read as _;
-
-        let exe = std::env::current_exe().map_err(|e| version_error("find", &e))?;
-        let mut file = std::fs::File::open(&exe).map_err(|e| version_error("read", &e))?;
-        let mut hasher = sha2::Sha256::new();
-        // The name and the bytes are separated by a byte that cannot appear in a name, so that no
-        // two (name, binary) pairs can produce the same input.
-        hasher.update(app_name.as_bytes());
-        hasher.update([0u8]);
-
-        // In chunks rather than into memory: an executable is tens of megabytes, and there is
-        // nothing to be gained by holding all of it at once.
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let read = file
-                .read(&mut chunk)
-                .map_err(|e| version_error("read", &e))?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&chunk[..read]);
-        }
-
-        let mut hex = String::with_capacity(64);
-        for byte in hasher.finalize() {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{byte:02x}");
-        }
-        Ok(hex)
-    })
-    .await
-    .map_err(|e| Error::Config(format!("could not compute the application version: {e}")))?
-}
-
-fn version_error(verb: &str, cause: &std::io::Error) -> Error {
-    Error::Config(format!(
-        "could not {verb} the running executable to compute the application version ({cause}); \
-         set `app_version`, or the {APP_VERSION_ENV} environment variable"
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn config() -> Config {
-        Config::new("test-app", "postgres://localhost/nothing")
+        Config::new("test-app", "1.0.0", "postgres://localhost/nothing")
     }
 
     #[tokio::test]
@@ -575,28 +515,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_config_is_refused_before_anything_is_connected() {
-        let dbos = DBOS::new(Config::new("No", "postgres://localhost/nothing"));
+        let dbos = DBOS::new(Config::new("No", "1.0.0", "postgres://localhost/nothing"));
         let err = dbos.launch().await.unwrap_err();
         assert!(matches!(err, Error::Config(_)), "{err}");
         assert!(!dbos.is_launched());
-    }
-
-    #[tokio::test]
-    async fn the_version_is_the_executable_hash_and_it_is_stable_across_calls() {
-        let once = compute_app_version("test-app").await.unwrap();
-        let twice = compute_app_version("test-app").await.unwrap();
-        assert_eq!(once, twice);
-        assert_eq!(once.len(), 64, "a SHA-256 in hex");
-        assert!(once.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[tokio::test]
-    async fn the_application_name_mixes_into_the_version() {
-        // Two applications shipping one binary must not share a version, or each would treat the
-        // other's abandoned workflows as its own to recover.
-        let one = compute_app_version("app-one").await.unwrap();
-        let other = compute_app_version("app-two").await.unwrap();
-        assert_ne!(one, other);
     }
 
     /// The registry lives on the instance, so anything a registered closure captures is held by
@@ -621,7 +543,11 @@ mod tests {
 
     #[test]
     fn debug_does_not_print_the_database_url() {
-        let dbos = DBOS::new(Config::new("test-app", "postgres://user:hunter2@host/db"));
+        let dbos = DBOS::new(Config::new(
+            "test-app",
+            "1.0.0",
+            "postgres://user:hunter2@host/db",
+        ));
         let shown = format!("{dbos:?}");
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(shown.contains("test-app"), "{shown}");

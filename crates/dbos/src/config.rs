@@ -75,7 +75,7 @@ impl Serializer {
 ///
 /// ```no_run
 /// # use dbos::Config;
-/// let config = Config { max_connections: 20, ..Config::from_env("my-app") };
+/// let config = Config { max_connections: 20, ..Config::from_env("my-app", "1.0.0") };
 /// ```
 ///
 /// **Deliberately not `#[non_exhaustive]`.** That attribute forbids struct-literal construction
@@ -115,15 +115,23 @@ pub struct Config {
 
     /// The version of the application's code.
     ///
-    /// `None` computes it: the SHA-256 of the running executable, with [`app_name`](Self::app_name)
-    /// mixed in so two applications shipping the same binary do not share a version.
+    /// **Required, and never computed.** A workflow is only recovered by an executor running the
+    /// version that started it, which is what makes a rolling deploy safe — so the value decides
+    /// which processes may pick up which work, and an application is the only thing that knows
+    /// when its code changed in a way that matters.
     ///
-    /// A workflow is only recovered by an executor running the version that started it, which is
-    /// what makes a rolling deploy safe. The consequence in development is worth knowing: rebuild
-    /// between a crash and a restart and the new binary hashes differently, so the previous run's
-    /// `PENDING` rows are left for an executor that no longer exists. Set this — or
-    /// `DBOS__APPVERSION`, which [`from_env`](Self::from_env) reads — to pin it while developing.
-    pub app_version: Option<String>,
+    /// The other implementations default it to a hash of the application's code, and that is the
+    /// mistake this does not repeat. In Rust there is nothing to hash but the executable, and a
+    /// Rust build is not reproducible: the same source compiles to a different binary, so the
+    /// version would change under a rebuild that changed nothing, stranding the previous run's
+    /// `PENDING` rows with an executor that no longer exists. Hashing tens of megabytes on every
+    /// launch to arrive at that is the second cost.
+    ///
+    /// `env!("CARGO_PKG_VERSION")` is the obvious value for an application that ships as a crate;
+    /// a deployment that ships per commit usually wants the commit sha, baked in at build time or
+    /// handed to it in the environment. [`from_env`](Self::from_env) reads `DBOS__APPVERSION`,
+    /// which is what a DBOS deployment sets.
+    pub app_version: String,
 
     /// How payloads are encoded.
     pub serializer: Serializer,
@@ -184,16 +192,20 @@ pub struct Config {
 }
 
 impl Config {
-    /// A configuration with the defaults every implementation shares, for an application named
-    /// `app_name`, reaching the database at `database_url`.
-    pub fn new(app_name: impl Into<String>, database_url: impl Into<String>) -> Self {
+    /// A configuration with the defaults every implementation shares, for version `app_version` of
+    /// an application named `app_name`, reaching the database at `database_url`.
+    pub fn new(
+        app_name: impl Into<String>,
+        app_version: impl Into<String>,
+        database_url: impl Into<String>,
+    ) -> Self {
         Self {
             app_name: app_name.into(),
+            app_version: app_version.into(),
             database_url: database_url.into(),
             max_connections: 10,
             schema: DEFAULT_SCHEMA.to_owned(),
             executor_id: None,
-            app_version: None,
             serializer: Serializer::default(),
             use_listen_notify: true,
             migrate: true,
@@ -204,21 +216,26 @@ impl Config {
         }
     }
 
-    /// [`Config::new`], taking the database URL from `DBOS_DATABASE_URL` and the application
-    /// version from `DBOS__APPVERSION`.
+    /// [`Config::new`], taking the database URL from `DBOS_DATABASE_URL` and preferring the
+    /// application version in `DBOS__APPVERSION` over `app_version` when that variable is set to
+    /// something non-empty.
+    ///
+    /// The version is still a parameter rather than a bare environment read: a process launched
+    /// without `DBOS__APPVERSION` — every `cargo run` — must still have a version, and the
+    /// application is what knows it. The variable is how a deployment overrides that.
     ///
     /// A missing or empty `DBOS_DATABASE_URL` leaves [`database_url`](Self::database_url) empty
     /// rather than failing here, so that a caller who sets it afterwards is not forced through an
     /// error path. [`launch`](crate::DBOS::launch) is where an empty URL is reported, which is also
     /// where it would have failed anyway.
-    pub fn from_env(app_name: impl Into<String>) -> Self {
+    pub fn from_env(app_name: impl Into<String>, app_version: impl Into<String>) -> Self {
         let url = std::env::var(DATABASE_URL_ENV).unwrap_or_default();
         let version = std::env::var(APP_VERSION_ENV)
             .ok()
             .filter(|v| !v.is_empty());
-        Self {
-            app_version: version,
-            ..Self::new(app_name, url)
+        match version {
+            Some(version) => Self::new(app_name, version, url),
+            None => Self::new(app_name, app_version, url),
         }
     }
 
@@ -231,6 +248,13 @@ impl Config {
             )));
         }
         validate_app_name(&self.app_name)?;
+        if self.app_version.is_empty() {
+            return Err(crate::Error::Config(format!(
+                "`app_version` cannot be empty: give one to `Config::new`, or set the \
+                 {APP_VERSION_ENV} environment variable if the configuration came from \
+                 `Config::from_env`"
+            )));
+        }
         if self.schema.is_empty() {
             return Err(crate::Error::Config("`schema` cannot be empty".to_owned()));
         }
@@ -315,7 +339,7 @@ mod tests {
 
     #[test]
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
-        let err = Config::new("app", "").validate().unwrap_err();
+        let err = Config::new("app", "1.0.0", "").validate().unwrap_err();
         assert!(err.to_string().contains(DATABASE_URL_ENV), "{err}");
     }
 
@@ -323,7 +347,7 @@ mod tests {
     fn a_zero_outcome_poll_interval_is_a_busy_loop_and_is_refused() {
         let config = |outcome_poll_interval| Config {
             outcome_poll_interval,
-            ..Config::new("app", "postgres://x")
+            ..Config::new("app", "1.0.0", "postgres://x")
         };
         assert_eq!(
             config(None).outcome_poll_interval(),
@@ -343,10 +367,21 @@ mod tests {
     }
 
     #[test]
+    fn a_version_is_required_because_nothing_computes_one() {
+        let err = Config {
+            app_version: String::new(),
+            ..Config::new("app", "1.0.0", "postgres://x")
+        }
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("app_version"), "{err}");
+    }
+
+    #[test]
     fn functional_update_is_the_documented_way_to_adjust_a_config() {
         let config = Config {
             max_connections: 20,
-            ..Config::new("app", "postgres://x")
+            ..Config::new("app", "1.0.0", "postgres://x")
         };
         assert_eq!(config.max_connections, 20);
         assert_eq!(config.app_name, "app");

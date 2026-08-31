@@ -49,10 +49,13 @@ const ENQUEUE_BATCH: usize = 5;
 /// from the standard libpq variables, such as PGUSER and PGPASSWORD.
 const DEFAULT_DATABASE_URL: &str = "postgres://localhost:5432/dbos_rust_starter";
 
-/// Pinning the version matters here more than in most apps: it defaults to a hash of the
-/// executable, and recovery only resumes workflows stamped with its own version — so a rebuild
-/// between the crash and the restart would look exactly like broken recovery.
-const DEFAULT_APP_VERSION: &str = "0.1.0";
+/// The version this build of the application is, which `DBOS__APPVERSION` overrides.
+///
+/// Every application has to give one — DBOS computes none — and recovery only resumes workflows
+/// stamped with the running executor's own version, so the crate's version is the natural answer:
+/// it changes when a release says the code changed, not when the compiler happens to emit
+/// different bytes.
+const DEFAULT_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A durable workflow, resilient to any failure: if the program is crashed, interrupted, or
 /// restarted while it runs, it automatically resumes from the last completed step.
@@ -119,13 +122,10 @@ struct App {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let mut config = Config::from_env("dbos-rust-starter");
+    let mut config = Config::from_env("dbos-rust-starter", DEFAULT_APP_VERSION);
     if config.database_url.is_empty() {
         config.database_url = DEFAULT_DATABASE_URL.to_owned();
     }
-    config
-        .app_version
-        .get_or_insert_with(|| DEFAULT_APP_VERSION.to_owned());
     let dbos = DBOS::new(config);
     let example = dbos.register_workflow("ExampleWorkflow", example_workflow)?;
     let enqueued = dbos.register_workflow("EnqueuedWorkflow", enqueued_workflow)?;

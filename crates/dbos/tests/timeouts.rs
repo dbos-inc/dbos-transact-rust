@@ -10,10 +10,14 @@ use dbos::{Config, DBOS, Error, StepOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
+/// The version every instance in this file launches with: required now that DBOS computes none,
+/// and shared so that a relaunch recovers what the previous launch left behind.
+const APP_VERSION: &str = "1.0.0";
+
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
-        ..Config::new(app_name, db.url())
+        ..Config::new(app_name, APP_VERSION, db.url())
     }
 }
 
@@ -269,7 +273,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
         migrate: false,
         // Poll briskly, so the test is not waiting out the one-second default.
         outcome_poll_interval: Some(Duration::from_millis(20)),
-        ..Config::new("preempt-app", db.url())
+        ..Config::new("preempt-app", APP_VERSION, db.url())
     });
     let entered = Arc::new(tokio::sync::Notify::new());
     let dbos_entered = Arc::clone(&entered);

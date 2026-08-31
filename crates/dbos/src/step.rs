@@ -699,7 +699,7 @@ mod tests {
         let db = dbos_test_support::test_database().await;
         let dbos = DBOS::new(Config {
             migrate: false,
-            ..Config::new("step-test", db.url())
+            ..Config::new("step-test", "1.0.0", db.url())
         });
         dbos.launch().await.expect("launch failed");
         dbos.executor("test")
