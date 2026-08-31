@@ -5093,6 +5093,21 @@ impl SystemDatabase for PostgresSystemDatabase {
             // One statement for the batch rather than one per workflow: every limit above has
             // already bounded `max_tasks`, so nothing is left to stop this part-way through.
             //
+            // **`recovery_attempts` is counted here, and only here.** This is the transition
+            // that starts a workflow, and since recovery re-enqueues rather than re-invoking, it
+            // is the transition every recovered workflow makes too — so a budget counted anywhere
+            // else is a budget never spent. `init_workflow`'s `ON CONFLICT` deliberately does not
+            // count it: that arm is Java's, and Java can own the count because Java re-invokes a
+            // `PENDING` row instead of re-enqueueing it, so its upsert sees the claim this
+            // statement sees. The three implementations that re-enqueue all count in their claim
+            // exactly here — go `system_database.go:4987`, ts `system_database.ts:3726` and
+            // `:3900`, python `_sys_db.py:4728`, whose comment says it outright: *"Count this
+            // dispatch against the DLQ limit; no later insert does it."*
+            //
+            // The `ENQUEUED` guard is what makes it correct rather than merely present: a peer
+            // that won the race has already moved the row, so a loser matches nothing and charges
+            // the workflow nothing.
+            //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
             // already moved the row, and re-dispatching it would run the workflow twice.
             // `COALESCE` claims an unclaimed row, which is what drains work a nameless client
@@ -5107,6 +5122,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                          started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = $4, \
                          updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $1), \
+                         recovery_attempts = recovery_attempts + 1, \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
@@ -5382,12 +5398,17 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                 // `RETURNING` reports exactly the rows this statement flipped, which is what
                 // makes the guard the admission control rather than a check before one.
+                //
+                // Counts `recovery_attempts` for the reason the unpartitioned sweep gives, and
+                // both count because both are claims: TypeScript increments in each of its two
+                // as well.
                 let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
                          started_at_epoch_ms = {NOW_MS_SQL}, rate_limited = FALSE, \
                          updated_at = {NOW_MS_SQL}, \
                          application_name = COALESCE(application_name, $4), \
+                         recovery_attempts = recovery_attempts + 1, \
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
