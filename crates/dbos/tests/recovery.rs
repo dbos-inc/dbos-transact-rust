@@ -242,14 +242,20 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
     let reader = reader(&db).await;
 
     let entered = Arc::new(AtomicU32::new(0));
+    // The body signals its own entry: the row turns PENDING when the workflow is started, well
+    // before the task that runs it is scheduled, so the row is no evidence that the body ran.
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
     let build = |db: &TestDatabase| {
         let dbos = DBOS::new(config("recovery-reenqueue-app", db));
         let entered = Arc::clone(&entered);
+        let reached = Arc::clone(&reached_gate);
         let workflow = dbos
             .register_workflow("held", move |()| {
                 let entered = Arc::clone(&entered);
+                let reached = Arc::clone(&reached);
                 async move {
                     entered.fetch_add(1, Ordering::SeqCst);
+                    reached.notify_one();
                     // Long enough that shutdown catches it mid-flight.
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     Ok::<u32, Error>(1)
@@ -272,6 +278,9 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
         )
         .await
         .expect("start failed");
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the workflow never entered its body");
     await_status(&reader, id, WorkflowStatus::Pending).await;
     // Aborts the task without writing anything durable, so the row stays PENDING.
     first.shutdown().await;
@@ -281,16 +290,15 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
     let (second, _workflow) = build(&db);
     second.launch().await.expect("relaunch failed");
 
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the workflow did not run again after being recovered");
+    assert_eq!(entered.load(Ordering::SeqCst), 2);
     let row = await_status(&reader, id, WorkflowStatus::Pending).await;
     assert_eq!(
         row.queue_name.as_deref(),
         Some(INTERNAL_QUEUE),
         "recovery ran the workflow in place instead of returning it to a queue"
-    );
-    assert_eq!(
-        entered.load(Ordering::SeqCst),
-        2,
-        "the workflow did not run again after being recovered"
     );
 
     second.shutdown().await;
