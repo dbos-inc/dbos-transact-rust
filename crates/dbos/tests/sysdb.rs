@@ -251,6 +251,141 @@ async fn exceeding_the_recovery_limit_parks_the_workflow() {
     assert_eq!(read.queue_name, None, "parking clears the queue assignment");
 }
 
+/// **The dequeue claim is what counts against the recovery budget.**
+///
+/// Recovery re-enqueues rather than re-invoking, so this transition is the one every recovered
+/// workflow makes — and until the claim counted it, `recovery_attempts` never moved for a queued
+/// workflow at all. Python, TypeScript and Go all count in their claim; Python's says so outright:
+/// *"Count this dispatch against the DLQ limit; no later insert does it."*
+#[tokio::test]
+async fn the_dequeue_claim_counts_an_attempt() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("counted"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let enqueued = sys
+        .init_workflow(
+            &NewWorkflow {
+                queue_name: Some("counted"),
+                ..workflow("wf-counted")
+            },
+            None,
+            Submission::Fresh,
+        )
+        .await
+        .expect("enqueue failed");
+    assert_eq!(
+        enqueued.recovery_attempts, 0,
+        "enqueueing is not an attempt: nothing has run yet",
+    );
+
+    let queue = sys.get_queue("counted").await.unwrap().unwrap();
+    let claimed = sys
+        .start_queued_workflows(&queue, "local", "v1", None, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(claimed, ["wf-counted"]);
+
+    let row = sys.get_workflow("wf-counted").await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Pending);
+    assert_eq!(
+        row.recovery_attempts, 1,
+        "the claim that starts the workflow is the attempt",
+    );
+}
+
+/// A claim that flips nothing charges nothing, which the `ENQUEUED` guard gives for free.
+#[tokio::test]
+async fn a_claim_that_wins_nothing_counts_nothing() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("raced"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    sys.init_workflow(
+        &NewWorkflow {
+            queue_name: Some("raced"),
+            ..workflow("wf-raced")
+        },
+        None,
+        Submission::Fresh,
+    )
+    .await
+    .unwrap();
+    let queue = sys.get_queue("raced").await.unwrap().unwrap();
+
+    let winner = sys
+        .start_queued_workflows(&queue, "winner", "v1", None, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(winner, ["wf-raced"]);
+    // The row is `PENDING` now, so the loser's guard matches nothing.
+    let loser = sys
+        .start_queued_workflows(&queue, "loser", "v1", None, 0, 0)
+        .await
+        .unwrap();
+    assert!(loser.is_empty(), "the second claim should have won nothing");
+
+    let row = sys.get_workflow("wf-raced").await.unwrap().unwrap();
+    assert_eq!(
+        row.recovery_attempts, 1,
+        "a claim that ran nothing must not spend the budget",
+    );
+}
+
+/// Re-enqueue and re-dequeue is what recovery now looks like, and enough of it parks the workflow.
+///
+/// The end of the path this counting exists for: without it the loop below runs forever with
+/// `recovery_attempts` stuck at zero, and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` is unreachable.
+#[tokio::test]
+async fn repeated_recoveries_through_the_queue_park_the_workflow() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("parking"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let queued = NewWorkflow {
+        queue_name: Some("parking"),
+        ..workflow("wf-parked")
+    };
+    sys.init_workflow(&queued, None, Submission::Fresh)
+        .await
+        .unwrap();
+    let queue = sys.get_queue("parking").await.unwrap().unwrap();
+
+    // A limit of one permits one recovery past the first dispatch — the check is
+    // `recovery_attempts > limit + 1` — so the third claim is the one too many.
+    let mut last = Ok(());
+    for _ in 0..5 {
+        let claimed = sys
+            .start_queued_workflows(&queue, "local", "v1", None, 0, 0)
+            .await
+            .unwrap();
+        if claimed.is_empty() {
+            break;
+        }
+        // What the dequeue loop does next: dispatch submits the claimed row, and that submission
+        // is where the limit is enforced.
+        last = sys
+            .init_workflow(&queued, Some(1), Submission::Dequeue)
+            .await
+            .map(|_| ());
+        if last.is_err() {
+            break;
+        }
+        // And what recovery does to a row whose executor is gone.
+        sys.reenqueue_for_recovery(&["local"], "v1", INTERNAL_QUEUE)
+            .await
+            .unwrap();
+    }
+
+    let err = last.expect_err("the workflow should have been parked");
+    assert!(
+        matches!(err, Error::MaxRecoveryAttemptsExceeded { limit: 1, .. }),
+        "expected a dead-letter error, got {err:?}",
+    );
+    let read = sys.get_workflow("wf-parked").await.unwrap().unwrap();
+    assert_eq!(read.status, WorkflowStatus::MaxRecoveryAttemptsExceeded);
+}
+
 /// A second owner must not run a workflow someone else holds.
 ///
 /// `executor_id` cannot decide this — it defaults to `"local"` and so collides between
