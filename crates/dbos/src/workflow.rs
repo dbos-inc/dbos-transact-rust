@@ -236,6 +236,17 @@ pub struct RunOptions<'a> {
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
     /// cancelled workflow was interrupted, not wrong.
     pub timeout: Timeout,
+
+    /// Caller-supplied attributes, stored as JSON on the workflow's row.
+    ///
+    /// Searchable metadata: a tenant, a request id, a trace context. Plain JSON, never the
+    /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by
+    /// every other implementation, so a workflow's own payload encoding has no say in it.
+    ///
+    /// **Not inherited by a child**, which starts with whatever its own call names. TypeScript
+    /// says the same of its `attributes` in as many words; nothing propagates here because a child
+    /// is started through this same type.
+    pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 /// What a caller may say about a start, beyond the input.
@@ -266,6 +277,16 @@ pub struct StartOptions<'a> {
     /// Everything an enqueue can ask for lives in [`Enqueue`] rather than beside this field, which
     /// is what makes the four queue-only options unstatable without a queue — see that type.
     pub queue: Option<Enqueue<'a>>,
+
+    /// Caller-supplied attributes, stored as JSON on the workflow's row.
+    ///
+    /// Searchable metadata: a tenant, a request id, a trace context. Plain JSON, never the
+    /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by
+    /// every other implementation, so a workflow's own payload encoding has no say in it.
+    ///
+    /// **Not inherited by a child**, which starts with whatever its own call names — see
+    /// [`RunOptions::attributes`].
+    pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A queue to leave a workflow on, and what to ask of it.
@@ -429,12 +450,33 @@ impl<'a> Enqueue<'a> {
     }
 }
 
+/// Caller-supplied attributes as the row stores them: JSON text, or nothing.
+///
+/// Plain `serde_json`, never the configured serializer — the column is read by containment and by
+/// every other implementation, so a workflow's payload encoding has no say in it. A
+/// [`serde_json::Map`] is an object by construction, which is the shape `validate_attributes`
+/// insists on downstream; the error arm is here because `to_string` is fallible in principle, not
+/// because a map can trip it.
+pub(crate) fn encode_attributes(
+    attributes: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<String>> {
+    attributes
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| Error::Serialization {
+            what: "attributes".into(),
+            message: error.to_string(),
+            source: Some(error),
+        })
+}
+
 impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
     /// A run is a start that nobody queued.
     fn from(options: RunOptions<'a>) -> Self {
         Self {
             workflow_id: options.workflow_id,
             timeout: options.timeout,
+            attributes: options.attributes,
             queue: None,
         }
     }
@@ -674,6 +716,7 @@ where
         // outside one is unaffected by everything below.
         let parent = self.parent()?;
         let input = Some(encode(&input, "argument")?);
+        let attributes = encode_attributes(options.attributes)?;
 
         // The launch is recorded against the parent before anything is created, so a replay of
         // this position finds the child it already started instead of starting a second one.
@@ -765,6 +808,7 @@ where
                     timeout: options.timeout.budget(),
                     deadline,
                     parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
+                    attributes: attributes.as_deref(),
                     // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
                     // it: a queue's whole point is that the process which asks is not necessarily
                     // the one that runs. A `delay` makes it `DELAYED` instead, which

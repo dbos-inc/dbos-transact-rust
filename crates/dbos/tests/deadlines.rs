@@ -47,6 +47,7 @@ async fn a_workflow_past_its_deadline_is_cancelled() {
             RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_millis(100)),
+                ..Default::default()
             },
         )
         .await
@@ -85,6 +86,7 @@ async fn a_workflow_within_its_deadline_is_unaffected() {
             RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(30)),
+                ..Default::default()
             },
         )
         .await

@@ -472,6 +472,7 @@ async fn an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet() {
                 workflow_id: Some(id),
                 queue: Some(Enqueue::new("unpolled-queue")),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
+                ..Default::default()
             },
         )
         .await
@@ -1066,6 +1067,7 @@ async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
                 workflow_id: Some(id),
                 queue: Some(Enqueue::new("demo-queue")),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
+                ..Default::default()
             },
         )
         .await
@@ -1135,6 +1137,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
             RunOptions {
                 workflow_id: Some(id),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
+                ..Default::default()
             },
         )
         .await
