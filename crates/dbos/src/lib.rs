@@ -42,6 +42,8 @@ mod event;
 #[cfg(feature = "engine")]
 mod handle;
 #[cfg(feature = "engine")]
+mod identity;
+#[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
@@ -62,7 +64,7 @@ mod workflow;
 #[cfg(feature = "engine")]
 pub use client::{Client, ClientConfig, Duplication, EnqueueOptions, Forks, Message};
 #[cfg(feature = "engine")]
-pub use config::{APP_VERSION_ENV, Config, DATABASE_URL_ENV, Serializer};
+pub use config::{Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
 pub use context::Ctx;
 #[cfg(feature = "engine")]
@@ -73,6 +75,8 @@ pub use error::{DurableError, EngineOnly, Error, Result};
 pub use event::{get_event, set_event};
 #[cfg(feature = "engine")]
 pub use handle::WorkflowHandle;
+#[cfg(feature = "engine")]
+pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, EXECUTOR_ID_ENV};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]

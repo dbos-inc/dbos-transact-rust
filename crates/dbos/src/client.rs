@@ -63,7 +63,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::{DATABASE_URL_ENV, Serializer, validate_app_name};
+use crate::config::{DATABASE_URL_ENV, Serializer};
+use crate::identity::validate_app_name;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;

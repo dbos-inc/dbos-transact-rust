@@ -62,9 +62,6 @@ tokio = { version = "1", features = ["time", "sync"] }
 # application is expected to hold a `dbos::Error` inside its own error enum, which is the derive's
 # `#[from]`/`#[error(transparent)]` idiom on both sides of the boundary.
 thiserror = "2"
-# The application version is the SHA-256 of the running executable (PLAN.md §4.14). Already in the
-# tree by way of sqlx, but named here because this crate depends on it directly.
-sha2 = "0.11"
 # `workflow_schedules.last_fired_at` is ISO-8601 text rather than the epoch milliseconds every
 # other time column holds, so one column needs a calendar. `std` has none — `SystemTime` and
 # `Duration` and nothing else — and the alternative was hand-written civil-date arithmetic to

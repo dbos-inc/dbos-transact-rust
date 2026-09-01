@@ -300,6 +300,7 @@ mod tests {
         let db = dbos_test_support::test_database().await;
         let dbos = crate::DBOS::new(crate::Config {
             migrate: false,
+            app_version: Some("1.0.0".to_owned()),
             ..crate::Config::new("ctx-test", db.url())
         });
         dbos.launch().await.expect("launch failed");

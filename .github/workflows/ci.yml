@@ -121,10 +121,14 @@ jobs:
         # so a failing `cargo test` still fails the step instead of being masked by `tee`'s
         # exit code. `set -o pipefail` again below because that guarantee is worth stating
         # where it is relied on rather than looked up.
+        #
+        # `--no-fail-fast` because each test file is its own binary and the first to fail
+        # aborts the rest: in #15 a failure in `children` hid an identical one in `events`
+        # and left nine binaries unrun.
         shell: bash
         run: |
           set -o pipefail
-          cargo test --all-features 2>&1 | tee "$RUNNER_TEST_LOG"
+          cargo test --all-features --no-fail-fast 2>&1 | tee "$RUNNER_TEST_LOG"
       - name: Upload the ${{ matrix.backend }} test run
         uses: actions/upload-artifact@v7
         # Both raw files, kept as data rather than rendered into the job summary. Neither is

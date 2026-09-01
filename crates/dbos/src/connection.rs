@@ -58,7 +58,16 @@ impl Connection {
     /// The executor's half of the connect: it takes an id, because an application's every
     /// statement is made by an identified process, and it may create and migrate the database
     /// because the application owns it.
-    pub(crate) async fn for_application(config: &Config, executor_id: &str) -> Result<Self> {
+    ///
+    /// `app_name` is the **resolved** name — [`identity::resolve`](crate::identity::resolve)'s,
+    /// not [`Config::app_name`](crate::Config::app_name)'s. On DBOS Cloud the deployment's
+    /// `DBOS_APP_NAME` outranks whatever the application was built believing, and the name that
+    /// stamps rows has to be the one that won.
+    pub(crate) async fn for_application(
+        config: &Config,
+        executor_id: &str,
+        app_name: &str,
+    ) -> Result<Self> {
         let sysdb = postgres::PostgresSystemDatabase::connect(&postgres::Config {
             url: &config.database_url,
             max_connections: config.max_connections,
@@ -67,7 +76,7 @@ impl Connection {
             settings: postgres::Settings {
                 schema: &config.schema,
                 executor_id: Some(executor_id),
-                application_name: Some(&config.app_name),
+                application_name: Some(app_name),
                 polling_concurrency: config.polling_concurrency,
                 notification_coalesce: config.notification_coalesce,
                 ..postgres::Settings::default()
@@ -79,7 +88,7 @@ impl Connection {
         Ok(Self {
             sysdb: Box::new(sysdb),
             serializer: config.serializer.clone(),
-            app_name: Some(config.app_name.clone()),
+            app_name: Some(app_name.to_owned()),
             outcome_poll_interval: config.outcome_poll_interval(),
         })
     }

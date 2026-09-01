@@ -13,9 +13,23 @@ use dbos_test_support::{TestDatabase, test_database};
 
 const DEADLINE: Duration = Duration::from_secs(60);
 
+/// The version each instance in this file launches with, derived from its application name.
+///
+/// DBOS computes none, so a launch without one fails, and it has to be stable across a relaunch of
+/// the same application or the relaunch would recover nothing. It cannot simply be a shared
+/// constant, though: `application_versions` still carries a global `UNIQUE (version_name)`, so two
+/// differently-named applications sharing one database cannot both register `1.0.0` — see the
+/// UPSTREAM notes on `resolve_owning_application`, and
+/// `lifecycle::a_launch_that_fails_after_connecting_closes_the_database`, which contests a version
+/// on purpose. Keying on the name gives both properties at once.
+fn app_version(app_name: &str) -> String {
+    format!("{app_name}-1.0.0")
+}
+
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
+        app_version: Some(app_version(app_name)),
         ..Config::new(app_name, db.url())
     }
 }

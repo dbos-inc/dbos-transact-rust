@@ -34,10 +34,15 @@ async fn nameless(db: &TestDatabase) -> Client {
         .expect("connect failed")
 }
 
+/// The version an instance in this file launches with unless it says otherwise: DBOS computes
+/// none, so a launch without one fails.
+const APP_VERSION: &str = "1.0.0";
+
 /// An application whose database is already migrated, so launching only connects.
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
+        app_version: Some(APP_VERSION.to_owned()),
         ..Config::new(app_name, db.url())
     }
 }
