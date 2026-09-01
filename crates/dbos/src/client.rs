@@ -73,7 +73,7 @@ use crate::sysdb::types::{
     Message as EncodedMessage, NewWorkflow, Submission, Timestamp, VersionInfo, WorkflowStatus,
 };
 use crate::sysdb::{DEFAULT_SCHEMA, Error as SysdbError};
-use crate::workflow::{Enqueue, MAX_RECOVERY_ATTEMPTS};
+use crate::workflow::{Enqueue, MAX_RECOVERY_ATTEMPTS, new_row};
 use crate::{Queue, QueueChange, QueueOptions};
 
 /// Everything a [`Client`] needs.
@@ -436,13 +436,10 @@ impl Client {
             // same way for the same reason.
             timeout: options.timeout,
             deadline: None,
-            queue_name: Some(options.queue.name),
-            deduplication_id: options.queue.deduplication_id,
-            priority: options.queue.stored_priority(),
-            queue_partition_key: options.queue.partition_key,
-            delay: options.queue.delay,
             attributes: attributes.as_deref(),
-            ..NewWorkflow::new(workflow_id)
+            // Always `Some`: a client cannot run a workflow, so every enqueue it makes names a
+            // queue — which is the difference from `start_with`, where the same base takes `None`.
+            ..new_row(workflow_id, Some(&options.queue))
         };
 
         loop {

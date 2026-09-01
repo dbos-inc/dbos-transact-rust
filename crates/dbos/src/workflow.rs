@@ -430,6 +430,30 @@ impl<'a> Enqueue<'a> {
     }
 }
 
+/// A new workflow row with its queue-shaped half filled in: the five columns an [`Enqueue`]
+/// decides, and what they are when there is no queue.
+///
+/// The base both literals that create a workflow build on —
+/// [`WorkflowRef::start_with`](WorkflowRef::start_with), where a queue is one option among
+/// several, and [`Client::enqueue_with`](crate::Client::enqueue_with), where there is always one.
+/// Written once because the two must agree about what a queue owns: which columns it fills, and
+/// that `priority` is a `NOT NULL` column whose unprioritised value is the sentinel `0` — zero
+/// also being what a workflow that was never enqueued stores, since it has no order to keep.
+///
+/// The status is not among them. A queued row goes in `ENQUEUED` rather than `PENDING`, and a
+/// [`delay`](Enqueue::delay) makes it `DELAYED`, but `initial_status` derives both from these
+/// columns rather than a caller stating them.
+pub(crate) fn new_row<'a>(workflow_id: &'a str, enqueue: Option<&Enqueue<'a>>) -> NewWorkflow<'a> {
+    NewWorkflow {
+        queue_name: enqueue.map(|enqueue| enqueue.name),
+        deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
+        priority: enqueue.map_or(0, Enqueue::stored_priority),
+        queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
+        delay: enqueue.and_then(|enqueue| enqueue.delay),
+        ..NewWorkflow::new(workflow_id)
+    }
+}
+
 impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
     /// A run is a start that nobody queued.
     fn from(options: RunOptions<'a>) -> Self {
@@ -769,18 +793,10 @@ where
                     timeout: options.timeout.budget(),
                     deadline,
                     parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
-                    // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
-                    // it: a queue's whole point is that the process which asks is not necessarily
-                    // the one that runs. A `delay` makes it `DELAYED` instead, which
-                    // `initial_status` derives rather than this call stating.
-                    queue_name: enqueue.map(|enqueue| enqueue.name),
-                    deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
-                    // Zero when unprioritised, and zero when there is no queue at all: the column
-                    // is `NOT NULL`, and a workflow that was never enqueued has no order to keep.
-                    priority: enqueue.map_or(0, Enqueue::stored_priority),
-                    queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
-                    delay: enqueue.and_then(|enqueue| enqueue.delay),
-                    ..NewWorkflow::new(&workflow_id)
+                    // The queue's five columns, and nothing below spawns the row they describe: a
+                    // queue's whole point is that the process which asks is not necessarily the
+                    // one that runs.
+                    ..new_row(&workflow_id, enqueue)
                 },
                 Some(MAX_RECOVERY_ATTEMPTS),
                 Submission::Fresh,
