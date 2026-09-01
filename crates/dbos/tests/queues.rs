@@ -11,8 +11,8 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewQueue, OnExistingQueue, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Change, Config, DBOS, Enqueue, Error, QueueChange, QueueConflict, QueueOptions, RateLimit,
-    RunOptions, StartOptions, Timeout,
+    Change, Config, DBOS, Duplication, Enqueue, Error, QueueChange, QueueConflict, QueueOptions,
+    RateLimit, RunOptions, StartOptions, Timeout,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -1214,6 +1214,14 @@ async fn an_incoherent_enqueue_is_refused() {
             },
             "`priority` must be at most 2147483647",
         ),
+        (
+            "a policy for resolving collisions on a key that does not exist",
+            Enqueue {
+                duplication: Duplication::ReturnExisting,
+                ..Enqueue::new("demo-queue")
+            },
+            "`Duplication::ReturnExisting` needs a `deduplication_id`",
+        ),
     ];
 
     for (what, enqueue, expected) in cases {
@@ -1392,6 +1400,102 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
         )
         .await
         .expect("the key was not released when the holder finished");
+
+    dbos.shutdown().await;
+}
+
+/// `Duplication::ReturnExisting` joins the holder instead of refusing, and the join is idempotent.
+///
+/// The enqueue that loses the key does not write a row at all: it takes a handle to the workflow
+/// that holds it, so a retried request waits on the first caller's workflow rather than being told
+/// no. The key is released when the holder finishes, so the same key afterwards is a new workflow
+/// — the same backlog-not-history rule the rejecting default follows.
+#[tokio::test]
+async fn return_existing_joins_the_workflow_holding_the_key() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-join-app", &db));
+    let workflow = dbos
+        .register_workflow("deduped", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    // Delayed, so the holder is still waiting when the second caller arrives.
+    let joining = Enqueue {
+        deduplication_id: Some("order-42"),
+        delay: Some(Duration::from_secs(3)),
+        duplication: Duplication::ReturnExisting,
+        ..Enqueue::new("demo-queue")
+    };
+    let first = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("join-first"),
+                queue: Some(joining.clone()),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the first enqueue failed");
+
+    let second = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("join-second"),
+                queue: Some(joining),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the second enqueue was refused rather than joined");
+    assert_eq!(
+        second.workflow_id(),
+        "join-first",
+        "the handle names the workflow holding the key, not the id this call offered",
+    );
+
+    let reader = reader(&db).await;
+    assert!(
+        reader
+            .get_workflow("join-second")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the losing enqueue writes no row of its own",
+    );
+
+    for handle in [first, second] {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(20), handle.result())
+                .await
+                .expect("the workflow never ran")
+                .expect("the workflow failed"),
+            7,
+            "both handles resolve to the one workflow that ran",
+        );
+    }
+
+    // The holder has finished, so the key is free and the same policy claims it rather than joining.
+    let third = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("join-third"),
+                queue: Some(Enqueue {
+                    deduplication_id: Some("order-42"),
+                    duplication: Duplication::ReturnExisting,
+                    ..Enqueue::new("demo-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the released key was not claimable");
+    assert_eq!(third.workflow_id(), "join-third");
 
     dbos.shutdown().await;
 }

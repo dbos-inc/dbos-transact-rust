@@ -275,7 +275,7 @@ pub struct StartOptions<'a> {
     /// a polling one, because the process that asked is usually not the process that runs it.
     ///
     /// Everything an enqueue can ask for lives in [`Enqueue`] rather than beside this field, which
-    /// is what makes the four queue-only options unstatable without a queue — see that type.
+    /// is what makes the five queue-only options unstatable without a queue — see that type.
     pub queue: Option<Enqueue<'a>>,
 
     /// Caller-supplied attributes, stored as JSON on the workflow's row.
@@ -293,12 +293,12 @@ pub struct StartOptions<'a> {
 ///
 /// **The queue-only options are nested here rather than sitting beside
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
-/// id, a priority, a partition key and a delay each mean nothing without a queue: Go checks all
-/// four at start and returns `InvalidOptionError` for each
-/// (`workflow.go:1178`–`1199`), which is four runtime errors describing states its type system
-/// allowed it to build. Owning them from the queue makes the same four unrepresentable — there is
-/// no queue-less value here to hang them on. Two rules survive as refusals at start, because no
-/// shape can take them:
+/// id, a priority, a partition key, a delay and a [`duplication`](Self::duplication) policy each
+/// mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError` for
+/// each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
+/// describing states its type system allowed it to build. Owning them from the queue makes the
+/// same five unrepresentable — there is no queue-less value here to hang them on. Three rules
+/// survive as refusals at start, because no shape can take them:
 ///
 /// - **A [`deduplication_id`](Self::deduplication_id) and a [`partition_key`](Self::partition_key)
 ///   cannot both be set.** Go refuses the same pair (`workflow.go:1201`), and it is not a policy
@@ -309,6 +309,10 @@ pub struct StartOptions<'a> {
 /// - **A [`priority`](Self::priority) must be between 1 and [`i32::MAX`].** `0` is the stored
 ///   sentinel for unprioritised, so accepting it would give that state a second spelling that
 ///   reads like a real priority.
+/// - **[`Duplication::ReturnExisting`] needs a [`deduplication_id`](Self::deduplication_id)**,
+///   because a policy for resolving a collision is meaningless where nothing can collide. Python
+///   and Go refuse the same pair (`_enqueue_options.py:82`, `workflow.go:1177`), and keeping the
+///   two apart is what makes the ordinary enqueue — a key, no policy — the short one to write.
 ///
 /// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts:324`), which
 /// is the nearest precedent; Go and Python keep them flat on their options struct.
@@ -339,8 +343,8 @@ pub struct Enqueue<'a> {
     /// finishes — so it deduplicates a *backlog*, not a history: enqueueing the same key again
     /// after the first one completed is a new workflow, not a duplicate.
     ///
-    /// A second enqueue under a held key is refused. Adopting the winner instead is what the
-    /// references' deduplication *policy* selects, which this slice does not carry yet.
+    /// A second enqueue under a held key is refused, unless [`duplication`](Self::duplication)
+    /// asks to join the holder instead.
     ///
     /// **Mutually exclusive with [`partition_key`](Self::partition_key)**: a start naming both is
     /// refused, for the reason this type's own documentation gives.
@@ -375,6 +379,65 @@ pub struct Enqueue<'a> {
     /// than computed here: the system database writes it against the same clock it writes
     /// `created_at` with, so a caller's clock skew never reaches the row.
     pub delay: Option<Duration>,
+
+    /// What to do when the [`deduplication_id`](Self::deduplication_id) is already held.
+    ///
+    /// **Its own field rather than riding inside the key**, though the two are meaningless apart
+    /// and keeping them separate costs a rule this type has to refuse at start. Folding them into
+    /// one value makes the invalid pair unrepresentable, but only by making the *ordinary* enqueue
+    /// name a policy it does not care about: every implementation defaults to rejecting, and every
+    /// reference's queue tutorial leads with a bare deduplication id, keeping `return-existing`
+    /// for the singleton-workflow section that follows. The common case stays a key and nothing
+    /// else.
+    pub duplication: Duplication,
+}
+
+/// What an enqueue does when its [`deduplication_id`](Enqueue::deduplication_id) is already held.
+///
+/// Only meaningful with a key: an enqueue with no deduplication id has nothing to collide with,
+/// and asking for [`ReturnExisting`](Self::ReturnExisting) without one is refused rather than
+/// ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Duplication {
+    /// Refuse the enqueue, reporting the collision.
+    ///
+    /// The default, and what every implementation defaults to. A caller who did not think about
+    /// collisions should hear that the key was taken, rather than silently joining a workflow
+    /// whose arguments are somebody else's.
+    #[default]
+    Reject,
+    /// Hand back a handle to the workflow already holding the key.
+    ///
+    /// **Idempotent enqueue**: the first caller's workflow is the one that runs, and every later
+    /// caller waits on it instead of being told no — so this caller's arguments are discarded,
+    /// which is the half worth knowing. Three implementations offer the choice — TypeScript's
+    /// `duplicationPolicy` (`dbos.ts:178`), Python's `duplication_policy` (`_context.py:794`) and
+    /// Go's `DeduplicationPolicy` (`workflow.go:888`) — and all three require a key, as this does.
+    /// Java is the one that always rejects, though it has the same lookup underneath: its
+    /// `DebouncerClient` hand-rolls the join with `findDeduplicationHolder`. All three document it
+    /// as how a *singleton workflow* is written.
+    ///
+    /// The key is held only while the holder is *waiting*, so this joins a backlog, not a history:
+    /// once the holder has finished, the same key enqueues a new workflow.
+    ///
+    /// **Started from inside a workflow, the parent's launch record points at the workflow that
+    /// was joined**, not at the id this call derived — so a replay resolves to the same workflow
+    /// rather than trying to start the child again. Go records the same mapping at the same
+    /// reserved step id, for the same stated reason (`workflow.go:1465`).
+    ///
+    /// **A joined workflow is a child by one measure and not by the other, deliberately.** The
+    /// relationship is stored twice: `operation_outputs.child_workflow_id` at the parent's step,
+    /// which is a pointer from one *position* and is what a replay reads, and
+    /// `workflow_status.parent_workflow_id` on the child's own row, which names its one owner and
+    /// is what [`get_workflow_children`](crate::sysdb::SystemDatabase::get_workflow_children) and
+    /// the cascading forms of cancel and delete walk. A join writes only the first, and cannot
+    /// write the second: the holder already has an owner, the column holds one value where any
+    /// number of callers may join one workflow, and re-parenting it would let *this* parent's
+    /// cascade cancel or delete a workflow somebody else created and is waiting on. So a joined
+    /// workflow is resolved by the parent's replay and named among its steps, but is not listed
+    /// among its children and does not go down with it. Go's join path records the same one of the
+    /// two.
+    ReturnExisting,
 }
 
 impl<'a> Enqueue<'a> {
@@ -387,6 +450,9 @@ impl<'a> Enqueue<'a> {
             priority: None,
             partition_key: None,
             delay: None,
+            // The enum's `#[default]`, not a second copy of it: "reject unless asked" is stated
+            // once, where the variants are.
+            duplication: Duplication::default(),
         }
     }
 
@@ -421,6 +487,13 @@ impl<'a> Enqueue<'a> {
             return refuse(
                 "`deduplication_id` and `partition_key` cannot both be set: a partitioned \
                  queue's dequeue and a deduplication key enforce different things"
+                    .to_owned(),
+            );
+        }
+        if self.duplication == Duplication::ReturnExisting && self.deduplication_id.is_none() {
+            return refuse(
+                "`Duplication::ReturnExisting` needs a `deduplication_id`: with no key there is \
+                 no collision to resolve"
                     .to_owned(),
             );
         }
@@ -789,44 +862,105 @@ where
         };
 
         let started_at = Timestamp::now();
-        let initialized = executor
-            .sysdb()
-            .init_workflow(
-                &NewWorkflow {
-                    name: Some(&self.key().name),
-                    class_name: self.key().class_name.as_deref(),
-                    config_name: self.key().config_name.as_deref(),
-                    input: input.as_deref(),
-                    serialization: Some(executor.serializer().name()),
-                    executor_id: Some(executor.executor_id()),
-                    application_name: Some(executor.app_name()),
-                    application_version: Some(executor.app_version()),
-                    // Only a budget is written: an inherited deadline is an *instant* and has no
-                    // budget behind it, and `Timeout::None` has neither. The column is what a
-                    // queue recomputes a deadline from on dequeue, so filling it in for either
-                    // would hand that path a budget nobody asked for.
-                    timeout: options.timeout.budget(),
-                    deadline,
-                    parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
-                    attributes: attributes.as_deref(),
-                    // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
-                    // it: a queue's whole point is that the process which asks is not necessarily
-                    // the one that runs. A `delay` makes it `DELAYED` instead, which
-                    // `initial_status` derives rather than this call stating.
-                    queue_name: enqueue.map(|enqueue| enqueue.name),
-                    deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
-                    // Zero when unprioritised, and zero when there is no queue at all: the column
-                    // is `NOT NULL`, and a workflow that was never enqueued has no order to keep.
-                    priority: enqueue.map_or(0, Enqueue::stored_priority),
-                    queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
-                    delay: enqueue.and_then(|enqueue| enqueue.delay),
-                    ..NewWorkflow::new(&workflow_id)
-                },
-                Some(MAX_RECOVERY_ATTEMPTS),
-                Submission::Fresh,
-            )
-            .await
-            .map_err(Error::SystemDatabase)?;
+        let new = NewWorkflow {
+            name: Some(&self.key().name),
+            class_name: self.key().class_name.as_deref(),
+            config_name: self.key().config_name.as_deref(),
+            input: input.as_deref(),
+            serialization: Some(executor.serializer().name()),
+            executor_id: Some(executor.executor_id()),
+            application_name: Some(executor.app_name()),
+            application_version: Some(executor.app_version()),
+            // Only a budget is written: an inherited deadline is an *instant* and has no
+            // budget behind it, and `Timeout::None` has neither. The column is what a
+            // queue recomputes a deadline from on dequeue, so filling it in for either
+            // would hand that path a budget nobody asked for.
+            timeout: options.timeout.budget(),
+            deadline,
+            parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
+            attributes: attributes.as_deref(),
+            // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
+            // it: a queue's whole point is that the process which asks is not necessarily
+            // the one that runs. A `delay` makes it `DELAYED` instead, which
+            // `initial_status` derives rather than this call stating.
+            queue_name: enqueue.map(|enqueue| enqueue.name),
+            deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
+            // Zero when unprioritised, and zero when there is no queue at all: the column
+            // is `NOT NULL`, and a workflow that was never enqueued has no order to keep.
+            priority: enqueue.map_or(0, Enqueue::stored_priority),
+            queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
+            delay: enqueue.and_then(|enqueue| enqueue.delay),
+            ..NewWorkflow::new(&workflow_id)
+        };
+
+        // A loop, because [`Duplication::ReturnExisting`] resolves a collision by reading who
+        // holds the key, and the holder can finish between the two statements. Everything the
+        // insert needs was decided above it: the id, the step the launch occupies, and the
+        // deadline are all fixed before the first attempt, so a second attempt writes the same row
+        // rather than a differently-derived one.
+        let initialized = loop {
+            match executor
+                .sysdb()
+                .init_workflow(&new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh)
+                .await
+            {
+                Ok(initialized) => break initialized,
+                // **A key another workflow holds, and a caller who asked to join it.** The insert
+                // lost on the partial unique index over `(queue_name, deduplication_id)`; the
+                // holder's id is the answer, and a handle to it is what
+                // [`Duplication::ReturnExisting`] promises.
+                Err(crate::sysdb::Error::QueueDeduplicated {
+                    queue_name,
+                    deduplication_id,
+                    ..
+                }) if enqueue
+                    .is_some_and(|enqueue| enqueue.duplication == Duplication::ReturnExisting) =>
+                {
+                    match executor
+                        .sysdb()
+                        .get_deduplication_key_holder(&queue_name, &deduplication_id)
+                        .await
+                        .map_err(Error::SystemDatabase)?
+                    {
+                        Some(holder) => {
+                            tracing::debug!(
+                                workflow_id = holder,
+                                deduplication_id,
+                                "the deduplication key is held; the handle joins its holder"
+                            );
+                            // **The launch records the workflow that was joined**, not the id this
+                            // call derived, so a replay of this position resolves to the same
+                            // workflow instead of trying to start a child that was never created.
+                            // Go records the same mapping at the same reserved step id.
+                            //
+                            // Only this record, and not the joined workflow's own
+                            // `parent_workflow_id`: it has an owner already, and a cascade
+                            // following that column must not reach a workflow this parent merely
+                            // joined. [`Duplication::ReturnExisting`] states the asymmetry.
+                            //
+                            // A crash between the lookup and this write is harmless, and for a
+                            // different reason than the one below: nothing was written by the
+                            // losing insert, so a replay simply asks again. It joins the same
+                            // holder if the key is still held, and starts a workflow of its own if
+                            // the holder has since finished — which is what the policy means at
+                            // that moment, since the key deduplicates a backlog rather than a
+                            // history.
+                            if let Some(parent) = &parent {
+                                parent
+                                    .record_launch(&executor, &holder, &self.key().name, started_at)
+                                    .await?;
+                            }
+                            return Ok(WorkflowHandle::polling(executor, holder));
+                        }
+                        // The holder finished between the conflict and this read, so the key is
+                        // free again: retry the insert rather than report a collision with a
+                        // workflow that is over. Python and TypeScript both loop here.
+                        None => continue,
+                    }
+                }
+                Err(error) => return Err(Error::SystemDatabase(error)),
+            }
+        };
 
         // **After the child exists, not before**, and the order is what makes a crash between the
         // two harmless: a parent that dies here leaves a child row and no launch record, and the
