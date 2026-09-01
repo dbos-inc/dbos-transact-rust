@@ -62,7 +62,7 @@ mod workflow;
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
 // because it *is* the brand — nobody writes `tokio::TOKIO`.
 #[cfg(feature = "engine")]
-pub use client::{Client, ClientConfig, Duplication, EnqueueOptions, Forks, Message};
+pub use client::{Client, ClientConfig, EnqueueOptions, Forks, Message};
 #[cfg(feature = "engine")]
 pub use config::{Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
@@ -88,4 +88,4 @@ pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit};
 #[cfg(feature = "engine")]
-pub use workflow::{Enqueue, RunOptions, StartOptions, Timeout};
+pub use workflow::{Duplication, Enqueue, RunOptions, StartOptions, Timeout};

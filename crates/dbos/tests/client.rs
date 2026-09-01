@@ -153,12 +153,13 @@ async fn every_option_reaches_the_row() {
                 app_version: Some("v1.2.3"),
                 timeout: Some(Duration::from_secs(90)),
                 attributes: Some(&attributes),
+                // Every field named, which is the point of this test -- so there is nothing left
+                // for a functional update to fill in.
                 queue: Enqueue {
                     priority: Some(5),
                     partition_key: Some("acme"),
                     ..Enqueue::new("billing")
                 },
-                ..EnqueueOptions::new("billing")
             },
         )
         .await
@@ -302,9 +303,9 @@ async fn a_held_deduplication_key_is_refused_or_joined() {
     let db = test_database().await;
     let client = client("client-dedup", &db).await;
     let options = |duplication| EnqueueOptions {
-        duplication,
         queue: Enqueue {
             deduplication_id: Some("order-42"),
+            duplication,
             ..Enqueue::new("work")
         },
         ..EnqueueOptions::new("work")
@@ -351,7 +352,10 @@ async fn returning_the_existing_workflow_needs_a_key() {
             "process_order",
             (),
             EnqueueOptions {
-                duplication: Duplication::ReturnExisting,
+                queue: Enqueue {
+                    duplication: Duplication::ReturnExisting,
+                    ..Enqueue::new("work")
+                },
                 ..EnqueueOptions::new("work")
             },
         )

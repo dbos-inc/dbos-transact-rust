@@ -69,11 +69,11 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::serialization::encode;
+use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{
-    Message as EncodedMessage, NewWorkflow, Submission, Timestamp, VersionInfo, WorkflowStatus,
+    Message as EncodedMessage, NewWorkflow, Timestamp, VersionInfo, WorkflowStatus,
 };
-use crate::sysdb::{DEFAULT_SCHEMA, Error as SysdbError};
-use crate::workflow::{Enqueue, MAX_RECOVERY_ATTEMPTS, new_row};
+use crate::workflow::{Enqueue, Submitted, init_or_join, new_row};
 use crate::{Queue, QueueChange, QueueOptions};
 
 /// Everything a [`Client`] needs.
@@ -382,15 +382,6 @@ impl Client {
         // Refused before anything is written, as `start_with` refuses it: an enqueue no queue could
         // honour should cost a round trip, not a row.
         options.queue.validate()?;
-        if options.duplication == Duplication::ReturnExisting
-            && options.queue.deduplication_id.is_none()
-        {
-            return Err(Error::Config(
-                "`Duplication::ReturnExisting` needs a `deduplication_id` on the enqueue: with no \
-                 key there is no collision to resolve"
-                    .to_owned(),
-            ));
-        }
 
         let input = encode(&input, "argument")?;
         let attributes = options
@@ -442,57 +433,24 @@ impl Client {
             ..new_row(workflow_id, Some(&options.queue))
         };
 
-        loop {
-            match self
-                .0
-                .sysdb()
-                .init_workflow(&new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh)
-                .await
-            {
-                Ok(_) => {
-                    tracing::debug!(
-                        workflow_id,
-                        workflow,
-                        queue = options.queue.name,
-                        "the workflow is enqueued"
-                    );
-                    return Ok(WorkflowHandle::polling(
-                        Arc::clone(&self.0),
-                        workflow_id.to_owned(),
-                    ));
-                }
-                // **A key another workflow holds, and a caller who asked to join it.** The insert
-                // lost on the partial unique index over `(queue_name, deduplication_id)`; the
-                // holder's id is the answer, and a handle to it is what
-                // [`Duplication::ReturnExisting`] promises.
-                Err(SysdbError::QueueDeduplicated {
-                    queue_name,
-                    deduplication_id,
-                    ..
-                }) if options.duplication == Duplication::ReturnExisting => {
-                    match self
-                        .0
-                        .sysdb()
-                        .get_deduplication_key_holder(&queue_name, &deduplication_id)
-                        .await
-                        .map_err(Error::SystemDatabase)?
-                    {
-                        Some(holder) => {
-                            tracing::debug!(
-                                workflow_id = holder,
-                                deduplication_id,
-                                "the deduplication key is held; the handle joins its holder"
-                            );
-                            return Ok(WorkflowHandle::polling(Arc::clone(&self.0), holder));
-                        }
-                        // The holder finished between the conflict and this read, so the key is
-                        // free again: retry the insert rather than report a collision with a
-                        // workflow that is over. Python and TypeScript both loop here.
-                        None => continue,
-                    }
-                }
-                Err(error) => return Err(Error::SystemDatabase(error)),
+        match init_or_join(&self.0, &new, options.queue.duplication).await? {
+            Submitted::Created(_) => {
+                tracing::debug!(
+                    workflow_id,
+                    workflow,
+                    queue = options.queue.name,
+                    "the workflow is enqueued"
+                );
+                Ok(WorkflowHandle::polling(
+                    Arc::clone(&self.0),
+                    workflow_id.to_owned(),
+                ))
             }
+            // The key was held and this caller asked to join whoever holds it, so the handle names
+            // that workflow rather than the id this call offered. A client has no parent, so there
+            // is nothing to record about the join — which is the whole of the difference from
+            // `start_with`.
+            Submitted::Joined(holder) => Ok(WorkflowHandle::polling(Arc::clone(&self.0), holder)),
         }
     }
 
@@ -864,9 +822,6 @@ pub struct EnqueueOptions<'a> {
     /// configured [`Serializer`] — the column is read by containment and by every other
     /// implementation, so a workflow's own payload encoding has no say in it.
     pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
-
-    /// What to do when the deduplication key is already held.
-    pub duplication: Duplication,
 }
 
 impl<'a> EnqueueOptions<'a> {
@@ -881,33 +836,8 @@ impl<'a> EnqueueOptions<'a> {
             app_version: None,
             timeout: None,
             attributes: None,
-            duplication: Duplication::default(),
         }
     }
-}
-
-/// What an enqueue does when its [`deduplication_id`](Enqueue::deduplication_id) is already held.
-///
-/// Only meaningful with a key: an enqueue with no deduplication id has nothing to collide with, and
-/// asking for [`ReturnExisting`](Self::ReturnExisting) without one is refused rather than ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Duplication {
-    /// Refuse the enqueue, reporting the collision.
-    ///
-    /// The default, and what the runtime's enqueue does with no way to ask for anything else. A
-    /// caller who did not think about deduplication is a caller who should hear that the key was
-    /// taken.
-    #[default]
-    Reject,
-    /// Hand back a handle to the workflow already holding the key.
-    ///
-    /// **Idempotent enqueue**: the first caller's workflow is the one that runs, and every later
-    /// caller waits on it instead of being told no. TypeScript introduced it and Python ported it;
-    /// Java is the one implementation that always rejects.
-    ///
-    /// The key is held only while the holder is *waiting*, so this joins a backlog, not a history:
-    /// once the holder has finished, the same key enqueues a new workflow.
-    ReturnExisting,
 }
 
 /// A message for a workflow, and how to address it.
@@ -972,6 +902,7 @@ pub enum Forks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::Duplication;
 
     #[test]
     fn a_bare_configuration_speaks_for_no_application() {
@@ -1023,7 +954,7 @@ mod tests {
         assert_eq!(options.app_version, None);
         assert_eq!(options.timeout, None);
         assert_eq!(
-            options.duplication,
+            options.queue.duplication,
             Duplication::Reject,
             "a caller who did not think about deduplication should hear that a key was taken"
         );

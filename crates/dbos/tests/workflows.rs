@@ -9,7 +9,7 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{BackendError, BackendErrorKind};
-use dbos::{Config, DBOS, Error};
+use dbos::{Config, DBOS, Error, RunOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -66,6 +66,68 @@ async fn a_workflow_runs_and_records_its_output() {
         Some(&*dbos.app_version().unwrap())
     );
     assert_eq!(row.executor_id.as_deref(), Some("local"));
+
+    dbos.shutdown().await;
+}
+
+/// Attributes reach the row of a workflow this process runs, not only of one that was enqueued.
+///
+/// Searchable metadata is a property of the workflow rather than of the queue it waited on, and
+/// TypeScript and Python both attach it on the start path too. The child is here because nothing
+/// propagates: a child carries what its own call names, and this one names nothing.
+#[tokio::test]
+async fn a_started_workflow_carries_the_attributes_it_was_given() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("attributes-app", &db));
+    let double = dbos.register_workflow("double", double).unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |_: ()| {
+            let double = double.clone();
+            async move { double.run(21).await }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("tenant".to_owned(), serde_json::json!("acme"));
+
+    parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("attributed"),
+                attributes: Some(&attributes),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let reader = reader(&db).await;
+    let row = reader
+        .get_workflow("attributed")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert!(
+        row.attributes
+            .as_deref()
+            .is_some_and(|json| json.contains("acme")),
+        "{:?}",
+        row.attributes
+    );
+
+    let child = reader
+        .list_workflows(&Default::default())
+        .await
+        .expect("read failed")
+        .into_iter()
+        .find(|row| row.workflow_id != "attributed")
+        .expect("the child is missing");
+    assert_eq!(
+        child.attributes, None,
+        "a child carries what its own call names, and inherits nothing"
+    );
 
     dbos.shutdown().await;
 }
