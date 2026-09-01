@@ -11,8 +11,8 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewQueue, OnExistingQueue, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Change, Config, DBOS, Duplication, Enqueue, Error, QueueChange, QueueConflict, QueueOptions,
-    RateLimit, RunOptions, StartOptions, Timeout,
+    Change, Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueChange, QueueConflict,
+    QueueOptions, RateLimit, RunOptions, StartOptions, Timeout,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -1217,10 +1217,10 @@ async fn an_incoherent_enqueue_is_refused() {
         (
             "a policy for resolving collisions on a key that does not exist",
             Enqueue {
-                duplication: Duplication::ReturnExisting,
+                duplication_policy: DuplicationPolicy::ReturnExisting,
                 ..Enqueue::new("demo-queue")
             },
-            "`Duplication::ReturnExisting` needs a `deduplication_id`",
+            "`DuplicationPolicy::ReturnExisting` needs a `deduplication_id`",
         ),
     ];
 
@@ -1404,7 +1404,7 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
     dbos.shutdown().await;
 }
 
-/// `Duplication::ReturnExisting` joins the holder instead of refusing, and the join is idempotent.
+/// `DuplicationPolicy::ReturnExisting` joins the holder instead of refusing, and the join is idempotent.
 ///
 /// The enqueue that loses the key does not write a row at all: it takes a handle to the workflow
 /// that holds it, so a retried request waits on the first caller's workflow rather than being told
@@ -1426,7 +1426,7 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
     let joining = Enqueue {
         deduplication_id: Some("order-42"),
         delay: Some(Duration::from_secs(3)),
-        duplication: Duplication::ReturnExisting,
+        duplication_policy: DuplicationPolicy::ReturnExisting,
         ..Enqueue::new("demo-queue")
     };
     let first = workflow
@@ -1487,7 +1487,7 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
                 workflow_id: Some("join-third"),
                 queue: Some(Enqueue {
                     deduplication_id: Some("order-42"),
-                    duplication: Duplication::ReturnExisting,
+                    duplication_policy: DuplicationPolicy::ReturnExisting,
                     ..Enqueue::new("demo-queue")
                 }),
                 ..StartOptions::default()
