@@ -7,7 +7,9 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
-use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
+use dbos::{
+    Config, DBOS, Duplication, Enqueue, Error, QueueOptions, RunOptions, StartOptions, Timeout,
+};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -109,6 +111,138 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
     // The relationship is queryable from the parent's side too.
     let children = reader.get_workflow_children(id).await.expect("read failed");
     assert_eq!(children.len(), 2, "two children: {children:?}");
+
+    dbos.shutdown().await;
+}
+
+/// A child that joins a held deduplication key is recorded as the workflow it joined.
+///
+/// The interesting half is the launch record. The child id this call derived — `{parent}-{step}` —
+/// names no row, because the insert lost the key and nothing was written under it. What the parent
+/// records at that step is the *holder's* id, so a replay of this position resolves to the same
+/// workflow instead of trying to start a child that never existed. Go records the same mapping at
+/// the same reserved step id, for the reason it states at `workflow.go:1465`.
+#[tokio::test]
+async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-dedup-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    deduplication_id: Some("order-42"),
+                                    duplication: Duplication::ReturnExisting,
+                                    ..Enqueue::new("demo-queue")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await?
+                        .result()
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue("demo-queue", QueueOptions::default())
+        .await
+        .expect("registration failed");
+
+    // The holder, enqueued before the parent runs and still waiting when the child starts.
+    let holder = child
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("the-holder"),
+                queue: Some(Enqueue {
+                    deduplication_id: Some("order-42"),
+                    delay: Some(Duration::from_secs(3)),
+                    ..Enqueue::new("demo-queue")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the holder was not enqueued");
+
+    let id = "the-joining-parent";
+    let result = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(result, 9, "the parent read the joined workflow's output");
+
+    let reader = reader(&db).await;
+    assert!(
+        reader
+            .get_workflow("the-joining-parent-0")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the derived child id names no row: the insert lost the key",
+    );
+    let steps = reader
+        .list_workflow_steps(id, false, None, None)
+        .await
+        .expect("read failed");
+    let launch = steps
+        .iter()
+        .find(|step| step.step_id == 0)
+        .expect("no launch step on the parent");
+    assert_eq!(launch.step_name, "child");
+    assert_eq!(
+        launch.child_workflow_id.as_deref(),
+        Some("the-holder"),
+        "the launch records the workflow that was joined",
+    );
+
+    // The other half of the relationship is deliberately absent. `parent_workflow_id` names the
+    // one owner of a row, and the holder has one already -- so a joined workflow is resolved by
+    // the parent's replay and named among its steps, but is not listed among its children, and a
+    // cascade following that column never reaches it.
+    assert!(
+        reader
+            .get_workflow_children(id)
+            .await
+            .expect("read failed")
+            .is_empty(),
+        "a joined workflow is not the joining parent's child",
+    );
+    assert_eq!(
+        reader
+            .get_workflow("the-holder")
+            .await
+            .expect("read failed")
+            .expect("the holder is missing")
+            .parent_workflow_id,
+        None,
+        "the holder keeps its own parentage: joining does not re-parent it",
+    );
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), holder.result())
+            .await
+            .expect("the holder never ran")
+            .expect("the holder failed"),
+        9
+    );
 
     dbos.shutdown().await;
 }
