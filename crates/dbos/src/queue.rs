@@ -333,6 +333,12 @@ pub struct QueueChange {
 /// queue's address across every application sharing the database — taking it would redirect a
 /// peer's work.
 ///
+/// **That holds for a caller with an application name of its own.** A nameless one — which is what
+/// a [`Client`](crate::Client) is unless it was configured otherwise — is let through by the
+/// ownership check every implementation shares, and then rewrites the stored limits of whatever
+/// queue it names, a peer's included; only the owner column is left alone. UPSTREAM item 26 on
+/// `resolve_owning_application` asks the team to settle whether that is the contract or the gap.
+///
 /// **No context-free default.** Which policy a bare registration should get depends on whether the
 /// caller has an application version at all, so the choice lives in
 /// [`QueueOptions::on_conflict`]'s `None` rather than in a `Default` impl here.

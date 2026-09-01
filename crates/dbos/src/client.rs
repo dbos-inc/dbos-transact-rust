@@ -64,10 +64,10 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::config::{DATABASE_URL_ENV, Serializer};
-use crate::identity::validate_app_name;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
+use crate::identity::validate_app_name;
 use crate::serialization::encode;
 use crate::sysdb::types::{
     Message as EncodedMessage, NewWorkflow, Submission, Timestamp, VersionInfo, WorkflowStatus,
@@ -106,6 +106,13 @@ pub struct ClientConfig {
     /// matches, and any may run — and reads across all of them. Go's client says the same in its
     /// own words: *"Leave empty to list all workflows, but beware that writing will serve all
     /// applications."*
+    ///
+    /// **Serving all applications includes editing their rows.** A registration a named
+    /// application already owns keeps its owner, but a nameless client still writes through it: it
+    /// replaces a queue's limits, a schedule's definition, or the timestamp deciding which version
+    /// is latest, where a client naming a *different* application would be refused. Every
+    /// implementation behaves this way and UPSTREAM item 26 asks whether it should, so name this
+    /// client if it is meant to touch only its own.
     ///
     /// Set it whenever several applications share a system database. Leave it unset for a tool
     /// whose job is to look at all of them.
@@ -606,6 +613,12 @@ impl Client {
     /// *explicitly* is refused, because a client has no application version to be the latest of;
     /// Python refuses the same combination for the same reason.
     ///
+    /// **A client with no application name of its own registers over a peer's queue rather than
+    /// being refused**, replacing its stored limits — the ownership check every implementation
+    /// shares lets a nameless writer through. Give the client an
+    /// [`app_name`](ClientConfig::app_name) to get the refusal
+    /// [`QueueConflict`](crate::QueueConflict) describes. UPSTREAM item 26.
+    ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
     /// let queue = client.register_queue("fleet", dbos::QueueOptions {
@@ -647,10 +660,16 @@ impl Client {
         self.0.delete_queue(name).await
     }
 
-    /// Every application version registered against this system database, newest first.
+    /// Every application version this client can see, newest first: the ones its own application
+    /// registered, plus the unclaimed. A nameless client sees every one, which is the read half of
+    /// what namelessness means — the same scoping [`list_queues`](Self::list_queues) has.
     ///
     /// What an operator reads to find out which versions of the code have ever announced
-    /// themselves, and which one a workflow row's `application_version` refers to.
+    /// themselves, and which one a workflow row's `application_version` refers to. A *named*
+    /// client answers that question for its own application only — a peer's versions are not in
+    /// the listing, and nothing here reads them, which is why a tool that has to see every
+    /// application leaves [`app_name`](ClientConfig::app_name) unset. Python and TypeScript scope
+    /// their listing the same way, and take no target either.
     pub async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
         self.0
             .sysdb()
@@ -679,12 +698,20 @@ impl Client {
     /// executors running it start dequeuing again, and an enqueue that names no version goes to it.
     ///
     /// The version must already exist; this does not register one. Registration is an executor's
-    /// business, because a version is a claim about code that is running somewhere.
+    /// business, because a version is a claim about code that is running somewhere. **A name that
+    /// matches nothing is not an error**, though: the write moves no row and reports success, so a
+    /// misspelled rollback reads as a rollback. Every implementation discards the row count here;
+    /// UPSTREAM item 2.
     ///
     /// Scoped to this client's application, as every write here is. Promoting a version another
     /// application registered fails rather than moving it — a timestamp is what a peer's fleet is
     /// rolling on, so it is not this client's to move without saying so. Saying so is
     /// [`set_latest_application_version_for`](Self::set_latest_application_version_for).
+    ///
+    /// **That scoping needs the client to have a name.** A client configured without an
+    /// [`app_name`](ClientConfig::app_name) has nothing to be refused under, so it
+    /// promotes whatever version it names, a peer's included — which is either what namelessness
+    /// is for or a shared gap, and UPSTREAM item 26 asks the team which.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {

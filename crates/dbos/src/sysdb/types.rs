@@ -1799,7 +1799,11 @@ impl<'a> NewQueue<'a> {
 /// What registering a queue that already exists should do to it.
 ///
 /// Never to its owner, which moves only by rename: a name already held by another application is
-/// [`Error::RegisteredByAnother`] in both cases, because the name is the queue's address.
+/// [`Error::RegisteredByAnother`] in both cases, because the name is the queue's address — as long
+/// as the caller has a name to be refused under. A nameless one is let through and [`Update`]
+/// replaces the peer's limits; UPSTREAM item 26.
+///
+/// [`Update`]: OnExistingQueue::Update
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnExistingQueue {
     /// Overwrite the stored limits with the ones supplied.

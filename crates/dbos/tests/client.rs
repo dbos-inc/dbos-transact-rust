@@ -867,7 +867,10 @@ async fn a_client_promotes_an_older_version_to_roll_a_deploy_back() {
 async fn a_client_promotes_a_version_for_a_named_application() {
     let db = test_database().await;
 
-    for (app, versions) in [("promote-own", ["v1", "v2"]), ("promote-peer", ["p1", "p2"])] {
+    for (app, versions) in [
+        ("promote-own", ["v1", "v2"]),
+        ("promote-peer", ["p1", "p2"]),
+    ] {
         for version in versions {
             let dbos = DBOS::new(Config {
                 app_version: Some(version.to_owned()),
@@ -902,7 +905,11 @@ async fn a_client_promotes_a_version_for_a_named_application() {
         .await
         .expect("promote failed");
     assert_eq!(latest(&peer).await, "p1", "the peer rolled back");
-    assert_eq!(latest(&own).await, "v2", "this client's own latest is untouched");
+    assert_eq!(
+        latest(&own).await,
+        "v2",
+        "this client's own latest is untouched"
+    );
 
     peer.close().await;
     own.close().await;

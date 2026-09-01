@@ -769,7 +769,12 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `application_name` names the application the version belongs to; `None` means this
     /// handle's own. A version already held by a *different* application is
-    /// [`Error::RegisteredByAnother`] rather than a silent takeover.
+    /// [`Error::RegisteredByAnother`] rather than a silent takeover — for a caller that has a name
+    /// to be refused under. A handle with no application name of its own is let through instead,
+    /// and registers nothing: the claim is guarded on the row being unowned and the insert
+    /// declines on conflict, so the peer's row stands as it was. That branch is a shared one; see
+    /// UPSTREAM item 26 on `resolve_owning_application` for the writes where it is *not*
+    /// harmless.
     async fn create_application_version(
         &self,
         version_name: &str,
@@ -809,6 +814,14 @@ pub trait SystemDatabase: Send + Sync {
     /// Promoting a *different* application's is [`Error::RegisteredByAnother`]: moving a timestamp
     /// is how a deployment is rolled forward or back, so it must not move one a peer is running
     /// on.
+    ///
+    /// **That guard needs the caller to have a name.** A handle with no application name of its
+    /// own resolves to the row's holder and retimes it, a peer's included — the shared behaviour
+    /// UPSTREAM item 26 asks all five implementations to settle, and what a default-configured
+    /// client does today.
+    ///
+    /// **A name that matches nothing is `Ok`, not [`Error::NotRegistered`].** The write moves no
+    /// row and says so to nobody, so a misspelled rollback reports success; UPSTREAM item 2.
     async fn update_application_version_timestamp(
         &self,
         version_name: &str,
@@ -822,9 +835,13 @@ pub trait SystemDatabase: Send + Sync {
     /// Callers use that to tell a first registration from a restart.
     ///
     /// **A name already held by another application is [`Error::RegisteredByAnother`] in either
-    /// mode.** A queue name addresses one row across every application sharing the database, so
-    /// taking it would redirect a peer's work; ownership moves only by
-    /// [`rename_application`](Self::rename_application).
+    /// mode**, for a caller with an application name of its own. A queue name addresses one row
+    /// across every application sharing the database, so taking it would redirect a peer's work;
+    /// ownership moves only by [`rename_application`](Self::rename_application).
+    ///
+    /// **A nameless caller is not refused, and [`OnExistingQueue::Update`] then replaces a peer's
+    /// stored limits** while leaving the owner column alone. Shared with every implementation, and
+    /// unresolved: UPSTREAM item 26 on `resolve_owning_application`.
     async fn upsert_queue(
         &self,
         queue: &NewQueue<'_>,
@@ -1052,7 +1069,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// [`Error::AlreadyRegistered`] when this application already holds the name, and
     /// [`Error::RegisteredByAnother`] when a peer does — the same distinction queues draw, since
-    /// `schedule_name` is unique across every application sharing the database.
+    /// `schedule_name` is unique across every application sharing the database. A caller with no
+    /// application name of its own gets the first of those for a peer's row rather than the
+    /// second, because nothing refuses it and the unique index is what stops the insert; nothing
+    /// is overwritten either way. UPSTREAM item 26.
     ///
     /// The cron expression is stored, not parsed. Java validates it here and the other three do
     /// not; validating belongs with the scheduler that has to interpret it, not with the layer
@@ -1079,7 +1099,8 @@ pub trait SystemDatabase: Send + Sync {
     /// forget where it had got to.
     ///
     /// An unclaimed row is claimed in the same statement, and a peer's is
-    /// [`Error::RegisteredByAnother`].
+    /// [`Error::RegisteredByAnother`] — again only for a caller that has a name. A nameless one
+    /// replaces the peer's definition instead, which is UPSTREAM item 26.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it, with the same
     /// meaning it has on [`create_schedule`](Self::create_schedule) — but on weaker precedent.
