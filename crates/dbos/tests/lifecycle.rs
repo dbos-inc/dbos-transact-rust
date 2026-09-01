@@ -21,9 +21,14 @@ async fn launched(app_name: &str) -> (DBOS, TestDatabase) {
     (dbos, db)
 }
 
+/// The version every instance in this file launches with: DBOS computes none, so a launch without
+/// one fails — and sharing it is what lets a relaunch recover what the previous launch left.
+const APP_VERSION: &str = "1.0.0";
+
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
+        app_version: Some(APP_VERSION.to_owned()),
         ..Config::new(app_name, db.url())
     }
 }
@@ -45,8 +50,11 @@ async fn launching_resolves_an_identity() {
         "the default every SDK shares"
     );
 
-    let version = dbos.app_version().expect("launched");
-    assert_eq!(version.len(), 64, "a SHA-256 in hex: {version}");
+    assert_eq!(
+        dbos.app_version().expect("launched"),
+        APP_VERSION,
+        "the version the configuration gave it, and nothing computed"
+    );
 
     dbos.shutdown().await;
 }
@@ -81,7 +89,7 @@ async fn relaunching_registers_the_same_version_once() {
     assert_eq!(
         dbos.app_version().expect("launched"),
         version,
-        "same binary, same version"
+        "same configuration, same version"
     );
 
     let versions = reader(&db)
@@ -137,8 +145,8 @@ async fn shutting_down_twice_is_idempotent() {
     assert!(!dbos.is_launched());
 }
 
-/// An explicit version overrides the executable hash, which is what a deployment pins and what
-/// development wants around a rebuild.
+/// The configured version is used as given: DBOS computes none, so what the application says is
+/// what every row it writes is stamped with.
 #[tokio::test]
 async fn an_explicit_application_version_is_used_as_given() {
     let db = test_database().await;
