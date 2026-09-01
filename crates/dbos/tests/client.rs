@@ -808,6 +808,106 @@ async fn a_client_reads_application_versions() {
     dbos.shutdown().await;
 }
 
+/// Promoting an older version rolls a deploy back.
+///
+/// The latest version is the one with the newest *timestamp*, not the one registered last, which
+/// is the whole reason promotion is a write an operator can make: moving `v1`'s timestamp forward
+/// puts the fleet back on `v1` without redeploying it.
+#[tokio::test]
+async fn a_client_promotes_an_older_version_to_roll_a_deploy_back() {
+    let db = test_database().await;
+
+    // Two deployments in order, so the registry's latest is the second.
+    for version in ["v1", "v2"] {
+        let dbos = DBOS::new(Config {
+            app_version: Some(version.to_owned()),
+            ..config("client-promote", &db)
+        });
+        dbos.launch().await.expect("launch failed");
+        dbos.shutdown().await;
+    }
+
+    let client = client("client-promote", &db).await;
+    let latest = async || {
+        client
+            .latest_application_version()
+            .await
+            .expect("read failed")
+            .expect("a version was registered at launch")
+            .version_name
+    };
+    assert_eq!(latest().await, "v2", "the newer deployment is the latest");
+
+    client
+        .set_latest_application_version("v1")
+        .await
+        .expect("promote failed");
+    assert_eq!(latest().await, "v1", "promoting rolls the fleet back");
+
+    // Promotion moves a timestamp; it registers nothing.
+    let mut names = client
+        .list_application_versions()
+        .await
+        .expect("list failed")
+        .into_iter()
+        .map(|version| version.version_name)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["v1", "v2"]);
+
+    client.close().await;
+}
+
+/// Promoting on behalf of a named application — which is the whole reason the setter takes a name.
+///
+/// One operator tool, pointed at a shared system database, rolls a peer application back without
+/// connecting a second client for it. Ownership still holds: the bare form refuses the peer's
+/// version, and naming the peer is what makes the same call legal.
+#[tokio::test]
+async fn a_client_promotes_a_version_for_a_named_application() {
+    let db = test_database().await;
+
+    for (app, versions) in [("promote-own", ["v1", "v2"]), ("promote-peer", ["p1", "p2"])] {
+        for version in versions {
+            let dbos = DBOS::new(Config {
+                app_version: Some(version.to_owned()),
+                ..config(app, &db)
+            });
+            dbos.launch().await.expect("launch failed");
+            dbos.shutdown().await;
+        }
+    }
+
+    let own = client("promote-own", &db).await;
+    let peer = client("promote-peer", &db).await;
+    let latest = async |client: &dbos::Client| {
+        client
+            .latest_application_version()
+            .await
+            .expect("read failed")
+            .expect("a version was registered at launch")
+            .version_name
+    };
+
+    // Unnamed, the call is scoped to this client's own application, so a peer's version is not its
+    // to move.
+    assert!(
+        own.set_latest_application_version("p1").await.is_err(),
+        "promoting a peer's version without naming the peer should be refused"
+    );
+    assert_eq!(latest(&peer).await, "p2", "the refusal moved nothing");
+
+    // Naming the peer is what makes it legal.
+    own.set_latest_application_version_for("p1", "promote-peer")
+        .await
+        .expect("promote failed");
+    assert_eq!(latest(&peer).await, "p1", "the peer rolled back");
+    assert_eq!(latest(&own).await, "v2", "this client's own latest is untouched");
+
+    peer.close().await;
+    own.close().await;
+}
+
 /// A client never migrates — and so refuses a database no application has created.
 ///
 /// The refusal is the interesting half. Connecting with migrations off *verifies* instead of

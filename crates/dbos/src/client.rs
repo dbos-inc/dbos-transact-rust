@@ -70,7 +70,7 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::serialization::encode;
 use crate::sysdb::types::{
-    Message as EncodedMessage, NewWorkflow, Submission, VersionInfo, WorkflowStatus,
+    Message as EncodedMessage, NewWorkflow, Submission, Timestamp, VersionInfo, WorkflowStatus,
 };
 use crate::sysdb::{DEFAULT_SCHEMA, Error as SysdbError};
 use crate::workflow::{Enqueue, MAX_RECOVERY_ATTEMPTS};
@@ -194,9 +194,32 @@ impl ClientConfig {
     ///
     /// A missing or empty variable leaves [`database_url`](Self::database_url) empty rather than
     /// failing here, so a caller who sets it afterwards is not forced through an error path;
-    /// [`Client::connect`] is where an empty URL is reported. `DBOS__APPVERSION` is **not** read,
-    /// unlike [`Config::from_env`](crate::Config::from_env): a client has no version of its own,
-    /// and an enqueue that wants one names it.
+    /// [`Client::connect`] is where an empty URL is reported.
+    ///
+    /// **The URL is the only thing it reads, and [`app_name`](Self::app_name) stays `None`.** That
+    /// is the deliberate half. An application resolves its whole identity against the environment
+    /// at launch — on DBOS Cloud the deployment's `DBOS_APP_NAME` outranks the configuration
+    /// entirely — and a client does none of that, because naming an application is a *claim*
+    /// rather than an observation: it decides which rows this client writes as its own and which
+    /// it can see. Picking a name up from an ambient variable would silently narrow an operator's
+    /// tool to whichever application happened to be deployed around it.
+    ///
+    /// The other implementations draw the line in the same place. Python's `DBOSClient` takes
+    /// `application_name` as a constructor argument and reads no environment variable anywhere in
+    /// its client module; Go's `ClientConfig.AppName` is likewise configuration only — the
+    /// `DBOS__APPVERSION`, `DBOS__VMID`, `DBOS__APPID` and `DBOS__CLOUD` reads all sit on its
+    /// executor's path — and its doc says what a nameless one costs: *"Leave empty to list all
+    /// workflows, but beware that writing will serve all applications."*
+    ///
+    /// So a client deployed alongside an application must be told its name, here or on the field:
+    ///
+    /// ```no_run
+    /// # use dbos::ClientConfig;
+    /// let config = ClientConfig {
+    ///     app_name: Some("my-app".to_owned()),
+    ///     ..ClientConfig::from_env()
+    /// };
+    /// ```
     pub fn from_env() -> Self {
         Self::new(std::env::var(DATABASE_URL_ENV).unwrap_or_default())
     }
@@ -644,6 +667,75 @@ impl Client {
         self.0
             .sysdb()
             .get_latest_application_version(self.0.app_name())
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+
+    /// Promotes an already-registered version to be the latest, by moving its timestamp to now.
+    ///
+    /// The write half of [`latest_application_version`](Self::latest_application_version), and how
+    /// a rolling deploy is steered from outside the fleet: the latest version is chosen by
+    /// timestamp rather than by creation order, so promoting an older one is a **rollback** — the
+    /// executors running it start dequeuing again, and an enqueue that names no version goes to it.
+    ///
+    /// The version must already exist; this does not register one. Registration is an executor's
+    /// business, because a version is a claim about code that is running somewhere.
+    ///
+    /// Scoped to this client's application, as every write here is. Promoting a version another
+    /// application registered fails rather than moving it — a timestamp is what a peer's fleet is
+    /// rolling on, so it is not this client's to move without saying so. Saying so is
+    /// [`set_latest_application_version_for`](Self::set_latest_application_version_for).
+    ///
+    /// ```no_run
+    /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
+    /// // Roll the fleet back to the version before the bad deploy.
+    /// client.set_latest_application_version("1.4.2").await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn set_latest_application_version(&self, version_name: &str) -> Result<()> {
+        self.0
+            .sysdb()
+            .update_application_version_timestamp(version_name, Timestamp::now(), self.0.app_name())
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+
+    /// Promotes a version on behalf of the application that registered it.
+    ///
+    /// [`set_latest_application_version`](Self::set_latest_application_version) promotes within
+    /// this client's own application; this one names the application to act as, which is what lets
+    /// a single operator tool roll several applications on a shared system database without
+    /// connecting a client per application.
+    ///
+    /// **The setter takes a name where the reader does not, and that asymmetry is the references'
+    /// too** — Python's `set_latest_application_version` has an `application_name` keyword and
+    /// TypeScript's an `applicationName` option, while neither `get_latest_application_version`
+    /// takes anything. Promotion is the operation that *claims*: the write also adopts a version
+    /// left unclaimed, which would otherwise read as every peer's latest. Reading claims nothing,
+    /// so it has nothing to say a name about. Go is the one implementation whose client promotes
+    /// without an override at all.
+    ///
+    /// A version some *third* application registered is still refused — naming an application is
+    /// how a caller says which fleet it means, not a way around ownership.
+    ///
+    /// ```no_run
+    /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
+    /// // One operator tool, rolling a peer application back.
+    /// client.set_latest_application_version_for("1.4.2", "billing").await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn set_latest_application_version_for(
+        &self,
+        version_name: &str,
+        application_name: &str,
+    ) -> Result<()> {
+        self.0
+            .sysdb()
+            .update_application_version_timestamp(
+                version_name,
+                Timestamp::now(),
+                Some(application_name),
+            )
             .await
             .map_err(Error::SystemDatabase)
     }
