@@ -502,8 +502,12 @@ impl Client {
     /// A handle to a workflow that already exists, by id.
     ///
     /// Always a polling handle — nothing runs here — and it is **not** checked: the id is not read
-    /// until the handle is used, so this cannot fail and does not go to the database. Asking for
-    /// the status of a workflow that does not exist is [`Error::WorkflowNotFound`] at that point.
+    /// until the handle is used, so this cannot fail and does not go to the database. Using a
+    /// handle to a workflow that does not exist is [`Error::WorkflowNotFound`] at that point,
+    /// from reading its status and from awaiting its result alike — the wait reports the absence
+    /// rather than polling for the row to appear, which is this crate's answer to the references'
+    /// `fail_if_missing`. A caller expecting a workflow it does not own to be enqueued shortly
+    /// loops over that error.
     /// Python's client returns an unchecked handle in the same way; Java's `retrieveWorkflow` and
     /// Go's take a round trip to verify the row first.
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> WorkflowHandle<R, E> {

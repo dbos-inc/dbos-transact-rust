@@ -111,6 +111,10 @@ where
     /// rather than waiting again on a workflow that may since have been forked or deleted — and the
     /// wait costs one row read instead of a poll to completion. All four implementations record it,
     /// under the same name, `DBOS.getResult`.
+    ///
+    /// An id that names no row is [`Error::WorkflowNotFound`], the same absence
+    /// [`status`](Self::status) reports: waiting stops at a workflow that does not exist rather
+    /// than polling for one to appear.
     pub async fn result(self) -> Result<R, E> {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run.

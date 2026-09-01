@@ -231,6 +231,11 @@ pub enum Error<E = EngineOnly> {
     ///
     /// Unreachable through a handle this process minted — starting is what wrote the row — and
     /// reachable through anything that takes a caller's workflow id on faith.
+    ///
+    /// **Both halves of such a handle report it**: reading the status finds no row, and awaiting
+    /// the result declines to wait for one to appear. The system database says the same thing as
+    /// `NonExistentWorkflow` and this is what a caller sees instead, so an unchecked id is one
+    /// error rather than two shapes of the same error.
     #[error("no workflow exists with id {workflow_id}")]
     WorkflowNotFound {
         /// The id that matched nothing.

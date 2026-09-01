@@ -1175,7 +1175,20 @@ impl Connection {
             .sysdb()
             .await_workflow_result(workflow_id, self.outcome_poll_interval())
             .await
-            .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
+            .map_err(|error| {
+                Failure::Control(match error {
+                    // The one thing this wait can say about the id itself, and the same absence
+                    // [`WorkflowHandle::status`] reports — so a caller holding an id that names no
+                    // row gets one error from both halves of its handle, rather than this one
+                    // buried in a system database failure. Reported for a single id because a
+                    // single id is what was awaited; the plural variant belongs to the calls that
+                    // take a list.
+                    crate::sysdb::Error::NonExistentWorkflow { .. } => Error::WorkflowNotFound {
+                        workflow_id: workflow_id.to_owned(),
+                    },
+                    other => Error::SystemDatabase(other),
+                })
+            })?;
         match outcome {
             AwaitedOutcome::Succeeded { output, .. } => Ok(output),
             // Handed back encoded, for the caller to decode into its own error type — the adopting

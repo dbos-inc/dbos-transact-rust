@@ -601,6 +601,13 @@ async fn a_client_reads_workflow_status() {
     let error = dangling.status().await.expect_err("there is no such row");
     assert!(matches!(error, Error::WorkflowNotFound { .. }), "{error}");
 
+    // And both halves of the handle say it the same way. Awaiting reports the absence rather than
+    // polling for the row to appear -- this crate's answer to the references' `fail_if_missing` --
+    // so a caller matching on one error catches both.
+    let dangling: WorkflowHandle<()> = client.retrieve_workflow("no-such-workflow");
+    let error = dangling.result().await.expect_err("there is no such row");
+    assert!(matches!(error, Error::WorkflowNotFound { .. }), "{error}");
+
     client.close().await;
 }
 
