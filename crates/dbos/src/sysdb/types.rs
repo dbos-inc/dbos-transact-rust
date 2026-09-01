@@ -1229,11 +1229,11 @@ pub struct WorkflowInitResult {
 
 /// Whether a name is usable as an application name.
 ///
-/// Three to thirty characters of lowercase letters, digits, dashes and underscores — the rule
+/// Three to 256 characters of lowercase letters, digits, dashes and underscores — the rule
 /// every implementation enforces, so a name registered by one is accepted by the others. The
 /// length is in bytes, which is the same as characters here because nothing outside ASCII passes.
 pub fn is_valid_application_name(name: &str) -> bool {
-    (3..=30).contains(&name.len())
+    (3..=256).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
