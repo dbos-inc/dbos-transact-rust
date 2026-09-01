@@ -182,6 +182,11 @@ impl Queue {
 ///
 /// Setting any per-partition limit is what **partitions** the queue; there is no separate switch.
 /// See [`partition_concurrency`](Self::partition_concurrency).
+///
+/// **Limits only.** What a registration does to a queue that already exists is a separate
+/// [`QueueConflict`] argument to the call, on both surfaces: it is a property of the registration
+/// rather than of the queue, and nothing else here differs between an application and a
+/// [`Client`](crate::Client).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueOptions {
     /// How many of this queue's workflows may run at once across every executor.
@@ -259,15 +264,6 @@ pub struct QueueOptions {
     /// a faster rate than that one does — the two periods need not match, so it is the rates that
     /// are compared and not the counts.
     pub partition_rate_limit: Option<RateLimit>,
-    /// What to do when the queue is already registered, or `None` for the caller's own default.
-    ///
-    /// **The default depends on who is registering**, because the useful policy does. An
-    /// application gets [`QueueConflict::UpdateIfLatestVersion`], which is what makes a rolling
-    /// deploy behave; a [`Client`](crate::Client) gets [`QueueConflict::AlwaysUpdate`], because it
-    /// runs none of the application's code and so has no version to be the latest of — the policy
-    /// it cannot ask for is the one an application defaults to. Python's client defaults the same
-    /// way for the same reason.
-    pub on_conflict: Option<QueueConflict>,
 }
 
 impl Default for QueueOptions {
@@ -281,7 +277,6 @@ impl Default for QueueOptions {
             partition_concurrency: None,
             partition_worker_concurrency: None,
             partition_rate_limit: None,
-            on_conflict: None,
         }
     }
 }
@@ -339,9 +334,16 @@ pub struct QueueChange {
 /// queue it names, a peer's included; only the owner column is left alone. UPSTREAM item 26 on
 /// `resolve_owning_application` asks the team to settle whether that is the contract or the gap.
 ///
-/// **No context-free default.** Which policy a bare registration should get depends on whether the
-/// caller has an application version at all, so the choice lives in
-/// [`QueueOptions::on_conflict`]'s `None` rather than in a `Default` impl here.
+/// **The same type on both surfaces**, as in Python and TypeScript. A
+/// [`Client`](crate::Client) can therefore name
+/// [`UpdateIfLatestVersion`](Self::UpdateIfLatestVersion), which it has no version to answer, and
+/// is refused when it does.
+///
+/// **Named at the call, never defaulted.** Python and TypeScript default it per surface — to
+/// `update_if_latest_version` for an application (`_dbos.py:981`, `dbos.ts:2745`) and to
+/// `always_update` for a client (`_client.py:382`, `client.ts:559`) — which one Rust type cannot
+/// express, a default being a property of the type rather than of the caller. So a registration
+/// says which it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueConflict {
     /// Overwrite only if this process is running the **latest registered application version**.
@@ -352,13 +354,15 @@ pub enum QueueConflict {
     /// for as long as it lived. An application with no registered versions yet is the latest by
     /// default, since it is the first.
     ///
-    /// **A client cannot ask for this**, having no version to be the latest of; it is refused
-    /// rather than guessed at. See [`Client::register_queue`](crate::Client::register_queue).
+    /// **A [`Client`](crate::Client) is refused this**, having no version to be the latest of:
+    /// [`Client::register_queue`](crate::Client::register_queue) returns [`Error::Config`], which
+    /// is where Python and TypeScript raise on the same combination (`_client.py:455`,
+    /// `client.ts:561`).
     UpdateIfLatestVersion,
     /// Always overwrite the stored limits.
     ///
-    /// A [`Client`](crate::Client)'s default: an operator registering a queue from outside the
-    /// application means the limits it names to take effect.
+    /// An operator's intent, and the usual answer for a registration made from outside the
+    /// application: the limits it names take effect.
     AlwaysUpdate,
     /// Leave the stored limits alone.
     ///
@@ -571,19 +575,29 @@ impl DBOS {
     /// Reserved: the engine's own [`INTERNAL_QUEUE`] cannot be registered. It has no row, takes no
     /// limits, and is where `resume` and `fork` leave work.
     ///
+    /// `on_conflict` says what a re-registration does to a queue that already exists, and is
+    /// named rather than defaulted — see [`QueueConflict`], whose
+    /// [`UpdateIfLatestVersion`](QueueConflict::UpdateIfLatestVersion) is what an application
+    /// registering at startup usually means.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// let queue = dbos.register_queue("demo-queue", dbos::QueueOptions {
     ///     worker_concurrency: Some(3),
     ///     ..Default::default()
-    /// }).await?;
+    /// }, dbos::QueueConflict::UpdateIfLatestVersion).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn register_queue(&self, name: &str, options: QueueOptions) -> Result<Queue> {
+    pub async fn register_queue(
+        &self,
+        name: &str,
+        options: QueueOptions,
+        on_conflict: QueueConflict,
+    ) -> Result<Queue> {
         let executor = self.executor("register a queue")?;
         executor
             .connection()
-            .register_queue(name, options, Some(executor.app_version()))
+            .register_queue(name, options, on_conflict, Some(executor.app_version()))
             .await
     }
 
@@ -664,15 +678,19 @@ impl Connection {
     /// Registers a queue, or reports the one already registered under this name.
     ///
     /// `app_version` is the caller's own, and `None` says it has none — which is what a
-    /// [`Client`](crate::Client) is. It exists as a parameter rather than as something read off the
-    /// handle precisely so that a client can call this: only
-    /// [`QueueConflict::UpdateIfLatestVersion`] consults it, and that policy is refused when there is
-    /// nothing to consult. It also settles an unstated
-    /// [`on_conflict`](QueueOptions::on_conflict), for the same reason.
+    /// [`Client`](crate::Client) is. It exists as a parameter rather than as something read off
+    /// the handle precisely so that a client can call this: only
+    /// [`QueueConflict::UpdateIfLatestVersion`] consults it, and that is the one policy a client
+    /// is refused.
+    ///
+    /// **The refusal lives here**, for both surfaces, because the condition it tests — a caller
+    /// with no version — is exactly what this parameter carries. Both surfaces take the same
+    /// [`QueueConflict`], as Python's and TypeScript's do.
     pub(crate) async fn register_queue(
         &self,
         name: &str,
         options: QueueOptions,
+        on_conflict: QueueConflict,
         app_version: Option<&str>,
     ) -> Result<Queue> {
         if name == INTERNAL_QUEUE {
@@ -681,15 +699,6 @@ impl Connection {
             )));
         }
         validate(name, &options)?;
-
-        // **The unstated policy follows the caller's version**, which is the same fact the policies
-        // themselves turn on: a caller with a version is an application mid-deploy, and wants the
-        // latest-version check; one without is a client, which cannot ask for that check at all,
-        // and whose registration is an operator saying what the limits should be.
-        let on_conflict = options.on_conflict.unwrap_or(match app_version {
-            Some(_) => QueueConflict::UpdateIfLatestVersion,
-            None => QueueConflict::AlwaysUpdate,
-        });
 
         let on_existing = match on_conflict {
             QueueConflict::AlwaysUpdate => OnExistingQueue::Update,
@@ -701,12 +710,10 @@ impl Connection {
             QueueConflict::UpdateIfLatestVersion => {
                 // **A handle with no application version cannot answer this question**, which is
                 // the case a [`Client`](crate::Client) is: it runs none of the application's code,
-                // so there is no version of it to weigh against the registered ones. Python
-                // refuses the same combination in the same words — *"does not support
-                // on_conflict='update_if_latest_version' because clients are not associated with
-                // an application version"* — rather than picking a side quietly, and the two
-                // wrong guesses are both bad: updating lets a tool revert a running deployment's
-                // limits, and leaving makes an operator's deliberate change vanish.
+                // so there is no version of it to weigh against the registered ones. Python and
+                // TypeScript refuse the same combination on the same grounds (`_client.py:455`,
+                // `client.ts:561`). Only a client reaches it: `DBOS::register_queue` passes the
+                // executor's version, which a launched instance always has.
                 let Some(version) = app_version else {
                     return Err(Error::Config(format!(
                         "registering queue `{name}`: `QueueConflict::UpdateIfLatestVersion` needs \
@@ -853,8 +860,6 @@ impl Connection {
                 partition_concurrency: limits.partition_concurrency,
                 partition_worker_concurrency: limits.partition_worker_concurrency,
                 partition_rate_limit: limits.partition_rate_limit,
-                // Nothing is being registered here; this shape exists only to be validated.
-                on_conflict: None,
             };
             validate_fields(&options)
                 .map_err(|(field, detail)| SysdbError::InvalidInput { field, detail })

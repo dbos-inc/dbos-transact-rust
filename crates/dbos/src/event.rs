@@ -114,7 +114,7 @@ where
     let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
     ctx.executor()
         .connection()
-        .read_event(workflow_id, key, timeout, caller)
+        .get_event(workflow_id, key, timeout, caller)
         .await
 }
 
@@ -161,7 +161,7 @@ impl DBOS {
         let caller = ctx.as_ref().map(caller_for);
         executor
             .connection()
-            .read_event(workflow_id, key, timeout, caller)
+            .get_event(workflow_id, key, timeout, caller)
             .await
     }
 }
@@ -190,7 +190,7 @@ impl crate::Client {
         // unlike `DBOS::get_event` there is no ambient context to reconcile with this handle's
         // executor and no `WrongInstance` to refuse.
         self.connection()
-            .read_event(workflow_id, key, timeout, None)
+            .get_event(workflow_id, key, timeout, None)
             .await
     }
 }
@@ -216,8 +216,12 @@ impl Connection {
     ///
     /// On the connection because a read is all it is: the free [`get_event`] reaches it through the
     /// ambient context's, [`DBOS::get_event`] through its executor's, and
-    /// [`Client::get_event`](crate::Client::get_event) through the only one it has.
-    pub(crate) async fn read_event<T: DeserializeOwned, E>(
+    /// [`Client::get_event`](crate::Client::get_event) through the only one it has. Named as they
+    /// are, which is what this crate's other shared internals do — `Connection::register_queue`,
+    /// `queue`, `list_queues`, `update_queue`, `delete_queue` all carry their surface's name. What
+    /// each surface adds is the *caller*: which ambient context to read, whether the read is
+    /// checkpointed, and whether a handle's executor has to be reconciled with it.
+    pub(crate) async fn get_event<T: DeserializeOwned, E>(
         &self,
         workflow_id: &str,
         key: &str,

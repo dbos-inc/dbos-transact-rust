@@ -74,7 +74,7 @@ use crate::sysdb::types::{
     Message as EncodedMessage, NewWorkflow, Timestamp, VersionInfo, WorkflowStatus,
 };
 use crate::workflow::{Enqueue, Submitted, init_or_join, new_row};
-use crate::{Queue, QueueChange, QueueOptions};
+use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
 /// Everything a [`Client`] needs.
 ///
@@ -565,12 +565,15 @@ impl Client {
     /// reason a client has it is that a queue is a row: a fleet may be configured by the tool that
     /// deploys it rather than by the code that drains it.
     ///
-    /// An unstated [`on_conflict`](crate::QueueOptions::on_conflict) is
-    /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate) here — the operator's intent, and
-    /// Python's client default — where an application would get the latest-version check.
-    /// Asking for [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion)
-    /// *explicitly* is refused, because a client has no application version to be the latest of;
-    /// Python refuses the same combination for the same reason.
+    /// The limits and the policy are the same [`QueueOptions`](crate::QueueOptions) and
+    /// [`QueueConflict`](crate::QueueConflict) an application states — but
+    /// [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
+    /// [`Error::Config`] here rather than a registration: a client runs none of the application's
+    /// code, so there is no version of it to be the latest of. Ask for
+    /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate), which is what Python's and
+    /// TypeScript's clients default to, or
+    /// [`NeverUpdate`](crate::QueueConflict::NeverUpdate). They refuse the same combination
+    /// (`_client.py:455`, `client.ts:561`).
     ///
     /// **A client with no application name of its own registers over a peer's queue rather than
     /// being refused**, replacing its stored limits — the ownership check every implementation
@@ -583,14 +586,21 @@ impl Client {
     /// let queue = client.register_queue("fleet", dbos::QueueOptions {
     ///     worker_concurrency: Some(3),
     ///     ..Default::default()
-    /// }).await?;
+    /// }, dbos::QueueConflict::AlwaysUpdate).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn register_queue(&self, name: &str, options: QueueOptions) -> Result<Queue> {
+    pub async fn register_queue(
+        &self,
+        name: &str,
+        options: QueueOptions,
+        on_conflict: QueueConflict,
+    ) -> Result<Queue> {
         // `None`: a client runs none of the application's code, so it has no version to be the
-        // latest of. That is also what settles an unstated policy to `AlwaysUpdate`, and what
-        // refuses an explicit `UpdateIfLatestVersion` — both inside `register_queue`, not here.
-        self.0.register_queue(name, options, None).await
+        // latest of. That is also what refuses `UpdateIfLatestVersion` — the registration reports
+        // the missing version rather than guessing at an answer.
+        self.0
+            .register_queue(name, options, on_conflict, None)
+            .await
     }
 
     /// The queue registered under this name, or `None` if there is none.

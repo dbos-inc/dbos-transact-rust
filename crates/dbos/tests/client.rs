@@ -64,9 +64,13 @@ async fn an_application_runs_what_a_client_enqueues() {
     dbos.register_workflow("double", |n: u32| async move { Ok::<u32, Error>(n * 2) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("work", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "work",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let client = client("client-handover", &db).await;
     let handle: WorkflowHandle<u32> = client
@@ -633,9 +637,9 @@ async fn a_client_manages_queues() {
             "fleet",
             QueueOptions {
                 worker_concurrency: Some(3),
-                on_conflict: Some(QueueConflict::AlwaysUpdate),
                 ..QueueOptions::default()
             },
+            QueueConflict::AlwaysUpdate,
         )
         .await
         .expect("registration failed");
@@ -728,10 +732,11 @@ async fn a_dropped_client_releases_its_connections() {
     }
 }
 
-/// A client cannot ask for the conflict policy that needs an application version.
+/// A client is refused the conflict policy that needs an application version.
 ///
 /// It has none — it runs none of the application's code — so "update if I am the latest version"
-/// has no answer. Python refuses the same combination rather than guessing at one.
+/// has no answer. Both surfaces take the same `QueueConflict`, as Python's and TypeScript's do,
+/// and both refuse this combination rather than guessing at an answer.
 #[tokio::test]
 async fn a_client_cannot_register_a_queue_by_version() {
     let db = test_database().await;
@@ -740,10 +745,8 @@ async fn a_client_cannot_register_a_queue_by_version() {
     let error = client
         .register_queue(
             "fleet",
-            QueueOptions {
-                on_conflict: Some(QueueConflict::UpdateIfLatestVersion),
-                ..QueueOptions::default()
-            },
+            QueueOptions::default(),
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect_err("a client has no version to be the latest of");
@@ -753,24 +756,28 @@ async fn a_client_cannot_register_a_queue_by_version() {
     client.close().await;
 }
 
-/// A client registering without naming a policy overwrites what is stored.
+/// A client's `AlwaysUpdate` re-registration replaces what is stored.
 ///
-/// The bare call has to work: `QueueOptions::default()` leaves `on_conflict` unstated, and the
-/// policy an application would fall back to is the one a client is refused. So a client falls back
-/// to `AlwaysUpdate` instead, which is also Python's client default.
+/// The policy an application reaches for first — update only if I am the latest version — is one a
+/// client is refused, so `AlwaysUpdate` is what an operator's registration says instead, and this
+/// is what it has to mean: the limits named last are the ones in force.
 #[tokio::test]
-async fn a_client_registers_a_queue_with_default_options() {
+async fn a_clients_registration_replaces_the_stored_limits() {
     let db = test_database().await;
     let client = client("client-queue-default", &db).await;
 
     let queue = client
-        .register_queue("fleet", QueueOptions::default())
+        .register_queue(
+            "fleet",
+            QueueOptions::default(),
+            QueueConflict::AlwaysUpdate,
+        )
         .await
         .expect("a client's default policy has to be one it can use");
     assert_eq!(queue.name(), "fleet");
 
-    // Registered again with a limit this time: the unstated policy is an update, so the stored row
-    // is the second registration's, not the first's.
+    // Registered again with a limit this time: the policy is an update, so the stored row is the
+    // second registration's, not the first's.
     let queue = client
         .register_queue(
             "fleet",
@@ -778,6 +785,7 @@ async fn a_client_registers_a_queue_with_default_options() {
                 worker_concurrency: Some(2),
                 ..QueueOptions::default()
             },
+            QueueConflict::AlwaysUpdate,
         )
         .await
         .expect("re-registration failed");

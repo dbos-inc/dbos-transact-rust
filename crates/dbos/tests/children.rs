@@ -8,8 +8,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
-    Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueOptions, RunOptions, StartOptions,
-    Timeout,
+    Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueConflict, QueueOptions, RunOptions,
+    StartOptions, Timeout,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -156,9 +156,13 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     // The holder, enqueued before the parent runs and still waiting when the child starts.
     let holder = child
