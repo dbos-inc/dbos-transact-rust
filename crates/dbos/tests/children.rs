@@ -8,7 +8,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
-    Config, DBOS, Duplication, Enqueue, Error, QueueOptions, RunOptions, StartOptions, Timeout,
+    Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueOptions, RunOptions, StartOptions,
+    Timeout,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -141,7 +142,7 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
                             StartOptions {
                                 queue: Some(Enqueue {
                                     deduplication_id: Some("order-42"),
-                                    duplication: Duplication::ReturnExisting,
+                                    duplication_policy: DuplicationPolicy::ReturnExisting,
                                     ..Enqueue::new("demo-queue")
                                 }),
                                 ..StartOptions::default()

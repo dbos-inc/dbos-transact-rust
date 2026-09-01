@@ -294,8 +294,8 @@ pub struct StartOptions<'a> {
 ///
 /// **The queue-only options are nested here rather than sitting beside
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
-/// id, a priority, a partition key, a delay and a [`duplication`](Self::duplication) policy each
-/// mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError` for
+/// id, a priority, a partition key, a delay and a
+/// [`duplication_policy`](Self::duplication_policy) each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError` for
 /// each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
 /// describing states its type system allowed it to build. Owning them from the queue makes the
 /// same five unrepresentable — there is no queue-less value here to hang them on. Three rules
@@ -310,7 +310,7 @@ pub struct StartOptions<'a> {
 /// - **A [`priority`](Self::priority) must be between 1 and [`i32::MAX`].** `0` is the stored
 ///   sentinel for unprioritised, so accepting it would give that state a second spelling that
 ///   reads like a real priority.
-/// - **[`Duplication::ReturnExisting`] needs a [`deduplication_id`](Self::deduplication_id)**,
+/// - **[`DuplicationPolicy::ReturnExisting`] needs a [`deduplication_id`](Self::deduplication_id)**,
 ///   because a policy for resolving a collision is meaningless where nothing can collide. Python
 ///   and Go refuse the same pair (`_enqueue_options.py:82`, `workflow.go:1177`), and keeping the
 ///   two apart is what makes the ordinary enqueue — a key, no policy — the short one to write.
@@ -344,7 +344,7 @@ pub struct Enqueue<'a> {
     /// finishes — so it deduplicates a *backlog*, not a history: enqueueing the same key again
     /// after the first one completed is a new workflow, not a duplicate.
     ///
-    /// A second enqueue under a held key is refused, unless [`duplication`](Self::duplication)
+    /// A second enqueue under a held key is refused, unless [`duplication_policy`](Self::duplication_policy)
     /// asks to join the holder instead.
     ///
     /// **Mutually exclusive with [`partition_key`](Self::partition_key)**: a start naming both is
@@ -383,6 +383,9 @@ pub struct Enqueue<'a> {
 
     /// What to do when the [`deduplication_id`](Self::deduplication_id) is already held.
     ///
+    /// Named as Python and TypeScript name it — `duplication_policy` and `duplicationPolicy`,
+    /// beside their `deduplication_id` — rather than shortened; Go says `DeduplicationPolicy`.
+    ///
     /// **Its own field rather than riding inside the key**, though the two are meaningless apart
     /// and keeping them separate costs a rule this type has to refuse at start. Folding them into
     /// one value makes the invalid pair unrepresentable, but only by making the *ordinary* enqueue
@@ -390,7 +393,7 @@ pub struct Enqueue<'a> {
     /// reference's queue tutorial leads with a bare deduplication id, keeping `return-existing`
     /// for the singleton-workflow section that follows. The common case stays a key and nothing
     /// else.
-    pub duplication: Duplication,
+    pub duplication_policy: DuplicationPolicy,
 }
 
 /// What an enqueue does when its [`deduplication_id`](Enqueue::deduplication_id) is already held.
@@ -399,7 +402,7 @@ pub struct Enqueue<'a> {
 /// and asking for [`ReturnExisting`](Self::ReturnExisting) without one is refused rather than
 /// ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Duplication {
+pub enum DuplicationPolicy {
     /// Refuse the enqueue, reporting the collision.
     ///
     /// The default, and what every implementation defaults to. A caller who did not think about
@@ -453,7 +456,7 @@ impl<'a> Enqueue<'a> {
             delay: None,
             // The enum's `#[default]`, not a second copy of it: "reject unless asked" is stated
             // once, where the variants are.
-            duplication: Duplication::default(),
+            duplication_policy: DuplicationPolicy::default(),
         }
     }
 
@@ -491,9 +494,11 @@ impl<'a> Enqueue<'a> {
                     .to_owned(),
             );
         }
-        if self.duplication == Duplication::ReturnExisting && self.deduplication_id.is_none() {
+        if self.duplication_policy == DuplicationPolicy::ReturnExisting
+            && self.deduplication_id.is_none()
+        {
             return refuse(
-                "`Duplication::ReturnExisting` needs a `deduplication_id`: with no key there is \
+                "`DuplicationPolicy::ReturnExisting` needs a `deduplication_id`: with no key there is \
                  no collision to resolve"
                     .to_owned(),
             );
@@ -553,13 +558,13 @@ pub(crate) enum Submitted {
     /// The row this call wrote, and what the system database decided about it.
     Created(WorkflowInitResult),
     /// The workflow already holding the deduplication key, which this call joined instead of
-    /// writing a row of its own. Only reachable under [`Duplication::ReturnExisting`].
+    /// writing a row of its own. Only reachable under [`DuplicationPolicy::ReturnExisting`].
     Joined(String),
 }
 
 /// Inserts a new workflow, resolving a deduplication collision the way the caller asked.
 ///
-/// A loop, because [`Duplication::ReturnExisting`] answers a collision by reading who holds the
+/// A loop, because [`DuplicationPolicy::ReturnExisting`] answers a collision by reading who holds the
 /// key, and the holder can finish between those two statements — leaving the key free and this
 /// call with nothing to join, so it tries the insert again. Everything the insert depends on is
 /// decided by the caller before the first attempt, so a retry writes the same row rather than a
@@ -572,7 +577,7 @@ pub(crate) enum Submitted {
 pub(crate) async fn init_or_join(
     conn: &Connection,
     new: &NewWorkflow<'_>,
-    duplication: Duplication,
+    policy: DuplicationPolicy,
 ) -> Result<Submitted> {
     loop {
         match conn
@@ -583,12 +588,12 @@ pub(crate) async fn init_or_join(
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
             // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
-            // is the answer, and a handle to it is what [`Duplication::ReturnExisting`] promises.
+            // is the answer, and a handle to it is what [`DuplicationPolicy::ReturnExisting`] promises.
             Err(crate::sysdb::Error::QueueDeduplicated {
                 queue_name,
                 deduplication_id,
                 ..
-            }) if duplication == Duplication::ReturnExisting => {
+            }) if policy == DuplicationPolicy::ReturnExisting => {
                 match conn
                     .sysdb()
                     .get_deduplication_key_holder(&queue_name, &deduplication_id)
@@ -981,7 +986,9 @@ where
         let initialized = match init_or_join(
             executor.connection(),
             &new,
-            enqueue.map_or(Duplication::Reject, |enqueue| enqueue.duplication),
+            enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
+                enqueue.duplication_policy
+            }),
         )
         .await?
         {
@@ -993,7 +1000,7 @@ where
             //
             // Only this record, and not the joined workflow's own `parent_workflow_id`: it has an
             // owner already, and a cascade following that column must not reach a workflow this
-            // parent merely joined. [`Duplication::ReturnExisting`] states the asymmetry.
+            // parent merely joined. [`DuplicationPolicy::ReturnExisting`] states the asymmetry.
             //
             // A crash between the join and this write is harmless, and for a different reason than
             // the one below: nothing was written by the losing insert, so a replay simply asks

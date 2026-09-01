@@ -12,8 +12,8 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
-    Change, Client, ClientConfig, Config, DBOS, Duplication, Enqueue, EnqueueOptions, Error, Forks,
-    Message, QueueChange, QueueConflict, QueueOptions, WorkflowHandle,
+    Change, Client, ClientConfig, Config, DBOS, DuplicationPolicy, Enqueue, EnqueueOptions, Error,
+    Forks, Message, QueueChange, QueueConflict, QueueOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -302,22 +302,22 @@ async fn the_workflow_id_is_an_idempotency_key() {
 async fn a_held_deduplication_key_is_refused_or_joined() {
     let db = test_database().await;
     let client = client("client-dedup", &db).await;
-    let options = |duplication| EnqueueOptions {
+    let options = |duplication_policy| EnqueueOptions {
         queue: Enqueue {
             deduplication_id: Some("order-42"),
-            duplication,
+            duplication_policy,
             ..Enqueue::new("work")
         },
         ..EnqueueOptions::new("work")
     };
 
     let first: WorkflowHandle<()> = client
-        .enqueue_with("process_order", (), options(Duplication::Reject))
+        .enqueue_with("process_order", (), options(DuplicationPolicy::Reject))
         .await
         .expect("enqueue failed");
 
     let error = client
-        .enqueue_with::<_, (), Error>("process_order", (), options(Duplication::Reject))
+        .enqueue_with::<_, (), Error>("process_order", (), options(DuplicationPolicy::Reject))
         .await
         .expect_err("the key is held, and rejecting is the default");
     assert!(
@@ -329,7 +329,11 @@ async fn a_held_deduplication_key_is_refused_or_joined() {
     );
 
     let joined: WorkflowHandle<()> = client
-        .enqueue_with("process_order", (), options(Duplication::ReturnExisting))
+        .enqueue_with(
+            "process_order",
+            (),
+            options(DuplicationPolicy::ReturnExisting),
+        )
         .await
         .expect("returning the existing workflow should not fail");
     assert_eq!(
@@ -353,7 +357,7 @@ async fn returning_the_existing_workflow_needs_a_key() {
             (),
             EnqueueOptions {
                 queue: Enqueue {
-                    duplication: Duplication::ReturnExisting,
+                    duplication_policy: DuplicationPolicy::ReturnExisting,
                     ..Enqueue::new("work")
                 },
                 ..EnqueueOptions::new("work")

@@ -433,7 +433,7 @@ impl Client {
             ..new_row(workflow_id, Some(&options.queue))
         };
 
-        match init_or_join(&self.0, &new, options.queue.duplication).await? {
+        match init_or_join(&self.0, &new, options.queue.duplication_policy).await? {
             Submitted::Created(_) => {
                 tracing::debug!(
                     workflow_id,
@@ -902,7 +902,7 @@ pub enum Forks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::Duplication;
+    use crate::workflow::DuplicationPolicy;
 
     #[test]
     fn a_bare_configuration_speaks_for_no_application() {
@@ -954,8 +954,8 @@ mod tests {
         assert_eq!(options.app_version, None);
         assert_eq!(options.timeout, None);
         assert_eq!(
-            options.queue.duplication,
-            Duplication::Reject,
+            options.queue.duplication_policy,
+            DuplicationPolicy::Reject,
             "a caller who did not think about deduplication should hear that a key was taken"
         );
     }
