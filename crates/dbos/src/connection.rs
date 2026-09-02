@@ -50,6 +50,28 @@ pub(crate) struct Connection {
     serializer: Serializer,
     app_name: Option<String>,
     outcome_poll_interval: Duration,
+    owner: Owner,
+}
+
+/// Which of the two surfaces a connection was opened for.
+///
+/// The one thing a connection remembers about where it came from, and it is remembered for one
+/// question: when a workflow awaits a handle whose connection is not its own, is that a mistake or
+/// a plain wait? Two instances of an application disagreeing is the mistake — each has a step
+/// counter the other cannot see, and the caller meant one of them. A client is not a second
+/// instance of anything: it has no executor, no counter and nothing to checkpoint against, so a
+/// workflow reaching through one is doing the only thing a client can do.
+///
+/// Nothing else asks, which is why this is a flag on the connection rather than a second type: a
+/// client's connection and an application's differ in the settings above and in nothing a call
+/// through them has to branch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Owner {
+    /// An [`Executor`](crate::Executor)'s: the connection an application runs its workflows
+    /// through, with a step counter behind it.
+    Application,
+    /// A [`Client`](crate::Client)'s, which runs nothing.
+    Client,
 }
 
 impl Connection {
@@ -90,6 +112,7 @@ impl Connection {
             serializer: config.serializer.clone(),
             app_name: Some(app_name.to_owned()),
             outcome_poll_interval: config.outcome_poll_interval(),
+            owner: Owner::Application,
         })
     }
 
@@ -147,6 +170,7 @@ impl Connection {
             serializer: config.serializer.clone(),
             app_name: config.app_name.clone(),
             outcome_poll_interval: config.outcome_poll_interval(),
+            owner: Owner::Client,
         })
     }
 
@@ -173,6 +197,11 @@ impl Connection {
     /// How often a caller waiting on a workflow it does not own asks whether it has finished.
     pub(crate) fn outcome_poll_interval(&self) -> Duration {
         self.outcome_poll_interval
+    }
+
+    /// Which surface this connection was opened for. See [`Owner`].
+    pub(crate) fn owner(&self) -> Owner {
+        self.owner
     }
 
     /// Releases the connections, the listener and the notifier.

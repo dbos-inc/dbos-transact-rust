@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
@@ -111,6 +111,12 @@ where
     /// rather than waiting again on a workflow that may since have been forked or deleted — and the
     /// wait costs one row read instead of a poll to completion. All four implementations record it,
     /// under the same name, `DBOS.getResult`.
+    ///
+    /// **A handle from a [`Client`](crate::Client) awaited there is a plain wait**, because a
+    /// client has no step counter of its own to agree with the workflow's: nothing is recorded,
+    /// and a replayed body waits again. A handle from another *instance* is
+    /// [`Error::WrongInstance`] instead — there the two counters both exist, and the caller meant
+    /// one of them.
     ///
     /// An id that names no row is [`Error::WorkflowNotFound`], the same absence
     /// [`status`](Self::status) reports: waiting stops at a workflow that does not exist rather
@@ -212,11 +218,18 @@ enum Awaiting {
     /// Not inside a workflow. Nothing is recorded, and a cancelled workflow is reported as
     /// [`Error::WorkflowCancelled`] — there is no *other* workflow here to confuse it with.
     Outside,
-    /// Inside a step. The awaited-cancelled distinction applies, because there is a workflow to
-    /// confuse it with, but nothing is checkpointed: a step is a leaf, and an id-allocating call
-    /// inside one would shift every later step onto the wrong replay slot. `get_event` degrades
-    /// the same way.
-    InsideAStep,
+    /// Inside a workflow, with nothing to record the await against. The awaited-cancelled
+    /// distinction applies, because there is a workflow to confuse it with, but nothing is
+    /// checkpointed. Two ways to land here, and `get_event` degrades both the same way:
+    ///
+    /// - **Inside a step**: a step is a leaf, and an id-allocating call inside one would shift
+    ///   every later step onto the wrong replay slot.
+    /// - **Holding a [`Client`](crate::Client)'s handle**: a client has no step counter to agree
+    ///   with this workflow's, and no execution of its own that a recorded await could belong to.
+    ///   A handle from *another instance* is the third case and is not this one — that is
+    ///   [`Error::WrongInstance`], because two instances each have a counter and the caller meant
+    ///   one of them.
+    Uncheckpointed,
     /// Inside a workflow at a step boundary: this await is a step of that workflow.
     Checkpointed { workflow_id: String, step_id: i32 },
 }
@@ -226,18 +239,36 @@ impl Awaiting {
         let Some(ctx) = Ctx::current() else {
             return Ok(Self::Outside);
         };
-        // The step id would come from this workflow's counter while the write went through the
-        // handle's own system database — the split `get_event` refuses for the same reason. The
-        // comparison is of *databases* rather than of executors, because the database is what the
-        // two halves would disagree about, and it is the thing a handle from a
+        // First, because inside a step nothing is checkpointed whoever the handle belongs to, and
+        // there is then nothing for the halves below to disagree about. `DBOS::get_event` orders
+        // its own two checks the same way.
+        if ctx.in_step() {
+            return Ok(Self::Uncheckpointed);
+        }
+        // Where the two halves would be combined: a step id is about to come from this workflow's
+        // counter while the write goes through the handle's own connection. What that means
+        // depends on whose connection it is, and it is the one question [`Owner`] exists for.
+        //
+        // The comparison is of *databases* rather than of executors, because the database is what
+        // the two halves would disagree about, and it is the thing a handle from a
         // [`Client`](crate::Client) has in common with one from a running executor.
         if !Arc::ptr_eq(ctx.executor().connection(), conn) {
-            return Err(Error::WrongInstance {
-                operation: "awaiting a workflow's result".into(),
-            });
-        }
-        if ctx.in_step() {
-            return Ok(Self::InsideAStep);
+            return match conn.owner() {
+                // **A client's handle is a plain wait, not a refusal.** There is no second counter
+                // here to have meant instead — a client has none — so the await degrades to the
+                // undurable version of itself, which is what `Client::enqueue` documents about a
+                // client used from inside a workflow body and what `Client::get_event` already
+                // does for the read.
+                Owner::Client => Ok(Self::Uncheckpointed),
+                // **Another instance's is the mistake the variant was raised for.** Both
+                // instances have a step counter, the caller meant one of them, and the record
+                // would land where the workflow that allocated the id cannot see it. Refused
+                // rather than quietly downgraded, because a second instance in a process is
+                // nearly always a wiring error and this is the only place it shows.
+                Owner::Application => Err(Error::WrongInstance {
+                    operation: "awaiting a workflow's result".into(),
+                }),
+            };
         }
         Ok(Self::Checkpointed {
             workflow_id: ctx.workflow_id().to_owned(),
