@@ -2,8 +2,8 @@
 //!
 //! This is what makes an `ENQUEUED` row run. Everything under it already existed — the claim is
 //! one transaction in the system database, and turning a claimed row into a running workflow is
-//! [`dispatch`](crate::dispatch) — so what lives here is the loop that asks, the cadence it asks
-//! at, and the count it has to keep to ask correctly.
+//! [`dispatch`] below — so what lives here is the loop that asks, the cadence it asks at, and the
+//! count it has to keep to ask correctly.
 //!
 //! **A supervisor, and a worker per queue**, which is Go's arrangement and holds harder in Rust
 //! where a task is cheaper than a goroutine. The supervisor sweeps once a second: transition
@@ -27,12 +27,16 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use crate::dbos::Executor;
-use crate::dispatch::dispatch;
+use crate::error::Error;
 use crate::queue::DEFAULT_POLLING_INTERVAL;
+use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
-use crate::sysdb::types::{Applications, QueueRecord, ResolvedLimits, Submission, WorkflowFilter};
-use crate::workflow::spawn_tracked;
+use crate::sysdb::types::{
+    Applications, NewWorkflow, QueueRecord, ResolvedLimits, Submission, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus,
+};
+use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
 /// How often the supervisor rebuilds the queue set and transitions delayed workflows.
 ///
@@ -579,6 +583,161 @@ async fn dispatch_claimed(
             );
         }
     }
+}
+
+/// Submits one workflow from the row that describes it, if this executor still can and should.
+///
+/// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
+/// describes — look the registration up by the row's own name, re-assert the claim, and spawn —
+/// and that is what this does. It takes the row rather than fetching it because the claim already
+/// read every row it took in one round trip, which is the shape Python's
+/// `start_dequeued_workflows` chose and the reason
+/// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
+///
+/// **This lived in its own module until it stopped having two callers.** It was factored out of
+/// recovery so the queue runner could share it, and recovery became a re-enqueue in the same
+/// branch — one write, no rows read, no dispatch. It has been the dequeue loop's alone since it
+/// reached `main`, so it lives here now, next to the loop that calls it.
+///
+/// [`Submission::Dequeue`] claims a row another executor may hold and counts against the recovery
+/// budget — that is what [`Submission::claims_ownership`] is — so the cap below is not a
+/// parameter. [`Submission::Fresh`] does not belong here: a first attempt starts from arguments,
+/// not from a row, and has never been through this path.
+///
+/// **The registry is consulted before the row is claimed, and for this caller that is harmless
+/// rather than load-bearing.** The order was recovery's: an `init_workflow` that succeeded and
+/// then found no registration would have burned an attempt and re-stamped the executor on a
+/// workflow this process cannot run. A dequeue has already paid both in its own claim, which
+/// flips the row to `PENDING`, counts the attempt, and stamps `executor_id` before this is
+/// reached. What the order does still mean here is that a row this process cannot run is never
+/// parked, however many attempts it accrues — the subject of the upstream note below.
+///
+/// `slot` is this workflow's place in its queue's local running tally. It travels into the spawned
+/// execution so the tally is released when the workflow's task ends — and is dropped here,
+/// releasing it immediately, on every path that does not spawn.
+///
+/// Returning `Ok(())` covers every reason not to run that is not a fault: no name, no
+/// registration, a row already claimed, a row already finished, a parked row. The caller logs a
+/// genuine `Err` and moves on to the next id — a sweep must not strand every workflow behind one
+/// bad row.
+async fn dispatch(
+    executor: &Arc<Executor>,
+    row: WorkflowRecord,
+    submission: Submission,
+    slot: Option<Slot>,
+) -> crate::Result<()> {
+    let workflow_id = row.workflow_id;
+    let Some(name) = row.name else {
+        tracing::warn!(workflow_id, "the row names no workflow; skipped");
+        return Ok(());
+    };
+
+    let key = WorkflowKey::from_row(name, row.class_name.as_deref(), row.config_name.as_deref());
+    if !executor.workflows().contains_key(&key) {
+        // Logged and skipped, never fatal: the code that knew this workflow was removed or
+        // renamed, and the row waits for a launch that recognises it.
+        //
+        // TODO(dbos-team): UPSTREAM item 24, the cap this skip never reaches. The claim already
+        // counted this dispatch — `start_queued_workflows` does `recovery_attempts + 1` — and
+        // `init_workflow` is the only place that reads that count against the cap and parks the
+        // row, so returning here skips it. A row naming a workflow this process does not have is
+        // claimed, counted, skipped, re-enqueued by recovery, and claimed again, with nothing
+        // ever parking it. All four implementations have the same hole in the same order:
+        // `_core.py:1235`, `dbos-executor.ts:690`, `queue.go:783` and `WorkflowDAO.java:185` all
+        // dead-letter only once the registration has resolved. For them the order is forced —
+        // the budget is read off the registration whose absence is the problem. Here it is
+        // `MAX_RECOVERY_ATTEMPTS`, a constant, so this could check the cap first; it does not,
+        // because a lone port that parks rows its peers leave alone is the worse divergence.
+        tracing::warn!(
+            workflow_id,
+            workflow = %key,
+            "no workflow is registered under the row's name; it stays where it is"
+        );
+        return Ok(());
+    }
+
+    let initialized = match executor
+        .sysdb()
+        .init_workflow(
+            &NewWorkflow {
+                name: Some(&key.name),
+                class_name: key.class_name.as_deref(),
+                config_name: key.config_name.as_deref(),
+                input: row.input.as_deref(),
+                // The row's own, not this executor's default: a submission from a row must not
+                // rewrite how a payload it did not encode is described.
+                serialization: row.serialization.as_deref(),
+                // The queue the row is already on. Omitting it does not mean "leave the queue
+                // alone" — `init_workflow` reads it as `None` and warns that the workflow is
+                // being submitted onto a different queue, which for every dequeued row is both
+                // untrue and unavoidable. Passing the row's own value is what lets that warning
+                // go on meaning a genuine requeue.
+                queue_name: row.queue_name.as_deref(),
+                executor_id: Some(executor.executor_id()),
+                application_name: Some(executor.app_name()),
+                application_version: Some(executor.app_version()),
+                ..NewWorkflow::new(&workflow_id)
+            },
+            Some(MAX_RECOVERY_ATTEMPTS),
+            submission,
+        )
+        .await
+    {
+        Ok(initialized) => initialized,
+        // Parked, not failed to submit: the row is now MAX_RECOVERY_ATTEMPTS_EXCEEDED and no
+        // later launch or dequeue will pick it up, which deserves its own line rather than the
+        // generic one.
+        Err(error @ sysdb::Error::MaxRecoveryAttemptsExceeded { .. }) => {
+            tracing::warn!(workflow_id, error = %error, "the workflow is parked");
+            return Ok(());
+        }
+        Err(error) => return Err(Error::SystemDatabase(error)),
+    };
+
+    // **Only a `PENDING` row can own its outcome.** A row that moved on since the claim —
+    // cancelled, resumed, or finished by a rival execution — would run for nothing, and a resumed
+    // one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`, so
+    // running it here while the next sweep claims it again is one workflow executing twice.
+    //
+    // The status is `init_workflow`'s own `RETURNING`, and its `ON CONFLICT` never writes the
+    // status column — so this is what the row holds as of a round trip ago, rather than as of the
+    // batch read that preceded every dispatch in this tick. The other four check the batch read's
+    // copy (`_core.py:1313`, `dbos-executor.ts:702`, `queue.go:798`, and Java's non-owner
+    // rollback), which narrows the window rather than closing it; this narrows it further.
+    //
+    // `should_execute` does not stand in for this, which is what it was doing before. It reports
+    // whether another owner holds the row *and this caller is not claiming it* — and a dequeue
+    // always claims, so it is `true` here whatever the row says.
+    if initialized.status != WorkflowStatus::Pending {
+        tracing::warn!(
+            workflow_id,
+            status = %initialized.status,
+            "the dequeued workflow is no longer pending; it is not started"
+        );
+        return Ok(());
+    }
+
+    tracing::debug!(
+        workflow_id,
+        workflow = %key,
+        attempt = initialized.recovery_attempts,
+        submission = ?submission,
+        "running the workflow"
+    );
+    // Detached: submitted workflows run concurrently and the caller moves on. The handle is not
+    // awaited by anyone, which is exactly the case the execution layer's own logging covers.
+    // The stored deadline, so a workflow gets what is *left* of its budget rather than the whole
+    // of it again — and one submitted after its expiry cancels at once instead of running on
+    // unbounded.
+    spawn_execution(
+        executor,
+        key,
+        workflow_id,
+        row.input,
+        initialized.deadline,
+        slot,
+    );
+    Ok(())
 }
 
 /// Whether a failed dequeue means a peer was mid-dequeue rather than something being wrong.
