@@ -85,7 +85,7 @@ pub struct Config {
     ///
     /// Load-bearing rather than cosmetic: it is the ownership key stamped on every row this
     /// instance writes, it mixes into the application version, and Conductor addresses an
-    /// application by it. Three to thirty characters of lowercase letters, digits, dashes and
+    /// application by it. Three to 256 characters of lowercase letters, digits, dashes and
     /// underscores, checked at [`launch`](crate::DBOS::launch).
     pub app_name: String,
 

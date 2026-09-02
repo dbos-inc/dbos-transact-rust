@@ -7423,7 +7423,7 @@ async fn a_batched_rename_loses_no_rows() {
 async fn a_rename_refuses_a_bad_target_name() {
     let (sys, _db) = sysdb().await;
 
-    for bad in ["ab", "Has-Capitals", "has spaces", &"x".repeat(31)] {
+    for bad in ["ab", "Has-Capitals", "has spaces", &"x".repeat(257)] {
         let result = sys
             .rename_application(
                 RenameFrom::Application("alpha"),

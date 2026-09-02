@@ -155,7 +155,7 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
     })
 }
 
-/// The rule the other implementations share: 3–30 characters of lowercase letters, digits, dashes
+/// The rule the other implementations share: 3–256 characters of lowercase letters, digits, dashes
 /// and underscores.
 ///
 /// Checked rather than trusted because the name is an ownership key: a row stamped with a name no
@@ -165,7 +165,7 @@ pub(crate) fn validate_app_name(name: &str) -> Result<()> {
     match name.chars().count() {
         0 => return bad("cannot be empty"),
         1..=2 => return bad("must be at least 3 characters"),
-        31.. => return bad("must be at most 30 characters"),
+        257.. => return bad("must be at most 256 characters"),
         _ => {}
     }
     if let Some(c) = name
@@ -268,13 +268,13 @@ mod tests {
 
     #[test]
     fn an_app_name_is_held_to_the_rule_every_implementation_shares() {
-        for ok in ["abc", "my-app", "my_app_2", &"a".repeat(30)] {
+        for ok in ["abc", "my-app", "my_app_2", &"a".repeat(256)] {
             assert!(validate_app_name(ok).is_ok(), "{ok:?} should be accepted");
         }
         for bad in [
             "",
             "ab",
-            &"a".repeat(31),
+            &"a".repeat(257),
             "My-App",
             "my app",
             "my.app",
