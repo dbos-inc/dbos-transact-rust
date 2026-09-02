@@ -34,7 +34,7 @@ use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     Applications, NewWorkflow, QueueRecord, ResolvedLimits, Submission, WorkflowFilter,
-    WorkflowRecord,
+    WorkflowRecord, WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
@@ -591,7 +591,8 @@ async fn dispatch_claimed(
 /// describes — look the registration up by the row's own name, re-assert the claim, and spawn —
 /// and that is what this does. It takes the row rather than fetching it because the claim already
 /// read every row it took in one round trip, which is the shape Python's
-/// `start_dequeued_workflows` chose and the reason [`start_queued_workflows`] returns ids.
+/// `start_dequeued_workflows` chose and the reason
+/// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
 ///
 /// **This lived in its own module until it stopped having two callers.** It was factored out of
 /// recovery so the queue runner could share it, and recovery became a re-enqueue in the same
@@ -607,9 +608,9 @@ async fn dispatch_claimed(
 /// rather than load-bearing.** The order was recovery's: an `init_workflow` that succeeded and
 /// then found no registration would have burned an attempt and re-stamped the executor on a
 /// workflow this process cannot run. A dequeue has already paid both in its own claim, which
-/// flips the row to `PENDING` and stamps `executor_id` before this is reached. What the order does
-/// still mean here is that the skipped row's attempt goes uncounted — the subject of the upstream
-/// note below.
+/// flips the row to `PENDING`, counts the attempt, and stamps `executor_id` before this is
+/// reached. What the order does still mean here is that a row this process cannot run is never
+/// parked, however many attempts it accrues — the subject of the upstream note below.
 ///
 /// `slot` is this workflow's place in its queue's local running tally. It travels into the spawned
 /// execution so the tally is released when the workflow's task ends — and is dropped here,
@@ -635,6 +636,18 @@ async fn dispatch(
     if !executor.workflows().contains_key(&key) {
         // Logged and skipped, never fatal: the code that knew this workflow was removed or
         // renamed, and the row waits for a launch that recognises it.
+        //
+        // TODO(dbos-team): UPSTREAM item 24, the cap this skip never reaches. The claim already
+        // counted this dispatch — `start_queued_workflows` does `recovery_attempts + 1` — and
+        // `init_workflow` is the only place that reads that count against the cap and parks the
+        // row, so returning here skips it. A row naming a workflow this process does not have is
+        // claimed, counted, skipped, re-enqueued by recovery, and claimed again, with nothing
+        // ever parking it. All four implementations have the same hole in the same order:
+        // `_core.py:1235`, `dbos-executor.ts:690`, `queue.go:783` and `WorkflowDAO.java:185` all
+        // dead-letter only once the registration has resolved. For them the order is forced —
+        // the budget is read off the registration whose absence is the problem. Here it is
+        // `MAX_RECOVERY_ATTEMPTS`, a constant, so this could check the cap first; it does not,
+        // because a lone port that parks rows its peers leave alone is the worse divergence.
         tracing::warn!(
             workflow_id,
             workflow = %key,
@@ -681,10 +694,25 @@ async fn dispatch(
         Err(error) => return Err(Error::SystemDatabase(error)),
     };
 
-    if !initialized.should_execute {
+    // **Only a `PENDING` row can own its outcome.** A row that moved on since the claim —
+    // cancelled, resumed, or finished by a rival execution — would run for nothing, and a resumed
+    // one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`, so
+    // running it here while the next sweep claims it again is one workflow executing twice.
+    //
+    // The status is `init_workflow`'s own `RETURNING`, and its `ON CONFLICT` never writes the
+    // status column — so this is what the row holds as of a round trip ago, rather than as of the
+    // batch read that preceded every dispatch in this tick. The other four check the batch read's
+    // copy (`_core.py:1313`, `dbos-executor.ts:697`, `queue.go:797`, and Java's non-owner
+    // rollback), which narrows the window rather than closing it; this narrows it further.
+    //
+    // `should_execute` does not stand in for this, which is what it was doing before. It reports
+    // whether another owner holds the row *and this caller is not claiming it* — and a dequeue
+    // always claims, so it is `true` here whatever the row says.
+    if initialized.status != WorkflowStatus::Pending {
         tracing::debug!(
             workflow_id,
-            "another executor claimed the workflow, or it already finished"
+            status = %initialized.status,
+            "the dequeued workflow is no longer pending; it is not started"
         );
         return Ok(());
     }
