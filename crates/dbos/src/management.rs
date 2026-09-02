@@ -125,6 +125,15 @@ pub enum ForkFrom<'a> {
 /// A struct for one field, because it is the field every reference has and none of them stopped
 /// there — and because `resume_all(&ids, None)` says nothing at a call site about what was
 /// declined.
+///
+/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has. Resume takes a
+/// queue name and no partition key in all five, and the `UPDATE` behind it moves `queue_name`
+/// while leaving `queue_partition_key` untouched — so resuming onto a partitioned queue either
+/// carries over a key belonging to whatever queue the workflow was on before, or, for a workflow
+/// that never had one, writes the unkeyed row that
+/// [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not closed here alone:
+/// the gap is the contract's, and a field no reference has would put this crate's `resume` ahead
+/// of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
     /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
@@ -139,8 +148,11 @@ pub struct ResumeOptions<'a> {
 
 /// What a fork inherits, and where it goes.
 ///
-/// Every field defaults to "the same as the source", which is what a caller who says nothing
-/// means.
+/// **`None` does not mean the same thing across these fields.**
+/// [`application_version`](Self::application_version) is the only one that falls back to the
+/// source's; the queue, its partition and the timeout are the *fork's own*, because a fork is
+/// enqueued where the caller says rather than where its source ran. Saying nothing about those
+/// three asks for the internal queue, no partition, and no bound — not "as before".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForkOptions<'a> {
     /// The id the fork gets. `None` generates one.
@@ -155,7 +167,22 @@ pub struct ForkOptions<'a> {
     pub application_version: Option<&'a str>,
     /// The queue the fork is enqueued on. `None` is the engine's internal queue.
     pub queue: Option<&'a str>,
-    /// How long the fork may run once it starts.
+    /// The partition of that queue, which a partitioned [`queue`](Self::queue) requires.
+    ///
+    /// **Not inherited.** A source enqueued under a key does not pass it on; the fork's column is
+    /// written from this field, so `None` is no partition even when the source had one.
+    ///
+    /// Leaving it out on a partitioned queue produces a fork that can never run. Such a queue is
+    /// swept one partition at a time and every read that does so is keyed — see
+    /// `get_queue_partitions`, which selects `WHERE queue_partition_key IS NOT NULL` — so an
+    /// unkeyed row belongs to no partition and no sweep will ever see it. It stays `ENQUEUED`,
+    /// and the handle waits on a workflow nothing will pick up.
+    ///
+    /// All four references carry this on their fork options, and for this reason: Python's
+    /// `queue_partition_key`, Go's `QueuePartitionKey`, TypeScript's `queuePartitionKey`, and
+    /// Java's `ForkFromFailureOptions::queuePartitionKey`.
+    pub queue_partition_key: Option<&'a str>,
+    /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
 }
 
@@ -658,7 +685,7 @@ async fn fork_batch(
     let sys_options = SysForkOptions {
         application_version: options.application_version,
         queue_name: options.queue,
-        queue_partition_key: None,
+        queue_partition_key: options.queue_partition_key,
         timeout: options.timeout,
         replacement_children: &[],
     };

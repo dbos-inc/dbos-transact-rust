@@ -232,6 +232,115 @@ async fn a_fork_takes_the_id_and_queue_it_is_given() {
     dbos.shutdown().await;
 }
 
+/// **A fork onto a partitioned queue needs its own partition key, and is not given one.**
+///
+/// A partitioned queue is swept one partition at a time and every read that finds those
+/// partitions is keyed, so an unkeyed row is in none of them and no sweep can see it. The fork's
+/// key is written from [`ForkOptions::queue_partition_key`] rather than inherited from the
+/// source, which is what makes leaving it out a workflow that never runs rather than one that
+/// lands where its source did.
+///
+/// Both halves are asserted from the same sweeps: the keyed fork runs to completion, and the
+/// unkeyed one — enqueued first, onto the same queue — is still `ENQUEUED` afterwards. No sleep
+/// decides that. A row the partitioned dequeue could see would have been claimed by one of the
+/// polls that ran the keyed fork.
+#[tokio::test]
+async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("fork-partition-app", &db));
+    let workflow = dbos
+        .register_workflow("sharded", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let queue = dbos
+        .register_queue(
+            "partitioned-forks",
+            dbos::QueueOptions {
+                partition_concurrency: Some(1),
+                ..dbos::QueueOptions::default()
+            },
+            dbos::QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("registration failed");
+    assert!(queue.is_partitioned());
+
+    let id = "the-source";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the source failed");
+
+    // Enqueued first, so it has had every sweep the keyed fork had.
+    dbos.fork_with::<u32, EngineOnly>(
+        id,
+        ForkFrom::Beginning,
+        ForkOptions {
+            forked_id: Some("unkeyed-fork"),
+            queue: Some("partitioned-forks"),
+            ..ForkOptions::default()
+        },
+    )
+    .await
+    .expect("fork failed");
+
+    let keyed = dbos
+        .fork_with::<u32, EngineOnly>(
+            id,
+            ForkFrom::Beginning,
+            ForkOptions {
+                forked_id: Some("keyed-fork"),
+                queue: Some("partitioned-forks"),
+                queue_partition_key: Some("tenant-a"),
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(30), keyed.result())
+            .await
+            .expect("the keyed fork never ran")
+            .expect("the fork failed"),
+        7
+    );
+
+    let reader = reader(&db).await;
+    let keyed_row = reader
+        .get_workflow("keyed-fork")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(
+        keyed_row.queue_partition_key.as_deref(),
+        Some("tenant-a"),
+        "the fork did not carry the partition key it was given"
+    );
+
+    let unkeyed_row = reader
+        .get_workflow("unkeyed-fork")
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(
+        unkeyed_row.queue_partition_key, None,
+        "an unkeyed fork inherited a key from somewhere"
+    );
+    assert_eq!(
+        unkeyed_row.status,
+        WorkflowStatus::Enqueued,
+        "a partitioned sweep claimed a row belonging to no partition"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// Nothing on this surface is available before launch — the reads no more than the writes, since
 /// every one of them needs the system database the launch opens.
 #[tokio::test]
