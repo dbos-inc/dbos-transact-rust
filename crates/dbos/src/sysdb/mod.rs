@@ -307,6 +307,15 @@ pub trait SystemDatabase: Send + Sync {
     /// "already finished" from "never existed", and here the distinction matters: resuming an id
     /// that was mistyped should say so rather than silently do nothing. Python draws the same
     /// line, and for the same reason.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 27. The only guard is that the row is not terminal, which is
+    /// the predicate all five share — so `PENDING` passes, and resuming a workflow that is
+    /// executing right now re-enqueues it underneath its own execution. The next sweep claims the
+    /// row and dispatches it, and two executions of one id run concurrently: neither is told about
+    /// the other, and the running one is not cancelled, so nothing stops it at its next step. It
+    /// cannot simply be tightened here, because `PENDING` means *owned*, not *running*, and the
+    /// row cannot say whether the owner is alive — a workflow left `PENDING` by a dead node is the
+    /// case an operator most wants to resume by hand.
     async fn resume_workflows(
         &self,
         workflow_ids: &[&str],
