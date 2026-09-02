@@ -994,10 +994,12 @@ impl crate::Client {
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
+    /// use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
+    ///
     /// let stuck = client
-    ///     .list_workflows(&dbos::WorkflowFilter {
-    ///         status: vec![dbos::WorkflowStatus::Pending],
-    ///         ..Default::default()
+    ///     .list_workflows(&WorkflowFilter {
+    ///         status: vec![WorkflowStatus::Pending],
+    ///         ..WorkflowFilter::default()
     ///     })
     ///     .await?;
     /// # Ok(()) }
