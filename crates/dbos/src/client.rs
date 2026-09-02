@@ -73,7 +73,7 @@ use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{
     Message as EncodedMessage, NewWorkflow, Timestamp, VersionInfo, WorkflowStatus,
 };
-use crate::workflow::{Enqueue, Submitted, init_or_join, new_row};
+use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
 /// Everything a [`Client`] needs.
@@ -384,15 +384,7 @@ impl Client {
         options.queue.validate()?;
 
         let input = encode(&input, "argument")?;
-        let attributes = options
-            .attributes
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| Error::Serialization {
-                what: "attributes".into(),
-                message: error.to_string(),
-                source: Some(error),
-            })?;
+        let attributes = encode_attributes(options.attributes)?;
         // Generated once, outside the retry below: a second attempt under a fresh id would enqueue
         // a *second* workflow if the first insert had in fact landed.
         let generated;
@@ -753,11 +745,23 @@ impl Client {
 /// # use dbos::{Enqueue, EnqueueOptions};
 /// let options = EnqueueOptions {
 ///     workflow_id: Some("order-42"),
-///     queue: Enqueue {
+///     ..EnqueueOptions::new("orders")
+/// };
+/// ```
+///
+/// Asking the queue for something is [`EnqueueOptions::on`], which takes the whole [`Enqueue`]
+/// rather than leaving the `queue` field to be overwritten afterwards — the queue is named once,
+/// where a `..EnqueueOptions::new(..)` base under a `queue:` field would name it twice and honour
+/// only the second:
+///
+/// ```no_run
+/// # use dbos::{Enqueue, EnqueueOptions};
+/// let options = EnqueueOptions {
+///     workflow_id: Some("order-42"),
+///     ..EnqueueOptions::on(Enqueue {
 ///         priority: Some(1),
 ///         ..Enqueue::new("orders")
-///     },
-///     ..EnqueueOptions::new("orders")
+///     })
 /// };
 /// ```
 ///
@@ -837,8 +841,20 @@ pub struct EnqueueOptions<'a> {
 impl<'a> EnqueueOptions<'a> {
     /// A plain enqueue onto `queue`, asking for nothing else.
     pub fn new(queue: &'a str) -> Self {
+        Self::on(Enqueue::new(queue))
+    }
+
+    /// The same, for an enqueue that has something to ask of the queue itself — a deduplication
+    /// id, a priority, a partition key, a delay.
+    ///
+    /// **The base to build on whenever [`queue`](Self::queue) is not the default one**, because
+    /// it is the only shape that names the queue once: `EnqueueOptions { queue: .., ..
+    /// EnqueueOptions::new(..) }` names it twice, and the functional update overwrites whatever
+    /// `new` was given, so a rename that misses one of the two silently enqueues onto the stale
+    /// queue.
+    pub fn on(queue: Enqueue<'a>) -> Self {
         Self {
-            queue: Enqueue::new(queue),
+            queue,
             workflow_id: None,
             class_name: None,
             config_name: None,
@@ -847,6 +863,12 @@ impl<'a> EnqueueOptions<'a> {
             timeout: None,
             attributes: None,
         }
+    }
+}
+
+impl<'a> From<Enqueue<'a>> for EnqueueOptions<'a> {
+    fn from(queue: Enqueue<'a>) -> Self {
+        Self::on(queue)
     }
 }
 
@@ -968,6 +990,27 @@ mod tests {
             DuplicationPolicy::Reject,
             "a caller who did not think about deduplication should hear that a key was taken"
         );
+    }
+
+    /// The queue is named once, and it is the one that was asked for.
+    ///
+    /// `on` exists so that an enqueue with something to say about the queue does not have to name
+    /// it twice — once in the [`Enqueue`] and once in an `EnqueueOptions::new` base, where only
+    /// the second is honoured.
+    #[test]
+    fn options_over_a_queue_keep_the_queue_they_were_given() {
+        let queue = Enqueue {
+            priority: Some(3),
+            ..Enqueue::new("billing")
+        };
+        let options = EnqueueOptions {
+            workflow_id: Some("order-42"),
+            ..EnqueueOptions::on(queue.clone())
+        };
+        assert_eq!(options.queue, queue);
+        assert_eq!(options.queue.name, "billing");
+        assert_eq!(options.workflow_id, Some("order-42"));
+        assert_eq!(EnqueueOptions::from(queue.clone()).queue, queue);
     }
 
     #[test]

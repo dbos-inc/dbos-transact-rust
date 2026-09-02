@@ -244,13 +244,10 @@ async fn a_delayed_enqueue_is_held_back() {
         .enqueue_with(
             "later",
             (),
-            EnqueueOptions {
-                queue: Enqueue {
-                    delay: Some(Duration::from_secs(3600)),
-                    ..Enqueue::new("work")
-                },
-                ..EnqueueOptions::new("work")
-            },
+            EnqueueOptions::on(Enqueue {
+                delay: Some(Duration::from_secs(3600)),
+                ..Enqueue::new("work")
+            }),
         )
         .await
         .expect("enqueue failed");
@@ -306,13 +303,12 @@ async fn the_workflow_id_is_an_idempotency_key() {
 async fn a_held_deduplication_key_is_refused_or_joined() {
     let db = test_database().await;
     let client = client("client-dedup", &db).await;
-    let options = |duplication_policy| EnqueueOptions {
-        queue: Enqueue {
+    let options = |duplication_policy| {
+        EnqueueOptions::on(Enqueue {
             deduplication_id: Some("order-42"),
             duplication_policy,
             ..Enqueue::new("work")
-        },
-        ..EnqueueOptions::new("work")
+        })
     };
 
     let first: WorkflowHandle<()> = client
@@ -359,13 +355,10 @@ async fn returning_the_existing_workflow_needs_a_key() {
         .enqueue_with::<_, (), Error>(
             "process_order",
             (),
-            EnqueueOptions {
-                queue: Enqueue {
-                    duplication_policy: DuplicationPolicy::ReturnExisting,
-                    ..Enqueue::new("work")
-                },
-                ..EnqueueOptions::new("work")
-            },
+            EnqueueOptions::on(Enqueue {
+                duplication_policy: DuplicationPolicy::ReturnExisting,
+                ..Enqueue::new("work")
+            }),
         )
         .await
         .expect_err("there is no collision to resolve without a deduplication id");
@@ -387,12 +380,11 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
             (),
             EnqueueOptions {
                 workflow_id: Some("never-written"),
-                queue: Enqueue {
+                ..EnqueueOptions::on(Enqueue {
                     deduplication_id: Some("key"),
                     partition_key: Some("part"),
                     ..Enqueue::new("work")
-                },
-                ..EnqueueOptions::new("work")
+                })
             },
         )
         .await
