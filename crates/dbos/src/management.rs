@@ -528,9 +528,19 @@ impl DBOS {
     /// that is still waiting, not a way to pause work that has started.
     /// [`cancel`](Self::cancel) is the one that stops something.
     ///
-    /// [`WorkflowDelay::For`] is resolved against the **database's** clock rather than this
-    /// process's, the same as the delay on an enqueue: a caller's skew should not reach the row,
-    /// where a whole fleet reads it.
+    /// [`WorkflowDelay::For`] is resolved against **this process's** clock, the same as the delay
+    /// on an enqueue and the same as every reference: Python's `time.time()`, Go's `time.Now()`,
+    /// TypeScript's `Date.now()`, Java's `Instant.now()`. So a caller's skew does reach the row.
+    ///
+    /// **And a second clock decides when the row is acted on.** The supervisor that releases a
+    /// `DELAYED` workflow compares the stamp against its *own* reading, so the moment a fleet
+    /// observes is two clocks away from the one that set it — the setter's and the releaser's,
+    /// neither of them the database's. `init_workflow` carries the reasoning for leaving it
+    /// there, and UPSTREAM item 22 the proposal to close it everywhere at once rather than here
+    /// alone.
+    ///
+    /// [`WorkflowDelay::Until`] removes the first of those readings: an absolute instant is
+    /// written as given, and nothing on this path consults a clock to do it.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
