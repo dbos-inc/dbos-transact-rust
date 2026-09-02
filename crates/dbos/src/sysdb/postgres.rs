@@ -664,11 +664,24 @@ impl PostgresSystemDatabase {
     /// `work` takes the transaction by value and hands it back, rather than borrowing it. A
     /// borrowing closure cannot promise its future is `Send`, which every caller needs behind
     /// `#[async_trait]` — the same constraint [`with_retry`] documents.
+    ///
+    /// **`started_at` is the caller's and the completion is this function's.** Every caller sits
+    /// inside a [`with_retry`], so the start is read once outside it and the recorded duration
+    /// spans every attempt, as [`crate::step`] does for an ordinary step; the completion is read
+    /// here, once the work has actually finished. Taking a whole [`StepTiming`] invited the
+    /// caller to read the clock twice in a row and record a duration of nothing.
+    ///
+    /// [`StepTiming::completed_at`] is also the token that recognises a caller's own write after
+    /// a lost acknowledgement, and stamping it per attempt would break that — everywhere but
+    /// here. The check and the insert share one transaction, so an attempt that committed and
+    /// lost its acknowledgement is caught by `check_step_on` on the next attempt and replayed,
+    /// never reaching the insert. What survives to compare timestamps is a genuine rival, and
+    /// there a differing completion is the right answer.
     async fn run_transactional_step<T, F, Fut>(
         &self,
         caller: Option<(&str, i32)>,
         step_name: &str,
-        timing: StepTiming,
+        started_at: Timestamp,
         work: F,
     ) -> Result<T, Error>
     where
@@ -726,7 +739,12 @@ impl PostgresSystemDatabase {
                 step_name,
                 Outcome::Output(Some(&recorded)),
                 Some(PORTABLE_JSON),
-                Some(timing),
+                // Read here rather than taken from the caller: the work above has run, so this
+                // is when the step finished rather than when it was about to start.
+                Some(StepTiming {
+                    started_at,
+                    completed_at: Timestamp::now(),
+                }),
                 None,
             )
             .await?;
@@ -969,16 +987,13 @@ impl PostgresSystemDatabase {
         options: &ForkOptions<'_>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "fork_workflows", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::FORK_WORKFLOW,
-                timing,
+                started_at,
                 |tx| async move {
                     let tx = self
                         .fork_on(tx, source_ids, forked_ids, steps, options)
@@ -2698,16 +2713,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         let workflow_table = workflow_table.as_str();
         let (status, prefixes) = (status.as_slice(), prefixes.as_slice());
         let application_name = self.application_name.as_deref();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_workflows", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::LIST_WORKFLOWS,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
                     // a hoisted one would make each attempt's future borrow the closure — which
@@ -3070,16 +3082,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         let now = Timestamp::now();
         let delay_until = delay.resolve(now).as_epoch_ms();
         let workflow_table = workflow_table.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "set_workflow_delay", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::SET_WORKFLOW_DELAY,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // `status = 'DELAYED'` is the guard: a released workflow is running or
                     // queued, and pushing its delay out would not recall it.
@@ -3131,10 +3140,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         validate_attributes(attributes)?;
         let workflow_table = self.tables.workflow_status.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(
             &self.retry,
@@ -3143,7 +3149,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 self.run_transactional_step(
                     caller,
                     step_names::UPDATE_WORKFLOW_ATTRIBUTES,
-                    timing,
+                    started_at,
                     |mut tx| async move {
                         sqlx::query(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
@@ -3264,10 +3270,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         if workflow_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         // The retry wraps the whole cascade, and the cascade is one transaction: a failure
         // partway through rolls back to before the roots were touched, so the next attempt starts
@@ -3278,7 +3281,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             self.run_transactional_step(
                 caller,
                 step_names::CANCEL_WORKFLOW,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // One statement per *level*, not per workflow: `cancel_batch` takes the whole
                     // frontier and matches it with `= ANY($1)`, so the round trips scale with the
@@ -3338,16 +3341,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
         let workflow_table = self.tables.workflow_status.as_str();
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "resume_workflows", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::RESUME_WORKFLOW,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // Existence is asked separately because a zero-row update conflates "already
                     // finished" — which is legal — with "no such workflow", which is not. In the
@@ -3463,16 +3463,13 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         let workflow_table = self.tables.workflow_status.as_str();
         let targets = targets.as_slice();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "delete_workflows", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::DELETE_WORKFLOW,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // Steps, notifications, events, and streams go with the row: every child
                     // table declares `ON DELETE CASCADE` on this foreign key, from migration 1
@@ -4263,16 +4260,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<StepRecord>, Error> {
         let steps_table = self.tables.operation_outputs.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_workflow_steps", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::LIST_WORKFLOW_STEPS,
-                timing,
+                started_at,
                 |mut tx| async move {
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
                     q.push(STEP_COLUMNS)
@@ -5911,12 +5905,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             .application_name
             .or(self.application_name.as_deref());
 
-        // Read once per attempt, so a retry after a lost commit acknowledgement records the times
-        // of the attempt that actually landed.
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        // Read once, outside the retry, so the duration spans every attempt rather than only the
+        // one that landed. `run_transactional_step` stamps the completion on the far side of the
+        // work.
+        let started_at = Timestamp::now();
 
         with_retry(
             &self.retry,
@@ -5928,7 +5920,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 self.run_transactional_step(
                     caller,
                     step_names::DEBOUNCE,
-                    timing,
+                    started_at,
                     |mut tx| async move {
                         // The cap is what stops a steady stream of requests postponing the workflow
                         // forever: past the deadline, the delay stops moving. `CASE` rather than the
@@ -6065,16 +6057,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             .schedule_id
             .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
         let schedule_id = schedule_id.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "create_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::CREATE_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // A peer holding the name is a collision this layer cannot resolve; this
                     // application holding it is one the caller can, so the two are different errors.
@@ -6155,16 +6144,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             .schedule_id
             .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
         let schedule_id = schedule_id.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "upsert_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::UPSERT_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     self.upsert_schedule_on(&mut tx, schedule, schedule_id)
                         .await?;
@@ -6182,10 +6168,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
     ) -> Result<Option<ScheduleRecord>, Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "get_schedule", move || async move {
             // A read is a step too: a workflow that branches on a schedule has to see the same
@@ -6193,7 +6176,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             self.run_transactional_step(
                 caller,
                 step_names::GET_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     let row = sqlx::query(AssertSqlSafe(format!(
                         "SELECT {SCHEDULE_COLUMNS} FROM {schedules_table} WHERE schedule_name = $1"
@@ -6245,16 +6228,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         let application_name = self.application_name.as_deref();
         let statuses: Vec<&str> = filter.statuses.iter().map(|s| s.as_str()).collect();
         let statuses = statuses.as_slice();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_schedules", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::LIST_SCHEDULES,
-                timing,
+                started_at,
                 |mut tx| async move {
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
                     q.push(SCHEDULE_COLUMNS)
@@ -6320,16 +6300,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "update_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::UPDATE_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // An empty update still has to say whether the schedule exists, so it becomes
                     // a read rather than an early return: silence would report a typo as success.
@@ -6399,13 +6376,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             ScheduleStatus::Active => step_names::RESUME_SCHEDULE,
             ScheduleStatus::Paused => step_names::PAUSE_SCHEDULE,
         };
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "set_schedule_status", move || async move {
-            self.run_transactional_step(caller, step_name, timing, |mut tx| async move {
+            self.run_transactional_step(caller, step_name, started_at, |mut tx| async move {
                 let updated = sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {schedules_table} SET status = $2 WHERE schedule_name = $1"
                 )))
@@ -6462,16 +6436,13 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "delete_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::DELETE_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM {schedules_table} WHERE schedule_name = $1"

@@ -1120,6 +1120,13 @@ pub struct StepTiming {
     /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
     /// than building it at the call site inside a retry loop.
     ///
+    /// **A step recorded on the same transaction that checked for it is the exception**, and
+    /// `run_transactional_step` is the one that does: an attempt whose commit was acknowledged to
+    /// nobody is caught by the check on the next attempt and replayed, so it never reaches the
+    /// insert. Only a genuine rival survives to be compared there, and a completion that differs
+    /// from this attempt's is the right answer rather than a spurious one — which is why that
+    /// path stamps the clock after its work rather than before it.
+    ///
     /// Omitting the timing altogether gives up that detection: with no recorded completion there
     /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
     /// behaves the same way, guarding its comparison with `if (endTimeEpochMs != null)`.
