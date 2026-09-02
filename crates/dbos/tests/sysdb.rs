@@ -644,7 +644,7 @@ async fn an_await_returns_a_recorded_outcome() {
         .await
         .unwrap();
     assert_eq!(
-        sys.await_workflow_result("wf-ok", BRISK_POLL)
+        sys.await_workflow_result("wf-ok", BRISK_POLL, false)
             .await
             .unwrap(),
         AwaitedOutcome::Succeeded {
@@ -659,7 +659,7 @@ async fn an_await_returns_a_recorded_outcome() {
         .await
         .unwrap();
     assert_eq!(
-        sys.await_workflow_result("wf-bad", BRISK_POLL)
+        sys.await_workflow_result("wf-bad", BRISK_POLL, false)
             .await
             .unwrap(),
         AwaitedOutcome::Failed {
@@ -681,7 +681,7 @@ async fn an_await_reports_a_void_return_as_a_success() {
         .unwrap();
 
     assert!(matches!(
-        sys.await_workflow_result("wf-void", BRISK_POLL)
+        sys.await_workflow_result("wf-void", BRISK_POLL, false)
             .await
             .unwrap(),
         AwaitedOutcome::Succeeded { output: None, .. }
@@ -708,7 +708,7 @@ async fn an_await_waits_for_a_workflow_that_has_not_finished() {
 
     let started = std::time::Instant::now();
     let settled = sys
-        .await_workflow_result("wf-slow", BRISK_POLL)
+        .await_workflow_result("wf-slow", BRISK_POLL, false)
         .await
         .unwrap();
     let waited = started.elapsed();
@@ -764,7 +764,10 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     // First, and given a head start, so it is the one holding the permit if the permit is held.
     let forever = {
         let sys = std::sync::Arc::clone(&sys);
-        tokio::spawn(async move { sys.await_workflow_result("wf-never", BRISK_POLL).await })
+        tokio::spawn(async move {
+            sys.await_workflow_result("wf-never", BRISK_POLL, false)
+                .await
+        })
     };
     tokio::time::sleep(BRIEFLY).await;
 
@@ -772,7 +775,7 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
         .iter()
         .map(|id| {
             let (sys, id) = (std::sync::Arc::clone(&sys), id.clone());
-            tokio::spawn(async move { sys.await_workflow_result(&id, BRISK_POLL).await })
+            tokio::spawn(async move { sys.await_workflow_result(&id, BRISK_POLL, false).await })
         })
         .collect();
     tokio::time::sleep(BRIEFLY).await;
@@ -830,7 +833,7 @@ async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
     let waiting = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.await_workflow_result("wf-closing", BRISK_POLL)
+            sys.await_workflow_result("wf-closing", BRISK_POLL, false)
                 .await
                 .map(|_| ())
         })
@@ -864,7 +867,7 @@ async fn an_await_reports_a_cancelled_workflow_as_cancelled() {
         .unwrap();
 
     assert_eq!(
-        sys.await_workflow_result("wf-doomed", BRISK_POLL)
+        sys.await_workflow_result("wf-doomed", BRISK_POLL, false)
             .await
             .unwrap(),
         AwaitedOutcome::Cancelled
@@ -893,7 +896,7 @@ async fn an_await_reports_a_parked_workflow_rather_than_waiting_for_it() {
     }
 
     let settled = sys
-        .await_workflow_result("wf-parked", BRISK_POLL)
+        .await_workflow_result("wf-parked", BRISK_POLL, false)
         .await
         .unwrap();
     let AwaitedOutcome::Parked { recovery_attempts } = settled else {
@@ -905,20 +908,19 @@ async fn an_await_reports_a_parked_workflow_rather_than_waiting_for_it() {
     );
 }
 
-/// An absent row is reported rather than waited through, and a caller that wants to wait can.
+/// An absent row is waited through, unless the caller says it has already seen it.
 ///
-/// The references take a `fail_if_missing` flag here and default it to waiting. This does not, so
-/// the deleted-mid-wait hang is unreachable for every caller rather than for the one that opts out;
-/// the cost is that holding an id from outside this process becomes a loop, which is what the second
-/// half of this test is.
+/// The default all four references take: a row that is not there is one that has not been inserted
+/// yet, so the wait is for it to appear. `fail_if_missing` is the park-and-adopt caller saying it
+/// inserted or read this row itself, which makes an absence a delete and polling on pointless.
 #[tokio::test]
-async fn an_absent_row_is_reported_and_a_caller_may_still_wait_for_one() {
+async fn an_absent_row_is_waited_through_unless_the_caller_says_otherwise() {
     let (sys, db) = sysdb().await;
 
     let err = sys
-        .await_workflow_result("never-existed", BRISK_POLL)
+        .await_workflow_result("never-existed", BRISK_POLL, true)
         .await
-        .expect_err("an id that names nothing has no outcome to wait for");
+        .expect_err("a caller that has seen the row is told it is gone");
     assert!(
         matches!(err, Error::NonExistentWorkflow { ref workflow_ids } if workflow_ids == &["never-existed"]),
         "got {err:?}"
@@ -938,15 +940,11 @@ async fn an_absent_row_is_reported_and_a_caller_may_still_wait_for_one() {
         }
     });
 
-    // The loop the flag used to be. Readable here because the absence is a value to match on, which
-    // is the half of this that is a language difference: in Python the same loop is a `try`/`except`
-    // around a poll, and pushing it down into the system database is the more attractive option.
-    let settled = loop {
-        match sys.await_workflow_result("wf-later", BRISK_POLL).await {
-            Err(Error::NonExistentWorkflow { .. }) => tokio::time::sleep(BRISK_POLL).await,
-            other => break other.unwrap(),
-        }
-    };
+    // No loop, which is the point: the wait spans the row's creation as well as its completion.
+    let settled = sys
+        .await_workflow_result("wf-later", BRISK_POLL, false)
+        .await
+        .expect("the row appeared while this waited");
     inserting.await.unwrap();
 
     assert_eq!(

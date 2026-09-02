@@ -577,7 +577,8 @@ async fn observe_cancellation(ctx: &Ctx) {
     let interval = executor.outcome_poll_interval();
     match executor
         .sysdb()
-        .await_workflow_result(ctx.workflow_id(), interval)
+        // This workflow's own row, which it is running out of, so an absence is a delete.
+        .await_workflow_result(ctx.workflow_id(), interval, true)
         .await
     {
         Ok(AwaitedOutcome::Cancelled) => (),

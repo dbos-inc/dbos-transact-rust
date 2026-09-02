@@ -161,6 +161,15 @@ pub enum ForkFrom<'a> {
 /// A struct for one field, because it is the field every reference has and none of them stopped
 /// there — and because `resume_all(&ids, None)` says nothing at a call site about what was
 /// declined.
+///
+/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has. Resume takes a
+/// queue name and no partition key in all five, and the `UPDATE` behind it moves `queue_name`
+/// while leaving `queue_partition_key` untouched — so resuming onto a partitioned queue either
+/// carries over a key belonging to whatever queue the workflow was on before, or, for a workflow
+/// that never had one, writes the unkeyed row that
+/// [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not closed here alone:
+/// the gap is the contract's, and a field no reference has would put this crate's `resume` ahead
+/// of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
     /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
@@ -175,8 +184,11 @@ pub struct ResumeOptions<'a> {
 
 /// What a fork inherits, and where it goes.
 ///
-/// Every field defaults to "the same as the source", which is what a caller who says nothing
-/// means.
+/// **`None` does not mean the same thing across these fields.**
+/// [`app_version`](Self::app_version) is the only one that falls back to the
+/// source's; the queue, its partition and the timeout are the *fork's own*, because a fork is
+/// enqueued where the caller says rather than where its source ran. Saying nothing about those
+/// three asks for the internal queue, no partition, and no bound — not "as before".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForkOptions<'a> {
     /// The id the fork gets. `None` generates one.
@@ -203,7 +215,22 @@ pub struct ForkOptions<'a> {
     pub app_version: Option<&'a str>,
     /// The queue the fork is enqueued on. `None` is the engine's internal queue.
     pub queue: Option<&'a str>,
-    /// How long the fork may run once it starts.
+    /// The partition of that queue, which a partitioned [`queue`](Self::queue) requires.
+    ///
+    /// **Not inherited.** A source enqueued under a key does not pass it on; the fork's column is
+    /// written from this field, so `None` is no partition even when the source had one.
+    ///
+    /// Leaving it out on a partitioned queue produces a fork that can never run. Such a queue is
+    /// swept one partition at a time and every read that does so is keyed — see
+    /// `get_queue_partitions`, which selects `WHERE queue_partition_key IS NOT NULL` — so an
+    /// unkeyed row belongs to no partition and no sweep will ever see it. It stays `ENQUEUED`,
+    /// and the handle waits on a workflow nothing will pick up.
+    ///
+    /// All four references carry this on their fork options, and for this reason: Python's
+    /// `queue_partition_key`, Go's `QueuePartitionKey`, TypeScript's `queuePartitionKey`, and
+    /// Java's `ForkFromFailureOptions::queuePartitionKey`.
+    pub queue_partition_key: Option<&'a str>,
+    /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
 }
 
@@ -220,23 +247,24 @@ impl DBOS {
     /// while TypeScript and Java hand back a handle either way, Java's doc saying "the workflow
     /// exists or not; `getStatus()` can be used to tell the difference".
     ///
-    /// **The split is downstream of a choice this crate made differently.** All four give their
-    /// `await_workflow_result` a `fail_if_missing` flag that is **off by default**, so awaiting an
-    /// id with no row *polls for a workflow that does not exist yet* — which is why Python and Go
-    /// check up front, and why a mistyped id handed to TypeScript's `retrieveWorkflow` waits
-    /// forever. Rust has no such flag: `await_workflow_result` reports `NonExistentWorkflow` and
-    /// its own comment says why — *"waiting for a workflow to finish, not for one to exist"*.
+    /// **The split is downstream of what awaiting a missing row does**, and this crate is on
+    /// TypeScript's and Java's side of it. All five give `await_workflow_result` a
+    /// `fail_if_missing` flag whose default is to wait, so an id nothing has seen — which is
+    /// exactly what this function hands back — polls for the row to appear rather than reporting
+    /// its absence. That is the case the default is for: an id from outside this process, awaited
+    /// before whoever owns it has committed the enqueue. The cost is the references': a *mistyped*
+    /// id awaited through this handle waits instead of failing.
     ///
-    /// So the check buys nothing here. A mistyped id is reported at the first use, with the error
-    /// a check would have raised, one round trip later and only for callers who use it — and this
-    /// stays a plain function, so mapping a listing to handles costs nothing.
-    ///
-    /// The case the flag exists for is the other one: awaiting an id whose row another process has
-    /// written but not yet committed. Rust reports that as a missing workflow rather than waiting
-    /// for it.
+    /// So the check would buy something, and what it costs is this call: a verified retrieve is
+    /// `async` and fallible on the id as well as the launch, and mapping a listing to handles then
+    /// costs a round trip apiece. [`status`](crate::WorkflowHandle::status) is the round trip when
+    /// it is wanted — it reports [`Error::WorkflowNotFound`] whatever the handle — and
+    /// `tokio::time::timeout` is the bound when a wait should not be open-ended, which is the
+    /// escape Python and Java cannot offer at all.
     ///
     /// It is not the same line [`resume`](Self::resume) draws, and deliberately: a resume is a
-    /// write that would otherwise silently do nothing.
+    /// write that would otherwise silently do nothing, and its handles name rows the call has just
+    /// moved.
     ///
     /// Doing no I/O also makes this the one member of the surface that records **no step** when it
     /// is called from inside a workflow: there is nothing to replay. Python checkpoints its
@@ -250,13 +278,16 @@ impl DBOS {
     /// ```
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
         let executor = self.executor("retrieve a workflow")?;
+        // Nothing here has seen the row: the id is the caller's, taken on faith, which is the one
+        // handle shape that waits for a row to appear rather than reporting it missing.
         Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             workflow_id.to_owned(),
+            false,
         ))
     }
 
-    /// Stops a workflow, and any executor running it.
+    /// Marks a workflow cancelled, which is how a running execution is told to stop.
     ///
     /// The row goes to `CANCELLED`, which is terminal: awaiting the workflow raises
     /// [`Error::WorkflowCancelled`] rather than returning a value, and an executor still running it
@@ -339,6 +370,30 @@ impl DBOS {
     /// so rather than silently do nothing — a distinction a zero-row update cannot draw, and one
     /// Python draws the same way.
     ///
+    /// # Resuming a workflow that is still running
+    ///
+    /// **Nothing checks for one.** Not being terminal is the whole guard, so a `PENDING` row
+    /// passes — and `PENDING` means *some executor owns this*, not *this has stopped*. Resuming a
+    /// workflow that is executing right now re-enqueues it underneath its own execution: the next
+    /// sweep claims the row and dispatches it, and two executions of one id run concurrently.
+    /// Neither is told about the other, and the running one is not cancelled, so nothing stops it
+    /// at its next step — see the module documentation on why cancelling is the only thing step
+    /// preemption watches for. Both run to a conclusion, one records the outcome and the other's
+    /// write is refused; the row is then tidy, but any step neither had checkpointed is performed
+    /// twice, side effects included.
+    ///
+    /// **[`cancel`](Self::cancel) first if the workflow may be live.** That gives the running
+    /// execution something to observe, so it abandons its attempt at the next preemptible step
+    /// rather than running on. It narrows the window rather than closing it: the two calls are
+    /// separate, and the resumed execution can start before the old one has read the
+    /// cancellation.
+    ///
+    /// The guard is not simply missing here. `PENDING` cannot say whether the executor that owns
+    /// it is alive, and a workflow left `PENDING` by a node that died is the case an operator most
+    /// wants to resume by hand — so a predicate that closes the hazard closes that too. All five
+    /// implementations share the two-status deny-list, and UPSTREAM item 27 asks them to settle
+    /// what resume should mean for a live row rather than each tightening it alone.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// let handle = dbos.resume::<u32, dbos::EngineOnly>("stalled-workflow").await?;
@@ -391,18 +446,25 @@ impl DBOS {
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let executor = self.executor("resume a workflow")?;
         let ctx = calling_workflow();
-        executor
+        let resumed = executor
             .sysdb()
             .resume_workflows(workflow_ids, options.queue, ctx.as_ref().map(caller_for))
             .await
             .map_err(Error::SystemDatabase)?;
+        // What moved, not what was asked for: an id that had already finished is not
+        // re-enqueued, and it still gets a handle below.
         tracing::info!(
-            count = workflow_ids.len(),
+            requested = workflow_ids.len(),
+            resumed = resumed.len(),
             "resumed workflows onto their queues"
         );
         Ok(workflow_ids
             .iter()
-            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), (*id).to_owned()))
+            // `resume_workflows` refuses an id with no row, so each of these named one a moment
+            // ago: a row missing from here was deleted, and waiting for it is waiting for nothing.
+            .map(|id| {
+                WorkflowHandle::polling(Arc::clone(executor.connection()), (*id).to_owned(), true)
+            })
             .collect())
     }
 
@@ -463,9 +525,11 @@ impl DBOS {
             Error::Config(format!("forking `{workflow_id}` produced no workflow"))
         })?;
         tracing::info!(workflow_id, forked_id, "forked the workflow onto its queue");
+        // The fork's row was written by the call above.
         Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             forked_id,
+            true,
         ))
     }
 
@@ -505,7 +569,8 @@ impl DBOS {
         tracing::info!(count = forked.len(), "forked workflows onto their queues");
         Ok(forked
             .into_iter()
-            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), id))
+            // Each fork's row was written by the batch above.
+            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), id, true))
             .collect())
     }
 
@@ -581,12 +646,20 @@ impl DBOS {
     /// [`cancel`](Self::cancel) is the one that stops something.
     ///
     /// [`WorkflowDelay::For`] is resolved against **this process's** clock, once, before the write
-    /// — the same as the delay on an enqueue, and the same as Go's `resolveDelayUntil`. The
-    /// workflow is then released by whichever supervisor next runs, against *its* clock, so a
-    /// skewed operator host moves a release time the whole fleet honours. That is `UPSTREAM`
-    /// item 22, it is four implementations wide, and the database's clock is the answer to it —
-    /// in all four at once, rather than here alone at the cost of a round trip none of them
-    /// spends.
+    /// — the same as the delay on an enqueue, and the same as every reference: Python's
+    /// `time.time()`, Go's `resolveDelayUntil`, TypeScript's `Date.now()`, Java's `Instant.now()`.
+    /// So a caller's skew does reach the row.
+    ///
+    /// **And a second clock decides when the row is acted on.** The workflow is released by
+    /// whichever supervisor next runs, comparing the stamp against *its* reading — so the moment a
+    /// fleet honours is two clocks away from the one that set it, and a skewed operator host moves
+    /// a release time the whole fleet obeys. `init_workflow` carries the reasoning for leaving it
+    /// there, and UPSTREAM item 22 the proposal to close it: the database's clock is the answer,
+    /// in every implementation at once rather than here alone at the cost of a round trip none of
+    /// them spends.
+    ///
+    /// [`WorkflowDelay::Until`] removes the first of those readings: an absolute instant is
+    /// written as given, and nothing on this path consults a clock to do it.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -603,7 +676,11 @@ impl DBOS {
             .set_workflow_delay(workflow_id, delay, ctx.as_ref().map(caller_for))
             .await
             .map_err(Error::SystemDatabase)?;
-        tracing::info!(workflow_id, "moved the workflow's release time");
+        // Phrased as the request rather than the effect. The statement is guarded on the row
+        // still being `DELAYED` and reports no count, so this call cannot tell a workflow that
+        // was rescheduled from one that had already been released — unlike `cancel_all` and
+        // `delete_all`, which log what they counted.
+        tracing::info!(workflow_id, "asked to move the workflow's release time");
         Ok(())
     }
 
@@ -666,7 +743,9 @@ impl DBOS {
             )
             .await
             .map_err(Error::SystemDatabase)?;
-        tracing::info!(workflow_id, "updated the workflow's attributes");
+        // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
+        // reaches here indistinguishable from one whose attributes were replaced.
+        tracing::info!(workflow_id, "asked to replace the workflow's attributes");
         Ok(())
     }
 
@@ -746,10 +825,21 @@ async fn fork_batch(
     forked_id: Option<&str>,
     options: &ForkOptions<'_>,
 ) -> Result<Vec<String>> {
+    // The other half of `fork_all`'s refusal. A caller who named a fork means to address it
+    // later, so an id that cannot be honoured is reported rather than replaced by a generated
+    // one — and only the two variants that name a step outright can honour it, since the rest
+    // resolve a different step per source and let the system database mint the ids.
+    if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
+        return Err(Error::Config(format!(
+            "ForkOptions::forked_id names the fork of a chosen step, and {from:?} resolves one \
+             from the source's own history"
+        )));
+    }
+
     let sys_options = SysForkOptions {
         application_version: options.app_version,
         queue_name: options.queue,
-        queue_partition_key: None,
+        queue_partition_key: options.queue_partition_key,
         timeout: options.timeout,
         replacement_children: &[],
     };

@@ -898,9 +898,13 @@ where
                 workflow_id = child,
                 "the child workflow was already started; the handle joins it"
             );
+            // The launch record is all this run read: the child's own row belongs to the earlier
+            // run that made it, and was never in front of this one. So an absent row is left as
+            // "not yet", the same answer an id from outside the process gets.
             return Ok(WorkflowHandle::polling(
                 Arc::clone(executor.connection()),
                 child,
+                false,
             ));
         }
 
@@ -1013,9 +1017,12 @@ where
                         .record_launch(&executor, &holder, &self.key().name, started_at)
                         .await?;
                 }
+                // The holder's row was just read to find it, so a missing one from here is a
+                // deletion rather than a row still to come.
                 return Ok(WorkflowHandle::polling(
                     Arc::clone(executor.connection()),
                     holder,
+                    true,
                 ));
             }
         };
@@ -1039,9 +1046,12 @@ where
                 queue = enqueue.name,
                 "the workflow is enqueued"
             );
+            // This call wrote the row, so the handle it hands back can say what an id from
+            // outside cannot: a row that goes missing was deleted.
             return Ok(WorkflowHandle::polling(
                 Arc::clone(executor.connection()),
                 workflow_id,
+                true,
             ));
         }
 
@@ -1053,9 +1063,14 @@ where
                 workflow_id,
                 "the workflow is already owned; the handle joins the existing run"
             );
+            // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read
+            // this row, and it is the case the references pass their own flag on — Python parks
+            // its unowned dispatch with `fail_if_missing=True` (`_core.py:1100`) and Go its lost
+            // start race (`workflow.go:1584`).
             return Ok(WorkflowHandle::polling(
                 Arc::clone(executor.connection()),
                 workflow_id,
+                true,
             ));
         }
 
@@ -1289,7 +1304,8 @@ async fn cancel_at_deadline(
                 "the deadline fired on a workflow another execution had already finished; its \
                  recorded outcome stands"
             );
-            executor.connection().adopt(workflow_id).await
+            // The cancel just read this row, so an absence now is a delete, not a race.
+            executor.connection().adopt(workflow_id, true).await
         }
         Err(error) => {
             tracing::error!(
@@ -1391,7 +1407,9 @@ async fn execute(
                 workflow_id,
                 "another execution recorded this workflow's outcome first"
             );
-            executor.connection().adopt(workflow_id).await
+            // Park-and-adopt: this run inserted the row, so a missing one has been deleted. The
+            // path every reference passes its own flag on.
+            executor.connection().adopt(workflow_id, true).await
         }
     }
 }
@@ -1406,19 +1424,19 @@ impl Connection {
     pub(crate) async fn adopt(
         &self,
         workflow_id: &str,
+        fail_if_missing: bool,
     ) -> std::result::Result<Option<String>, Failure> {
         let outcome = self
             .sysdb()
-            .await_workflow_result(workflow_id, self.outcome_poll_interval())
+            .await_workflow_result(workflow_id, self.outcome_poll_interval(), fail_if_missing)
             .await
             .map_err(|error| {
                 Failure::Control(match error {
-                    // The one thing this wait can say about the id itself, and the same absence
-                    // [`WorkflowHandle::status`] reports — so a caller holding an id that names no
-                    // row gets one error from both halves of its handle, rather than this one
-                    // buried in a system database failure. Reported for a single id because a
-                    // single id is what was awaited; the plural variant belongs to the calls that
-                    // take a list.
+                    // Only reachable with `fail_if_missing`, so this is a row the caller had
+                    // already seen: it was deleted mid-wait. Reported as the same absence
+                    // [`WorkflowHandle::status`] reports rather than buried in a system database
+                    // failure, and for a single id because a single id is what was awaited — the
+                    // plural variant belongs to the calls that take a list.
                     crate::sysdb::Error::NonExistentWorkflow { .. } => Error::WorkflowNotFound {
                         workflow_id: workflow_id.to_owned(),
                     },

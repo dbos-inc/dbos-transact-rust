@@ -605,12 +605,18 @@ async fn a_client_reads_workflow_status() {
     let error = dangling.status().await.expect_err("there is no such row");
     assert!(matches!(error, Error::WorkflowNotFound { .. }), "{error}");
 
-    // And both halves of the handle say it the same way. Awaiting reports the absence rather than
-    // polling for the row to appear -- this crate's answer to the references' `fail_if_missing` --
-    // so a caller matching on one error catches both.
+    // The other half answers differently, and deliberately: a wait treats a missing row as one
+    // that has not been enqueued yet and keeps polling for it, which is what all four references
+    // default to and what a client -- the caller most likely to hold an id before its owner has
+    // committed -- needs. Nothing here ever creates the row, so the wait is still running when the
+    // timeout takes it.
     let dangling: WorkflowHandle<()> = client.retrieve_workflow("no-such-workflow");
-    let error = dangling.result().await.expect_err("there is no such row");
-    assert!(matches!(error, Error::WorkflowNotFound { .. }), "{error}");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(750), dangling.result())
+            .await
+            .is_err(),
+        "awaiting an id with no row should wait for it to appear, not report it"
+    );
 
     client.close().await;
 }
