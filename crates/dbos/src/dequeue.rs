@@ -702,14 +702,14 @@ async fn dispatch(
     // The status is `init_workflow`'s own `RETURNING`, and its `ON CONFLICT` never writes the
     // status column — so this is what the row holds as of a round trip ago, rather than as of the
     // batch read that preceded every dispatch in this tick. The other four check the batch read's
-    // copy (`_core.py:1313`, `dbos-executor.ts:697`, `queue.go:797`, and Java's non-owner
+    // copy (`_core.py:1313`, `dbos-executor.ts:702`, `queue.go:798`, and Java's non-owner
     // rollback), which narrows the window rather than closing it; this narrows it further.
     //
     // `should_execute` does not stand in for this, which is what it was doing before. It reports
     // whether another owner holds the row *and this caller is not claiming it* — and a dequeue
     // always claims, so it is `true` here whatever the row says.
     if initialized.status != WorkflowStatus::Pending {
-        tracing::debug!(
+        tracing::warn!(
             workflow_id,
             status = %initialized.status,
             "the dequeued workflow is no longer pending; it is not started"
