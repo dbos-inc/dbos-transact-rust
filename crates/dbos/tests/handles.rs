@@ -193,3 +193,57 @@ async fn dropping_the_handle_does_not_stop_the_workflow() {
 
     dbos.shutdown().await;
 }
+
+/// A handle over a row this process read reports the row's *deletion* rather than waiting for it.
+///
+/// The joining half of `starting_a_taken_id_joins_the_existing_run`, with the row deleted under it.
+/// `init_workflow` had that row in front of it, so an absence now is a delete and there is nothing
+/// left to wait for — where an id this process has never seen (`Client::retrieve_workflow`) is
+/// waited on instead, because for that one "deleted" and "not yet" are the same observation.
+#[tokio::test]
+async fn a_handle_over_a_row_this_process_read_reports_its_deletion() {
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("deleted-app", &db));
+    let slow = {
+        let release = Arc::clone(&release);
+        dbos.register_workflow("slow", move |()| {
+            let release = Arc::clone(&release);
+            async move {
+                release.notified().await;
+                Ok::<_, dbos::Error>(7u32)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let options = || StartOptions {
+        workflow_id: Some("task-99"),
+        ..Default::default()
+    };
+    let running = slow.start_with((), options()).await.expect("start failed");
+    // The second start owns nothing: it joins the run already going, over a row it just read.
+    let joined = slow.start_with((), options()).await.expect("start failed");
+
+    let deleted = reader(&db)
+        .await
+        .delete_workflows(&["task-99"], false)
+        .await
+        .expect("delete failed");
+    assert_eq!(deleted, 1, "the row was there to delete");
+
+    let err = tokio::time::timeout(DEADLINE, joined.result())
+        .await
+        .expect("the handle polled a row that will never reappear")
+        .expect_err("the row is gone");
+    assert!(matches!(err, Error::WorkflowNotFound { .. }), "{err:?}");
+
+    // The run itself has nowhere to record its outcome, which is delete's documented consequence
+    // rather than this test's subject.
+    release.notify_one();
+    let _ = tokio::time::timeout(DEADLINE, running.result()).await;
+
+    dbos.shutdown().await;
+}

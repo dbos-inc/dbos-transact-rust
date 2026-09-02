@@ -2654,6 +2654,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         poll_interval: Duration,
+        fail_if_missing: bool,
     ) -> Result<AwaitedOutcome, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
@@ -2727,13 +2728,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                         return Ok(settled);
                     }
                 }
-                // Waiting for a workflow to finish, not for one to exist. A caller holding an id
-                // from outside this process loops over this error.
-                None => {
+                // Not there *yet*: the row a caller from outside this process is waiting for may
+                // not have been enqueued. `fail_if_missing` is the caller saying it has seen this
+                // row already, so an absence is a delete rather than a race, and polling on would
+                // wait for something that will never come back.
+                None if fail_if_missing => {
                     return Err(Error::NonExistentWorkflow {
                         workflow_ids: vec![workflow_id.to_owned()],
                     });
                 }
+                None => {}
             }
 
             tokio::time::sleep(poll_interval).await;

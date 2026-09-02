@@ -169,19 +169,49 @@ pub trait SystemDatabase: Send + Sync {
     /// **No timeout**, following Python and Go. A wait ends when the workflow does, and a caller
     /// that wants to stop sooner drops the future.
     ///
-    /// **A missing row is always [`Error::NonExistentWorkflow`].** This waits for a workflow to
-    /// *finish*, not for one to exist. Python, Go and TypeScript take a `fail_if_missing` flag that
-    /// chooses between the two and default it to waiting; Java has no flag and always waits.
+    /// **A missing row means "not inserted yet", and `fail_if_missing` is how a caller says
+    /// otherwise.** This waits for a workflow to *finish*, and by default a row that is not there
+    /// is one that has not appeared yet — a caller holding an id from outside this process, waiting
+    /// on whoever owns it to enqueue it, is the case that default serves. A caller that knows the
+    /// row must already exist passes `true` and gets [`Error::NonExistentWorkflow`] instead of
+    /// polling for a row that will never reappear.
     ///
-    /// **A deliberate divergence, and a narrow one.** That default was never chosen: `git log -S`
-    /// puts the flag's arrival in the park-and-adopt change itself, which added it so *its* new
-    /// caller could have the error, and defaulted it to the behaviour every existing caller already
-    /// had. Meanwhile waiting through an absent row means a workflow deleted mid-wait hangs its
-    /// waiter forever — the hazard those same commits describe, then apply to one call site in
-    /// three. Within a process the case for waiting cannot even arise: every path that yields a
-    /// workflow id inserts the row first. What is given up is a caller holding an id from outside
-    /// this process, awaiting it before whoever owns it enqueues — which is a loop over this
-    /// error, and reads better one level up than as a flag every other caller has to decline.
+    /// All four references draw the line in the same place and in the same words — Python's
+    /// `fail_if_missing` (`_sys_db.py:1885`), Go's and Java's required `failIfMissing`,
+    /// TypeScript's optional one — and they all give the same reason for it: *"The row is known to
+    /// have existed (this run inserted or read it), so a missing row means it was deleted: fail
+    /// fast rather than polling for a row that will never reappear."* Python, Go and TypeScript
+    /// pass `true` only where a run parks on its own outcome; **Java also passes it at a handle**,
+    /// on a start that finds the row already `SUCCESS` (`DBOSExecutor.java:1914`), and carries the
+    /// flag on the handle itself — `WorkflowHandleDBPoll`, defaulting to `false`, *"for handles
+    /// built from a `workflow_status` row that was just read"*.
+    ///
+    /// **This engine takes Java's shape and applies the reason wherever it holds**, which is more
+    /// call sites than any reference has. The test is whether the caller has had the row in front
+    /// of it, not which internal route it arrived by. Everyone's park sites are here — the adopt
+    /// path in `workflow.rs`, the deadline cancellation beside it, and the cancellation poller in
+    /// `step.rs` — and so is every handle minted by a call that wrote or read the row: a start, an
+    /// enqueue, a join onto a workflow another execution already owns. Java stops after the
+    /// already-finished start and lets the rest wait; the other three let every handle wait. What
+    /// still waits here is what cannot do better: an id this process has only been handed
+    /// ([`Client::retrieve_workflow`](crate::Client::retrieve_workflow)) or holds only a launch
+    /// record for (a parent replaying a child it started), where "deleted" and "not yet" are the
+    /// same observation.
+    ///
+    /// **The hazard the default carries is real**: a workflow deleted while somebody awaits it
+    /// hangs that waiter, because such a wait cannot tell "not yet" from "never again". Deleting is
+    /// an ordinary operation, reachable from Console and Conductor. Rust refused a missing row
+    /// unconditionally until 2026-09-02; it now waits where the references wait, but only on the
+    /// handles that have never seen the row, where all four wait on every handle.
+    ///
+    /// **The fix for what remains is a bound on the wait, and here the caller already has one.**
+    /// Go offers `WithHandleTimeout` and TypeScript a durable `timeoutSeconds`, both of which a
+    /// caller has to know to pass; Python and Java have nothing to pass, and a blocked
+    /// `get_result` stays blocked. A Rust caller wraps the future in `tokio::time::timeout` or
+    /// simply drops it, and the poll stops — the same escape the *no timeout* note above describes,
+    /// applied to the one case that can still wait forever. That is why this method takes no
+    /// timeout of its own: the language supplies the bound the references had to add parameters
+    /// for.
     ///
     /// TODO(dbos-team): UPSTREAM item 17.
     ///
@@ -204,6 +234,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_id: &str,
         poll_interval: Duration,
+        fail_if_missing: bool,
     ) -> Result<AwaitedOutcome, Error>;
 
     /// Moves a delayed workflow's release time.
