@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
@@ -839,17 +840,29 @@ async fn a_workflow_can_be_retrieved_by_id() {
     );
     assert_eq!(handle.result().await.expect("the workflow failed"), 6);
 
-    // An id with no row is handed back too, and says so at the first use rather than waiting for a
-    // workflow that will never exist.
+    // An id with no row is handed back too, and the two halves of that handle answer differently:
+    // a status read reports the absence, because a single read has nothing to wait for.
     let missing = dbos
         .retrieve_workflow::<u32, EngineOnly>("never-existed")
         .expect("retrieve failed");
     assert!(
         matches!(
-            missing.result().await,
+            missing.status().await,
             Err(Error::WorkflowNotFound { workflow_id }) if workflow_id == "never-existed"
         ),
-        "awaiting a workflow with no row should report it, not wait for it"
+        "reading the status of a workflow with no row should report it"
+    );
+
+    // Awaiting waits instead: nothing here has seen this row, so an absence is "not enqueued yet".
+    // Nothing in this test ever creates it, so the wait is still running when the timeout takes it.
+    let missing = dbos
+        .retrieve_workflow::<u32, EngineOnly>("never-existed")
+        .expect("retrieve failed");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), missing.result())
+            .await
+            .is_err(),
+        "awaiting an id with no row should wait for it to appear, not report it"
     );
 
     dbos.shutdown().await;

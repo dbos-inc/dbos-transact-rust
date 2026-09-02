@@ -172,23 +172,24 @@ impl DBOS {
     /// while TypeScript and Java hand back a handle either way, Java's doc saying "the workflow
     /// exists or not; `getStatus()` can be used to tell the difference".
     ///
-    /// **The split is downstream of a choice this crate made differently.** All four give their
-    /// `await_workflow_result` a `fail_if_missing` flag that is **off by default**, so awaiting an
-    /// id with no row *polls for a workflow that does not exist yet* — which is why Python and Go
-    /// check up front, and why a mistyped id handed to TypeScript's `retrieveWorkflow` waits
-    /// forever. Rust has no such flag: `await_workflow_result` reports `NonExistentWorkflow` and
-    /// its own comment says why — *"waiting for a workflow to finish, not for one to exist"*.
+    /// **The split is downstream of what awaiting a missing row does**, and this crate is on
+    /// TypeScript's and Java's side of it. All five give `await_workflow_result` a
+    /// `fail_if_missing` flag whose default is to wait, so an id nothing has seen — which is
+    /// exactly what this function hands back — polls for the row to appear rather than reporting
+    /// its absence. That is the case the default is for: an id from outside this process, awaited
+    /// before whoever owns it has committed the enqueue. The cost is the references': a *mistyped*
+    /// id awaited through this handle waits instead of failing.
     ///
-    /// So the check buys nothing here. A mistyped id is reported at the first use, with the error
-    /// a check would have raised, one round trip later and only for callers who use it — and this
-    /// stays a plain function, so mapping a listing to handles costs nothing.
-    ///
-    /// The case the flag exists for is the other one: awaiting an id whose row another process has
-    /// written but not yet committed. Rust reports that as a missing workflow rather than waiting
-    /// for it.
+    /// So the check would buy something, and what it costs is this call: a verified retrieve is
+    /// `async` and fallible on the id as well as the launch, and mapping a listing to handles then
+    /// costs a round trip apiece. [`status`](crate::WorkflowHandle::status) is the round trip when
+    /// it is wanted — it reports [`Error::WorkflowNotFound`] whatever the handle — and
+    /// `tokio::time::timeout` is the bound when a wait should not be open-ended, which is the
+    /// escape Python and Java cannot offer at all.
     ///
     /// It is not the same line [`resume`](Self::resume) draws, and deliberately: a resume is a
-    /// write that would otherwise silently do nothing.
+    /// write that would otherwise silently do nothing, and its handles name rows the call has just
+    /// moved.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -198,9 +199,12 @@ impl DBOS {
     /// ```
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
         let executor = self.executor("retrieve a workflow")?;
+        // Nothing here has seen the row: the id is the caller's, taken on faith, which is the one
+        // handle shape that waits for a row to appear rather than reporting it missing.
         Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             workflow_id.to_owned(),
+            false,
         ))
     }
 
@@ -342,7 +346,11 @@ impl DBOS {
         );
         Ok(workflow_ids
             .iter()
-            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), (*id).to_owned()))
+            // `resume_workflows` refuses an id with no row, so each of these named one a moment
+            // ago: a row missing from here was deleted, and waiting for it is waiting for nothing.
+            .map(|id| {
+                WorkflowHandle::polling(Arc::clone(executor.connection()), (*id).to_owned(), true)
+            })
             .collect())
     }
 
@@ -396,9 +404,11 @@ impl DBOS {
             Error::Config(format!("forking `{workflow_id}` produced no workflow"))
         })?;
         tracing::info!(workflow_id, forked_id, "forked the workflow onto its queue");
+        // The fork's row was written by the call above.
         Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             forked_id,
+            true,
         ))
     }
 
@@ -438,7 +448,8 @@ impl DBOS {
         tracing::info!(count = forked.len(), "forked workflows onto their queues");
         Ok(forked
             .into_iter()
-            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), id))
+            // Each fork's row was written by the batch above.
+            .map(|id| WorkflowHandle::polling(Arc::clone(executor.connection()), id, true))
             .collect())
     }
 
