@@ -5,8 +5,9 @@
 //! the two listings are reads and writes against the row itself, and are checked against the
 //! system database directly.
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
@@ -109,8 +110,10 @@ async fn resuming_a_workflow_that_does_not_exist_is_an_error() {
 
 /// **A fork is a new workflow that replays what came before the fork point.**
 ///
-/// The source records two steps and then fails. Forking from the beginning re-runs both; the fork
-/// gets its own id, and the source is left where it was.
+/// The source fails on its first attempt and records no steps at all, so there is nothing below
+/// the fork point to replay and the body runs from the top. The fork gets its own id, and the
+/// source keeps the outcome it had. Where the fork point falls when there *are* steps is
+/// [`forking_from_a_chosen_step_replays_the_steps_below_it`] and the two tests after it.
 #[tokio::test]
 async fn forking_from_the_beginning_runs_the_workflow_again_under_a_new_id() {
     let db = test_database().await;
@@ -336,6 +339,257 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
         unkeyed_row.status,
         WorkflowStatus::Enqueued,
         "a partitioned sweep claimed a row belonging to no partition"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A fork from a chosen step replays everything below it and re-runs the rest.**
+///
+/// The steps a fork copies are those with `function_id < start_step`, so forking from step 1
+/// carries step 0's recorded result across and leaves 1 and 2 to run again. This is the half of
+/// [`ForkFrom`] that needs no lookup — the caller supplied the number, and `fork_batch` goes
+/// straight to `fork_workflows` with it.
+#[tokio::test]
+async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("fork-step-app", &db));
+    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
+    let workflow = dbos
+        .register_workflow("staged", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    for name in ["one", "two", "three"] {
+                        dbos::step(name, || async {
+                            ran.lock().unwrap().push(name.to_owned());
+                            Ok::<u32, Error>(0)
+                        })
+                        .await?;
+                    }
+                    Ok::<u32, Error>(0)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-source";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the source failed");
+    assert_eq!(*ran.lock().unwrap(), ["one", "two", "three"]);
+    ran.lock().unwrap().clear();
+
+    let forked = dbos
+        .fork::<u32, EngineOnly>(id, ForkFrom::Step(1))
+        .await
+        .expect("fork failed");
+    let forked_id = forked.workflow_id().to_owned();
+    forked.result().await.expect("the fork failed");
+    assert_eq!(
+        *ran.lock().unwrap(),
+        ["two", "three"],
+        "step 0 was supposed to replay from the checkpoint copied to the fork"
+    );
+
+    // The copy is the fork's own history, not a view of the source's: it lists three steps,
+    // one of which it never ran.
+    let steps = dbos
+        .list_workflow_steps(&forked_id)
+        .await
+        .expect("listing failed");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| s.step_name.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two", "three"],
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **`LastFailure` resolves against each source's own history, not a step worked out once.**
+///
+/// Two sources of the same workflow, failing at different steps: one at its first, one at its
+/// last. A single [`fork_all`](dbos::DBOS::fork_all) with [`ForkFrom::LastFailure`] forks each
+/// from wherever *it* failed, so one fork re-runs everything and the other re-runs one step.
+/// That is the claim the batch makes, and it cannot be checked by forking a single workflow.
+#[tokio::test]
+async fn forking_from_the_last_failure_uses_each_sources_own_history() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("fork-failure-app", &db));
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    #[error("the first attempt fails")]
+    struct FirstAttempt;
+
+    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let workflow = dbos
+        .register_workflow("staged", {
+            let ran = Arc::clone(&ran);
+            let seen = Arc::clone(&seen);
+            move |source: String| {
+                let ran = Arc::clone(&ran);
+                let seen = Arc::clone(&seen);
+                async move {
+                    // `a` fails at its first step and `b` at its last, and only on the run that
+                    // first sees the id — so the forks get through.
+                    let fails_at = if source == "a" { 0 } else { 2 };
+                    let first_run = seen.lock().unwrap().insert(source.clone());
+                    for (index, name) in ["one", "two", "three"].into_iter().enumerate() {
+                        let source = &source;
+                        let ran = &ran;
+                        dbos::step(name, || async {
+                            ran.lock().unwrap().push(format!("{source}:{name}"));
+                            if first_run && index == fails_at {
+                                Err(FirstAttempt)?;
+                            }
+                            Ok::<u32, dbos::Error<FirstAttempt>>(0)
+                        })
+                        .await?;
+                    }
+                    Ok::<u32, dbos::Error<FirstAttempt>>(0)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    for id in ["a", "b"] {
+        let outcome = workflow
+            .run_with(
+                id.to_owned(),
+                dbos::RunOptions {
+                    workflow_id: Some(id),
+                    ..dbos::RunOptions::default()
+                },
+            )
+            .await;
+        assert!(outcome.is_err(), "the source was supposed to fail");
+    }
+    ran.lock().unwrap().clear();
+
+    let forks = dbos
+        .fork_all::<u32, FirstAttempt>(&["a", "b"], ForkFrom::LastFailure, ForkOptions::default())
+        .await
+        .expect("bulk fork failed");
+    assert_eq!(forks.len(), 2);
+    for fork in forks {
+        fork.result().await.expect("the fork failed");
+    }
+
+    // Cloned out rather than held: the two forks ran concurrently, so this is a snapshot to
+    // split by source, and nothing below needs the lock.
+    let ran = ran.lock().unwrap().clone();
+    let for_source = |source: &str| -> Vec<String> {
+        ran.iter()
+            .filter(|entry| entry.starts_with(&format!("{source}:")))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        for_source("a"),
+        ["a:one", "a:two", "a:three"],
+        "`a` failed at step 0, so its fork had nothing to replay"
+    );
+    assert_eq!(
+        for_source("b"),
+        ["b:three"],
+        "`b` failed at step 2, so its fork should have replayed the two below it"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **`LastStep`, `StepNamed`, and the fallback that makes `LastFailure` useful.**
+///
+/// One source, which succeeded — so nothing recorded an error, and
+/// [`ForkFrom::LastFailure`] has nothing to filter on. Its `COALESCE` falls back to the last
+/// recorded step, which is what makes it work on a workflow killed mid-step: such a workflow
+/// records no error at all, and reporting "no failure to fork from" would be useless.
+///
+/// So `LastStep` and `LastFailure` land on the same step here, and `StepNamed` finds `two`
+/// wherever it happens to fall. The forks run one at a time because they share an id and an
+/// input, and only the order they run in tells them apart.
+#[tokio::test]
+async fn forking_from_the_last_step_and_from_a_named_one() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("fork-named-app", &db));
+    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
+    let workflow = dbos
+        .register_workflow("staged", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    for name in ["one", "two", "three"] {
+                        dbos::step(name, || async {
+                            ran.lock().unwrap().push(name.to_owned());
+                            Ok::<u32, Error>(0)
+                        })
+                        .await?;
+                    }
+                    Ok::<u32, Error>(0)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-source";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the source failed");
+
+    for (from, expected) in [
+        (ForkFrom::LastStep, &["three"][..]),
+        (ForkFrom::LastFailure, &["three"][..]),
+        (ForkFrom::StepNamed("two"), &["two", "three"][..]),
+    ] {
+        ran.lock().unwrap().clear();
+        let forked = dbos
+            .fork::<u32, EngineOnly>(id, from)
+            .await
+            .expect("fork failed");
+        forked.result().await.expect("the fork failed");
+        assert_eq!(
+            *ran.lock().unwrap(),
+            expected,
+            "{from:?} forked from the wrong step"
+        );
+    }
+
+    // A name the source never recorded resolves to no step at all. That is its own refusal,
+    // naming the step as well as the workflow — not the beginning, and not the missing-workflow
+    // error an unresolvable id gets.
+    let error = dbos
+        .fork::<u32, EngineOnly>(id, ForkFrom::StepNamed("never-ran"))
+        .await
+        .expect_err("a fork from a step that does not exist was allowed");
+    assert!(
+        matches!(
+            &error,
+            Error::SystemDatabase(dbos::sysdb::Error::NoForkPoint { step_name, .. })
+                if step_name.as_deref() == Some("never-ran")
+        ),
+        "expected a no-fork-point refusal naming the step, got {error:?}"
     );
 
     dbos.shutdown().await;
@@ -809,7 +1063,8 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     }
     assert_eq!(ran.load(Ordering::SeqCst), 2);
 
-    // Both sources succeeded, so both fork from the last step they recorded.
+    // From the top rather than from either source's history: neither recorded a step, and the
+    // count below is what says the bodies ran again.
     let forks = dbos
         .fork_all::<u32, EngineOnly>(&ids, ForkFrom::Beginning, ForkOptions::default())
         .await
