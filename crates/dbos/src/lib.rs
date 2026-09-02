@@ -42,6 +42,8 @@ mod handle;
 #[cfg(feature = "engine")]
 mod identity;
 #[cfg(feature = "engine")]
+mod management;
+#[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
@@ -76,6 +78,8 @@ pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
 pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, EXECUTOR_ID_ENV};
 #[cfg(feature = "engine")]
+pub use management::{Children, ForkFrom, ForkOptions, ResumeOptions};
+#[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
@@ -84,6 +88,6 @@ pub use sleep::sleep;
 #[cfg(feature = "engine")]
 pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
-pub use sysdb::types::{Change, RateLimit};
+pub use sysdb::types::{Change, RateLimit, WorkflowDelay};
 #[cfg(feature = "engine")]
 pub use workflow::{DuplicationPolicy, Enqueue, RunOptions, StartOptions, Timeout};
