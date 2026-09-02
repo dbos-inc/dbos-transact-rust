@@ -1082,10 +1082,15 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     dbos.shutdown().await;
 }
 
-/// One id cannot name many forks, so asking for one in the bulk form is refused rather than
-/// quietly ignored.
+/// **A chosen id is refused wherever it cannot be honoured, rather than quietly replaced.**
+///
+/// Two reasons, one rule. The bulk form refuses it whatever the fork point, because one id cannot
+/// name many forks. The single form refuses it for the three fork points that resolve a step from
+/// the source's own history, because the system database mints those ids itself — and a caller
+/// who named a fork means to address it later, so handing back a generated id instead is the one
+/// outcome that helps nobody.
 #[tokio::test]
-async fn forking_in_bulk_refuses_a_chosen_id() {
+async fn forking_refuses_a_chosen_id_it_cannot_honour() {
     let db = test_database().await;
     let dbos = DBOS::new(config("bulk-fork-id-app", &db));
     dbos.launch().await.expect("launch failed");
@@ -1105,6 +1110,30 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
         matches!(&error, Error::Config(message) if message.contains("forked_id")),
         "expected a configuration refusal, got {error:?}"
     );
+
+    // The single form takes it where the caller named the step, and refuses it where the step is
+    // resolved. Neither call reaches a workflow: the option is checked before the ids are.
+    for from in [
+        ForkFrom::LastFailure,
+        ForkFrom::LastStep,
+        ForkFrom::StepNamed("two"),
+    ] {
+        let error = dbos
+            .fork_with::<u32, EngineOnly>(
+                "a",
+                from,
+                ForkOptions {
+                    forked_id: Some("the-chosen-one"),
+                    ..ForkOptions::default()
+                },
+            )
+            .await
+            .expect_err("a chosen id was accepted for a resolved fork point");
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains("forked_id")),
+            "expected a configuration refusal for {from:?}, got {error:?}"
+        );
+    }
 
     dbos.shutdown().await;
 }

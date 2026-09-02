@@ -157,8 +157,15 @@ pub struct ResumeOptions<'a> {
 pub struct ForkOptions<'a> {
     /// The id the fork gets. `None` generates one.
     ///
-    /// Ignored unless [`ForkFrom`] names a step outright: a caller who is not choosing the step is
-    /// not choosing the id either, which is the rule the system database enforces.
+    /// **Only where [`ForkFrom`] names the step outright** — [`Beginning`](ForkFrom::Beginning) or
+    /// [`Step`](ForkFrom::Step). The other three resolve a step from each source's own history and
+    /// the system database generates their ids, so setting this beside one is [`Error::Config`]
+    /// rather than an id quietly replaced by a generated one: a caller who names a fork means to
+    /// address it later. Java's `ForkFromFailureOptions` carries no id field at all, which states
+    /// the same rule by omission.
+    ///
+    /// [`fork_all`](DBOS::fork_all) refuses it whatever the fork point, for the other half of the
+    /// reason: one id cannot name many forks.
     pub forked_id: Option<&'a str>,
     /// The version the fork runs under. `None` inherits the source's.
     ///
@@ -235,7 +242,7 @@ impl DBOS {
         ))
     }
 
-    /// Stops a workflow, and any executor running it.
+    /// Marks a workflow cancelled, which is how a running execution is told to stop.
     ///
     /// The row goes to `CANCELLED`, which is terminal: awaiting the workflow raises
     /// [`Error::WorkflowCancelled`] rather than returning a value, and an executor still running it
@@ -386,13 +393,16 @@ impl DBOS {
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let executor = self.executor("resume a workflow")?;
-        executor
+        let resumed = executor
             .sysdb()
             .resume_workflows(workflow_ids, options.queue)
             .await
             .map_err(Error::SystemDatabase)?;
+        // What moved, not what was asked for: an id that had already finished is not
+        // re-enqueued, and it still gets a handle below.
         tracing::info!(
-            count = workflow_ids.len(),
+            requested = workflow_ids.len(),
+            resumed = resumed.len(),
             "resumed workflows onto their queues"
         );
         Ok(workflow_ids
@@ -580,7 +590,11 @@ impl DBOS {
             .set_workflow_delay(workflow_id, delay)
             .await
             .map_err(Error::SystemDatabase)?;
-        tracing::info!(workflow_id, "moved the workflow's release time");
+        // Phrased as the request rather than the effect. The statement is guarded on the row
+        // still being `DELAYED` and reports no count, so this call cannot tell a workflow that
+        // was rescheduled from one that had already been released — unlike `cancel_all` and
+        // `delete_all`, which log what they counted.
+        tracing::info!(workflow_id, "asked to move the workflow's release time");
         Ok(())
     }
 
@@ -638,7 +652,9 @@ impl DBOS {
             .update_workflow_attributes(workflow_id, encoded.as_deref())
             .await
             .map_err(Error::SystemDatabase)?;
-        tracing::info!(workflow_id, "updated the workflow's attributes");
+        // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
+        // reaches here indistinguishable from one whose attributes were replaced.
+        tracing::info!(workflow_id, "asked to replace the workflow's attributes");
         Ok(())
     }
 
@@ -716,6 +732,17 @@ async fn fork_batch(
     forked_id: Option<&str>,
     options: &ForkOptions<'_>,
 ) -> Result<Vec<String>> {
+    // The other half of `fork_all`'s refusal. A caller who named a fork means to address it
+    // later, so an id that cannot be honoured is reported rather than replaced by a generated
+    // one — and only the two variants that name a step outright can honour it, since the rest
+    // resolve a different step per source and let the system database mint the ids.
+    if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
+        return Err(Error::Config(format!(
+            "ForkOptions::forked_id names the fork of a chosen step, and {from:?} resolves one \
+             from the source's own history"
+        )));
+    }
+
     let sys_options = SysForkOptions {
         application_version: options.application_version,
         queue_name: options.queue,
