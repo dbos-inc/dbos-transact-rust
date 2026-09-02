@@ -311,6 +311,30 @@ impl DBOS {
     /// so rather than silently do nothing — a distinction a zero-row update cannot draw, and one
     /// Python draws the same way.
     ///
+    /// # Resuming a workflow that is still running
+    ///
+    /// **Nothing checks for one.** Not being terminal is the whole guard, so a `PENDING` row
+    /// passes — and `PENDING` means *some executor owns this*, not *this has stopped*. Resuming a
+    /// workflow that is executing right now re-enqueues it underneath its own execution: the next
+    /// sweep claims the row and dispatches it, and two executions of one id run concurrently.
+    /// Neither is told about the other, and the running one is not cancelled, so nothing stops it
+    /// at its next step — see the module documentation on why cancelling is the only thing step
+    /// preemption watches for. Both run to a conclusion, one records the outcome and the other's
+    /// write is refused; the row is then tidy, but any step neither had checkpointed is performed
+    /// twice, side effects included.
+    ///
+    /// **[`cancel`](Self::cancel) first if the workflow may be live.** That gives the running
+    /// execution something to observe, so it abandons its attempt at the next preemptible step
+    /// rather than running on. It narrows the window rather than closing it: the two calls are
+    /// separate, and the resumed execution can start before the old one has read the
+    /// cancellation.
+    ///
+    /// The guard is not simply missing here. `PENDING` cannot say whether the executor that owns
+    /// it is alive, and a workflow left `PENDING` by a node that died is the case an operator most
+    /// wants to resume by hand — so a predicate that closes the hazard closes that too. All five
+    /// implementations share the two-status deny-list, and UPSTREAM item 27 asks them to settle
+    /// what resume should mean for a live row rather than each tightening it alone.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// let handle = dbos.resume::<u32, dbos::EngineOnly>("stalled-workflow").await?;
