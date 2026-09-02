@@ -40,7 +40,17 @@ enum Provenance {
     /// The workflow runs in this process: the task's outcome is awaited directly.
     Local(JoinHandle<std::result::Result<Option<String>, Failure>>),
     /// The workflow runs elsewhere, or already finished: the database is the only witness.
-    Polling,
+    Polling {
+        /// Whether the call that minted this handle had the row in front of it.
+        ///
+        /// `true` where this process inserted or read it, so a later absence is a deletion and
+        /// waiting for the row is waiting for something that will never come back; `false` for an
+        /// id taken on faith, which may name a workflow whose enqueue has not committed yet. It is
+        /// the references' `fail_if_missing`, and it reaches
+        /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) as
+        /// exactly that.
+        fail_if_missing: bool,
+    },
 }
 
 impl<R, E> WorkflowHandle<R, E> {
@@ -64,11 +74,19 @@ impl<R, E> WorkflowHandle<R, E> {
     /// [`Client`](crate::Client) hand one back: watching a workflow is reading its row, and reading
     /// a row needs no process that could run it. Java's client builds the same thing — a small
     /// handle class over the system database alone.
-    pub(crate) fn polling(conn: Arc<Connection>, workflow_id: String) -> Self {
+    ///
+    /// `fail_if_missing` says whether this call saw the row: `true` when it inserted or read it,
+    /// `false` for an id it was merely given. [`result`](Self::result) spells out what the two do
+    /// differently when the row is not there.
+    pub(crate) fn polling(
+        conn: Arc<Connection>,
+        workflow_id: String,
+        fail_if_missing: bool,
+    ) -> Self {
         Self {
             conn,
             workflow_id,
-            provenance: Provenance::Polling,
+            provenance: Provenance::Polling { fail_if_missing },
             types: PhantomData,
         }
     }
@@ -118,9 +136,30 @@ where
     /// [`Error::WrongInstance`] instead — there the two counters both exist, and the caller meant
     /// one of them.
     ///
-    /// An id that names no row is [`Error::WorkflowNotFound`], the same absence
-    /// [`status`](Self::status) reports: waiting stops at a workflow that does not exist rather
-    /// than polling for one to appear.
+    /// **An id that names no row is waited on when nothing has seen that row, and refused when
+    /// something has.** A handle minted by a call that had the row in front of it — a start, an
+    /// enqueue, a join onto a workflow another execution owns — reports
+    /// [`Error::WorkflowNotFound`], because a row that was there and is gone was deleted and will
+    /// not come back. A handle over an id taken on faith —
+    /// [`Client::retrieve_workflow`](crate::Client::retrieve_workflow), or a parent replaying a
+    /// launch it recorded rather than a row it read — polls for the row to appear, because such an
+    /// id may legitimately name a workflow whose enqueue has not committed yet.
+    ///
+    /// [`status`](Self::status) is the other half, and answers an unknown id the same way whatever
+    /// the handle: it reports the absence, because a single read has nothing to wait for.
+    ///
+    /// That split is the references' `fail_if_missing` drawn one line further out. Java draws it
+    /// at a handle too — `WorkflowHandleDBPoll` carries the flag, set for a handle built from a row
+    /// it just read — and stops after the already-finished start; the other three pass it only
+    /// where a run parks on its own row and let every handle wait. What is left waiting here is the
+    /// case none of them can avoid: an id whose row this process has never seen, where "deleted"
+    /// and "not yet" are the same observation.
+    ///
+    /// **A wait that could go on forever is bounded by dropping it.** `tokio::time::timeout` around
+    /// this future, or dropping the future outright, ends the poll — so the hazard
+    /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) describes
+    /// costs a caller here what Go and TypeScript charge an argument for and Python and Java cannot
+    /// offer at all.
     pub async fn result(self) -> Result<R, E> {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run.
@@ -151,7 +190,12 @@ where
                 })),
                 Err(join) => std::panic::resume_unwind(join.into_panic()),
             },
-            Provenance::Polling => self.conn.adopt(&self.workflow_id).await,
+            // Whether a missing row is "not yet" or "never again" is decided where the handle
+            // was minted, because that is the only place that knows whether anything ever saw the
+            // row.
+            Provenance::Polling { fail_if_missing } => {
+                self.conn.adopt(&self.workflow_id, fail_if_missing).await
+            }
         };
 
         // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
@@ -422,7 +466,7 @@ impl<R, E> std::fmt::Debug for WorkflowHandle<R, E> {
                 "provenance",
                 match &self.provenance {
                     Provenance::Local(_) => &"local",
-                    Provenance::Polling => &"polling",
+                    Provenance::Polling { .. } => &"polling",
                 },
             )
             .finish_non_exhaustive()

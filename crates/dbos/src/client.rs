@@ -433,32 +433,43 @@ impl Client {
                     queue = options.queue.name,
                     "the workflow is enqueued"
                 );
+                // This call wrote the row, so a later absence is a deletion: the handle fails
+                // fast rather than polling for a row that will never reappear.
                 Ok(WorkflowHandle::polling(
                     Arc::clone(&self.0),
                     workflow_id.to_owned(),
+                    true,
                 ))
             }
             // The key was held and this caller asked to join whoever holds it, so the handle names
             // that workflow rather than the id this call offered. A client has no parent, so there
             // is nothing to record about the join — which is the whole of the difference from
             // `start_with`.
-            Submitted::Joined(holder) => Ok(WorkflowHandle::polling(Arc::clone(&self.0), holder)),
+            Submitted::Joined(holder) => {
+                Ok(WorkflowHandle::polling(Arc::clone(&self.0), holder, true))
+            }
         }
     }
 
     /// A handle to a workflow that already exists, by id.
     ///
     /// Always a polling handle — nothing runs here — and it is **not** checked: the id is not read
-    /// until the handle is used, so this cannot fail and does not go to the database. Using a
-    /// handle to a workflow that does not exist is [`Error::WorkflowNotFound`] at that point,
-    /// from reading its status and from awaiting its result alike — the wait reports the absence
-    /// rather than polling for the row to appear, which is this crate's answer to the references'
-    /// `fail_if_missing`. A caller expecting a workflow it does not own to be enqueued shortly
-    /// loops over that error.
-    /// Python's client returns an unchecked handle in the same way; Java's `retrieveWorkflow` and
-    /// Go's take a round trip to verify the row first.
+    /// until the handle is used, so this cannot fail and does not go to the database. The two
+    /// halves of the handle then answer an unknown id differently, deliberately:
+    /// [`status`](crate::WorkflowHandle::status) reports [`Error::WorkflowNotFound`], while
+    /// [`result`](crate::WorkflowHandle::result) **waits** — a client is the caller most likely to
+    /// hold an id before whoever owns it has committed the enqueue, and this is the one handle in
+    /// the crate that waits for a row to appear rather than reporting its absence.
+    ///
+    /// **Java's client is the other unchecked one**, and its javadoc sends users to that same pair:
+    /// *"This call does not ensure that the workflow exists; use the returned handle's
+    /// `getStatus()`"* (`DBOSClient.java:1157`). Python's and Go's spend a round trip instead and
+    /// refuse an id that names nothing (`_client.py:570`, `workflow.go:4433`) — which is what a
+    /// caller who wants it writes here as [`workflow_status`](Self::workflow_status) before taking
+    /// the handle — or bounds the wait instead, since dropping the future ends it and
+    /// `tokio::time::timeout` is the whole of what Go's `WithHandleTimeout` exists to provide.
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> WorkflowHandle<R, E> {
-        WorkflowHandle::polling(Arc::clone(&self.0), workflow_id.to_owned())
+        WorkflowHandle::polling(Arc::clone(&self.0), workflow_id.to_owned(), false)
     }
 
     /// A workflow's status, or `None` if there is no such workflow.
