@@ -272,7 +272,7 @@ impl Config {
 }
 
 /// The interval every implementation polls a workflow's outcome at.
-const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests {

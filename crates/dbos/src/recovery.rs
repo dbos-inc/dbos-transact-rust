@@ -42,7 +42,7 @@ use crate::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 /// Called by [`Executor::start`](crate::dbos::Executor) before `launch` returns, and reports what
 /// moved rather than handles: this process may run none of them.
 pub(crate) async fn reenqueue(
-    sysdb: &impl SystemDatabase,
+    sysdb: &dyn SystemDatabase,
     executor_id: &str,
     app_version: &str,
 ) -> Result<Vec<String>> {

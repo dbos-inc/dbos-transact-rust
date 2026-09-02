@@ -3,9 +3,10 @@
 use std::sync::{Arc, RwLock};
 
 use crate::config::{Config, Serializer};
+use crate::connection::Connection;
 use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, Snapshot};
-use crate::sysdb::{SystemDatabase, postgres};
+use crate::sysdb::SystemDatabase;
 use crate::workflow::Tasks;
 use crate::{Error, Result};
 
@@ -13,18 +14,23 @@ use crate::{Error, Result};
 ///
 /// Everything that needs a database or a runtime lives here rather than on the instance, so that
 /// "not launched" is one absent value rather than a scatter of `Option`s.
+///
+/// **The connection is held rather than embedded**, which is the split a [`Client`](crate::Client)
+/// rests on. Every other field here exists because this process *runs* workflows: the id, version
+/// and application name a claim stamps, the runtime they are spawned onto, the registry snapshot
+/// they are resolved through, the task set shutdown reaches. A client runs none, so it holds the
+/// connection alone, and everything both surfaces do is a method on that rather than on this
+/// type.
 pub struct Executor {
-    sysdb: Box<dyn SystemDatabase>,
+    conn: Arc<Connection>,
     executor_id: String,
     app_version: String,
+    app_name: String,
     app_id: String,
-    serializer: Serializer,
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
-    app_name: String,
     listen_queues: Option<Vec<String>>,
     tasks: Tasks,
-    outcome_poll_interval: std::time::Duration,
 }
 
 impl Executor {
@@ -58,32 +64,17 @@ impl Executor {
             app_id,
         } = crate::identity::resolve(config, &Environment::read())?;
 
-        let sysdb = postgres::PostgresSystemDatabase::connect(&postgres::Config {
-            url: &config.database_url,
-            max_connections: config.max_connections,
-            use_listen_notify: config.use_listen_notify,
-            migrate: config.migrate,
-            settings: postgres::Settings {
-                schema: &config.schema,
-                executor_id: Some(&executor_id),
-                application_name: Some(&app_name),
-                polling_concurrency: config.polling_concurrency,
-                notification_coalesce: config.notification_coalesce,
-                ..postgres::Settings::default()
-            },
-        })
-        .await
-        .map_err(Error::SystemDatabase)?;
+        let conn = Connection::for_application(config, &executor_id, &app_name).await?;
 
         // Everything that can fail after the connect goes through one call, so there is one error
         // path and it closes the handle. `connect` has already spawned the listener and the
         // notifier, and the listener's only way out of its loop is the pool closing — so a handle
         // dropped without `close` leaves both tasks and every connection alive for the life of the
         // process, with each retried `launch` adding another set.
-        let recovered = match prepare(&sysdb, &executor_id, &app_version).await {
+        let recovered = match prepare(conn.sysdb(), &executor_id, &app_version).await {
             Ok(recovered) => recovered,
             Err(error) => {
-                sysdb.close().await;
+                conn.close().await;
                 return Err(error);
             }
         };
@@ -91,11 +82,10 @@ impl Executor {
         tracing::info!(app_name, executor_id, app_version, "DBOS launched");
 
         let executor = Self {
-            sysdb: Box::new(sysdb),
+            conn: Arc::new(conn),
             executor_id,
             app_version,
             app_id,
-            serializer: config.serializer.clone(),
             // Decision 20: the runtime is the executor's, taken here. `start` is `async`, so a
             // runtime is necessarily current.
             runtime: tokio::runtime::Handle::current(),
@@ -103,14 +93,22 @@ impl Executor {
             app_name,
             listen_queues: config.listen_queues.clone(),
             tasks: Tasks::default(),
-            outcome_poll_interval: config.outcome_poll_interval(),
         };
         Ok((executor, recovered))
     }
 
+    /// The connection this executor talks through, which is all a caller needs to read or write a
+    /// row.
+    ///
+    /// Handed out rather than proxied so that everything both surfaces do can be a method on the
+    /// connection and be called by a [`Client`](crate::Client) too — see that module.
+    pub(crate) fn connection(&self) -> &Arc<Connection> {
+        &self.conn
+    }
+
     /// The system database this executor is running against.
     pub(crate) fn sysdb(&self) -> &dyn SystemDatabase {
-        &*self.sysdb
+        self.conn.sysdb()
     }
 
     /// Identifies this process among the executors sharing the database.
@@ -119,6 +117,15 @@ impl Executor {
     }
 
     /// Names the application whose rows this executor owns.
+    ///
+    /// **Its own, and not an [`Option`].** The connection reports a name that may be absent, because
+    /// the one a [`Client`](crate::Client) opens may speak for every application at once. An
+    /// executor may not: the identity is resolved and validated at launch, before anything
+    /// connects, and the name that wins — on DBOS Cloud the deployment's
+    /// `DBOS_APP_NAME` rather than [`Config::app_name`](crate::Config::app_name) — is the
+    /// ownership key on every row this process writes. Holding it here rather than unwrapping the
+    /// database's is what keeps that a fact of the type instead of an invariant each caller has to
+    /// remember.
     pub fn app_name(&self) -> &str {
         &self.app_name
     }
@@ -138,7 +145,7 @@ impl Executor {
 
     /// How often an adopting caller asks whether the run that won has finished.
     pub(crate) fn outcome_poll_interval(&self) -> std::time::Duration {
-        self.outcome_poll_interval
+        self.conn.outcome_poll_interval()
     }
 
     /// The version of the application's code, as workflow rows record it.
@@ -164,7 +171,7 @@ impl Executor {
 
     /// How payloads are encoded.
     pub(crate) fn serializer(&self) -> &Serializer {
-        &self.serializer
+        self.conn.serializer()
     }
 
     /// The workflows this executor was launched with.
@@ -214,7 +221,7 @@ impl Executor {
                 "cancelled workflows still running; they stay PENDING"
             );
         }
-        self.sysdb.close().await;
+        self.conn.close().await;
     }
 }
 
@@ -437,7 +444,7 @@ impl std::fmt::Debug for DBOS {
 /// connect and the executor being built belongs here for that reason, and anything added later
 /// belongs here too.
 async fn prepare(
-    sysdb: &impl SystemDatabase,
+    sysdb: &dyn SystemDatabase,
     executor_id: &str,
     app_version: &str,
 ) -> Result<Vec<String>> {
@@ -451,7 +458,7 @@ async fn prepare(
 /// a rollback looks like, and it is the deployment's call. What it must not be is silent, because
 /// the symptom — an executor that starts cleanly and is handed no unversioned work — reads as a
 /// broken queue rather than as a deliberate policy.
-async fn register_version(sysdb: &impl SystemDatabase, version: &str) -> Result<()> {
+async fn register_version(sysdb: &dyn SystemDatabase, version: &str) -> Result<()> {
     sysdb
         .create_application_version(version, None)
         .await

@@ -47,6 +47,7 @@ async fn registering_a_queue_writes_a_row() {
                 worker_concurrency: Some(3),
                 ..QueueOptions::default()
             },
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect("registration failed");
@@ -89,6 +90,7 @@ async fn re_registering_updates_the_stored_limits() {
             worker_concurrency: Some(3),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");
@@ -100,6 +102,7 @@ async fn re_registering_updates_the_stored_limits() {
                 worker_concurrency: Some(7),
                 ..QueueOptions::default()
             },
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect("re-registration failed");
@@ -124,6 +127,7 @@ async fn declining_to_update_reports_what_is_stored() {
             worker_concurrency: Some(3),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");
@@ -133,9 +137,9 @@ async fn declining_to_update_reports_what_is_stored() {
             "demo-queue",
             QueueOptions {
                 worker_concurrency: Some(99),
-                on_conflict: QueueConflict::NeverUpdate,
                 ..QueueOptions::default()
             },
+            QueueConflict::NeverUpdate,
         )
         .await
         .expect("re-registration failed");
@@ -156,7 +160,11 @@ async fn the_internal_queue_name_is_reserved() {
     dbos.launch().await.expect("launch failed");
 
     let error = dbos
-        .register_queue("_dbos_internal_queue", QueueOptions::default())
+        .register_queue(
+            "_dbos_internal_queue",
+            QueueOptions::default(),
+            QueueConflict::UpdateIfLatestVersion,
+        )
         .await
         .expect_err("the reserved name was accepted");
     assert!(
@@ -223,7 +231,10 @@ async fn incoherent_limits_are_refused() {
     ];
 
     for (what, options, expected) in cases {
-        let error = match dbos.register_queue("demo-queue", options).await {
+        let error = match dbos
+            .register_queue("demo-queue", options, QueueConflict::UpdateIfLatestVersion)
+            .await
+        {
             Ok(_) => panic!("{what} was accepted"),
             Err(error) => error,
         };
@@ -261,6 +272,7 @@ async fn a_per_process_limit_may_equal_the_fleet_limit() {
                 worker_concurrency: Some(3),
                 ..QueueOptions::default()
             },
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect("registration failed");
@@ -277,7 +289,11 @@ async fn registering_before_launch_is_refused() {
     let dbos = DBOS::new(config("queue-unlaunched-app", &db));
 
     let error = dbos
-        .register_queue("demo-queue", QueueOptions::default())
+        .register_queue(
+            "demo-queue",
+            QueueOptions::default(),
+            QueueConflict::UpdateIfLatestVersion,
+        )
         .await
         .expect_err("an unlaunched instance registered a queue");
     assert!(
@@ -323,6 +339,7 @@ async fn worker_concurrency_bounds_what_one_process_runs_at_once() {
             worker_concurrency: Some(3),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");
@@ -374,9 +391,13 @@ async fn an_enqueued_workflow_is_dispatched_by_the_runner() {
         .register_workflow("queued", |()| async move { Ok::<u32, Error>(7) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let id = "left-on-the-queue";
     let handle = workflow
@@ -425,9 +446,13 @@ async fn a_queue_registered_after_launch_is_dequeued_from() {
 
     // Long enough that the supervisor has already reconciled without this queue in the set.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    dbos.register_queue("late-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "late-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let handle = workflow
         .start_with(
@@ -564,9 +589,13 @@ async fn listen_queues_narrows_what_this_process_dequeues() {
         .unwrap();
     dbos.launch().await.expect("launch failed");
     for name in ["fast", "slow"] {
-        dbos.register_queue(name, QueueOptions::default())
-            .await
-            .expect("registration failed");
+        dbos.register_queue(
+            name,
+            QueueOptions::default(),
+            QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("registration failed");
     }
 
     let listened = workflow
@@ -659,9 +688,13 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
         .register_workflow("nothing", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("ignored", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "ignored",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     workflow
         .start_with(
@@ -739,6 +772,7 @@ async fn updating_a_queue_changes_what_a_running_worker_honours() {
             worker_concurrency: Some(1),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");
@@ -808,6 +842,7 @@ async fn an_update_cannot_leave_a_queue_incoherent() {
             worker_concurrency: Some(2),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");
@@ -861,9 +896,13 @@ async fn the_queue_registry_can_be_read_and_deleted() {
     let dbos = DBOS::new(config("queue-registry-app", &db));
     dbos.launch().await.expect("launch failed");
     for name in ["alpha", "beta"] {
-        dbos.register_queue(name, QueueOptions::default())
-            .await
-            .expect("registration failed");
+        dbos.register_queue(
+            name,
+            QueueOptions::default(),
+            QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("registration failed");
     }
 
     assert!(
@@ -1055,9 +1094,13 @@ async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
         .register_workflow("budgeted", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let id = "budget-starts-on-dequeue";
     let handle = workflow
@@ -1184,9 +1227,13 @@ async fn an_incoherent_enqueue_is_refused() {
         .register_workflow("checked", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let cases = [
         (
@@ -1284,9 +1331,13 @@ async fn a_delayed_enqueue_waits_before_it_is_dequeued() {
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let handle = workflow
         .start_with(
@@ -1340,9 +1391,13 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
     dbos.launch().await.expect("launch failed");
     // Delayed, so the first workflow is still holding the key when the second arrives rather than
     // racing the runner to finish before it.
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     let held = Enqueue {
         deduplication_id: Some("order-42"),
@@ -1418,9 +1473,13 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
         .register_workflow("deduped", |()| async move { Ok::<u32, Error>(7) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     // Delayed, so the holder is still waiting when the second caller arrives.
     let joining = Enqueue {
@@ -1568,6 +1627,7 @@ async fn priority_orders_the_backlog_lower_first() {
             worker_concurrency: Some(1),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");
@@ -1602,9 +1662,13 @@ async fn a_partition_key_is_recorded_on_the_row() {
         .register_workflow("partitioned", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     workflow
         .start_with(
@@ -1645,9 +1709,13 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
         .register_workflow("plain", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue("demo-queue", QueueOptions::default())
-        .await
-        .expect("registration failed");
+    dbos.register_queue(
+        "demo-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
     workflow
         .start_with(
@@ -1698,6 +1766,7 @@ async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
                 priority_enabled: true,
                 ..QueueOptions::default()
             },
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect("registration failed");
@@ -1840,7 +1909,14 @@ async fn an_unhonourable_queue_configuration_is_refused() {
     ];
 
     for (what, options, expected) in cases {
-        let error = match dbos.register_queue("checked-queue", options).await {
+        let error = match dbos
+            .register_queue(
+                "checked-queue",
+                options,
+                QueueConflict::UpdateIfLatestVersion,
+            )
+            .await
+        {
             Ok(_) => panic!("{what} was accepted"),
             Err(error) => error,
         };
@@ -1876,6 +1952,7 @@ async fn an_unhonourable_queue_configuration_is_refused() {
             }),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("a slower per-partition rate should be honoured");
@@ -1904,6 +1981,7 @@ async fn per_partition_limits_partition_a_queue() {
                 partition_worker_concurrency: Some(2),
                 ..QueueOptions::default()
             },
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect("registration failed");
@@ -2072,6 +2150,7 @@ async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
                 partition_concurrency: Some(1),
                 ..QueueOptions::default()
             },
+            QueueConflict::UpdateIfLatestVersion,
         )
         .await
         .expect("registration failed");
@@ -2171,6 +2250,7 @@ async fn a_counted_partitioned_queue_runs_its_limit_per_key() {
             partition_concurrency: Some(2),
             ..QueueOptions::default()
         },
+        QueueConflict::UpdateIfLatestVersion,
     )
     .await
     .expect("registration failed");

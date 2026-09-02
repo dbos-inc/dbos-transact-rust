@@ -144,9 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         QUEUE_NAME,
         QueueOptions {
             worker_concurrency: Some(DEFAULT_WORKER_CONCURRENCY),
-            on_conflict: dbos::QueueConflict::NeverUpdate,
             ..QueueOptions::default()
         },
+        dbos::QueueConflict::NeverUpdate,
     )
     .await?;
 

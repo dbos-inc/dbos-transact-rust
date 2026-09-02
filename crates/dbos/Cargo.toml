@@ -10,7 +10,7 @@ authors.workspace = true
 [features]
 default = ["engine"]
 # Gates the durable execution engine: the lifecycle, registry, contexts, workflows, steps,
-# events and recovery so far, with queues, the scheduler, messaging and the client to come.
+# events, recovery, queues and the client so far, with the scheduler and messaging to come.
 # With it off, what remains is the system database and Conductor layers — the surface a future
 # FFI host would consume. `cargo check --no-default-features` is a standing CI gate, so the
 # boundary is checked continuously rather than rediscovered once it has already blurred.

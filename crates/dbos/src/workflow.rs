@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use tokio::task::AbortHandle;
 use tracing::Instrument;
 
+use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::dbos::Executor;
 use crate::error::{DurableError, Error, Failure, Result};
@@ -16,7 +17,7 @@ use crate::handle::WorkflowHandle;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
 use crate::sysdb::types::{
-    AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
+    AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp, WorkflowInitResult,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -528,6 +529,96 @@ impl<'a> Enqueue<'a> {
     }
 }
 
+/// A new workflow row with its queue-shaped half filled in: the five columns an [`Enqueue`]
+/// decides, and what they are when there is no queue.
+///
+/// The base both literals that create a workflow build on —
+/// [`WorkflowRef::start_with`](WorkflowRef::start_with), where a queue is one option among
+/// several, and [`Client::enqueue_with`](crate::Client::enqueue_with), where there is always one.
+/// Written once because the two must agree about what a queue owns: which columns it fills, and
+/// that `priority` is a `NOT NULL` column whose unprioritised value is the sentinel `0` — zero
+/// also being what a workflow that was never enqueued stores, since it has no order to keep.
+///
+/// The status is not among them. A queued row goes in `ENQUEUED` rather than `PENDING`, and a
+/// [`delay`](Enqueue::delay) makes it `DELAYED`, but `initial_status` derives both from these
+/// columns rather than a caller stating them.
+pub(crate) fn new_row<'a>(workflow_id: &'a str, enqueue: Option<&Enqueue<'a>>) -> NewWorkflow<'a> {
+    NewWorkflow {
+        queue_name: enqueue.map(|enqueue| enqueue.name),
+        deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
+        priority: enqueue.map_or(0, Enqueue::stored_priority),
+        queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
+        delay: enqueue.and_then(|enqueue| enqueue.delay),
+        ..NewWorkflow::new(workflow_id)
+    }
+}
+
+/// What an insert did: wrote this call's row, or resolved a collision by joining someone else's.
+pub(crate) enum Submitted {
+    /// The row this call wrote, and what the system database decided about it.
+    Created(WorkflowInitResult),
+    /// The workflow already holding the deduplication key, which this call joined instead of
+    /// writing a row of its own. Only reachable under [`DuplicationPolicy::ReturnExisting`].
+    Joined(String),
+}
+
+/// Inserts a new workflow, resolving a deduplication collision the way the caller asked.
+///
+/// A loop, because [`DuplicationPolicy::ReturnExisting`] answers a collision by reading who holds the
+/// key, and the holder can finish between those two statements — leaving the key free and this
+/// call with nothing to join, so it tries the insert again. Everything the insert depends on is
+/// decided by the caller before the first attempt, so a retry writes the same row rather than a
+/// differently-derived one.
+///
+/// Shared by the two callers that create workflows — [`WorkflowRef::start_with`] and
+/// [`Client::enqueue_with`](crate::Client::enqueue_with) — which differ in what they do with the
+/// answer and not in how they get it: a start has a parent's launch to record and a body to spawn,
+/// a client has neither.
+pub(crate) async fn init_or_join(
+    conn: &Connection,
+    new: &NewWorkflow<'_>,
+    policy: DuplicationPolicy,
+) -> Result<Submitted> {
+    loop {
+        match conn
+            .sysdb()
+            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh)
+            .await
+        {
+            Ok(initialized) => return Ok(Submitted::Created(initialized)),
+            // **A key another workflow holds, and a caller who asked to join it.** The insert lost
+            // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
+            // is the answer, and a handle to it is what [`DuplicationPolicy::ReturnExisting`] promises.
+            Err(crate::sysdb::Error::QueueDeduplicated {
+                queue_name,
+                deduplication_id,
+                ..
+            }) if policy == DuplicationPolicy::ReturnExisting => {
+                match conn
+                    .sysdb()
+                    .get_deduplication_key_holder(&queue_name, &deduplication_id)
+                    .await
+                    .map_err(Error::SystemDatabase)?
+                {
+                    Some(holder) => {
+                        tracing::debug!(
+                            workflow_id = holder,
+                            deduplication_id,
+                            "the deduplication key is held; the handle joins its holder"
+                        );
+                        return Ok(Submitted::Joined(holder));
+                    }
+                    // The holder finished between the conflict and this read, so the key is free
+                    // again: retry the insert rather than report a collision with a workflow that
+                    // is over. Python and TypeScript both loop here.
+                    None => continue,
+                }
+            }
+            Err(error) => return Err(Error::SystemDatabase(error)),
+        }
+    }
+}
+
 /// Caller-supplied attributes as the row stores them: JSON text, or nothing.
 ///
 /// Plain `serde_json`, never the configured serializer — the column is read by containment and by
@@ -807,7 +898,10 @@ where
                 workflow_id = child,
                 "the child workflow was already started; the handle joins it"
             );
-            return Ok(WorkflowHandle::polling(executor, child));
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                child,
+            ));
         }
 
         let workflow_id = match (options.workflow_id, &parent) {
@@ -884,87 +978,45 @@ where
             deadline,
             parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
             attributes: attributes.as_deref(),
-            // The row goes in `ENQUEUED` rather than `PENDING`, and nothing below spawns
-            // it: a queue's whole point is that the process which asks is not necessarily
-            // the one that runs. A `delay` makes it `DELAYED` instead, which
-            // `initial_status` derives rather than this call stating.
-            queue_name: enqueue.map(|enqueue| enqueue.name),
-            deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
-            // Zero when unprioritised, and zero when there is no queue at all: the column
-            // is `NOT NULL`, and a workflow that was never enqueued has no order to keep.
-            priority: enqueue.map_or(0, Enqueue::stored_priority),
-            queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
-            delay: enqueue.and_then(|enqueue| enqueue.delay),
-            ..NewWorkflow::new(&workflow_id)
+            // The queue's five columns, and nothing below spawns the row they describe: a queue's
+            // whole point is that the process which asks is not necessarily the one that runs.
+            ..new_row(&workflow_id, enqueue)
         };
 
-        // A loop, because [`DuplicationPolicy::ReturnExisting`] resolves a collision by reading who
-        // holds the key, and the holder can finish between the two statements. Everything the
-        // insert needs was decided above it: the id, the step the launch occupies, and the
-        // deadline are all fixed before the first attempt, so a second attempt writes the same row
-        // rather than a differently-derived one.
-        let initialized = loop {
-            match executor
-                .sysdb()
-                .init_workflow(&new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh)
-                .await
-            {
-                Ok(initialized) => break initialized,
-                // **A key another workflow holds, and a caller who asked to join it.** The insert
-                // lost on the partial unique index over `(queue_name, deduplication_id)`; the
-                // holder's id is the answer, and a handle to it is what
-                // [`DuplicationPolicy::ReturnExisting`] promises.
-                Err(crate::sysdb::Error::QueueDeduplicated {
-                    queue_name,
-                    deduplication_id,
-                    ..
-                }) if enqueue.is_some_and(|enqueue| {
-                    enqueue.duplication_policy == DuplicationPolicy::ReturnExisting
-                }) =>
-                {
-                    match executor
-                        .sysdb()
-                        .get_deduplication_key_holder(&queue_name, &deduplication_id)
-                        .await
-                        .map_err(Error::SystemDatabase)?
-                    {
-                        Some(holder) => {
-                            tracing::debug!(
-                                workflow_id = holder,
-                                deduplication_id,
-                                "the deduplication key is held; the handle joins its holder"
-                            );
-                            // **The launch records the workflow that was joined**, not the id this
-                            // call derived, so a replay of this position resolves to the same
-                            // workflow instead of trying to start a child that was never created.
-                            // Go records the same mapping at the same reserved step id.
-                            //
-                            // Only this record, and not the joined workflow's own
-                            // `parent_workflow_id`: it has an owner already, and a cascade
-                            // following that column must not reach a workflow this parent merely
-                            // joined. [`DuplicationPolicy::ReturnExisting`] states the asymmetry.
-                            //
-                            // A crash between the lookup and this write is harmless, and for a
-                            // different reason than the one below: nothing was written by the
-                            // losing insert, so a replay simply asks again. It joins the same
-                            // holder if the key is still held, and starts a workflow of its own if
-                            // the holder has since finished — which is what the policy means at
-                            // that moment, since the key deduplicates a backlog rather than a
-                            // history.
-                            if let Some(parent) = &parent {
-                                parent
-                                    .record_launch(&executor, &holder, &self.key().name, started_at)
-                                    .await?;
-                            }
-                            return Ok(WorkflowHandle::polling(executor, holder));
-                        }
-                        // The holder finished between the conflict and this read, so the key is
-                        // free again: retry the insert rather than report a collision with a
-                        // workflow that is over. Python and TypeScript both loop here.
-                        None => continue,
-                    }
+        let initialized = match init_or_join(
+            executor.connection(),
+            &new,
+            enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
+                enqueue.duplication_policy
+            }),
+        )
+        .await?
+        {
+            Submitted::Created(initialized) => initialized,
+            // **The launch records the workflow that was joined**, not the id this call derived,
+            // so a replay of this position resolves to the same workflow instead of trying to
+            // start a child that was never created. Go records the same mapping at the same
+            // reserved step id.
+            //
+            // Only this record, and not the joined workflow's own `parent_workflow_id`: it has an
+            // owner already, and a cascade following that column must not reach a workflow this
+            // parent merely joined. [`DuplicationPolicy::ReturnExisting`] states the asymmetry.
+            //
+            // A crash between the join and this write is harmless, and for a different reason than
+            // the one below: nothing was written by the losing insert, so a replay simply asks
+            // again. It joins the same holder if the key is still held, and starts a workflow of
+            // its own if the holder has since finished — which is what the policy means at that
+            // moment, since the key deduplicates a backlog rather than a history.
+            Submitted::Joined(holder) => {
+                if let Some(parent) = &parent {
+                    parent
+                        .record_launch(&executor, &holder, &self.key().name, started_at)
+                        .await?;
                 }
-                Err(error) => return Err(Error::SystemDatabase(error)),
+                return Ok(WorkflowHandle::polling(
+                    Arc::clone(executor.connection()),
+                    holder,
+                ));
             }
         };
 
@@ -987,7 +1039,10 @@ where
                 queue = enqueue.name,
                 "the workflow is enqueued"
             );
-            return Ok(WorkflowHandle::polling(executor, workflow_id));
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                workflow_id,
+            ));
         }
 
         // Someone else owns this row — the id was supplied and a previous run has it, or another
@@ -998,7 +1053,10 @@ where
                 workflow_id,
                 "the workflow is already owned; the handle joins the existing run"
             );
-            return Ok(WorkflowHandle::polling(executor, workflow_id));
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                workflow_id,
+            ));
         }
 
         // The deadline the *database* holds, not the one this caller offered: `init_workflow`
@@ -1013,7 +1071,11 @@ where
             // A fresh start is not a dequeue, so it holds no queue's slot.
             None,
         );
-        Ok(WorkflowHandle::local(executor, workflow_id, task))
+        Ok(WorkflowHandle::local(
+            Arc::clone(executor.connection()),
+            workflow_id,
+            task,
+        ))
     }
 }
 
@@ -1223,7 +1285,7 @@ async fn cancel_at_deadline(
                 "the deadline fired on a workflow another execution had already finished; its \
                  recorded outcome stands"
             );
-            adopt(executor, workflow_id).await
+            executor.connection().adopt(workflow_id).await
         }
         Err(error) => {
             tracing::error!(
@@ -1325,34 +1387,54 @@ async fn execute(
                 workflow_id,
                 "another execution recorded this workflow's outcome first"
             );
-            adopt(executor, workflow_id).await
+            executor.connection().adopt(workflow_id).await
         }
     }
 }
 
-/// Reads back the outcome of a workflow this caller does not own.
-pub(crate) async fn adopt(
-    executor: &Executor,
-    workflow_id: &str,
-) -> std::result::Result<Option<String>, Failure> {
-    let outcome = executor
-        .sysdb()
-        .await_workflow_result(workflow_id, executor.outcome_poll_interval())
-        .await
-        .map_err(|e| Failure::Control(Error::SystemDatabase(e)))?;
-    match outcome {
-        AwaitedOutcome::Succeeded { output, .. } => Ok(output),
-        // Handed back encoded, for the caller to decode into its own error type — the adopting
-        // caller knows what that is and this function does not.
-        AwaitedOutcome::Failed { error, .. } => Err(Failure::Recorded(error)),
-        AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
-            workflow_id: workflow_id.to_owned(),
-        })),
-        AwaitedOutcome::Parked { recovery_attempts } => {
-            Err(Failure::Control(Error::MaxRecoveryAttemptsExceeded {
+impl Connection {
+    /// Reads back the outcome of a workflow this caller does not own.
+    ///
+    /// On the connection rather than on an executor because that is all it needs — a row read and
+    /// the interval to re-ask at — and because both surfaces reach it: a `WorkflowHandle` polls
+    /// through here whether it came from a running application or from a
+    /// [`Client`](crate::Client).
+    pub(crate) async fn adopt(
+        &self,
+        workflow_id: &str,
+    ) -> std::result::Result<Option<String>, Failure> {
+        let outcome = self
+            .sysdb()
+            .await_workflow_result(workflow_id, self.outcome_poll_interval())
+            .await
+            .map_err(|error| {
+                Failure::Control(match error {
+                    // The one thing this wait can say about the id itself, and the same absence
+                    // [`WorkflowHandle::status`] reports — so a caller holding an id that names no
+                    // row gets one error from both halves of its handle, rather than this one
+                    // buried in a system database failure. Reported for a single id because a
+                    // single id is what was awaited; the plural variant belongs to the calls that
+                    // take a list.
+                    crate::sysdb::Error::NonExistentWorkflow { .. } => Error::WorkflowNotFound {
+                        workflow_id: workflow_id.to_owned(),
+                    },
+                    other => Error::SystemDatabase(other),
+                })
+            })?;
+        match outcome {
+            AwaitedOutcome::Succeeded { output, .. } => Ok(output),
+            // Handed back encoded, for the caller to decode into its own error type — the adopting
+            // caller knows what that is and this function does not.
+            AwaitedOutcome::Failed { error, .. } => Err(Failure::Recorded(error)),
+            AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
                 workflow_id: workflow_id.to_owned(),
-                recovery_attempts,
-            }))
+            })),
+            AwaitedOutcome::Parked { recovery_attempts } => {
+                Err(Failure::Control(Error::MaxRecoveryAttemptsExceeded {
+                    workflow_id: workflow_id.to_owned(),
+                    recovery_attempts,
+                }))
+            }
         }
     }
 }

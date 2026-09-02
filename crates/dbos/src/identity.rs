@@ -160,7 +160,7 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
 ///
 /// Checked rather than trusted because the name is an ownership key: a row stamped with a name no
 /// other executor spells the same way is a row nothing claims.
-fn validate_app_name(name: &str) -> Result<()> {
+pub(crate) fn validate_app_name(name: &str) -> Result<()> {
     let bad = |why: &str| Err(Error::Config(format!("`app_name` {why}: {name:?}")));
     match name.chars().count() {
         0 => return bad("cannot be empty"),

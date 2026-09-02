@@ -571,6 +571,36 @@ impl PostgresSystemDatabase {
     }
 }
 
+impl Drop for PostgresSystemDatabase {
+    /// Stops the two tasks a handle that was never closed would otherwise leave running.
+    ///
+    /// **A safety net, not the shutdown.** [`close`](SystemDatabase::close) is still what a caller
+    /// wants — it flushes the notifier's window, closes the pool, and waits for both tasks, so that
+    /// afterwards nothing of this handle is running. A destructor can do none of that, because all
+    /// of it is asynchronous.
+    ///
+    /// Without this, dropping a handle instead of closing it leaks both tasks *and* a connection
+    /// for the life of the process: the tasks hold `Arc`s carrying their own clones of the pool, so
+    /// the pool cannot reach zero handles and close itself, and the listener's only way out of its
+    /// loop is that close — it would go on holding a `LISTEN` connection with nobody left to
+    /// deliver to. Dropping rather than closing is the ordinary end of a
+    /// [`Client`](crate::Client), which is a value in someone's application state rather than
+    /// something with a lifecycle of its own.
+    fn drop(&mut self) {
+        // The notifier ends itself on the flag, flushing what it had queued on the way out, so it
+        // needs no abort — and aborting it would be the one way to lose that flush.
+        self.notifier.stop();
+
+        // The listener has no such flag: it stops when the pool closes, and closing a pool is
+        // asynchronous. Aborting drops the task's `Arc<Listener>`, which is what releases its pool
+        // clone and hands the `LISTEN` connection back for the pool's own teardown to close.
+        let task = self.listener_task.lock().expect("listener lock").take();
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
+}
+
 /// The `WHERE` selecting the rows a rename moves.
 ///
 /// Unclaimed rows are matched only when the source asks for them — the one place in this feature
@@ -1158,10 +1188,16 @@ const VERSION_COLUMNS: &str =
 /// work here. `None` back means the row is unclaimed and this writer has no name to claim it
 /// with.
 ///
+/// **A nameless writer is not thereby stopped from writing.** Leaving the owner intact means the
+/// *column*: the holder comes back, the write that follows is scoped to it, and so a handle with
+/// no application name of its own goes on to rewrite a row a named application holds. That is
+/// what a client with no configured name does by default, and all five implementations do it —
+/// see the item 26 note below before reading any surrounding doc as a guarantee.
+///
 /// **Diagnostic, not a guard.** The writes it precedes match only a row that is unclaimed or
-/// already this application's, and that is what keeps a peer's row safe. Inside a transaction it
-/// still races at READ COMMITTED, where every statement takes a fresh snapshot: a registrar
-/// claiming the row in between costs a following write that silently matches nothing.
+/// already this application's, and that is what keeps a *named* peer's row safe. Inside a
+/// transaction it still races at READ COMMITTED, where every statement takes a fresh snapshot: a
+/// registrar claiming the row in between costs a following write that silently matches nothing.
 /// `SELECT … FOR UPDATE` would close that, and neither reference does it — both lock rows only on
 /// the dequeue path — so it is a change to raise with them rather than make alone.
 ///
@@ -1192,8 +1228,28 @@ const VERSION_COLUMNS: &str =
 /// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED —
 /// the default in all of them — a registrar can claim the row in between. The write is
 /// self-guarding, so it matches zero rows rather than landing on the wrong one, but the caller is
-/// told `Ok`: an operator can believe a version rollback took effect when it did not. A
-/// `SELECT … FOR UPDATE` here would settle it, or reporting rows-affected to the caller.
+/// told `Ok`: an operator can believe a version rollback took effect when it did not. The same
+/// silence covers a name that matches nothing at all — promoting a version that was never
+/// registered reports success and moves nothing, in all four references as well — which is the
+/// failure item 12 describes for schedule writes, on the one operation an operator reaches for
+/// when a deploy has gone wrong. A `SELECT … FOR UPDATE` here would settle the race; reporting
+/// rows-affected to the caller settles both, and is the only one of the two that catches the name
+/// nobody holds.
+///
+/// TODO(dbos-team): UPSTREAM item 26. The nameless branch above is a shared gap, not this port's
+/// choice: `_resolve_row_owner` (`_sys_db.py:892`), `#resolveRowOwner` (`system_database.ts:1095`),
+/// `resolveRowOwner` (`system_database.go:203`) and `RowOwner.resolve` (`RowOwner.java:27`) all
+/// return the holder to a claimant that has no name, and their callers then write scoped to it —
+/// so a nameless `upsert_queue` replaces a peer's stored limits, a nameless
+/// `update_application_version_timestamp` retimes a version another fleet is rolling on, and a
+/// nameless `upsert_schedule` replaces a peer's definition. Go's resolver reads as though this is
+/// deliberate ("the path of a client operating on behalf of all apps"); the other four say only
+/// that the owner is left intact, and their client-facing docs promise a peer's name is refused
+/// without qualifying it for the caller that usually has no name of its own. Either a nameless
+/// writer acts for every application — in which case all five need to say so — or it may claim an
+/// unclaimed row but not overwrite an owned one, in which case this returns
+/// [`Error::RegisteredByAnother`] with no `claimant`, which the variant already models. Not a
+/// change to make in one implementation.
 async fn resolve_owning_application(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,

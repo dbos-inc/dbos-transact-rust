@@ -13,13 +13,12 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
+use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
-use crate::dbos::Executor;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus};
-use crate::workflow::adopt;
 
 /// A running — or finished — workflow, by id.
 ///
@@ -28,7 +27,7 @@ use crate::workflow::adopt;
 /// runtime error (Go returns *"workflow result channel is already closed"* at the same point).
 /// Dropping a handle does not stop the workflow — it only stops watching.
 pub struct WorkflowHandle<R, E = crate::EngineOnly> {
-    executor: Arc<Executor>,
+    conn: Arc<Connection>,
     workflow_id: String,
     provenance: Provenance,
     /// `fn() -> (R, E)`: the handle holds neither, it only names them — which keeps it `Send`,
@@ -47,12 +46,12 @@ enum Provenance {
 impl<R, E> WorkflowHandle<R, E> {
     /// A handle over the task this process spawned.
     pub(crate) fn local(
-        executor: Arc<Executor>,
+        conn: Arc<Connection>,
         workflow_id: String,
         task: JoinHandle<std::result::Result<Option<String>, Failure>>,
     ) -> Self {
         Self {
-            executor,
+            conn,
             workflow_id,
             provenance: Provenance::Local(task),
             types: PhantomData,
@@ -60,9 +59,14 @@ impl<R, E> WorkflowHandle<R, E> {
     }
 
     /// A handle over a workflow some other execution owns.
-    pub(crate) fn polling(executor: Arc<Executor>, workflow_id: String) -> Self {
+    ///
+    /// **Takes a connection rather than an executor**, which is what lets a
+    /// [`Client`](crate::Client) hand one back: watching a workflow is reading its row, and reading
+    /// a row needs no process that could run it. Java's client builds the same thing — a small
+    /// handle class over the system database alone.
+    pub(crate) fn polling(conn: Arc<Connection>, workflow_id: String) -> Self {
         Self {
-            executor,
+            conn,
             workflow_id,
             provenance: Provenance::Polling,
             types: PhantomData,
@@ -77,7 +81,7 @@ impl<R, E> WorkflowHandle<R, E> {
     /// The workflow's status, as its row records it right now.
     pub async fn status(&self) -> Result<WorkflowStatus> {
         let row = self
-            .executor
+            .conn
             .sysdb()
             .get_workflow(&self.workflow_id)
             .await
@@ -107,15 +111,25 @@ where
     /// rather than waiting again on a workflow that may since have been forked or deleted — and the
     /// wait costs one row read instead of a poll to completion. All four implementations record it,
     /// under the same name, `DBOS.getResult`.
+    ///
+    /// **A handle from a [`Client`](crate::Client) awaited there is a plain wait**, because a
+    /// client has no step counter of its own to agree with the workflow's: nothing is recorded,
+    /// and a replayed body waits again. A handle from another *instance* is
+    /// [`Error::WrongInstance`] instead — there the two counters both exist, and the caller meant
+    /// one of them.
+    ///
+    /// An id that names no row is [`Error::WorkflowNotFound`], the same absence
+    /// [`status`](Self::status) reports: waiting stops at a workflow that does not exist rather
+    /// than polling for one to appear.
     pub async fn result(self) -> Result<R, E> {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run.
-        let awaiting = match Awaiting::of(&self.executor) {
+        let awaiting = match Awaiting::of(&self.conn) {
             Ok(awaiting) => awaiting,
             Err(wrong) => return Err(wrong.lift()),
         };
         if let Some(recorded) = awaiting
-            .recorded(&self.executor, &self.workflow_id)
+            .recorded(&self.conn, &self.workflow_id)
             .await
             .map_err(Error::lift)?
         {
@@ -137,7 +151,7 @@ where
                 })),
                 Err(join) => std::panic::resume_unwind(join.into_panic()),
             },
-            Provenance::Polling => adopt(&self.executor, &self.workflow_id).await,
+            Provenance::Polling => self.conn.adopt(&self.workflow_id).await,
         };
 
         // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
@@ -149,7 +163,7 @@ where
         // there is one encoding, so it costs nothing yet; it becomes a real question when a second
         // serializer does, and it is that change's to answer.
         awaiting
-            .record(&self.executor, &self.workflow_id, &outcome, started_at)
+            .record(&self.conn, &self.workflow_id, &outcome, started_at)
             .await
             .map_err(Error::lift)?;
 
@@ -204,29 +218,57 @@ enum Awaiting {
     /// Not inside a workflow. Nothing is recorded, and a cancelled workflow is reported as
     /// [`Error::WorkflowCancelled`] — there is no *other* workflow here to confuse it with.
     Outside,
-    /// Inside a step. The awaited-cancelled distinction applies, because there is a workflow to
-    /// confuse it with, but nothing is checkpointed: a step is a leaf, and an id-allocating call
-    /// inside one would shift every later step onto the wrong replay slot. `get_event` degrades
-    /// the same way.
-    InsideAStep,
+    /// Inside a workflow, with nothing to record the await against. The awaited-cancelled
+    /// distinction applies, because there is a workflow to confuse it with, but nothing is
+    /// checkpointed. Two ways to land here, and `get_event` degrades both the same way:
+    ///
+    /// - **Inside a step**: a step is a leaf, and an id-allocating call inside one would shift
+    ///   every later step onto the wrong replay slot.
+    /// - **Holding a [`Client`](crate::Client)'s handle**: a client has no step counter to agree
+    ///   with this workflow's, and no execution of its own that a recorded await could belong to.
+    ///   A handle from *another instance* is the third case and is not this one — that is
+    ///   [`Error::WrongInstance`], because two instances each have a counter and the caller meant
+    ///   one of them.
+    Uncheckpointed,
     /// Inside a workflow at a step boundary: this await is a step of that workflow.
     Checkpointed { workflow_id: String, step_id: i32 },
 }
 
 impl Awaiting {
-    fn of(executor: &Arc<Executor>) -> std::result::Result<Self, Error> {
+    fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
         let Some(ctx) = Ctx::current() else {
             return Ok(Self::Outside);
         };
-        // The step id would come from this workflow's counter while the write went through the
-        // handle's own system database — the split `get_event` refuses for the same reason.
-        if !Arc::ptr_eq(ctx.executor(), executor) {
-            return Err(Error::WrongInstance {
-                operation: "awaiting a workflow's result".into(),
-            });
-        }
+        // First, because inside a step nothing is checkpointed whoever the handle belongs to, and
+        // there is then nothing for the halves below to disagree about. `DBOS::get_event` orders
+        // its own two checks the same way.
         if ctx.in_step() {
-            return Ok(Self::InsideAStep);
+            return Ok(Self::Uncheckpointed);
+        }
+        // Where the two halves would be combined: a step id is about to come from this workflow's
+        // counter while the write goes through the handle's own connection. What that means
+        // depends on whose connection it is, and it is the one question [`Owner`] exists for.
+        //
+        // The comparison is of *databases* rather than of executors, because the database is what
+        // the two halves would disagree about, and it is the thing a handle from a
+        // [`Client`](crate::Client) has in common with one from a running executor.
+        if !Arc::ptr_eq(ctx.executor().connection(), conn) {
+            return match conn.owner() {
+                // **A client's handle is a plain wait, not a refusal.** There is no second counter
+                // here to have meant instead — a client has none — so the await degrades to the
+                // undurable version of itself, which is what `Client::enqueue` documents about a
+                // client used from inside a workflow body and what `Client::get_event` already
+                // does for the read.
+                Owner::Client => Ok(Self::Uncheckpointed),
+                // **Another instance's is the mistake the variant was raised for.** Both
+                // instances have a step counter, the caller meant one of them, and the record
+                // would land where the workflow that allocated the id cannot see it. Refused
+                // rather than quietly downgraded, because a second instance in a process is
+                // nearly always a wiring error and this is the only place it shows.
+                Owner::Application => Err(Error::WrongInstance {
+                    operation: "awaiting a workflow's result".into(),
+                }),
+            };
         }
         Ok(Self::Checkpointed {
             workflow_id: ctx.workflow_id().to_owned(),
@@ -252,13 +294,13 @@ impl Awaiting {
 
     async fn recorded(
         &self,
-        executor: &Executor,
+        conn: &Connection,
         awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
         let Some((workflow_id, step_id)) = self.checkpoint() else {
             return Ok(None);
         };
-        let Some(recorded) = executor
+        let Some(recorded) = conn
             .sysdb()
             .check_child_result(workflow_id, step_id)
             .await
@@ -329,7 +371,7 @@ impl Awaiting {
     /// [`Error::AwaitedWorkflowCancelled`].
     async fn record(
         &self,
-        executor: &Executor,
+        conn: &Connection,
         child_workflow_id: &str,
         settled: &std::result::Result<Option<String>, Failure>,
         started_at: Timestamp,
@@ -355,14 +397,13 @@ impl Awaiting {
             }
             Err(Failure::Control(_)) => return Ok(()),
         };
-        executor
-            .sysdb()
+        conn.sysdb()
             .record_child_result(
                 workflow_id,
                 step_id,
                 child_workflow_id,
                 outcome,
-                Some(executor.serializer().name()),
+                Some(conn.serializer().name()),
                 Some(StepTiming {
                     started_at,
                     completed_at: Timestamp::now(),
