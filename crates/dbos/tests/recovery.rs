@@ -116,7 +116,7 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
 
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let [row] = &rows[..] else {
@@ -125,7 +125,7 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
     assert_eq!(row.status, WorkflowStatus::Pending, "abandoned, not failed");
     let workflow_id = row.workflow_id.clone();
     let steps = reader
-        .list_workflow_steps(&workflow_id, true, None, None)
+        .list_workflow_steps(&workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(
@@ -210,7 +210,7 @@ async fn an_unregistered_workflow_is_skipped_and_the_rest_recover() {
 
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let id_of = |name: &str| {

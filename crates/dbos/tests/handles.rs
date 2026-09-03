@@ -84,7 +84,7 @@ async fn starting_a_taken_id_joins_the_existing_run() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let [row] = &rows[..] else {
@@ -229,7 +229,7 @@ async fn a_handle_over_a_row_this_process_read_reports_its_deletion() {
 
     let deleted = reader(&db)
         .await
-        .delete_workflows(&["task-99"], false)
+        .delete_workflows(&["task-99"], false, None)
         .await
         .expect("delete failed");
     assert_eq!(deleted, 1, "the row was there to delete");

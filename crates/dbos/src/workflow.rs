@@ -1288,9 +1288,13 @@ async fn cancel_at_deadline(
     // the row stays PENDING and is recovered, where the expired deadline is read again and cancels
     // immediately — so this logs rather than propagating, and still reports the cancellation it
     // was unable to record.
+    // No caller, though this cancels a workflow that is running right here: the checkpoint
+    // argument records the cancel as a *step of the workflow that asked for it*, and the engine is
+    // not one. Spending a step id from this workflow's own counter would shift every step after it
+    // onto the wrong replay slot.
     match executor
         .sysdb()
-        .cancel_workflows(&[workflow_id], false)
+        .cancel_workflows(&[workflow_id], false, None)
         .await
     {
         Ok(moved) if moved.iter().any(|id| id == workflow_id) => cancelled(),

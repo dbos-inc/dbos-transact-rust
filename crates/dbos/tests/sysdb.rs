@@ -862,7 +862,9 @@ async fn an_await_reports_a_cancelled_workflow_as_cancelled() {
     sys.init_workflow(&workflow("wf-doomed"), None, Submission::Fresh)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-doomed"], false).await.unwrap();
+    sys.cancel_workflows(&["wf-doomed"], false, None)
+        .await
+        .unwrap();
 
     assert_eq!(
         sys.await_workflow_result("wf-doomed", BRISK_POLL, false)
@@ -1251,7 +1253,7 @@ async fn ids(
     sys: &PostgresSystemDatabase,
     filter: &dbos::sysdb::types::WorkflowFilter<'_>,
 ) -> Vec<String> {
-    sys.list_workflows(filter)
+    sys.list_workflows(filter, None)
         .await
         .expect("list failed")
         .into_iter()
@@ -1585,16 +1587,19 @@ async fn payloads_can_be_left_unloaded() {
         .await
         .unwrap();
 
-    let loaded = &sys.list_workflows(&F::default()).await.unwrap()[0];
+    let loaded = &sys.list_workflows(&F::default(), None).await.unwrap()[0];
     assert_eq!(loaded.input.as_deref(), Some(r#"{"positionalArgs":[1]}"#));
     assert_eq!(loaded.output.as_deref(), Some("42"));
 
     let bare = &sys
-        .list_workflows(&F {
-            load_input: false,
-            load_output: false,
-            ..F::default()
-        })
+        .list_workflows(
+            &F {
+                load_input: false,
+                load_output: false,
+                ..F::default()
+            },
+            None,
+        )
         .await
         .unwrap()[0];
     assert_eq!(bare.workflow_id, "wf-payload", "the row is still returned");
@@ -1620,7 +1625,10 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
         .await
         .unwrap();
 
-    let cancelled = sys.cancel_workflows(&["wf-cancel"], false).await.unwrap();
+    let cancelled = sys
+        .cancel_workflows(&["wf-cancel"], false, None)
+        .await
+        .unwrap();
     assert_eq!(cancelled, ["wf-cancel"]);
 
     let read = sys.get_workflow("wf-cancel").await.unwrap().unwrap();
@@ -1637,10 +1645,13 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
 
     // The key is genuinely free again, and not merely absent from the row this test read.
     let holders = sys
-        .list_workflows(&dbos::sysdb::types::WorkflowFilter {
-            deduplication_ids: vec!["dedup-1"],
-            ..Default::default()
-        })
+        .list_workflows(
+            &dbos::sysdb::types::WorkflowFilter {
+                deduplication_ids: vec!["dedup-1"],
+                ..Default::default()
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(
@@ -1663,7 +1674,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
         .unwrap();
 
     let first = sys
-        .cancel_workflows(&["wf-twice-cancelled"], false)
+        .cancel_workflows(&["wf-twice-cancelled"], false, None)
         .await
         .unwrap();
     assert_eq!(first, ["wf-twice-cancelled"]);
@@ -1674,7 +1685,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
         .unwrap();
 
     let second = sys
-        .cancel_workflows(&["wf-twice-cancelled"], false)
+        .cancel_workflows(&["wf-twice-cancelled"], false, None)
         .await
         .unwrap();
     assert!(
@@ -1706,7 +1717,10 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
         .await
         .unwrap();
 
-    let cancelled = sys.cancel_workflows(&["wf-done"], false).await.unwrap();
+    let cancelled = sys
+        .cancel_workflows(&["wf-done"], false, None)
+        .await
+        .unwrap();
     assert!(
         cancelled.is_empty(),
         "nothing moved, and the caller is told so",
@@ -1739,7 +1753,10 @@ async fn cancelling_children_descends_the_whole_tree() {
             .unwrap();
     }
 
-    let mut cancelled = sys.cancel_workflows(&["wf-root"], true).await.unwrap();
+    let mut cancelled = sys
+        .cancel_workflows(&["wf-root"], true, None)
+        .await
+        .unwrap();
     cancelled.sort();
     assert_eq!(cancelled, ["wf-child", "wf-grandchild", "wf-root"]);
 
@@ -1761,7 +1778,10 @@ async fn cancelling_children_descends_the_whole_tree() {
     sys.init_workflow(&child, None, Submission::Fresh)
         .await
         .unwrap();
-    let shallow = sys.cancel_workflows(&["wf-root2"], false).await.unwrap();
+    let shallow = sys
+        .cancel_workflows(&["wf-root2"], false, None)
+        .await
+        .unwrap();
     assert_eq!(shallow, ["wf-root2"]);
 }
 
@@ -1780,7 +1800,10 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
             .unwrap();
     }
 
-    let resumed = sys.resume_workflows(&["wf-resume"], None).await.unwrap();
+    let resumed = sys
+        .resume_workflows(&["wf-resume"], None, None)
+        .await
+        .unwrap();
     assert_eq!(resumed, ["wf-resume"]);
 
     let read = sys.get_workflow("wf-resume").await.unwrap().unwrap();
@@ -1801,7 +1824,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     sys.init_workflow(&workflow("wf-resume2"), None, Submission::Fresh)
         .await
         .unwrap();
-    sys.resume_workflows(&["wf-resume2"], Some("orders"))
+    sys.resume_workflows(&["wf-resume2"], Some("orders"), None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-resume2").await.unwrap().unwrap();
@@ -1819,7 +1842,10 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
         .await
         .unwrap();
 
-    match sys.resume_workflows(&["wf-real", "wf-ghost"], None).await {
+    match sys
+        .resume_workflows(&["wf-real", "wf-ghost"], None, None)
+        .await
+    {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
             assert_eq!(workflow_ids, ["wf-ghost"], "only the missing id is named");
         }
@@ -1833,7 +1859,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     );
 
     let cancelled = sys
-        .cancel_workflows(&["wf-ghost"], false)
+        .cancel_workflows(&["wf-ghost"], false, None)
         .await
         .expect("cancelling a missing workflow is a no-op, not an error");
     assert!(cancelled.is_empty());
@@ -1851,7 +1877,7 @@ async fn attributes_are_replaced_not_merged() {
         .await
         .unwrap();
 
-    sys.update_workflow_attributes("wf-attrs", Some(r#"{"tier": "silver"}"#))
+    sys.update_workflow_attributes("wf-attrs", Some(r#"{"tier": "silver"}"#), None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-attrs").await.unwrap().unwrap();
@@ -1862,7 +1888,7 @@ async fn attributes_are_replaced_not_merged() {
         "a replacement drops keys the new value omits, got {attributes}",
     );
 
-    sys.update_workflow_attributes("wf-attrs", None)
+    sys.update_workflow_attributes("wf-attrs", None, None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-attrs").await.unwrap().unwrap();
@@ -1928,7 +1954,7 @@ async fn empty_and_zero_values_are_rejected() {
 
     // Nothing was written on the way to any of those errors.
     let all = sys
-        .list_workflows(&dbos::sysdb::types::WorkflowFilter::default())
+        .list_workflows(&dbos::sysdb::types::WorkflowFilter::default(), None)
         .await
         .unwrap();
     assert!(all.is_empty(), "a rejected workflow must leave no row");
@@ -2086,7 +2112,9 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
     sys.init_workflow(&workflow("wf-stopped"), None, Submission::Fresh)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-stopped"], false).await.unwrap();
+    sys.cancel_workflows(&["wf-stopped"], false, None)
+        .await
+        .unwrap();
 
     match sys.check_step("wf-stopped", 0, "charge").await {
         Err(Error::WorkflowCancelled { workflow_id }) => assert_eq!(workflow_id, "wf-stopped"),
@@ -2124,7 +2152,7 @@ async fn steps_are_listed_in_execution_order() {
     }
 
     let steps = sys
-        .list_workflow_steps("wf-list", true, None, None)
+        .list_workflow_steps("wf-list", true, None, None, None)
         .await
         .unwrap();
     let ids: Vec<i32> = steps.iter().map(|s| s.step_id).collect();
@@ -2133,7 +2161,7 @@ async fn steps_are_listed_in_execution_order() {
     assert_eq!(steps[1].output.as_deref(), Some("out-1"));
 
     let bare = sys
-        .list_workflow_steps("wf-list", false, None, None)
+        .list_workflow_steps("wf-list", false, None, None, None)
         .await
         .unwrap();
     assert_eq!(bare.len(), 3, "declining payloads returns the same rows");
@@ -2141,7 +2169,7 @@ async fn steps_are_listed_in_execution_order() {
     assert_eq!(bare[1].step_name, "step-1", "other columns still load");
 
     let page = sys
-        .list_workflow_steps("wf-list", true, Some(1), Some(1))
+        .list_workflow_steps("wf-list", true, Some(1), Some(1), None)
         .await
         .unwrap();
     assert_eq!(page.len(), 1);
@@ -2503,14 +2531,17 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
         .unwrap();
 
     // Without the flag the child survives, so the cascade is opt-in rather than implied.
-    let deleted = sys.delete_workflows(&["wf-gone"], false).await.unwrap();
+    let deleted = sys
+        .delete_workflows(&["wf-gone"], false, None)
+        .await
+        .unwrap();
     assert_eq!(deleted, 1);
     assert!(sys.get_workflow("wf-gone").await.unwrap().is_none());
     assert!(sys.get_workflow("wf-gone-kid").await.unwrap().is_some());
 
     // The step went with the row: the foreign key cascades, so no second delete is needed.
     let steps = sys
-        .list_workflow_steps("wf-gone", true, None, None)
+        .list_workflow_steps("wf-gone", true, None, None, None)
         .await
         .unwrap();
     assert!(steps.is_empty(), "operation_outputs should cascade");
@@ -2529,7 +2560,7 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
             .await
             .unwrap();
     }
-    let deleted = sys.delete_workflows(&["wf-p"], true).await.unwrap();
+    let deleted = sys.delete_workflows(&["wf-p"], true, None).await.unwrap();
     assert_eq!(deleted, 3, "the whole tree, at every depth");
 }
 
@@ -2757,17 +2788,19 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
     sys.set_workflow_delay(
         "wf-delayed",
         WorkflowDelay::Until(Timestamp::from_epoch_ms(9_000_000)),
+        None,
     )
     .await
     .unwrap();
     let read = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
     assert_eq!(read.delay_until, Some(Timestamp::from_epoch_ms(9_000_000)));
 
-    // A relative delay resolves against the database layer's clock.
+    // A relative delay resolves against the system database layer's clock, not the caller's.
     let before = Timestamp::now();
     sys.set_workflow_delay(
         "wf-delayed",
         WorkflowDelay::For(std::time::Duration::from_secs(60)),
+        None,
     )
     .await
     .unwrap();
@@ -2785,6 +2818,7 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
     sys.set_workflow_delay(
         "wf-running",
         WorkflowDelay::Until(Timestamp::from_epoch_ms(9_000_000)),
+        None,
     )
     .await
     .unwrap();
@@ -3093,7 +3127,7 @@ async fn attributes_must_be_a_json_object() {
 
         // And on update.
         match sys
-            .update_workflow_attributes("wf-attr-ok", Some(bad))
+            .update_workflow_attributes("wf-attr-ok", Some(bad), None)
             .await
         {
             Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "attributes"),
@@ -3102,10 +3136,10 @@ async fn attributes_must_be_a_json_object() {
     }
 
     // An object is fine, and so is clearing.
-    sys.update_workflow_attributes("wf-attr-ok", Some(r#"{"tenant":"acme"}"#))
+    sys.update_workflow_attributes("wf-attr-ok", Some(r#"{"tenant":"acme"}"#), None)
         .await
         .unwrap();
-    sys.update_workflow_attributes("wf-attr-ok", None)
+    sys.update_workflow_attributes("wf-attr-ok", None, None)
         .await
         .unwrap();
 
@@ -3800,7 +3834,9 @@ async fn a_recovered_read_resumes_the_original_deadline() {
 async fn a_cancelled_reader_stops_rather_than_waiting() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.cancel_workflows(&["wf-reader"], false).await.unwrap();
+    sys.cancel_workflows(&["wf-reader"], false, None)
+        .await
+        .unwrap();
 
     let err = tokio::time::timeout(
         RECHECK * 10,
@@ -4325,7 +4361,9 @@ async fn a_cancelled_receiver_stops_rather_than_waiting() {
     sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-receiver"], false).await.unwrap();
+    sys.cancel_workflows(&["wf-receiver"], false, None)
+        .await
+        .unwrap();
 
     let err = tokio::time::timeout(
         RECHECK * 10,
@@ -5002,7 +5040,7 @@ async fn a_fork_carries_the_steps_below_its_start_step() {
         start_step: 2,
     }];
     let ids = sys
-        .fork_workflows(&forks, &ForkOptions::default())
+        .fork_workflows(&forks, &ForkOptions::default(), None)
         .await
         .unwrap();
     assert_eq!(ids, ["wf-fork"]);
@@ -5024,7 +5062,7 @@ async fn a_fork_carries_the_steps_below_its_start_step() {
 
     // Steps 0 and 1 came across; 2 and 3 did not — those are the ones the fork will run.
     let steps = sys
-        .list_workflow_steps("wf-fork", true, None, None)
+        .list_workflow_steps("wf-fork", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -5036,6 +5074,224 @@ async fn a_fork_carries_the_steps_below_its_start_step() {
             (0, "step_0", Some("\"out0\"")),
             (1, "step_1", Some("\"out1\"")),
         ],
+    );
+}
+
+/// **A fork and the step recording it commit together**, so a replay forks nothing.
+///
+/// The rest of the management surface is idempotent — cancelling the same workflow twice reaches
+/// the same end state — but a fork generates ids, so an execution that found no checkpoint would
+/// write a *second* fork under a second id and run the work again. Two calls under the same
+/// caller are what that replay looks like from here.
+#[tokio::test]
+async fn a_fork_records_its_step_and_replays_from_it() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-forked"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.init_workflow(&workflow("wf-operator"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let caller = Some(("wf-operator", 0));
+    let first = sys
+        .fork_workflows(&[Fork::new("wf-forked")], &ForkOptions::default(), caller)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+
+    // The checkpoint is a step of the workflow that asked, under the cross-SDK name.
+    let steps = sys
+        .list_workflow_steps("wf-operator", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.step_id, s.step_name.as_str()))
+            .collect::<Vec<_>>(),
+        [(0, "DBOS.forkWorkflow")],
+    );
+
+    // The replay: the recorded ids come back, and no second fork is written.
+    let replayed = sys
+        .fork_workflows(&[Fork::new("wf-forked")], &ForkOptions::default(), caller)
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed, first,
+        "the replay forked again instead of replaying its checkpoint"
+    );
+    let forks: Vec<String> = sys
+        .list_workflows(&WorkflowFilter::default(), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.forked_from.as_deref() == Some("wf-forked"))
+        .map(|w| w.workflow_id)
+        .collect();
+    assert_eq!(forks, first, "the source was forked twice");
+}
+
+/// **A write and its checkpoint commit together, so a replay writes nothing** — and says what the
+/// first execution said, not what a second one would.
+///
+/// Cancelling twice is harmless, which is why this can be tested by simply calling twice: a fresh
+/// second cancel returns *no* ids, because the workflow is already `CANCELLED` and `cancel_batch`
+/// excludes terminal rows. Getting the id back instead is the checkpoint answering.
+#[tokio::test]
+async fn a_cancel_records_its_step_and_replays_from_it() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-target"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.init_workflow(&workflow("wf-operator"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let caller = Some(("wf-operator", 0));
+    let first = sys
+        .cancel_workflows(&["wf-target"], false, caller)
+        .await
+        .unwrap();
+    assert_eq!(first, ["wf-target"]);
+
+    let steps = sys
+        .list_workflow_steps("wf-operator", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.step_id, s.step_name.as_str()))
+            .collect::<Vec<_>>(),
+        [(0, "DBOS.cancelWorkflow")],
+    );
+
+    // Without the checkpoint this returns nothing: the row is already terminal.
+    let fresh = sys
+        .cancel_workflows(&["wf-target"], false, None)
+        .await
+        .unwrap();
+    assert!(fresh.is_empty(), "a second cancel moved something");
+
+    let replayed = sys
+        .cancel_workflows(&["wf-target"], false, caller)
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed, first,
+        "the replay cancelled again instead of replaying its checkpoint"
+    );
+}
+
+/// **A read is checkpointed too, so a replay sees the rows the first execution saw.**
+///
+/// Go leaves its listings on the non-transactional wrapper; here they take the same one
+/// transaction as the writes, which is what makes this hold — the workflow created between the two
+/// calls is in the fresh listing and not in the replayed one.
+#[tokio::test]
+async fn a_listing_replays_the_rows_it_recorded() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-first"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.init_workflow(&workflow("wf-operator"), None, Submission::Fresh)
+        .await
+        .unwrap();
+
+    let caller = Some(("wf-operator", 0));
+    let filter = WorkflowFilter {
+        workflow_ids: vec!["wf-first", "wf-later"],
+        ..WorkflowFilter::default()
+    };
+    let first = sys.list_workflows(&filter, caller).await.unwrap();
+    assert_eq!(first.len(), 1, "only one of the two exists yet");
+
+    sys.init_workflow(&workflow("wf-later"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    let fresh = sys.list_workflows(&filter, None).await.unwrap();
+    assert_eq!(fresh.len(), 2, "the new workflow is really there");
+
+    let replayed = sys.list_workflows(&filter, caller).await.unwrap();
+    assert_eq!(
+        replayed, first,
+        "the replay read the table again instead of its checkpoint"
+    );
+}
+
+/// A replayed `fork_from` resolves nothing, because the resolve is inside the transaction.
+///
+/// Proved by making a fresh resolve impossible: the source's steps are deleted between the two
+/// calls, so a second lookup would fail with [`Error::NoForkPoint`]. The replay answers from its
+/// checkpoint instead, which is the whole point of the checkpoint covering the lookup as well as
+/// the write.
+#[tokio::test]
+async fn a_replayed_fork_from_does_not_resolve_the_fork_point_again() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-resolved"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.init_workflow(&workflow("wf-operator"), None, Submission::Fresh)
+        .await
+        .unwrap();
+    sys.record_step(
+        "wf-resolved",
+        0,
+        "step_0",
+        Outcome::Output(Some("\"out\"")),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let caller = Some(("wf-operator", 0));
+    let first = sys
+        .fork_from(
+            &["wf-resolved"],
+            ForkPoint::LastStep,
+            &ForkOptions::default(),
+            caller,
+        )
+        .await
+        .unwrap();
+
+    // Nothing left to resolve from: the source's own history is gone, and the fork's copy of it
+    // lives under the fork's id rather than the source's.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "DELETE FROM dbos.operation_outputs WHERE workflow_uuid = 'wf-resolved'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    let fresh = sys
+        .fork_from(
+            &["wf-resolved"],
+            ForkPoint::LastStep,
+            &ForkOptions::default(),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(fresh, Err(Error::NoForkPoint { .. })),
+        "expected the lookup to be impossible now, got {fresh:?}"
+    );
+
+    let replayed = sys
+        .fork_from(
+            &["wf-resolved"],
+            ForkPoint::LastStep,
+            &ForkOptions::default(),
+            caller,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed, first,
+        "the replay looked the fork point up again instead of replaying its checkpoint"
     );
 }
 
@@ -5061,7 +5317,7 @@ async fn a_fork_sees_the_event_values_as_of_its_start_step() {
         forked_id: Some("wf-events-fork"),
         start_step: 2,
     }];
-    sys.fork_workflows(&forks, &ForkOptions::default())
+    sys.fork_workflows(&forks, &ForkOptions::default(), None)
         .await
         .unwrap();
 
@@ -5098,7 +5354,10 @@ async fn forking_a_missing_workflow_writes_nothing() {
             start_step: 1,
         },
     ];
-    match sys.fork_workflows(&forks, &ForkOptions::default()).await {
+    match sys
+        .fork_workflows(&forks, &ForkOptions::default(), None)
+        .await
+    {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
             assert_eq!(workflow_ids, ["wf-absent"], "names which one is missing")
         }
@@ -5128,6 +5387,7 @@ async fn a_fork_can_have_its_id_generated_and_its_placement_chosen() {
                 timeout: Some(std::time::Duration::from_secs(30)),
                 replacement_children: &[],
             },
+            None,
         )
         .await
         .unwrap();
@@ -5176,7 +5436,9 @@ async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
             },
         ),
     ] {
-        let result = sys.fork_workflows(&[Fork::new("wf-blank")], &options).await;
+        let result = sys
+            .fork_workflows(&[Fork::new("wf-blank")], &options, None)
+            .await;
         match result {
             Err(Error::InvalidInput { field: f, .. }) => assert_eq!(f, field),
             other => panic!("expected {field} to be refused, got {other:?}"),
@@ -5192,6 +5454,7 @@ async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
                 start_step: 0,
             }],
             &ForkOptions::default(),
+            None,
         )
         .await;
     assert!(matches!(
@@ -5226,6 +5489,7 @@ async fn replacing_one_child_twice_is_refused() {
                 replacement_children: &[("child", "fork-a"), ("child", "fork-b")],
                 ..ForkOptions::default()
             },
+            None,
         )
         .await;
     match result {
@@ -5253,6 +5517,7 @@ async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
                 timeout: Some(std::time::Duration::MAX),
                 ..ForkOptions::default()
             },
+            None,
         )
         .await;
     assert!(
@@ -5301,12 +5566,13 @@ async fn a_fork_can_rewrite_the_children_it_replays() {
             replacement_children: &[("child-original", "child-forked")],
             ..ForkOptions::default()
         },
+        None,
     )
     .await
     .unwrap();
 
     let steps = sys
-        .list_workflow_steps("wf-parent-fork", true, None, None)
+        .list_workflow_steps("wf-parent-fork", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(steps.len(), 2, "both steps came across");
@@ -5363,6 +5629,7 @@ async fn forking_from_the_failure_restarts_at_the_failed_step() {
             &["wf-failed"],
             ForkPoint::LastFailure,
             &ForkOptions::default(),
+            None,
         )
         .await
         .unwrap();
@@ -5370,7 +5637,7 @@ async fn forking_from_the_failure_restarts_at_the_failed_step() {
     // Step 1 failed, so the fork starts there: only step 0 comes across, and the fork will run
     // the failing step again.
     let steps = sys
-        .list_workflow_steps(&ids[0], true, None, None)
+        .list_workflow_steps(&ids[0], true, None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -5410,11 +5677,12 @@ async fn forking_from_the_failure_of_a_workflow_that_never_failed_uses_its_last_
             &["wf-clean"],
             ForkPoint::LastFailure,
             &ForkOptions::default(),
+            None,
         )
         .await
         .unwrap();
     let steps = sys
-        .list_workflow_steps(&ids[0], true, None, None)
+        .list_workflow_steps(&ids[0], true, None, None, None)
         .await
         .unwrap();
     assert_eq!(steps.len(), 1, "resumes at step 1, so only step 0 replays");
@@ -5433,11 +5701,11 @@ async fn each_fork_point_resolves_to_its_own_step() {
         (ForkPoint::Step(0), 0),             // nothing replays
     ] {
         let ids = sys
-            .fork_from(&["wf-points"], point, &ForkOptions::default())
+            .fork_from(&["wf-points"], point, &ForkOptions::default(), None)
             .await
             .unwrap();
         let steps = sys
-            .list_workflow_steps(&ids[0], true, None, None)
+            .list_workflow_steps(&ids[0], true, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -5463,6 +5731,7 @@ async fn forking_from_a_point_that_does_not_exist_is_refused() {
             &["wf-has-steps", "wf-no-steps"],
             ForkPoint::LastStep,
             &ForkOptions::default(),
+            None,
         )
         .await
     {
@@ -5482,6 +5751,7 @@ async fn forking_from_a_point_that_does_not_exist_is_refused() {
             &["wf-has-steps"],
             ForkPoint::StepNamed("refund"),
             &ForkOptions::default(),
+            None,
         )
         .await
     {
@@ -5497,10 +5767,13 @@ async fn forking_from_a_point_that_does_not_exist_is_refused() {
 
     // The workflow that did have a fork point was not forked either.
     let forks = sys
-        .list_workflows(&dbos::sysdb::types::WorkflowFilter {
-            forked_from: vec!["wf-has-steps"],
-            ..Default::default()
-        })
+        .list_workflows(
+            &dbos::sysdb::types::WorkflowFilter {
+                forked_from: vec!["wf-has-steps"],
+                ..Default::default()
+            },
+            None,
+        )
         .await
         .unwrap();
     assert!(forks.is_empty(), "a refused batch forks nothing");
@@ -5549,6 +5822,7 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
             &["wf-alpha", "wf-beta"],
             ForkPoint::LastFailure,
             &ForkOptions::default(),
+            None,
         )
         .await
         .unwrap();
@@ -5564,11 +5838,11 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
 
     // wf-alpha failed at step 1, so only step 0 replays; wf-beta failed at 3, so 0..=2 do.
     let alpha_steps = sys
-        .list_workflow_steps(&ids[0], true, None, None)
+        .list_workflow_steps(&ids[0], true, None, None, None)
         .await
         .unwrap();
     let beta_steps = sys
-        .list_workflow_steps(&ids[1], true, None, None)
+        .list_workflow_steps(&ids[1], true, None, None, None)
         .await
         .unwrap();
     assert_eq!(alpha_steps.len(), 1, "wf-alpha resumes at its own step 1");
@@ -5726,7 +6000,7 @@ async fn a_replayed_send_does_not_send_again() {
         "the replay should have found the step recorded and sent nothing"
     );
     let steps = sys
-        .list_workflow_steps("wf-sender", true, None, None)
+        .list_workflow_steps("wf-sender", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(steps.len(), 1);
@@ -5784,12 +6058,12 @@ async fn a_message_can_follow_a_workflow_to_its_forks() {
 
     // A fork, and a fork of that fork: the walk must reach both.
     let child = sys
-        .fork_workflows(&[Fork::new("wf-root")], &ForkOptions::default())
+        .fork_workflows(&[Fork::new("wf-root")], &ForkOptions::default(), None)
         .await
         .unwrap()
         .remove(0);
     let grandchild = sys
-        .fork_workflows(&[Fork::new(&child)], &ForkOptions::default())
+        .fork_workflows(&[Fork::new(&child)], &ForkOptions::default(), None)
         .await
         .unwrap()
         .remove(0);
@@ -5851,7 +6125,7 @@ async fn sending_no_messages_still_records_the_step() {
         .unwrap();
 
     let steps = sys
-        .list_workflow_steps("wf-empty", true, None, None)
+        .list_workflow_steps("wf-empty", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(steps.len(), 1, "the step id must not be left unoccupied");
@@ -5864,7 +6138,7 @@ async fn sending_no_messages_still_records_the_step() {
         .await
         .unwrap();
     assert_eq!(
-        sys.list_workflow_steps("wf-empty", true, None, None)
+        sys.list_workflow_steps("wf-empty", true, None, None, None)
             .await
             .unwrap()
             .len(),
@@ -5874,7 +6148,7 @@ async fn sending_no_messages_still_records_the_step() {
     // With no step to record either, there is nothing to do and nothing is written.
     sys.send_messages(&[], None, None, false).await.unwrap();
     assert_eq!(
-        sys.list_workflow_steps("wf-empty", true, None, None)
+        sys.list_workflow_steps("wf-empty", true, None, None, None)
             .await
             .unwrap()
             .len(),
@@ -5915,7 +6189,7 @@ async fn the_recorded_step_name_follows_the_batch_size() {
     .unwrap();
 
     let steps = sys
-        .list_workflow_steps("wf-namer", true, None, None)
+        .list_workflow_steps("wf-namer", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -6276,7 +6550,7 @@ async fn a_replayed_stream_write_does_not_append_again() {
         1
     );
     let steps = sys
-        .list_workflow_steps("wf-replay", true, None, None)
+        .list_workflow_steps("wf-replay", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(steps.len(), 1);
@@ -6305,7 +6579,7 @@ async fn a_write_from_inside_a_step_records_nothing_of_its_own() {
         3
     );
     assert!(
-        sys.list_workflow_steps("wf-instep", true, None, None)
+        sys.list_workflow_steps("wf-instep", true, None, None, None)
             .await
             .unwrap()
             .is_empty(),
@@ -6337,7 +6611,7 @@ async fn closing_a_stream_appends_the_sentinel() {
 
     // Recorded as a close, which is what tells a replay it was closing rather than writing.
     let steps = sys
-        .list_workflow_steps("wf-close", true, None, None)
+        .list_workflow_steps("wf-close", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -6535,6 +6809,7 @@ async fn a_fork_inherits_its_sources_application() {
             },
         ],
         &ForkOptions::default(),
+        None,
     )
     .await
     .unwrap();
@@ -6661,7 +6936,7 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     // A search: alpha's own, plus the unclaimed.
     assert_eq!(
         ids(alpha
-            .list_workflows(&WorkflowFilter::default())
+            .list_workflows(&WorkflowFilter::default(), None)
             .await
             .unwrap()),
         ["wf-alpha", "wf-nobody"],
@@ -6670,10 +6945,13 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     // Said out loud: everyone's.
     assert_eq!(
         ids(alpha
-            .list_workflows(&WorkflowFilter {
-                applications: Applications::Any,
-                ..WorkflowFilter::default()
-            })
+            .list_workflows(
+                &WorkflowFilter {
+                    applications: Applications::Any,
+                    ..WorkflowFilter::default()
+                },
+                None
+            )
             .await
             .unwrap()),
         ["wf-alpha", "wf-beta", "wf-nobody"],
@@ -6682,10 +6960,13 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     // Named: that application's, plus the unclaimed.
     assert_eq!(
         ids(alpha
-            .list_workflows(&WorkflowFilter {
-                applications: Applications::Named(vec!["beta"]),
-                ..WorkflowFilter::default()
-            })
+            .list_workflows(
+                &WorkflowFilter {
+                    applications: Applications::Named(vec!["beta"]),
+                    ..WorkflowFilter::default()
+                },
+                None
+            )
             .await
             .unwrap()),
         ["wf-beta", "wf-nobody"],
@@ -6694,10 +6975,13 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     // An id is an address: alpha asks for beta's workflow by id and gets it.
     assert_eq!(
         ids(alpha
-            .list_workflows(&WorkflowFilter {
-                workflow_ids: vec!["wf-beta"],
-                ..WorkflowFilter::default()
-            })
+            .list_workflows(
+                &WorkflowFilter {
+                    workflow_ids: vec!["wf-beta"],
+                    ..WorkflowFilter::default()
+                },
+                None
+            )
             .await
             .unwrap()),
         ["wf-beta"],
@@ -6706,10 +6990,13 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     // A prefix is a search, not an address, so it stays scoped.
     assert_eq!(
         ids(alpha
-            .list_workflows(&WorkflowFilter {
-                workflow_id_prefixes: vec!["wf-"],
-                ..WorkflowFilter::default()
-            })
+            .list_workflows(
+                &WorkflowFilter {
+                    workflow_id_prefixes: vec!["wf-"],
+                    ..WorkflowFilter::default()
+                },
+                None
+            )
             .await
             .unwrap()),
         ["wf-alpha", "wf-nobody"],
@@ -6718,7 +7005,7 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     // And a nameless handle has nothing to scope to, so its default search sees everything.
     assert_eq!(
         ids(anonymous
-            .list_workflows(&WorkflowFilter::default())
+            .list_workflows(&WorkflowFilter::default(), None)
             .await
             .unwrap()),
         ["wf-alpha", "wf-beta", "wf-nobody"],
@@ -6783,7 +7070,7 @@ async fn releasing_delayed_workflows_stays_within_an_application() {
         sys.init_workflow(&wf, None, Submission::Fresh)
             .await
             .unwrap();
-        sys.set_workflow_delay(id, WorkflowDelay::Until(Timestamp::from_epoch_ms(1)))
+        sys.set_workflow_delay(id, WorkflowDelay::Until(Timestamp::from_epoch_ms(1)), None)
             .await
             .unwrap();
     }
@@ -9893,7 +10180,7 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     // Four steps for four ids, and nothing from the calls that passed no caller — a `None` is not
     // a step at some other position, it is no step at all.
     let steps = sys
-        .list_workflow_steps("wf-caller", true, None, None)
+        .list_workflow_steps("wf-caller", true, None, None, None)
         .await
         .unwrap();
     let names: Vec<&str> = steps.iter().map(|s| s.step_name.as_str()).collect();
@@ -10329,7 +10616,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
 
     // Recorded as a step, so a replay has something to read.
     let steps = sys
-        .list_workflow_steps("wf-caller", true, None, None)
+        .list_workflow_steps("wf-caller", true, None, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -10344,6 +10631,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
     sys.set_workflow_delay(
         "wf-debounced",
         WorkflowDelay::Until(Timestamp::from_epoch_ms(1)),
+        None,
     )
     .await
     .unwrap();

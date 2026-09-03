@@ -34,7 +34,17 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 ///
 /// Exactly what the columns hold, so reading and writing are lossless.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub struct Timestamp(i64);
 
@@ -186,7 +196,14 @@ pub fn duration_from_secs(secs: f64) -> Option<Duration> {
 ///
 /// Stored as text and shared with every other DBOS implementation, so the spellings are a wire
 /// format rather than an internal choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The serde representation is those same spellings, which is what the rename on the derive is
+/// for: a status that round-trips through a checkpoint — see [`DBOS::list_workflows`] — must
+/// come back as what [`as_str`](Self::as_str) would have written.
+///
+/// [`DBOS::list_workflows`]: crate::DBOS::list_workflows
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WorkflowStatus {
     /// Claimed by an executor and running.
     Pending,
@@ -261,48 +278,81 @@ impl fmt::Display for WorkflowStatus {
 /// was not, which is the kind of loss this layer should report rather than absorb.
 ///
 /// Every payload field holds encoded text — see the module documentation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` because a listing made from inside a workflow is checkpointed and
+/// replays from what it recorded, so the rows have to round-trip. No other implementation reads
+/// that encoding — it is the engine talking to its own replay.
+///
+/// **It is still a stored format, and the build that reads it is rarely the one that wrote it.**
+/// A workflow checkpoints a listing on one deployment and replays it on the next, which is the
+/// ordinary case rather than the exotic one — recovery after a deploy, and forking onto fixed
+/// code, both land there. So **every field here carries `#[serde(default)]`** bar the two the
+/// schema declares `NOT NULL` and this layer always writes, and a field added later must carry it
+/// too. Without it, adding a column — this struct mirrors `workflow_status`, which gains them —
+/// makes an older checkpoint unreadable, and `run_transactional_step` reports that as
+/// [`Error::Malformed`]: not a retryable class, raised on the
+/// replay path, so the workflow can never get past that step. Unknown fields are already
+/// tolerated, `serde` ignoring them by default, so the reverse direction needs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowRecord {
     /// Primary key, and the identity a caller uses everywhere else.
     pub workflow_id: String,
     /// Lifecycle state.
     pub status: WorkflowStatus,
     /// Registered function name. Nullable in the schema, so nullable here.
+    #[serde(default)]
     pub name: Option<String>,
     /// The type the function belongs to, for a method or a configured instance.
+    #[serde(default)]
     pub class_name: Option<String>,
     /// The configured instance, if any.
+    #[serde(default)]
     pub config_name: Option<String>,
     /// Encoded input, in whatever format `serialization` names.
+    #[serde(default)]
     pub input: Option<String>,
     /// Encoded output, present once the workflow succeeds.
+    #[serde(default)]
     pub output: Option<String>,
     /// Encoded error, present once the workflow fails.
+    #[serde(default)]
     pub error: Option<String>,
     /// Which format the payloads above are in. `None` on rows written before the column
     /// existed, which means the writer's own default.
+    #[serde(default)]
     pub serialization: Option<String>,
     /// The executor that most recently claimed this workflow.
+    #[serde(default)]
     pub executor_id: Option<String>,
     /// Application version that created it, used to keep recovery on compatible code.
+    #[serde(default)]
     pub application_version: Option<String>,
     /// Recovery attempts so far, against the dead-letter limit.
+    #[serde(default)]
     pub recovery_attempts: i64,
     /// Queue this workflow was enqueued on, if it was.
+    #[serde(default)]
     pub queue_name: Option<String>,
     /// When the row was created.
+    #[serde(default)]
     pub created_at: Timestamp,
     /// When the row last changed.
+    #[serde(default)]
     pub updated_at: Timestamp,
     /// When execution began, if it has.
+    #[serde(default)]
     pub started_at: Option<Timestamp>,
     /// When the workflow reached a terminal state.
+    #[serde(default)]
     pub completed_at: Option<Timestamp>,
     /// The workflow that forked this one, if any.
+    #[serde(default)]
     pub forked_from: Option<String>,
     /// The workflow that started this one as a child, if any.
+    #[serde(default)]
     pub parent_workflow_id: Option<String>,
     /// Whether this workflow has been forked from at least once.
+    #[serde(default)]
     pub was_forked_from: bool,
 
     // ── Ownership and attribution ──────────────────────────────────────────────
@@ -310,41 +360,53 @@ pub struct WorkflowRecord {
     ///
     /// The single-execution guard: distinct per attempt, unlike `executor_id`, which defaults
     /// to `"local"` and collides between processes on one machine.
+    #[serde(default)]
     pub owner_xid: Option<String>,
     /// Deployment identifier, for installations running several applications.
+    #[serde(default)]
     pub application_id: Option<String>,
     /// User on whose behalf the workflow runs.
+    #[serde(default)]
     pub authenticated_user: Option<String>,
     /// Roles that user holds.
     ///
     /// Decoded from the column's JSON array, which this layer owns — see
     /// [`NewWorkflow::authenticated_roles`]. A NULL column reads as empty.
+    #[serde(default)]
     pub authenticated_roles: Vec<String>,
     /// Role actually assumed for this execution.
+    #[serde(default)]
     pub assumed_role: Option<String>,
     /// Request context captured at creation.
+    #[serde(default)]
     pub request: Option<String>,
     /// The application that owns this workflow, or `None` if it is unclaimed.
     ///
     /// Unclaimed means no application has taken it — a row written before any implementation
     /// supported ownership, or by a handle with no application of its own. Every application may
     /// run it, and the first to dequeue it claims it.
+    #[serde(default)]
     pub application_name: Option<String>,
 
     // ── Queueing ───────────────────────────────────────────────────────────────
     /// Deduplication key within the queue. At most one live workflow may hold a given key.
+    #[serde(default)]
     pub deduplication_id: Option<String>,
     /// Dequeue priority; lower runs sooner.
     ///
     /// `i32` and not optional, mirroring `INT4 NOT NULL DEFAULT 0`. Widening to `i64` would let
     /// values round-trip through a type the column cannot hold, and making it optional would
     /// invite writing a NULL the column rejects.
+    #[serde(default)]
     pub priority: i32,
     /// Partition this workflow belongs to, on a partitioned queue.
+    #[serde(default)]
     pub queue_partition_key: Option<String>,
     /// Whether a rate limiter is currently holding this workflow back.
+    #[serde(default)]
     pub rate_limited: bool,
     /// Schedule that enqueued this workflow, if a schedule did.
+    #[serde(default)]
     pub schedule_name: Option<String>,
 
     // ── Timing ─────────────────────────────────────────────────────────────────
@@ -352,14 +414,19 @@ pub struct WorkflowRecord {
     ///
     /// A **duration**, unlike `deadline` below, which is an instant. The two are adjacent
     /// columns and mean different things: this is a budget, that is a wall-clock cutoff.
+    #[serde(default)]
     pub timeout: Option<Duration>,
     /// Wall-clock instant the workflow must finish by.
+    #[serde(default)]
     pub deadline: Option<Timestamp>,
     /// Instant before which the workflow must not be dequeued.
+    #[serde(default)]
     pub delay_until: Option<Timestamp>,
     /// Cap past which a debounce may not push the delay any further.
+    #[serde(default)]
     pub debounce_deadline: Option<Timestamp>,
     /// Whether the deduplication id is a debounce key, cleared on DELAYED to ENQUEUED.
+    #[serde(default)]
     pub is_debounced: bool,
 
     // ── Caller-supplied metadata ───────────────────────────────────────────────
@@ -367,6 +434,7 @@ pub struct WorkflowRecord {
     ///
     /// Opaque here like every other payload: this layer stores and returns the text and does
     /// not parse it, even though the column is `jsonb` and is queried by containment.
+    #[serde(default)]
     pub attributes: Option<String>,
 }
 
@@ -951,7 +1019,14 @@ impl Default for WorkflowFilter<'_> {
 /// distinction, and the reason is that "function" is what these were called before steps had a
 /// name of their own — the columns cannot be renamed without a migration every SDK must agree
 /// on, but the Rust API need not inherit the old word.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde-able for the same reason as [`WorkflowRecord`], and `#[serde(default)]` per field for
+/// the same reason too: a step listing taken from inside a workflow is itself a checkpointed
+/// step, replays from what it recorded, and the build that reads the record is rarely the one
+/// that wrote it. The exemptions here are the primary key and the name a replay matches on —
+/// defaulting those would let a record this build cannot fully read pass as step 0 of a step
+/// with no name, which is worse than reporting it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StepRecord {
     /// The workflow the step belongs to.
     pub workflow_id: String,
@@ -962,20 +1037,26 @@ pub struct StepRecord {
     /// The registered step name, checked on replay. Column `function_name`.
     pub step_name: String,
     /// Encoded return value, if the step returned one.
+    #[serde(default)]
     pub output: Option<String>,
     /// Encoded error, if the step raised one. Never set alongside `output`.
+    #[serde(default)]
     pub error: Option<String>,
     /// The workflow this step started, for steps that are child-workflow calls.
+    #[serde(default)]
     pub child_workflow_id: Option<String>,
     /// How `output` and `error` are encoded.
+    #[serde(default)]
     pub serialization: Option<String>,
     /// When the step began.
+    #[serde(default)]
     pub started_at: Option<Timestamp>,
     /// When the step finished.
     ///
     /// Also the tie-breaker on a duplicate record: a second write carrying a *different*
     /// completion time is another executor, while one carrying the same is this caller's own
     /// retry. See [`SystemDatabase::record_step`](crate::sysdb::SystemDatabase::record_step).
+    #[serde(default)]
     pub completed_at: Option<Timestamp>,
 }
 
@@ -1105,6 +1186,13 @@ pub struct StepTiming {
     /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
     /// than building it at the call site inside a retry loop.
     ///
+    /// **A step recorded on the same transaction that checked for it is the exception**, and
+    /// `run_transactional_step` is the one that does: an attempt whose commit was acknowledged to
+    /// nobody is caught by the check on the next attempt and replayed, so it never reaches the
+    /// insert. Only a genuine rival survives to be compared there, and a completion that differs
+    /// from this attempt's is the right answer rather than a spurious one — which is why that
+    /// path stamps the clock after its work rather than before it.
+    ///
     /// Omitting the timing altogether gives up that detection: with no recorded completion there
     /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
     /// behaves the same way, guarding its comparison with `if (endTimeEpochMs != null)`.
@@ -1143,8 +1231,13 @@ pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error>
 pub enum WorkflowDelay {
     /// Wait this long from now.
     ///
-    /// Resolved against the database layer's clock, for the same reason
-    /// [`NewWorkflow::delay`] is: the caller's skew should not reach the row.
+    /// Resolved by the system database layer rather than by the caller, for the same reason
+    /// [`NewWorkflow::delay`] is a duration: `now + delay` computed at a call site is one more
+    /// place for the two to disagree.
+    ///
+    /// The clock is **this process's**, not the database's, which leaves the stamp out by whatever
+    /// this host and the releasing supervisor's disagree by — UPSTREAM item 22, shared with all
+    /// four implementations.
     For(Duration),
     /// Wait until this instant.
     Until(Timestamp),
@@ -2203,6 +2296,56 @@ pub mod step_names {
     /// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
     /// only crosses one by enqueue, so this is a convention rather than a wire format.
     pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
+
+    /// The step names the management surface records, which a replay compares against.
+    ///
+    /// Every one of these is written by a management call made *from inside a workflow* —
+    /// [`DBOS::cancel`](crate::DBOS::cancel) and its neighbours — and is what another execution
+    /// of that workflow looks the recorded answer up by. Four are unanimous across the
+    /// implementations: `resumeWorkflow`, `setWorkflowDelay`, `listWorkflows` and
+    /// `forkWorkflow`. The rest are worth their reasons.
+    ///
+    /// **The singular name covers the bulk form too.** Python, TypeScript and Java record the
+    /// singular whatever the batch size; Go pluralizes, and inconsistently — `DBOS.cancelWorkflow`
+    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one.
+    /// Three of four decides it, and one name per operation is worth having on its own: the
+    /// singular forms here *are* the bulk ones with a single id, so a workflow that switches
+    /// between [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all)
+    /// between runs still replays instead of raising [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
+    ///
+    /// **[`LIST_WORKFLOW_STEPS`] follows the three, not Go**, which records
+    /// `DBOS.getWorkflowSteps` where Python, TypeScript and Java all say `listWorkflowSteps`.
+    ///
+    /// **[`UPDATE_WORKFLOW_ATTRIBUTES`] is what Go's method records, not what it is called**: Go
+    /// spells the method `SetWorkflowAttributes` and the step `DBOS.updateWorkflowAttributes`, so
+    /// the step name is the half Python and Java agree with. TypeScript has no attributes method
+    /// at all.
+    ///
+    /// **There is no `DBOS.listQueuedWorkflows`.** Python and TypeScript record one because they
+    /// have a second entry point for it; here
+    /// [`WorkflowFilter::queues_only`](super::WorkflowFilter::queues_only) is that method, so a
+    /// queues-only listing records [`LIST_WORKFLOWS`] like any other.
+    ///
+    /// **Nothing names a retrieve.** Python and Go check the row and so record `DBOS.getStatus`
+    /// and `DBOS.retrieveWorkflow`; [`retrieve_workflow`](crate::DBOS::retrieve_workflow) does no
+    /// I/O, and a call that reads nothing has nothing to replay.
+    ///
+    /// All of these are recorded from down here rather than by the engine, because each
+    /// checkpoint commits in the same transaction as the operation it records — see
+    /// [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    ///
+    /// **[`FORK_WORKFLOW`] covers every fork point.** Java splits its from-failure batch out as
+    /// `DBOS.forkFromFailure`; Go keeps one name whatever the fork point, and so does this,
+    /// because [`fork_from`](crate::sysdb::SystemDatabase::fork_from) resolves all four
+    /// [`ForkPoint`](super::ForkPoint)s through one method.
+    pub const CANCEL_WORKFLOW: &str = "DBOS.cancelWorkflow";
+    pub const RESUME_WORKFLOW: &str = "DBOS.resumeWorkflow";
+    pub const DELETE_WORKFLOW: &str = "DBOS.deleteWorkflow";
+    pub const FORK_WORKFLOW: &str = "DBOS.forkWorkflow";
+    pub const SET_WORKFLOW_DELAY: &str = "DBOS.setWorkflowDelay";
+    pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.updateWorkflowAttributes";
+    pub const LIST_WORKFLOWS: &str = "DBOS.listWorkflows";
+    pub const LIST_WORKFLOW_STEPS: &str = "DBOS.listWorkflowSteps";
 
     /// The step names the schedule methods record, which a replay compares against.
     ///

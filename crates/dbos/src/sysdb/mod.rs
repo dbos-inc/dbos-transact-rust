@@ -124,7 +124,15 @@ pub trait SystemDatabase: Send + Sync {
     /// This is one query with every filter folded into its `WHERE` clause, not a scan the caller
     /// narrows. `WorkflowFilter::default()` therefore returns the whole table, and callers that
     /// mean to page should say so with [`WorkflowFilter::limit`].
-    async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error>;
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// read and its step checkpoint **commit together**, so what a replay reads back is exactly
+    /// the snapshot the first execution saw — see [`fork_workflows`](Self::fork_workflows).
+    async fn list_workflows(
+        &self,
+        filter: &WorkflowFilter<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Vec<WorkflowRecord>, Error>;
 
     /// Every workflow descended from this one, at any depth.
     ///
@@ -241,10 +249,16 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Only touches a `DELAYED` row. A workflow that has already been released is running or
     /// queued, and pushing its delay out would not recall it.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together** — see
+    /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
+    /// surface takes it.
     async fn set_workflow_delay(
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
+        caller: Option<(&str, i32)>,
     ) -> Result<(), Error>;
 
     /// Puts a running workflow back on its queue, reporting whether it moved.
@@ -256,10 +270,16 @@ pub trait SystemDatabase: Send + Sync {
     /// Replaces a workflow's attributes. `None` clears them.
     ///
     /// A replacement rather than a merge, matching every implementation.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together** — see
+    /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
+    /// surface takes it.
     async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
         attributes: Option<&str>,
+        caller: Option<(&str, i32)>,
     ) -> Result<(), Error>;
 
     /// Returns this executor's abandoned workflows to a queue, so any peer may run them.
@@ -321,10 +341,34 @@ pub trait SystemDatabase: Send + Sync {
     /// trip rather than one per level, but it walks the tree while every workflow in it is still
     /// running, so a child spawned during the walk is missed. Python and Java both interleave,
     /// and this follows them.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together** — see
+    /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
+    /// surface takes it.
+    ///
+    /// **The cascade is one transaction, which buys atomicity and not exclusion.** A failure
+    /// partway through leaves the tree untouched rather than half-cancelled — that is the part it
+    /// buys. It does not stop a child being spawned behind the walk: at READ COMMITTED these
+    /// writes are invisible to the workflows they cancel until the commit, and nothing constrains
+    /// `parent_workflow_id`, so a parent that has not yet learned it is cancelled can commit a new
+    /// child after the walk has read its level. That child keeps running.
+    ///
+    /// What bounds the window is the interleaving: each level is read after the level above it is
+    /// written, so the deeper the tree the later the last read, and a child committed before that
+    /// read is caught. Only the commit actually stops a parent, at its next step boundary.
+    ///
+    /// **Python and Java get more from the same order than this does**, and the difference is the
+    /// transaction. Python commits each level (`_sys_db.py:1129`, a `with self.engine.begin()` per
+    /// level, its child reads outside any transaction), so a parent reading its own status between
+    /// levels finds `CANCELLED` and stops spawning mid-walk. Wrapping the cascade to commit it with
+    /// the step checkpoint — which is what this whole surface does — trades that visibility for
+    /// atomicity. Worth knowing before treating either half as free.
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error>;
 
     /// Re-enqueues workflows, returning the ids that actually moved.
@@ -339,6 +383,11 @@ pub trait SystemDatabase: Send + Sync {
     /// that was mistyped should say so rather than silently do nothing. Python draws the same
     /// line, and for the same reason.
     ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together** — see
+    /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
+    /// surface takes it.
+    ///
     /// TODO(dbos-team): UPSTREAM item 27. The only guard is that the row is not terminal, which is
     /// the predicate all five share — so `PENDING` passes, and resuming a workflow that is
     /// executing right now re-enqueues it underneath its own execution. The next sweep claims the
@@ -351,6 +400,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error>;
 
     /// Deletes workflows and everything hanging off them.
@@ -359,8 +409,10 @@ pub trait SystemDatabase: Send + Sync {
     /// `ON DELETE CASCADE` on every child table, so one `DELETE` is the whole operation.
     ///
     /// Unlike [`cancel_workflows`](Self::cancel_workflows), the descendants are collected first
-    /// and deleted in one statement rather than level by level. Cancelling interleaves so a
-    /// parent cannot spawn behind the walk; a deleted parent cannot spawn at all.
+    /// and deleted in one statement rather than level by level: the cascade does the work that
+    /// cancelling needs a statement per level for. Interleaving would buy nothing here, because
+    /// what stops a parent spawning is the delete itself, and that is one statement whichever
+    /// order the tree was read in.
     ///
     /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
     /// Go have it, and this follows them.
@@ -380,10 +432,25 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Takes `&[&str]` rather than `&[String]`, as the other bulk methods do: a caller holding
     /// owned ids converts by copying pointers, where the reverse would allocate.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// write and its step checkpoint **commit together** — see
+    /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
+    /// surface takes it.
+    ///
+    /// The descendants are collected *before* the transaction, unlike
+    /// [`cancel_workflows`](Self::cancel_workflows)'s cascade, because there is no race a
+    /// transaction could close: a parent stops spawning when its row goes, which is after the
+    /// walk rather than during it, and moving the walk inside would not change that at READ
+    /// COMMITTED. A child committed between the walk and the delete survives its parent, with
+    /// `parent_workflow_id` naming a row that is gone — nothing constrains that column. Deleting
+    /// a tree that is still running is inherently that: [`cancel_workflows`](Self::cancel_workflows)
+    /// first is what makes it a tree that has stopped.
     async fn delete_workflows(
         &self,
         workflow_ids: &[&str],
         delete_children: bool,
+        caller: Option<(&str, i32)>,
     ) -> Result<u64, Error>;
 
     /// Forks workflows, each resuming from its own start step.
@@ -415,10 +482,25 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Fails with [`Error::NonExistentWorkflow`] if any source is missing, and writes nothing —
     /// a partially applied batch would leave forks whose siblings never existed.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing the forking. Given
+    /// one, the forks and their step checkpoint **commit together**, and a replay returns the ids
+    /// the first run generated rather than forking again. That atomicity matters more here than
+    /// anywhere else on the management surface: a fork's id is generated by the call, so a replay
+    /// that found no checkpoint would write a *second* fork under a second id and run the work
+    /// twice. Cancelling or deleting the same workflow twice reaches the same end state; forking
+    /// it twice does not.
+    ///
+    /// **This is ahead of the references.** All four route their management calls through a
+    /// non-transactional step wrapper — Python's `call_function_as_step`, TypeScript's
+    /// `runInternalStep`, Go's `RunAsStep`, Java's `runDbosFunctionAsStep` — which leaves exactly
+    /// that window open. TypeScript has the transactional variant and spends it on schedules;
+    /// this crate has it too, and spends it here as well.
     async fn fork_workflows(
         &self,
         forks: &[Fork<'_>],
         options: &ForkOptions<'_>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error>;
 
     /// Forks workflows from a step this works out for each of them.
@@ -436,11 +518,18 @@ pub trait SystemDatabase: Send + Sync {
     /// Fails with [`Error::NoForkPoint`] if any workflow has nothing at the point asked for, and
     /// writes nothing. [`ForkPoint::Step`] is exempt: it names a position directly, so there is
     /// nothing to look up and nothing to be missing.
+    ///
+    /// `caller` works as it does on [`fork_workflows`](Self::fork_workflows), and covers the
+    /// lookup as well as the write: the resolve runs inside the same transaction, so a replay
+    /// never asks where the fork point was. That is what lets a replayed fork answer for a source
+    /// whose steps have since been deleted — the recorded ids are the answer, and nothing is
+    /// looked up to produce them.
     async fn fork_from(
         &self,
         workflow_ids: &[&str],
         point: ForkPoint<'_>,
         options: &ForkOptions<'_>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error>;
 
     /// Delivers messages to workflows, in one transaction.
@@ -633,12 +722,17 @@ pub trait SystemDatabase: Send + Sync {
     /// `load_output` off leaves `output` and `error` `None`, as on
     /// [`WorkflowFilter`] and with the same caveat: absent and
     /// not-asked-for look identical.
+    ///
+    /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
+    /// read and its step checkpoint **commit together**, so what a replay reads back is exactly
+    /// the snapshot the first execution saw — see [`fork_workflows`](Self::fork_workflows).
     async fn list_workflow_steps(
         &self,
         workflow_id: &str,
         load_output: bool,
         limit: Option<i64>,
         offset: Option<i64>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<StepRecord>, Error>;
 
     /// Checkpoints a durable sleep, returning the instant to wake at.

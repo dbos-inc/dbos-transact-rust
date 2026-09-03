@@ -524,11 +524,15 @@ async fn dispatch_claimed(
     let ids: Vec<&str> = claimed.iter().map(String::as_str).collect();
     let rows = match executor
         .sysdb()
-        .list_workflows(&WorkflowFilter {
-            workflow_ids: ids,
-            load_output: false,
-            ..WorkflowFilter::default()
-        })
+        .list_workflows(
+            &WorkflowFilter {
+                workflow_ids: ids,
+                load_output: false,
+                ..WorkflowFilter::default()
+            },
+            // The dequeue loop is nobody's step.
+            None,
+        )
         .await
     {
         Ok(rows) => rows,

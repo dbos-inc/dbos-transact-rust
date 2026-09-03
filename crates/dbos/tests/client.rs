@@ -286,7 +286,7 @@ async fn the_workflow_id_is_an_idempotency_key() {
 
     let rows = reader(&db)
         .await
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("list failed");
     assert_eq!(rows.len(), 1, "two enqueues, one workflow");

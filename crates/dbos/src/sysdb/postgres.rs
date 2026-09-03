@@ -619,6 +619,97 @@ fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
     }
 }
 
+/// Where a batch of forks starts, which is the only thing the two fork entry points disagree on.
+///
+/// [`Given`](Self::Given) is `fork_workflows`, whose caller states the step. [`Resolve`](Self::Resolve)
+/// is `fork_from`, which works it out from each source's own recorded history — and does so
+/// *inside* the fork's transaction, so the history a fork point comes from is the history the
+/// fork is written against, and so a replay looks nothing up at all.
+#[derive(Debug, Clone, Copy)]
+enum StartSteps<'a> {
+    /// One start step per source, in the same order.
+    Given(&'a [i32]),
+    /// The SQL that picks each source's step, and the step name it narrows to, if any.
+    Resolve {
+        aggregate: &'a str,
+        named: Option<&'a str>,
+    },
+}
+
+/// What a single-statement step's work runs on.
+///
+/// [`run_single_statement_step`](PostgresSystemDatabase::run_single_statement_step) needs a
+/// transaction only when there is a checkpoint to commit with the work; without one, a lone
+/// statement is atomic by itself and a `BEGIN`/`COMMIT` around it is two round trips for nothing.
+/// One carrier covers both so the work is written once.
+///
+/// **Carried by value rather than borrowed**, which is what lets the work be an ordinary
+/// `Fn(StepConn) -> Fut`: a closure handed `&mut PgConnection` cannot return a future that holds
+/// it across an await, because `Fut` is one type and the borrow is higher-ranked. Passing
+/// ownership in and handing it back is how [`with_retry`] and `#[async_trait]` get the `Send`
+/// future they need — the same reason
+/// [`run_transactional_step`](PostgresSystemDatabase::run_transactional_step) hands its
+/// transaction over. The [`DerefMut`](std::ops::DerefMut) is so a body reads the same either way:
+/// `&mut *conn` reaches the connection.
+enum StepConn {
+    /// No checkpoint to write, so no transaction to write it in.
+    Pooled(sqlx::pool::PoolConnection<sqlx::Postgres>),
+    /// The checkpoint and the statement share this, and commit together. Boxed because a
+    /// transaction is much the larger of the two.
+    Transactional(Box<sqlx::Transaction<'static, sqlx::Postgres>>),
+}
+
+impl std::ops::Deref for StepConn {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            StepConn::Pooled(conn) => conn,
+            StepConn::Transactional(tx) => tx,
+        }
+    }
+}
+
+impl std::ops::DerefMut for StepConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            StepConn::Pooled(conn) => conn,
+            StepConn::Transactional(tx) => tx,
+        }
+    }
+}
+
+/// What a replayed step hands back, decoded from the row that recorded it.
+///
+/// Only a success is ever recorded by the two step runners, so a step carrying an error is a row
+/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py:6420`);
+/// reporting beats asserting, but the expectation is identical.
+///
+/// A void method reaches here too, and does not trip the missing-output check: `()` serialises to
+/// the four-character string `null`, so the column holds a value rather than SQL NULL. Whether a
+/// step ran is answered by the row existing, never by its output being empty — which is also why
+/// `Option<T>` round-trips correctly, a recorded `None` and an absent step being the same JSON and
+/// different answers.
+fn replayed_output<T: serde::de::DeserializeOwned>(
+    step: &StepRecord,
+    workflow_id: &str,
+    step_id: i32,
+    step_name: &str,
+) -> Result<T, Error> {
+    tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
+    let recorded = step.output.as_deref().ok_or_else(|| {
+        Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
+        ))
+    })?;
+    serde_json::from_str(recorded).map_err(|e| {
+        Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} ({step_name}) has an output this build cannot \
+             read: {e}"
+        ))
+    })
+}
+
 impl PostgresSystemDatabase {
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
@@ -647,11 +738,24 @@ impl PostgresSystemDatabase {
     /// `work` takes the transaction by value and hands it back, rather than borrowing it. A
     /// borrowing closure cannot promise its future is `Send`, which every caller needs behind
     /// `#[async_trait]` — the same constraint [`with_retry`] documents.
+    ///
+    /// **`started_at` is the caller's and the completion is this function's.** Every caller sits
+    /// inside a [`with_retry`], so the start is read once outside it and the recorded duration
+    /// spans every attempt, as [`crate::step`] does for an ordinary step; the completion is read
+    /// here, once the work has actually finished. Taking a whole [`StepTiming`] invited the
+    /// caller to read the clock twice in a row and record a duration of nothing.
+    ///
+    /// [`StepTiming::completed_at`] is also the token that recognises a caller's own write after
+    /// a lost acknowledgement, and stamping it per attempt would break that — everywhere but
+    /// here. The check and the insert share one transaction, so an attempt that committed and
+    /// lost its acknowledgement is caught by `check_step_on` on the next attempt and replayed,
+    /// never reaching the insert. What survives to compare timestamps is a genuine rival, and
+    /// there a differing completion is the right answer.
     async fn run_transactional_step<T, F, Fut>(
         &self,
         caller: Option<(&str, i32)>,
         step_name: &str,
-        timing: StepTiming,
+        started_at: Timestamp,
         work: F,
     ) -> Result<T, Error>
     where
@@ -667,27 +771,7 @@ impl PostgresSystemDatabase {
                 .await?
         {
             tx.commit().await?;
-            tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
-            // Only a success is ever recorded here, so a step carrying an error is a row this
-            // path did not write. Python asserts the same thing at its own replay
-            // (`_sys_db.py:6420`); reporting beats asserting, but the expectation is identical.
-            //
-            // A void method reaches here too, and does not trip this: `()` serialises to the
-            // four-character string `null`, so the column holds a value rather than SQL NULL.
-            // Whether a step ran is answered by the row existing, never by its output being
-            // empty — which is also why `Option<T>` returns round-trip correctly, a recorded
-            // `None` and an absent step being the same JSON and different answers.
-            let recorded = step.output.as_deref().ok_or_else(|| {
-                Error::Malformed(format!(
-                    "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
-                ))
-            })?;
-            return serde_json::from_str(recorded).map_err(|e| {
-                Error::Malformed(format!(
-                    "workflow {workflow_id} step {step_id} ({step_name}) has an output this \
-                     build cannot read: {e}"
-                ))
-            });
+            return replayed_output(&step, workflow_id, step_id, step_name);
         }
 
         // A failure rolls the transaction back and records nothing, so the replay runs the work
@@ -698,24 +782,362 @@ impl PostgresSystemDatabase {
         let (mut tx, value) = work(tx).await?;
 
         if let Some((workflow_id, step_id)) = caller {
-            // `serde_json` only fails here on a type that cannot be JSON — a non-string map key,
-            // a NaN — and every payload this takes is a plain record.
-            let recorded = serde_json::to_string(&value)
-                .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
-            self.record_step_on(
-                &mut tx,
-                workflow_id,
-                step_id,
-                step_name,
-                Outcome::Output(Some(&recorded)),
-                Some(PORTABLE_JSON),
-                Some(timing),
-                None,
-            )
-            .await?;
+            self.record_step_output(&mut tx, workflow_id, step_id, step_name, &value, started_at)
+                .await?;
         }
         tx.commit().await?;
         Ok(value)
+    }
+
+    /// Writes the checkpoint for a step that has just done its work.
+    ///
+    /// Shared by [`run_transactional_step`](Self::run_transactional_step) and
+    /// [`run_single_statement_step`](Self::run_single_statement_step), which differ in what they
+    /// run the work on and not in what they record.
+    async fn record_step_output<T: serde::Serialize>(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        value: &T,
+        started_at: Timestamp,
+    ) -> Result<(), Error> {
+        // `serde_json` only fails here on a type that cannot be JSON — a non-string map key, a
+        // NaN — and every payload this takes is a plain record.
+        let recorded = serde_json::to_string(value)
+            .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
+        self.record_step_on(
+            conn,
+            workflow_id,
+            step_id,
+            step_name,
+            Outcome::Output(Some(&recorded)),
+            Some(PORTABLE_JSON),
+            // Read here rather than taken from the caller: the work above has run, so this is
+            // when the step finished rather than when it was about to start.
+            Some(StepTiming {
+                started_at,
+                completed_at: Timestamp::now(),
+            }),
+            None,
+        )
+        .await
+    }
+
+    /// [`run_transactional_step`](Self::run_transactional_step) for work that is **one
+    /// statement**.
+    ///
+    /// The same three steps and the same guarantees, with one difference: given no `caller` there
+    /// is no checkpoint to commit alongside the work, and a lone statement is already atomic, so
+    /// it runs on a pooled connection rather than in a transaction of its own. That is two round
+    /// trips saved on every call the engine or an operator's tool makes for itself — see
+    /// [`StepConn`].
+    ///
+    /// **Only for work that is genuinely one statement.** Anything else needs the transaction
+    /// whether or not it is checkpointed: the cancel cascade and every fork are one operation
+    /// spread over several statements, and running those on a bare connection leaves a tree
+    /// half-cancelled or a fork half-written. Those take
+    /// [`run_transactional_step`](Self::run_transactional_step), which is the default and the
+    /// safe answer when the count is not obvious.
+    async fn run_single_statement_step<T, F, Fut>(
+        &self,
+        caller: Option<(&str, i32)>,
+        step_name: &str,
+        started_at: Timestamp,
+        work: F,
+    ) -> Result<T, Error>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        F: Fn(StepConn) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<(StepConn, T), Error>> + Send,
+    {
+        let Some((workflow_id, step_id)) = caller else {
+            // Nothing to commit on the way out either: the statement committed itself, and the
+            // connection goes back to the pool as it drops.
+            let (_conn, value) = work(StepConn::Pooled(self.pool.acquire().await?)).await?;
+            return Ok(value);
+        };
+
+        let mut conn = StepConn::Transactional(Box::new(self.pool.begin().await?));
+        if let Some(step) = self
+            .check_step_on(&mut conn, workflow_id, step_id, step_name)
+            .await?
+        {
+            return replayed_output(&step, workflow_id, step_id, step_name);
+        }
+
+        // A failure drops the transaction, which rolls it back and records nothing — as above.
+        let (mut conn, value) = work(conn).await?;
+        self.record_step_output(
+            &mut conn,
+            workflow_id,
+            step_id,
+            step_name,
+            &value,
+            started_at,
+        )
+        .await?;
+        match conn {
+            StepConn::Transactional(tx) => (*tx).commit().await?,
+            // Unreachable: this arm of the function built a `Transactional` above, and `work`
+            // hands back what it was given.
+            StepConn::Pooled(_) => {}
+        }
+        Ok(value)
+    }
+
+    /// Writes a batch of forks on the caller's transaction, and hands it back.
+    ///
+    /// Everything [`fork_workflows`](SystemDatabase::fork_workflows) and
+    /// [`fork_from`](SystemDatabase::fork_from) have in common, which is all of it bar where the
+    /// start steps come from — hence [`StartSteps`]. The transaction is taken by value and
+    /// returned because that is what [`run_transactional_step`](Self::run_transactional_step)
+    /// asks of its work.
+    ///
+    /// The forked ids are the caller's, generated before any of this, so that a retry writes the
+    /// same forks rather than a second set.
+    async fn fork_on(
+        &self,
+        mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+        source_ids: &[&str],
+        forked_ids: &[String],
+        steps: StartSteps<'_>,
+        options: &ForkOptions<'_>,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Error> {
+        // Resolved here rather than by the caller, so a fork point read from a workflow's history
+        // and the fork written from it come from one snapshot.
+        let resolved: Vec<i32>;
+        let start_steps: &[i32] = match steps {
+            StartSteps::Given(given) => given,
+            StartSteps::Resolve { aggregate, named } => {
+                resolved = self
+                    .resolve_fork_points_on(&mut tx, source_ids, aggregate, named)
+                    .await?;
+                &resolved
+            }
+        };
+
+        // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's
+        // guard, not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`,
+        // and with steps_table numbered from zero the latter drops step 0 from every fork that resumes
+        // at step 1 — the fork then re-runs a step it was given the result of.
+        let copies_anything = start_steps.iter().any(|&step| step > 0);
+
+        let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
+        // Reported rather than saturated, following `Timestamp::checked_add` and the rule stated
+        // on `to_system_time`: a value this layer cannot store is the caller's to hear about, not
+        // one to quietly replace with a different timeout.
+        let timeout_ms = match options.timeout.map(|t| i64::try_from(t.as_millis())) {
+            None => None,
+            Some(Ok(ms)) => Some(ms),
+            Some(Err(_)) => {
+                return Err(Error::InvalidInput {
+                    field: "timeout".into(),
+                    detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
+                });
+            }
+        };
+        let (replace_from, replace_to): (Vec<&str>, Vec<&str>) =
+            options.replacement_children.iter().copied().unzip();
+        let (replace_from, replace_to) = (&replace_from[..], &replace_to[..]);
+
+        let workflow_table = self.tables.workflow_status.as_str();
+        let steps_table = self.tables.operation_outputs.as_str();
+        let events_table = self.tables.workflow_events.as_str();
+        let history_table = self.tables.workflow_events_history.as_str();
+        let streams_table = self.tables.streams.as_str();
+        let application_name = self.application_name.as_deref();
+
+        // Every source must exist before anything is written. A batch that forked the
+        // workflows it could find would leave a caller holding ids for forks that are not
+        // there, with nothing to say which.
+        let found: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
+        )))
+        .bind(source_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        let missing: Vec<String> = source_ids
+            .iter()
+            .filter(|id| !found.iter().any(|f| f == *id))
+            .map(|id| (*id).to_owned())
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::NonExistentWorkflow {
+                workflow_ids: missing,
+            });
+        }
+
+        // The fork inherits its source's identity and starts enqueued. `application_version`
+        // falls back to the source's, matching Go and TypeScript: a fork stamped with no
+        // version would be invisible to the recovery that scopes by it.
+        //
+        // `application_name` falls back the other way — the source's owner wins, and this
+        // application's name is used only to claim a source nobody owns, which is what a
+        // dequeue would do anyway. A fork has to run on the same application as its source:
+        // it replays that application's recorded steps.
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {workflow_table} (workflow_uuid, status, name, class_name, config_name, \
+                application_version, application_id, authenticated_user, authenticated_roles, \
+                assumed_role, inputs, serialization, request, queue_name, \
+                queue_partition_key, forked_from, attributes, workflow_timeout_ms, \
+                application_name) \
+             SELECT m.fork_id, 'ENQUEUED', w.name, w.class_name, w.config_name, \
+                COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
+                w.authenticated_roles, w.assumed_role, w.inputs, w.serialization, w.request, \
+                $5, $6, w.workflow_uuid, w.attributes, $7, \
+                COALESCE(w.application_name, $8) \
+             FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+             JOIN {workflow_table} w ON w.workflow_uuid = m.source_id"
+        )))
+        .bind(source_ids)
+        .bind(forked_ids)
+        .bind(start_steps)
+        .bind(options.application_version)
+        .bind(queue_name)
+        .bind(options.queue_partition_key)
+        .bind(timeout_ms)
+        .bind(application_name)
+        .execute(&mut *tx)
+        .await?;
+
+        // What makes a source discoverable as a fork point afterwards.
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {workflow_table} SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)"
+        )))
+        .bind(source_ids)
+        .execute(&mut *tx)
+        .await?;
+
+        if copies_anything {
+            // The recorded steps_table, which are what the fork replays instead of running. The
+            // `CASE` rewrites recorded children when the caller is forking a whole tree;
+            // with no replacements it collapses to the original column.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {steps_table} (workflow_uuid, function_id, output, error, \
+                    serialization, function_name, child_workflow_id, started_at_epoch_ms, \
+                    completed_at_epoch_ms, application_name) \
+                 SELECT m.fork_id, o.function_id, o.output, o.error, o.serialization, \
+                    o.function_name, \
+                    COALESCE(r.replacement, o.child_workflow_id), \
+                    o.started_at_epoch_ms, o.completed_at_epoch_ms, \
+                    COALESCE(w.application_name, $6) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 JOIN {steps_table} o \
+                   ON o.workflow_uuid = m.source_id AND o.function_id < m.start_step \
+                 JOIN {workflow_table} w ON w.workflow_uuid = m.source_id \
+                 LEFT JOIN unnest($4::text[], $5::text[]) AS r(original, replacement) \
+                   ON r.original = o.child_workflow_id"
+            )))
+            .bind(source_ids)
+            .bind(forked_ids)
+            .bind(start_steps)
+            .bind(replace_from)
+            .bind(replace_to)
+            // The same owner the fork's status row just took, computed the same way — one
+            // owner per fork, shared by its status row and its copied steps. Read from the
+            // source workflow rather than from the copied step, whose own `application_name`
+            // records only who ran it and may be a third application entirely.
+            .bind(application_name)
+            .execute(&mut *tx)
+            .await?;
+
+            // The per-step event history_table, bounded the same way.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {history_table} (workflow_uuid, function_id, key, value, serialization) \
+                 SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 JOIN {history_table} h \
+                   ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step"
+            )))
+            .bind(source_ids)
+            .bind(forked_ids)
+            .bind(start_steps)
+            .execute(&mut *tx)
+            .await?;
+
+            // The current value of each key, rebuilt from the history_table rather than copied
+            // from the source's `workflow_events`. The source's current value may have been
+            // set *after* the fork point, and a fork must not see the future.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {events_table} (workflow_uuid, key, value, serialization) \
+                 SELECT fork_id, key, value, serialization FROM ( \
+                   SELECT m.fork_id, h.key, h.value, h.serialization, \
+                          row_number() OVER (PARTITION BY m.fork_id, h.key \
+                                             ORDER BY h.function_id DESC) AS rn \
+                   FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                   JOIN {history_table} h \
+                     ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step \
+                 ) latest WHERE rn = 1"
+            )))
+            .bind(source_ids)
+            .bind(forked_ids)
+            .bind(start_steps)
+            .execute(&mut *tx)
+            .await?;
+
+            // Stream entries written before the fork point, so a reader replaying the fork
+            // sees the same stream the original had produced by then.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {streams_table} (workflow_uuid, function_id, key, value, \
+                    serialization, \"offset\") \
+                 SELECT m.fork_id, s.function_id, s.key, s.value, s.serialization, s.\"offset\" \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 JOIN {streams_table} s \
+                   ON s.workflow_uuid = m.source_id AND s.function_id < m.start_step"
+            )))
+            .bind(source_ids)
+            .bind(forked_ids)
+            .bind(start_steps)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tracing::info!(
+            count = source_ids.len(),
+            queue_name,
+            "forked workflows onto the queue"
+        );
+        Ok(tx)
+    }
+
+    /// The retry and the checkpoint around [`fork_on`](Self::fork_on).
+    ///
+    /// Both fork entry points end here, so both are one transaction: the forks, the steps they
+    /// copy, and — when a workflow is the one forking — the step that records the ids, all
+    /// committed together or not at all. A crash between the fork and its checkpoint is what this
+    /// closes, and forking is the operation where that matters, since replaying an uncheckpointed
+    /// fork writes a *second* one under a second id.
+    ///
+    /// `timing` is built once, outside the retry, because
+    /// [`record_step_on`](Self::record_step_on) tells this caller's own retried write from
+    /// another execution's by comparing the stored completion time against it.
+    async fn fork_batch(
+        &self,
+        source_ids: &[&str],
+        forked_ids: &[String],
+        steps: StartSteps<'_>,
+        options: &ForkOptions<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Vec<String>, Error> {
+        let started_at = Timestamp::now();
+
+        with_retry(&self.retry, "fork_workflows", move || async move {
+            self.run_transactional_step(
+                caller,
+                step_names::FORK_WORKFLOW,
+                started_at,
+                |tx| async move {
+                    let tx = self
+                        .fork_on(tx, source_ids, forked_ids, steps, options)
+                        .await?;
+                    Ok((tx, forked_ids.to_vec()))
+                },
+            )
+            .await
+        })
+        .await
     }
 
     /// [`upsert_schedule`](SystemDatabase::upsert_schedule) against a caller's transaction.
@@ -1602,14 +2024,18 @@ impl PostgresSystemDatabase {
     /// Not retried in here: that belongs to the trait method that owns the whole operation, since
     /// a retry restarting only this statement would leave the cascade around it half-walked.
     ///
-    /// The clock is per level, so a deep tree's `completed_at` values span the walk rather than
-    /// sharing one instant. Every other implementation does the same — Python and TypeScript put
-    /// `now()` in this statement, Java reads its own inside the equivalent of this method — and
-    /// nothing reads the column to decide anything.
+    /// The clock is the transaction's. `now()` is `transaction_timestamp()` in Postgres, so every
+    /// level of one cascade stamps the same instant — where the references, whose levels each
+    /// commit on their own, write times that span the walk. Nothing reads the column to decide
+    /// anything, and one cancellation happening at one instant is the more honest of the two.
     ///
     /// The terminal-status guard is what makes cancellation safe to repeat: a workflow that has
     /// already succeeded keeps its result rather than being overwritten with `CANCELLED`.
-    async fn cancel_batch<S>(&self, workflow_ids: &[S]) -> Result<Vec<String>, Error>
+    async fn cancel_batch<S>(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_ids: &[S],
+    ) -> Result<Vec<String>, Error>
     where
         S: AsRef<str> + Sync,
     {
@@ -1655,7 +2081,7 @@ impl PostgresSystemDatabase {
              RETURNING workflow_uuid"
         )))
         .bind(ids)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         Ok(cancelled)
     }
@@ -1665,7 +2091,11 @@ impl PostgresSystemDatabase {
     /// Generic over the element type so a caller can pass `&[String]` from a frontier or
     /// `&[&str]` from a borrowed seed without cloning either. The only copy is the vector of
     /// pointers the driver needs to encode a `text[]`.
-    async fn direct_children<S>(&self, workflow_ids: &[S]) -> Result<Vec<String>, Error>
+    async fn direct_children<S>(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_ids: &[S],
+    ) -> Result<Vec<String>, Error>
     where
         S: AsRef<str> + Sync,
     {
@@ -1675,7 +2105,7 @@ impl PostgresSystemDatabase {
             "SELECT workflow_uuid FROM {workflow_table} WHERE parent_workflow_id = ANY($1)"
         )))
         .bind(ids)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await?;
         Ok(children)
     }
@@ -1831,14 +2261,19 @@ impl PostgresSystemDatabase {
     /// `aggregate` is the SQL that picks the step, and `named` narrows to one step name. Both
     /// come from the caller's match on [`ForkPoint`], which is where [`ForkPoint::Step`] is
     /// answered — it supplies the step id outright, so there is nothing to look up.
-    async fn resolve_fork_points(
+    ///
+    /// Takes the caller's connection, and does not retry on its own: it runs inside the
+    /// transaction that writes the forks, so that a fork resolved from a workflow's history and
+    /// the forks written from it come from one snapshot — and so that a replay never runs it at
+    /// all, the recorded ids being the whole answer.
+    async fn resolve_fork_points_on(
         &self,
+        conn: &mut sqlx::PgConnection,
         workflow_ids: &[&str],
         aggregate: &str,
         named: Option<&str>,
     ) -> Result<Vec<i32>, Error> {
         let steps_table = self.tables.operation_outputs.as_str();
-        let pool = &self.pool;
 
         let filter = if named.is_some() {
             " AND function_name = $2"
@@ -1846,20 +2281,15 @@ impl PostgresSystemDatabase {
             ""
         };
 
-        let rows: Vec<(String, i32)> = with_retry(&self.retry, "resolve_fork_points", move || {
-            let sql = format!(
-                "SELECT workflow_uuid, {aggregate} AS start_step FROM {steps_table} \
-                 WHERE workflow_uuid = ANY($1){filter} GROUP BY workflow_uuid"
-            );
-            async move {
-                let mut query = sqlx::query_as(AssertSqlSafe(sql)).bind(workflow_ids);
-                if let Some(name) = named {
-                    query = query.bind(name);
-                }
-                Ok(query.fetch_all(pool).await?)
-            }
-        })
-        .await?;
+        let sql = format!(
+            "SELECT workflow_uuid, {aggregate} AS start_step FROM {steps_table} \
+             WHERE workflow_uuid = ANY($1){filter} GROUP BY workflow_uuid"
+        );
+        let mut query = sqlx::query_as(AssertSqlSafe(sql)).bind(workflow_ids);
+        if let Some(name) = named {
+            query = query.bind(name);
+        }
+        let rows: Vec<(String, i32)> = query.fetch_all(&mut *conn).await?;
 
         // Back into the caller's order, which `GROUP BY` does not preserve, reporting anything
         // that produced no row. One pass over the ids, so a workflow is either a start step or a
@@ -2386,7 +2816,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Vec<WorkflowRecord>, Error> {
+    async fn list_workflows(
+        &self,
+        filter: &WorkflowFilter<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<Vec<WorkflowRecord>, Error> {
         let workflow_table = &self.tables.workflow_status;
         // `status` is the one filter whose values are not already strings.
         let status: Vec<&str> = filter
@@ -2410,157 +2844,170 @@ impl SystemDatabase for PostgresSystemDatabase {
                 )
             })
             .collect();
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let workflow_table = workflow_table.as_str();
         let (status, prefixes) = (status.as_slice(), prefixes.as_slice());
         let application_name = self.application_name.as_deref();
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_workflows", move || async move {
-            // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
-            // a hoisted one would make each attempt's future borrow the closure — which
-            // `FnMut() -> Fut` cannot express. It costs nothing on the happy path, where there
-            // is one attempt either way.
-            let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-            // One row reader serves every query, so a declined column is selected as a typed
-            // NULL rather than dropped.
-            q.push(WORKFLOW_COLUMNS)
-                .push(", ")
-                .push(workflow_payloads(filter.load_input, filter.load_output));
-            q.push(" FROM ").push(workflow_table);
+            self.run_single_statement_step(
+                caller,
+                step_names::LIST_WORKFLOWS,
+                started_at,
+                |mut conn| async move {
+                    // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
+                    // a hoisted one would make each attempt's future borrow the closure — which
+                    // `FnMut() -> Fut` cannot express. It costs nothing on the happy path, where there
+                    // is one attempt either way.
+                    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+                    // One row reader serves every query, so a declined column is selected as a typed
+                    // NULL rather than dropped.
+                    q.push(WORKFLOW_COLUMNS)
+                        .push(", ")
+                        .push(workflow_payloads(filter.load_input, filter.load_output));
+                    q.push(" FROM ").push(workflow_table);
 
-            // `separated(" AND ")` writes the separator only between clauses, so neither a
-            // leading `WHERE` with no filters nor a trailing `AND` is possible by construction.
-            let mut first = true;
-            let mut clause = |q: &mut sqlx::QueryBuilder<sqlx::Postgres>, sql: &str| {
-                q.push(if first { " WHERE " } else { " AND " });
-                first = false;
-                q.push(sql);
-            };
+                    // `separated(" AND ")` writes the separator only between clauses, so neither a
+                    // leading `WHERE` with no filters nor a trailing `AND` is possible by construction.
+                    let mut first = true;
+                    let mut clause = |q: &mut sqlx::QueryBuilder<sqlx::Postgres>, sql: &str| {
+                        q.push(if first { " WHERE " } else { " AND " });
+                        first = false;
+                        q.push(sql);
+                    };
 
-            // `= ANY($n)` rather than `IN ($1, $2, …)`: one placeholder for the whole list,
-            // whatever its length, so the SQL text does not vary with the caller's input.
-            macro_rules! any_of {
-                ($values:expr, $column:literal) => {
-                    if !$values.is_empty() {
-                        clause(&mut q, concat!($column, " = ANY("));
-                        q.push_bind($values).push(")");
+                    // `= ANY($n)` rather than `IN ($1, $2, …)`: one placeholder for the whole list,
+                    // whatever its length, so the SQL text does not vary with the caller's input.
+                    macro_rules! any_of {
+                        ($values:expr, $column:literal) => {
+                            if !$values.is_empty() {
+                                clause(&mut q, concat!($column, " = ANY("));
+                                q.push_bind($values).push(")");
+                            }
+                        };
                     }
-                };
-            }
-            any_of!(&filter.workflow_ids[..], "workflow_uuid");
+                    any_of!(&filter.workflow_ids[..], "workflow_uuid");
 
-            // Whose rows this covers. `Unset` reads differently depending on the rest of the
-            // filter: a workflow id is a global address, so asking for one by id is an identity
-            // read and answering "no such workflow" for one that plainly exists would be a lie.
-            // Any other query is a search, and a search that has not said whose workflows it
-            // wants means its own. Prefixes are searches, so they do not count as id-keyed.
-            match &filter.applications {
-                Applications::Any => {}
-                Applications::Named(names) if names.is_empty() => {}
-                Applications::Named(names) => {
-                    clause(&mut q, "(application_name = ANY(");
-                    q.push_bind(&names[..])
-                        .push(") OR application_name IS NULL)");
-                }
-                Applications::Unset if !filter.workflow_ids.is_empty() => {}
-                // A handle with no application of its own has nothing to scope to, so it sees
-                // every application's rows rather than only the unclaimed ones — which is what
-                // `application_name = NULL` would have matched.
-                Applications::Unset => {
-                    if let Some(name) = application_name {
-                        clause(&mut q, "(application_name = ");
-                        q.push_bind(name).push(" OR application_name IS NULL)");
+                    // Whose rows this covers. `Unset` reads differently depending on the rest of the
+                    // filter: a workflow id is a global address, so asking for one by id is an identity
+                    // read and answering "no such workflow" for one that plainly exists would be a lie.
+                    // Any other query is a search, and a search that has not said whose workflows it
+                    // wants means its own. Prefixes are searches, so they do not count as id-keyed.
+                    match &filter.applications {
+                        Applications::Any => {}
+                        Applications::Named(names) if names.is_empty() => {}
+                        Applications::Named(names) => {
+                            clause(&mut q, "(application_name = ANY(");
+                            q.push_bind(&names[..])
+                                .push(") OR application_name IS NULL)");
+                        }
+                        Applications::Unset if !filter.workflow_ids.is_empty() => {}
+                        // A handle with no application of its own has nothing to scope to, so it sees
+                        // every application's rows rather than only the unclaimed ones — which is what
+                        // `application_name = NULL` would have matched.
+                        Applications::Unset => {
+                            if let Some(name) = application_name {
+                                clause(&mut q, "(application_name = ");
+                                q.push_bind(name).push(" OR application_name IS NULL)");
+                            }
+                        }
                     }
-                }
-            }
 
-            any_of!(&filter.names[..], "name");
-            any_of!(&filter.class_names[..], "class_name");
-            any_of!(&filter.config_names[..], "config_name");
-            any_of!(status, "status");
-            any_of!(&filter.application_versions[..], "application_version");
-            any_of!(&filter.executor_ids[..], "executor_id");
-            any_of!(&filter.authenticated_users[..], "authenticated_user");
-            any_of!(&filter.queue_names[..], "queue_name");
-            any_of!(&filter.schedule_names[..], "schedule_name");
-            any_of!(&filter.deduplication_ids[..], "deduplication_id");
-            any_of!(&filter.parent_workflow_ids[..], "parent_workflow_id");
-            any_of!(&filter.forked_from[..], "forked_from");
+                    any_of!(&filter.names[..], "name");
+                    any_of!(&filter.class_names[..], "class_name");
+                    any_of!(&filter.config_names[..], "config_name");
+                    any_of!(status, "status");
+                    any_of!(&filter.application_versions[..], "application_version");
+                    any_of!(&filter.executor_ids[..], "executor_id");
+                    any_of!(&filter.authenticated_users[..], "authenticated_user");
+                    any_of!(&filter.queue_names[..], "queue_name");
+                    any_of!(&filter.schedule_names[..], "schedule_name");
+                    any_of!(&filter.deduplication_ids[..], "deduplication_id");
+                    any_of!(&filter.parent_workflow_ids[..], "parent_workflow_id");
+                    any_of!(&filter.forked_from[..], "forked_from");
 
-            if !prefixes.is_empty() {
-                clause(&mut q, "workflow_uuid LIKE ANY(");
-                q.push_bind(prefixes).push(")");
-            }
-
-            macro_rules! compare {
-                ($value:expr, $sql:literal) => {
-                    if let Some(v) = $value {
-                        clause(&mut q, $sql);
-                        q.push_bind(v.as_epoch_ms());
+                    if !prefixes.is_empty() {
+                        clause(&mut q, "workflow_uuid LIKE ANY(");
+                        q.push_bind(prefixes).push(")");
                     }
-                };
-            }
-            compare!(filter.created_after, "created_at >= ");
-            compare!(filter.created_before, "created_at <= ");
-            compare!(filter.completed_after, "completed_at >= ");
-            compare!(filter.completed_before, "completed_at <= ");
-            compare!(filter.started_after, "started_at_epoch_ms >= ");
-            compare!(filter.started_before, "started_at_epoch_ms <= ");
 
-            macro_rules! flag {
-                ($value:expr, $sql:literal) => {
-                    if let Some(v) = $value {
-                        clause(&mut q, $sql);
-                        q.push_bind(v);
+                    macro_rules! compare {
+                        ($value:expr, $sql:literal) => {
+                            if let Some(v) = $value {
+                                clause(&mut q, $sql);
+                                q.push_bind(v.as_epoch_ms());
+                            }
+                        };
                     }
-                };
-            }
-            flag!(filter.was_forked_from, "was_forked_from = ");
-            flag!(filter.is_debounced, "is_debounced = ");
+                    compare!(filter.created_after, "created_at >= ");
+                    compare!(filter.created_before, "created_at <= ");
+                    compare!(filter.completed_after, "completed_at >= ");
+                    compare!(filter.completed_before, "completed_at <= ");
+                    compare!(filter.started_after, "started_at_epoch_ms >= ");
+                    compare!(filter.started_before, "started_at_epoch_ms <= ");
 
-            if filter.queues_only {
-                clause(&mut q, "queue_name IS NOT NULL");
-            }
-            if let Some(has_parent) = filter.has_parent {
-                clause(
-                    &mut q,
-                    if has_parent {
-                        "parent_workflow_id IS NOT NULL"
+                    macro_rules! flag {
+                        ($value:expr, $sql:literal) => {
+                            if let Some(v) = $value {
+                                clause(&mut q, $sql);
+                                q.push_bind(v);
+                            }
+                        };
+                    }
+                    flag!(filter.was_forked_from, "was_forked_from = ");
+                    flag!(filter.is_debounced, "is_debounced = ");
+
+                    if filter.queues_only {
+                        clause(&mut q, "queue_name IS NOT NULL");
+                    }
+                    if let Some(has_parent) = filter.has_parent {
+                        clause(
+                            &mut q,
+                            if has_parent {
+                                "parent_workflow_id IS NOT NULL"
+                            } else {
+                                "parent_workflow_id IS NULL"
+                            },
+                        );
+                    }
+                    if let Some(attributes) = &filter.attributes {
+                        // Containment, served by the GIN index. SQLite cannot reproduce `@>` and Go
+                        // rejects the filter there; both Postgres and CockroachDB support it.
+                        clause(&mut q, "attributes @> ");
+                        q.push_bind(attributes).push("::jsonb");
+                    }
+
+                    // `created_at` alone, which is what Python, TypeScript and Go all order by. It is a
+                    // millisecond stamp, so rows created inside one millisecond are returned in an order
+                    // this query does not fix — and `limit`/`offset` page through that order. Adding
+                    // `workflow_uuid` as a tiebreaker would settle it, and is deliberately not done here:
+                    // a listing that pages differently from every other implementation is a worse problem
+                    // than one that pages ambiguously in the same way they do.
+                    //
+                    // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this order, so a
+                    // boundary inside a tie hands one workflow to two pages and skips another. Worth
+                    // fixing in all four, and only there.
+                    q.push(if filter.sort_desc {
+                        " ORDER BY created_at DESC"
                     } else {
-                        "parent_workflow_id IS NULL"
-                    },
-                );
-            }
-            if let Some(attributes) = &filter.attributes {
-                // Containment, served by the GIN index. SQLite cannot reproduce `@>` and Go
-                // rejects the filter there; both Postgres and CockroachDB support it.
-                clause(&mut q, "attributes @> ");
-                q.push_bind(attributes).push("::jsonb");
-            }
+                        " ORDER BY created_at ASC"
+                    });
+                    if let Some(limit) = filter.limit {
+                        q.push(" LIMIT ").push_bind(limit);
+                    }
+                    if let Some(offset) = filter.offset {
+                        q.push(" OFFSET ").push_bind(offset);
+                    }
 
-            // `created_at` alone, which is what Python, TypeScript and Go all order by. It is a
-            // millisecond stamp, so rows created inside one millisecond are returned in an order
-            // this query does not fix — and `limit`/`offset` page through that order. Adding
-            // `workflow_uuid` as a tiebreaker would settle it, and is deliberately not done here:
-            // a listing that pages differently from every other implementation is a worse problem
-            // than one that pages ambiguously in the same way they do.
-            //
-            // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this order, so a
-            // boundary inside a tie hands one workflow to two pages and skips another. Worth
-            // fixing in all four, and only there.
-            q.push(if filter.sort_desc {
-                " ORDER BY created_at DESC"
-            } else {
-                " ORDER BY created_at ASC"
-            });
-            if let Some(limit) = filter.limit {
-                q.push(" LIMIT ").push_bind(limit);
-            }
-            if let Some(offset) = filter.offset {
-                q.push(" OFFSET ").push_bind(offset);
-            }
-
-            let rows = q.build().fetch_all(pool).await?;
-            rows.iter().map(workflow_from_row).collect()
+                    let rows = q.build().fetch_all(&mut *conn).await?;
+                    let workflows: Vec<WorkflowRecord> = rows
+                        .iter()
+                        .map(workflow_from_row)
+                        .collect::<Result<_, _>>()?;
+                    Ok((conn, workflows))
+                },
+            )
+            .await
         })
         .await
     }
@@ -2576,6 +3023,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // once for the dedup set, rather than three times. The root is excluded by
             // comparison rather than by seeding `seen` with a copy of it, which also states the
             // contract: a workflow is not its own descendant.
+            // One connection for the whole walk, rather than one per level from the pool.
+            let mut conn = self.pool.acquire().await?;
             let mut seen = std::collections::HashSet::new();
             let mut descendants: Vec<String> = Vec::new();
             let mut absorb = |into: &mut Vec<String>, children: Vec<String>| {
@@ -2588,7 +3037,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             absorb(
                 &mut descendants,
-                self.direct_children(&[workflow_id]).await?,
+                self.direct_children(&mut conn, &[workflow_id]).await?,
             );
 
             // Level by level, as all four do. Terminates because `seen` only grows, so a cycle —
@@ -2596,7 +3045,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             let mut start = 0;
             while start < descendants.len() {
                 let end = descendants.len();
-                let children = self.direct_children(&descendants[start..end]).await?;
+                let children = self
+                    .direct_children(&mut conn, &descendants[start..end])
+                    .await?;
                 start = end;
                 absorb(&mut descendants, children);
             }
@@ -2748,29 +3199,46 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
+        caller: Option<(&str, i32)>,
     ) -> Result<(), Error> {
         let workflow_table = &self.tables.workflow_status;
         // Resolved once, outside the retry, so a relative delay does not creep further out with
         // each attempt. Go's `resolveDelayUntil` collapses its two options to one absolute
         // `time.Time` before the write for the same reason; see `init_workflow` on why the
         // caller's clock is the one that resolves it.
+        //
+        // A relative delay is stamped by *this* process, and released by whichever supervisor
+        // next runs, against *its* clock — so a skewed operator host moves a release time the
+        // whole fleet honours. That is UPSTREAM item 22, anchored on `init_workflow` and shared
+        // with all four implementations: Go's `resolveDelayUntil` reads `time.Now()`, Python and
+        // TypeScript the same. Closing it here alone would cost a round trip that none of them
+        // spends, so the clock stays this one and the gap stays the team's to close.
         let now = Timestamp::now();
         let delay_until = delay.resolve(now).as_epoch_ms();
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let workflow_table = workflow_table.as_str();
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "set_workflow_delay", move || async move {
-            // `status = 'DELAYED'` is the guard: a released workflow is running or queued, and
-            // pushing its delay out would not recall it.
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} \
-                 SET delay_until_epoch_ms = $2, updated_at = {NOW_MS_SQL} \
-                 WHERE workflow_uuid = $1 AND status = 'DELAYED'"
-            )))
-            .bind(workflow_id)
-            .bind(delay_until)
-            .execute(pool)
-            .await?;
-            Ok(())
+            self.run_single_statement_step(
+                caller,
+                step_names::SET_WORKFLOW_DELAY,
+                started_at,
+                |mut conn| async move {
+                    // `status = 'DELAYED'` is the guard: a released workflow is running or
+                    // queued, and pushing its delay out would not recall it.
+                    sqlx::query(AssertSqlSafe(format!(
+                        "UPDATE {workflow_table} \
+                         SET delay_until_epoch_ms = $2, updated_at = {NOW_MS_SQL} \
+                         WHERE workflow_uuid = $1 AND status = 'DELAYED'"
+                    )))
+                    .bind(workflow_id)
+                    .bind(delay_until)
+                    .execute(&mut *conn)
+                    .await?;
+                    Ok((conn, ()))
+                },
+            )
+            .await
         })
         .await
     }
@@ -2802,25 +3270,34 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         attributes: Option<&str>,
+        caller: Option<(&str, i32)>,
     ) -> Result<(), Error> {
         validate_attributes(attributes)?;
-        let workflow_table = &self.tables.workflow_status;
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let workflow_table = self.tables.workflow_status.as_str();
+        let started_at = Timestamp::now();
 
         with_retry(
             &self.retry,
             "update_workflow_attributes",
             move || async move {
-                sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} \
-                     SET attributes = $2::jsonb, updated_at = {NOW_MS_SQL} \
-                     WHERE workflow_uuid = $1"
-                )))
-                .bind(workflow_id)
-                .bind(attributes)
-                .execute(pool)
-                .await?;
-                Ok(())
+                self.run_single_statement_step(
+                    caller,
+                    step_names::UPDATE_WORKFLOW_ATTRIBUTES,
+                    started_at,
+                    |mut conn| async move {
+                        sqlx::query(AssertSqlSafe(format!(
+                            "UPDATE {workflow_table} \
+                             SET attributes = $2::jsonb, updated_at = {NOW_MS_SQL} \
+                             WHERE workflow_uuid = $1"
+                        )))
+                        .bind(workflow_id)
+                        .bind(attributes)
+                        .execute(&mut *conn)
+                        .await?;
+                        Ok((conn, ()))
+                    },
+                )
+                .await
             },
         )
         .await
@@ -2922,62 +3399,62 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
         if workflow_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let started_at = Timestamp::now();
 
-        // The retry wraps the whole cascade, not each statement inside it. A failure partway
-        // through leaves some of the tree cancelled, and restarting from the roots finishes the
-        // job — where retrying one statement would return a half-walked tree as a success.
-        //
-        // `cancelled` survives across attempts, which is only sound because `cancel_batch`
-        // excludes rows that are already `CANCELLED`: a workflow can be returned once and never
-        // again, so a retry adds what the failed attempt did not reach and cannot double-report
-        // what it did. The walk itself restarts from the roots each attempt, since there is no
-        // way to know how far the last one got.
-        //
-        // Not for concurrency — nothing else touches this. It is how an accumulator outlives a
-        // retry while the closure stays `FnMut` returning a `Send` future, which is what
-        // `with_retry` requires. A plain `&mut Vec` would make the future borrow the closure.
-        let cancelled = std::sync::Mutex::new(Vec::new());
-        let collected = &cancelled;
-        with_retry(&self.retry, "cancel_workflows", move || async move {
-            // One statement per *level*, not per workflow: `cancel_batch` takes the whole
-            // frontier and matches it with `= ANY($1)`, so the round trips scale with the depth
-            // of the tree rather than its size. Cancelling the level before asking for its
-            // children is the ordering that stops a parent spawning behind the walk.
-            //
-            // The roots are used borrowed; only the levels below are owned, because those come
-            // back from the database already allocated.
-            // Awaited before locking: a guard held across an await would make this future
-            // non-`Send`, which `with_retry` requires.
-            let roots = self.cancel_batch(workflow_ids).await?;
-            collected.lock().expect("cancelled ids").extend(roots);
-            if !cancel_children {
-                return Ok(());
-            }
-            // Owned, because the levels below arrive owned from the database and the set has to
-            // hold both.
-            let mut seen: std::collections::HashSet<String> =
-                workflow_ids.iter().map(|id| (*id).to_owned()).collect();
-            let mut frontier = self.direct_children(workflow_ids).await?;
-            frontier.retain(|c| seen.insert(c.clone()));
+        // The retry wraps the whole cascade, and the cascade is one transaction: a failure
+        // partway through rolls back to before the roots were touched, so the next attempt starts
+        // from a tree nothing has moved. That is what lets the ids simply accumulate in a local —
+        // an earlier version had to keep them in a `Mutex` outside the retry, because a failed
+        // attempt left part of the tree cancelled and the next one could not see what it had done.
+        let cancelled = with_retry(&self.retry, "cancel_workflows", move || async move {
+            self.run_transactional_step(
+                caller,
+                step_names::CANCEL_WORKFLOW,
+                started_at,
+                |mut tx| async move {
+                    // One statement per *level*, not per workflow: `cancel_batch` takes the whole
+                    // frontier and matches it with `= ANY($1)`, so the round trips scale with the
+                    // depth of the tree rather than its size.
+                    //
+                    // Cancelling a level before reading its children narrows the window a child
+                    // can be spawned in; it does not close it. Inside this transaction the writes
+                    // are invisible to the workflows being cancelled until it commits, so a parent
+                    // still running can commit a child after `direct_children` has passed its
+                    // level. Each level's read simply takes a later snapshot than the last. See
+                    // the trait method, which sets this against Python's per-level commit.
+                    let mut cancelled = self.cancel_batch(&mut tx, workflow_ids).await?;
+                    if !cancel_children {
+                        return Ok((tx, cancelled));
+                    }
+                    // Owned, because the levels below arrive owned from the database and the set
+                    // has to hold both.
+                    let mut seen: std::collections::HashSet<String> =
+                        workflow_ids.iter().map(|id| (*id).to_owned()).collect();
+                    let mut frontier = self.direct_children(&mut tx, workflow_ids).await?;
+                    frontier.retain(|c| seen.insert(c.clone()));
 
-            // Terminates because `seen` only grows and a workflow enters a frontier at most once.
-            while !frontier.is_empty() {
-                let level = self.cancel_batch(&frontier).await?;
-                collected.lock().expect("cancelled ids").extend(level);
-                let children = self.direct_children(&frontier).await?;
-                frontier = children
-                    .into_iter()
-                    .filter(|c| seen.insert(c.clone()))
-                    .collect();
-            }
-            Ok(())
+                    // Terminates because `seen` only grows and a workflow enters a frontier at
+                    // most once.
+                    while !frontier.is_empty() {
+                        cancelled.extend(self.cancel_batch(&mut tx, &frontier).await?);
+                        let children = self.direct_children(&mut tx, &frontier).await?;
+                        frontier = children
+                            .into_iter()
+                            .filter(|c| seen.insert(c.clone()))
+                            .collect();
+                    }
+                    Ok((tx, cancelled))
+                },
+            )
+            .await
         })
         .await?;
-        let cancelled = cancelled.into_inner().expect("cancelled ids");
+
         tracing::debug!(
             requested = workflow_ids.len(),
             cancelled = cancelled.len(),
@@ -2991,56 +3468,67 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
         if workflow_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let workflow_table = &self.tables.workflow_status;
+        let workflow_table = self.tables.workflow_status.as_str();
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "resume_workflows", move || async move {
-            // Existence is asked separately because a zero-row update conflates "already
-            // finished" — which is legal — with "no such workflow", which is not.
-            let existing: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
-            )))
-            .bind(workflow_ids)
-            .fetch_all(pool)
-            .await?;
-            let missing: Vec<String> = workflow_ids
-                .iter()
-                .filter(|id| !existing.iter().any(|e| e == *id))
-                .map(|id| (*id).to_owned())
-                .collect();
-            if !missing.is_empty() {
-                return Err(Error::NonExistentWorkflow {
-                    workflow_ids: missing,
-                });
-            }
+            self.run_transactional_step(
+                caller,
+                step_names::RESUME_WORKFLOW,
+                started_at,
+                |mut tx| async move {
+                    // Existence is asked separately because a zero-row update conflates "already
+                    // finished" — which is legal — with "no such workflow", which is not. In the
+                    // same transaction as the update, so a workflow deleted between the two
+                    // cannot make this report a resume that did not happen.
+                    let existing: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
+                    )))
+                    .bind(workflow_ids)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    let missing: Vec<String> = workflow_ids
+                        .iter()
+                        .filter(|id| !existing.iter().any(|e| e == *id))
+                        .map(|id| (*id).to_owned())
+                        .collect();
+                    if !missing.is_empty() {
+                        return Err(Error::NonExistentWorkflow {
+                            workflow_ids: missing,
+                        });
+                    }
 
-            // `completed_at` and `started_at_epoch_ms` are cleared as well as the counters: the
-            // workflow is going to run again, and leaving them set would date it to its last
-            // attempt.
-            let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
-                 recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
-                 deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
-                 updated_at = {NOW_MS_SQL} \
-                 WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
-                 RETURNING workflow_uuid"
-            )))
-            .bind(workflow_ids)
-            .bind(queue)
-            .fetch_all(pool)
-            .await?;
-            tracing::debug!(
-                requested = workflow_ids.len(),
-                resumed = resumed.len(),
-                queue,
-                "resumed workflows"
-            );
-            Ok(resumed)
+                    // `completed_at` and `started_at_epoch_ms` are cleared as well as the
+                    // counters: the workflow is going to run again, and leaving them set would
+                    // date it to its last attempt.
+                    let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
+                         recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
+                         deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
+                         updated_at = {NOW_MS_SQL} \
+                         WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \
+                         RETURNING workflow_uuid"
+                    )))
+                    .bind(workflow_ids)
+                    .bind(queue)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    tracing::debug!(
+                        requested = workflow_ids.len(),
+                        resumed = resumed.len(),
+                        queue,
+                        "resumed workflows"
+                    );
+                    Ok((tx, resumed))
+                },
+            )
+            .await
         })
         .await
     }
@@ -3049,16 +3537,26 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         delete_children: bool,
+        caller: Option<(&str, i32)>,
     ) -> Result<u64, Error> {
         if workflow_ids.is_empty() {
             return Ok(0);
         }
         // Descendants arrive owned from the database and are kept alive here; the roots stay
         // borrowed, so `targets` copies pointers rather than strings.
+        //
+        // Collected before the transaction rather than inside it, unlike the cascade in
+        // `cancel_workflows`: this is a read, and moving it inside would close no race. A parent
+        // stops spawning when its row goes, which is after the walk either way, and at READ
+        // COMMITTED a statement inside the transaction sees concurrent commits just as one
+        // outside does. A child born between the walk and the delete outlives its parent —
+        // `parent_workflow_id` has no constraint on it — which is what cancelling first avoids.
+        //
+        // What the placement costs is that a replay walks the tree again before finding its
+        // checkpoint and throwing the answer away — reads, and only when a workflow is the one
+        // deleting.
         let mut children: Vec<String> = Vec::new();
         if delete_children {
-            // Collected before the delete rather than interleaved: a deleted parent cannot spawn,
-            // so there is no race to close, and one statement is cheaper than one per level.
             for id in workflow_ids {
                 children.extend(self.get_workflow_children(id).await?);
             }
@@ -3067,22 +3565,61 @@ impl SystemDatabase for PostgresSystemDatabase {
         targets.extend(children.iter().map(String::as_str));
         targets.sort_unstable();
         targets.dedup();
-        let workflow_table = &self.tables.workflow_status;
-        let (workflow_table, pool, targets) =
-            (workflow_table.as_str(), &self.pool, targets.as_slice());
+
+        // A workflow cannot delete itself, and cannot delete an ancestor whose tree it is inside.
+        // The checkpoint for this step is written to `operation_outputs` in the same transaction as
+        // the delete, and migration 1's foreign key points it at the `workflow_status` row the
+        // cascade has just removed — so the insert violates the key and takes the delete down with
+        // it. Refused here, before either statement runs, because the alternative is a foreign key
+        // violation surfacing as a backend error with nothing in it a caller could act on.
+        //
+        // Only the caller's own id is checked, not its ancestry: an ancestor is a target only when
+        // it was named with `delete_children`, and then the walk above has already put the caller
+        // in `targets`. A parent deleted on its own leaves this workflow's row alone.
+        //
+        // TODO(dbos-team): UPSTREAM item 25. The other three implementations write the same
+        // checkpoint against the same foreign key and none of them refuses the call, so a
+        // self-delete from inside a workflow fails there too — Python and TypeScript with the
+        // delete already committed and the checkpoint failing behind it, which is worse than this.
+        // Whether a workflow may delete itself at all is the cross-implementation question; this
+        // refusal is the conservative reading, and is Rust alone until the four agree.
+        if let Some((caller_id, _)) = caller
+            && targets.contains(&caller_id)
+        {
+            return Err(Error::InvalidInput {
+                field: "workflow_ids".into(),
+                detail: format!(
+                    "workflow {caller_id} cannot delete itself: the step checkpoint for the delete \
+                     is written in the same transaction and would outlive the row it references"
+                ),
+            });
+        }
+
+        let workflow_table = self.tables.workflow_status.as_str();
+        let targets = targets.as_slice();
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "delete_workflows", move || async move {
-            // Steps, notifications, events, and streams go with the row: every child table
-            // declares `ON DELETE CASCADE` on this foreign key, from migration 1 onward.
-            let deleted = sqlx::query(AssertSqlSafe(format!(
-                "DELETE FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
-            )))
-            .bind(targets)
-            .execute(pool)
-            .await?
-            .rows_affected();
-            tracing::debug!(deleted, targets = targets.len(), "deleted workflows");
-            Ok(deleted)
+            self.run_single_statement_step(
+                caller,
+                step_names::DELETE_WORKFLOW,
+                started_at,
+                |mut conn| async move {
+                    // Steps, notifications, events, and streams go with the row: every child
+                    // table declares `ON DELETE CASCADE` on this foreign key, from migration 1
+                    // onward.
+                    let deleted = sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
+                    )))
+                    .bind(targets)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+                    tracing::debug!(deleted, targets = targets.len(), "deleted workflows");
+                    Ok((conn, deleted))
+                },
+            )
+            .await
         })
         .await
     }
@@ -3091,6 +3628,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         forks: &[Fork<'_>],
         options: &ForkOptions<'_>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
         if forks.is_empty() {
             return Ok(Vec::new());
@@ -3110,219 +3648,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned)
             })
             .collect();
-
-        // The batch is passed as three parallel arrays and reassembled server-side by `unnest`,
-        // so the SQL text is the same whatever the caller passes: the server can reuse a plan,
-        // and a large batch cannot grow a statement without bound.
-        //
-        // **A deliberate divergence.** None of the references map the batch this way — Python
-        // unions a `SELECT literal(...)` per fork, Go does the same with casts, and TypeScript
-        // builds a `VALUES` CTE, all three emitting SQL that grows a row per workflow. The
-        // construct is not exotic, though: Python and TypeScript both `unnest` a `text[]` to
-        // batch `pg_notify`. What is new is unnesting three arrays in parallel, which is why it
-        // is checked against CockroachDB as well as PostgreSQL rather than assumed portable.
-        //
-        // Mismatched lengths would pad with `NULL` rather than fail, so the three are built from
-        // one iteration of `forks` and cannot disagree — which is also why [`Fork`] is a struct
-        // per workflow and not three slices.
         let source_ids: Vec<&str> = forks.iter().map(|f| f.source_id).collect();
         let start_steps: Vec<i32> = forks.iter().map(|f| f.start_step).collect();
-        // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's
-        // guard, not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`,
-        // and with steps_table numbered from zero the latter drops step 0 from every fork that resumes
-        // at step 1 — the fork then re-runs a step it was given the result of.
-        let copies_anything = start_steps.iter().any(|&step| step > 0);
 
-        let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
-        // Reported rather than saturated, following `Timestamp::checked_add` and the rule stated
-        // on `to_system_time`: a value this layer cannot store is the caller's to hear about, not
-        // one to quietly replace with a different timeout.
-        let timeout_ms = match options.timeout.map(|t| i64::try_from(t.as_millis())) {
-            None => None,
-            Some(Ok(ms)) => Some(ms),
-            Some(Err(_)) => {
-                return Err(Error::InvalidInput {
-                    field: "timeout".into(),
-                    detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
-                });
-            }
-        };
-        let (replace_from, replace_to): (Vec<&str>, Vec<&str>) =
-            options.replacement_children.iter().copied().unzip();
-
-        let workflow_table = &self.tables.workflow_status;
-        let steps_table = &self.tables.operation_outputs;
-        let events_table = &self.tables.workflow_events;
-        let history_table = &self.tables.workflow_events_history;
-        let streams_table = &self.tables.streams;
-        let (workflow_table, steps_table, events_table, history_table, streams_table) = (
-            workflow_table.as_str(),
-            steps_table.as_str(),
-            events_table.as_str(),
-            history_table.as_str(),
-            streams_table.as_str(),
-        );
-        let pool = &self.pool;
-        let (source_ids, forked_ids, start_steps) = (&source_ids, &forked_ids, &start_steps);
-        let (replace_from, replace_to) = (&replace_from, &replace_to);
-        let application_name = self.application_name.as_deref();
-
-        with_retry(&self.retry, "fork_workflows", move || async move {
-            let mut tx = pool.begin().await?;
-
-            // Every source must exist before anything is written. A batch that forked the
-            // workflows it could find would leave a caller holding ids for forks that are not
-            // there, with nothing to say which.
-            let found: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
-            )))
-            .bind(source_ids)
-            .fetch_all(&mut *tx)
-            .await?;
-            let missing: Vec<String> = source_ids
-                .iter()
-                .filter(|id| !found.iter().any(|f| f == *id))
-                .map(|id| (*id).to_owned())
-                .collect();
-            if !missing.is_empty() {
-                return Err(Error::NonExistentWorkflow {
-                    workflow_ids: missing,
-                });
-            }
-
-            // The fork inherits its source's identity and starts enqueued. `application_version`
-            // falls back to the source's, matching Go and TypeScript: a fork stamped with no
-            // version would be invisible to the recovery that scopes by it.
-            //
-            // `application_name` falls back the other way — the source's owner wins, and this
-            // application's name is used only to claim a source nobody owns, which is what a
-            // dequeue would do anyway. A fork has to run on the same application as its source:
-            // it replays that application's recorded steps.
-            sqlx::query(AssertSqlSafe(format!(
-                "INSERT INTO {workflow_table} (workflow_uuid, status, name, class_name, config_name, \
-                    application_version, application_id, authenticated_user, authenticated_roles, \
-                    assumed_role, inputs, serialization, request, queue_name, \
-                    queue_partition_key, forked_from, attributes, workflow_timeout_ms, \
-                    application_name) \
-                 SELECT m.fork_id, 'ENQUEUED', w.name, w.class_name, w.config_name, \
-                    COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
-                    w.authenticated_roles, w.assumed_role, w.inputs, w.serialization, w.request, \
-                    $5, $6, w.workflow_uuid, w.attributes, $7, \
-                    COALESCE(w.application_name, $8) \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
-                 JOIN {workflow_table} w ON w.workflow_uuid = m.source_id"
-            )))
-            .bind(source_ids)
-            .bind(forked_ids)
-            .bind(start_steps)
-            .bind(options.application_version)
-            .bind(queue_name)
-            .bind(options.queue_partition_key)
-            .bind(timeout_ms)
-            .bind(application_name)
-            .execute(&mut *tx)
-            .await?;
-
-            // What makes a source discoverable as a fork point afterwards.
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)"
-            )))
-            .bind(source_ids)
-            .execute(&mut *tx)
-            .await?;
-
-            if copies_anything {
-                // The recorded steps_table, which are what the fork replays instead of running. The
-                // `CASE` rewrites recorded children when the caller is forking a whole tree;
-                // with no replacements it collapses to the original column.
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {steps_table} (workflow_uuid, function_id, output, error, \
-                        serialization, function_name, child_workflow_id, started_at_epoch_ms, \
-                        completed_at_epoch_ms, application_name) \
-                     SELECT m.fork_id, o.function_id, o.output, o.error, o.serialization, \
-                        o.function_name, \
-                        COALESCE(r.replacement, o.child_workflow_id), \
-                        o.started_at_epoch_ms, o.completed_at_epoch_ms, \
-                        COALESCE(w.application_name, $6) \
-                     FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
-                     JOIN {steps_table} o \
-                       ON o.workflow_uuid = m.source_id AND o.function_id < m.start_step \
-                     JOIN {workflow_table} w ON w.workflow_uuid = m.source_id \
-                     LEFT JOIN unnest($4::text[], $5::text[]) AS r(original, replacement) \
-                       ON r.original = o.child_workflow_id"
-                )))
-                .bind(source_ids)
-                .bind(forked_ids)
-                .bind(start_steps)
-                .bind(replace_from)
-                .bind(replace_to)
-                // The same owner the fork's status row just took, computed the same way — one
-                // owner per fork, shared by its status row and its copied steps. Read from the
-                // source workflow rather than from the copied step, whose own `application_name`
-                // records only who ran it and may be a third application entirely.
-                .bind(application_name)
-                .execute(&mut *tx)
-                .await?;
-
-                // The per-step event history_table, bounded the same way.
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {history_table} (workflow_uuid, function_id, key, value, serialization) \
-                     SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization \
-                     FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
-                     JOIN {history_table} h \
-                       ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step"
-                )))
-                .bind(source_ids)
-                .bind(forked_ids)
-                .bind(start_steps)
-                .execute(&mut *tx)
-                .await?;
-
-                // The current value of each key, rebuilt from the history_table rather than copied
-                // from the source's `workflow_events`. The source's current value may have been
-                // set *after* the fork point, and a fork must not see the future.
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {events_table} (workflow_uuid, key, value, serialization) \
-                     SELECT fork_id, key, value, serialization FROM ( \
-                       SELECT m.fork_id, h.key, h.value, h.serialization, \
-                              row_number() OVER (PARTITION BY m.fork_id, h.key \
-                                                 ORDER BY h.function_id DESC) AS rn \
-                       FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
-                       JOIN {history_table} h \
-                         ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step \
-                     ) latest WHERE rn = 1"
-                )))
-                .bind(source_ids)
-                .bind(forked_ids)
-                .bind(start_steps)
-                .execute(&mut *tx)
-                .await?;
-
-                // Stream entries written before the fork point, so a reader replaying the fork
-                // sees the same stream the original had produced by then.
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {streams_table} (workflow_uuid, function_id, key, value, \
-                        serialization, \"offset\") \
-                     SELECT m.fork_id, s.function_id, s.key, s.value, s.serialization, s.\"offset\" \
-                     FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
-                     JOIN {streams_table} s \
-                       ON s.workflow_uuid = m.source_id AND s.function_id < m.start_step"
-                )))
-                .bind(source_ids)
-                .bind(forked_ids)
-                .bind(start_steps)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            tx.commit().await?;
-            tracing::info!(
-                count = forks.len(),
-                queue_name,
-                "forked workflows onto the queue"
-            );
-            Ok(forked_ids.clone())
-        })
+        self.fork_batch(
+            &source_ids,
+            &forked_ids,
+            StartSteps::Given(&start_steps),
+            options,
+            caller,
+        )
         .await
     }
 
@@ -3331,19 +3666,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_ids: &[&str],
         point: ForkPoint<'_>,
         options: &ForkOptions<'_>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
         if workflow_ids.is_empty() {
             return Ok(Vec::new());
         }
-
-        // **No `with_retry` here, and it must not gain one.** Both halves already retry —
-        // `resolve_fork_points` wraps its query, `fork_workflows` wraps its transaction — so
-        // every statement is covered. Wrapping the pair would re-enter `fork_workflows`, which
-        // generates the fork ids *before* its own retry so that a lost commit acknowledgement
-        // cannot fork twice. An outer retry would hand it fresh ids and do exactly that.
-        //
-        // Retrying piecewise is sound because the first half only reads: repeating it is free,
-        // and it commits nothing that the second half could duplicate.
 
         // `MAX(function_id)` is the step itself, not the one after it, so the resolved step
         // *re-runs* — forking from a failure means running the failed step again.
@@ -3354,34 +3681,51 @@ impl SystemDatabase for PostgresSystemDatabase {
         const LAST_FAILURE: &str =
             "COALESCE(MAX(function_id) FILTER (WHERE error IS NOT NULL), MAX(function_id))";
 
-        let start_steps = match point {
-            // Nothing to look up: the caller supplied the step id.
-            ForkPoint::Step(step) => vec![step; workflow_ids.len()],
-            ForkPoint::LastFailure => {
-                self.resolve_fork_points(workflow_ids, LAST_FAILURE, None)
-                    .await?
-            }
-            ForkPoint::LastStep => {
-                self.resolve_fork_points(workflow_ids, LAST_STEP, None)
-                    .await?
-            }
-            ForkPoint::StepNamed(name) => {
-                self.resolve_fork_points(workflow_ids, LAST_STEP, Some(name))
-                    .await?
-            }
+        options.validate()?;
+        // The checks `fork_workflows` makes on each [`Fork`], made here because this builds none:
+        // three of the four fork points are not known until the resolve runs, and it runs inside
+        // the transaction. Ids are always generated — a caller who is not choosing the step is
+        // not choosing the id either.
+        let given_step = match point {
+            ForkPoint::Step(step) => step,
+            _ => 0,
         };
-
-        // Ids are always generated. A caller who is not choosing the step is not choosing the id.
-        let forks: Vec<Fork<'_>> = workflow_ids
-            .iter()
-            .zip(&start_steps)
-            .map(|(source_id, &start_step)| Fork {
+        for &source_id in workflow_ids {
+            Fork {
                 source_id,
                 forked_id: None,
-                start_step,
-            })
+                start_step: given_step,
+            }
+            .validate()?;
+        }
+
+        // Outside the retry and outside the transaction, for the reason `fork_workflows` gives.
+        let forked_ids: Vec<String> = workflow_ids
+            .iter()
+            .map(|_| uuid::Uuid::new_v4().to_string())
             .collect();
-        self.fork_workflows(&forks, options).await
+
+        // `ForkPoint::Step` says where to start outright; the other three are searches through
+        // each source's own history, and `fork_batch` runs them inside the fork's transaction.
+        let given = vec![given_step; workflow_ids.len()];
+        let steps = match point {
+            ForkPoint::Step(_) => StartSteps::Given(&given),
+            ForkPoint::LastFailure => StartSteps::Resolve {
+                aggregate: LAST_FAILURE,
+                named: None,
+            },
+            ForkPoint::LastStep => StartSteps::Resolve {
+                aggregate: LAST_STEP,
+                named: None,
+            },
+            ForkPoint::StepNamed(name) => StartSteps::Resolve {
+                aggregate: LAST_STEP,
+                named: Some(name),
+            },
+        };
+
+        self.fork_batch(workflow_ids, &forked_ids, steps, options, caller)
+            .await
     }
 
     async fn send_messages(
@@ -4047,29 +4391,42 @@ impl SystemDatabase for PostgresSystemDatabase {
         load_output: bool,
         limit: Option<i64>,
         offset: Option<i64>,
+        caller: Option<(&str, i32)>,
     ) -> Result<Vec<StepRecord>, Error> {
-        let steps_table = &self.tables.operation_outputs;
-        let (steps_table, pool) = (steps_table.as_str(), &self.pool);
+        let steps_table = self.tables.operation_outputs.as_str();
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_workflow_steps", move || async move {
-            let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-            q.push(STEP_COLUMNS)
-                .push(", ")
-                .push(step_payloads(load_output))
-                .push(" FROM ")
-                .push(steps_table)
-                // `function_id` is the step order, so ordering by it replays the workflow.
-                .push(" WHERE workflow_uuid = ")
-                .push_bind(workflow_id)
-                .push(" ORDER BY function_id");
-            if let Some(limit) = limit {
-                q.push(" LIMIT ").push_bind(limit);
-            }
-            if let Some(offset) = offset {
-                q.push(" OFFSET ").push_bind(offset);
-            }
-            let rows = q.build().fetch_all(pool).await?;
-            rows.iter().map(|r| step_from_row(r, workflow_id)).collect()
+            self.run_single_statement_step(
+                caller,
+                step_names::LIST_WORKFLOW_STEPS,
+                started_at,
+                |mut conn| async move {
+                    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+                    q.push(STEP_COLUMNS)
+                        .push(", ")
+                        .push(step_payloads(load_output))
+                        .push(" FROM ")
+                        .push(steps_table)
+                        // `function_id` is the step order, so ordering by it replays the workflow.
+                        .push(" WHERE workflow_uuid = ")
+                        .push_bind(workflow_id)
+                        .push(" ORDER BY function_id");
+                    if let Some(limit) = limit {
+                        q.push(" LIMIT ").push_bind(limit);
+                    }
+                    if let Some(offset) = offset {
+                        q.push(" OFFSET ").push_bind(offset);
+                    }
+                    let rows = q.build().fetch_all(&mut *conn).await?;
+                    let steps: Vec<StepRecord> = rows
+                        .iter()
+                        .map(|r| step_from_row(r, workflow_id))
+                        .collect::<Result<_, _>>()?;
+                    Ok((conn, steps))
+                },
+            )
+            .await
         })
         .await
     }
@@ -5682,12 +6039,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             .application_name
             .or(self.application_name.as_deref());
 
-        // Read once per attempt, so a retry after a lost commit acknowledgement records the times
-        // of the attempt that actually landed.
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        // Read once, outside the retry, so the duration spans every attempt rather than only the
+        // one that landed. `run_transactional_step` stamps the completion on the far side of the
+        // work.
+        let started_at = Timestamp::now();
 
         with_retry(
             &self.retry,
@@ -5699,7 +6054,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 self.run_transactional_step(
                     caller,
                     step_names::DEBOUNCE,
-                    timing,
+                    started_at,
                     |mut tx| async move {
                         // The cap is what stops a steady stream of requests postponing the workflow
                         // forever: past the deadline, the delay stops moving. `CASE` rather than the
@@ -5836,16 +6191,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             .schedule_id
             .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
         let schedule_id = schedule_id.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "create_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::CREATE_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // A peer holding the name is a collision this layer cannot resolve; this
                     // application holding it is one the caller can, so the two are different errors.
@@ -5926,16 +6278,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             .schedule_id
             .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
         let schedule_id = schedule_id.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "upsert_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::UPSERT_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     self.upsert_schedule_on(&mut tx, schedule, schedule_id)
                         .await?;
@@ -5953,10 +6302,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
     ) -> Result<Option<ScheduleRecord>, Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "get_schedule", move || async move {
             // A read is a step too: a workflow that branches on a schedule has to see the same
@@ -5964,7 +6310,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             self.run_transactional_step(
                 caller,
                 step_names::GET_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     let row = sqlx::query(AssertSqlSafe(format!(
                         "SELECT {SCHEDULE_COLUMNS} FROM {schedules_table} WHERE schedule_name = $1"
@@ -6016,16 +6362,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         let application_name = self.application_name.as_deref();
         let statuses: Vec<&str> = filter.statuses.iter().map(|s| s.as_str()).collect();
         let statuses = statuses.as_slice();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_schedules", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::LIST_SCHEDULES,
-                timing,
+                started_at,
                 |mut tx| async move {
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
                     q.push(SCHEDULE_COLUMNS)
@@ -6091,16 +6434,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "update_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::UPDATE_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     // An empty update still has to say whether the schedule exists, so it becomes
                     // a read rather than an early return: silence would report a typo as success.
@@ -6170,13 +6510,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             ScheduleStatus::Active => step_names::RESUME_SCHEDULE,
             ScheduleStatus::Paused => step_names::PAUSE_SCHEDULE,
         };
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "set_schedule_status", move || async move {
-            self.run_transactional_step(caller, step_name, timing, |mut tx| async move {
+            self.run_transactional_step(caller, step_name, started_at, |mut tx| async move {
                 let updated = sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {schedules_table} SET status = $2 WHERE schedule_name = $1"
                 )))
@@ -6233,16 +6570,13 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
+        let started_at = Timestamp::now();
 
         with_retry(&self.retry, "delete_schedule", move || async move {
             self.run_transactional_step(
                 caller,
                 step_names::DELETE_SCHEDULE,
-                timing,
+                started_at,
                 |mut tx| async move {
                     sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM {schedules_table} WHERE schedule_name = $1"

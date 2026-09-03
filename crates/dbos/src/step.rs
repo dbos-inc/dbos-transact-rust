@@ -806,7 +806,7 @@ mod tests {
             .executor("test")
             .unwrap()
             .sysdb()
-            .list_workflow_steps("wf-blip", true, None, None)
+            .list_workflow_steps("wf-blip", true, None, None, None)
             .await
             .expect("read failed");
         assert!(
@@ -933,7 +933,7 @@ mod tests {
             .executor("test")
             .unwrap()
             .sysdb()
-            .list_workflow_steps("wf-order", true, None, None)
+            .list_workflow_steps("wf-order", true, None, None, None)
             .await
             .expect("read failed");
         let seen: Vec<(i32, &str)> = steps
@@ -971,7 +971,7 @@ mod tests {
             .executor("test")
             .unwrap()
             .sysdb()
-            .list_workflow_steps("wf-nested", true, None, None)
+            .list_workflow_steps("wf-nested", true, None, None, None)
             .await
             .expect("read failed");
         let seen: Vec<(i32, &str)> = steps

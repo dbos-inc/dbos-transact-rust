@@ -47,11 +47,11 @@ async fn a_sleep_waits_and_is_checkpointed() {
 
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let steps = reader
-        .list_workflow_steps(&rows[0].workflow_id, true, None, None)
+        .list_workflow_steps(&rows[0].workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1, "the sleep is a step");

@@ -83,7 +83,7 @@ async fn progress_events_survive_recovery_without_republishing() {
     // The demo's `GET /last_step` handler: an outside caller polling with a zero timeout.
     let reader = reader(&db).await;
     let rows = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed");
     let workflow_id = rows[0].workflow_id.clone();
@@ -143,7 +143,7 @@ async fn progress_events_survive_recovery_without_republishing() {
 
     // The publishes are checkpoints, under the cross-SDK step name, and the replay added none.
     let steps = reader
-        .list_workflow_steps(&workflow_id, true, None, None)
+        .list_workflow_steps(&workflow_id, true, None, None, None)
         .await
         .expect("read failed");
     let seen: Vec<(i32, &str)> = steps
@@ -222,7 +222,7 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
     publisher.run(()).await.expect("the publisher failed");
     let reader = reader(&db).await;
     let publisher_id = reader
-        .list_workflows(&Default::default())
+        .list_workflows(&Default::default(), None)
         .await
         .expect("read failed")
         .iter()
@@ -257,7 +257,7 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
         let reader = &reader;
         async move {
             let rows = reader
-                .list_workflows(&Default::default())
+                .list_workflows(&Default::default(), None)
                 .await
                 .expect("read failed");
             let id = &rows
@@ -266,7 +266,7 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
                 .unwrap_or_else(|| panic!("no row for {name}"))
                 .workflow_id;
             reader
-                .list_workflow_steps(id, true, None, None)
+                .list_workflow_steps(id, true, None, None, None)
                 .await
                 .expect("read failed")
                 .iter()
