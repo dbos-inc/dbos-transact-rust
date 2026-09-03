@@ -22,6 +22,8 @@
 pub mod sysdb;
 
 #[cfg(feature = "engine")]
+mod checkpoint;
+#[cfg(feature = "engine")]
 mod client;
 #[cfg(feature = "engine")]
 mod config;
@@ -56,6 +58,8 @@ mod sleep;
 #[cfg(feature = "engine")]
 mod step;
 #[cfg(feature = "engine")]
+mod wait;
+#[cfg(feature = "engine")]
 mod workflow;
 
 // Flattened deliberately: the crate path is the branding, so these are `dbos::Config` and
@@ -89,5 +93,7 @@ pub use sleep::sleep;
 pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit, WorkflowDelay};
+#[cfg(feature = "engine")]
+pub use wait::{wait_all, wait_first};
 #[cfg(feature = "engine")]
 pub use workflow::{DuplicationPolicy, Enqueue, RunOptions, StartOptions, Timeout};

@@ -245,6 +245,64 @@ pub trait SystemDatabase: Send + Sync {
         fail_if_missing: bool,
     ) -> Result<AwaitedOutcome, Error>;
 
+    /// Waits until one of these workflows has settled, and reports which.
+    ///
+    /// "Settled" is the *status* leaving `PENDING`, `ENQUEUED` and `DELAYED` — the same three
+    /// TypeScript's `awaitFirstWorkflowId` and Python's `check_first_workflow_id` exclude. So a
+    /// cancelled or dead-lettered workflow counts as settled and can be the one reported, which is
+    /// deliberate in all three: the caller asked which race finished first, not which succeeded,
+    /// and it has [`await_workflow_result`](Self::await_workflow_result) to ask the second question
+    /// with. Reporting only successes would leave a caller waiting out its whole fan-out because
+    /// one member was cancelled.
+    ///
+    /// **An id naming no row is waited for, never refused.** There is no `fail_if_missing` here
+    /// and neither reference has one: a set of ids is settled by whichever member appears first,
+    /// and an id whose enqueue has not committed yet is indistinguishable from one that will never
+    /// exist. A caller who needs the stricter reading holds one id and uses
+    /// [`await_workflow_result`](Self::await_workflow_result).
+    ///
+    /// Duplicate ids are the caller's to reject before calling: `ANY` de-duplicates on its own, so
+    /// this cannot tell a repeated id from a single one and would answer with a winner the caller
+    /// cannot map back to exactly one handle.
+    ///
+    /// Empty input is [`Error::Malformed`], not a wait that never ends. Python raises
+    /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which
+    /// is the worst possible reading of "wait for one of nothing".
+    ///
+    /// **One row, not one per id**, and it polls under the same concurrency cap
+    /// [`await_workflow_result`](Self::await_workflow_result) waits under and for the same reason
+    /// — a fan-out waiting on N workflows through N separate result waits is N queries per
+    /// interval, where this is one whatever N is. That is the efficiency the call exists for as
+    /// much as the semantics.
+    async fn await_first_workflow_id(
+        &self,
+        workflow_ids: &[&str],
+        poll_interval: Duration,
+    ) -> Result<String, Error>;
+
+    /// Waits until every one of these workflows has settled.
+    ///
+    /// The all-form of [`await_first_workflow_id`](Self::await_first_workflow_id), with the same
+    /// definition of settled and the same treatment of an id that names no row — so this waits out
+    /// a mistyped id rather than reporting it, exactly as TypeScript's `awaitWorkflowIds` does.
+    ///
+    /// **Each pass asks only about the ids still outstanding**, which is what keeps a long fan-out
+    /// from re-reading the whole set every interval once most of it has finished. TypeScript
+    /// narrows the same way, against a `Set` it deletes from.
+    ///
+    /// Duplicates are harmless here, unlike in the first-form: settling is a property of the id
+    /// rather than a choice between ids, so a repeated id is simply satisfied twice. The engine
+    /// de-duplicates before calling anyway, to keep the array it sends proportional to the work.
+    ///
+    /// Empty input returns at once. Nothing to wait for is a satisfied wait, and TypeScript
+    /// short-circuits an empty handle list the same way — where an empty *first*-wait has no
+    /// answer to give and is refused.
+    async fn await_workflow_ids(
+        &self,
+        workflow_ids: &[&str],
+        poll_interval: Duration,
+    ) -> Result<(), Error>;
+
     /// Moves a delayed workflow's release time.
     ///
     /// Only touches a `DELAYED` row. A workflow that has already been released is running or
