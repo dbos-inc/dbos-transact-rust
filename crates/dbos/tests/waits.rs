@@ -64,11 +64,11 @@ struct Gates {
 /// `wait_first` reports the position of whichever member settles first, and the test picks which
 /// that is.
 ///
-/// Three workflows blocked at their own gates; the middle one is released. The answer has to be
-/// position 1 — which is the whole contract: not the first id passed, not the first started, but
-/// the first to *finish*.
+/// Three workflows blocked at their own gates; the middle one is released. The answer has to name
+/// that one — which is the whole contract: not the first id passed, not the first started, but the
+/// first to *finish*.
 #[tokio::test]
-async fn wait_first_reports_the_position_of_the_first_to_settle() {
+async fn wait_first_reports_the_first_to_settle() {
     let db = test_database().await;
     let dbos = DBOS::new(config("wait-first-app", &db));
 
@@ -128,7 +128,10 @@ async fn wait_first_reports_the_position_of_the_first_to_settle() {
         .expect("the wait never resolved")
         .expect("the waiting task panicked")
         .expect("wait_first failed");
-    assert_eq!(first, 1, "the released workflow is the one that finished");
+    assert_eq!(
+        first, "blocked-1",
+        "the released workflow is the one that finished"
+    );
 
     // The others are still going, which is what makes the answer meaningful.
     for other in [0, 2] {
@@ -205,7 +208,10 @@ async fn a_cancelled_workflow_counts_as_settled() {
     .await
     .expect("the wait never resolved")
     .expect("wait_first failed");
-    assert_eq!(first, 0, "the cancelled workflow is the one that settled");
+    assert_eq!(
+        first, "doomed",
+        "the cancelled workflow is the one that settled"
+    );
 
     release.notify_one();
     dbos.shutdown().await;
@@ -308,14 +314,15 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
     dbos.shutdown().await;
 }
 
-/// A repeated id is refused by `wait_first` and accepted by `wait_all`.
+/// A repeated id is accepted by both waits, and answers with the id it names.
 ///
-/// The asymmetry follows from what each returns. A position cannot name a duplicate, so the answer
-/// would be ambiguous; settling is a property of an id rather than a choice between ids, so a
-/// repeat is simply satisfied twice. Python and TypeScript reject the same input in `waitFirst`
-/// for the same reason.
+/// Python and TypeScript refuse it in `waitFirst`, but only because they return the winning
+/// *handle* and key a map by id to find it. An id has no such collision: a set holding `a` twice
+/// answers `a`, which names one workflow however many entries pointed at it. The set arises
+/// legitimately — a caller-supplied id that `start` joined to a run already going hands back a
+/// second handle on one workflow.
 #[tokio::test]
-async fn a_repeated_id_is_refused_only_where_the_answer_is_a_position() {
+async fn a_repeated_id_is_accepted_by_both_waits() {
     let db = test_database().await;
     let dbos = DBOS::new(config("wait-dup-app", &db));
     let quick = dbos
@@ -327,14 +334,12 @@ async fn a_repeated_id_is_refused_only_where_the_answer_is_a_position() {
     let id = handle.workflow_id().to_owned();
     assert_eq!(handle.result().await.expect("the workflow failed"), 1);
 
-    let err = dbos
-        .wait_first(&[&id, &id])
+    let first = tokio::time::timeout(DEADLINE, dbos.wait_first(&[&id, &id]))
         .await
-        .expect_err("a duplicate should be refused");
-    assert!(matches!(err, Error::Config(_)), "{err}");
-    assert!(err.to_string().contains(&id), "{err}");
+        .expect("the wait never resolved")
+        .expect("a duplicate should be accepted");
+    assert_eq!(first, id, "the answer names the one workflow in the set");
 
-    // The same input is fine here: it is already settled, so this returns at once.
     tokio::time::timeout(DEADLINE, dbos.wait_all(&[&id, &id]))
         .await
         .expect("the wait never resolved")
@@ -375,7 +380,7 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
                     // executor from the ambient context rather than capturing a `DBOS`.
                     let first = dbos::wait_first(&ids).await?;
                     dbos::wait_all(&ids).await?;
-                    Ok::<_, Error>(first as u32)
+                    Ok::<_, Error>(first)
                 }
             }
         })
@@ -408,19 +413,24 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
         "the two launches and the two waits, in order"
     );
 
-    // The winner is the payload, and it is the id of whichever child the parent reported.
+    // The winner is the payload, and it is exactly what the parent returned — no projection on
+    // the way out, which is the point of answering with the id rather than a position.
     let recorded = steps[2]
         .output
         .as_deref()
         .expect("waitFirst recorded no winner");
     let winner: String = serde_json::from_str(recorded).expect("the winner is not a string");
+    assert_eq!(
+        winner, first,
+        "the recorded winner is what the parent returned"
+    );
     let children = reader
         .get_workflow_children(&workflow_id)
         .await
         .expect("read failed");
-    assert_eq!(
-        winner, children[first as usize],
-        "the recorded winner is the position the parent returned"
+    assert!(
+        children.contains(&winner),
+        "the winner {winner} is not one of the children {children:?}"
     );
 
     // An all-wait decides nothing, so there is nothing for a replay to branch on.
@@ -494,12 +504,15 @@ async fn a_client_waits_on_workflows_it_did_not_start() {
         .expect("wait_all failed");
     assert_eq!(ran.load(Ordering::SeqCst), 2);
 
-    // Both are settled, so a first-wait answers at once with a position in the set it was given.
+    // Both are settled, so a first-wait answers at once with an id from the set it was given.
     let first = tokio::time::timeout(DEADLINE, client.wait_first(&borrowed))
         .await
         .expect("the wait never resolved")
         .expect("wait_first failed");
-    assert!(first < 2, "the position names a member of the set");
+    assert!(
+        borrowed.contains(&first.as_str()),
+        "the answer {first} is not one of the ids waited on"
+    );
 
     dbos.shutdown().await;
 }

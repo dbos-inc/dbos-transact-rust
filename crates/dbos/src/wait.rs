@@ -12,13 +12,13 @@
 //! let mut handles = handles;
 //! while !handles.is_empty() {
 //!     // The borrow ends with the block, so the set can be narrowed below.
-//!     let first = {
+//!     let id = {
 //!         let ids: Vec<&str> = handles.iter().map(|h| h.workflow_id()).collect();
 //!         dbos.wait_first(&ids).await?
 //!     };
 //!     // Removed before it is awaited, so the next pass waits on the rest.
-//!     let winner = handles.swap_remove(first);
-//!     let id = winner.workflow_id().to_owned();
+//!     let at = handles.iter().position(|h| h.workflow_id() == id).expect("in the set");
+//!     let winner = handles.swap_remove(at);
 //!     println!("{id} finished: {:?}", winner.result().await);
 //! }
 //! # Ok(()) }
@@ -39,14 +39,22 @@
 //!
 //! # Where this differs from the references
 //!
-//! **They return handles; these return positions.** `DBOS.waitFirst` hands back the handle that
-//! won, which in a language without ownership costs nothing: the caller still holds the others.
-//! Handing back an owned [`WorkflowHandle`] here would mean taking the whole set by value and
-//! dropping every loser, which is precisely the wrong thing for the loop the call exists for. An
-//! index leaves the caller holding everything and composes with
-//! [`Vec::swap_remove`](std::vec::Vec::swap_remove), as above. `wait_all` returns nothing for the
-//! same reason its references return their inputs unchanged: there is nothing to hand back that
-//! the caller did not already have.
+//! **They return handles; these return ids.** `DBOS.waitFirst` hands back the handle that won,
+//! which in a language without ownership costs nothing: the caller still holds the others. Handing
+//! back an owned [`WorkflowHandle`] here would mean taking the whole set by value and dropping
+//! every loser, which is precisely the wrong thing for the loop the call exists for. So the answer
+//! is the winner's **id** — the identity the handle carried anyway, and the same thing the
+//! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
+//!
+//! A position in the slice was the other candidate and is worse on every count that matters: it is
+//! the only positional return anywhere in this crate (`cancel_all` and its neighbours take ids and
+//! give back ids), it is meaningful only against the exact slice it came from and so can be
+//! misapplied to a drifted one with no error, and it is what would force a set with no repeats.
+//! The one thing it buys is skipping a
+//! [`position`](std::iter::Iterator::position) lookup in the drain loop above.
+//!
+//! `wait_all` returns nothing for the same reason its references return their inputs unchanged:
+//! there is nothing to hand back that the caller did not already have.
 //!
 //! **They take handles; these take ids.** Every bulk call in this crate takes `&[&str]` —
 //! [`cancel_all`](crate::DBOS::cancel_all), [`delete_all`](crate::DBOS::delete_all),
@@ -71,7 +79,7 @@
 //! - **`wait_first` records a choice.** A replay that raced again could see a different member
 //!   finish first and take a different branch, which would make the workflow nondeterministic in
 //!   the one way a workflow may never be. So the winner's id is the step's output, and a replay
-//!   returns the same position without waiting.
+//!   hands back the same id without waiting.
 //! - **`wait_all` records only that it happened.** Every member has settled by the time it
 //!   returns, in whatever order, so there is no choice to pin — the checkpoint exists to skip the
 //!   poll on replay, which is what TypeScript's records too.
@@ -107,7 +115,7 @@ use crate::error::{Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 
-/// Waits until one of these workflows finishes, and reports **which position** in the slice it was.
+/// Waits until one of these workflows finishes, and reports **which**.
 ///
 /// The waiter for a workflow body: it takes the executor from the ambient context, so a workflow
 /// that waits on a fan-out needs no [`DBOS`] handle and its registered closure captures nothing.
@@ -125,15 +133,18 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// for n in 0..3 {
 ///     handles.push(child.start(n).await?);
 /// }
-/// let ids: Vec<&str> = handles.iter().map(|h| h.workflow_id()).collect();
-/// let first = dbos::wait_first(&ids).await?;
-/// handles.swap_remove(first).result().await
+/// let id = {
+///     let ids: Vec<&str> = handles.iter().map(|h| h.workflow_id()).collect();
+///     dbos::wait_first(&ids).await?
+/// };
+/// let at = handles.iter().position(|h| h.workflow_id() == id).expect("in the set");
+/// handles.swap_remove(at).result().await
 /// # }
 /// ```
 ///
 /// Outside a workflow there is no context to read, so this is [`Error::NotInWorkflow`]. That is
 /// where [`DBOS::wait_first`] is the call.
-pub async fn wait_first<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<usize, E> {
+pub async fn wait_first<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<String, E> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {
             operation: "wait_first".into(),
@@ -180,8 +191,7 @@ pub async fn wait_all<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<(
 }
 
 impl DBOS {
-    /// Waits until one of these workflows finishes, and reports **which position** in the slice it
-    /// was.
+    /// Waits until one of these workflows finishes, and reports **which**.
     ///
     /// The waiter for code outside a workflow — an operator's tool, or an HTTP handler watching a
     /// batch it kicked off. **Inside a workflow, reach for the free [`wait_first`] instead**: it
@@ -198,16 +208,16 @@ impl DBOS {
     /// [`WorkflowHandle::result`](crate::WorkflowHandle::result), typed — this answers *when*, and
     /// the handle answers *what*.
     ///
-    /// **A position, where the references hand back a handle.** Returning an owned
+    /// **The winner's id, where the references hand back its handle.** Returning an owned
     /// [`WorkflowHandle`](crate::WorkflowHandle) would mean taking the whole set by value and
-    /// dropping every loser, which is the wrong thing for the loop this call exists for. An index
-    /// leaves the caller holding everything and composes with
-    /// [`Vec::swap_remove`](std::vec::Vec::swap_remove).
+    /// dropping every loser, which is the wrong thing for the loop this call exists for. The id is
+    /// the identity that handle carried, it is what the checkpoint stores, and it is what every
+    /// other bulk call in this crate deals in.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS, a: &str, b: &str) -> dbos::Result<()> {
     /// let first = dbos.wait_first(&[a, b]).await?;
-    /// println!("{} got there first", [a, b][first]);
+    /// println!("{first} got there first");
     /// # Ok(()) }
     /// ```
     ///
@@ -219,30 +229,23 @@ impl DBOS {
     /// [`await_first_workflow_id`](crate::sysdb::SystemDatabase::await_first_workflow_id) sets out
     /// why an `ORDER BY` would make this worse rather than better.
     ///
-    /// **Duplicate ids are refused.** Python and TypeScript refuse them too, but for a reason that
-    /// does not reach here: both return the winning *handle*, so both build a map keyed by id, and
-    /// a repeat would put two handles under one key. A position has no such collision — `[a, b, a]`
-    /// would answer `0` and go on answering `0` across a replay.
+    /// **Duplicate ids are accepted**, here and in [`wait_all`](Self::wait_all). Python and
+    /// TypeScript both refuse them, for a reason that does not reach a Rust caller: they return the
+    /// winning *handle*, so they key a map by id, and a repeat would put two handles under one key.
+    /// An id has no such collision — a set with `a` twice answers `a`, which names one workflow
+    /// however many entries pointed at it. A caller-supplied id that
+    /// [`start`](crate::WorkflowRef::start) joined to a run already going produces exactly that
+    /// set, legitimately, and there is nothing here for it to break.
     ///
-    /// It is refused because of what a repeat *means*: a caller who believes they are waiting on
-    /// N workflows and is in fact waiting on fewer. A drain loop over such a set still terminates
-    /// and still drains — which is precisely the problem, since it works while the count it was
-    /// built from is wrong. Wait time is a good place to hear about a fan-out that started fewer
-    /// workflows than it meant to.
-    ///
-    /// The one legitimate way to arrive here is real: a caller-supplied id that
-    /// [`start`](crate::WorkflowRef::start) joined to a run already going hands back a second
-    /// handle on one workflow. That case dedupes in a line, which is the trade taken deliberately
-    /// — accepting duplicates later would stay compatible, and demanding them later would not.
-    ///
-    /// **An empty slice is refused** rather than waited on. Python raises here too; a wait for one
-    /// of nothing has no answer it could ever give.
+    /// **An empty slice is refused** rather than waited on — the one input either wait rejects.
+    /// Python raises here too; a wait for one of nothing has no answer it could ever give, where a
+    /// wait for *all* of nothing is already satisfied.
     ///
     /// **An id naming no workflow is waited for, not reported**, which is what makes a set of ids
     /// usable before every enqueue has committed — and what makes a mistyped id a wait that never
     /// ends. That is the trade every reference makes here, and the bound on it is dropping the
     /// future.
-    pub async fn wait_first(&self, workflow_ids: &[&str]) -> Result<usize> {
+    pub async fn wait_first(&self, workflow_ids: &[&str]) -> Result<String> {
         let executor = self.executor("wait_first")?;
         executor.connection().wait_first(workflow_ids).await
     }
@@ -265,10 +268,10 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     ///
-    /// **Duplicates are accepted**, unlike in [`wait_first`](Self::wait_first): settling is a
-    /// property of an id rather than a choice between ids, so a repeated one is simply satisfied
-    /// twice. **An empty slice returns at once** — nothing to wait for is a satisfied wait, where
-    /// an empty first-wait has no answer and is refused.
+    /// **Duplicates are accepted**, as they are in [`wait_first`](Self::wait_first): settling is a
+    /// property of an id, so a repeated one is simply satisfied twice. **An empty slice returns at
+    /// once** — nothing to wait for is a satisfied wait, where an empty first-wait has no answer
+    /// and is refused.
     pub async fn wait_all(&self, workflow_ids: &[&str]) -> Result<()> {
         let executor = self.executor("wait_all")?;
         executor.connection().wait_all(workflow_ids).await
@@ -290,11 +293,11 @@ impl DBOS {
 /// operator's tool wants most: a client is the caller most likely to hold a set of ids it did not
 /// start.
 impl crate::Client {
-    /// Waits until one of these workflows finishes, and reports which position it was.
+    /// Waits until one of these workflows finishes, and reports which.
     ///
     /// See [`DBOS::wait_first`]. Nothing is checkpointed, because a client has nothing to
     /// checkpoint against.
-    pub async fn wait_first(&self, workflow_ids: &[&str]) -> Result<usize> {
+    pub async fn wait_first(&self, workflow_ids: &[&str]) -> Result<String> {
         self.connection().wait_first(workflow_ids).await
     }
 
@@ -315,22 +318,17 @@ impl Connection {
     pub(crate) async fn wait_first(
         self: &std::sync::Arc<Self>,
         workflow_ids: &[&str],
-    ) -> Result<usize> {
+    ) -> Result<String> {
         // Before the placement, because a call that cannot be answered should not move the
         // workflow's step counter: a workflow that fails here and is fixed to pass a non-empty set
         // would otherwise replay onto a different slot than it recorded.
+        //
+        // The only thing refused. Nothing here cares whether an id repeats — the answer is the id
+        // itself, which names one workflow however many entries pointed at it.
         if workflow_ids.is_empty() {
             return Err(Error::Config(
                 "wait_first was given no workflow ids to wait for".to_owned(),
             ));
-        }
-        // Enforced here and nowhere below: `await_first_workflow_id` is total on duplicates, and
-        // it is *this* surface's answer — a position — that needs the ids to be distinct.
-        if let Some(duplicate) = first_duplicate(workflow_ids) {
-            return Err(Error::Config(format!(
-                "wait_first was given the workflow id `{duplicate}` more than once, so the set \
-                 names fewer workflows than it has entries"
-            )));
         }
 
         let placement = Placement::of(self, "wait_first")?;
@@ -341,21 +339,21 @@ impl Connection {
                 workflow_id = winner,
                 "replaying wait_first; the same workflow wins again"
             );
-            // **The recorded winner has to still be in the set.** A workflow that changed which
-            // ids it waits on between runs has changed the meaning of this position, and adopting
-            // a stale winner would silently take the branch the old code took. This is the same
-            // check `Awaiting::recorded` makes against a recorded child id, for the same reason.
-            return position_of(&winner, workflow_ids).ok_or_else(|| {
-                Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
-                    workflow_id: placement
-                        .step()
-                        .map(|(id, _)| id.to_owned())
-                        .unwrap_or_default(),
-                    step_id: placement.step().map(|(_, step)| step).unwrap_or_default(),
+            // **The recorded winner has to still be in the set**, which is a determinism check and
+            // not bookkeeping: a workflow that changed which ids it waits on has changed what this
+            // position of its code means, and handing back a winner it no longer waits on would
+            // have it act on an answer to a question it stopped asking. The same check
+            // `Awaiting::check` makes against a recorded child id, for the same reason.
+            if !workflow_ids.contains(&winner.as_str()) {
+                let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
+                return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+                    workflow_id: workflow_id.to_owned(),
+                    step_id,
                     expected: format!("a wait_first over a set containing {winner}"),
                     recorded: format!("a wait_first won by {winner}, which is no longer waited on"),
-                })
-            });
+                }));
+            }
+            return Ok(winner);
         }
 
         // Taken before the wait, so a workflow's timeline shows the waiting rather than the
@@ -377,11 +375,7 @@ impl Connection {
                 started_at,
             )
             .await?;
-
-        // The database answered with an id it read out of the set this call sent, so a position
-        // always exists; the `expect` is the invariant rather than a case.
-        Ok(position_of(&winner, workflow_ids)
-            .expect("the winner came from the set that was waited on"))
+        Ok(winner)
     }
 
     /// The all-wait itself, shared by both surfaces.
@@ -416,46 +410,5 @@ impl Connection {
                 started_at,
             )
             .await
-    }
-}
-
-/// The first id that appears twice, if any.
-///
-/// A quadratic scan over a list short enough to name in one query, which is what these waits are
-/// for — building a hash set would cost more than it saves, and this runs once per call rather
-/// than once per poll.
-fn first_duplicate<'a>(workflow_ids: &[&'a str]) -> Option<&'a str> {
-    workflow_ids
-        .iter()
-        .enumerate()
-        .find(|(index, id)| workflow_ids[..*index].contains(id))
-        .map(|(_, id)| *id)
-}
-
-/// Where `winner` sits in the set that was waited on.
-fn position_of(winner: &str, workflow_ids: &[&str]) -> Option<usize> {
-    workflow_ids.iter().position(|id| *id == winner)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_repeated_id_is_found_wherever_it_sits() {
-        assert_eq!(first_duplicate(&["a", "b", "c"]), None);
-        assert_eq!(first_duplicate(&["a", "b", "a"]), Some("a"));
-        assert_eq!(first_duplicate(&["a", "a"]), Some("a"));
-        assert_eq!(first_duplicate(&[]), None);
-        // The *second* occurrence is what is reported, so the message names the id rather than a
-        // position the caller would have to count to.
-        assert_eq!(first_duplicate(&["a", "b", "b", "a"]), Some("b"));
-    }
-
-    #[test]
-    fn a_winner_maps_back_to_the_first_position_holding_it() {
-        assert_eq!(position_of("b", &["a", "b", "c"]), Some(1));
-        assert_eq!(position_of("z", &["a", "b", "c"]), None);
-        assert_eq!(position_of("a", &[]), None);
     }
 }

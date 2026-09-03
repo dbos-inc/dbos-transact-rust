@@ -261,13 +261,12 @@ pub trait SystemDatabase: Send + Sync {
     /// exist. A caller who needs the stricter reading holds one id and uses
     /// [`await_workflow_result`](Self::await_workflow_result).
     ///
-    /// **Duplicate ids are fine here, and this makes no demand about them.** `ANY` de-duplicates
-    /// on its own and `LIMIT 1` answers with an id either way, so there is nothing a repeat can
-    /// break at this layer. The uniqueness requirement belongs to
-    /// [`wait_first`](crate::DBOS::wait_first) alone, because what *it* returns is a position, and
-    /// a position is only meaningful over a set whose ids are distinct. Stating a precondition
-    /// down here that only the layer above needs would be claiming a constraint this method does
-    /// not have and does not check.
+    /// **Duplicate ids are fine, and nothing above requires otherwise either.** `ANY`
+    /// de-duplicates on its own and `LIMIT 1` answers with an id, which names one workflow however
+    /// many entries pointed at it — so a repeat is invisible here and stays invisible all the way
+    /// out to [`wait_first`](crate::DBOS::wait_first), whose answer is that same id. Python and
+    /// TypeScript both reject a repeated id at their own surface, but only because they return a
+    /// *handle* and key a map by id to find it; neither constraint survives the translation.
     ///
     /// Empty input is [`Error::Malformed`], not a wait that never ends. Python raises
     /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which
