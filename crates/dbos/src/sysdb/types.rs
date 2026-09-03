@@ -2286,6 +2286,29 @@ pub mod step_names {
     /// reason both of those exist rather than the caller passing a name.
     pub const GET_RESULT: &str = "DBOS.getResult";
 
+    /// The step names a wait over several workflow handles records.
+    ///
+    /// **camelCase in both, and both are taken from a reference rather than invented.** Python
+    /// spells its method `wait_first` but records `"DBOS.waitFirst"`
+    /// (`_dbos.py:1634`), and TypeScript's `DBOS.waitFirst` records the same string — so
+    /// [`WAIT_FIRST`] is unanimous among the two implementations that have the call at all.
+    /// [`WAIT_ALL`] is TypeScript's alone, from the `runInternalStep` label in `DBOS.waitAll`;
+    /// Python has no `wait_all`, and Go and Java have neither.
+    ///
+    /// **What each one records is not the same shape.** A first-wait's answer is a *choice* — the
+    /// id that won — and a replay that made it again could pick a different winner and take a
+    /// different branch, so the winner is the step's output. An all-wait has no choice to make:
+    /// every id it was given has settled by the time it returns, in whatever order, and the
+    /// handles come back in the order the caller passed them. Its checkpoint therefore carries no
+    /// payload and exists only to skip the poll, which is exactly what TypeScript's records.
+    ///
+    /// Neither name is a bulk/singular pair like [`CANCEL_WORKFLOW`] — these are two different
+    /// operations, and a workflow that switched between them between runs has changed what it
+    /// waits for, which is nondeterminism worth raising
+    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) over.
+    pub const WAIT_FIRST: &str = "DBOS.waitFirst";
+    pub const WAIT_ALL: &str = "DBOS.waitAll";
+
     /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT`].
     pub const RECV: &str = "DBOS.recv";
 

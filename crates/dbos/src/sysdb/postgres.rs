@@ -1519,6 +1519,19 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// compared against is the dequeue's own.
 const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 
+/// The three statuses that mean a workflow has not finished doing anything yet.
+///
+/// Spelled into the SQL rather than bound, because these are this crate's own enum rendered by
+/// [`WorkflowStatus::as_str`](super::types::WorkflowStatus::as_str) and never a caller's string —
+/// the same standing the table names have. Binding them would cost an array parameter on a query
+/// that runs once per poll interval for the length of every wait.
+///
+/// **The complement is the definition of "settled", and it is deliberately wide**: `SUCCESS`,
+/// `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` all end a wait. Python and TypeScript
+/// exclude exactly these three and no others, so a Rust waiter and a TypeScript one watching the
+/// same fan-out agree on who finished first.
+const UNSETTLED: &str = "'PENDING', 'ENQUEUED', 'DELAYED'";
+
 /// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
@@ -3229,6 +3242,120 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    async fn await_first_workflow_id(
+        &self,
+        workflow_ids: &[&str],
+        poll_interval: Duration,
+    ) -> Result<String, Error> {
+        // Refused rather than parked forever: `= ANY('{}')` matches nothing, so an empty wait would
+        // be a wait with no possible end. Python raises at the same point.
+        if workflow_ids.is_empty() {
+            return Err(Error::InvalidInput {
+                field: "workflow_ids".into(),
+                detail: "must name at least one workflow to wait for".to_owned(),
+            });
+        }
+        let workflow_table = self.tables.workflow_status.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // One id, not the row: this asks *which* finished, and whatever it returned is read
+        // afterwards through the winner's own handle. `LIMIT 1` because one answer ends the wait —
+        // a second settled member is the caller's next question, not this one's.
+        let select = format!(
+            "SELECT workflow_uuid FROM {workflow_table} \
+             WHERE workflow_uuid = ANY($1) AND status NOT IN ({UNSETTLED}) \
+             LIMIT 1"
+        );
+        let select = &select;
+        let ids: Vec<String> = workflow_ids.iter().map(|id| (*id).to_owned()).collect();
+        let ids = &ids;
+
+        loop {
+            // Inside the loop, so a transient failure is retried by the policy and a lasting one
+            // reaches the caller rather than being swallowed by the wait — as in
+            // `await_workflow_result`, and the permit is taken and dropped on the same terms.
+            let row = with_retry(&self.retry, "await_first_workflow_id", move || async move {
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
+                Ok(sqlx::query(AssertSqlSafe(select.clone()))
+                    .bind(ids)
+                    .fetch_optional(pool)
+                    .await?)
+            })
+            .await?;
+
+            if let Some(row) = row {
+                let winner: String = row.try_get("workflow_uuid")?;
+                tracing::debug!(workflow_id = winner, "the first of the awaited set settled");
+                return Ok(winner);
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    async fn await_workflow_ids(
+        &self,
+        workflow_ids: &[&str],
+        poll_interval: Duration,
+    ) -> Result<(), Error> {
+        // Nothing to wait for is a satisfied wait — and unlike the first-form above there is no
+        // answer missing, so this returns rather than refusing.
+        if workflow_ids.is_empty() {
+            return Ok(());
+        }
+        let workflow_table = self.tables.workflow_status.as_str();
+        let (pool, polling) = (&self.pool, &self.polling);
+        // Returns the settled members rather than a count, because the next pass has to ask about
+        // the rest: a count would say how many are done without saying which.
+        let select = format!(
+            "SELECT workflow_uuid FROM {workflow_table} \
+             WHERE workflow_uuid = ANY($1) AND status NOT IN ({UNSETTLED})"
+        );
+        let select = &select;
+        let mut outstanding: Vec<String> = workflow_ids.iter().map(|id| (*id).to_owned()).collect();
+        // **Where the first-form's caller rejects duplicates, this one accepts them**, because
+        // settling is a property of an id rather than a choice between ids — so a repeat is simply
+        // satisfied twice, and this is the wait that actually receives one.
+        //
+        // Correctness never depended on the dedup: `retain` below drops *every* copy of an id that
+        // settles, so duplicates would fall out on their own the first pass one of them did. What
+        // it saves is the array bytes until then. The sort is not an ordering decision — `dedup`
+        // only removes *consecutive* duplicates, and that is the whole of what it is for.
+        outstanding.sort_unstable();
+        outstanding.dedup();
+
+        while !outstanding.is_empty() {
+            let ids = &outstanding;
+            let settled = with_retry(&self.retry, "await_workflow_ids", move || async move {
+                let _permit = polling
+                    .acquire()
+                    .await
+                    .expect("the polling limiter is never closed");
+                Ok(sqlx::query(AssertSqlSafe(select.clone()))
+                    .bind(ids)
+                    .fetch_all(pool)
+                    .await?)
+            })
+            .await?;
+
+            for row in &settled {
+                let id: String = row.try_get("workflow_uuid")?;
+                // A linear scan of a list that is only ever shrinking, over a set small enough to
+                // name in one query — a hash set would cost more to build than it saves.
+                outstanding.retain(|outstanding| *outstanding != id);
+            }
+            if outstanding.is_empty() {
+                break;
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+        tracing::debug!("every awaited workflow settled");
+        Ok(())
     }
 
     async fn set_workflow_delay(

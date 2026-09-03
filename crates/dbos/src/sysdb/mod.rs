@@ -245,6 +245,100 @@ pub trait SystemDatabase: Send + Sync {
         fail_if_missing: bool,
     ) -> Result<AwaitedOutcome, Error>;
 
+    /// Waits until one of these workflows has settled, and reports which.
+    ///
+    /// "Settled" is the *status* leaving `PENDING`, `ENQUEUED` and `DELAYED` — the same three
+    /// TypeScript's `awaitFirstWorkflowId` and Python's `check_first_workflow_id` exclude. So a
+    /// cancelled or dead-lettered workflow counts as settled and can be the one reported, which is
+    /// deliberate in all three: the caller asked which race finished first, not which succeeded,
+    /// and it has [`await_workflow_result`](Self::await_workflow_result) to ask the second question
+    /// with. Reporting only successes would leave a caller waiting out its whole fan-out because
+    /// one member was cancelled.
+    ///
+    /// **An id naming no row is waited for, never refused.** There is no `fail_if_missing` here
+    /// and neither reference has one: a set of ids is settled by whichever member appears first,
+    /// and an id whose enqueue has not committed yet is indistinguishable from one that will never
+    /// exist. A caller who needs the stricter reading holds one id and uses
+    /// [`await_workflow_result`](Self::await_workflow_result).
+    ///
+    /// **Duplicate ids are fine, and nothing above requires otherwise either.** `ANY`
+    /// de-duplicates on its own and `LIMIT 1` answers with an id, which names one workflow however
+    /// many entries pointed at it — so a repeat is invisible here and stays invisible all the way
+    /// out to [`wait_first`](crate::DBOS::wait_first), whose answer is that same id. Python and
+    /// TypeScript both reject a repeated id at their own surface, but only because they return a
+    /// *handle* and key a map by id to find it; neither constraint survives the translation.
+    ///
+    /// Empty input is [`Error::InvalidInput`], not a wait that never ends — a caller's value the
+    /// layer will not act on, rather than a stored one it could not read. Python raises
+    /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which
+    /// is the worst possible reading of "wait for one of nothing".
+    ///
+    /// **Two members that settle in the same interval are a tie this cannot break**, and the
+    /// winner between them is arbitrary. There is no `ORDER BY`: the poll asks for one settled row
+    /// and takes whichever the plan yields first, which can vary with statistics and physical row
+    /// order. TypeScript and Python both do exactly this — neither orders its own `LIMIT 1` — so a
+    /// Rust waiter and a TypeScript one on the same database are arbitrary in the same way rather
+    /// than differently.
+    ///
+    /// It is also the honest answer, because **the poll interval is the resolution at which this
+    /// call can observe finishing at all**. Two candidate orderings look like improvements and are
+    /// not:
+    ///
+    /// - `ORDER BY completed_at` would be a lie for the one status hardest to reason about. The
+    ///   dead-letter transition sets neither `completed_at` nor `updated_at`, so a parked member
+    ///   sorts on a stale or absent value and would systematically win or lose by where `NULLS`
+    ///   were put — not by when it stopped.
+    /// - `ORDER BY workflow_uuid` would be stable and meaningless: it turns *which finished first*
+    ///   into *which sorts first* whenever more than one is ready, biasing every tie toward
+    ///   `task-0` in a fan-out named that way. Stable nondeterminism reads as a guarantee and is
+    ///   not one, which is worse than visible arbitrariness.
+    ///
+    /// **What makes the arbitrariness harmless is the checkpoint above this layer**, not anything
+    /// here. [`wait_first`](crate::DBOS::wait_first) records the winner, so a replay reads it back
+    /// rather than racing again and cannot take a different branch. A caller outside a workflow
+    /// has nothing recorded and may well see a different winner from a second call over the same
+    /// settled set — which is right, because it asked a question about *now*.
+    ///
+    /// **One row, not one per id**, and it polls under the same concurrency cap
+    /// [`await_workflow_result`](Self::await_workflow_result) waits under and for the same reason
+    /// — a fan-out waiting on N workflows through N separate result waits is N queries per
+    /// interval, where this is one whatever N is. That is the efficiency the call exists for as
+    /// much as the semantics.
+    async fn await_first_workflow_id(
+        &self,
+        workflow_ids: &[&str],
+        poll_interval: Duration,
+    ) -> Result<String, Error>;
+
+    /// Waits until every one of these workflows has settled.
+    ///
+    /// The all-form of [`await_first_workflow_id`](Self::await_first_workflow_id), with the same
+    /// definition of settled and the same treatment of an id that names no row — so this waits out
+    /// a mistyped id rather than reporting it, exactly as TypeScript's `awaitWorkflowIds` does.
+    ///
+    /// **Each pass asks only about the ids still outstanding**, which is what keeps a long fan-out
+    /// from re-reading the whole set every interval once most of it has finished. TypeScript
+    /// narrows the same way, against a `Set` it deletes from.
+    ///
+    /// **Duplicates are harmless**, as they are in the first-form: settling is a property of an id
+    /// rather than a choice between ids, so a repeated id is simply satisfied twice. Nothing above
+    /// removes them either — [`wait_all`](crate::DBOS::wait_all) passes the caller's slice through
+    /// as it was given — so an implementation must expect them.
+    ///
+    /// Narrowing the array it sends is then an implementation's own business rather than a
+    /// contract: the Postgres one de-duplicates once before its first pass, which buys array bytes
+    /// and nothing else, since the narrowing above drops *every* copy of an id the moment one of
+    /// them settles.
+    ///
+    /// Empty input returns at once. Nothing to wait for is a satisfied wait, and TypeScript
+    /// short-circuits an empty handle list the same way — where an empty *first*-wait has no
+    /// answer to give and is refused.
+    async fn await_workflow_ids(
+        &self,
+        workflow_ids: &[&str],
+        poll_interval: Duration,
+    ) -> Result<(), Error>;
+
     /// Moves a delayed workflow's release time.
     ///
     /// Only touches a `DELAYED` row. A workflow that has already been released is running or
