@@ -290,7 +290,7 @@ impl fmt::Display for WorkflowStatus {
 /// schema declares `NOT NULL` and this layer always writes, and a field added later must carry it
 /// too. Without it, adding a column — this struct mirrors `workflow_status`, which gains them —
 /// makes an older checkpoint unreadable, and `run_transactional_step` reports that as
-/// [`Error::Malformed`](crate::sysdb::Error::Malformed): not a retryable class, raised on the
+/// [`Error::Malformed`]: not a retryable class, raised on the
 /// replay path, so the workflow can never get past that step. Unknown fields are already
 /// tolerated, `serde` ignoring them by default, so the reverse direction needs nothing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

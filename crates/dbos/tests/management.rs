@@ -22,12 +22,19 @@ use dbos_test_support::{TestDatabase, test_database};
 
 /// The version an instance in this file launches with: DBOS computes none, so a launch without
 /// one fails.
-const APP_VERSION: &str = "1.0.0";
+///
+/// Derived from the application name, as `events.rs` and `children.rs` do, because a version row
+/// is claimed by the first application to register it — so two instances sharing a database and a
+/// version, which is what the two-instance tests below set up, would have the second refused with
+/// `RegisteredByAnother` before it could get to what it is testing.
+fn app_version(app_name: &str) -> String {
+    format!("{app_name}-1.0.0")
+}
 
 fn config(app_name: &str, db: &TestDatabase) -> Config {
     Config {
         migrate: false,
-        app_version: Some(APP_VERSION.to_owned()),
+        app_version: Some(app_version(app_name)),
         ..Config::new(app_name, db.url())
     }
 }
