@@ -319,9 +319,15 @@ pub trait SystemDatabase: Send + Sync {
     /// from re-reading the whole set every interval once most of it has finished. TypeScript
     /// narrows the same way, against a `Set` it deletes from.
     ///
-    /// Duplicates are harmless here, unlike in the first-form: settling is a property of the id
-    /// rather than a choice between ids, so a repeated id is simply satisfied twice. The engine
-    /// de-duplicates before calling anyway, to keep the array it sends proportional to the work.
+    /// **Duplicates are harmless**, as they are in the first-form: settling is a property of an id
+    /// rather than a choice between ids, so a repeated id is simply satisfied twice. Nothing above
+    /// removes them either — [`wait_all`](crate::DBOS::wait_all) passes the caller's slice through
+    /// as it was given — so an implementation must expect them.
+    ///
+    /// Narrowing the array it sends is then an implementation's own business rather than a
+    /// contract: the Postgres one de-duplicates once before its first pass, which buys array bytes
+    /// and nothing else, since the narrowing above drops *every* copy of an id the moment one of
+    /// them settles.
     ///
     /// Empty input returns at once. Nothing to wait for is a satisfied wait, and TypeScript
     /// short-circuits an empty handle list the same way — where an empty *first*-wait has no
