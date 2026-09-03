@@ -6,14 +6,18 @@
 //! stand a real [`DBOS`] instance up beside the client, and assert the thing that makes the client
 //! worth having: work handed over by one process and run by another.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
+use dbos::sysdb::types::WorkflowFilter;
 use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
-    Change, Client, ClientConfig, Config, DBOS, DuplicationPolicy, Enqueue, EnqueueOptions, Error,
-    Forks, Message, QueueChange, QueueConflict, QueueOptions, WorkflowHandle,
+    Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
+    EnqueueOptions, Error, ForkFrom, ForkOptions, Forks, Message, QueueChange, QueueConflict,
+    QueueOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -1011,4 +1015,363 @@ async fn a_bad_configuration_is_refused_at_connect() {
         .await,
         Error::Config(_)
     ));
+}
+
+/// **The operator's case: a client stops work it did not start, and starts it again.**
+///
+/// The application enqueues onto a queue nothing polls, so the row sits still. A client — a
+/// separate process, holding nothing but a connection — cancels it, and the application never runs
+/// it. Resuming moves it onto the internal queue, which the application does poll, and it runs.
+#[tokio::test]
+async fn a_client_cancels_and_resumes_a_workflow_it_did_not_start() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("client-cancel", &db));
+    let ran = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("interruptible", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(7)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "stopped-from-outside";
+    workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(Enqueue::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let client = client("client-cancel", &db).await;
+    let cancelled = client
+        .cancel_all(&[id], Children::Skip)
+        .await
+        .expect("cancel failed");
+    assert_eq!(cancelled, [id], "the cancel did not move the row it named");
+    assert_eq!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Cancelled,
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "a cancelled workflow ran");
+
+    // And back again, from the same process that stopped it.
+    let handle = client
+        .resume::<u32, EngineOnly>(id)
+        .await
+        .expect("resume failed");
+    assert_eq!(handle.workflow_id(), id, "resuming changed the id");
+    assert_eq!(handle.result().await.expect("the workflow failed"), 7);
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// A client forks a workflow, and the application dequeues the fork and runs it.
+///
+/// The job an operator reaches for a client to do: re-run finished work without the application's
+/// code and without touching the original.
+#[tokio::test]
+async fn a_client_forks_a_workflow_the_application_then_runs() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("client-fork", &db));
+    let ran = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("repeatable", {
+            let ran = Arc::clone(&ran);
+            move |()| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(9)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let source = "already-run";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(source),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    let client = client("client-fork", &db).await;
+    let fork = client
+        .fork_with::<u32, EngineOnly>(
+            source,
+            ForkFrom::Beginning,
+            ForkOptions {
+                app_version: Some(APP_VERSION),
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_ne!(
+        fork.workflow_id(),
+        source,
+        "the fork reused the source's id"
+    );
+    assert_eq!(fork.result().await.expect("the fork failed"), 9);
+    assert_eq!(ran.load(Ordering::SeqCst), 2, "the fork did not run");
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// A chosen id names one fork, so the bulk form refuses it — the same refusal `DBOS::fork_all`
+/// makes, checked here because it is the one rule this surface enforces before any I/O.
+#[tokio::test]
+async fn a_clients_bulk_fork_refuses_a_chosen_id() {
+    let db = test_database().await;
+    let client = client("client-fork-refusal", &db).await;
+
+    let error = client
+        .fork_all::<u32, EngineOnly>(
+            &["a", "b"],
+            ForkFrom::Beginning,
+            ForkOptions {
+                forked_id: Some("only-one-of-me"),
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect_err("one id cannot name two forks");
+    assert!(matches!(error, Error::Config(_)), "{error}");
+
+    client.close().await;
+}
+
+/// A client deletes a workflow, and the row and its steps go with it.
+#[tokio::test]
+async fn a_client_deletes_a_workflow_it_did_not_start() {
+    let db = test_database().await;
+    let client = client("client-delete", &db).await;
+
+    let handle: WorkflowHandle<()> = client
+        .enqueue_with(
+            "never_registered",
+            (),
+            EnqueueOptions {
+                workflow_id: Some("to-be-deleted"),
+                ..EnqueueOptions::new("work")
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    assert_eq!(handle.workflow_id(), "to-be-deleted");
+
+    let deleted = client
+        .delete_all(&["to-be-deleted"], Children::Skip)
+        .await
+        .expect("delete failed");
+    assert_eq!(deleted, 1, "the delete removed the wrong number of rows");
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow("to-be-deleted")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the row survived its delete"
+    );
+
+    client.close().await;
+}
+
+/// Listing, tagging and delaying: the reads and small writes an operator's tool makes.
+///
+/// One test because they share a row, and because what each asserts is narrow. The attributes are
+/// a **replacement** rather than a merge, and `None` clears them, which is the half worth checking.
+#[tokio::test]
+async fn a_client_lists_tags_and_delays_workflows() {
+    let db = test_database().await;
+    let client = client("client-reads", &db).await;
+
+    let id = "under-inspection";
+    let _: WorkflowHandle<()> = client
+        .enqueue_with(
+            "never_registered",
+            (),
+            EnqueueOptions {
+                workflow_id: Some(id),
+                ..EnqueueOptions::new("work")
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let listed = client
+        .list_workflows(&WorkflowFilter {
+            workflow_ids: vec![id],
+            ..WorkflowFilter::default()
+        })
+        .await
+        .expect("listing failed");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|w| w.workflow_id.as_str())
+            .collect::<Vec<_>>(),
+        [id],
+    );
+    assert!(
+        client
+            .list_workflow_steps(id)
+            .await
+            .expect("step listing failed")
+            .is_empty(),
+        "a workflow nothing has run has no steps"
+    );
+
+    // Containment, not equality: one key out of two matches.
+    let tags = serde_json::json!({ "tenant": "acme", "tier": "gold" });
+    client
+        .update_workflow_attributes(id, tags.as_object())
+        .await
+        .expect("update failed");
+    let found = client
+        .list_workflows(&WorkflowFilter {
+            attributes: Some(r#"{"tenant":"acme"}"#),
+            ..WorkflowFilter::default()
+        })
+        .await
+        .expect("listing failed");
+    assert_eq!(
+        found
+            .iter()
+            .map(|w| w.workflow_id.as_str())
+            .collect::<Vec<_>>(),
+        [id],
+    );
+
+    // `None` clears, rather than leaving what was there.
+    client
+        .update_workflow_attributes(id, None)
+        .await
+        .expect("clear failed");
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .attributes
+            .is_none(),
+        "the attributes were not cleared"
+    );
+
+    // A delay only moves a DELAYED row, and this one is ENQUEUED -- so the call is accepted and
+    // changes nothing, which is the reference behaviour rather than an error.
+    client
+        .set_workflow_delay(id, dbos::WorkflowDelay::For(Duration::ZERO))
+        .await
+        .expect("delay failed");
+
+    client.close().await;
+}
+
+/// **A client's management call inside a workflow is not a step, where the same call on `DBOS`
+/// is.**
+///
+/// The line this crate already draws for a client's handle and its `get_event`, checked for the
+/// operator surface: the step id would have to come from an ambient context belonging to an
+/// instance the client is not. So the workflow records nothing, and a replay would make the call
+/// again.
+#[tokio::test]
+async fn a_clients_management_call_inside_a_workflow_is_not_a_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("client-inside", &db));
+    let client = client("client-inside", &db).await;
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("operator", {
+            let client = client.clone();
+            move |id: String| {
+                let client = client.clone();
+                async move {
+                    client.cancel(&id).await?;
+                    Ok::<(), Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let target_id = "cancelled-through-a-client";
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(target_id),
+                queue: Some(Enqueue::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let operator_id = "the-client-operator";
+    operator
+        .run_with(
+            target_id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(operator_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator workflow failed");
+
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow(target_id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Cancelled,
+        "the client's cancel did not reach the row",
+    );
+    assert!(
+        reader
+            .list_workflow_steps(operator_id, true, None, None, None)
+            .await
+            .expect("read failed")
+            .is_empty(),
+        "a client's call was checkpointed into the calling workflow's step sequence",
+    );
+
+    client.close().await;
+    dbos.shutdown().await;
 }
