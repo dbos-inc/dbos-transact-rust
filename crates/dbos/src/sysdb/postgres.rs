@@ -155,6 +155,10 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// failure to obtain a connection, and the difference only decides whether
 /// [`RetryPolicy::retry_connection_errors`] can opt out of it.
 ///
+/// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
+/// CockroachDB reports a lost client connection as an internal error, so the code alone would
+/// call a transport failure permanent. See [`is_transport_failure`].
+///
 /// Prefixes rather than exact codes, deliberately. The first version of the migration runner's
 /// classifier listed codes and was wrong twice; matching the class the standard defines is what
 /// stopped that.
@@ -168,6 +172,18 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
         return match &code[..2.min(code.len())] {
             "40" => BackendErrorKind::Transient,
             "08" | "53" | "57" => BackendErrorKind::Connection,
+            // `XX` is the internal-error class, and CockroachDB's `XXUUU` is its catch-all: the
+            // code it attaches to a failure it has no better code for. That includes losing the
+            // connection to a client mid-read, which it reports as an internal error whose
+            // message is the transport failure verbatim. Reading the message is the only way to
+            // tell those apart, and getting it wrong in this direction is what the reference
+            // implementations already accept: Python and TypeScript both match driver message
+            // text alongside the code, rather than letting a code that is not in the connection
+            // set end the decision.
+            "XX" => match error.as_database_error().map(|e| e.message()) {
+                Some(message) if is_transport_failure(message) => BackendErrorKind::Connection,
+                _ => BackendErrorKind::Permanent,
+            },
             _ => BackendErrorKind::Permanent,
         };
     }
@@ -185,6 +201,26 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
         sqlx::Error::PoolClosed => BackendErrorKind::Permanent,
         _ => BackendErrorKind::Permanent,
     }
+}
+
+/// Whether a database error's message is really a transport failure wearing a SQLSTATE.
+///
+/// Only consulted for the internal-error class, where the code says nothing beyond "something
+/// went wrong". The needles are Go's `net` package errors, which is what CockroachDB embeds when
+/// the connection to a client dies under it — `read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o
+/// timeout` and its siblings. Deliberately narrow: a false match here classifies a permanent
+/// failure as a connection one, and [`with_retry`](super::retry::with_retry) retries those
+/// forever.
+fn is_transport_failure(message: &str) -> bool {
+    const NEEDLES: [&str; 5] = [
+        "i/o timeout",
+        "broken pipe",
+        "connection reset by peer",
+        "connection refused",
+        "use of closed network connection",
+    ];
+    let message = message.to_ascii_lowercase();
+    NEEDLES.iter().any(|needle| message.contains(needle))
 }
 
 /// How a handle behaves against a database it is already connected to.
@@ -6760,8 +6796,43 @@ impl SystemDatabase for PostgresSystemDatabase {
 
 #[cfg(test)]
 mod tests {
-    use super::{polling_limit, split_database};
+    use super::{is_transport_failure, polling_limit, split_database};
     use tokio::sync::Semaphore;
+
+    /// The message CockroachDB attaches to `XXUUU` when a client's connection dies mid-read,
+    /// which is what makes that code a connection failure rather than an internal one.
+    #[test]
+    fn a_dead_socket_reads_as_a_transport_failure() {
+        assert!(is_transport_failure(
+            "read tcp 172.17.0.3:26257->172.17.0.1:37026: i/o timeout"
+        ));
+        assert!(is_transport_failure(
+            "write tcp 172.17.0.3:26257->172.17.0.1:37026: broken pipe"
+        ));
+        assert!(is_transport_failure(
+            "read tcp 10.0.0.2:26257->10.0.0.9:5432: connection reset by peer"
+        ));
+        assert!(is_transport_failure("use of closed network connection"));
+    }
+
+    /// Case is the server's business, not ours: the same failure is written either way depending
+    /// on which layer formatted it.
+    #[test]
+    fn transport_text_matches_whatever_its_case() {
+        assert!(is_transport_failure("read tcp: I/O timeout"));
+    }
+
+    /// The guard on the needles being narrow. `XXUUU` is a catch-all, so everything else carrying
+    /// it is a genuine internal error, and calling one a connection failure would have
+    /// `with_retry` retry it forever.
+    #[test]
+    fn a_real_internal_error_is_not_a_transport_failure() {
+        assert!(!is_transport_failure(
+            "internal error: expected LHS of assignment to be a variable"
+        ));
+        assert!(!is_transport_failure("index corrupted: duplicate key"));
+        assert!(!is_transport_failure(""));
+    }
 
     #[test]
     fn the_default_polling_cap_is_half_the_pool() {
