@@ -84,6 +84,15 @@
 //!   returns, in whatever order, so there is no choice to pin — the checkpoint exists to skip the
 //!   poll on replay, which is what TypeScript's records too.
 //!
+//! **A replay checks what its payload lets it check, and no more.** `wait_first` can ask whether
+//! the recorded winner is still in the set, because the winner is what it recorded anyway; the
+//! all-wait recorded no set and so cannot ask the same of one. A workflow resumed or forked with a
+//! member the first execution never waited on therefore skips the wait for it, exactly as a
+//! [`sleep`](crate::sleep) whose duration changed keeps the deadline it recorded. Step *inputs*
+//! are not checkpointed anywhere in DBOS — no implementation's step row has a column for them — so
+//! a replay whose arguments changed reads back the answer to the question it asked the first time.
+//! This is that rule rather than an exception to it.
+//!
 //! Outside a workflow neither is checkpointed and both are plain waits, which is the operator's
 //! and the client's case. Inside a *step* they are plain too, by the leaf rule every id-allocating
 //! call in this crate follows. [`Placement`] owns those rules and the argument for each.
@@ -104,8 +113,10 @@
 //!
 //! Neither takes a timeout, for the reason
 //! [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) gives at length:
-//! `tokio::time::timeout` around the future, or dropping it, ends the poll. That is the bound Go
-//! and TypeScript had to add a parameter for and Python and Java cannot offer at all.
+//! `tokio::time::timeout` around the future, or dropping it, ends the poll. No reference offers one
+//! here either — Python's `wait_first` and TypeScript's `waitFirst`/`waitAll` take a polling
+//! interval and nothing else — but where they would have to grow a parameter to bound the wait,
+//! the language already supplies it.
 
 use crate::checkpoint::Placement;
 use crate::connection::Connection;
@@ -287,11 +298,10 @@ impl DBOS {
 /// [`WorkflowHandle::result`](crate::WorkflowHandle::result) already draws for a client's handle
 /// awaited there.
 ///
-/// **No reference client has either call.** Python's `DBOSClient.wait_first` is the exception that
-/// proves it — Python's client *does* carry `wait_first`, and TypeScript's carries both — so this
-/// is the union of the two that have them rather than an invention. It is the surface an
-/// operator's tool wants most: a client is the caller most likely to hold a set of ids it did not
-/// start.
+/// **This is the union of the reference clients rather than an invention.** Python's client
+/// carries `wait_first` and no `wait_all`; TypeScript's carries both; Go and Java have neither
+/// call anywhere. It is the surface an operator's tool wants most: a client is the caller most
+/// likely to hold a set of ids it did not start.
 impl crate::Client {
     /// Waits until one of these workflows finishes, and reports which.
     ///
@@ -306,6 +316,24 @@ impl crate::Client {
     /// See [`DBOS::wait_all`]. Nothing is checkpointed, for the same reason.
     pub async fn wait_all(&self, workflow_ids: &[&str]) -> Result<()> {
         self.connection().wait_all(workflow_ids).await
+    }
+}
+
+/// Names an id set for an error message, without letting a fan-out of thousands *become* the
+/// message.
+///
+/// The first few and a count: enough to see which set is meant, where the whole of a wide one
+/// would be a wall of ids that says no more than its first line did.
+fn summarize(workflow_ids: &[&str]) -> String {
+    const SHOWN: usize = 5;
+    if workflow_ids.len() <= SHOWN {
+        workflow_ids.join(", ")
+    } else {
+        format!(
+            "{}, and {} more",
+            workflow_ids[..SHOWN].join(", "),
+            workflow_ids.len() - SHOWN
+        )
     }
 }
 
@@ -344,13 +372,25 @@ impl Connection {
             // position of its code means, and handing back a winner it no longer waits on would
             // have it act on an answer to a question it stopped asking. The same check
             // `Awaiting::check` makes against a recorded child id, for the same reason.
+            //
+            // **Both references make it too, without writing it down**, because returning a
+            // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
+            // `KeyError` on exactly this (`_dbos.py:1636`), and TypeScript's
+            // `handleMap.get(completedId)!` is an assertion that is false on it, so the caller is
+            // handed `undefined` as a handle and learns about it somewhere else. Answering with
+            // the id means nothing here dereferences it against the set, so the check that comes
+            // free there has to be spelled — which is the whole cost of it. It reads no extra
+            // state: the winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
                 let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
+                // `expected` is what this run is asking for and `recorded` what the row holds,
+                // which is the order `Error::UnexpectedStep` prints them in and the order
+                // `Awaiting::check` builds them in.
                 return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                     workflow_id: workflow_id.to_owned(),
                     step_id,
-                    expected: format!("a wait_first over a set containing {winner}"),
-                    recorded: format!("a wait_first won by {winner}, which is no longer waited on"),
+                    expected: format!("a wait_first over {}", summarize(workflow_ids)),
+                    recorded: format!("a wait_first won by {winner}"),
                 }));
             }
             return Ok(winner);
@@ -388,6 +428,11 @@ impl Connection {
         }
 
         let placement = Placement::of(self, "wait_all")?;
+        // The row is the whole of the answer, and there is nothing in it to check the current set
+        // against: an all-wait records no set, so a replay of one whose set has *grown* skips the
+        // wait for the member it never waited on. That is the ordinary reading of a step whose
+        // arguments changed — no implementation checkpoints step inputs — and the module doc says
+        // so where a caller will read it.
         if placement.check(self, step_names::WAIT_ALL).await?.is_some() {
             tracing::debug!("replaying wait_all; every member had already settled");
             return Ok(());
@@ -401,7 +446,8 @@ impl Connection {
 
         // **No payload**, which is the shape of the thing rather than an economy: an all-wait
         // decides nothing, so there is nothing a replay could take a different branch on. The row
-        // records that the wait happened, and that is all a replay needs to skip it.
+        // records that the wait happened, and that is all a replay needs to skip it — the same
+        // thing TypeScript's `runInternalStep` around `awaitWorkflowIds` writes.
         placement
             .record(
                 self,

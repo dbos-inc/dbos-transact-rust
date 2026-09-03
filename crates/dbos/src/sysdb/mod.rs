@@ -268,7 +268,8 @@ pub trait SystemDatabase: Send + Sync {
     /// TypeScript both reject a repeated id at their own surface, but only because they return a
     /// *handle* and key a map by id to find it; neither constraint survives the translation.
     ///
-    /// Empty input is [`Error::Malformed`], not a wait that never ends. Python raises
+    /// Empty input is [`Error::InvalidInput`], not a wait that never ends — a caller's value the
+    /// layer will not act on, rather than a stored one it could not read. Python raises
     /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which
     /// is the worst possible reading of "wait for one of nothing".
     ///

@@ -3216,9 +3216,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Refused rather than parked forever: `= ANY('{}')` matches nothing, so an empty wait would
         // be a wait with no possible end. Python raises at the same point.
         if workflow_ids.is_empty() {
-            return Err(Error::Malformed(
-                "await_first_workflow_id was given no workflow ids to wait for".to_owned(),
-            ));
+            return Err(Error::InvalidInput {
+                field: "workflow_ids".into(),
+                detail: "must name at least one workflow to wait for".to_owned(),
+            });
         }
         let workflow_table = self.tables.workflow_status.as_str();
         let (pool, polling) = (&self.pool, &self.polling);
