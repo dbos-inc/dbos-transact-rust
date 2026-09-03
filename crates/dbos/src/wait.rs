@@ -211,6 +211,14 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     ///
+    /// **A tie is broken arbitrarily.** Two workflows that settle within the same poll interval
+    /// are not ordered by anything — the interval is the resolution at which this can observe
+    /// finishing, and neither Python nor TypeScript orders its own query either. Inside a workflow
+    /// that costs nothing, because the winner is recorded and a replay reads it back instead of
+    /// racing again; outside one, a second call over the same settled set may answer differently.
+    /// [`await_first_workflow_id`](crate::sysdb::SystemDatabase::await_first_workflow_id) sets out
+    /// why an `ORDER BY` would make this worse rather than better.
+    ///
     /// **Duplicate ids are refused**, because the answer is a position and a repeated id has more
     /// than one. Python and TypeScript both reject the same input at the same point, and for the
     /// same reason: their handle map cannot hold two entries under one key.

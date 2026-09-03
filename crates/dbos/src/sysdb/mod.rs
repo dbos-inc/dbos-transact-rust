@@ -269,6 +269,32 @@ pub trait SystemDatabase: Send + Sync {
     /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which
     /// is the worst possible reading of "wait for one of nothing".
     ///
+    /// **Two members that settle in the same interval are a tie this cannot break**, and the
+    /// winner between them is arbitrary. There is no `ORDER BY`: the poll asks for one settled row
+    /// and takes whichever the plan yields first, which can vary with statistics and physical row
+    /// order. TypeScript and Python both do exactly this — neither orders its own `LIMIT 1` — so a
+    /// Rust waiter and a TypeScript one on the same database are arbitrary in the same way rather
+    /// than differently.
+    ///
+    /// It is also the honest answer, because **the poll interval is the resolution at which this
+    /// call can observe finishing at all**. Two candidate orderings look like improvements and are
+    /// not:
+    ///
+    /// - `ORDER BY completed_at` would be a lie for the one status hardest to reason about. The
+    ///   dead-letter transition sets neither `completed_at` nor `updated_at`, so a parked member
+    ///   sorts on a stale or absent value and would systematically win or lose by where `NULLS`
+    ///   were put — not by when it stopped.
+    /// - `ORDER BY workflow_uuid` would be stable and meaningless: it turns *which finished first*
+    ///   into *which sorts first* whenever more than one is ready, biasing every tie toward
+    ///   `task-0` in a fan-out named that way. Stable nondeterminism reads as a guarantee and is
+    ///   not one, which is worse than visible arbitrariness.
+    ///
+    /// **What makes the arbitrariness harmless is the checkpoint above this layer**, not anything
+    /// here. [`wait_first`](crate::DBOS::wait_first) records the winner, so a replay reads it back
+    /// rather than racing again and cannot take a different branch. A caller outside a workflow
+    /// has nothing recorded and may well see a different winner from a second call over the same
+    /// settled set — which is right, because it asked a question about *now*.
+    ///
     /// **One row, not one per id**, and it polls under the same concurrency cap
     /// [`await_workflow_result`](Self::await_workflow_result) waits under and for the same reason
     /// — a fan-out waiting on N workflows through N separate result waits is N queries per
