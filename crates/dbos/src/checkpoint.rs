@@ -136,7 +136,14 @@ impl Placement {
     /// `check_step` compares the recorded name, so a call whose position now holds some other
     /// step is already [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this
     /// returns — which is the determinism check, not an incidental one.
-    pub(crate) async fn recorded(
+    ///
+    /// **Named for the layer below rather than for this type.** `check`/[`record`](Self::record)
+    /// is the pair `sysdb` already uses — `check_step`/`record_step`,
+    /// `check_child_result`/`record_child_result` — and this is the thin wrapper over the first of
+    /// them. It also keeps the word `Recorded` meaning one thing: it is a
+    /// [`Placement`] variant, describing where the caller stands, and a method of the same name
+    /// describing a step row would be the same word for two unrelated things.
+    pub(crate) async fn check(
         &self,
         conn: &Connection,
         step_name: &str,
@@ -150,7 +157,7 @@ impl Placement {
             .map_err(Error::SystemDatabase)
     }
 
-    /// Records what this call answered, so [`recorded`](Self::recorded) finds it.
+    /// Records what this call answered, so [`check`](Self::check) finds it.
     ///
     /// `started_at` is when the operation began rather than when it finished being written down,
     /// so a workflow's timeline shows the wait. It is paired with a completion stamped here, and
@@ -159,6 +166,8 @@ impl Placement {
     ///
     /// A no-op where nothing is checkpointed, so a caller need not branch: the placement already
     /// decided, and repeating the decision at every call site is how the two halves drift apart.
+    ///
+    /// Pairs with [`check`](Self::check), as `record_step` pairs with `check_step`.
     pub(crate) async fn record(
         &self,
         conn: &Connection,

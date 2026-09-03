@@ -168,7 +168,7 @@ where
             Err(wrong) => return Err(wrong.lift()),
         };
         if let Some(recorded) = awaiting
-            .recorded(&self.conn, &self.workflow_id)
+            .check(&self.conn, &self.workflow_id)
             .await
             .map_err(Error::lift)?
         {
@@ -280,7 +280,7 @@ impl Awaiting {
         self.0.step()
     }
 
-    async fn recorded(
+    async fn check(
         &self,
         conn: &Connection,
         awaited_workflow_id: &str,

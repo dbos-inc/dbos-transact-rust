@@ -334,7 +334,7 @@ impl Connection {
         }
 
         let placement = Placement::of(self, "wait_first")?;
-        if let Some(recorded) = placement.recorded(self, step_names::WAIT_FIRST).await? {
+        if let Some(recorded) = placement.check(self, step_names::WAIT_FIRST).await? {
             let winner: String =
                 decode(recorded.output.as_deref(), "the id that won a wait_first")?;
             tracing::debug!(
@@ -394,11 +394,7 @@ impl Connection {
         }
 
         let placement = Placement::of(self, "wait_all")?;
-        if placement
-            .recorded(self, step_names::WAIT_ALL)
-            .await?
-            .is_some()
-        {
+        if placement.check(self, step_names::WAIT_ALL).await?.is_some() {
             tracing::debug!("replaying wait_all; every member had already settled");
             return Ok(());
         }
