@@ -235,6 +235,52 @@ pub struct ForkOptions<'a> {
 }
 
 impl DBOS {
+    /// This instance, refused if it is not the one running the calling workflow — and that
+    /// workflow, which the call is checkpointed against.
+    ///
+    /// Both halves come back together because the check is what relates them: a checkpointed
+    /// management call takes its executor from `self` and its step id from the ambient context,
+    /// and the two have to be the same instance. Resolving them apart is what let them disagree.
+    /// `operation` names the call in either failure, so taking it once is also what keeps the two
+    /// messages from drifting.
+    ///
+    /// The context is `None` outside a workflow, where a management call is just a call — an
+    /// operator's tool, an admin endpoint, a test. `None` inside a *step* as well, by the leaf
+    /// rule the rest of the crate follows: the step's own checkpoint stands for everything its
+    /// body did, and allocating an id under it would shift every later step onto the wrong replay
+    /// slot.
+    ///
+    /// **A workflow running on another instance is [`Error::WrongInstance`].** This is where the
+    /// two halves of a checkpointed management call are combined: the step id comes from the
+    /// ambient workflow's counter and the checkpoint is written through *this* instance's system
+    /// database, so a handle to some other instance would write the row where the workflow that
+    /// allocated the id cannot see it — and, since `operation_outputs` carries a foreign key onto
+    /// `workflow_status` from migration 1 onward, usually cannot write it at all.
+    /// [`get_event`](Self::get_event) and [`WorkflowRef::parent`](crate::WorkflowRef) refuse the
+    /// same combination for the same reason. Inside a step there is nothing to refuse: nothing is
+    /// checkpointed, so the two halves are never combined and the call is plain whichever
+    /// instance serves it.
+    ///
+    /// **The launch check comes first**, as every method on this surface expects: an unlaunched
+    /// instance should say so whatever else is wrong with the call.
+    ///
+    /// The context is returned rather than the caller pair, and held in a local at each call
+    /// site, because [`caller_for`] borrows from it — and because allocating the step id is what
+    /// spends it, which must not happen before a call's own argument checks have passed.
+    fn checked_executor(&self, operation: &'static str) -> Result<(Arc<Executor>, Option<Ctx>)> {
+        let executor = self.executor(operation)?;
+        let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
+        if ctx
+            .as_ref()
+            .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
+        {
+            return Err(Error::WrongInstance {
+                operation: operation.into(),
+            });
+        }
+        Ok((executor, ctx))
+    }
+
     /// A handle to a workflow this process did not start.
     ///
     /// The way a listing becomes something to act on: [`list_workflows`](Self::list_workflows)
@@ -339,8 +385,7 @@ impl DBOS {
         workflow_ids: &[&str],
         children: Children,
     ) -> Result<Vec<String>> {
-        let executor = self.executor("cancel a workflow")?;
-        let ctx = calling_workflow();
+        let (executor, ctx) = self.checked_executor("cancel a workflow")?;
         let cancelled = executor
             .sysdb()
             .cancel_workflows(
@@ -444,8 +489,7 @@ impl DBOS {
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        let executor = self.executor("resume a workflow")?;
-        let ctx = calling_workflow();
+        let (executor, ctx) = self.checked_executor("resume a workflow")?;
         let resumed = executor
             .sysdb()
             .resume_workflows(workflow_ids, options.queue, ctx.as_ref().map(caller_for))
@@ -517,9 +561,16 @@ impl DBOS {
         from: ForkFrom<'_>,
         options: ForkOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        let executor = self.executor("fork a workflow")?;
-        let forked =
-            fork_batch(&executor, &[workflow_id], from, options.forked_id, &options).await?;
+        let (executor, ctx) = self.checked_executor("fork a workflow")?;
+        let forked = fork_batch(
+            &executor,
+            &[workflow_id],
+            from,
+            options.forked_id,
+            &options,
+            ctx,
+        )
+        .await?;
 
         let forked_id = forked.into_iter().next().ok_or_else(|| {
             Error::Config(format!("forking `{workflow_id}` produced no workflow"))
@@ -556,16 +607,17 @@ impl DBOS {
         from: ForkFrom<'_>,
         options: ForkOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        // The launch check first, as every other method on this surface does: an unlaunched
-        // instance should say so whatever else is wrong with the call.
-        let executor = self.executor("fork a workflow")?;
+        // Which instance is serving this, and whether a workflow is asking — before the
+        // argument checks, as every other method on this surface does: an unlaunched instance,
+        // or one that is not the caller's, should say so whatever else is wrong with the call.
+        let (executor, ctx) = self.checked_executor("fork a workflow")?;
         if options.forked_id.is_some() {
             return Err(Error::Config(
                 "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
                     .to_owned(),
             ));
         }
-        let forked = fork_batch(&executor, workflow_ids, from, None, &options).await?;
+        let forked = fork_batch(&executor, workflow_ids, from, None, &options, ctx).await?;
         tracing::info!(count = forked.len(), "forked workflows onto their queues");
         Ok(forked
             .into_iter()
@@ -621,8 +673,7 @@ impl DBOS {
     /// caller's own tree from outside it, or deleting an unrelated tree from inside a workflow,
     /// is unaffected.
     pub async fn delete_all(&self, workflow_ids: &[&str], children: Children) -> Result<u64> {
-        let executor = self.executor("delete a workflow")?;
-        let ctx = calling_workflow();
+        let (executor, ctx) = self.checked_executor("delete a workflow")?;
         let deleted = executor
             .sysdb()
             .delete_workflows(
@@ -669,8 +720,7 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
-        let executor = self.executor("delay a workflow")?;
-        let ctx = calling_workflow();
+        let (executor, ctx) = self.checked_executor("delay a workflow")?;
         executor
             .sysdb()
             .set_workflow_delay(workflow_id, delay, ctx.as_ref().map(caller_for))
@@ -721,7 +771,7 @@ impl DBOS {
         workflow_id: &str,
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<()> {
-        let executor = self.executor("update a workflow's attributes")?;
+        let (executor, ctx) = self.checked_executor("update a workflow's attributes")?;
         // Plain JSON, never the configured [`Serializer`](crate::Serializer): the column is read by
         // `@>` containment and by every other implementation, so what a workflow chose for its own
         // payloads has no say in it.
@@ -733,7 +783,6 @@ impl DBOS {
                 message: error.to_string(),
                 source: Some(error),
             })?;
-        let ctx = calling_workflow();
         executor
             .sysdb()
             .update_workflow_attributes(
@@ -780,8 +829,7 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub async fn list_workflows(&self, filter: &WorkflowFilter<'_>) -> Result<Vec<WorkflowRecord>> {
-        let executor = self.executor("list workflows")?;
-        let ctx = calling_workflow();
+        let (executor, ctx) = self.checked_executor("list workflows")?;
         executor
             .sysdb()
             .list_workflows(filter, ctx.as_ref().map(caller_for))
@@ -802,8 +850,7 @@ impl DBOS {
     /// An id with no row returns no steps rather than failing, the same as an id whose workflow
     /// has not reached its first step.
     pub async fn list_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
-        let executor = self.executor("list a workflow's steps")?;
-        let ctx = calling_workflow();
+        let (executor, ctx) = self.checked_executor("list a workflow's steps")?;
         executor
             .sysdb()
             .list_workflow_steps(workflow_id, true, None, None, ctx.as_ref().map(caller_for))
@@ -818,24 +865,18 @@ impl DBOS {
 /// lookup; the other three are searches through each source's own history, and `fork_from` is where
 /// that search lives. Shared by [`DBOS::fork_with`] and [`DBOS::fork_all`] so the rule is written
 /// once — the batch form is the primitive, and the single form is a batch of one.
+///
+/// `ctx` is the calling workflow, from [`DBOS::checked_executor`], passed in rather than read here:
+/// both entry points have already resolved it alongside the executor it has to agree with, and
+/// reading it again would name this operation a second time in a second place.
 async fn fork_batch(
     executor: &Executor,
     workflow_ids: &[&str],
     from: ForkFrom<'_>,
     forked_id: Option<&str>,
     options: &ForkOptions<'_>,
+    ctx: Option<Ctx>,
 ) -> Result<Vec<String>> {
-    // The other half of `fork_all`'s refusal. A caller who named a fork means to address it
-    // later, so an id that cannot be honoured is reported rather than replaced by a generated
-    // one — and only the two variants that name a step outright can honour it, since the rest
-    // resolve a different step per source and let the system database mint the ids.
-    if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
-        return Err(Error::Config(format!(
-            "ForkOptions::forked_id names the fork of a chosen step, and {from:?} resolves one \
-             from the source's own history"
-        )));
-    }
-
     let sys_options = SysForkOptions {
         application_version: options.app_version,
         queue_name: options.queue,
@@ -857,6 +898,9 @@ async fn fork_batch(
     // see the module documentation on the naming. So the field exists on a call it cannot serve,
     // and saying so is the merged shape's version of Java's missing field. It was silently dropped
     // before, which is the one behaviour no reference has.
+    //
+    // The other half of [`DBOS::fork_all`]'s refusal, which turns the same field down for the
+    // other reason: one id cannot name many forks, whatever the fork point.
     if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
         return Err(Error::Config(
             "ForkOptions::forked_id needs a fork point that names its step: use ForkFrom::Step, \
@@ -865,7 +909,7 @@ async fn fork_batch(
         ));
     }
 
-    let ctx = calling_workflow();
+    // After the refusal above, so a fork this call is going to turn down spends no step id.
     let caller = ctx.as_ref().map(caller_for);
 
     match from {
@@ -912,18 +956,6 @@ async fn fork_batch(
         }
     }
     .map_err(Error::SystemDatabase)
-}
-
-/// The workflow this call is being made from, if there is one to checkpoint against.
-///
-/// `None` outside a workflow, where a management call is just a call — an operator's tool, an
-/// admin endpoint, a test. `None` inside a *step* as well, by the leaf rule the rest of the crate
-/// follows: the step's own checkpoint stands for everything its body did, and allocating an id
-/// under it would shift every later step onto the wrong replay slot.
-///
-/// Held in a local at each call site because [`caller_for`] borrows from it.
-fn calling_workflow() -> Option<Ctx> {
-    Ctx::current().filter(|ctx| !ctx.in_step())
 }
 
 /// Where the caller stands, for `sysdb` to commit the checkpoint against.

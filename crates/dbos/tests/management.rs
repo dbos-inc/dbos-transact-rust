@@ -1829,3 +1829,205 @@ async fn a_workflow_cannot_delete_an_ancestors_tree() {
 
     dbos.shutdown().await;
 }
+
+/// A management call through another instance, from inside a workflow, is refused.
+///
+/// The third place [`Error::WrongInstance`] is reachable from, and it is here for the reason the
+/// other two are: the step id comes from *this* workflow's counter while the checkpoint is written
+/// through the other instance's system database, landing where the workflow that allocated it
+/// cannot see it — and `operation_outputs` carries a foreign key onto `workflow_status`, so
+/// usually it cannot be written at all. `DBOS::get_event` refuses the same combination, and
+/// `WorkflowRef::parent` refuses it for starting a child.
+///
+/// The second half of the test is the leaf rule: from inside a *step* nothing is checkpointed, so
+/// the two halves are never combined and there is nothing to refuse.
+#[tokio::test]
+async fn management_through_another_instance_from_inside_a_workflow_is_refused() {
+    let db = test_database().await;
+    let other = DBOS::new(config("other-management-app", &db));
+    let owner = DBOS::new(config("owner-management-app", &db));
+
+    let target = owner
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+
+    // A write and a fork, which reach the guard by different routes: the methods hold it
+    // themselves, and `fork_batch` is a free function that had to be handed the instance.
+    let cancels_through_other = {
+        let other = other.clone();
+        owner
+            .register_workflow("cancels_through_other", move |id: String| {
+                let other = other.clone();
+                async move {
+                    other.cancel(&id).await?;
+                    Ok::<u32, Error>(1)
+                }
+            })
+            .unwrap()
+    };
+    let forks_through_other = {
+        let other = other.clone();
+        owner
+            .register_workflow("forks_through_other", move |id: String| {
+                let other = other.clone();
+                async move {
+                    let handle = other
+                        .fork_with::<u32, EngineOnly>(
+                            &id,
+                            ForkFrom::Beginning,
+                            ForkOptions {
+                                forked_id: Some("refused-fork"),
+                                ..ForkOptions::default()
+                            },
+                        )
+                        .await?;
+                    Ok::<String, Error>(handle.workflow_id().to_owned())
+                }
+            })
+            .unwrap()
+    };
+    // From inside a *step* the call is plain — nothing is checkpointed, so the two halves are
+    // never combined and there is nothing to refuse.
+    let lists_in_step = {
+        let other = other.clone();
+        owner
+            .register_workflow("lists_in_step", move |id: String| {
+                let other = other.clone();
+                async move {
+                    let seen = dbos::step("list", || {
+                        let other = other.clone();
+                        let id = id.clone();
+                        async move {
+                            let rows = other
+                                .list_workflows(&WorkflowFilter {
+                                    workflow_ids: vec![&id],
+                                    ..WorkflowFilter::default()
+                                })
+                                .await?;
+                            Ok(rows.len())
+                        }
+                    })
+                    .await?;
+                    Ok::<usize, Error>(seen)
+                }
+            })
+            .unwrap()
+    };
+    other.launch().await.expect("launch failed");
+    owner.launch().await.expect("launch failed");
+
+    // The target sits on a queue nothing polls, so it is there to be cancelled or forked.
+    let target_id = "target-of-another-instance";
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(target_id),
+                queue: Some(Enqueue::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    for (workflow_id, error) in [
+        (
+            "refused-cancel",
+            cancels_through_other
+                .run_with(
+                    target_id.to_owned(),
+                    dbos::RunOptions {
+                        workflow_id: Some("refused-cancel"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .expect_err("the cancel through another instance was accepted"),
+        ),
+        (
+            "refused-fork",
+            forks_through_other
+                .run_with(
+                    target_id.to_owned(),
+                    dbos::RunOptions {
+                        workflow_id: Some("refused-fork-caller"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ())
+                .expect_err("the fork through another instance was accepted"),
+        ),
+    ] {
+        assert!(
+            matches!(&error, Error::WrongInstance { operation } if operation.contains("workflow")),
+            "expected a wrong-instance refusal for {workflow_id}, got {error:?}"
+        );
+    }
+
+    let reader = reader(&db).await;
+
+    // Refused before anything was written: the target is untouched and no fork exists.
+    assert_eq!(
+        reader
+            .get_workflow(target_id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .status,
+        WorkflowStatus::Enqueued,
+        "the target moved even though the cancel was refused",
+    );
+    assert!(
+        reader
+            .get_workflow("refused-fork")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "a fork was written even though the call was refused",
+    );
+
+    // And no step id was spent: the guard runs before `caller_for` allocates one.
+    for caller in ["refused-cancel", "refused-fork-caller"] {
+        assert!(
+            reader
+                .list_workflow_steps(caller, true, None, None, None)
+                .await
+                .expect("read failed")
+                .is_empty(),
+            "{caller} checkpointed a step for a call that was refused",
+        );
+    }
+
+    // The same call from inside a step is plain, and reaches the other instance's database.
+    let seen = lists_in_step
+        .run_with(
+            target_id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some("lists-in-step"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a listing from inside a step was refused");
+    assert_eq!(seen, 1, "the plain listing did not see the target");
+
+    // One step, the caller's own — the listing under it recorded nothing of its own.
+    let steps = reader
+        .list_workflow_steps("lists-in-step", true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "list")],
+        "a listing from inside a step allocated a step id of its own",
+    );
+
+    owner.shutdown().await;
+    other.shutdown().await;
+}
