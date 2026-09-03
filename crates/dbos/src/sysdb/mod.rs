@@ -261,9 +261,13 @@ pub trait SystemDatabase: Send + Sync {
     /// exist. A caller who needs the stricter reading holds one id and uses
     /// [`await_workflow_result`](Self::await_workflow_result).
     ///
-    /// Duplicate ids are the caller's to reject before calling: `ANY` de-duplicates on its own, so
-    /// this cannot tell a repeated id from a single one and would answer with a winner the caller
-    /// cannot map back to exactly one handle.
+    /// **Duplicate ids are fine here, and this makes no demand about them.** `ANY` de-duplicates
+    /// on its own and `LIMIT 1` answers with an id either way, so there is nothing a repeat can
+    /// break at this layer. The uniqueness requirement belongs to
+    /// [`wait_first`](crate::DBOS::wait_first) alone, because what *it* returns is a position, and
+    /// a position is only meaningful over a set whose ids are distinct. Stating a precondition
+    /// down here that only the layer above needs would be claiming a constraint this method does
+    /// not have and does not check.
     ///
     /// Empty input is [`Error::Malformed`], not a wait that never ends. Python raises
     /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which

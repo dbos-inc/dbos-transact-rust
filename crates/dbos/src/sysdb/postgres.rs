@@ -3280,9 +3280,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         );
         let select = &select;
         let mut outstanding: Vec<String> = workflow_ids.iter().map(|id| (*id).to_owned()).collect();
-        // De-duplicated here rather than left to `ANY`, so the array shrinks with the work: the
-        // engine already rejects a repeated id in `wait_first`, but an all-wait accepts one and
-        // sending it every interval for the life of the wait is pure waste.
+        // **Where the first-form's caller rejects duplicates, this one accepts them**, because
+        // settling is a property of an id rather than a choice between ids — so a repeat is simply
+        // satisfied twice, and this is the wait that actually receives one.
+        //
+        // Correctness never depended on the dedup: `retain` below drops *every* copy of an id that
+        // settles, so duplicates would fall out on their own the first pass one of them did. What
+        // it saves is the array bytes until then. The sort is not an ordering decision — `dedup`
+        // only removes *consecutive* duplicates, and that is the whole of what it is for.
         outstanding.sort_unstable();
         outstanding.dedup();
 

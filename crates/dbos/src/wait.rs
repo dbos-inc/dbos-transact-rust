@@ -219,9 +219,21 @@ impl DBOS {
     /// [`await_first_workflow_id`](crate::sysdb::SystemDatabase::await_first_workflow_id) sets out
     /// why an `ORDER BY` would make this worse rather than better.
     ///
-    /// **Duplicate ids are refused**, because the answer is a position and a repeated id has more
-    /// than one. Python and TypeScript both reject the same input at the same point, and for the
-    /// same reason: their handle map cannot hold two entries under one key.
+    /// **Duplicate ids are refused.** Python and TypeScript refuse them too, but for a reason that
+    /// does not reach here: both return the winning *handle*, so both build a map keyed by id, and
+    /// a repeat would put two handles under one key. A position has no such collision — `[a, b, a]`
+    /// would answer `0` and go on answering `0` across a replay.
+    ///
+    /// It is refused because of what a repeat *means*: a caller who believes they are waiting on
+    /// N workflows and is in fact waiting on fewer. A drain loop over such a set still terminates
+    /// and still drains — which is precisely the problem, since it works while the count it was
+    /// built from is wrong. Wait time is a good place to hear about a fan-out that started fewer
+    /// workflows than it meant to.
+    ///
+    /// The one legitimate way to arrive here is real: a caller-supplied id that
+    /// [`start`](crate::WorkflowRef::start) joined to a run already going hands back a second
+    /// handle on one workflow. That case dedupes in a line, which is the trade taken deliberately
+    /// — accepting duplicates later would stay compatible, and demanding them later would not.
     ///
     /// **An empty slice is refused** rather than waited on. Python raises here too; a wait for one
     /// of nothing has no answer it could ever give.
@@ -312,10 +324,12 @@ impl Connection {
                 "wait_first was given no workflow ids to wait for".to_owned(),
             ));
         }
+        // Enforced here and nowhere below: `await_first_workflow_id` is total on duplicates, and
+        // it is *this* surface's answer — a position — that needs the ids to be distinct.
         if let Some(duplicate) = first_duplicate(workflow_ids) {
             return Err(Error::Config(format!(
-                "wait_first was given the workflow id `{duplicate}` more than once, so a winner \
-                 would name more than one position"
+                "wait_first was given the workflow id `{duplicate}` more than once, so the set \
+                 names fewer workflows than it has entries"
             )));
         }
 
