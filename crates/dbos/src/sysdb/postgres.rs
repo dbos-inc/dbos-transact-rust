@@ -636,6 +636,80 @@ enum StartSteps<'a> {
     },
 }
 
+/// What a single-statement step's work runs on.
+///
+/// [`run_single_statement_step`](PostgresSystemDatabase::run_single_statement_step) needs a
+/// transaction only when there is a checkpoint to commit with the work; without one, a lone
+/// statement is atomic by itself and a `BEGIN`/`COMMIT` around it is two round trips for nothing.
+/// One carrier covers both so the work is written once.
+///
+/// **Carried by value rather than borrowed**, which is what lets the work be an ordinary
+/// `Fn(StepConn) -> Fut`: a closure handed `&mut PgConnection` cannot return a future that holds
+/// it across an await, because `Fut` is one type and the borrow is higher-ranked. Passing
+/// ownership in and handing it back is how [`with_retry`] and `#[async_trait]` get the `Send`
+/// future they need — the same reason
+/// [`run_transactional_step`](PostgresSystemDatabase::run_transactional_step) hands its
+/// transaction over. The [`DerefMut`](std::ops::DerefMut) is so a body reads the same either way:
+/// `&mut *conn` reaches the connection.
+enum StepConn {
+    /// No checkpoint to write, so no transaction to write it in.
+    Pooled(sqlx::pool::PoolConnection<sqlx::Postgres>),
+    /// The checkpoint and the statement share this, and commit together. Boxed because a
+    /// transaction is much the larger of the two.
+    Transactional(Box<sqlx::Transaction<'static, sqlx::Postgres>>),
+}
+
+impl std::ops::Deref for StepConn {
+    type Target = sqlx::PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            StepConn::Pooled(conn) => conn,
+            StepConn::Transactional(tx) => tx,
+        }
+    }
+}
+
+impl std::ops::DerefMut for StepConn {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            StepConn::Pooled(conn) => conn,
+            StepConn::Transactional(tx) => tx,
+        }
+    }
+}
+
+/// What a replayed step hands back, decoded from the row that recorded it.
+///
+/// Only a success is ever recorded by the two step runners, so a step carrying an error is a row
+/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py:6420`);
+/// reporting beats asserting, but the expectation is identical.
+///
+/// A void method reaches here too, and does not trip the missing-output check: `()` serialises to
+/// the four-character string `null`, so the column holds a value rather than SQL NULL. Whether a
+/// step ran is answered by the row existing, never by its output being empty — which is also why
+/// `Option<T>` round-trips correctly, a recorded `None` and an absent step being the same JSON and
+/// different answers.
+fn replayed_output<T: serde::de::DeserializeOwned>(
+    step: &StepRecord,
+    workflow_id: &str,
+    step_id: i32,
+    step_name: &str,
+) -> Result<T, Error> {
+    tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
+    let recorded = step.output.as_deref().ok_or_else(|| {
+        Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
+        ))
+    })?;
+    serde_json::from_str(recorded).map_err(|e| {
+        Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} ({step_name}) has an output this build cannot \
+             read: {e}"
+        ))
+    })
+}
+
 impl PostgresSystemDatabase {
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
@@ -697,27 +771,7 @@ impl PostgresSystemDatabase {
                 .await?
         {
             tx.commit().await?;
-            tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
-            // Only a success is ever recorded here, so a step carrying an error is a row this
-            // path did not write. Python asserts the same thing at its own replay
-            // (`_sys_db.py:6420`); reporting beats asserting, but the expectation is identical.
-            //
-            // A void method reaches here too, and does not trip this: `()` serialises to the
-            // four-character string `null`, so the column holds a value rather than SQL NULL.
-            // Whether a step ran is answered by the row existing, never by its output being
-            // empty — which is also why `Option<T>` returns round-trip correctly, a recorded
-            // `None` and an absent step being the same JSON and different answers.
-            let recorded = step.output.as_deref().ok_or_else(|| {
-                Error::Malformed(format!(
-                    "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
-                ))
-            })?;
-            return serde_json::from_str(recorded).map_err(|e| {
-                Error::Malformed(format!(
-                    "workflow {workflow_id} step {step_id} ({step_name}) has an output this \
-                     build cannot read: {e}"
-                ))
-            });
+            return replayed_output(&step, workflow_id, step_id, step_name);
         }
 
         // A failure rolls the transaction back and records nothing, so the replay runs the work
@@ -728,28 +782,108 @@ impl PostgresSystemDatabase {
         let (mut tx, value) = work(tx).await?;
 
         if let Some((workflow_id, step_id)) = caller {
-            // `serde_json` only fails here on a type that cannot be JSON — a non-string map key,
-            // a NaN — and every payload this takes is a plain record.
-            let recorded = serde_json::to_string(&value)
-                .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
-            self.record_step_on(
-                &mut tx,
-                workflow_id,
-                step_id,
-                step_name,
-                Outcome::Output(Some(&recorded)),
-                Some(PORTABLE_JSON),
-                // Read here rather than taken from the caller: the work above has run, so this
-                // is when the step finished rather than when it was about to start.
-                Some(StepTiming {
-                    started_at,
-                    completed_at: Timestamp::now(),
-                }),
-                None,
-            )
-            .await?;
+            self.record_step_output(&mut tx, workflow_id, step_id, step_name, &value, started_at)
+                .await?;
         }
         tx.commit().await?;
+        Ok(value)
+    }
+
+    /// Writes the checkpoint for a step that has just done its work.
+    ///
+    /// Shared by [`run_transactional_step`](Self::run_transactional_step) and
+    /// [`run_single_statement_step`](Self::run_single_statement_step), which differ in what they
+    /// run the work on and not in what they record.
+    async fn record_step_output<T: serde::Serialize>(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        value: &T,
+        started_at: Timestamp,
+    ) -> Result<(), Error> {
+        // `serde_json` only fails here on a type that cannot be JSON — a non-string map key, a
+        // NaN — and every payload this takes is a plain record.
+        let recorded = serde_json::to_string(value)
+            .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
+        self.record_step_on(
+            conn,
+            workflow_id,
+            step_id,
+            step_name,
+            Outcome::Output(Some(&recorded)),
+            Some(PORTABLE_JSON),
+            // Read here rather than taken from the caller: the work above has run, so this is
+            // when the step finished rather than when it was about to start.
+            Some(StepTiming {
+                started_at,
+                completed_at: Timestamp::now(),
+            }),
+            None,
+        )
+        .await
+    }
+
+    /// [`run_transactional_step`](Self::run_transactional_step) for work that is **one
+    /// statement**.
+    ///
+    /// The same three steps and the same guarantees, with one difference: given no `caller` there
+    /// is no checkpoint to commit alongside the work, and a lone statement is already atomic, so
+    /// it runs on a pooled connection rather than in a transaction of its own. That is two round
+    /// trips saved on every call the engine or an operator's tool makes for itself — see
+    /// [`StepConn`].
+    ///
+    /// **Only for work that is genuinely one statement.** Anything else needs the transaction
+    /// whether or not it is checkpointed: the cancel cascade and every fork are one operation
+    /// spread over several statements, and running those on a bare connection leaves a tree
+    /// half-cancelled or a fork half-written. Those take
+    /// [`run_transactional_step`](Self::run_transactional_step), which is the default and the
+    /// safe answer when the count is not obvious.
+    async fn run_single_statement_step<T, F, Fut>(
+        &self,
+        caller: Option<(&str, i32)>,
+        step_name: &str,
+        started_at: Timestamp,
+        work: F,
+    ) -> Result<T, Error>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+        F: Fn(StepConn) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<(StepConn, T), Error>> + Send,
+    {
+        let Some((workflow_id, step_id)) = caller else {
+            // Nothing to commit on the way out either: the statement committed itself, and the
+            // connection goes back to the pool as it drops.
+            let (_conn, value) = work(StepConn::Pooled(self.pool.acquire().await?)).await?;
+            return Ok(value);
+        };
+
+        let mut conn = StepConn::Transactional(Box::new(self.pool.begin().await?));
+        if let Some(step) = self
+            .check_step_on(&mut conn, workflow_id, step_id, step_name)
+            .await?
+        {
+            return replayed_output(&step, workflow_id, step_id, step_name);
+        }
+
+        // A failure drops the transaction, which rolls it back and records nothing — as above.
+        let (mut conn, value) = work(conn).await?;
+        self.record_step_output(
+            &mut conn,
+            workflow_id,
+            step_id,
+            step_name,
+            &value,
+            started_at,
+        )
+        .await?;
+        match conn {
+            StepConn::Transactional(tx) => (*tx).commit().await?,
+            // Unreachable: this arm of the function built a `Transactional` above, and `work`
+            // hands back what it was given.
+            StepConn::Pooled(_) => {}
+        }
         Ok(value)
     }
 
@@ -2716,11 +2850,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_workflows", move || async move {
-            self.run_transactional_step(
+            self.run_single_statement_step(
                 caller,
                 step_names::LIST_WORKFLOWS,
                 started_at,
-                |mut tx| async move {
+                |mut conn| async move {
                     // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
                     // a hoisted one would make each attempt's future borrow the closure — which
                     // `FnMut() -> Fut` cannot express. It costs nothing on the happy path, where there
@@ -2865,12 +2999,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                         q.push(" OFFSET ").push_bind(offset);
                     }
 
-                    let rows = q.build().fetch_all(&mut *tx).await?;
+                    let rows = q.build().fetch_all(&mut *conn).await?;
                     let workflows: Vec<WorkflowRecord> = rows
                         .iter()
                         .map(workflow_from_row)
                         .collect::<Result<_, _>>()?;
-                    Ok((tx, workflows))
+                    Ok((conn, workflows))
                 },
             )
             .await
@@ -3085,11 +3219,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "set_workflow_delay", move || async move {
-            self.run_transactional_step(
+            self.run_single_statement_step(
                 caller,
                 step_names::SET_WORKFLOW_DELAY,
                 started_at,
-                |mut tx| async move {
+                |mut conn| async move {
                     // `status = 'DELAYED'` is the guard: a released workflow is running or
                     // queued, and pushing its delay out would not recall it.
                     sqlx::query(AssertSqlSafe(format!(
@@ -3099,9 +3233,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     )))
                     .bind(workflow_id)
                     .bind(delay_until)
-                    .execute(&mut *tx)
+                    .execute(&mut *conn)
                     .await?;
-                    Ok((tx, ()))
+                    Ok((conn, ()))
                 },
             )
             .await
@@ -3146,11 +3280,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "update_workflow_attributes",
             move || async move {
-                self.run_transactional_step(
+                self.run_single_statement_step(
                     caller,
                     step_names::UPDATE_WORKFLOW_ATTRIBUTES,
                     started_at,
-                    |mut tx| async move {
+                    |mut conn| async move {
                         sqlx::query(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
                              SET attributes = $2::jsonb, updated_at = {NOW_MS_SQL} \
@@ -3158,9 +3292,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                         )))
                         .bind(workflow_id)
                         .bind(attributes)
-                        .execute(&mut *tx)
+                        .execute(&mut *conn)
                         .await?;
-                        Ok((tx, ()))
+                        Ok((conn, ()))
                     },
                 )
                 .await
@@ -3466,11 +3600,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "delete_workflows", move || async move {
-            self.run_transactional_step(
+            self.run_single_statement_step(
                 caller,
                 step_names::DELETE_WORKFLOW,
                 started_at,
-                |mut tx| async move {
+                |mut conn| async move {
                     // Steps, notifications, events, and streams go with the row: every child
                     // table declares `ON DELETE CASCADE` on this foreign key, from migration 1
                     // onward.
@@ -3478,11 +3612,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                         "DELETE FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
                     )))
                     .bind(targets)
-                    .execute(&mut *tx)
+                    .execute(&mut *conn)
                     .await?
                     .rows_affected();
                     tracing::debug!(deleted, targets = targets.len(), "deleted workflows");
-                    Ok((tx, deleted))
+                    Ok((conn, deleted))
                 },
             )
             .await
@@ -4263,11 +4397,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "list_workflow_steps", move || async move {
-            self.run_transactional_step(
+            self.run_single_statement_step(
                 caller,
                 step_names::LIST_WORKFLOW_STEPS,
                 started_at,
-                |mut tx| async move {
+                |mut conn| async move {
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
                     q.push(STEP_COLUMNS)
                         .push(", ")
@@ -4284,12 +4418,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                     if let Some(offset) = offset {
                         q.push(" OFFSET ").push_bind(offset);
                     }
-                    let rows = q.build().fetch_all(&mut *tx).await?;
+                    let rows = q.build().fetch_all(&mut *conn).await?;
                     let steps: Vec<StepRecord> = rows
                         .iter()
                         .map(|r| step_from_row(r, workflow_id))
                         .collect::<Result<_, _>>()?;
-                    Ok((tx, steps))
+                    Ok((conn, steps))
                 },
             )
             .await
