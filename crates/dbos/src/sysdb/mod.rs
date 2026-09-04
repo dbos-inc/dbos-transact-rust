@@ -261,10 +261,10 @@ pub trait SystemDatabase: Send + Sync {
     /// exist. A caller who needs the stricter reading holds one id and uses
     /// [`await_workflow_result`](Self::await_workflow_result).
     ///
-    /// **Duplicate ids are fine, and nothing above requires otherwise either.** `ANY`
-    /// de-duplicates on its own and `LIMIT 1` answers with an id, which names one workflow however
-    /// many entries pointed at it — so a repeat is invisible here and stays invisible all the way
-    /// out to [`wait_first`](crate::DBOS::wait_first), whose answer is that same id. Python and
+    /// **Duplicate ids are fine, and nothing above requires otherwise either.** `ANY` de-duplicates
+    /// on its own and `LIMIT 1` answers with an id, which names one workflow however many entries
+    /// pointed at it — so a repeat is invisible here and stays invisible all the way out to
+    /// [`select_workflow`](crate::DBOS::select_workflow), whose answer is that same id. Python and
     /// TypeScript both reject a repeated id at their own surface, but only because they return a
     /// *handle* and key a map by id to find it; neither constraint survives the translation.
     ///
@@ -294,10 +294,10 @@ pub trait SystemDatabase: Send + Sync {
     ///   not one, which is worse than visible arbitrariness.
     ///
     /// **What makes the arbitrariness harmless is the checkpoint above this layer**, not anything
-    /// here. [`wait_first`](crate::DBOS::wait_first) records the winner, so a replay reads it back
-    /// rather than racing again and cannot take a different branch. A caller outside a workflow
-    /// has nothing recorded and may well see a different winner from a second call over the same
-    /// settled set — which is right, because it asked a question about *now*.
+    /// here. [`select_workflow`](crate::DBOS::select_workflow) records the winner, so a replay
+    /// reads it back rather than racing again and cannot take a different branch. A caller outside
+    /// a workflow has nothing recorded and may well see a different winner from a second call over
+    /// the same settled set — which is right, because it asked a question about *now*.
     ///
     /// **One row, not one per id**, and it polls under the same concurrency cap
     /// [`await_workflow_result`](Self::await_workflow_result) waits under and for the same reason
@@ -322,8 +322,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **Duplicates are harmless**, as they are in the first-form: settling is a property of an id
     /// rather than a choice between ids, so a repeated id is simply satisfied twice. Nothing above
-    /// removes them either — [`wait_all`](crate::DBOS::wait_all) passes the caller's slice through
-    /// as it was given — so an implementation must expect them.
+    /// removes them either — [`join_workflows`](crate::DBOS::join_workflows) passes the caller's
+    /// slice through as it was given — so an implementation must expect them.
     ///
     /// Narrowing the array it sends is then an implementation's own business rather than a
     /// contract: the Postgres one de-duplicates once before its first pass, which buys array bytes

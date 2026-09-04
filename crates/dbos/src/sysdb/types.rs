@@ -2288,12 +2288,25 @@ pub mod step_names {
 
     /// The step names a wait over several workflow handles records.
     ///
-    /// **camelCase in both, and both are taken from a reference rather than invented.** Python
-    /// spells its method `wait_first` but records `"DBOS.waitFirst"`
-    /// (`_dbos.py:1634`), and TypeScript's `DBOS.waitFirst` records the same string — so
-    /// [`WAIT_FIRST`] is unanimous among the two implementations that have the call at all.
-    /// [`WAIT_ALL`] is TypeScript's alone, from the `runInternalStep` label in `DBOS.waitAll`;
-    /// Python has no `wait_all`, and Go and Java have neither.
+    /// **The two exceptions in this table: named for the calls that write them rather than for a
+    /// reference.** Every other constant here is a string some other implementation already writes,
+    /// because a step row a Python or TypeScript reader may see should say what that reader calls
+    /// the operation. These two do not follow that rule. Python records `"DBOS.waitFirst"`
+    /// (`_dbos.py:1634`) and TypeScript records the same string from `DBOS.waitFirst`; TypeScript
+    /// alone records `"DBOS.waitAll"`, from the `runInternalStep` label in `DBOS.waitAll`, and Go
+    /// and Java have neither call. This crate names its calls
+    /// [`select_workflow`](crate::select_workflow()) and
+    /// [`join_workflows`](crate::join_workflows()), after the concurrency shapes rather than after
+    /// the wait, and the step a caller reads in a listing is named for the call they wrote — so
+    /// these follow the calls.
+    ///
+    /// **What that costs, stated plainly.** A Rust workflow's wait steps do not line up with the
+    /// same wait's steps in Python or TypeScript: a cross-SDK reader — Conductor's step listing, or
+    /// anything grouping steps by name across implementations — sees two names for one operation.
+    /// Nothing breaks, because no implementation reads another's step *names* to decide anything;
+    /// the name is what a replay of this workflow checks against its own row, and that stays
+    /// internally consistent. The spelling still follows the table's convention, `DBOS.` and
+    /// camelCase, so the divergence is the word and not the shape.
     ///
     /// **What each one records is not the same shape.** A first-wait's answer is a *choice* — the
     /// id that won — and a replay that made it again could pick a different winner and take a
@@ -2302,12 +2315,12 @@ pub mod step_names {
     /// handles come back in the order the caller passed them. Its checkpoint therefore carries no
     /// payload and exists only to skip the poll, which is exactly what TypeScript's records.
     ///
-    /// Neither name is a bulk/singular pair like [`CANCEL_WORKFLOW`] — these are two different
-    /// operations, and a workflow that switched between them between runs has changed what it
-    /// waits for, which is nondeterminism worth raising
+    /// Neither is a bulk/singular pair like [`CANCEL_WORKFLOW`] — these are two different
+    /// operations, and a workflow that switched between them between runs has changed what it waits
+    /// for, which is nondeterminism worth raising
     /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) over.
-    pub const WAIT_FIRST: &str = "DBOS.waitFirst";
-    pub const WAIT_ALL: &str = "DBOS.waitAll";
+    pub const SELECT_WORKFLOW: &str = "DBOS.selectWorkflow";
+    pub const JOIN_WORKFLOWS: &str = "DBOS.joinWorkflows";
 
     /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT`].
     pub const RECV: &str = "DBOS.recv";
