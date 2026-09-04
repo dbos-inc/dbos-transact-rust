@@ -77,8 +77,8 @@ impl Serializer {
 /// a field stays source-compatible for every caller who wrote `..Config::new(..)`, so the
 /// convention is documented rather than enforced.
 ///
-/// This carries what the lifecycle uses. The rest of the configuration surface — patching, queues,
-/// the scheduler, Conductor — arrives with the phase that reads it.
+/// The rest of the configuration surface — patching, the scheduler, Conductor — arrives with the
+/// phase that reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Names this application among those sharing the system database.
@@ -163,11 +163,11 @@ pub struct Config {
 
     /// Which queues this process dequeues from. `None` is all of them.
     ///
-    /// **Configuration rather than a runtime call**, which is PLAN §4.13's decision: Go takes a
-    /// replace-the-set API, Python a pre-launch call, TypeScript and Java configuration, and Rust
-    /// follows the latter pair. The supervisor intersects this with what it reads from the
-    /// `queues` table on every sweep, so the dynamic half — a queue registered later, or deleted
-    /// — comes for free without a second way to change the set.
+    /// **Configuration rather than a runtime call.** Go takes a replace-the-set API, Python a
+    /// pre-launch call, TypeScript and Java configuration, and Rust follows the latter pair. The
+    /// supervisor intersects this with what it reads from the `queues` table on every sweep, so
+    /// the dynamic half — a queue registered later, or deleted — comes for free without a second
+    /// way to change the set.
     ///
     /// What it is for: splitting one application's queues across differently-shaped processes.
     /// A worker fleet sized for slow media jobs and one sized for fast API calls share a database

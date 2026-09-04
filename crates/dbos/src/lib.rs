@@ -7,15 +7,14 @@
 //!
 //! # Status
 //!
-//! Under construction. The system database layer landed first and the execution engine is
-//! being built on it; the lifecycle, registration, workflows, steps, events, recovery, queues
-//! and the client are here, with the scheduler arriving next.
+//! Under construction. The lifecycle, registration, workflows, steps, events, recovery, queues
+//! and the client are implemented; the scheduler is not yet.
 //!
 //! # Cargo features
 //!
 //! - `engine` *(default)* — the durable execution engine: registry, contexts, workflows,
-//!   steps, queues, scheduler, messaging, and the client. Turning it off leaves the system
-//!   database and Conductor layers, which is the surface a future FFI host would consume.
+//!   steps, queues, sending a message, and the client. Turning it off leaves the system database
+//!   and Conductor layers, which is the surface a future FFI host would consume.
 
 #![forbid(unsafe_code)]
 

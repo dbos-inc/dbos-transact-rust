@@ -2,7 +2,7 @@
 //!
 //! Every abandonment here is a real one: a workflow is started, cut down mid-flight by
 //! `shutdown`, and left `PENDING` — then a relaunch recovers it. That is the crash-and-resume
-//! demonstration the workstream exists for, minus only the process boundary.
+//! demonstration recovery exists for, minus only the process boundary.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -150,7 +150,7 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
         row.recovery_attempts
     );
 
-    // The assertion the whole workstream exists for.
+    // The assertion recovery exists for.
     assert_eq!(one.load(Ordering::SeqCst), 1, "step one ran exactly once");
     assert_eq!(two.load(Ordering::SeqCst), 1, "step two ran exactly once");
 

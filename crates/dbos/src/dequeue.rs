@@ -1,9 +1,9 @@
 //! The dequeue loop: a supervisor, and a worker task per queue.
 //!
-//! This is what makes an `ENQUEUED` row run. Everything under it already existed — the claim is
-//! one transaction in the system database, and turning a claimed row into a running workflow is
-//! [`dispatch`] below — so what lives here is the loop that asks, the cadence it asks at, and the
-//! count it has to keep to ask correctly.
+//! This is what makes an `ENQUEUED` row run. The claim itself is one transaction in the system
+//! database and turning a claimed row into a running workflow is [`dispatch`] below, so what lives
+//! here is the loop that asks, the cadence it asks at, and the count it has to keep to ask
+//! correctly.
 //!
 //! **A supervisor, and a worker per queue**, which is Go's arrangement and holds harder in Rust
 //! where a task is cheaper than a goroutine. The supervisor sweeps once a second: transition
@@ -644,14 +644,12 @@ async fn dispatch(
         // TODO(dbos-team): UPSTREAM item 24, the cap this skip never reaches. The claim already
         // counted this dispatch — `start_queued_workflows` does `recovery_attempts + 1` — and
         // `init_workflow` is the only place that reads that count against the cap and parks the
-        // row, so returning here skips it. A row naming a workflow this process does not have is
-        // claimed, counted, skipped, re-enqueued by recovery, and claimed again, with nothing
-        // ever parking it. All four implementations have the same hole in the same order:
-        // `_core.py:1235`, `dbos-executor.ts:690`, `queue.go:783` and `WorkflowDAO.java:185` all
-        // dead-letter only once the registration has resolved. For them the order is forced —
-        // the budget is read off the registration whose absence is the problem. Here it is
-        // `MAX_RECOVERY_ATTEMPTS`, a constant, so this could check the cap first; it does not,
-        // because a lone port that parks rows its peers leave alone is the worse divergence.
+        // row, so returning here skips it: the row is claimed, counted, skipped, re-enqueued by
+        // recovery, and claimed again, with nothing ever parking it. All four implementations
+        // have the same hole, and for them the order is forced because the budget is read off the
+        // registration whose absence is the problem. Here it is `MAX_RECOVERY_ATTEMPTS`, a
+        // constant, so this could check the cap first; it does not, because a lone port that
+        // parks rows its peers leave alone is the worse divergence.
         tracing::warn!(
             workflow_id,
             workflow = %key,

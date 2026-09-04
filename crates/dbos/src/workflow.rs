@@ -294,12 +294,12 @@ pub struct StartOptions<'a> {
 ///
 /// **The queue-only options are nested here rather than sitting beside
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
-/// id, a priority, a partition key, a delay and a
-/// [`duplication_policy`](Self::duplication_policy) each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError` for
-/// each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
-/// describing states its type system allowed it to build. Owning them from the queue makes the
-/// same five unrepresentable — there is no queue-less value here to hang them on. Three rules
-/// survive as refusals at start, because no shape can take them:
+/// id, a priority, a partition key, a delay and a [`duplication_policy`](Self::duplication_policy)
+/// each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError`
+/// for each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
+/// describing states its type system allowed it to build. Owning them from the queue makes the same
+/// five unrepresentable — there is no queue-less value here to hang them on. Three rules survive as
+/// refusals at start, because no shape can take them:
 ///
 /// - **A [`deduplication_id`](Self::deduplication_id) and a [`partition_key`](Self::partition_key)
 ///   cannot both be set.** Go refuses the same pair (`workflow.go:1201`), and it is not a policy
@@ -344,8 +344,8 @@ pub struct Enqueue<'a> {
     /// finishes — so it deduplicates a *backlog*, not a history: enqueueing the same key again
     /// after the first one completed is a new workflow, not a duplicate.
     ///
-    /// A second enqueue under a held key is refused, unless [`duplication_policy`](Self::duplication_policy)
-    /// asks to join the holder instead.
+    /// A second enqueue under a held key is refused, unless
+    /// [`duplication_policy`](Self::duplication_policy) asks to join the holder instead.
     ///
     /// **Mutually exclusive with [`partition_key`](Self::partition_key)**: a start naming both is
     /// refused, for the reason this type's own documentation gives.
@@ -372,9 +372,10 @@ pub struct Enqueue<'a> {
     pub partition_key: Option<&'a str>,
     /// How long to hold the workflow before it may be dequeued at all.
     ///
-    /// The row goes in `DELAYED` rather than `ENQUEUED` and the supervisor moves it across when
-    /// the delay expires — [`NewWorkflow::initial_status`](crate::sysdb::types::NewWorkflow::initial_status)
-    /// derives that from this field's presence.
+    /// The row goes in `DELAYED` rather than `ENQUEUED` and the supervisor moves it across when the
+    /// delay expires —
+    /// [`NewWorkflow::initial_status`](crate::sysdb::types::NewWorkflow::initial_status) derives
+    /// that from this field's presence.
     ///
     /// **A duration, not an instant**, and the wall-clock moment is stamped by the database rather
     /// than computed here: the system database writes it against the same clock it writes
@@ -564,8 +565,8 @@ pub(crate) enum Submitted {
 
 /// Inserts a new workflow, resolving a deduplication collision the way the caller asked.
 ///
-/// A loop, because [`DuplicationPolicy::ReturnExisting`] answers a collision by reading who holds the
-/// key, and the holder can finish between those two statements — leaving the key free and this
+/// A loop, because [`DuplicationPolicy::ReturnExisting`] answers a collision by reading who holds
+/// the key, and the holder can finish between those two statements — leaving the key free and this
 /// call with nothing to join, so it tries the insert again. Everything the insert depends on is
 /// decided by the caller before the first attempt, so a retry writes the same row rather than a
 /// differently-derived one.
@@ -587,8 +588,9 @@ pub(crate) async fn init_or_join(
         {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
-            // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
-            // is the answer, and a handle to it is what [`DuplicationPolicy::ReturnExisting`] promises.
+            // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id is
+            // the answer, and a handle to it is what [`DuplicationPolicy::ReturnExisting`]
+            // promises.
             Err(crate::sysdb::Error::QueueDeduplicated {
                 queue_name,
                 deduplication_id,
@@ -667,8 +669,8 @@ impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
 ///   `Timeout.Inherit`, `Timeout.None` and `Timeout.Explicit` (`workflow/Timeout.java`), resolved
 ///   at `DBOSContext.resolveTimeoutAndDeadline` — where the `None` case clears the propagated
 ///   deadline *and* the timeout, exactly as [`None`](Self::None) does here. This is the one place
-///   Java **is** the model, variant names included; decision 6's "Java is not a model" is about
-///   its user-facing `withDeadline` and the precedence that follows from it, which Rust lacks.
+///   Java **is** the model, variant names included. What Rust does not follow is its user-facing
+///   `withDeadline` and the precedence that follows from it.
 /// - **TypeScript** spells the three as `number | null | undefined` (`context.ts:31`) and branches
 ///   on the middle one under the comment *"Detach child deadline if a null timeout is configured"*
 ///   (`dbos.ts:1969`, and again at `enqueue_workflow.ts:92`).
@@ -813,7 +815,7 @@ where
     /// Returns as soon as the workflow is recorded and spawned. If the id is already owned —
     /// another process is running it, or a previous run finished it — the handle joins the
     /// existing run rather than this being an error: the id is an idempotency key, and honouring
-    /// it is the promise (decision 13). The error is the engine's own channel, because a start
+    /// it is the promise. The error is the engine's own channel, because a start
     /// fails only in the engine's terms; the *workflow's* failures come out of the handle.
     ///
     /// # Child workflows
@@ -865,7 +867,7 @@ where
     /// ```
     ///
     /// A `join!` over the launches — or over the awaits — is the same trap a `join!` over
-    /// [`step`](crate::step)s is, and is unsound for the same reason.
+    /// [`step`](crate::step())s is, and is unsound for the same reason.
     pub async fn start_with(
         &self,
         input: P,
@@ -926,8 +928,8 @@ where
         // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
         // not another hour, and a crash loop cannot extend the budget indefinitely.
         //
-        // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
-        // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
+        // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in
+        // the queue is not part of the budget — which is the branch below.
         let deadline = match (options.timeout, &parent) {
             // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
             // explicit timeout records the budget and leaves the deadline null for the claim
@@ -1110,10 +1112,11 @@ impl Parent {
     /// Reads back a launch recorded at this position, if this parent has run this far before.
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
-    /// [`Error::UnexpectedStep`] before this sees it. What is left to check is the child id: a row
-    /// under the right name carrying none was written by a plain step, which means the parent's
-    /// code changed — `step("charge")` became a child workflow named `charge` — and starting a
-    /// child now would give this position two meanings across two runs.
+    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this sees it. What is
+    /// left to check is the child id: a row under the right name carrying none was written by a
+    /// plain step, which means the parent's code changed — `step("charge")` became a child workflow
+    /// named `charge` — and starting a child now would give this position two meanings across two
+    /// runs.
     ///
     /// **Stricter than the references here.** Python falls through to a fresh launch when the
     /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
@@ -1212,7 +1215,8 @@ pub(crate) fn spawn_execution(
     )
 }
 
-/// Runs `body` until it finishes or its deadline passes, cancelling it durably if the deadline wins.
+/// Runs `body` until it finishes or its deadline passes, cancelling it durably if the deadline
+/// wins.
 ///
 /// **This is the engine's only durable-cancellation path, and shutdown deliberately does not go
 /// through it.** Go #426 had to fix exactly that confusion: its shutdown cancelled a context, the

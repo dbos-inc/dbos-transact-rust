@@ -28,7 +28,7 @@ use crate::sysdb::types::Timestamp;
 ///
 /// The checkpoint's `completed_at` is stamped at the wake time rather than at the moment the row is
 /// written, so an hour's sleep reads as an hour on a timeline instead of as an instant. All four
-/// references now do this — Go was the holdout and joined in #442.
+/// references do the same.
 ///
 /// A zero or negative duration is not an error: it records the checkpoint and returns, so a
 /// computed delay that has already elapsed behaves the same on the first run and on a replay.

@@ -23,7 +23,7 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A registered workflow with its types erased: encoded argument in, encoded outcome out.
 ///
-/// That *is* an FFI shape, and deliberately so (§9.2) — a host language marshals strings and never
+/// That *is* an FFI shape, and deliberately so — a host language marshals strings and never
 /// a Rust type. No context parameter appears in it, because the context is ambient. The error is
 /// erased along with the value, which is what lets a caller keep a typed error while recovery,
 /// holding only a row, keeps none.
@@ -262,7 +262,7 @@ impl DBOS {
     /// **Do not capture the [`DBOS`] instance in `workflow`.** The registry lives on the instance,
     /// so the closure is stored inside the very `Arc` a captured handle points at — a cycle, and
     /// the instance, its executor and its connection pool are then never freed. Nothing a workflow
-    /// body needs requires one: [`step`](crate::step), [`set_event`](crate::set_event) and
+    /// body needs requires one: [`step`](crate::step()), [`set_event`](crate::set_event) and
     /// [`get_event`](crate::get_event) all read the ambient context.
     ///
     /// A [`WorkflowRef`] holds an instance too, so capturing one — to start a child workflow —

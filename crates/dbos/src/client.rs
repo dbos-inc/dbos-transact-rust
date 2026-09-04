@@ -19,7 +19,7 @@
 //! calls it with no executor in sight.
 //!
 //! The type system then makes the boundary concrete twice over. Nothing on this type can fail with
-//! [`Error::NotLaunched`](crate::Error::NotLaunched), because **a client is always connected** —
+//! [`Error::NotLaunched`], because **a client is always connected** —
 //! [`connect`](Client::connect) hands back a usable client or an error, with no second state to
 //! check afterwards. And nothing on it can run a workflow, because it holds nothing that could.
 //!
@@ -149,8 +149,8 @@ pub struct ClientConfig {
     /// On, so [`get_event`](crate::Client::get_event) is woken rather than polling. That is the one
     /// wait it serves here: a workflow's *outcome* is announced on no channel, in this
     /// implementation or any other — Python's `await_workflow_result` polls too — so a result wait
-    /// looks again every [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this is
-    /// set to.
+    /// looks again every [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this
+    /// is set to.
     ///
     /// Go's client starts its listener for the same reason. Python defaults its client's off — a
     /// client there is often a short-lived script, and the listener is a thread and a held
@@ -279,8 +279,8 @@ impl ClientConfig {
 /// teardown, which closes the connections but says nothing about when. That is a safety net —
 /// without it the listener would hold a `LISTEN` connection for the life of the process — and not a
 /// shutdown: nothing waits for either task, and whatever the notifier had inside its coalescing
-/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client is
-/// put away deliberately, and is what a process that connects repeatedly wants.
+/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client
+/// is put away deliberately, and is what a process that connects repeatedly wants.
 #[derive(Clone, Debug)]
 pub struct Client(Arc<Connection>);
 
@@ -494,10 +494,9 @@ impl Client {
     ///
     /// The message waits in the database until the destination reads it, so sending to a workflow
     /// that has not reached its receive — or is not running at all — is normal rather than an
-    /// error. Sending to a workflow that *does not exist* is
-    /// [`Error::SystemDatabase`](crate::Error::SystemDatabase) carrying the system database's
-    /// non-existent-workflow error: the foreign key catches it, so a message is never left
-    /// addressed to nothing.
+    /// error. Sending to a workflow that *does not exist* is [`Error::SystemDatabase`] carrying the
+    /// system database's non-existent-workflow error: the foreign key catches it, so a message is
+    /// never left addressed to nothing.
     ///
     /// **A client's send is not a step**, and that is the difference from the send a workflow body
     /// will make. A workflow's send is checkpointed, so a replay does not send twice; a client has
@@ -568,8 +567,8 @@ impl Client {
     /// reason a client has it is that a queue is a row: a fleet may be configured by the tool that
     /// deploys it rather than by the code that drains it.
     ///
-    /// The limits and the policy are the same [`QueueOptions`](crate::QueueOptions) and
-    /// [`QueueConflict`](crate::QueueConflict) an application states — but
+    /// The limits and the policy are the same [`QueueOptions`] and
+    /// [`QueueConflict`] an application states — but
     /// [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
     /// [`Error::Config`] here rather than a registration: a client runs none of the application's
     /// code, so there is no version of it to be the latest of. Ask for
@@ -582,7 +581,7 @@ impl Client {
     /// being refused**, replacing its stored limits — the ownership check every implementation
     /// shares lets a nameless writer through. Give the client an
     /// [`app_name`](ClientConfig::app_name) to get the refusal
-    /// [`QueueConflict`](crate::QueueConflict) describes. UPSTREAM item 26.
+    /// [`QueueConflict`] describes. UPSTREAM item 26.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {

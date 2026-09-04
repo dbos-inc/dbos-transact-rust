@@ -87,9 +87,9 @@ pub struct StepOptions<E = EngineOnly> {
     /// system database.
     ///
     /// The cost is a periodic status read per running step, at
-    /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the same
-    /// polling-concurrency cap as every other database-backed wait. Python's `preemptible` does
-    /// the same and hardcodes its interval.
+    /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the
+    /// same polling-concurrency cap as every other database-backed wait. Python's `preemptible`
+    /// does the same and hardcodes its interval.
     ///
     /// **A preempted step records nothing** and runs again on resume, because a cancellation is a
     /// control signal rather than the step's result — the step did not fail, it was interrupted.
@@ -238,7 +238,7 @@ impl<E> StepOptions<E> {
 /// nothing, stays `PENDING`, and is recovered until it parks.
 ///
 /// That is a known gap rather than a rule with a workaround. Concurrent steps are a later change:
-/// the flag has to become per-call-stack — a nested [`Ctx`](crate::Ctx) scope around the body, so
+/// the flag has to become per-call-stack — a nested [`Ctx`] scope around the body, so
 /// that nesting is exact and siblings cannot see each other — and wants a count of live steps, so
 /// that genuine concurrency is refused loudly rather than degrading to a plain call. Until then,
 /// sequential is the contract.
@@ -290,7 +290,7 @@ where
 ///
 /// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
 /// to after the final attempt, rather than the last attempt alone. Python takes its
-/// `step_start_time` in the same place, and Go moved to it in #442.
+/// `step_start_time` in the same place, and Go does too since #442.
 pub async fn step_with<T, E, F, Fut>(name: &str, options: StepOptions<E>, body: F) -> Result<T, E>
 where
     T: Serialize + DeserializeOwned,
@@ -313,8 +313,7 @@ where
     let workflow_id = ctx.workflow_id();
 
     // Before the check, not after it: the recorded duration covers the whole step, including the
-    // round trip that asks whether it has already run. Go moved to this in #442 and Python has
-    // always taken `step_start_time` here.
+    // round trip that asks whether it has already run.
     let started_at = Timestamp::now();
 
     let recorded = executor
@@ -567,11 +566,6 @@ where
 /// between polls, and already runs under the polling-concurrency cap that stops a fan-out of
 /// waiters from starving the control plane. Python's poller is the same loop over
 /// `get_workflow_status`, with an interval it hardcodes and this one takes from config.
-///
-/// A terminal outcome that is *not* a cancellation means another executor wrote this workflow's
-/// result while this process was still running it. There is nothing to preempt for — the step's
-/// own outcome is no longer wanted either way — so this parks rather than reporting a cancellation
-/// that did not happen, and lets the attempt finish on its own terms.
 async fn observe_cancellation(ctx: &Ctx) {
     let executor = ctx.executor();
     let interval = executor.outcome_poll_interval();

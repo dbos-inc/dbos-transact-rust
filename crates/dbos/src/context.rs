@@ -60,12 +60,9 @@ struct WorkflowState {
     deadline: Option<Timestamp>,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
-    /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
-    /// pre-increments (`stepID: -1, // Steps are 0-indexed`), while TypeScript and Java start at 0
-    /// and post-increment. Python is the outlier at one-based, and that is an upstream
-    /// inconsistency rather than a choice open to this port: the step id addresses a fork point
-    /// and labels a row in a step listing, so it is a number Conductor renders and a user passes
-    /// to `fork`. Three of four is what a fourth implementation has to match.
+    /// **Zero-based, matching Go, TypeScript and Java.** Python is the outlier at one-based. The
+    /// id addresses a fork point and labels a row in a step listing, so it is a number that leaves
+    /// its own SDK: three of four is what a fourth has to match.
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
@@ -78,7 +75,7 @@ struct WorkflowState {
     ///
     /// **Here, and so per-workflow, which is only right while steps run one at a time.** The
     /// question is really per-call-stack, so two steps in flight at once share an answer meant for
-    /// one — silently, and in both directions; [`step`](crate::step) documents what that costs a
+    /// one — silently, and in both directions; [`step`](crate::step()) documents what that costs a
     /// caller and why sequential is the contract for now. Supporting concurrency starts by moving
     /// this out of here: the flag belongs to the [`Ctx`] that [`Ctx::in_step_scope`] wraps the body
     /// with, rather than to the state every clone shares, and then `WorkflowState` holds only what
@@ -175,7 +172,7 @@ impl Ctx {
     /// restoring here would fix, because the flag is shared rather than per-stack in the first
     /// place.
     ///
-    /// [`step`]: crate::step
+    /// [`step`]: crate::step()
     pub(crate) async fn in_step_scope<F: Future>(
         &self,
         cancellation: Option<CancellationToken>,

@@ -303,8 +303,8 @@ impl std::fmt::Display for BackendError {
 pub enum BackendErrorKind {
     /// The connection failed, or the server cannot serve requests right now.
     ///
-    /// Retried by default, and the one class [`super::retry::RetryPolicy`] can be told to give up on:
-    /// a caller that would rather see the failure than block can opt out.
+    /// Retried by default, and the one class [`super::retry::RetryPolicy`] can be told to give up
+    /// on: a caller that would rather see the failure than block can opt out.
     Connection,
     /// Contention — a serialization failure or a deadlock.
     ///

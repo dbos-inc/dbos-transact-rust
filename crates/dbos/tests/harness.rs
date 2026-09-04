@@ -113,8 +113,8 @@ async fn recorded_version(pool: &sqlx::PgPool) -> i64 {
 /// introducing an object the dump does not emit — all look like passing tests running against
 /// the wrong schema rather than like failures.
 ///
-/// It costs one full corpus run on top of the one the pool already makes. That is the price of
-/// the other several this file's binary no longer pays.
+/// It costs one full corpus run on top of the one the pool already makes, which is the price of
+/// the several the baseline spares every other test in this binary.
 #[tokio::test]
 async fn a_pooled_database_matches_one_the_migrations_built() {
     let migrated = raw_database().await;
@@ -244,11 +244,10 @@ async fn shared_slot_releases_once_nobody_holds_it() {
 /// `SERIAL` is not the same type on both backends: `INT4` on Postgres, `INT8` on
 /// CockroachDB.
 ///
-/// This divergence was caught by the first CockroachDB CI run before the 2026-08-04 repo
-/// reset, and no amount of reading the migrations would have surfaced it. It is recorded
-/// here as an executable note, and it is why the DBOS schema uses explicit `BIGINT`
-/// rather than `SERIAL`. It also proves the backend switch actually reaches
-/// a different engine, which a `SELECT 1` cannot.
+/// Nothing in the migrations' text surfaces this; only running against CockroachDB does. It is
+/// recorded here as an executable note, and it is why the DBOS schema uses explicit `BIGINT`
+/// rather than `SERIAL`. It also proves the backend switch actually reaches a different engine,
+/// which a `SELECT 1` cannot.
 #[tokio::test]
 async fn serial_width_diverges_between_backends() {
     // Raw lane: this creates a table, and a pooled database must not be handed on dirty.

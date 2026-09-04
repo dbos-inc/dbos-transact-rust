@@ -41,10 +41,10 @@
 //!
 //! **They return handles; these return ids.** `DBOS.waitFirst` hands back the handle that won,
 //! which in a language without ownership costs nothing: the caller still holds the others. Handing
-//! back an owned [`WorkflowHandle`] here would mean taking the whole set by value and dropping
-//! every loser, which is precisely the wrong thing for the loop the call exists for. So the answer
-//! is the winner's **id** — the identity the handle carried anyway, and the same thing the
-//! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
+//! back an owned [`WorkflowHandle`](crate::WorkflowHandle) here would mean taking the whole set by
+//! value and dropping every loser, which is precisely the wrong thing for the loop the call exists
+//! for. So the answer is the winner's **id** — the identity the handle carried anyway, and the same
+//! thing the checkpoint stores, so nothing is projected on the way out and re-derived on replay.
 //!
 //! A position in the slice was the other candidate and is worse on every count that matters: it is
 //! the only positional return anywhere in this crate (`cancel_all` and its neighbours take ids and
@@ -82,13 +82,13 @@
 //!   hands back the same id without waiting.
 //! - **`wait_all` records only that it happened.** Every member has settled by the time it
 //!   returns, in whatever order, so there is no choice to pin — the checkpoint exists to skip the
-//!   poll on replay, which is what TypeScript's records too.
+//!   poll on replay, which is what TypeScript's checkpoint records too.
 //!
 //! **A replay checks what its payload lets it check, and no more.** `wait_first` can ask whether
 //! the recorded winner is still in the set, because the winner is what it recorded anyway; the
 //! all-wait recorded no set and so cannot ask the same of one. A workflow resumed or forked with a
 //! member the first execution never waited on therefore skips the wait for it, exactly as a
-//! [`sleep`](crate::sleep) whose duration changed keeps the deadline it recorded. Step *inputs*
+//! [`sleep`](crate::sleep()) whose duration changed keeps the deadline it recorded. Step *inputs*
 //! are not checkpointed anywhere in DBOS — no implementation's step row has a column for them — so
 //! a replay whose arguments changed reads back the answer to the question it asked the first time.
 //! This is that rule rather than an exception to it.
@@ -105,9 +105,8 @@
 //! a registered closure that captured one would be stored inside the very `Arc` it holds a strong
 //! reference to, keeping the instance, its executor and its pool alive for the life of the
 //! process. [`DBOS::wait_first`] and [`DBOS::wait_all`] are for code **outside** a workflow, where
-//! there is nothing ambient to take an executor from; [`Client::wait_first`](crate::Client::wait_first)
-//! and [`Client::wait_all`](crate::Client::wait_all) are that same caller from outside the
-//! application altogether.
+//! there is nothing ambient to take an executor from; the two on
+//! [`Client`](crate::Client) are that same caller from outside the application altogether.
 //!
 //! # Bounding the wait
 //!
@@ -134,7 +133,7 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// it is why [`get_event`](crate::get_event) is a free function too.
 ///
 /// The wait is checkpointed as a step, so a replay returns the same winner instead of racing
-/// again. The error is the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no
+/// again. The error is the *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no
 /// conversion. From inside a *step* it waits plainly with no checkpoint, the step's own checkpoint
 /// standing for everything its body did.
 ///

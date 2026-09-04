@@ -86,7 +86,7 @@ pub type Result<T, E = EngineOnly> = std::result::Result<T, Error<E>>;
 
 /// Everything a durable function can fail with.
 ///
-/// `#[non_exhaustive]` because the twenty codes the other implementations share (§4.6) arrive with
+/// `#[non_exhaustive]` because the twenty codes the other implementations share arrive with
 /// the phases that raise them; matching callers need a wildcard arm from the start rather than a
 /// breaking change later.
 ///
@@ -337,14 +337,14 @@ pub enum Error<E = EngineOnly> {
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
-    /// not Java's — Java rethrows the final failure untyped, and `sdk-parity.md` records it as the
-    /// outlier. The first failure is usually the informative one and the last is usually a timeout,
+    /// not Java's — Java rethrows the final failure untyped, and is the outlier here. The first
+    /// failure is usually the informative one and the last is usually a timeout,
     /// so keeping only one loses the half that explains the other.
     ///
     /// Raised only where retries were actually asked for. A step left at the default
-    /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its one
-    /// attempt failed with, unwrapped: there is no retry policy to report on, and wrapping would
-    /// make every ordinary step failure arrive inside a collection of one.
+    /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its
+    /// one attempt failed with, unwrapped: there is no retry policy to report on, and wrapping
+    /// would make every ordinary step failure arrive inside a collection of one.
     #[error("the step {step} failed on all {attempts} attempts")]
     MaxStepRetriesExceeded {
         /// The step's name.
@@ -497,7 +497,7 @@ impl Error<EngineOnly> {
     /// let child = checkout.start(order).await.map_err(Error::lift)?;
     /// ```
     ///
-    /// The workflow-facing calls do not need it: [`step`](crate::step),
+    /// The workflow-facing calls do not need it: [`step`](crate::step()),
     /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) are all generic over
     /// the caller's channel, so `?` works on them directly.
     pub fn lift<E>(self) -> Error<E> {

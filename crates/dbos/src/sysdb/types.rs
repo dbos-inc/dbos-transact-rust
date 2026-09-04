@@ -20,10 +20,10 @@
 //! exactly rather than through someone's calendar, and `Duration` is in `std`. Callers wanting a
 //! calendar type convert at their own edge.
 //!
-//! One exception, and it is the schema's rather than a preference: `workflow_schedules.last_fired_at`
-//! holds ISO-8601 text, so a calendar is unavoidable for that column. `std` has none, so
-//! [`Timestamp::to_iso8601`] and [`Timestamp::parse_iso8601`] go through `time` — parsing and
-//! formatting only, with no timezone database, since the column is always UTC.
+//! One exception, and it is the schema's rather than a preference:
+//! `workflow_schedules.last_fired_at` holds ISO-8601 text, so a calendar is unavoidable for that
+//! column. `std` has none, so [`Timestamp::to_iso8601`] and [`Timestamp::parse_iso8601`] go through
+//! `time` — parsing and formatting only, with no timezone database, since the column is always UTC.
 
 use super::Error;
 use std::fmt;
@@ -152,9 +152,11 @@ impl Timestamp {
     /// Formats as ISO-8601 in UTC: `2026-08-12T14:30:00.123Z`, or `2026-08-12T14:30:00Z` on a
     /// whole second.
     ///
-    /// For [`workflow_schedules.last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at),
-    /// the one column in the schema holding a formatted instant rather than epoch milliseconds.
-    /// This is Go's and Java's spelling of the four; every implementation's reader accepts it.
+    /// For [`workflow_schedules.last_fired_at`][lf], the one column in the schema holding a
+    /// formatted instant rather than epoch milliseconds. This is Go's and Java's spelling of the
+    /// four; every implementation's reader accepts it.
+    ///
+    /// [lf]: crate::sysdb::SystemDatabase::update_schedule_last_fired_at
     ///
     /// Infallible in practice and `String` rather than `Result` because of it: the only way
     /// `time` refuses to format is a year outside its range, which is four orders of magnitude
@@ -1112,16 +1114,17 @@ impl<'a> Outcome<'a> {
 /// workflow rather than by it, so they are states no run ever reports — and it is precisely the
 /// caller waiting on a workflow it is not running that has to be told about them.
 ///
-/// **"Awaited" is the references' own word for that side of the relationship**, and it is load-bearing
-/// rather than decorative: Python raises `DBOSAwaitedWorkflowCancelledError` specifically so a
-/// cancelled *awaited* workflow is not mistaken for the *awaiting* one having been cancelled. The
-/// same distinction is why the variants below are values — see the second bullet.
+/// **"Awaited" is the references' own word for that side of the relationship**, and it is
+/// load-bearing rather than decorative: Python raises `DBOSAwaitedWorkflowCancelledError`
+/// specifically so a cancelled *awaited* workflow is not mistaken for the *awaiting* one having
+/// been cancelled. The same distinction is why the variants below are values — see the second
+/// bullet.
 ///
-/// Not named for terminality, because one variant is not terminal:
-/// [`WorkflowStatus::is_terminal`] is deliberately false for
+/// Not named for terminality, because one variant is not terminal: [`WorkflowStatus::is_terminal`]
+/// is deliberately false for
 /// [`MaxRecoveryAttemptsExceeded`](WorkflowStatus::MaxRecoveryAttemptsExceeded), which
-/// [`Parked`](Self::Parked) is. It ends a *wait* without ending the workflow, since the workflow can
-/// still be resumed.
+/// [`Parked`](Self::Parked) is. It ends a *wait* without ending the workflow, since the workflow
+/// can still be resumed.
 ///
 /// **All four come back as values, including the two that are failures.** Two reasons, and the
 /// second is the one that would be a bug:
@@ -1259,9 +1262,9 @@ impl WorkflowDelay {
 ///
 /// The references model this as two booleans, `is_recovery_request` and `is_dequeued_request`,
 /// but **no call site in any of them sets both** — Python's dispatchers pass exactly
-/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. A
-/// three-way choice is what it has always been, and naming it removes an unreadable pair of
-/// adjacent `bool` arguments that would compile just as happily swapped.
+/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. That is a
+/// three-way choice, and naming it removes an unreadable pair of adjacent `bool` arguments that
+/// would compile just as happily swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Submission {
     /// A first attempt, which does not claim a workflow another owner already holds.
@@ -1663,8 +1666,9 @@ impl DebounceRequest<'_> {
 /// What a debounce did, or why it could not.
 ///
 /// Recorded as a debounce step's output when one runs inside a workflow, so a replay reports what
-/// the first run did rather than bouncing again — see
-/// [`SystemDatabase::debounce_delayed_workflow`](crate::sysdb::SystemDatabase::debounce_delayed_workflow).
+/// the first run did rather than bouncing again — see [`debounce_delayed_workflow`][d].
+///
+/// [d]: crate::sysdb::SystemDatabase::debounce_delayed_workflow
 ///
 /// Three outcomes rather than the flat record the references return: their `DebounceResult`
 /// carries `bounced_workflow_id` alongside a run of `holder_*` fields, of which exactly one group
@@ -1814,7 +1818,7 @@ impl QueueRecord {
     /// **The deprecated flag re-scopes rather than adds.** Under `partition_queue`, `concurrency`,
     /// `worker_concurrency` and the rate limit all apply *per partition* — so they move into the
     /// partition fields and the queue-wide ones are dropped, leaving nothing enforced queue-wide.
-    /// That is what the flag has always meant; Python spells it `_resolve_limits` and TypeScript
+    /// That is what the flag means; Python spells it `_resolve_limits` and TypeScript
     /// `resolveQueueLimits`, both returning exactly this, and reading such a row any other way
     /// would either over-admit or strand a peer's backlog.
     ///
@@ -2056,8 +2060,9 @@ pub struct Fork<'a> {
     pub source_id: &'a str,
     /// The id the fork gets, or `None` to have one generated.
     ///
-    /// Optional because Go and TypeScript both generate one when the caller does not care, and
-    /// the generated ids come back from [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    /// Optional because Go and TypeScript both generate one when the caller does not care, and the
+    /// generated ids come back from
+    /// [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
     pub forked_id: Option<&'a str>,
     /// The first step the fork will run.
     ///
@@ -2142,7 +2147,8 @@ pub struct ForkOptions<'a> {
     /// Forking onto a *new* version is the point of the parameter: a workflow that failed on a
     /// broken deployment is forked onto the fixed one.
     pub application_version: Option<&'a str>,
-    /// The queue the fork is enqueued on. `None` means [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    /// The queue the fork is enqueued on. `None` means
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
     ///
     /// A fork is always enqueued rather than started: it is created by whoever asked for the
     /// fork, and run by whichever executor picks it up.
@@ -2220,9 +2226,10 @@ impl ForkOptions<'_> {
 ///
 /// **Here rather than in a backend, because they are stored contract.** Each of these lands in
 /// `operation_outputs.function_name`, where a replay compares it, Conductor renders it, and another
-/// SDK's step listing has to agree with it — so they belong beside the row shapes rather than beside
-/// the SQL of whichever backend happens to write them. A second backend that redeclared them could
-/// drift from this one silently, and nothing would notice until a workflow crossed between the two.
+/// SDK's step listing has to agree with it — so they belong beside the row shapes rather than
+/// beside the SQL of whichever backend happens to write them. A second backend that redeclared them
+/// could drift from this one silently, and nothing would notice until a workflow crossed between
+/// the two.
 ///
 /// **Public because a caller may legitimately need to name one** — filtering a step listing to the
 /// engine's own operations, or grouping by them — and retyping a string the engine already owns is
@@ -2255,8 +2262,8 @@ pub mod step_names {
     /// including an empty batch, came from the bulk API.
     ///
     /// A workflow whose message count changes between runs will flip names and be caught as
-    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep). That is nondeterminism in the
-    /// workflow, and catching it is the point of recording the name at all.
+    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep). That is nondeterminism in
+    /// the workflow, and catching it is the point of recording the name at all.
     pub const SEND: &str = "DBOS.send";
     pub const SEND_BULK: &str = "DBOS.sendBulk";
 
@@ -2314,10 +2321,11 @@ pub mod step_names {
 
     /// The step a debounce records when a workflow does the bouncing.
     ///
-    /// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations disagree
-    /// on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's, which is the
-    /// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
-    /// only crosses one by enqueue, so this is a convention rather than a wire format.
+    /// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations
+    /// disagree on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's,
+    /// which is the form DBOS's own type names take. Nothing reads a step name across languages,
+    /// since a workflow only crosses one by enqueue, so this is a convention rather than a wire
+    /// format.
     pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
 
     /// The step names the management surface records, which a replay compares against.
@@ -2330,11 +2338,12 @@ pub mod step_names {
     ///
     /// **The singular name covers the bulk form too.** Python, TypeScript and Java record the
     /// singular whatever the batch size; Go pluralizes, and inconsistently — `DBOS.cancelWorkflow`
-    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one.
-    /// Three of four decides it, and one name per operation is worth having on its own: the
-    /// singular forms here *are* the bulk ones with a single id, so a workflow that switches
-    /// between [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all)
-    /// between runs still replays instead of raising [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
+    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one. Three
+    /// of four decides it, and one name per operation is worth having on its own: the singular
+    /// forms here *are* the bulk ones with a single id, so a workflow that switches between
+    /// [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all) between runs
+    /// still replays instead of raising
+    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
     ///
     /// **[`LIST_WORKFLOW_STEPS`] follows the three, not Go**, which records
     /// `DBOS.getWorkflowSteps` where Python, TypeScript and Java all say `listWorkflowSteps`.
@@ -2372,13 +2381,13 @@ pub mod step_names {
 
     /// The step names the schedule methods record, which a replay compares against.
     ///
-    /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause
-    /// and resume are two names there because they are two API calls; they reach one method here, so
-    /// the name follows the status being set rather than the method being called.
+    /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`.
+    /// Pause and resume are two names there because they are two API calls; they reach one method
+    /// here, so the name follows the status being set rather than the method being called.
     ///
     /// **`DBOS.upsertSchedule` is the exception**: TypeScript has no such method — its upsert is
-    /// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is this
-    /// crate's, camelCased from Python's by analogy with the seven that are verbatim.
+    /// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is
+    /// this crate's, camelCased from Python's by analogy with the seven that are verbatim.
     pub const CREATE_SCHEDULE: &str = "DBOS.createSchedule";
     pub const UPSERT_SCHEDULE: &str = "DBOS.upsertSchedule";
     pub const GET_SCHEDULE: &str = "DBOS.getSchedule";
@@ -2486,13 +2495,16 @@ pub struct ScheduleRecord {
     /// Stored as ISO-8601 text rather than the epoch milliseconds every other time column holds,
     /// and read back through [`Timestamp::parse_iso8601`] so a caller gets an instant either way.
     /// The four implementations write four spellings of it — see
-    /// [`SystemDatabase::update_schedule_last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at).
+    /// [`update_schedule_last_fired_at`][u].
+    ///
+    /// [u]: crate::sysdb::SystemDatabase::update_schedule_last_fired_at
     pub last_fired_at: Option<Timestamp>,
     /// Whether missed firings are made up when a paused or stopped schedule resumes.
     pub automatic_backfill: bool,
     /// The timezone the cron expression is read in, or `None` for UTC.
     pub cron_timezone: Option<String>,
-    /// The queue firings are enqueued onto, or `None` for [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    /// The queue firings are enqueued onto, or `None` for
+    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
     pub queue_name: Option<String>,
     /// The application that owns the schedule, or `None` if it is unclaimed.
     pub application_name: Option<String>,
@@ -2511,7 +2523,7 @@ pub struct NewSchedule<'a> {
     /// higher, at every call site that registers a schedule, and hand this layer a value it must
     /// take. That is the same split `application_name` has, and it resolves the same way: the
     /// fallback lives here because nothing sits above this layer yet, and becomes a second line
-    /// of defence rather than the only one once Phase 2's registration layer does.
+    /// of defence rather than the only one once the scheduler's registration does.
     pub schedule_id: Option<&'a str>,
     /// See [`ScheduleRecord::schedule_name`].
     pub schedule_name: &'a str,

@@ -14,8 +14,8 @@
 //! refers to. It also removes the branch every reference runner carries, where a queue's
 //! configuration is re-read per iteration only if it came from the database.
 //!
-//! The one queue with no row is [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE), which is the
-//! engine's own: `resume` and `fork` put work there, and it is not a queue anybody registers.
+//! The one queue with no row is [`INTERNAL_QUEUE`], which is the engine's own: `resume` and `fork`
+//! put work there, and it is not a queue anybody registers.
 
 use std::borrow::Cow;
 use std::result::Result as StdResult;
@@ -46,11 +46,11 @@ pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// **Its own fields rather than a wrapped [`QueueRecord`]**, which is what Go's `queueFromConfig`,
 /// TypeScript's `WorkflowQueue._fromRecord` and Python's `ResolvedQueueLimits` each build too. Two
-/// reasons, and the second is why it is worth the mapping: the engine names a limit for the scope
-/// it applies at while the row names it for its column — [`concurrency`](Self::concurrency)
-/// against `concurrency` — and derived equality over a wrapped row would compare
-/// [`application_name`](QueueRecord::application_name), which this type deliberately does not
-/// report, so two queues identical through every accessor here could still differ.
+/// reasons: this reports every limit at the scope it is enforced at, where the row spells them as
+/// the columns a deprecated `partition_queue` flag re-scopes; and derived equality over a wrapped
+/// row would compare [`application_name`](QueueRecord::application_name) and `partition_queue`,
+/// neither of which this type reports, so two queues identical through every accessor here could
+/// still differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queue {
     name: String,
@@ -71,8 +71,7 @@ impl Queue {
     /// registered the two are the same. For one a peer wrote with the deprecated `partition_queue`
     /// flag they are not: that flag means every queue-wide limit applies per partition, so
     /// [`QueueRecord::resolved_limits`] moves them into the partition fields and the receipt says
-    /// what the queue
-    /// actually does rather than which columns happen to hold it.
+    /// what the queue actually does rather than which columns happen to hold it.
     fn from_record(record: QueueRecord) -> Self {
         let name = record.name.clone();
         let polling_interval = record.polling_interval;
@@ -155,10 +154,10 @@ impl Queue {
 /// They are one idea crossed two ways — over **scope**, the whole queue or one partition key, and
 /// over **reach**, the whole fleet or this process alone:
 ///
-/// |                       | whole queue                       | one partition                               |
-/// |-----------------------|-----------------------------------|---------------------------------------------|
-/// | **every executor**    | [`concurrency`][g]         | [`partition_concurrency`][p]                |
-/// | **this process only** | [`worker_concurrency`][w]         | [`partition_worker_concurrency`][pw]        |
+/// |                       | whole queue                | one partition                          |
+/// |-----------------------|----------------------------|----------------------------------------|
+/// | **every executor**    | [`concurrency`][g]         | [`partition_concurrency`][p]           |
+/// | **this process only** | [`worker_concurrency`][w]  | [`partition_worker_concurrency`][pw]   |
 ///
 /// [g]: Self::concurrency
 /// [p]: Self::partition_concurrency

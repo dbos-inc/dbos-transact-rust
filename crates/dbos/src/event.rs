@@ -1,7 +1,7 @@
 //! Workflow events: a key/value a workflow publishes and anyone may read.
 //!
 //! Four surfaces, split by where the caller stands. [`set_event`] and [`get_event`] are free
-//! functions like [`step`](crate::step), callable only from inside a workflow: they take the
+//! functions like [`step`](crate::step()), callable only from inside a workflow: they take the
 //! executor and the step-id sequence from the ambient context, so a workflow body needs no
 //! handle to anything. [`DBOS::get_event`] is the instance method for the other reader — an HTTP
 //! handler polling for progress, outside any workflow, where there is nothing ambient to take an
@@ -14,7 +14,7 @@
 //! of the process. Making a workflow capture a handle in order to read an event would have made
 //! that the documented way to write one.
 //!
-//! All three are thin: `sysdb` owns the transactional write, the replay skip, the blocking read,
+//! All four are thin: `sysdb` owns the transactional write, the replay skip, the blocking read,
 //! and the cross-SDK step names (`DBOS.setEvent`, `DBOS.getEvent`). What the engine adds is the
 //! step ids from the ambient context, the payload encoding, and the guards on where each call may
 //! stand.
@@ -40,7 +40,7 @@ use crate::sysdb::types::GetEventCaller;
 ///
 /// The write is checkpointed under a step id, so a replay does not publish again — `sysdb` sees
 /// the recorded step and skips, in the same transaction that would have written. The error is the
-/// *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion.
+/// *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no conversion.
 ///
 /// Only from inside a workflow, and not from inside a step. Outside a workflow there is no step
 /// sequence to checkpoint against, and unlike a step there is no plain version of a durable write
@@ -91,7 +91,7 @@ where
 ///
 /// The read is checkpointed as two steps (the read and its deadline), so a replay returns what the
 /// first run saw, including a timeout's `None`, instead of waiting again. The error is the
-/// *workflow's* channel, like [`step`](crate::step)'s and [`set_event`]'s, so `?` needs no
+/// *workflow's* channel, like [`step`](crate::step())'s and [`set_event`]'s, so `?` needs no
 /// conversion. From inside a *step* it reads plainly with no checkpoint, the step's own checkpoint
 /// standing for everything its body did — the same leaf rule as a nested step.
 ///

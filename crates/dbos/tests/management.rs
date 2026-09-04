@@ -1214,8 +1214,8 @@ async fn forking_from_a_searched_point_refuses_a_chosen_id() {
 /// **A resume can name the queue it goes back on**, which is how a backlog is resumed without
 /// flooding the fleet — the internal queue takes no limits.
 ///
-/// All four references offer this and Rust was the only one that did not. The proof is the row's
-/// own `queue_name` after the resume, not just that the workflow ran.
+/// All four references offer it too. The proof is the row's own `queue_name` after the resume,
+/// not just that the workflow ran.
 #[tokio::test]
 async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
     let db = test_database().await;

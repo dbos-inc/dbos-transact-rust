@@ -101,7 +101,8 @@ async fn a_replayed_sleep_does_not_start_its_clock_again() {
     dbos.shutdown().await;
 }
 
-/// Outside a workflow it is a plain sleep, so a function built from steps and sleeps stays callable.
+/// Outside a workflow it is a plain sleep, so a function built from steps and sleeps stays
+/// callable.
 #[tokio::test]
 async fn a_sleep_outside_a_workflow_waits_plainly() {
     let before = std::time::Instant::now();

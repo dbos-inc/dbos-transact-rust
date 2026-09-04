@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 # Each crate is created by the work that first ships code into it, rather than scaffolded up
-# front: `dbos-macros` arrives with the attribute macros, and `dbos-transact` only when a
-# signpost release to `dbos` is cut. `test-support` is unpublished and exists so that tests
-# needing a real database can live beside the code they test, rather than only under `tests/`.
+# front: `dbos-macros` arrives with the first macro a `macro_rules!` cannot express, and
+# `dbos-transact` only when a signpost release to `dbos` is cut. `test-support` is unpublished
+# and exists so that tests needing a real database can live beside the code they test, rather
+# than only under `tests/`.
 members = ["crates/dbos", "crates/test-support", "demo-apps/dbos-rust-starter"]
 
 [workspace.package]

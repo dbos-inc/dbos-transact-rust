@@ -205,12 +205,11 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
 
 /// Whether a database error's message is really a transport failure wearing a SQLSTATE.
 ///
-/// Only consulted for the internal-error class, where the code says nothing beyond "something
-/// went wrong". The needles are Go's `net` package errors, which is what CockroachDB embeds when
-/// the connection to a client dies under it — `read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o
-/// timeout` and its siblings. Deliberately narrow: a false match here classifies a permanent
-/// failure as a connection one, and [`with_retry`](super::retry::with_retry) retries those
-/// forever.
+/// Only consulted for the internal-error class, where the code says nothing beyond "something went
+/// wrong". The needles are Go's `net` package errors, which is what CockroachDB embeds when the
+/// connection to a client dies under it — `read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o timeout` and
+/// its siblings. Deliberately narrow: a false match here classifies a permanent failure as a
+/// connection one, and [`with_retry`] retries those forever.
 fn is_transport_failure(message: &str) -> bool {
     const NEEDLES: [&str; 5] = [
         "i/o timeout",
@@ -657,10 +656,10 @@ fn rename_source_predicate(source: RenameFrom<'_>, param: usize) -> String {
 
 /// Where a batch of forks starts, which is the only thing the two fork entry points disagree on.
 ///
-/// [`Given`](Self::Given) is `fork_workflows`, whose caller states the step. [`Resolve`](Self::Resolve)
-/// is `fork_from`, which works it out from each source's own recorded history — and does so
-/// *inside* the fork's transaction, so the history a fork point comes from is the history the
-/// fork is written against, and so a replay looks nothing up at all.
+/// [`Given`](Self::Given) is `fork_workflows`, whose caller states the step.
+/// [`Resolve`](Self::Resolve) is `fork_from`, which works it out from each source's own recorded
+/// history — and does so *inside* the fork's transaction, so the history a fork point comes from is
+/// the history the fork is written against, and so a replay looks nothing up at all.
 #[derive(Debug, Clone, Copy)]
 enum StartSteps<'a> {
     /// One start step per source, in the same order.
@@ -762,11 +761,11 @@ impl PostgresSystemDatabase {
     ///   than it sounds: a step written from a dropped connection would freeze a transient outage
     ///   into a permanent answer for that workflow.
     ///
-    /// TODO(dbos-team): UPSTREAM item 14. That last point is a real asymmetry, not a detail. An *ordinary* step's
-    /// failure is recorded and replayed as the same failure in both references; only these
-    /// internal ones drop it, so a replay can take a different branch from the run it is
-    /// replaying — create fails with "already exists", an operator deletes the schedule, and the
-    /// replay succeeds. Worth deciding whether that is intended, and documenting it either way.
+    /// TODO(dbos-team): UPSTREAM item 14. That last point is a real asymmetry, not a detail. An
+    /// *ordinary* step's failure is recorded and replayed as the same failure in both references;
+    /// only these internal ones drop it, so a replay can take a different branch from the run it
+    /// is replaying — create fails with "already exists", an operator deletes the schedule, and
+    /// the replay succeeds.
     ///
     /// Without a `caller` this is just the work on its own transaction: no step is checked and
     /// none is written.
@@ -777,7 +776,7 @@ impl PostgresSystemDatabase {
     ///
     /// **`started_at` is the caller's and the completion is this function's.** Every caller sits
     /// inside a [`with_retry`], so the start is read once outside it and the recorded duration
-    /// spans every attempt, as [`crate::step`] does for an ordinary step; the completion is read
+    /// spans every attempt, as [`crate::step()`] does for an ordinary step; the completion is read
     /// here, once the work has actually finished. Taking a whole [`StepTiming`] invited the
     /// caller to read the clock twice in a row and record a duration of nothing.
     ///
@@ -812,9 +811,10 @@ impl PostgresSystemDatabase {
 
         // A failure rolls the transaction back and records nothing, so the replay runs the work
         // again. Both references do exactly this — Python's `with self.engine.begin()`
-        // (`_sys_db.py:6415`) and TypeScript's `catch { ROLLBACK; throw }` (`system_database.ts:1461`)
-        // — and the alternative is worse than it sounds: a step recorded from a dropped connection
-        // freezes a transient outage into a permanent answer for that workflow.
+        // (`_sys_db.py:6415`) and TypeScript's `catch { ROLLBACK; throw }`
+        // (`system_database.ts:1461`) — and the alternative is worse than it sounds: a step
+        // recorded from a dropped connection freezes a transient outage into a permanent answer for
+        // that workflow.
         let (mut tx, value) = work(tx).await?;
 
         if let Some((workflow_id, step_id)) = caller {
@@ -954,10 +954,10 @@ impl PostgresSystemDatabase {
             }
         };
 
-        // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's
-        // guard, not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`,
-        // and with steps_table numbered from zero the latter drops step 0 from every fork that resumes
-        // at step 1 — the fork then re-runs a step it was given the result of.
+        // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's guard,
+        // not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`, and with
+        // steps_table numbered from zero the latter drops step 0 from every fork that resumes at
+        // step 1 — the fork then re-runs a step it was given the result of.
         let copies_anything = start_steps.iter().any(|&step| step > 0);
 
         let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
@@ -1214,8 +1214,8 @@ impl PostgresSystemDatabase {
         // `schedule_id`, `status` and `last_fired_at` are absent, so they keep the stored ones. A
         // redeployment therefore cannot resume a paused schedule or forget where it had got to.
         //
-        // Ownership is claimed, never taken: `COALESCE` leaves an owned row alone, so a registration
-        // landing between the resolve above and this write keeps the name it took.
+        // Ownership is claimed, never taken: `COALESCE` leaves an owned row alone, so a
+        // registration landing between the resolve above and this write keeps the name it took.
         sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {schedules_table} \
              (schedule_id, schedule_name, workflow_name, workflow_class_name, schedule, status, \
@@ -1680,13 +1680,10 @@ const VERSION_COLUMNS: &str =
 ///
 /// TODO(dbos-team): UPSTREAM item 9, per-application queue and schedule names. Their global
 /// uniqueness means two applications sharing a system database cannot both register `orders`, so
-/// anyone sharing one needs an application prefix by convention because the schema will not
-/// disambiguate. Routing is not the obstacle — a dequeue is already scoped by `application_name`,
-/// so each would pick up only its own workflows — it is that the registry row *is* the shared
-/// configuration: one set of concurrency, rate and polling values per name. A
-/// `(application_name, name)` key mirroring 106 and 107 would settle it, but it is a larger change
-/// than the version one, because `workflow_status.queue_name` stores a bare string that would then
-/// no longer identify a queue on its own.
+/// anyone sharing one needs an application prefix by convention. A `(application_name, name)` key
+/// mirroring 106 and 107 would settle it, but it is a larger change than the version one, because
+/// `workflow_status.queue_name` stores a bare string that would then no longer identify a queue on
+/// its own.
 ///
 /// TODO(dbos-team): UPSTREAM item 1. This read is exact only while the name is globally unique.
 /// Migrations 106 and 107 exist to replace `application_versions`' `UNIQUE (version_name)` with
@@ -1696,29 +1693,16 @@ const VERSION_COLUMNS: &str =
 /// name alone too, so the drop migration wants an `application_name IS NOT DISTINCT FROM` scope on
 /// this read in all three, agreed before anyone writes the drop.
 ///
-/// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED —
-/// the default in all of them — a registrar can claim the row in between. The write is
-/// self-guarding, so it matches zero rows rather than landing on the wrong one, but the caller is
-/// told `Ok`: an operator can believe a version rollback took effect when it did not. The same
-/// silence covers a name that matches nothing at all — promoting a version that was never
-/// registered reports success and moves nothing, in all four references as well — which is the
-/// failure item 12 describes for schedule writes, on the one operation an operator reaches for
-/// when a deploy has gone wrong. A `SELECT … FOR UPDATE` here would settle the race; reporting
-/// rows-affected to the caller settles both, and is the only one of the two that catches the name
-/// nobody holds.
+/// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED a
+/// registrar can claim the row in between. The write is self-guarding, so it matches zero rows
+/// rather than landing on the wrong one — but the caller is told `Ok`, as it is for a version name
+/// that matches nothing at all.
 ///
-/// TODO(dbos-team): UPSTREAM item 26. The nameless branch above is a shared gap, not this port's
-/// choice: `_resolve_row_owner` (`_sys_db.py:892`), `#resolveRowOwner` (`system_database.ts:1095`),
-/// `resolveRowOwner` (`system_database.go:203`) and `RowOwner.resolve` (`RowOwner.java:27`) all
-/// return the holder to a claimant that has no name, and their callers then write scoped to it —
-/// so a nameless `upsert_queue` replaces a peer's stored limits, a nameless
-/// `update_application_version_timestamp` retimes a version another fleet is rolling on, and a
-/// nameless `upsert_schedule` replaces a peer's definition. Go's resolver reads as though this is
-/// deliberate ("the path of a client operating on behalf of all apps"); the other four say only
-/// that the owner is left intact, and their client-facing docs promise a peer's name is refused
-/// without qualifying it for the caller that usually has no name of its own. Either a nameless
-/// writer acts for every application — in which case all five need to say so — or it may claim an
-/// unclaimed row but not overwrite an owned one, in which case this returns
+/// TODO(dbos-team): UPSTREAM item 26. The nameless branch above is a shared gap rather than this
+/// port's choice — all five resolvers return the holder to a claimant that has no name, and their
+/// callers then write scoped to it, so a nameless writer rewrites a peer's registration. Either
+/// that is what a nameless writer is for, in which case all five need to say so, or it may claim
+/// an unclaimed row but not overwrite an owned one, in which case this returns
 /// [`Error::RegisteredByAnother`] with no `claimant`, which the variant already models. Not a
 /// change to make in one implementation.
 async fn resolve_owning_application(
@@ -2090,36 +2074,12 @@ impl PostgresSystemDatabase {
     {
         let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
-        // TODO(dbos-team): UPSTREAM item 6, clearing `started_at_epoch_ms` here. All four
-        // implementations do it identically (`system_database.go:1910`, `system_database.ts:1536`,
-        // `_sys_db.py:1062`) and none of them explain it.
-        //
-        // When this was raised with other members of the DBOS team, the explanation was that
-        // clearing the start time was needed for rate limiting.
-        //
-        // While this explanation is coherent, it does not apply here. The limiter counts starts,
-        // not running work: its status filter excludes only `ENQUEUED` and `DELAYED` — the
-        // not-yet-started states — so `CANCELLED`, `SUCCESS`, `ERROR` and `PENDING` all count,
-        // and a workflow keeps its slot for the rest of the window however it ended. That is
-        // deliberate: a workflow that started and then failed still consumed a start, and
-        // probably still reached whatever the limiter exists to protect. So a `CANCELLED` row with
-        // a recent start really would hold a slot.
-        //
-        // **But this statement also sets `queue_name = NULL` on the same line, and the count is
-        // scoped `WHERE queue_name = $1`.** The row leaves the limiter through the queue name, not
-        // through the start time. Clearing the start time buys nothing here.
-        //
-        // Where the clearing *is* motivated is the paths that put a workflow back on a queue and
-        // keep its name — `clear_queue_assignment` and `resume_workflows`. Even there the limiter
-        // is not the reason, since those rows land in `ENQUEUED`, which the filter already
-        // excludes. The reason is what the column means: "when the current execution started",
-        // and a workflow sitting in a queue has not started. Leaving a stale value would also
-        // make it ambiguous whether the next dequeue's stamp was the first start.
-        //
-        // That reasoning looks inherited here, and it runs backwards: a workflow that was running
-        // when it was cancelled *did* start, so clearing the column discards true information.
-        // The cost is that `started_after`/`started_before` no longer find it, and it ends up
-        // with a `completed_at` and no matching start. Kept anyway — diverging from four
+        // TODO(dbos-team): UPSTREAM item 6, clearing `started_at_epoch_ms` here. The rate limiter
+        // is the usual justification and does not apply: this statement sets `queue_name = NULL`
+        // on the same line, and the count is scoped `WHERE queue_name = $1`, so the row leaves the
+        // limiter through the name rather than through the start time. A workflow that was running
+        // when it was cancelled *did* start, so clearing the column discards true information and
+        // hides the row from `started_after`/`started_before`. Kept anyway — diverging from four
         // implementations on a durable column is the worse trade.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
@@ -2444,8 +2404,8 @@ impl PostgresSystemDatabase {
 impl PostgresSystemDatabase {
     /// Re-owns a table's rows in half-open key ranges, returning how many moved.
     ///
-    /// **Ranges, not `LIMIT`.** A `LIMIT` walks past every row already moved on each pass, turning a
-    /// long history into quadratic work, and collecting the keys into an `IN` list plans as a
+    /// **Ranges, not `LIMIT`.** A `LIMIT` walks past every row already moved on each pass, turning
+    /// a long history into quadratic work, and collecting the keys into an `IN` list plans as a
     /// whole-table hash join. A watermark on the key column reads each row once.
     ///
     /// Two details carry the correctness. The bound is the `batch_size`-th **distinct** key, so a
@@ -2494,19 +2454,20 @@ impl PostgresSystemDatabase {
         // cannot drift out of step with the SQL.
         //
         // The `batch_size`-th distinct key bounds each range, inclusively. The offset is one less
-        // because `OFFSET` counts from zero, and `DISTINCT` is what keeps one workflow's steps inside a
-        // single batch. It is interpolated rather than bound, alone among the values here: a `u32`
-        // renders as digits and nothing else, and a literal offset is one the planner can see.
+        // because `OFFSET` counts from zero, and `DISTINCT` is what keeps one workflow's steps
+        // inside a single batch. It is interpolated rather than bound, alone among the values here:
+        // a `u32` renders as digits and nothing else, and a literal offset is one the planner can
+        // see.
         let select_bound = format!(
             "SELECT DISTINCT {key_column} FROM {table} \
              WHERE {select_predicate} AND {key_column} > COALESCE($2, '') \
              ORDER BY {key_column} LIMIT 1 OFFSET {}",
             batch_size - 1
         );
-        // Two update shapes rather than one with nullable bounds, because an upper bound the planner
-        // cannot resolve costs as much as a missing lower one: with both bounds bare this is an index
-        // range, with either wrapped in a null test it degrades to a scan. Each carries exactly the
-        // parameters it names.
+        // Two update shapes rather than one with nullable bounds, because an upper bound the
+        // planner cannot resolve costs as much as a missing lower one: with both bounds bare this
+        // is an index range, with either wrapped in a null test it degrades to a scan. Each carries
+        // exactly the parameters it names.
         let update_range = format!(
             "UPDATE {table} SET application_name = $1 \
              WHERE {update_predicate} \
@@ -2606,17 +2567,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         // `created_at` from `time.time()`, Go computes `time.Now().Add(delay)` in `workflow.go`,
         // and TypeScript does the same; all three bind an absolute instant.
         //
-        // Moving this one onto `now()` was tried and backed out, because it trades a skew they
-        // all have for a drift only this one would have. `NOW_MS_SQL` is re-read on every
-        // attempt, and `with_retry` starts at a one-second backoff with no attempt limit, so an
-        // insert that lost its first attempt to a serialization failure would release its
-        // workflow a second late — and a hundred-millisecond delay would be off by an order of
-        // magnitude. The `ON CONFLICT` arm below does not rewrite the column, but that only
-        // covers the lost-acknowledgement case, where the first attempt did commit.
+        // `NOW_MS_SQL` here instead would trade a skew they all have for a drift only this one
+        // would have: it is re-read on every attempt, and `with_retry` starts at a one-second
+        // backoff with no attempt limit, so an insert that lost its first attempt to a
+        // serialization failure would release its workflow a second late — and a
+        // hundred-millisecond delay would be off by an order of magnitude. The `ON CONFLICT` arm
+        // below does not rewrite the column, but that only covers the lost-acknowledgement case,
+        // where the first attempt did commit.
         //
         // TODO(dbos-team): UPSTREAM item 22. The skew is worth closing, but in all four at once
-        // and against the database's clock — read once outside the retry, which is the part the
-        // attempt above got wrong.
+        // and against the database's clock, read once outside the retry.
         let now = Timestamp::now();
         let delay_until = workflow
             .delay
@@ -2652,13 +2612,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // between processes on one machine.
             //
             // TODO(dbos-team): UPSTREAM item 10, to settle before v1. No implementation does
-            // exactly what the `CASE` does, and the 2–2 split is weaker than it looks: Java and
-            // TypeScript are the same code (identical `shouldCommit` flag, identical comment),
-            // and Go's commit is entangled with its enqueue path, which must commit regardless.
-            // Python is the only unambiguous vote for leaving the re-stamp in place, and it may
-            // be inheritance rather than intent — the same open question as
-            // `started_at_epoch_ms` in `cancel_batch`. Worth confirming, and worth proposing
-            // upstream rather than carrying as a Rust-only difference.
+            // exactly this, so it wants proposing upstream rather than carrying as a Rust-only
+            // difference.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {workflow_table} (workflow_uuid, status, inputs, \
                  name, class_name, config_name, \
@@ -2728,8 +2683,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // TODO(dbos-team): UPSTREAM item 3, which asks for nothing beyond awareness. Rows come
             // out identical either way, since no upstream path arrives unfilled — but a reviewer
             // comparing implementations should not read the extra fallback as a behavioural
-            // difference. It becomes a redundant second line of defence when Phase 2's executor
-            // lands, which is a reason to keep it rather than remove it.
+            // difference. The executor resolves the name above this layer, which makes this a
+            // redundant second line of defence — a reason to keep it rather than remove it.
             .bind(
                 workflow
                     .application_name
@@ -2904,20 +2859,21 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::LIST_WORKFLOWS,
                 started_at,
                 |mut conn| async move {
-                    // The builder is rebuilt per attempt, and has to be: `build` borrows it mutably, so
-                    // a hoisted one would make each attempt's future borrow the closure — which
-                    // `FnMut() -> Fut` cannot express. It costs nothing on the happy path, where there
-                    // is one attempt either way.
+                    // The builder is rebuilt per attempt, and has to be: `build` borrows it
+                    // mutably, so a hoisted one would make each attempt's future borrow the closure
+                    // — which `FnMut() -> Fut` cannot express. It costs nothing on the happy path,
+                    // where there is one attempt either way.
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-                    // One row reader serves every query, so a declined column is selected as a typed
-                    // NULL rather than dropped.
+                    // One row reader serves every query, so a declined column is selected as a
+                    // typed NULL rather than dropped.
                     q.push(WORKFLOW_COLUMNS)
                         .push(", ")
                         .push(workflow_payloads(filter.load_input, filter.load_output));
                     q.push(" FROM ").push(workflow_table);
 
                     // `separated(" AND ")` writes the separator only between clauses, so neither a
-                    // leading `WHERE` with no filters nor a trailing `AND` is possible by construction.
+                    // leading `WHERE` with no filters nor a trailing `AND` is possible by
+                    // construction.
                     let mut first = true;
                     let mut clause = |q: &mut sqlx::QueryBuilder<sqlx::Postgres>, sql: &str| {
                         q.push(if first { " WHERE " } else { " AND " });
@@ -2937,11 +2893,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                     }
                     any_of!(&filter.workflow_ids[..], "workflow_uuid");
 
-                    // Whose rows this covers. `Unset` reads differently depending on the rest of the
-                    // filter: a workflow id is a global address, so asking for one by id is an identity
-                    // read and answering "no such workflow" for one that plainly exists would be a lie.
-                    // Any other query is a search, and a search that has not said whose workflows it
-                    // wants means its own. Prefixes are searches, so they do not count as id-keyed.
+                    // Whose rows this covers. `Unset` reads differently depending on the rest of
+                    // the filter: a workflow id is a global address, so asking for one by id is an
+                    // identity read and answering "no such workflow" for one that plainly exists
+                    // would be a lie. Any other query is a search, and a search that has not said
+                    // whose workflows it wants means its own. Prefixes are searches, so they do not
+                    // count as id-keyed.
                     match &filter.applications {
                         Applications::Any => {}
                         Applications::Named(names) if names.is_empty() => {}
@@ -2951,9 +2908,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                                 .push(") OR application_name IS NULL)");
                         }
                         Applications::Unset if !filter.workflow_ids.is_empty() => {}
-                        // A handle with no application of its own has nothing to scope to, so it sees
-                        // every application's rows rather than only the unclaimed ones — which is what
-                        // `application_name = NULL` would have matched.
+                        // A handle with no application of its own has nothing to scope to, so it
+                        // sees every application's rows rather than only the unclaimed ones — which
+                        // is what `application_name = NULL` would have matched.
                         Applications::Unset => {
                             if let Some(name) = application_name {
                                 clause(&mut q, "(application_name = ");
@@ -3026,16 +2983,17 @@ impl SystemDatabase for PostgresSystemDatabase {
                         q.push_bind(attributes).push("::jsonb");
                     }
 
-                    // `created_at` alone, which is what Python, TypeScript and Go all order by. It is a
-                    // millisecond stamp, so rows created inside one millisecond are returned in an order
-                    // this query does not fix — and `limit`/`offset` page through that order. Adding
-                    // `workflow_uuid` as a tiebreaker would settle it, and is deliberately not done here:
-                    // a listing that pages differently from every other implementation is a worse problem
-                    // than one that pages ambiguously in the same way they do.
+                    // `created_at` alone, which is what Python, TypeScript and Go all order by. It
+                    // is a millisecond stamp, so rows created inside one millisecond are returned
+                    // in an order this query does not fix — and `limit`/`offset` page through that
+                    // order. Adding `workflow_uuid` as a tiebreaker would settle it, and is
+                    // deliberately not done here: a listing that pages differently from every other
+                    // implementation is a worse problem than one that pages ambiguously in the same
+                    // way they do.
                     //
-                    // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this order, so a
-                    // boundary inside a tie hands one workflow to two pages and skips another. Worth
-                    // fixing in all four, and only there.
+                    // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this
+                    // order, so a boundary inside a tie hands one workflow to two pages and skips
+                    // another. Worth fixing in all four, and only there.
                     q.push(if filter.sort_desc {
                         " ORDER BY created_at DESC"
                     } else {
@@ -3571,9 +3529,9 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // The retry wraps the whole cascade, and the cascade is one transaction: a failure
         // partway through rolls back to before the roots were touched, so the next attempt starts
-        // from a tree nothing has moved. That is what lets the ids simply accumulate in a local —
-        // an earlier version had to keep them in a `Mutex` outside the retry, because a failed
-        // attempt left part of the tree cancelled and the next one could not see what it had done.
+        // from a tree nothing has moved. That is what lets the ids simply accumulate in a local:
+        // without the transaction a failed attempt would leave part of the tree cancelled and
+        // invisible to the next one, and the ids would have to survive the retry in a `Mutex`.
         let cancelled = with_retry(&self.retry, "cancel_workflows", move || async move {
             self.run_transactional_step(
                 caller,
@@ -4103,14 +4061,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Two statements, unlike `get_event`'s one, and here the split is forced rather than
         // chosen: a message cannot be read without taking it, and taking it has to be atomic with
         // recording the step. So the poll asks only whether something is waiting, and the taking
-        // happens once, below.
-        // `LIMIT 1` because this asks a yes/no question: without it the statement returns a row per
-        // unconsumed message, once per interval, for as long as the receiver waits — and a producer
-        // outrunning its consumer is exactly when that grows. Go asks the same question the same
-        // way, as `SELECT EXISTS (SELECT 1 …)`; Python, TypeScript and Java all project `topic` with
-        // no bound, and so all three pay for rows they discard. Bounding beats `EXISTS` here only in
-        // that nothing has to be decoded — a bare `1` types as `INT4` on PostgreSQL and `INT8` on
-        // CockroachDB, and a column never read cannot be read wrongly.
+        // happens once, below. `LIMIT 1` because this asks a yes/no question: without it the
+        // statement returns a row per unconsumed message, once per interval, for as long as the
+        // receiver waits — and a producer outrunning its consumer is exactly when that grows. Go
+        // asks the same question the same way, as `SELECT EXISTS (SELECT 1 …)`; Python, TypeScript
+        // and Java all project `topic` with no bound, and so all three pay for rows they discard.
+        // Bounding beats `EXISTS` here only in that nothing has to be decoded — a bare `1` types as
+        // `INT4` on PostgreSQL and `INT8` on CockroachDB, and a column never read cannot be read
+        // wrongly.
         //
         // TODO(dbos-team): UPSTREAM item 18. The three unbounded ones ship rows they discard, on
         // the statement every waiting `recv` runs once per interval. One word fixes each.
@@ -4120,9 +4078,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         );
         // The oldest unconsumed message for the topic, marked consumed as it is read.
         //
-        // **`AND consumed = FALSE` on the outer statement is not a restatement of the subquery.** At
-        // READ COMMITTED two receivers resolve the subquery to the same oldest `message_uuid`; one
-        // updates, the other blocks on the row lock and, when it is released, re-evaluates this
+        // **`AND consumed = FALSE` on the outer statement is not a restatement of the subquery.**
+        // At READ COMMITTED two receivers resolve the subquery to the same oldest `message_uuid`;
+        // one updates, the other blocks on the row lock and, when it is released, re-evaluates this
         // predicate against the committed version, matching nothing. Without it the loser's qual is
         // still true of the row the winner just took and its `RETURNING` hands the same message
         // back.
@@ -4137,13 +4095,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         // all restate them: `message_uuid` is the primary key, so the row the subquery names
         // already carries both and repeating them cannot exclude anything.
         //
-        // TODO(dbos-team): UPSTREAM item 16. Go omits this predicate — the only one of the five to
-        // do so. Item 16 reads that as a live double-delivery bug; on re-reading Go it is not, for
-        // the reason above: `runAsTxn` puts `ConsumeMessage` and `RecordOperationResult` in one
-        // transaction under `defer tx.Rollback`, and the second execution's record conflicts on
-        // `(workflow_uuid, function_id)`, so its consumption is discarded with it. The divergence
-        // stands and the one-line fix is still worth making; the severity does not. Item 16 has
-        // been rewritten to say so.
+        // TODO(dbos-team): UPSTREAM item 16. Go omits this predicate — the only one of the five
+        // to do so — and gets away with it: `runAsTxn` puts `ConsumeMessage` and
+        // `RecordOperationResult` in one transaction under `defer tx.Rollback`, so the second
+        // execution's record conflicts on `(workflow_uuid, function_id)` and its consumption is
+        // discarded with it. The divergence stands and the one-line fix is still worth making.
         let consume = format!(
             "UPDATE {notifications_table} SET consumed = TRUE \
              WHERE message_uuid = ( \
@@ -4462,8 +4418,8 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // Closing the pool is the whole of it for the waits parked on a polling permit: every
         // in-flight poll's query fails permanently and releases its permit, so a parked waiter
-        // acquires, queries, and gets the same failure. An earlier version also closed the limiter
-        // to end those waits one query sooner; deleting it failed no test, so it is gone.
+        // acquires, queries, and gets the same failure. Closing the limiter as well would end
+        // those waits one query sooner, and buys nothing a test can see.
         self.pool.close().await;
 
         // The listener is told to stop by the same act — it watches the pool's close event — but
@@ -4974,8 +4930,8 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(&self.retry, "read_stream_value", move || async move {
             // A reader's loop calls this once per offset and then once per interval while it waits,
-            // so it is a poll like the other two and is capped like them. Inside the retried region,
-            // so a call that is backing off is not holding a permit through its backoff.
+            // so it is a poll like the other two and is capped like them. Inside the retried
+            // region, so a call that is backing off is not holding a permit through its backoff.
             let _permit = polling
                 .acquire()
                 .await
@@ -5356,16 +5312,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         // select nothing and report an empty partition, which reads as "no work" rather than as
         // the mistake it is.
         //
-        // TODO(dbos-team): UPSTREAM item 5 — all four implementations differ, and no
-        // two arrived at their answer the same way. Go guards every partition clause with
-        // `len(input.QueuePartitionKey) > 0`, so empty *is* its absent value. Java normalises it
-        // (`QueuesDAO.java:36`, `if (partitionKey != null && partitionKey.isEmpty())
-        // partitionKey = null`). Python tests `is not None` and TypeScript `!== undefined`, so
-        // both let an empty key through to match rows that cannot exist — the silently-empty
-        // result nobody would choose deliberately. Rust refuses it, which is the only answer
-        // consistent with rejecting the same value on the way in; whether the others should
-        // reject it too, or Rust should normalise like Go and Java, is a cross-SDK decision
-        // rather than one to take here.
+        // TODO(dbos-team): UPSTREAM item 5 — an empty partition key means four different things
+        // across the four implementations. Rust refuses it, which is the only answer consistent
+        // with `NewWorkflow::validate` rejecting the same value on the way in; whether the others
+        // should reject it too, or Rust should normalise as Go and Java do, is a cross-SDK
+        // decision rather than one to take here.
         if partition_key == Some("") {
             return Err(Error::InvalidInput {
                 field: "partition_key".into(),
@@ -5575,40 +5526,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
             let version_predicate = version_predicate(is_latest, 3);
 
-            // TODO(dbos-team): UPSTREAM item 7. `SKIP LOCKED` under-delivers on CockroachDB;
-            // settle before changing it.
-            //
-            // CockroachDB resolves write intents asynchronously after a commit, and `SKIP LOCKED`
-            // skips a row whose intent is still unresolved rather than waiting. A workflow
-            // enqueued moments ago is passed over, so the dequeue comes back short and that work
-            // waits for the next poll. Measured on a single node, 15 rounds of three workflows:
-            //
-            //   FOR UPDATE SKIP LOCKED                     11/15 rounds short
-            //   ... with a point read of each row first     5/15
-            //   ... with a locking read over the queue      1/15
-            //   FOR UPDATE                                  0/15
-            //
-            // **Recommendation: use a plain `FOR UPDATE` on CockroachDB**, keeping `SKIP LOCKED`
-            // on PostgreSQL, in this statement and in the partitioned sweep's lock step. It waits
-            // for the intent instead of skipping it, and measured clean. The cost is that
-            // concurrent dequeues on one queue serialise on CockroachDB — the trade this needs
-            // agreement on, because nothing else recovers the missing rows.
-            //
-            // No barrier outside this statement works: a row is readable while still being
-            // skippable, so reading it first only narrows the window. A point-read barrier was
-            // tried in the tests and CI kept failing, at a lower rate.
-            //
-            // Not Rust-specific, and nobody else varies the SQL. Python passes its two flags
-            // straight through; TypeScript concatenates the mode; Java concatenates the literal
-            // in `QueuesDAO` and keeps its CockroachDB handling in `MigrationManager`. Go alone
-            // has the seam — `type CockroachDialect struct{ PostgresDialect }` overrides only
-            // `Name` and `SupportsListenNotify`, inheriting `LockSkipLocked`, so its fix is one
-            // line. Java's suite runs on CockroachDB and does not catch this: all fifteen of its
-            // dequeue assertions check a limit being enforced (`assertEquals(0, ...)` or
-            // `assertEquals(2, ...)` against four enqueued) rather than a count being complete.
-            // See `UPSTREAM.md`.
-            //
-            // Until then the affected integration tests are skipped on CockroachDB.
+            // TODO(dbos-team): UPSTREAM item 7. CockroachDB resolves write intents
+            // asynchronously after a commit, and `SKIP LOCKED` skips a row whose intent is still
+            // unresolved rather than waiting, so a workflow enqueued moments ago is passed over
+            // and the dequeue comes back short. A plain `FOR UPDATE` on CockroachDB measures
+            // clean and is what the item recommends, here and in the partitioned sweep's lock
+            // step; it is not applied yet, because the cost is that concurrent dequeues on one
+            // queue serialise there, and no implementation varies its SQL for it. No barrier
+            // outside this statement helps — a row is readable while still being skippable. The
+            // integration tests that assert a complete dequeue are skipped on CockroachDB.
             //
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
             // unlimited queue scale across executors. `NOWAIT` instead whenever a shared budget
@@ -5840,9 +5766,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // rather than backing off.
                 //
                 // TODO(dbos-team): UPSTREAM item 21. Python and TypeScript place the `LIMIT` and
-                // the version predicate exactly here too, so this is upstream behaviour rather
-                // than a port's slip, and the fix worth having — `application_version` in
-                // `idx_workflow_status_partition_dequeue_v2` — is a shared migration in any case.
+                // the version predicate here too, and the fix worth having —
+                // `application_version` in `idx_workflow_status_partition_dequeue_v2` — is a
+                // shared migration in any case.
                 //
                 // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
                 // loop instead of a slower per-row subplan. `workflow_uuid` totalizes the head
@@ -5911,12 +5837,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                             OR application_name IS NULL)"
                 );
 
-                // TODO(dbos-team): UPSTREAM item 7. This `SKIP LOCKED` under-delivers on CockroachDB
-                // for the reason given
-                // on `start_queued_workflows` — a head enqueued moments ago is skipped and its
-                // partition idles until the next sweep. **Recommendation: plain `FOR UPDATE` on
-                // CockroachDB**, applied here as well as there. Settle with the wider DBOS team
-                // first; see `UPSTREAM.md`.
+                // TODO(dbos-team): UPSTREAM item 7. This `SKIP LOCKED` under-delivers on
+                // CockroachDB for the reason given on `start_queued_workflows` — a head enqueued
+                // moments ago is skipped and its partition idles until the next sweep. The item's
+                // recommended plain `FOR UPDATE` applies here as well as there.
                 //
                 // Locks the fixed candidate set rather than re-selecting with a `LIMIT`, whose
                 // `SKIP LOCKED` could slide past a locked head and admit a partition's second
@@ -6004,9 +5928,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "get_deduplication_key_holder",
             move || async move {
-                // No status filter, and none is needed: every terminal transition clears the key, so
-                // a row still carrying one is by definition an active holder. The references filter
-                // on nothing either.
+                // No status filter, and none is needed: every terminal transition clears the key,
+                // so a row still carrying one is by definition an active holder. The references
+                // filter on nothing either.
                 let holder: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT workflow_uuid FROM {workflow_table} \
                      WHERE queue_name = $1 AND deduplication_id = $2"
@@ -6220,21 +6144,23 @@ impl SystemDatabase for PostgresSystemDatabase {
                     started_at,
                     |mut tx| async move {
                         // The cap is what stops a steady stream of requests postponing the workflow
-                        // forever: past the deadline, the delay stops moving. `CASE` rather than the
-                        // `LEAST` this backend has, so the statement stays diffable against the four
-                        // references, which all spell the cap out this way.
+                        // forever: past the deadline, the delay stops moving. `CASE` rather than
+                        // the `LEAST` this backend has, so the statement stays diffable against the
+                        // four references, which all spell the cap out this way.
                         //
-                        // `is_debounced` and the workflow's identity are both in the guard. Without the
-                        // identity, two unrelated workflows whose keys happen to concatenate the same way
-                        // — or two configured instances of one class — would overwrite each other's
-                        // inputs; without `is_debounced`, an ordinary deduplicated enqueue would be
-                        // silently rescheduled.
+                        // `is_debounced` and the workflow's identity are both in the guard. Without
+                        // the identity, two unrelated workflows whose keys happen to concatenate
+                        // the same way — or two configured instances of one class — would overwrite
+                        // each other's inputs; without `is_debounced`, an ordinary deduplicated
+                        // enqueue would be silently rescheduled.
                         //
-                        // `application_name` is claimed for the target the way its dequeue would: left
-                        // unclaimed, every peer coalesces onto the one workflow and the last inputs win.
+                        // `application_name` is claimed for the target the way its dequeue would:
+                        // left unclaimed, every peer coalesces onto the one workflow and the last
+                        // inputs win.
                         //
-                        // These stay Rust comments. A `\` continuation strips the newline, so a `--`
-                        // comment inside the string would comment out the rest of the statement.
+                        // These stay Rust comments. A `\` continuation strips the newline, so a
+                        // `--` comment inside the string would comment out the rest of the
+                        // statement.
                         let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
                              SET delay_until_epoch_ms = CASE \
@@ -6261,8 +6187,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(request.inputs)
                         .bind(request.serialization)
                         .bind(application_name)
-                        // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL the
-                        // enqueue stored rather than matching nothing, as `=` would.
+                        // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL
+                        // the enqueue stored rather than matching nothing, as `=` would.
                         .bind(request.class_name)
                         .bind(request.config_name)
                         .fetch_optional(&mut *tx)
@@ -6272,8 +6198,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                             return Ok((tx, Debounce::Bounced { workflow_id }));
                         }
 
-                        // Deliberately unscoped: whatever blocked the update above is what the caller needs
-                        // described, and a peer's workflow is the most useful case to be able to name.
+                        // Deliberately unscoped: whatever blocked the update above is what the
+                        // caller needs described, and a peer's workflow is the most useful case to
+                        // be able to name.
                         type HolderRow = (
                             String,
                             bool,
@@ -6312,8 +6239,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                             }),
                         };
                         // Returned even when nothing bounced, so the wrapper records it: the step
-                        // consumed its id either way, and a replay that re-ran it would report a holder
-                        // that has since changed.
+                        // consumed its id either way, and a replay that re-ran it would report a
+                        // holder that has since changed.
                         Ok((tx, outcome))
                     },
                 )
@@ -6363,7 +6290,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 started_at,
                 |mut tx| async move {
                     // A peer holding the name is a collision this layer cannot resolve; this
-                    // application holding it is one the caller can, so the two are different errors.
+                    // application holding it is one the caller can, so the two are different
+                    // errors.
                     let owner = resolve_owning_application(
                         &mut tx,
                         schedules_table,

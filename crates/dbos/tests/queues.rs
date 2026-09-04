@@ -1,7 +1,9 @@
-//! Queue registration and enqueueing, against real databases.
+//! Queue registration, enqueueing and dequeueing, against real databases.
 //!
-//! Nothing here dequeues — the runner arrives with the next commit — so these assert the row and
-//! the handle, which is exactly what a workflow left on a queue *is* until someone polls for it.
+//! Registration and enqueue are asserted on the row and the handle — which is exactly what a
+//! workflow left on a queue *is* until someone polls for it — and the dequeue tests then run the
+//! supervisor and its workers for real, so a limit is asserted by what actually runs at once
+//! rather than by what the row says.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1462,7 +1464,8 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
     dbos.shutdown().await;
 }
 
-/// `DuplicationPolicy::ReturnExisting` joins the holder instead of refusing, and the join is idempotent.
+/// `DuplicationPolicy::ReturnExisting` joins the holder instead of refusing, and the join is
+/// idempotent.
 ///
 /// The enqueue that loses the key does not write a row at all: it takes a handle to the workflow
 /// that holds it, so a retried request waits on the first caller's workflow rather than being told
@@ -1541,7 +1544,8 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
         );
     }
 
-    // The holder has finished, so the key is free and the same policy claims it rather than joining.
+    // The holder has finished, so the key is free and the same policy claims it rather than
+    // joining.
     let third = workflow
         .start_with(
             (),

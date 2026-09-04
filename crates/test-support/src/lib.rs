@@ -73,11 +73,10 @@ const CONTAINER_LABEL: (&str, &str) = ("dev.dbos.test-harness", "true");
 
 /// The most migrated databases to keep, and so the widest a suite can run.
 ///
-/// This used to be a migration budget: each pooled database cost a full corpus run, so four
-/// was as many as CockroachDB could afford. The baseline took that cost away — a pooled
-/// database is now under a second there — and what bounds this number instead is how much
-/// parallelism a suite this size can actually use. Four still fits a CI runner's core count,
-/// so it stays; raising it is now cheap if a suite ever outgrows it.
+/// Not a migration budget: a pooled database is cloned from a migrated baseline, so it costs
+/// under a second even on CockroachDB. What bounds this number is how much parallelism a suite
+/// this size can actually use, and four fits a CI runner's core count. Raising it is cheap if a
+/// suite ever outgrows it.
 pub const POOL_SIZE: usize = 4;
 
 /// How long to wait for the server to accept connections after the container starts.
@@ -588,11 +587,11 @@ impl TestServer {
                 GenericImage::new(COCKROACH_IMAGE.0, COCKROACH_IMAGE.1)
                     .with_exposed_port(COCKROACH_PORT.tcp())
                     // An in-memory store, because nothing here outlives the container and
-                    // CockroachDB's cost is dominated by DDL: the corpus is 47 migrations, each
-                    // an online schema change, and the suite applies it once per pooled database
-                    // plus once per migration test. Measured over the whole CockroachDB leg it
-                    // is worth more than half the wall clock — 4m09s to 1m53s locally — and two
-                    // seconds off container startup besides.
+                    // CockroachDB's cost is dominated by DDL: the corpus carries 56 migrations that
+                    // do work, each an online schema change, and the suite applies it once per
+                    // pooled database plus once per migration test. Measured over the whole
+                    // CockroachDB leg it is worth more than half the wall clock — 4m09s to 1m53s
+                    // locally — and two seconds off container startup besides.
                     //
                     // The size is a ceiling rather than a reservation. The suite's data is a few
                     // thousand rows; the headroom is for CockroachDB's own system ranges and the

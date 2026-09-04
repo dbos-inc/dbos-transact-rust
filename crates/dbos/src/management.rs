@@ -8,8 +8,8 @@
 //!
 //! [`resume`](DBOS::resume) and [`fork`](DBOS::fork) each write an `ENQUEUED` row and leave it for
 //! whichever executor next polls that queue, which is what every reference does — so both hand back
-//! a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process is very
-//! probably not the one doing the work.
+//! a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process is
+//! very probably not the one doing the work.
 //!
 //! **The whole surface exists twice**, on [`DBOS`] for an application managing its own workflows
 //! and on [`Client`](crate::Client) for a process outside it — which, given the paragraph above, is
@@ -35,8 +35,8 @@
 //! form is a caller with one id. [`retrieve_workflow`](DBOS::retrieve_workflow),
 //! [`set_workflow_delay`](DBOS::set_workflow_delay) and
 //! [`update_workflow_attributes`](DBOS::update_workflow_attributes) have none, in this crate or in
-//! any reference: each addresses one row and none of them is worth a round trip to batch.
-//! The bulk form is the primitive: the system database cancels, deletes and forks in batches because a
+//! any reference: each addresses one row and none of them is worth a round trip to batch. The bulk
+//! form is the primitive: the system database cancels, deletes and forks in batches because a
 //! partially applied batch is worse than a slow one, and the singular methods are wrappers that
 //! pass a one-element slice.
 //!
@@ -46,19 +46,19 @@
 //!
 //! # Called from inside a workflow
 //!
-//! Every operation **on [`DBOS`]** is **checkpointed as a step of the workflow that calls it**, so a
-//! replay reads back what the first execution did instead of doing it again: a fork keeps the id it
-//! generated rather than writing a second one, a cancel or a delete is issued once, and a listing
-//! replays the rows it saw.
+//! Every operation **on [`DBOS`]** is **checkpointed as a step of the workflow that calls it**, so
+//! a replay reads back what the first execution did instead of doing it again: a fork keeps the id
+//! it generated rather than writing a second one, a cancel or a delete is issued once, and a
+//! listing replays the rows it saw.
 //!
-//! **The same call on a [`Client`](crate::Client) is not**, and cannot be. The step id would have to
-//! come from the ambient context, which belongs to a `DBOS` instance the client is not — possibly
-//! against another database entirely — so a client's management call runs again on replay. That is
-//! the line already drawn for a client's handle awaited inside a workflow
+//! **The same call on a [`Client`](crate::Client) is not**, and cannot be. The step id would have
+//! to come from the ambient context, which belongs to a `DBOS` instance the client is not —
+//! possibly against another database entirely — so a client's management call runs again on replay.
+//! That is the line already drawn for a client's handle awaited inside a workflow
 //! ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and for its
-//! [`get_event`](crate::Client::get_event): a client is a guest, and a guest does not write into its
-//! host's step sequence. No reference checkpoints a client's calls either — their wrappers all read
-//! an ambient context a client does not have.
+//! [`get_event`](crate::Client::get_event): a client is a guest, and a guest does not write into
+//! its host's step sequence. No reference checkpoints a client's calls either — their wrappers all
+//! read an ambient context a client does not have.
 //!
 //! **The checkpoint commits with the operation**, in one transaction, because the step id travels
 //! down into the system database rather than wrapping the call here — see
@@ -90,8 +90,8 @@
 //! what failed was the database being unreachable rather than the operation being wrong.
 //!
 //! [`retrieve_workflow`](DBOS::retrieve_workflow) is the one member of the `DBOS` surface with no
-//! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its equivalent as
-//! `DBOS.getStatus` because Python's reads the row.
+//! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its
+//! equivalent as `DBOS.getStatus` because Python's reads the row.
 //!
 //! # One thing this surface deliberately does not do
 //!
@@ -99,8 +99,8 @@
 //! and the running execution finds out by reading, not by being interrupted: a preemptible step
 //! polls the status and abandons its attempt, and any other step finishes before the workflow's own
 //! terminal write is refused by the status gate on `record_workflow_outcome`. That is what makes
-//! cancelling work at all across a fleet, where the executor running the workflow is usually not the
-//! one being asked to cancel it.
+//! cancelling work at all across a fleet, where the executor running the workflow is usually not
+//! the one being asked to cancel it.
 //!
 //! That also keeps this crate clear of go #426, where shutdown's context cancellation reached the
 //! *durable* cancel path and marked in-flight workflows `CANCELLED` instead of leaving them
@@ -178,14 +178,12 @@ pub enum ForkFrom<'a> {
 /// there — and because `resume_all(&ids, None)` says nothing at a call site about what was
 /// declined.
 ///
-/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has. Resume takes a
-/// queue name and no partition key in all five, and the `UPDATE` behind it moves `queue_name`
-/// while leaving `queue_partition_key` untouched — so resuming onto a partitioned queue either
-/// carries over a key belonging to whatever queue the workflow was on before, or, for a workflow
-/// that never had one, writes the unkeyed row that
-/// [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not closed here alone:
-/// the gap is the contract's, and a field no reference has would put this crate's `resume` ahead
-/// of it.
+/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has: resume takes a
+/// queue name and no partition key in all five, so resuming onto a partitioned queue either
+/// carries over a key belonging to whatever queue the workflow was on before, or writes the
+/// unkeyed row that [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not
+/// closed here alone — a field no reference has would put this crate's `resume` ahead of the
+/// contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
     /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
@@ -619,7 +617,8 @@ impl DBOS {
     /// same statement reads "Delete all matching workflows regardless of their state".
     ///
     /// The executor running a deleted workflow finds its row gone at the next step boundary and
-    /// fails with `NonExistentWorkflow`, rather than stopping cleanly. Cancel first if that matters.
+    /// fails with `NonExistentWorkflow`, rather than stopping cleanly. Cancel first if that
+    /// matters.
     ///
     /// Deleting an id with no row is not an error, and children are left alone —
     /// [`delete_all`](Self::delete_all) with [`Children::Include`] is how a tree goes.
@@ -688,7 +687,11 @@ impl DBOS {
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// use std::time::Duration;
     /// // Not before the hour is up.
-    /// dbos.set_workflow_delay("scheduled-report", dbos::WorkflowDelay::For(Duration::from_secs(3600))).await?;
+    /// dbos.set_workflow_delay(
+    ///     "scheduled-report",
+    ///     dbos::WorkflowDelay::For(Duration::from_secs(3600)),
+    /// )
+    /// .await?;
     /// # Ok(()) }
     /// ```
     pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
@@ -720,9 +723,9 @@ impl DBOS {
     ///
     /// **Named for what three of the four call it.** Python's is `update_workflow_attributes` and
     /// Java's `updateWorkflowAttributes`; TypeScript has no attributes method at all; and Go's
-    /// method is `SetWorkflowAttributes` while the step it records is `DBOS.updateWorkflowAttributes`
-    /// — so Go disagrees with itself, and the stored name is the half that other implementations
-    /// read.
+    /// method is `SetWorkflowAttributes` while the step it records is
+    /// `DBOS.updateWorkflowAttributes` — so Go disagrees with itself, and the stored name is the
+    /// half that other implementations read.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -807,7 +810,7 @@ impl DBOS {
 /// Every method here is [`DBOS`]'s, and the differences are the two a client always has. **There is
 /// no launch check**, because a client is connected or it does not exist — `connect` hands back a
 /// usable client or an error, so none of these can fail with
-/// [`Error::NotLaunched`](crate::Error::NotLaunched). And **nothing is checkpointed**: called from
+/// [`Error::NotLaunched`]. And **nothing is checkpointed**: called from
 /// inside a workflow, a client's management call runs again on replay, where the same call on
 /// `DBOS` would replay its recorded step. A client has no step counter of its own to agree with the
 /// workflow's, and the ambient context belongs to an instance this client is not — the line
@@ -1047,7 +1050,8 @@ impl Connection {
     /// Puts workflows back on a queue, and hands back a handle to each.
     ///
     /// `self: &Arc<Self>` because the handles hold the connection they poll through, which is this
-    /// one — the same reason [`crate::workflow::start`] takes the executor by `Arc`.
+    /// one — the same reason [`spawn_execution`](crate::workflow::spawn_execution) takes the
+    /// executor by `Arc`.
     pub(crate) async fn resume_all<R, E>(
         self: &Arc<Self>,
         workflow_ids: &[&str],

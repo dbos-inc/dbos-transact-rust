@@ -1,9 +1,9 @@
-//! Where a call that is not a [`step`](crate::step) stands, and what that means for its replay.
+//! Where a call that is not a [`step`](crate::step()) stands, and what that means for its replay.
 //!
 //! Several calls in this crate are *durable operations that are not steps*: awaiting a workflow's
 //! result, waiting on a set of handles, reading an event. Each is a single durable act that a
 //! replay must not perform twice, and each therefore takes a step id from the ambient workflow and
-//! records its answer under it. None of them is a step in the [`step`](crate::step) sense — there
+//! records its answer under it. None of them is a step in the [`step`](crate::step()) sense — there
 //! is no user body, no retry policy, no timeout — so none of them goes through `step_with`.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
@@ -19,11 +19,10 @@
 //!   on *whose* connection it is — a [`Client`](crate::Client)'s degrades to the plain call, a
 //!   second application instance's is [`Error::WrongInstance`].
 //!
-//! Those four cases and the argument for each were written once, for
-//! [`WorkflowHandle::result`](crate::WorkflowHandle::result), and are now shared by every caller
-//! that has the same question. The references keep the same logic in one place for the same
-//! reason: Python's `call_function_as_step`, TypeScript's `runInternalStep` and Java's
-//! `runDbosFunctionAsStep` are each one wrapper that every non-step durable call goes through.
+//! The four cases and the argument for each live here rather than at each call site. The
+//! references keep the same logic in one place for the same reason: Python's
+//! `call_function_as_step`, TypeScript's `runInternalStep` and Java's `runDbosFunctionAsStep` are
+//! each one wrapper that every non-step durable call goes through.
 //!
 //! **What is *not* shared is the write**, and deliberately. A child await records the awaited id
 //! alongside the outcome and reads it back through

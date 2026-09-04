@@ -128,8 +128,8 @@ impl Connection {
     ///   migrations: the system database must already have been created by a DBOS application"*),
     ///   and an operator's tool that can rewrite the schema it is inspecting is a tool that can
     ///   break the application it was pointed at. There is no knob:
-    ///   [`ClientConfig`](crate::ClientConfig) has no `migrate` field to set.
-    ///   It does **verify**, because that is what this crate's `migrate: false` has always meant:
+    ///   [`ClientConfig`] has no `migrate` field to set.
+    ///   It does **verify**, because that is what this crate's `migrate: false` means:
     ///   a schema that is missing or behind what this build's queries are written against fails
     ///   here, naming the version it found, instead of surfacing as a confusing SQL error on the
     ///   first real call. **Go's client does the same** (`SkipMigrations: true`, *"Clients never

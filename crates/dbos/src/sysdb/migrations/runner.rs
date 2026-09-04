@@ -221,7 +221,7 @@ async fn ensure_schema(pool: &PgPool, schema: &str) -> Result<(), MigrateError> 
     ] {
         match sqlx::raw_sql(AssertSqlSafe(sql)).execute(pool).await {
             Ok(_) => {}
-            // A peer created it between our check and ours — which is the outcome we wanted.
+            // A peer created it first, which is the outcome this wanted anyway.
             Err(e) if is_already_exists(&e) => {}
             Err(e) => return Err(e.into()),
         }

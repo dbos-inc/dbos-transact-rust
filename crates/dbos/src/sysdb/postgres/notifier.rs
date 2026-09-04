@@ -10,9 +10,9 @@
 //!
 //! **Nothing here is load-bearing**, exactly as in [`listener`](super::listener): every wait
 //! re-queries on its own interval, so with this module deleted the same values are delivered, just
-//! later. What it buys is that a reader in another process hears about a value in milliseconds rather than
-//! waiting out an interval — and a reader in *this* process hears with no round trip at all, since
-//! [`signal`](Notifier::signal) wakes the local registry directly.
+//! later. What it buys is that a reader in another process hears about a value in milliseconds
+//! rather than waiting out an interval — and a reader in *this* process hears with no round trip at
+//! all, since [`signal`](Notifier::signal) wakes the local registry directly.
 //!
 //! All four references do this, and agree on the shape: a per-channel set of payloads, a loop that
 //! flushes it on a ~10ms cadence, one `pg_notify` statement per channel per flush, and a failed
@@ -36,8 +36,9 @@ use crate::sysdb::notify::{Registry, key_for};
 /// Python's `notification_coalesce_sec`, TypeScript's `DEFAULT_NOTIFICATION_COALESCE_MS` and
 /// Java's flush period.
 ///
-/// The default rather than the value: [`Settings::notification_coalesce`](super::Settings::notification_coalesce)
-/// overrides it, as the same setting does in all three.
+/// The default rather than the value:
+/// [`Settings::notification_coalesce`](super::Settings::notification_coalesce) overrides it, as the
+/// same setting does in all four.
 pub(crate) const COALESCE_INTERVAL: Duration = Duration::from_millis(10);
 
 /// One statement per channel per flush, however many payloads the batch holds.
@@ -123,7 +124,8 @@ impl Notifier {
     /// same-process write visible promptly on CockroachDB, where there is no wire.
     pub(crate) fn signal(&self, channel: &'static str, workflow_id: &str, key: &str) {
         // The wire form, exactly as migration 1's trigger builds it and as every other SDK sends
-        // it: `id::key`, with neither half escaped. See [`crate::sysdb::notify`] on why nothing splits it.
+        // it: `id::key`, with neither half escaped. See [`crate::sysdb::notify`] on why nothing
+        // splits it.
         let payload = format!("{workflow_id}::{key}");
         let Some(registry_key) = key_for(channel, &payload) else {
             // Unreachable: the callers pass channel constants. A channel nobody listens on has no
@@ -184,9 +186,9 @@ impl Notifier {
 
     /// Asks [`run`](Self::run) to make its final flush and return.
     ///
-    /// **The final flush is a database write**, so a caller closing a handle has to stop the notifier
-    /// *before* closing the pool, not after — the opposite order from the listener, which is ended
-    /// by that close.
+    /// **The final flush is a database write**, so a caller closing a handle has to stop the
+    /// notifier *before* closing the pool, not after — the opposite order from the listener, which
+    /// is ended by that close.
     pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
         self.woken.notify_one();
@@ -215,10 +217,10 @@ impl Notifier {
                 // — would otherwise be retried forever and stall every later batch behind it. What
                 // is lost is an interval of latency for whoever was waiting, not the value.
                 //
-                // Not retried through [`with_retry`](crate::sysdb::retry::with_retry) either, for the
-                // same reason: it has no attempt limit, so a channel that cannot be pushed would
-                // hold the loop rather than the queue. Python, TypeScript and Java do not retry;
-                // Go does, bounded.
+                // Not retried through [`with_retry`](crate::sysdb::retry::with_retry) either, for
+                // the same reason: it has no attempt limit, so a channel that cannot be pushed
+                // would hold the loop rather than the queue. Python, TypeScript and Java do not
+                // retry; Go does, bounded.
                 tracing::warn!(
                     channel,
                     count = payloads.len(),

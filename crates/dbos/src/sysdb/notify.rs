@@ -84,10 +84,9 @@ pub(crate) fn event_key(workflow_id: &str, key: &str) -> String {
 ///
 /// **The one key here with no caller**, and deliberately so: `read_stream_value` reads a single
 /// offset and returns, so the subscription belongs to the loop above it — the engine's
-/// `read_stream`, which does not exist yet. Decision 9 in the design note settles that the loop
-/// stays there rather than moving behind the trait, so this waits for an engine rather than for a
-/// change of mind. The listener already derives this key from the streams channel and wakes nobody
-/// with it, which is correct until then.
+/// `read_stream`, which does not exist yet. That loop stays there rather than moving behind the
+/// trait, so this waits for an engine rather than for a change of mind. The listener already
+/// derives this key from the streams channel and wakes nobody with it, which is correct until then.
 #[allow(dead_code)]
 pub(crate) fn stream_key(workflow_id: &str, key: &str) -> String {
     format!("{STREAM_PREFIX}::{workflow_id}::{key}")
