@@ -1,8 +1,9 @@
 //! Waiting on several workflows at once, against real databases.
 //!
-//! Two questions, and they are answered by two different shapes of row read. `wait_first` reports
-//! *which* member settled and has to pin that choice into the caller's replay; `wait_all` reports
-//! only that every member has, and has nothing to pin. The tests are grouped that way.
+//! Two questions, and they are answered by two different shapes of row read. `select_workflow`
+//! reports *which* member settled and has to pin that choice into the caller's replay;
+//! `join_workflows` reports only that every member has, and has nothing to pin. The tests are
+//! grouped that way.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -61,14 +62,14 @@ struct Gates {
     release: Vec<Arc<tokio::sync::Notify>>,
 }
 
-/// `wait_first` reports the position of whichever member settles first, and the test picks which
-/// that is.
+/// `select_workflow` reports the position of whichever member settles first, and the test picks
+/// which that is.
 ///
 /// Three workflows blocked at their own gates; the middle one is released. The answer has to name
 /// that one — which is the whole contract: not the first id passed, not the first started, but the
 /// first to *finish*.
 #[tokio::test]
-async fn wait_first_reports_the_first_to_settle() {
+async fn select_workflow_reports_the_first_to_settle() {
     let db = test_database().await;
     let dbos = DBOS::new(config("wait-first-app", &db));
 
@@ -118,7 +119,7 @@ async fn wait_first_reports_the_first_to_settle() {
         let ids: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
         async move {
             let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-            dbos.wait_first(&ids).await
+            dbos.select_workflow(&ids).await
         }
     });
     gates.release[1].notify_one();
@@ -127,7 +128,7 @@ async fn wait_first_reports_the_first_to_settle() {
         .await
         .expect("the wait never resolved")
         .expect("the waiting task panicked")
-        .expect("wait_first failed");
+        .expect("select_workflow failed");
     assert_eq!(
         first, "blocked-1",
         "the released workflow is the one that finished"
@@ -203,11 +204,11 @@ async fn a_cancelled_workflow_counts_as_settled() {
 
     let first = tokio::time::timeout(
         DEADLINE,
-        dbos.wait_first(&[doomed.workflow_id(), survivor.workflow_id()]),
+        dbos.select_workflow(&[doomed.workflow_id(), survivor.workflow_id()]),
     )
     .await
     .expect("the wait never resolved")
-    .expect("wait_first failed");
+    .expect("select_workflow failed");
     assert_eq!(
         first, "doomed",
         "the cancelled workflow is the one that settled"
@@ -217,10 +218,10 @@ async fn a_cancelled_workflow_counts_as_settled() {
     dbos.shutdown().await;
 }
 
-/// `wait_all` returns only once every member has settled — and then every handle resolves without
-/// waiting.
+/// `join_workflows` returns only once every member has settled — and then every handle resolves
+/// without waiting.
 #[tokio::test]
-async fn wait_all_returns_when_the_last_one_settles() {
+async fn join_workflows_returns_when_the_last_one_settles() {
     let db = test_database().await;
     let dbos = DBOS::new(config("wait-all-app", &db));
 
@@ -253,7 +254,7 @@ async fn wait_all_returns_when_the_last_one_settles() {
         let ids = ids.clone();
         async move {
             let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-            dbos.wait_all(&ids).await
+            dbos.join_workflows(&ids).await
         }
     });
 
@@ -269,7 +270,7 @@ async fn wait_all_returns_when_the_last_one_settles() {
     );
     assert!(
         !waiting.is_finished(),
-        "wait_all returned before the last member settled"
+        "join_workflows returned before the last member settled"
     );
 
     release.notify_one();
@@ -277,7 +278,7 @@ async fn wait_all_returns_when_the_last_one_settles() {
         .await
         .expect("the wait never resolved")
         .expect("the waiting task panicked")
-        .expect("wait_all failed");
+        .expect("join_workflows failed");
 
     // What the wait bought: every handle now has its answer in hand.
     for (which, handle) in handles.into_iter().enumerate() {
@@ -300,14 +301,14 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
     let dbos = DBOS::new(config("wait-empty-app", &db));
     dbos.launch().await.expect("launch failed");
 
-    dbos.wait_all(&[])
+    dbos.join_workflows(&[])
         .await
-        .expect("an empty wait_all should be satisfied");
+        .expect("an empty join_workflows should be satisfied");
 
     let err = dbos
-        .wait_first(&[])
+        .select_workflow(&[])
         .await
-        .expect_err("an empty wait_first should be refused");
+        .expect_err("an empty select_workflow should be refused");
     assert!(matches!(err, Error::Config(_)), "{err}");
     assert!(err.to_string().contains("no workflow ids"), "{err}");
 
@@ -334,22 +335,22 @@ async fn a_repeated_id_is_accepted_by_both_waits() {
     let id = handle.workflow_id().to_owned();
     assert_eq!(handle.result().await.expect("the workflow failed"), 1);
 
-    let first = tokio::time::timeout(DEADLINE, dbos.wait_first(&[&id, &id]))
+    let first = tokio::time::timeout(DEADLINE, dbos.select_workflow(&[&id, &id]))
         .await
         .expect("the wait never resolved")
         .expect("a duplicate should be accepted");
     assert_eq!(first, id, "the answer names the one workflow in the set");
 
-    tokio::time::timeout(DEADLINE, dbos.wait_all(&[&id, &id]))
+    tokio::time::timeout(DEADLINE, dbos.join_workflows(&[&id, &id]))
         .await
         .expect("the wait never resolved")
-        .expect("wait_all failed");
+        .expect("join_workflows failed");
 
     dbos.shutdown().await;
 }
 
 /// Called from inside a workflow, both waits are checkpointed under their cross-SDK step names —
-/// and `wait_first` records the winner while `wait_all` records no payload.
+/// and `select_workflow` records the winner while `join_workflows` records no payload.
 ///
 /// The recorded winner is what makes the choice survive a replay: a second execution reads the id
 /// back rather than racing again, so a workflow that branches on which member won cannot take a
@@ -378,8 +379,8 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
                     let ids: Vec<&str> = children.iter().map(|c| c.workflow_id()).collect();
                     // The free functions, not the instance methods: a workflow body takes its
                     // executor from the ambient context rather than capturing a `DBOS`.
-                    let first = dbos::wait_first(&ids).await?;
-                    dbos::wait_all(&ids).await?;
+                    let first = dbos::select_workflow(&ids).await?;
+                    dbos::join_workflows(&ids).await?;
                     Ok::<_, Error>(first)
                 }
             }
@@ -407,8 +408,8 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
         [
             (0, "quick"),
             (1, "quick"),
-            (2, "DBOS.waitFirst"),
-            (3, "DBOS.waitAll"),
+            (2, "DBOS.selectWorkflow"),
+            (3, "DBOS.joinWorkflows"),
         ],
         "the two launches and the two waits, in order"
     );
@@ -418,7 +419,7 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
     let recorded = steps[2]
         .output
         .as_deref()
-        .expect("waitFirst recorded no winner");
+        .expect("selectWorkflow recorded no winner");
     let winner: String = serde_json::from_str(recorded).expect("the winner is not a string");
     assert_eq!(
         winner, first,
@@ -434,7 +435,7 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
     );
 
     // An all-wait decides nothing, so there is nothing for a replay to branch on.
-    assert_eq!(steps[3].output, None, "waitAll recorded a payload");
+    assert_eq!(steps[3].output, None, "joinWorkflows recorded a payload");
     assert_eq!(steps[3].error, None);
 
     dbos.shutdown().await;
@@ -491,7 +492,7 @@ async fn a_client_waits_on_workflows_it_did_not_start() {
         let ids = ids.clone();
         async move {
             let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-            client.wait_all(&ids).await
+            client.join_workflows(&ids).await
         }
     });
 
@@ -501,14 +502,14 @@ async fn a_client_waits_on_workflows_it_did_not_start() {
         .await
         .expect("the client's wait never resolved")
         .expect("the waiting task panicked")
-        .expect("wait_all failed");
+        .expect("join_workflows failed");
     assert_eq!(ran.load(Ordering::SeqCst), 2);
 
     // Both are settled, so a first-wait answers at once with an id from the set it was given.
-    let first = tokio::time::timeout(DEADLINE, client.wait_first(&borrowed))
+    let first = tokio::time::timeout(DEADLINE, client.select_workflow(&borrowed))
         .await
         .expect("the wait never resolved")
-        .expect("wait_first failed");
+        .expect("select_workflow failed");
     assert!(
         borrowed.contains(&first.as_str()),
         "the answer {first} is not one of the ids waited on"

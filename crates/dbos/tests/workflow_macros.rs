@@ -94,7 +94,7 @@ fn race_steps() -> [(i32, String); 4] {
     [
         (0, "counter".to_owned()),
         (1, "namer".to_owned()),
-        (2, "DBOS.waitFirst".to_owned()),
+        (2, "DBOS.selectWorkflow".to_owned()),
         (3, "DBOS.getResult".to_owned()),
     ]
 }
@@ -142,8 +142,8 @@ async fn select_workflow_runs_the_winners_arm_and_awaits_nobody_else() {
 /// A replay takes the arm it took the first time, because the winner is read back rather than
 /// raced for again.
 ///
-/// Forked from the `DBOS.getResult`, so the two launches and the `DBOS.waitFirst` all replay from
-/// their rows and only the arm's own await runs afresh. The loser is still sitting at its gate
+/// Forked from the `DBOS.getResult`, so the two launches and the `DBOS.selectWorkflow` all replay
+/// from their rows and only the arm's own await runs afresh. The loser is still sitting at its gate
 /// while this happens, which is the sharper half of the claim: a fork that re-raced would have to
 /// wait for it, and this one does not wait at all.
 #[tokio::test]
@@ -186,9 +186,9 @@ async fn a_replayed_select_takes_the_same_arm() {
 
 /// Every result comes back, typed, in the order the handles were written.
 ///
-/// The step rows are the claim: one `DBOS.waitAll` and then one `DBOS.getResult` per handle, in
-/// source order. Sequential reads are not a concession here — the set is already settled when the
-/// first one is read — and taking them in source order is what keeps each id where a replay
+/// The step rows are the claim: one `DBOS.joinWorkflows` and then one `DBOS.getResult` per handle,
+/// in source order. Sequential reads are not a concession here — the set is already settled when
+/// the first one is read — and taking them in source order is what keeps each id where a replay
 /// expects it.
 #[tokio::test]
 async fn join_workflows_returns_every_result_in_source_order() {
@@ -237,7 +237,7 @@ async fn join_workflows_returns_every_result_in_source_order() {
         [
             (0, "counter".to_owned()),
             (1, "namer".to_owned()),
-            (2, "DBOS.waitAll".to_owned()),
+            (2, "DBOS.joinWorkflows".to_owned()),
             (3, "DBOS.getResult".to_owned()),
             (4, "DBOS.getResult".to_owned()),
         ],
