@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = ["engine"]
+default = ["engine", "macros"]
 # Gates the durable execution engine: the lifecycle, registry, contexts, workflows, steps,
 # events, recovery, queues and the client so far, with the scheduler and messaging to come.
 # With it off, what remains is the system database and Conductor layers — the surface a future
@@ -23,10 +23,19 @@ default = ["engine"]
 # dev-dependencies happened to turn the feature on for the test build — which `cargo doc` and
 # `--no-default-features` both see through.
 engine = ["tokio/rt", "tokio/macros"]
-# A `macros` feature (implying `engine`) arrives with the `dbos-macros` crate. Adding a
-# feature is not a breaking change, so it waits until it re-exports something.
+# Re-exports `select_step!` from `dbos-macros`. Implies `engine` because the macro expands into
+# the engine's checkpoint machinery, and there is nothing for it to expand into without one.
+#
+# Default-on, because a durable race is not an advanced corner of the API — a step that can time
+# out is the ordinary case, and a macro nobody has enabled is a trap rather than a feature.
+# Turning it off is for a build that wants `dbos` without `syn` and `quote` compiled ahead of it,
+# which is the only cost: a proc-macro crate runs in the compiler and links into nothing.
+macros = ["engine", "dep:dbos-macros"]
 
 [dependencies]
+# `select_step!`, behind the `macros` feature. Version-locked to this crate because the expansion
+# names `dbos::__private`, which is documented as unstable and changes with it.
+dbos-macros = { path = "../dbos-macros", version = "=0.1.2", optional = true }
 # The system database layer talks to PostgreSQL directly. `AssertSqlSafe` in 0.9 means any
 # runtime-built SQL — every rendered migration — must be explicitly vouched for.
 sqlx = { version = "0.9", default-features = false, features = [

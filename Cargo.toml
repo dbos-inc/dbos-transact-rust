@@ -1,10 +1,16 @@
 [workspace]
 resolver = "3"
 # Each crate is created by the work that first ships code into it, rather than scaffolded up
-# front: `dbos-macros` arrives with the attribute macros, and `dbos-transact` only when a
-# signpost release to `dbos` is cut. `test-support` is unpublished and exists so that tests
-# needing a real database can live beside the code they test, rather than only under `tests/`.
-members = ["crates/dbos", "crates/test-support", "demo-apps/dbos-rust-starter"]
+# front: `dbos-macros` arrives with `select_step!` — a durable race needs a slot named per branch,
+# which is the one thing a `macro_rules!` cannot write — and `dbos-transact` only when a signpost
+# release to `dbos` is cut. `test-support` is unpublished and exists so that tests needing a real
+# database can live beside the code they test, rather than only under `tests/`.
+members = [
+    "crates/dbos",
+    "crates/dbos-macros",
+    "crates/test-support",
+    "demo-apps/dbos-rust-starter",
+]
 
 [workspace.package]
 # Published placeholders occupy 0.1.1 on crates.io, so the first real release must be

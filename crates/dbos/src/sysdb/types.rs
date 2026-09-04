@@ -2302,7 +2302,7 @@ pub mod step_names {
     /// affordable — a workflow only crosses an implementation by enqueue, and an enqueued workflow
     /// starts from step zero. Agreeing with Go here is a convention, not a wire format. The same
     /// argument [`DEBOUNCE`] makes, and the one #31 made for
-    /// [`SELECT_WORKFLOW`](self::SELECT_WORKFLOW).
+    /// [`SELECT_WORKFLOW`].
     ///
     /// **A join over steps records nothing and so needs no name**: every branch checkpoints itself
     /// under the id it was built with, and the combinator makes no choice a replay could remake.

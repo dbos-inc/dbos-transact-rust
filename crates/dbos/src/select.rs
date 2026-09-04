@@ -14,28 +14,26 @@
 //!
 //! # The split, and why the checkpoint is not in the macro
 //!
-//! [`begin`] and [`finish`] are ordinary async functions dealing only in **indices**. Everything
-//! that touches [`Placement`], the system database, or serialization lives here, in code that can
-//! be read and tested without macro hygiene in the way; what is left for the macro is a poll loop
-//! over branches whose types differ. That split is also why [`select_indexed`] exists: it is the
-//! same core driven by a homogeneous `Vec`, so the checkpoint half can be tested directly.
+//! [`check_select`] and [`record_select`] are ordinary async functions dealing only in
+//! **indices**, named for the `check`/`record` pair the crate uses at every other checkpoint.
+//! Everything that touches `Placement`, the system database, or serialization lives here, in
+//! code that can be read without macro expansion in the way, and can be tested by calling it.
+//! What [`select_step!`](crate::select_step) adds is the part that has to be written per call
+//! site: a local per branch, a poll loop in source order, and one arm.
 //!
-//! [`select_indexed`] is deliberately **not public**. A `Vec` forces every branch to share `T` and
-//! `E`, which a race almost never wants — "the fetch returned" and "the timeout fired" are
-//! different types — and it answers with a position rather than running the winner's arm. It was
-//! tried as a public surface and withdrawn for exactly that; it survives as the core's test seam.
+//! **The poll loop is in the macro, not here, and that is the point of a procedural macro.** A
+//! race's answer is a choice among branches whose outputs differ in type, and Rust has no
+//! anonymous sum to return one through — so a function that owned the loop would need a sum type
+//! per arity, and a declarative macro (which can neither invent an identifier nor count) would
+//! need a rule per arity to match on it. A procedural macro writes a differently-named slot per
+//! branch instead, so nothing here is written twice and there is no arity to run out of.
+//!
+//! A `Vec`-taking form was tried as a public surface and withdrawn: a `Vec` forces every branch to
+//! share `T` and `E`, which a race almost never wants — "the fetch returned" and "the timeout
+//! fired" are different types — and a position is not a handler. [`Branches`] is what is left of
+//! it, and it carries only the half that *is* uniform: how the branches fail.
 
-// **Nothing calls this yet, and `select_step!` is what will.** The checkpoint half is built and
-// tested first, deliberately: it is ordinary async code that can be read and exercised without
-// macro hygiene in the way, where the macro over it is a poll loop across branches of differing
-// type. This allow comes off in the same commit that adds the macro — if it is still here after
-// that, something that was meant to have a caller does not.
-#![allow(dead_code)]
-
-use std::task::Poll;
-
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use std::marker::PhantomData;
 
 use crate::checkpoint::Placement;
 use crate::context::Ctx;
@@ -44,42 +42,108 @@ use crate::serialization::{decode, encode};
 use crate::step::PendingStep;
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 
-/// What [`begin`] found: a winner already recorded, or a race still to run.
+/// What [`check_select`] found: a winner already recorded, or a race still to run.
 ///
-/// Two states rather than an `Option<Select>` plus a loose index, because the caller must handle
-/// both and the type is what makes forgetting one a compile error.
-pub(crate) enum Racing {
+/// Two states rather than an `Option<Recording>` plus a loose index, because the caller must
+/// handle both and the type is what makes forgetting one a compile error.
+pub enum Racing {
     /// This select already ran. Poll **only** this branch, which then replays from its own step
     /// row without running, and take its arm.
     Replay(usize),
-    /// No checkpoint yet. Race the branches, then hand the winner to [`finish`].
-    Fresh(Select),
+    /// No checkpoint yet. Race the branches, then hand the winner to [`record_select`].
+    Fresh(Recording),
 }
 
-/// A race in progress, carrying what [`finish`] needs to record it.
+/// A checkpoint that has been claimed and not yet written.
+///
+/// Named for the half-finished row rather than for the race, and it is what links the pair: a
+/// [`record_select`] cannot be reached without a [`check_select`] to hand one over, where the
+/// crate's other `check`/`record` pairs are independent calls that trust their caller to order
+/// them.
 ///
 /// Holds the placement rather than re-deriving it, and the start instant rather than taking a
 /// fresh one at the end: the recorded duration should cover the waiting, which is where every
 /// other recorded call in this crate takes its `started_at`.
-pub(crate) struct Select {
+pub struct Recording {
     ctx: Option<Ctx>,
     placement: Placement,
     started_at: Timestamp,
 }
 
+/// The branches of one race: what each is called, what id it claimed, and how they all fail.
+///
+/// **Built by pushing, not from a literal, because pushing is what unifies `E`.** A race's
+/// branches differ in what they return — that is the whole reason it is a race — and agree on how
+/// they fail, since one `Result` comes out the far end. Nothing in a macro expansion can state
+/// that agreement; a `Vec<(String, Option<i32>)>` has already forgotten it, and every branch's
+/// error type would then be inferred alone, leaving the race's own error type unconstrained and
+/// the caller annotating a type that used to be obvious. One generic method fixes it in one line.
+///
+/// The names and ids are read while the branches are still alive, because the losers are dropped
+/// as soon as the race is decided and a stale-winner report has to be able to name a branch that
+/// is gone.
+pub struct Branches<E> {
+    identities: Vec<(String, Option<i32>)>,
+    // `fn() -> E` rather than `E`: this owns no error and must not inherit a `Send`/`Sync`
+    // restriction from one, only the type.
+    failure: PhantomData<fn() -> E>,
+}
+
+impl<E> Default for Branches<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E> Branches<E> {
+    /// An empty set, which only a macro expansion ever holds — every race pushes at least two.
+    #[must_use]
+    pub fn new() -> Self {
+        Branches {
+            identities: Vec::new(),
+            failure: PhantomData,
+        }
+    }
+
+    /// Records what this branch is called and which id it claimed, in build order.
+    ///
+    /// Takes the step by reference: a branch is about to be raced, so this may not consume it,
+    /// and `T` is free per call while `E` is fixed by the set.
+    pub fn push<T>(&mut self, step: &PendingStep<'_, T, E>) {
+        self.identities
+            .push((step.name().to_owned(), step.step_id()));
+    }
+
+    /// How many branches this race has, which is the set a recorded winner is checked against.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.identities.len()
+    }
+
+    /// Whether no branch was pushed. Only reachable by calling [`Branches::new`] directly.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.identities.is_empty()
+    }
+}
+
 /// Claims this select's step id and asks whether it already has a winner.
+///
+/// The `check` half of the pair [`check_step`](crate::sysdb::SystemDatabase::check_step) and
+/// [`record_step`](crate::sysdb::SystemDatabase::record_step) name at the layer below, doing a
+/// little more than they do: it takes the `Placement` as well as reading the row, and it checks
+/// the recorded winner against the branches that exist now.
 ///
 /// **Called after every branch is built**, and that ordering is the contract rather than a
 /// convenience: the branches take their ids as they are constructed, and the select's own id
 /// follows them. A select that took its id first would leave its branches' ids one higher than the
 /// replay expects.
 ///
-/// `branches` is only used to check a recorded winner against the set that exists now. An empty
-/// race never reaches here — the macro refuses it at compile time, which is the one refusal a
-/// macro can make that the withdrawn function had to make at run time.
-pub(crate) async fn begin<E: DurableError>(
-    branches: &[(String, Option<i32>)],
-) -> Result<Racing, E> {
+/// `branches` is only used to check a recorded winner against the set that exists now, and to fix
+/// the error type. An empty race never reaches here — the macro refuses fewer than two branches at
+/// compile time, which is the one refusal a macro can make that the withdrawn `Vec`-taking form
+/// had to make at run time.
+pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Racing, E> {
     // The connection is the ambient executor's, so the placement can only be `Outside`,
     // `Uncheckpointed` or `Recorded` — never `WrongInstance`, which needs two connections to
     // disagree and there is only one here.
@@ -103,12 +167,13 @@ pub(crate) async fn begin<E: DurableError>(
         // its code means**, and adopting a stale winner would silently take the branch the old
         // code took. The same check `select_workflow` makes against its recorded id, and the same
         // reason: the payload is the only thing a replay can check the current shape against.
-        if winner >= branches.len() {
+        if winner >= branches.identities.len() {
             let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
             // Names the branches this run actually built, which is the thing a reader has to
             // compare against the recorded index — "branch 2" alone says nothing about what the
             // code in front of them now does.
             let now = branches
+                .identities
                 .iter()
                 .enumerate()
                 .map(|(at, (name, id))| match id {
@@ -120,7 +185,10 @@ pub(crate) async fn begin<E: DurableError>(
             return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                 workflow_id: workflow_id.to_owned(),
                 step_id,
-                expected: format!("a select over {} branches — {now}", branches.len()),
+                expected: format!(
+                    "a select over {} branches — {now}",
+                    branches.identities.len()
+                ),
                 recorded: format!("a select won by branch {winner}, which no longer exists"),
             }));
         }
@@ -128,14 +196,17 @@ pub(crate) async fn begin<E: DurableError>(
         return Ok(Racing::Replay(winner));
     }
 
-    Ok(Racing::Fresh(Select {
+    Ok(Racing::Fresh(Recording {
         ctx,
         placement,
         started_at,
     }))
 }
 
-/// Records which branch won, once the race has one.
+/// Writes which branch won, once the race has one.
+///
+/// The `record` half, taking the [`Recording`] that [`check_select`] handed over — so the order the
+/// crate's other pairs leave to their caller is a type error here instead.
 ///
 /// **The position, not the branch's result.** The result is already recorded under the winning
 /// step's own id, so writing it again here would store one outcome in two places and leave a
@@ -143,12 +214,12 @@ pub(crate) async fn begin<E: DurableError>(
 ///
 /// Outside a workflow this records nothing and the race was a plain one, which is the same
 /// fall-through an ordinary step takes.
-pub(crate) async fn finish<E: DurableError>(select: Select, winner: usize) -> Result<(), E> {
-    let Select {
+pub async fn record_select<E: DurableError>(recording: Recording, winner: usize) -> Result<(), E> {
+    let Recording {
         ctx,
         placement,
         started_at,
-    } = select;
+    } = recording;
     let Some(ctx) = ctx else { return Ok(()) };
 
     let encoded = encode(&winner, "the branch that won a select")?;
@@ -163,82 +234,9 @@ pub(crate) async fn finish<E: DurableError>(select: Select, winner: usize) -> Re
         .map_err(Error::lift)
 }
 
-/// The core driven by a homogeneous `Vec`, so that it can be tested without the macro.
-///
-/// Answers with the winning position and that branch's outcome. Not public, and the module doc
-/// says why: a `Vec` forces one `T` on every branch and a position is not a handler.
-pub(crate) async fn select_indexed<'a, T, E>(
-    mut branches: Vec<PendingStep<'a, T, E>>,
-) -> Result<(usize, Result<T, E>), E>
-where
-    T: Serialize + DeserializeOwned + Send + 'a,
-    E: DurableError + Send + 'a,
-{
-    // Refused before the placement, so a call that cannot be answered does not move the step
-    // counter: a workflow fixed to pass branches would otherwise replay onto a different slot than
-    // it recorded. The macro makes this a compile error instead.
-    if branches.is_empty() {
-        return Err(Error::Config(
-            "select_step was given no branches to choose between".to_owned(),
-        ));
-    }
-
-    // Read before the race, because the losers are dropped once it is decided and a stale-winner
-    // report has to be able to name a branch that is gone.
-    let identities: Vec<_> = branches
-        .iter()
-        .map(|b| (b.name().to_owned(), b.step_id()))
-        .collect();
-
-    match begin(&identities).await? {
-        // **Only the winner is polled.** The losers recorded nothing on the first execution, so
-        // running them now would be running them for the first time — side effects the original
-        // never had. The branches before it were still *built*, which is what keeps their ids
-        // spent and every later id where the replay expects it.
-        Racing::Replay(winner) => {
-            tracing::debug!(
-                winner,
-                step = %identities[winner].0,
-                "replaying select_step; only the winning branch is polled"
-            );
-            let outcome = branches.swap_remove(winner).await;
-            Ok((winner, outcome))
-        }
-        Racing::Fresh(select) => {
-            let mut running: Vec<_> = branches
-                .into_iter()
-                .map(PendingStep::into_running)
-                .collect();
-            let (winner, outcome) = std::future::poll_fn(|cx| {
-                for (index, branch) in running.iter_mut().enumerate() {
-                    // Returned from inside the loop, so nothing is polled after it went `Ready`.
-                    // Fixed source order, not tokio's randomised one: fairness is exactly the
-                    // property a replay cannot reproduce, so two branches ready in the same instant
-                    // resolve to the earlier one — and a replay reads the winner rather than racing
-                    // at all, which makes that bias a tie-break rather than something to depend on.
-                    if let Poll::Ready(outcome) = branch.as_mut().poll(cx) {
-                        return Poll::Ready((index, outcome));
-                    }
-                }
-                Poll::Pending
-            })
-            .await;
-            // Dropped before the checkpoint is written, so every loser is stopped at its next
-            // suspension point and its destructors have run before anything records that the race
-            // is over. Whatever a loser did before that, it did once and invisibly — the same trade
-            // a step timeout makes, and what Go says of its own `Select`.
-            drop(running);
-
-            finish(select, winner).await?;
-            Ok((winner, outcome))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use super::*;
@@ -278,45 +276,6 @@ mod tests {
             .into_iter()
             .map(|s| (s.step_id, s.step_name))
             .collect()
-    }
-
-    /// **The claim S1 exists for.** The *second* branch finishes first, and the ids are still the
-    /// order the branches were built in — which a design that allocated at the first poll passes
-    /// only by luck.
-    #[tokio::test]
-    async fn a_race_keeps_the_ids_the_branches_were_built_with() {
-        let (dbos, _db) = workflow("wf-order").await;
-
-        let (winner, outcome) = Ctx::scope(ctx(&dbos, "wf-order"), async {
-            // Built first, finishes last.
-            let slow = step("slow", || async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                Ok::<_, crate::Error>(1u32)
-            });
-            // Built second, finishes first.
-            let quick = step("quick", || async { Ok::<_, crate::Error>(2u32) });
-            select_indexed(vec![slow, quick]).await
-        })
-        .await
-        .expect("the select failed");
-
-        assert_eq!(winner, 1, "the second branch finished first");
-        assert_eq!(outcome.unwrap(), 2);
-
-        // **The hole at id 0 is the point.** `slow` was built first and so took id 0, then lost
-        // and was dropped before it could record — so the rows skip straight to 1. That the winner
-        // is at 1 rather than 0 is exactly the claim: the id came from where the branch was
-        // *built*, not from the order the bodies finished in. A design that allocated at the first
-        // poll would have put `quick` at 0.
-        let rows = steps(&dbos, "wf-order").await;
-        assert_eq!(
-            rows,
-            [(1, "quick".to_owned()), (2, "DBOS.selectStep".to_owned())],
-            "the winner keeps its build-order id, the loser records nothing, and the select's own \
-             id follows both"
-        );
-
-        dbos.shutdown().await;
     }
 
     /// The id is readable on the value, in build order — and `None` where none was claimed.
@@ -559,128 +518,282 @@ mod tests {
         dbos.shutdown().await;
     }
 
-    /// A replay takes the branch it recorded, and never runs the loser.
-    #[tokio::test]
-    async fn a_replayed_race_reuses_the_winner_and_leaves_the_loser_alone() {
-        let (dbos, _db) = workflow("wf-replay").await;
-        let loser_ran = Arc::new(AtomicU32::new(0));
+    /// The macro over the core, behind the feature that re-exports it.
+    ///
+    /// Nested rather than gated test by test, because the split is worth stating once: above
+    /// is what a durable race *is*, and here is what writing one looks like.
+    #[cfg(feature = "macros")]
+    mod races {
+        use std::sync::atomic::{AtomicU32, Ordering};
 
-        let race = |loser_ran: Arc<AtomicU32>| async move {
-            let quick = step("quick", || async { Ok::<_, crate::Error>(7u32) });
-            let slow = step("slow", {
-                let loser_ran = loser_ran.clone();
-                move || {
-                    let loser_ran = loser_ran.clone();
-                    async move {
-                        loser_ran.fetch_add(1, Ordering::SeqCst);
+        use super::*;
+
+        /// A recorded winner that no longer exists is a changed shape, not a branch to take.
+        ///
+        /// The select has to land on the same step id both times, so the same three steps are
+        /// built — only two of them are raced the second time.
+        #[tokio::test]
+        async fn a_recorded_winner_outside_the_current_set_is_reported() {
+            let (dbos, _db) = workflow("wf-shrunk").await;
+
+            let first: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
+                crate::select_step! {
+                    b = step("b", || async {
                         tokio::time::sleep(Duration::from_millis(300)).await;
-                        Ok::<_, crate::Error>(8u32)
-                    }
+                        Ok::<_, crate::Error>(2u32)
+                    }) => b?,
+                    c = step("c", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, crate::Error>(3u32)
+                    }) => c?,
+                    a = step("a", || async { Ok::<_, crate::Error>(1u32) }) => a?
                 }
-            });
-            select_indexed(vec![quick, slow]).await
-        };
+            })
+            .await;
+            assert_eq!(first.unwrap(), 1, "the branch built third finished first");
 
-        let (first, _) = Ctx::scope(ctx(&dbos, "wf-replay"), race(loser_ran.clone()))
-            .await
-            .expect("the select failed");
-        assert_eq!(first, 0);
-        let started_once = loser_ran.load(Ordering::SeqCst);
+            let shrunk: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
+                let _third = step("a", || async { Ok::<_, crate::Error>(1u32) });
+                crate::select_step! {
+                    b = step("b", || async { Ok::<_, crate::Error>(2u32) }) => b?,
+                    c = step("c", || async { Ok::<_, crate::Error>(3u32) }) => c?
+                }
+            })
+            .await;
 
-        // A fresh context over the same workflow id: step ids start again from zero.
-        let (again, outcome) = Ctx::scope(ctx(&dbos, "wf-replay"), race(loser_ran.clone()))
-            .await
-            .expect("the select failed");
-        assert_eq!(again, 0, "the replay takes the branch it recorded");
-        assert_eq!(
-            outcome.unwrap(),
-            7,
-            "and that branch replays from its own row"
-        );
-        assert_eq!(
-            loser_ran.load(Ordering::SeqCst),
-            started_once,
-            "the loser recorded nothing on the first run, so a replay must not run it for the \
-             first time now"
-        );
+            match shrunk {
+                Err(crate::Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+                    recorded,
+                    ..
+                })) => assert!(recorded.contains("branch 2"), "{recorded}"),
+                other => panic!("a stale winner must be reported, got {other:?}"),
+            }
 
-        dbos.shutdown().await;
-    }
-
-    /// A recorded winner that no longer exists is a changed shape, not a branch to take.
-    #[tokio::test]
-    async fn a_recorded_winner_outside_the_current_set_is_reported() {
-        let (dbos, _db) = workflow("wf-shrunk").await;
-
-        let (winner, _) = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
-            let b = step("b", || async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                Ok::<_, crate::Error>(2u32)
-            });
-            let c = step("c", || async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                Ok::<_, crate::Error>(3u32)
-            });
-            let a = step("a", || async { Ok::<_, crate::Error>(1u32) });
-            select_indexed(vec![b, c, a]).await
-        })
-        .await
-        .expect("the select failed");
-        assert_eq!(winner, 2, "the branch built third finished first");
-
-        // The same three steps are built, so the select lands on the same id — but only two of
-        // them are raced, so the recorded winner names a branch that is no longer there.
-        let shrunk = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
-            let b = step("b", || async { Ok::<_, crate::Error>(2u32) });
-            let c = step("c", || async { Ok::<_, crate::Error>(3u32) });
-            let _dropped = step("a", || async { Ok::<_, crate::Error>(1u32) });
-            select_indexed(vec![b, c]).await
-        })
-        .await;
-
-        match shrunk {
-            Err(crate::Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
-                recorded,
-                ..
-            })) => assert!(recorded.contains("branch 2"), "{recorded}"),
-            other => panic!("a stale winner must be reported, got {other:?}"),
+            dbos.shutdown().await;
         }
 
-        dbos.shutdown().await;
-    }
+        /// Outside a workflow the branches run plainly and nothing is recorded — which is what
+        /// keeps a function built from steps ordinarily callable and ordinarily testable.
+        #[tokio::test]
+        async fn outside_a_workflow_the_race_is_plain() {
+            let answer: crate::Result<u32> = async {
+                crate::select_step! {
+                    quick = step("quick", || async { Ok::<_, crate::Error>(1u32) }) => quick?,
+                    slow = step("slow", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, crate::Error>(2u32)
+                    }) => slow?
+                }
+            }
+            .await;
+            assert_eq!(answer.unwrap(), 1);
+        }
 
-    /// Nothing to choose between has no answer it could ever give.
-    #[tokio::test]
-    async fn an_empty_race_is_refused_and_spends_no_id() {
-        let (dbos, _db) = workflow("wf-empty").await;
+        /// The macro over the core: heterogeneous branches, typed arms, one arm run.
+        ///
+        /// The branches return different types — a `u32` and a `String` — which is the thing the
+        /// `Vec`-taking core cannot express and the whole reason this is a macro.
+        #[tokio::test]
+        async fn the_macro_races_heterogeneous_branches_and_runs_one_arm() {
+            let (dbos, _db) = workflow("wf-macro").await;
+            let loser_ran = Arc::new(AtomicU32::new(0));
 
-        let refused = Ctx::scope(ctx(&dbos, "wf-empty"), async {
-            let empty: Vec<crate::PendingStep<'_, u32, crate::Error>> = Vec::new();
-            select_indexed(empty).await
-        })
-        .await;
-        assert!(matches!(refused, Err(crate::Error::Config(_))));
+            let answer: crate::Result<String> = Ctx::scope(ctx(&dbos, "wf-macro"), {
+                let loser_ran = Arc::clone(&loser_ran);
+                async move {
+                    crate::select_step! {
+                        slow = step("slow", {
+                            let loser_ran = Arc::clone(&loser_ran);
+                            move || {
+                                let loser_ran = Arc::clone(&loser_ran);
+                                async move {
+                                    loser_ran.fetch_add(1, Ordering::SeqCst);
+                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    Ok::<_, crate::Error>(1u32)
+                                }
+                            }
+                        }) => format!("the counter won with {}", slow?),
+                        quick = step("quick", || async {
+                            Ok::<_, crate::Error>("hello".to_owned())
+                        }) => format!("the namer won with {}", quick?)
+                    }
+                }
+            })
+            .await;
 
-        assert!(
-            steps(&dbos, "wf-empty").await.is_empty(),
-            "a refused select must not move the step counter"
-        );
+            assert_eq!(answer.unwrap(), "the namer won with hello");
 
-        dbos.shutdown().await;
-    }
+            // The loser was built — so it spent id 0 — and dropped without recording.
+            assert_eq!(
+                steps(&dbos, "wf-macro").await,
+                [(1, "quick".to_owned()), (2, "DBOS.selectStep".to_owned())],
+                "the winner keeps its build-order id, the loser records nothing"
+            );
 
-    /// Outside a workflow the branches run plainly and nothing is recorded.
-    #[tokio::test]
-    async fn outside_a_workflow_the_race_is_plain() {
-        let quick = step("quick", || async { Ok::<_, crate::Error>(1u32) });
-        let slow = step("slow", || async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            Ok::<_, crate::Error>(2u32)
-        });
-        let (winner, outcome) = select_indexed(vec![quick, slow])
-            .await
-            .expect("the select failed");
-        assert_eq!(winner, 0);
-        assert_eq!(outcome.unwrap(), 1);
+            dbos.shutdown().await;
+        }
+
+        /// A replay takes the same arm, and the loser is not run for the first time on the way
+        /// through.
+        #[tokio::test]
+        async fn a_replayed_macro_race_takes_the_same_arm() {
+            let (dbos, _db) = workflow("wf-macro-replay").await;
+            let loser_ran = Arc::new(AtomicU32::new(0));
+
+            let race = |loser_ran: Arc<AtomicU32>| async move {
+                crate::select_step! {
+                    quick = step("quick", || async { Ok::<_, crate::Error>(7u32) }) => {
+                        format!("quick: {}", quick?)
+                    },
+                    slow = step("slow", {
+                        let loser_ran = Arc::clone(&loser_ran);
+                        move || {
+                            let loser_ran = Arc::clone(&loser_ran);
+                            async move {
+                                loser_ran.fetch_add(1, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                Ok::<_, crate::Error>("slow".to_owned())
+                            }
+                        }
+                    }) => format!("slow: {}", slow?)
+                }
+            };
+
+            let first: crate::Result<String> =
+                Ctx::scope(ctx(&dbos, "wf-macro-replay"), race(Arc::clone(&loser_ran))).await;
+            assert_eq!(first.unwrap(), "quick: 7");
+            let started_once = loser_ran.load(Ordering::SeqCst);
+
+            let again: crate::Result<String> =
+                Ctx::scope(ctx(&dbos, "wf-macro-replay"), race(Arc::clone(&loser_ran))).await;
+            assert_eq!(again.unwrap(), "quick: 7", "the replay takes the same arm");
+            assert_eq!(
+                loser_ran.load(Ordering::SeqCst),
+                started_once,
+                "the loser recorded nothing first time, so a replay must not run it now"
+            );
+
+            dbos.shutdown().await;
+        }
+
+        /// **No arity to run out of.** Ten branches, where the declarative form stopped at the
+        /// last sum type somebody wrote — the macro names a slot per branch, so the only bound
+        /// is patience.
+        #[tokio::test]
+        async fn a_race_wider_than_any_hand_written_arity() {
+            let (dbos, _db) = workflow("wf-macro-wide").await;
+
+            // Nine that sleep and one that does not, so the winner is unambiguous and last.
+            let slow = |name: &'static str| {
+                step(name, || async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok::<_, crate::Error>(0u32)
+                })
+            };
+
+            let answer: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-macro-wide"), async {
+                crate::select_step! {
+                    a = slow("a") => a?,
+                    b = slow("b") => b?,
+                    c = slow("c") => c?,
+                    d = slow("d") => d?,
+                    e = slow("e") => e?,
+                    f = slow("f") => f?,
+                    g = slow("g") => g?,
+                    h = slow("h") => h?,
+                    i = slow("i") => i?,
+                    j = step("j", || async { Ok::<_, crate::Error>(10u32) }) => j?,
+                }
+            })
+            .await;
+
+            assert_eq!(answer.unwrap(), 10, "the tenth branch finished first");
+            assert_eq!(
+                steps(&dbos, "wf-macro-wide").await,
+                [(9, "j".to_owned()), (10, "DBOS.selectStep".to_owned())],
+                "nine losers spend their ids and record nothing"
+            );
+
+            dbos.shutdown().await;
+        }
+
+        /// The comma rule is `match`'s: a block body ends its own arm, including mid-list.
+        ///
+        /// Run outside a workflow because what is under test is the grammar, not the checkpoint —
+        /// this compiling at all is the assertion.
+        #[tokio::test]
+        async fn a_block_arm_ends_itself_like_a_match_arm() {
+            let answer: crate::Result<u32> = async {
+                crate::select_step! {
+                    quick = step("quick", || async { Ok::<_, crate::Error>(1u32) }) => {
+                        let won = quick?;
+                        won + 10
+                    }
+                    slow = step("slow", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, crate::Error>(2u32)
+                    }) => match slow {
+                        Ok(value) => value + 1,
+                        Err(_) => 0,
+                    }
+                }
+            }
+            .await;
+            assert_eq!(answer.unwrap(), 11);
+        }
+
+        /// **The race's error type comes from its branches, with nothing written down.**
+        ///
+        /// `Branches` is what carries it: the branches disagree about `T` — that is the point
+        /// of a race — and agree about `E`, and pushing each one is what states the agreement.
+        /// Without it the only thing tying the expansion's error type to the branches' would be
+        /// a `?` inside an arm, so a race whose arms handle their own failures would need an
+        /// annotation. No annotation here is the whole test.
+        #[tokio::test]
+        async fn the_error_type_is_inferred_from_the_branches() {
+            let (dbos, _db) = workflow("wf-macro-inferred").await;
+
+            let answer = Ctx::scope(ctx(&dbos, "wf-macro-inferred"), async {
+                crate::select_step! {
+                    counted = step("counted", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, crate::Error>(1u32)
+                    }) => counted.is_ok(),
+                    named = step("named", || async {
+                        Ok::<_, crate::Error>("hello".to_owned())
+                    }) => named.is_ok(),
+                }
+            })
+            .await;
+
+            assert!(answer.unwrap(), "the branch that finished first succeeded");
+
+            dbos.shutdown().await;
+        }
+
+        /// Three branches, to show the arity rules are not a two-branch special case.
+        #[tokio::test]
+        async fn the_macro_handles_more_than_two_branches() {
+            let (dbos, _db) = workflow("wf-macro-three").await;
+
+            let answer: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-macro-three"), async {
+                crate::select_step! {
+                    a = step("a", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, crate::Error>(1u32)
+                    }) => a? + 100,
+                    b = step("b", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, crate::Error>("b".to_owned())
+                    }) => b.map(|_| 200u32)?,
+                    c = step("c", || async { Ok::<_, crate::Error>(3u32) }) => c? + 300
+                }
+            })
+            .await;
+
+            assert_eq!(answer.unwrap(), 303, "the third branch finished first");
+
+            dbos.shutdown().await;
+        }
     }
 }

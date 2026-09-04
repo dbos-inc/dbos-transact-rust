@@ -382,17 +382,6 @@ type Running<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>
 type Body<'a, T, E> = Box<dyn FnMut() -> Running<'a, T, E> + Send + 'a>;
 
 impl<'a, T, E> PendingStep<'a, T, E> {
-    /// Unwraps to the run inside, for a combinator that has to hold several branches pinned.
-    ///
-    /// `pub(crate)` because handing out the erased future would let a caller build a race over
-    /// arbitrary futures, and a race over branches that checkpoint nothing is the failure the
-    /// durable select exists to prevent.
-    // Called by the select core's poll loop, which lands with `select_step!`.
-    #[allow(dead_code)]
-    pub(crate) fn into_running(self) -> Running<'a, T, E> {
-        self.running
-    }
-
     /// What this step is called — the name it will be checked against on replay.
     #[must_use]
     pub fn name(&self) -> &str {

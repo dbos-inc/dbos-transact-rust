@@ -1,0 +1,31 @@
+[package]
+name = "dbos-macros"
+description = "Procedural macros for DBOS Transact"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# A proc-macro crate is compiled for the *host* and loaded by the compiler, so nothing here
+# reaches a user's binary. What it does cost is build time: `syn` and `quote` are compiled
+# before `dbos` can be, which is the price the `macros` feature exists to let a build decline.
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+# `full` for the expression and pattern grammars — an arm is `pattern = expression => expression`,
+# and both halves are the real Rust ones rather than a subset. Version 2 rather than the newer 3
+# because every derive crate already in this tree resolves to 2, so it is a compile unit the
+# build has anyway; picking 3 would add one to no purpose.
+#
+# `default-features = false` drops `derive` and `clone-impls`, which are for reading `struct`
+# and `enum` definitions. This macro reads neither.
+syn = { version = "2", default-features = false, features = [
+    "full",
+    "parsing",
+    "printing",
+    "proc-macro",
+] }

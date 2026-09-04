@@ -461,6 +461,7 @@ name = "dbos"
 version = "0.1.2"
 dependencies = [
  "async-trait",
+ "dbos-macros",
  "dbos-test-support",
  "serde",
  "serde_json",
@@ -471,6 +472,15 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "dbos-macros"
+version = "0.1.2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
