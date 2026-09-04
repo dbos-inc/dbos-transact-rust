@@ -2296,24 +2296,20 @@ pub mod step_names {
     /// The step names a wait over several workflow handles records.
     ///
     /// **The two exceptions in this table: named for the calls that write them rather than for a
-    /// reference.** Every other constant here is a string some other implementation already writes,
-    /// because a step row a Python or TypeScript reader may see should say what that reader calls
-    /// the operation. These two do not follow that rule. Python records `"DBOS.waitFirst"`
-    /// (`_dbos.py:1634`) and TypeScript records the same string from `DBOS.waitFirst`; TypeScript
-    /// alone records `"DBOS.waitAll"`, from the `runInternalStep` label in `DBOS.waitAll`, and Go
-    /// and Java have neither call. This crate names its calls
-    /// [`select_workflow`](crate::select_workflow()) and
-    /// [`join_workflows`](crate::join_workflows()), after the concurrency shapes rather than after
-    /// the wait, and the step a caller reads in a listing is named for the call they wrote — so
-    /// these follow the calls.
+    /// reference.** Every other constant here is a string another implementation already writes,
+    /// so a step row a Python or TypeScript reader may see says what that reader calls the
+    /// operation. Python records `"DBOS.waitFirst"` (`_dbos.py:1634`) and TypeScript the same
+    /// string; TypeScript alone records `"DBOS.waitAll"`; Go and Java have neither call. This
+    /// crate names its calls [`select_workflow`](crate::select_workflow()) and
+    /// [`join_workflows`](crate::join_workflows()), after the concurrency shapes rather than the
+    /// wait, and a step listing should name the call the caller wrote — so these follow the calls.
     ///
-    /// **What that costs, stated plainly.** A Rust workflow's wait steps do not line up with the
-    /// same wait's steps in Python or TypeScript: a cross-SDK reader — Conductor's step listing, or
-    /// anything grouping steps by name across implementations — sees two names for one operation.
-    /// Nothing breaks, because no implementation reads another's step *names* to decide anything;
-    /// the name is what a replay of this workflow checks against its own row, and that stays
-    /// internally consistent. The spelling still follows the table's convention, `DBOS.` and
-    /// camelCase, so the divergence is the word and not the shape.
+    /// **The cost** is that a Rust workflow's wait steps do not line up with the same wait's in
+    /// Python or TypeScript: a cross-SDK reader such as Conductor's step listing sees two names for
+    /// one operation. Nothing breaks, because no implementation reads another's step *names* to
+    /// decide anything — the name is what a replay of this workflow checks against its own row.
+    /// The spelling keeps the table's convention, `DBOS.` and camelCase, so the divergence is the
+    /// word and not the shape.
     ///
     /// **What each one records is not the same shape.** A first-wait's answer is a *choice* — the
     /// id that won — and a replay that made it again could pick a different winner and take a
