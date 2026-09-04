@@ -109,6 +109,30 @@
 //! and [`Client::wait_all`](crate::Client::wait_all) are that same caller from outside the
 //! application altogether.
 //!
+//! # Two macros over the same two calls
+//!
+//! [`select_workflow!`](crate::select_workflow) and [`join_workflows!`](crate::join_workflows) are
+//! the same two waits taking **handles** and giving back **typed results**, which is what the
+//! id-taking calls cannot do: a set of ids has no one type, where a fixed list of handles has one
+//! per branch. Neither macro records anything of its own — each expands to the wait beside it plus
+//! [`result`](crate::WorkflowHandle::result) on the handles it needs, so the checkpoint that pins
+//! the choice is the `wait_first` the macro already made.
+//!
+//! They are macros because a select's answer is a *sum* over branches that may differ in type, and
+//! Rust has no anonymous sum type to return; a function would have to give back nested `Either`s,
+//! or force one type on every branch. That is why `select!` is a macro everywhere it exists. Both
+//! are `macro_rules!`, exported from this crate rather than a companion one, as `tokio::select!`
+//! and `tokio::join!` are.
+//!
+//! Both take an optional instance before a semicolon — `select_workflow!(dbos; ..)` — which is the
+//! three-surface split above spelled at the call site, because a macro has no ambient context of
+//! its own to consult. The expansion names the *method* rather than a type, so a [`DBOS`] and a
+//! [`Client`](crate::Client) are the same two lines.
+//!
+//! The id-taking calls are not superseded by any of this. A macro is fixed-arity and needs the
+//! handles, so a set built in a loop, a set of ids read from somewhere else, and a
+//! [`Client`](crate::Client) that never had handles are all still theirs.
+//!
 //! # Bounding the wait
 //!
 //! Neither takes a timeout, for the reason
@@ -199,6 +223,234 @@ pub async fn wait_all<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<(
         .wait_all(workflow_ids)
         .await
         .map_err(Error::lift)
+}
+
+/// Races these workflow handles and runs the arm belonging to the one that finishes first.
+///
+/// The macro form of [`wait_first`]. Where that answers with the winner's **id**, this hands the
+/// winning arm the winner's **typed result** — so a fan-out over children that return different
+/// types is one expression rather than an id, a lookup against the set, and a cast.
+///
+/// ```no_run
+/// # async fn race(
+/// #     counter: dbos::WorkflowRef<u32, u32>,
+/// #     namer: dbos::WorkflowRef<(), String>,
+/// # ) -> dbos::Result<String> {
+/// let count = counter.start(3).await?;
+/// let name = namer.start(()).await?;
+/// dbos::select_workflow! {
+///     n = count => format!("the counter won with {}", n?),
+///     s = name  => format!("the namer won with {}", s?),
+/// }
+/// # }
+/// ```
+///
+/// # Inside a workflow
+///
+/// **Nothing new is recorded.** The expansion is one [`wait_first`] over the handles' ids — the
+/// checkpoint that already makes this choice survive a replay — and then
+/// [`result`](crate::WorkflowHandle::result) on the winner alone. A replayed body reads the same
+/// winner back out of that checkpoint and awaits the same handle, so the arm taken the second time
+/// is the arm taken the first.
+///
+/// **Only the winner is awaited**, and that is what keeps the step ids stable rather than being an
+/// optimisation: a loser's `result` is called on neither the run nor the replay, so no id is taken
+/// on one and not the other. Dropping the losing handles does not stop those workflows — a
+/// workflow runs on whether or not anything is watching it, which is the difference between racing
+/// workflows and racing steps.
+///
+/// # Outside a workflow
+///
+/// An instance before a semicolon is the other form, and it is the [`DBOS::wait_first`] surface
+/// where the bare form is the free [`wait_first`] one — the same split the calls themselves make,
+/// spelled at the call site because a macro has no ambient context of its own to consult:
+///
+/// ```no_run
+/// # async fn race(dbos: &dbos::DBOS, a: dbos::WorkflowHandle<u32>, b: dbos::WorkflowHandle<u32>)
+/// # -> dbos::Result<u32> {
+/// dbos::select_workflow! { dbos;
+///     first = a => first?,
+///     second = b => second?,
+/// }
+/// # }
+/// ```
+///
+/// Anything with the two waits on it goes there, which today is a [`DBOS`] or a
+/// [`Client`](crate::Client) — the macro names the method rather than a type, so a client's
+/// undurable wait and an instance's checkpointed one are the same expansion. **Inside a workflow,
+/// prefer the bare form**: it needs no handle, for the reason a registered closure that captured a
+/// [`DBOS`] would keep the instance alive for the life of the process, and a client's wait inside a
+/// workflow body is not checkpointed and so runs again on every replay.
+///
+/// One wrinkle belongs to this form alone: an instance answers in the engine's own channel, so the
+/// expansion lifts that error into the caller's, and where nothing else says which channel that is
+/// — a test, or any caller that never `?`s the result — it has to be annotated. Inside a workflow
+/// the body's own return type settles it and the question does not arise.
+///
+/// # The shape of an arm
+///
+/// **A branch is a variable holding a handle, not an arbitrary expression.** The handle is named
+/// twice, once for its id and once to consume it, and an expression would be evaluated twice —
+/// which for `child.start(n).await?` would start the workflow twice. A workflow body starts its
+/// children one at a time anyway, so they are already bound.
+///
+/// **Two branches naming the same workflow are answered by the first**, in the order the arms are
+/// written. [`wait_first`] accepts a repeated id for the same reason: the answer names one
+/// workflow however many entries pointed at it.
+///
+/// The value is a [`Result`](crate::Result), because the wait itself can fail. Each arm binds its
+/// own handle's result, so an arm decides for itself whether to `?` it, match it, or report it.
+#[macro_export]
+macro_rules! select_workflow {
+    // The two public forms differ only in which wait they reach for, so both hand the same arms to
+    // this one along with the call that produces the winner. Internal rules come first because a
+    // rule that fails on a literal backtracks cleanly, where one that fails inside a `pat` or
+    // `expr` fragment need not.
+    ( @race { $wait:expr } $( $bind:pat = $handle:ident => $arm:expr ),+ ) => {
+        'dbos_select: {
+            let winner = match $wait {
+                ::core::result::Result::Ok(winner) => winner,
+                ::core::result::Result::Err(failed) => {
+                    break 'dbos_select ::core::result::Result::Err(failed);
+                }
+            };
+            $(
+                if $handle.workflow_id() == winner {
+                    let $bind = $handle.result().await;
+                    break 'dbos_select ::core::result::Result::Ok($arm);
+                }
+            )+
+            // `wait_first` checks its recorded winner against the set it was given, so an id from
+            // outside it has already been reported as `UnexpectedStep` before this is reached.
+            ::core::unreachable!(
+                "wait_first answered with {winner}, which is none of the handles it was given"
+            )
+        }
+    };
+    ( $( $bind:pat = $handle:ident => $arm:expr ),+ $(,)? ) => {
+        $crate::select_workflow!(
+            @race { $crate::wait_first(&[$( $handle.workflow_id() ),+]).await }
+            $( $bind = $handle => $arm ),+
+        )
+    };
+    ( $instance:expr ; $( $bind:pat = $handle:ident => $arm:expr ),+ $(,)? ) => {
+        // `lift` because an instance and a client answer in the engine's own channel, where the
+        // arms speak the application's: the free form is generic over that channel and needs no
+        // conversion, and this one is the `map_err(Error::lift)` every other engine-channel call
+        // asks of its caller.
+        $crate::select_workflow!(
+            @race {
+                $instance
+                    .wait_first(&[$( $handle.workflow_id() ),+])
+                    .await
+                    .map_err($crate::Error::lift)
+            }
+            $( $bind = $handle => $arm ),+
+        )
+    };
+    // Last, so it speaks only for input no other rule claimed. Worth the rule because the two
+    // shapes it covers are the two mistakes available here, and rustc's own answer to both is
+    // "no rules expected this token".
+    ( $( $bad:tt )* ) => {
+        ::core::compile_error!(
+            "select_workflow! takes arms of the form `binding = handle => expression`, where each \
+             handle is a variable holding a WorkflowHandle rather than an expression. An instance \
+             to wait through goes before a *semicolon*: `select_workflow!(dbos; won = a => won?)`."
+        )
+    };
+}
+
+/// Waits for all of these workflows and returns what each of them returned.
+///
+/// The macro form of [`wait_all`], and the reason to reach for it rather than awaiting each handle
+/// in turn: one poll loop settles the whole set — **one query per interval whatever N is** — and
+/// only then is each result read, so N handles cost one wait and N row reads instead of N waits.
+///
+/// ```no_run
+/// # async fn both(
+/// #     counter: dbos::WorkflowRef<u32, u32>,
+/// #     namer: dbos::WorkflowRef<(), String>,
+/// # ) -> dbos::Result<String> {
+/// let count = counter.start(3).await?;
+/// let name = namer.start(()).await?;
+/// let (count, name) = dbos::join_workflows!(count, name)?;
+/// # Ok(format!("{name} counted to {count}")) }
+/// ```
+///
+/// **Nothing new is recorded, and the awaits stay sequential.** The expansion is one [`wait_all`]
+/// and then [`result`](crate::WorkflowHandle::result) on each handle in source order. Sequential is
+/// not a concession here: the set is already settled by the time the first result is read, so every
+/// one of them is a row read that does not wait — and taking them in source order is what keeps
+/// each `DBOS.getResult` on the step id its replay expects.
+///
+/// **The first failure ends it**, in source order, as `try_join!` does: the tuple holds values
+/// rather than results, so a failed child is the value of the whole call. Where each child's own
+/// failure matters, [`wait_all`] followed by a `result` per handle reports all of them.
+///
+/// An instance before a semicolon is the outside-a-workflow form, exactly as it is for
+/// [`select_workflow!`](crate::select_workflow), which sets out when to reach for which:
+///
+/// ```no_run
+/// # async fn both(dbos: &dbos::DBOS, a: dbos::WorkflowHandle<u32>, b: dbos::WorkflowHandle<u32>)
+/// # -> dbos::Result<u32> {
+/// let (a, b) = dbos::join_workflows!(dbos; a, b)?;
+/// # Ok(a + b) }
+/// ```
+///
+/// A branch is a variable holding a handle, for the reason
+/// [`select_workflow!`](crate::select_workflow) gives.
+///
+/// **A comma there is not caught.** `join_workflows!(dbos, a, b)` is a perfectly good list of three
+/// idents, so it is read as three handles and fails inside the expansion, where the instance turns
+/// out to have no `workflow_id`. That ambiguity is why the separator is a semicolon at all: unlike
+/// [`select_workflow!`](crate::select_workflow), whose arms cannot be mistaken for an instance,
+/// nothing distinguishes the two shapes here.
+#[macro_export]
+macro_rules! join_workflows {
+    ( @join { $wait:expr } $( $handle:ident ),+ ) => {
+        'dbos_join: {
+            if let ::core::result::Result::Err(failed) = $wait {
+                break 'dbos_join ::core::result::Result::Err(failed);
+            }
+            ::core::result::Result::Ok((
+                $(
+                    match $handle.result().await {
+                        ::core::result::Result::Ok(value) => value,
+                        ::core::result::Result::Err(failed) => {
+                            break 'dbos_join ::core::result::Result::Err(failed);
+                        }
+                    },
+                )+
+            ))
+        }
+    };
+    ( $( $handle:ident ),+ $(,)? ) => {
+        $crate::join_workflows!(
+            @join { $crate::wait_all(&[$( $handle.workflow_id() ),+]).await }
+            $( $handle ),+
+        )
+    };
+    ( $instance:expr ; $( $handle:ident ),+ $(,)? ) => {
+        $crate::join_workflows!(
+            @join {
+                $instance
+                    .wait_all(&[$( $handle.workflow_id() ),+])
+                    .await
+                    .map_err($crate::Error::lift)
+            }
+            $( $handle ),+
+        )
+    };
+    // The comma form this cannot catch is called out by name: `join_workflows!(dbos, a, b)` is a
+    // valid list of three idents, so it matches the bare rule above and fails later, inside the
+    // expansion, on an instance that has no `workflow_id`.
+    ( $( $bad:tt )* ) => {
+        ::core::compile_error!(
+            "join_workflows! takes variables holding WorkflowHandles: `join_workflows!(a, b)`. An \
+             instance to wait through goes before a *semicolon*: `join_workflows!(dbos; a, b)` — \
+             with a comma there, the instance is read as one more handle."
+        )
+    };
 }
 
 impl DBOS {
