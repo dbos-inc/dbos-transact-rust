@@ -326,6 +326,57 @@ pub enum Error<E = EngineOnly> {
     /// because the portable error shape matches on `name` and makes `code` optional — Python codes
     /// this error 18 and TypeScript codes it 31, and neither is a value a fifth implementation
     /// should adopt.
+    /// A step was built in one place and polled somewhere that disagrees about which workflow it
+    /// belongs to.
+    ///
+    /// A step takes its id **when it is built**, which is what makes a set of them built first and
+    /// driven together deterministic — and it makes the id a claim on *one position in one
+    /// workflow*. Polling the step somewhere else cannot honour that claim, and both ways of
+    /// getting it wrong are otherwise silent:
+    ///
+    /// - **Built outside a workflow, polled inside one.** There is no id to record under, so the
+    ///   body would run undurably exactly where the caller expected a checkpoint.
+    /// - **Built inside one workflow, polled inside another.** The row would land under the
+    ///   building workflow's id, at a position the polling workflow never reserved — so the
+    ///   polling workflow's own replay would run the step again.
+    ///
+    /// **The usual cause is building a step as an argument to something that enters the context
+    /// afterwards.** `Ctx::scope(ctx, step(..))` evaluates `step(..)` *before* the scope exists, so
+    /// the step is built outside the workflow it was meant for. Build it where it is used instead:
+    /// `Ctx::scope(ctx, async { step(..).await })`.
+    ///
+    /// **Identity is compared by workflow, never by the in-step flag.** That flag is one
+    /// `AtomicBool` for the whole workflow, so a sibling step's running body sets it while another
+    /// branch is first polled — a check that consulted it would refuse the concurrent steps this
+    /// design exists to allow.
+    ///
+    /// **One case this does not catch, and it is a gap rather than an exemption.** A step built
+    /// *inside another step's body* takes no id, by the leaf rule that makes a nested step a plain
+    /// call. Carried out of that body and awaited in the workflow proper, it runs undurably and is
+    /// not refused — the same harm as the built-outside case above, silently. Telling those two
+    /// apart needs a per-step-scope identity to compare, and the only signal available is the
+    /// shared in-step flag, which fails in both directions: a legitimate poll inside the body would
+    /// be refused when a concurrent sibling has cleared the flag, and a smuggled one allowed when a
+    /// sibling has set it.
+    ///
+    /// The gap is narrow in practice. Awaiting such a step the ordinary inline way stays inside the
+    /// body, which is legitimate; reaching this needs an un-awaited step deliberately moved out
+    /// through a `Mutex`, a channel, or a return value. Where the built-outside case is an accident
+    /// — `Ctx::scope(ctx, step(..))` — this one has to be arranged. It closes when the in-step
+    /// marker moves onto the context that `Ctx::in_step_scope` binds, rather than onto the state
+    /// every clone shares.
+    #[error(
+        "step {step} was built {built} but polled {polled}: a step takes its id where it is built"
+    )]
+    StepBuiltElsewhere {
+        /// The step's name, which is the only thing a caller can find it by.
+        step: String,
+        /// Where its id came from, or that it has none.
+        built: std::borrow::Cow<'static, str>,
+        /// Where it was polled instead.
+        polled: std::borrow::Cow<'static, str>,
+    },
+
     #[error("the step {step} exceeded its {}ms timeout", timeout.as_millis())]
     StepTimeout {
         /// The step's name.
@@ -431,6 +482,15 @@ impl<E> Error<E> {
             },
             Error::StepFailed { step, message } => Error::StepFailed { step, message },
             Error::StepTimeout { step, timeout } => Error::StepTimeout { step, timeout },
+            Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            } => Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            },
             Error::MaxStepRetriesExceeded {
                 step,
                 attempts,

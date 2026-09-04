@@ -2286,6 +2286,28 @@ pub mod step_names {
     /// reason both of those exist rather than the caller passing a name.
     pub const GET_RESULT: &str = "DBOS.getResult";
 
+    /// The step a durable race over *steps* records: which branch won.
+    ///
+    /// **Named for the call that writes it, a deliberate half-step from Go.** Go's `Select` names
+    /// its step `"DBOS.select"` (`workflow.go:3082`), so the one other implementation with a
+    /// durable race over steps writes the shorter string. This crate's call is `select_step!`,
+    /// because a bare `select` in a Rust namespace reads as a future combinator where this one
+    /// takes only [`PendingStep`](crate::PendingStep)s, and the recorded name follows the call
+    /// rather than diverging from it by a word.
+    ///
+    /// Python's could not have been borrowed at all: `asyncio_wait` records
+    /// `"DBOS.asyncio_wait"`, naming the event-loop library it wraps rather than the operation.
+    ///
+    /// **Nothing reads a step name across implementations**, which is what makes the divergence
+    /// affordable — a workflow only crosses an implementation by enqueue, and an enqueued workflow
+    /// starts from step zero. Agreeing with Go here is a convention, not a wire format. The same
+    /// argument [`DEBOUNCE`] makes, and the one #31 made for
+    /// [`SELECT_WORKFLOW`](self::SELECT_WORKFLOW).
+    ///
+    /// **A join over steps records nothing and so needs no name**: every branch checkpoints itself
+    /// under the id it was built with, and the combinator makes no choice a replay could remake.
+    pub const SELECT_STEP: &str = "DBOS.selectStep";
+
     /// The step names a wait over several workflow handles records.
     ///
     /// **The two exceptions in this table: named for the calls that write them rather than for a
