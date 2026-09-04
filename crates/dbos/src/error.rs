@@ -350,21 +350,20 @@ pub enum Error<E = EngineOnly> {
     /// branch is first polled — a check that consulted it would refuse the concurrent steps this
     /// design exists to allow.
     ///
-    /// **One case this does not catch, and it is a gap rather than an exemption.** A step built
-    /// *inside another step's body* takes no id, by the leaf rule that makes a nested step a plain
-    /// call. Carried out of that body and awaited in the workflow proper, it runs undurably and is
-    /// not refused — the same harm as the built-outside case above, silently. Telling those two
-    /// apart needs a per-step-scope identity to compare, and the only signal available is the
-    /// shared in-step flag, which fails in both directions: a legitimate poll inside the body would
-    /// be refused when a concurrent sibling has cleared the flag, and a smuggled one allowed when a
-    /// sibling has set it.
+    /// **A step built inside another step's body is caught too**, and telling that case apart is
+    /// what the per-body scope on the context is for. Such a step takes no id, by the leaf rule
+    /// that makes a nested step a plain call; carried out of that body and awaited in the workflow
+    /// proper it would otherwise run undurably, which is the same silent harm as the built-outside
+    /// case and shares its workflow id, so nothing else distinguishes the two places. The rule runs
+    /// both ways: a step claimed in the workflow proper and carried *into* a step body is refused
+    /// as well, because its checkpoint would sit beneath a step whose own row already covers
+    /// whatever its body did.
     ///
-    /// The gap is narrow in practice. Awaiting such a step the ordinary inline way stays inside the
-    /// body, which is legitimate; reaching this needs an un-awaited step deliberately moved out
-    /// through a `Mutex`, a channel, or a return value. Where the built-outside case is an accident
-    /// — `Ctx::scope(ctx, step(..))` — this one has to be arranged. It closes when the in-step
-    /// marker moves onto the context that `Ctx::in_step_scope` binds, rather than onto the state
-    /// every clone shares.
+    /// The step marker is compared, never the in-step flag, for the reason above. It is bound on the
+    /// context that `Ctx::in_step_scope` rebinds, so it is per-call-stack and a concurrent sibling
+    /// does not see it. Deciding whether a step *takes an id* still reads the shared flag, which is
+    /// the remaining half of that change and a larger one.
+    ///
     #[error(
         "step {step} was built {built} but polled {polled}: a step takes its id where it is built"
     )]

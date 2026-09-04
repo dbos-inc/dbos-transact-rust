@@ -41,7 +41,42 @@ pub struct Ctx {
     ///
     /// `None` outside a step, and outside a step there is nothing to cancel.
     step_cancellation: Option<CancellationToken>,
+    /// Which step body this context is inside, if any.
+    ///
+    /// **On the `Ctx` rather than on [`WorkflowState`], which is what makes it per-call-stack.**
+    /// The task-local is rebound for the duration of a step body, so a concurrently polled sibling
+    /// does not see it — where [`in_step`](WorkflowState::in_step), being one `AtomicBool` every
+    /// clone shares, is set and cleared by whichever step happens to start and finish.
+    ///
+    /// It exists so that a step can be told whether it is being polled in the same body it was
+    /// built in. Comparing workflow ids alone cannot: a step built inside a step body and carried
+    /// out to the workflow proper has the same workflow id in both places, takes no id, and would
+    /// otherwise run undurably where a checkpoint was expected.
+    ///
+    /// It does **not** replace `in_step`, which still decides whether a step takes an id — moving
+    /// that decision here is the rest of the per-call-stack change and a larger one.
+    step_marker: Option<StepMarker>,
 }
+
+/// Identifies one invocation of one step body.
+///
+/// **A newtype rather than a bare integer, because the other integer in scope is a step id and
+/// they mean nothing like each other.** A step id is an ordinal *position* in a workflow, starts
+/// again from zero on every replay, and is half the primary key of a checkpoint row. This is an
+/// opaque tag, unique for the life of the process, never persisted and never compared across runs
+/// — only ever asked whether two contexts are the same body. Making them distinct types is what
+/// keeps a future edit from passing one where the other belongs.
+///
+/// One per *attempt*, not one per step: [`Ctx::in_step_scope`] is entered again for each retry, so
+/// a step built during one attempt does not match the body of the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StepMarker(u64);
+
+/// Hands out a fresh [`StepMarker`] per step body.
+///
+/// Monotonic and never reused within a process, which is all equality needs. Wrapping is
+/// unreachable: a process would have to enter more than `u64::MAX` step bodies.
+static NEXT_STEP_MARKER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The parts of a workflow that outlive any one call within it.
 struct WorkflowState {
@@ -108,6 +143,8 @@ impl Ctx {
                 next_step_id: AtomicI32::new(0),
                 in_step: AtomicBool::new(false),
             }),
+            // A fresh workflow context is the workflow proper, not any step body.
+            step_marker: None,
             step_cancellation: None,
         }
     }
@@ -162,6 +199,11 @@ impl Ctx {
         self.workflow.in_step.load(Ordering::Relaxed)
     }
 
+    /// Which step body this context is inside, if any. See [`StepMarker`].
+    pub(crate) fn step_marker(&self) -> Option<StepMarker> {
+        self.step_marker
+    }
+
     /// Runs `body` with [`in_step`](Self::in_step) set, clearing it afterwards.
     ///
     /// A guard rather than a plain pair of writes, so the flag is cleared even when the body
@@ -189,6 +231,9 @@ impl Ctx {
             executor: Arc::clone(&self.executor),
             workflow: Arc::clone(&self.workflow),
             step_cancellation: cancellation,
+            // A fresh one per body, so a step built in this body can tell this body from any other
+            // — including a later body of the same retried step.
+            step_marker: Some(StepMarker(NEXT_STEP_MARKER.fetch_add(1, Ordering::Relaxed))),
         };
         CURRENT.scope(scoped, body).await
     }
@@ -218,6 +263,7 @@ impl std::fmt::Debug for Ctx {
                 "steps_taken",
                 &self.workflow.next_step_id.load(Ordering::Relaxed),
             )
+            .field("step_marker", &self.step_marker)
             .finish_non_exhaustive()
     }
 }

@@ -12,7 +12,7 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::context::Ctx;
+use crate::context::{Ctx, StepMarker};
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
@@ -442,8 +442,20 @@ impl<T, E> std::fmt::Debug for PendingStep<'_, T, E> {
 enum Built {
     /// Took an id: this position, in this workflow.
     Claimed { ctx: Ctx, step_id: i32 },
-    /// Inside a workflow but nested in one of its steps, so a plain call by the leaf rule.
-    Nested { workflow_id: String },
+    /// Inside a workflow but nested in one of its step bodies, so a plain call by the leaf rule.
+    ///
+    /// Carries *which* body, so a step carried out of it and awaited in the workflow proper is
+    /// refused rather than quietly running undurably. `marker` is `None` where the in-step flag
+    /// said we were nested but no marker was bound — the two disagree only under the concurrency
+    /// the shared flag cannot describe, and treating that as its own place keeps the comparison
+    /// exact either way.
+    ///
+    /// Named `marker` rather than `body` because in this file a step's *body* is its closure, and
+    /// the field would shadow it wherever both are in scope.
+    Nested {
+        workflow_id: String,
+        marker: Option<StepMarker>,
+    },
     /// No workflow context at all, so a plain call and ordinarily testable.
     Outside,
 }
@@ -454,6 +466,7 @@ impl Built {
         match Ctx::current() {
             Some(ctx) if ctx.in_step() => Built::Nested {
                 workflow_id: ctx.workflow_id().to_owned(),
+                marker: ctx.step_marker(),
             },
             Some(ctx) => {
                 let step_id = ctx.next_step_id();
@@ -474,7 +487,11 @@ impl Built {
     fn whereabouts(&self) -> std::borrow::Cow<'static, str> {
         match self {
             Built::Claimed { ctx, .. } => format!("in workflow {}", ctx.workflow_id()).into(),
-            Built::Nested { workflow_id } => format!("in workflow {workflow_id}").into(),
+            Built::Nested {
+                workflow_id,
+                marker: Some(_),
+            } => format!("inside a step of workflow {workflow_id}").into(),
+            Built::Nested { workflow_id, .. } => format!("in workflow {workflow_id}").into(),
             Built::Outside => "outside a workflow".into(),
         }
     }
@@ -487,6 +504,9 @@ impl Built {
 /// here would refuse exactly the concurrent steps the eager id exists to permit.
 fn polled_in(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
     match ctx {
+        Some(ctx) if ctx.step_marker().is_some() => {
+            format!("inside a step of workflow {}", ctx.workflow_id()).into()
+        }
         Some(ctx) => format!("in workflow {}", ctx.workflow_id()).into(),
         None => "outside a workflow".into(),
     }
@@ -511,14 +531,23 @@ where
     // this.
     let ambient = Ctx::current();
     let (ctx, step_id) = match (&built, ambient.as_ref()) {
-        // The ordinary durable case: built at a step boundary of this workflow, polled in it.
+        // The ordinary durable case: built at a step boundary of this workflow, polled at one.
+        // No step body may be in scope on either side, or this is a step claimed in the workflow
+        // proper and carried *into* a step body, where its checkpoint would sit beneath a step
+        // whose own row already covers whatever its body did.
         (Built::Claimed { ctx, step_id }, Some(here))
-            if here.workflow_id() == ctx.workflow_id() =>
+            if here.workflow_id() == ctx.workflow_id() && here.step_marker().is_none() =>
         {
             (ctx.clone(), *step_id)
         }
-        // Took no id, and is polled where it took none. Plain, as it always was.
-        (Built::Nested { workflow_id }, Some(here)) if here.workflow_id() == workflow_id => {
+        // Took no id, and is polled in the same step body it was built in. Plain, as it always was.
+        (
+            Built::Nested {
+                workflow_id,
+                marker,
+            },
+            Some(here),
+        ) if here.workflow_id() == workflow_id && here.step_marker() == *marker => {
             tracing::debug!(
                 step_name = name,
                 "the step body runs plainly: it was built inside another step"

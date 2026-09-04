@@ -426,6 +426,101 @@ mod tests {
         dbos.shutdown().await;
     }
 
+    /// **The gap the scope id closes.** A step built inside another step's body takes no id by
+    /// the leaf rule; carried out of that body and awaited in the workflow proper it would run
+    /// undurably, where the caller plainly expected a checkpoint.
+    ///
+    /// Both places have the same workflow id, so only the per-body scope tells them apart.
+    #[tokio::test]
+    async fn a_step_built_inside_a_step_and_awaited_outside_it_is_refused() {
+        let (dbos, _db) = workflow("wf-carried-out").await;
+
+        // The inner step cannot be the outer one's *result* — a step's output must serialize — so
+        // it leaves the body the way a real mistake would, through a slot the body can reach.
+        type Slot =
+            Arc<std::sync::Mutex<Option<crate::PendingStep<'static, u32, crate::EngineOnly>>>>;
+        let smuggled: Slot = Arc::new(std::sync::Mutex::new(None));
+
+        Ctx::scope(ctx(&dbos, "wf-carried-out"), {
+            let smuggled = Arc::clone(&smuggled);
+            async move {
+                step("outer", move || {
+                    let smuggled = Arc::clone(&smuggled);
+                    async move {
+                        *smuggled.lock().unwrap() =
+                            Some(step("inner", || async { Ok::<_, crate::Error>(1u32) }));
+                        Ok::<_, crate::Error>(0u32)
+                    }
+                })
+                .await
+            }
+        })
+        .await
+        .expect("the outer step failed");
+
+        let carried = smuggled.lock().unwrap().take().expect("built in the body");
+        // It took no id, being nested — that part is the leaf rule working correctly.
+        assert_eq!(carried.step_id(), None);
+
+        let refused = Ctx::scope(ctx(&dbos, "wf-carried-out"), carried).await;
+        match refused {
+            Err(crate::Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!(step, "inner");
+                assert_eq!(built, "inside a step of workflow wf-carried-out");
+                assert_eq!(polled, "in workflow wf-carried-out");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
+
+        dbos.shutdown().await;
+    }
+
+    /// The other half of the same rule: a step claimed in the workflow proper and carried *into*
+    /// a step body would checkpoint beneath a step whose own row already covers whatever its body
+    /// did.
+    #[tokio::test]
+    async fn a_step_carried_into_a_step_body_is_refused() {
+        let (dbos, _db) = workflow("wf-carried-in").await;
+
+        let inside = Ctx::scope(ctx(&dbos, "wf-carried-in"), async {
+            let claimed = step("claimed", || async { Ok::<_, crate::Error>(1u32) });
+            assert_eq!(claimed.step_id(), Some(0), "claimed at a step boundary");
+
+            // Handed into another step's body and awaited there instead of where it was built.
+            let mut carried = Some(claimed);
+            step("outer", move || {
+                let taken = carried.take();
+                async move {
+                    match taken {
+                        Some(inner) => inner.await,
+                        None => Ok::<_, crate::Error>(0u32),
+                    }
+                }
+            })
+            .await
+        })
+        .await;
+
+        match inside {
+            Err(crate::Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!(step, "claimed");
+                assert_eq!(built, "in workflow wf-carried-in");
+                assert_eq!(polled, "inside a step of workflow wf-carried-in");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
+
+        dbos.shutdown().await;
+    }
+
     /// Built in one workflow, polled in another: the id names a position in the first.
     #[tokio::test]
     async fn a_step_built_in_another_workflow_is_refused() {
