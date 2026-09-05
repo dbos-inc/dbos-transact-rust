@@ -16,8 +16,8 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, ForkFrom, ForkOptions, Forks, Message, QueueChange, QueueConflict,
-    QueueOptions, StartOptions, WorkflowHandle,
+    EnqueueOptions, Error, ForkFrom, ForkOptions, Message, QueueChange, QueueConflict,
+    QueueOptions, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -490,7 +490,7 @@ async fn a_batch_of_messages_lands_together() {
                 Message::new(&second, &"two"),
                 Message::new(&first, &"three"),
             ],
-            Forks::Skip,
+            SendOptions::default(),
         )
         .await
         .expect("send failed");
@@ -521,7 +521,7 @@ async fn a_batch_of_messages_lands_together() {
                 Message::new(&first, &"four"),
                 Message::new("no-such-workflow", &"five"),
             ],
-            Forks::Skip,
+            SendOptions::default(),
         )
         .await
         .expect_err("a message addressed to nothing should fail");

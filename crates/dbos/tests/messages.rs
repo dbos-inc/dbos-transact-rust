@@ -6,7 +6,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error};
+use dbos::{Config, DBOS, Error, Forks, Message, SendOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -83,7 +83,8 @@ async fn a_message_from_outside_reaches_a_waiting_workflow() {
 
     // The send races the workflow reaching its receive, deliberately: a message that arrives first
     // waits in the database, so both orderings must deliver.
-    dbos.send(&workflow_id, &"approved".to_owned(), None)
+    let payload = "approved".to_owned();
+    dbos.send(Message::new(&workflow_id, &payload))
         .await
         .expect("send failed");
 
@@ -136,9 +137,13 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
         .await
         .expect("the workflow never reached its gate");
 
-    dbos.send(&workflow_id, &"yes".to_owned(), Some("approvals"))
-        .await
-        .expect("send failed");
+    let payload = "yes".to_owned();
+    dbos.send(Message {
+        topic: Some("approvals"),
+        ..Message::new(&workflow_id, &payload)
+    })
+    .await
+    .expect("send failed");
     release_gate.notify_one();
 
     let (default, approvals) = tokio::time::timeout(DEADLINE, handle.result())
@@ -183,10 +188,11 @@ async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
     let handle = receives.start(()).await.expect("start failed");
     let workflow_id = handle.workflow_id().to_owned();
     // Two messages, so a replay that took another would visibly take the second.
-    dbos.send(&workflow_id, &"first".to_owned(), None)
+    let (first, second) = ("first".to_owned(), "second".to_owned());
+    dbos.send(Message::new(&workflow_id, &first))
         .await
         .expect("send failed");
-    dbos.send(&workflow_id, &"second".to_owned(), None)
+    dbos.send(Message::new(&workflow_id, &second))
         .await
         .expect("send failed");
 
@@ -246,7 +252,8 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
         dbos.register_workflow("sends", move |destination: String| {
             let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
             async move {
-                dbos::send(&destination, &"hello".to_owned(), None).await?;
+                let payload = "hello".to_owned();
+                dbos::send(Message::new(&destination, &payload)).await?;
                 reached.notify_one();
                 release.notified().await;
                 Ok::<_, dbos::Error>(())
@@ -297,10 +304,13 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
     dbos.shutdown().await;
 }
 
-/// Neither call may stand inside a step: a receive consumes and a send delivers, and a step's own
-/// checkpoint records neither.
+/// A receive may not stand inside a step; a send may, and is then plain.
+///
+/// The asymmetry is the references': a send that runs twice delivers twice, where a receive that
+/// runs twice loses a message. Python, TypeScript and Java send plainly from inside a step and all
+/// four block a receive there.
 #[tokio::test]
-async fn neither_send_nor_recv_may_stand_inside_a_step() {
+async fn a_step_may_send_but_may_not_receive() {
     let db = test_database().await;
     let dbos = DBOS::new(config("guard-app", &db));
     let receives_in_step = dbos
@@ -313,12 +323,20 @@ async fn neither_send_nor_recv_may_stand_inside_a_step() {
             Ok::<_, dbos::Error>(())
         })
         .unwrap();
+    // The destination outlives the sender, so the foreign key always has something to point at.
+    let sleeps = dbos
+        .register_workflow("sleeps", |()| async {
+            dbos::sleep(Duration::from_secs(5)).await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
     let sends_in_step = dbos
         .register_workflow("sends_in_step", |destination: String| async move {
             dbos::step("write", || {
                 let destination = destination.clone();
                 async move {
-                    dbos::send(&destination, &"hello".to_owned(), None).await?;
+                    let payload = "hello".to_owned();
+                    dbos::send(Message::new(&destination, &payload)).await?;
                     Ok(())
                 }
             })
@@ -337,13 +355,100 @@ async fn neither_send_nor_recv_may_stand_inside_a_step() {
         "{err}"
     );
 
-    let err = sends_in_step
-        .run("no-such-workflow".to_owned())
+    let destination = sleeps.start(()).await.expect("start failed");
+    let destination_id = destination.workflow_id().to_owned();
+    let handle = sends_in_step
+        .start(destination_id.clone())
         .await
-        .expect_err("a send inside a step should be refused");
-    assert!(
-        matches!(&err, Error::InsideStep { operation } if operation == "send"),
-        "{err}"
+        .expect("start failed");
+    let sender_id = handle.workflow_id().to_owned();
+    tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the sender never finished")
+        .expect("the send inside a step should have been allowed");
+
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_all_notifications(&destination_id)
+            .await
+            .expect("read failed")
+            .len(),
+        1,
+        "the message was delivered",
+    );
+    assert_eq!(
+        steps(&reader, &sender_id).await,
+        [(0, "write".to_owned())],
+        "the step is the only checkpoint: the send inside it recorded nothing of its own",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// `SendOptions` reaches the insert: with `Forks::Include` a message also lands on the workflows
+/// forked from its destination, and with the default it does not.
+///
+/// The fan-out itself is `sysdb`'s and is tested there. What this pins is the engine mapping —
+/// `SendOptions::forks` becoming the flag `send_messages` takes — which lives in one place
+/// (`Connection::send`) shared by all three surfaces, so exercising it through one covers them all.
+#[tokio::test]
+async fn a_send_may_fan_out_to_the_destinations_forks() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("forks-app", &db));
+    let noop = dbos
+        .register_workflow("noop", |()| async { Ok::<_, dbos::Error>(()) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let original = noop.start(()).await.expect("start failed");
+    let original_id = original.workflow_id().to_owned();
+    original.result().await.expect("the workflow failed");
+
+    let fork = dbos
+        .fork::<(), dbos::EngineOnly>(&original_id, dbos::ForkFrom::Beginning)
+        .await
+        .expect("fork failed");
+    let fork_id = fork.workflow_id().to_owned();
+
+    let reader = reader(&db).await;
+    let delivered = async |id: &str| {
+        reader
+            .get_all_notifications(id)
+            .await
+            .expect("read failed")
+            .len()
+    };
+
+    // The default addresses the destination alone.
+    let skipped = "skipped".to_owned();
+    dbos.send(Message::new(&original_id, &skipped))
+        .await
+        .expect("send failed");
+    assert_eq!(delivered(&original_id).await, 1);
+    assert_eq!(
+        delivered(&fork_id).await,
+        0,
+        "the default is Forks::Skip: a fork is not a destination"
+    );
+
+    // Asking for the fan-out reaches both.
+    let included = "included".to_owned();
+    dbos.send_with(
+        Message::new(&original_id, &included),
+        // Written out rather than with `..Default::default()`: clippy rejects a struct update
+        // that fills in nothing, which is true only while this type has one field.
+        SendOptions {
+            forks: Forks::Include,
+        },
+    )
+    .await
+    .expect("send failed");
+    assert_eq!(delivered(&original_id).await, 2);
+    assert_eq!(
+        delivered(&fork_id).await,
+        1,
+        "Forks::Include reaches the workflows forked from the destination"
     );
 
     dbos.shutdown().await;

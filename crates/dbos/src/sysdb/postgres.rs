@@ -4006,12 +4006,19 @@ impl SystemDatabase for PostgresSystemDatabase {
                     destination_ids.push(destination);
                     topics.push(message.topic.unwrap_or(NULL_TOPIC));
                     payloads.push(message.message);
-                    // The key is scoped per recipient, so one key can fan out to a whole fork
-                    // tree and still give each recipient a distinct, repeatable row — and so the
-                    // id a destination sees does not depend on whether the send fanned out.
+                    // Scoped per recipient, so one send can fan out to a whole fork tree and
+                    // still give each recipient a distinct, repeatable row — and so the id a
+                    // destination sees does not depend on whether the send fanned out.
+                    //
+                    // **Both branches have to be scoped, not just the keyed one.** The insert ends
+                    // `ON CONFLICT (message_uuid) DO NOTHING`, so an unscoped fallback shared by
+                    // the destination and its forks would collide with itself and deliver to the
+                    // destination alone — silently, since a discarded row is not an error. The
+                    // fallback stays fixed across retries because it is generated once, above the
+                    // retry, and suffixing it here does not change that.
                     message_ids.push(match message.idempotency_key {
                         Some(key) => format!("{key}::{destination}"),
-                        None => fallback.clone(),
+                        None => format!("{fallback}::{destination}"),
                     });
                 }
             }

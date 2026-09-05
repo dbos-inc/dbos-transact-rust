@@ -6106,6 +6106,38 @@ async fn a_message_can_follow_a_workflow_to_its_forks() {
     .unwrap();
     assert_eq!(sys.get_all_notifications("wf-root").await.unwrap().len(), 2);
     assert_eq!(sys.get_all_notifications(&child).await.unwrap().len(), 1);
+
+    // **Without an idempotency key the fan-out must still reach every fork.** The row id is
+    // derived per recipient on both branches, and it has to be: the insert ends
+    // `ON CONFLICT (message_uuid) DO NOTHING`, so one id shared by the destination and its forks
+    // would collide with itself and deliver to the destination alone — silently, because a
+    // discarded row is not an error. That was the behaviour until the fallback was scoped the way
+    // the keyed branch already was, and every assertion above passed throughout, because every
+    // send above names a key.
+    sys.send_messages(
+        &[Message {
+            destination_id: "wf-root",
+            topic: Some("t"),
+            message: "\"unkeyed\"",
+            idempotency_key: None,
+        }],
+        None,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    for (id, expected) in [
+        ("wf-root", 3),
+        (child.as_str(), 2),
+        (grandchild.as_str(), 2),
+    ] {
+        assert_eq!(
+            sys.get_all_notifications(id).await.unwrap().len(),
+            expected,
+            "{id} should have received the unkeyed broadcast"
+        );
+    }
 }
 
 /// An empty batch still records its step, so a replay stays a replay.
