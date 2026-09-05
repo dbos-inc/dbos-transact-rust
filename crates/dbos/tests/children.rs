@@ -857,6 +857,90 @@ async fn a_control_signal_winning_a_select_step_records_no_winner() {
     dbos.shutdown().await;
 }
 
+/// **A durable call built inside a step runs inside that step or not at all.** Inside a step it
+/// takes no id and records nothing, because the step's own checkpoint stands for everything its
+/// body did. Carried out of the step and polled in the workflow proper, it would run unrecorded
+/// at a position that should have been checkpointed, and every replay would run it again — so it
+/// is refused, exactly as a nested step is. Awaited where it was built, it is the plain call it
+/// was always going to be.
+#[tokio::test]
+async fn a_call_built_inside_a_step_and_polled_in_the_workflow_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("smuggled-await-app", &db));
+    let smuggled: Arc<std::sync::Mutex<Option<dbos::Pending<'static, ()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let workflow = {
+        let smuggled = Arc::clone(&smuggled);
+        dbos.register_workflow("workflow", move |()| {
+            let smuggled = Arc::clone(&smuggled);
+            async move {
+                // Built and awaited inside one step: a plain sleep, and the step is the only row.
+                dbos::step("inside", || async {
+                    dbos::sleep::<dbos::EngineOnly>(Duration::ZERO).await?;
+                    Ok::<u32, Error>(1)
+                })
+                .await?;
+                // Built inside a step, awaited outside it.
+                dbos::step("build", {
+                    let smuggled = Arc::clone(&smuggled);
+                    move || {
+                        let smuggled = Arc::clone(&smuggled);
+                        async move {
+                            *smuggled.lock().unwrap() = Some(dbos::sleep(Duration::ZERO));
+                            Ok::<u32, Error>(2)
+                        }
+                    }
+                })
+                .await?;
+                let sleep = smuggled.lock().unwrap().take().expect("built by the step");
+                match sleep.await {
+                    Err(Error::StepBuiltElsewhere {
+                        step,
+                        built,
+                        polled,
+                    }) => {
+                        assert_eq!(step, "DBOS.sleep");
+                        assert_eq!(built, "inside a step");
+                        assert_eq!(polled, "in workflow smuggled");
+                    }
+                    other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+                }
+                Ok::<u32, Error>(3)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let outcome = workflow
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("smuggled"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    assert_eq!(outcome, 3);
+
+    let steps: Vec<_> = reader(&db)
+        .await
+        .list_workflow_steps("smuggled", false, None, None, None)
+        .await
+        .expect("read failed")
+        .iter()
+        .map(|step| (step.step_id, step.step_name.clone()))
+        .collect();
+    assert_eq!(
+        steps,
+        [(0, "inside".to_owned()), (1, "build".to_owned())],
+        "the sleeps left no rows of their own: one ran inside its step, the other was refused"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// A child started and never awaited is still recorded, so a recovered parent adopts it.
 ///
 /// The launch row is what makes a child adoptable, and it is written by `start` alone — nothing

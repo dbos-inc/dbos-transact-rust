@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
-use crate::context::Ctx;
+use crate::context::{Ctx, StepMarker};
 use crate::error::Error;
 use crate::instance::Executor;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
@@ -197,16 +197,19 @@ pub(crate) enum Placement {
     Outside,
     /// Inside a workflow, with nothing to record against. The awaited-cancelled distinction
     /// applies, because there is a workflow to confuse it with, but nothing is checkpointed. Two
-    /// ways to land here:
+    /// ways to land here, told apart by `marker`:
     ///
-    /// - **Inside a step**: a step is a leaf, and an id-allocating call inside one would shift
-    ///   every later step onto the wrong replay slot.
-    /// - **Holding a [`Client`](crate::Client)'s connection**: a client has no step counter to
-    ///   agree with this workflow's, and no execution of its own that a recorded call could belong
-    ///   to. A handle from *another instance* is the third case and is not this one — that is
-    ///   [`Error::WrongInstance`], because two instances each have a counter and the caller meant
-    ///   one of them.
-    Uncheckpointed,
+    /// - **Inside a step**, and `marker` is that step's: a step is a leaf, and an id-allocating
+    ///   call inside one would shift every later step onto the wrong replay slot. The marker is
+    ///   what [`check_here`](Self::check_here) holds the call to — built inside a step, it runs
+    ///   inside that step or not at all, exactly as a nested step does.
+    /// - **Holding a [`Client`](crate::Client)'s connection**, and `marker` is `None`: a client
+    ///   has no step counter to agree with this workflow's, and no execution of its own that a
+    ///   recorded call could belong to. Nothing pins it, because a client's call is legitimately
+    ///   driven from anywhere. A handle from *another instance* is the third case and is not this
+    ///   one — that is [`Error::WrongInstance`], because two instances each have a counter and
+    ///   the caller meant one of them.
+    Uncheckpointed { marker: Option<StepMarker> },
     /// Inside a workflow at a step boundary: this call is a step of that workflow.
     Recorded { workflow_id: String, step_id: i32 },
 }
@@ -226,8 +229,10 @@ impl Placement {
         };
         // First, because inside a step nothing is checkpointed whoever the connection belongs to,
         // and there is then nothing for the halves below to disagree about.
-        if ctx.in_step() {
-            return Ok(Self::Uncheckpointed);
+        if let Some(marker) = ctx.step_marker() {
+            return Ok(Self::Uncheckpointed {
+                marker: Some(marker),
+            });
         }
         // Where the two halves would be combined: a step id is about to come from this workflow's
         // counter while the write goes through the caller's own connection. What that means
@@ -243,7 +248,7 @@ impl Placement {
                 // undurable version of itself, which is what `Client::enqueue` documents about a
                 // client used from inside a workflow body and what `Client::get_event` already
                 // does for the read.
-                Owner::Client => Ok(Self::Uncheckpointed),
+                Owner::Client => Ok(Self::Uncheckpointed { marker: None }),
                 // **Another instance's is the mistake the variant was raised for.** Both
                 // instances have a step counter, the caller meant one of them, and the record
                 // would land where the workflow that allocated the id cannot see it. Refused
@@ -277,18 +282,29 @@ impl Placement {
 
     /// Refuses to run where this placement was not built.
     ///
-    /// The id is a claim on *one position in one workflow*, taken at build, and the same two
-    /// silent failures a step's own run refuses apply here: built outside a
-    /// workflow and polled inside one, the call would run unrecorded where a checkpoint was
-    /// expected; built in one workflow and polled in another, the row would land under the wrong
-    /// workflow's id. `Uncheckpointed` is not checked — it records nothing wherever it runs, and
-    /// the client-connection case that produces it is legitimately driven from anywhere.
+    /// The id is a claim on *one position in one workflow*, taken at build, and the same silent
+    /// failures a step's own run refuses apply here: built outside a workflow and polled inside
+    /// one, the call would run unrecorded where a checkpoint was expected; built in one workflow
+    /// and polled in another, the row would land under the wrong workflow's id; built inside a
+    /// step and polled in the workflow proper, it would run unrecorded at a position that should
+    /// have been checkpointed, and every replay would run it again. That last is the case a
+    /// nested step carries its [`StepMarker`] for, and the marker is held to the same way here.
+    ///
+    /// The one placement not checked is a client connection's — `Uncheckpointed` with no marker.
+    /// It records nothing wherever it runs, and the client that produces it is legitimately
+    /// driven from anywhere.
     ///
     /// `operation` is what a refusal names as the step.
     pub(crate) fn check_here(&self, operation: &str) -> Result<(), Error> {
         let here = Ctx::current();
         let built: Option<std::borrow::Cow<'static, str>> = match (self, here.as_ref()) {
-            (Self::Uncheckpointed, _) => None,
+            (Self::Uncheckpointed { marker: None }, _) => None,
+            (
+                Self::Uncheckpointed {
+                    marker: Some(marker),
+                },
+                Some(here),
+            ) if here.step_marker() == Some(*marker) => None,
             (Self::Outside, None) => None,
             (Self::Recorded { workflow_id, .. }, Some(here))
                 if here.workflow_id() == workflow_id && here.step_marker().is_none() =>
@@ -296,6 +312,7 @@ impl Placement {
                 None
             }
             (Self::Outside, _) => Some("outside a workflow".into()),
+            (Self::Uncheckpointed { .. }, _) => Some("inside a step".into()),
             (Self::Recorded { workflow_id, .. }, _) => {
                 Some(format!("in workflow {workflow_id}").into())
             }

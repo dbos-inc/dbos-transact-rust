@@ -580,7 +580,7 @@ impl crate::Client {
     pub async fn select_workflow(&self, workflow_ids: &[&str]) -> Result<String> {
         refuse_empty_select(workflow_ids)?;
         self.connection()
-            .select_workflow(workflow_ids, &Placement::Uncheckpointed)
+            .select_workflow(workflow_ids, &Placement::Uncheckpointed { marker: None })
             .await
     }
 
@@ -592,7 +592,7 @@ impl crate::Client {
             return Ok(());
         }
         self.connection()
-            .join_workflows(workflow_ids, &Placement::Uncheckpointed)
+            .join_workflows(workflow_ids, &Placement::Uncheckpointed { marker: None })
             .await
     }
 }
@@ -654,7 +654,7 @@ where
 /// The all-wait as a [`Pending`], its step id taken here at the call. See [`select_at`].
 ///
 /// Nothing to wait for is a satisfied wait — and, unlike the first-wait, one with an answer. It
-/// is placed as [`Placement::Uncheckpointed`] so an empty call spends no step id, which matches
+/// is placed as [`Placement::Uncheckpointed`] with no marker, so an empty call spends no step id, which matches
 /// TypeScript short-circuiting its empty handle list before `runInternalStep`.
 fn join_at<'a, E>(
     executor: Result<Arc<Executor>>,
@@ -664,7 +664,7 @@ where
     E: 'a,
 {
     let built = if workflow_ids.is_empty() {
-        executor.map(|executor| (executor, Placement::Uncheckpointed))
+        executor.map(|executor| (executor, Placement::Uncheckpointed { marker: None }))
     } else {
         Placement::taken(executor, "join_workflows")
     };
