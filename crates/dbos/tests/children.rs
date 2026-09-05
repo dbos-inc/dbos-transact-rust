@@ -787,6 +787,76 @@ async fn a_select_step_can_race_a_step_against_a_child_launch() {
     dbos.shutdown().await;
 }
 
+/// **A control signal winning a race is not the race's decision.** A step that ends in a
+/// cancellation, an interruption or a database failure records nothing, so the workflow stays
+/// pending and is recovered — and the race it won has to do the same. Recording the branch as
+/// the winner would pin every recovery to a branch that never ran its body, and never race the
+/// other again.
+#[tokio::test]
+async fn a_control_signal_winning_a_select_step_records_no_winner() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("control-race-app", &db));
+    let raced = Arc::new(tokio::sync::Notify::new());
+    let parent = {
+        let raced = Arc::clone(&raced);
+        dbos.register_workflow("parent", move |()| {
+            let raced = Arc::clone(&raced);
+            async move {
+                // The arms hand the branch's own result out rather than `?`-ing it, so the
+                // workflow reaches the notify whichever way the race went.
+                let outcome: Result<Result<u32, Error>, Error> = dbos::select_step! {
+                    // The shape a cancelled or interrupted body reports in: a control signal,
+                    // which the step returns without checkpointing.
+                    interrupted = dbos::step("interrupted", || async {
+                        Err::<u32, Error>(Error::Interrupted {
+                            workflow_id: "raced".to_owned(),
+                        })
+                    }) => interrupted,
+                    slow = dbos::step("slow", || async {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok::<u32, Error>(1)
+                    }) => slow,
+                };
+                raced.notify_one();
+                outcome.and_then(|won| won)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("raced"),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed to start");
+    tokio::time::timeout(Duration::from_secs(5), raced.notified())
+        .await
+        .expect("the race did not finish");
+
+    let steps: Vec<_> = reader(&db)
+        .await
+        .list_workflow_steps("raced", false, None, None, None)
+        .await
+        .expect("read failed")
+        .iter()
+        .map(|step| (step.step_id, step.step_name.clone()))
+        .collect();
+    assert_eq!(
+        steps,
+        [],
+        "neither the interrupted step nor the race it won left a row"
+    );
+    drop(handle);
+
+    dbos.shutdown().await;
+}
+
 /// A child started and never awaited is still recorded, so a recovered parent adopts it.
 ///
 /// The launch row is what makes a child adoptable, and it is written by `start` alone — nothing

@@ -158,6 +158,13 @@ pub use wait::{join_workflows, select_workflow};
 /// likewise keeps going. Neither is cancelled by losing — cancel from the winning arm if abandoning
 /// the loser is the intent.
 ///
+/// **A control signal winning is not a decision.** A branch that resolves to a cancellation, an
+/// interruption or a database failure has recorded nothing, as a step ending that way never does,
+/// and the race records nothing either: the error is returned, the workflow stays pending, and a
+/// recovery races every branch afresh. Recording the branch as the winner would pin every recovery
+/// to one that never ran its body. An application error is the branch's own recorded outcome, and
+/// winning with one is recorded and replayed like any other win.
+///
 /// **A [`run`](WorkflowRef::run) is refused, by type.** It returns a [`PendingRun`] rather than a
 /// `Pending`, because it holds two ids and a losing run is a child that was started and recorded
 /// whose outcome the parent will never learn. Race the `start`, and await the handle in the arm.
@@ -221,7 +228,9 @@ pub use dbos_macros::select_step;
 #[cfg(feature = "engine")]
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::select::{Branches, Racing, Recording, check_select, record_select};
+    pub use crate::select::{
+        Branches, Racing, Recording, check_select, control_error, record_select,
+    };
 }
 #[cfg(feature = "engine")]
 pub use workflow::{DuplicationPolicy, Enqueue, PendingRun, RunOptions, StartOptions, Timeout};

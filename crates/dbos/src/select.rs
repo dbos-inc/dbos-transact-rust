@@ -237,6 +237,25 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
         .map_err(Error::lift)
 }
 
+/// Takes a control signal out of the winning branch's slot, if that is what it holds.
+///
+/// **A control signal is not the race's decision.** A step that ends in a cancellation, an
+/// interruption or a database failure records nothing — `step::run` returns it with the row
+/// untouched, so the workflow stays pending and is recovered — and the race it won has to do the
+/// same. Recording the branch as the winner would pin every recovery to a branch that never ran
+/// its body, and never race the others again; and a control signal tends to arrive *fast*, one
+/// failed round trip ahead of any branch doing real work, so it would win exactly when it
+/// matters. An application error is different: the branch recorded it under its own id, so
+/// recording it as the winner is a faithful account, and a replay reproduces it.
+///
+/// Returns `None` where the slot holds anything else, leaving it in place for the arm.
+pub fn control_error<T, E>(slot: &mut Option<Result<T, E>>) -> Option<Error<E>> {
+    match slot {
+        Some(Err(error)) if error.control().is_some() => slot.take().and_then(Result::err),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

@@ -275,9 +275,23 @@ fn expand(race: &Race) -> TokenStream2 {
                 // the same trade a step timeout makes.
                 ::core::mem::drop(( #( #branch, )* ));
 
-                match ::dbos::__private::record_select(#recording, #at).await {
-                    ::core::result::Result::Ok(()) => ::core::result::Result::Ok(#at),
-                    ::core::result::Result::Err(#failed) => ::core::result::Result::Err(#failed),
+                // A control signal — a cancellation, an interruption, a database failure — is
+                // not the race's decision, and is returned with nothing recorded, exactly as the
+                // step that produced it returned it. See `control_error`.
+                let #failed = match #at {
+                    #( #index => ::dbos::__private::control_error(&mut #slot), )*
+                    _ => ::core::option::Option::None,
+                };
+                match #failed {
+                    ::core::option::Option::Some(#failed) => ::core::result::Result::Err(#failed),
+                    ::core::option::Option::None => {
+                        match ::dbos::__private::record_select(#recording, #at).await {
+                            ::core::result::Result::Ok(()) => ::core::result::Result::Ok(#at),
+                            ::core::result::Result::Err(#failed) => {
+                                ::core::result::Result::Err(#failed)
+                            }
+                        }
+                    }
                 }
             }
         };
