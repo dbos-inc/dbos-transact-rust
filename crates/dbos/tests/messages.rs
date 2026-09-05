@@ -475,10 +475,10 @@ async fn a_workflows_batch_is_one_checkpoint() {
         dbos.register_workflow("broadcasts", move |ids: Vec<String>| {
             let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
             async move {
-                dbos::send_all(&[Message::new(&ids[0], &"one"), Message::new(&ids[1], &"two")])
+                dbos::send_bulk(&[Message::new(&ids[0], &"one"), Message::new(&ids[1], &"two")])
                     .await?;
                 // A batch of one, to pin the name the size chooses.
-                dbos::send_all(&[Message::new(&ids[0], &"alone")]).await?;
+                dbos::send_bulk(&[Message::new(&ids[0], &"alone")]).await?;
                 reached.notify_one();
                 release.notified().await;
                 Ok::<_, dbos::Error>(())

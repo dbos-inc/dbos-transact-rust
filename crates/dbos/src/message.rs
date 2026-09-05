@@ -8,7 +8,7 @@
 //! | | inside a workflow | outside |
 //! |---|---|---|
 //! | [`send`] | free function | [`DBOS::send`], [`Client::send`](crate::Client::send) |
-//! | [`send_all`] | free function | [`DBOS::send_all`], [`Client::send_all`](crate::Client::send_all) |
+//! | [`send_bulk`] | free function | [`DBOS::send_bulk`], [`Client::send_bulk`](crate::Client::send_bulk) |
 //! | [`recv`] | free function | — |
 //!
 //! **[`recv`] has no form outside a workflow, and that is structural rather than an omission.** A
@@ -45,8 +45,8 @@
 //! `send(destination_id, message)`, with a topic, an idempotency key and the fork fan-out in
 //! [`SendOptions`] on the `_with` form — the split [`step`](crate::step)/[`step_with`](crate::step_with)
 //! and `fork`/[`fork_with`](crate::DBOS::fork_with) already make. The batch is the one exception and
-//! has to be: the [`send_all`] family takes [`Message`] values carrying their own topic and key,
-//! because those vary per message, beside a batch-wide [`SendAllOptions`]. Python and Java split it
+//! has to be: the [`send_bulk`] family takes [`Message`] values carrying their own topic and key,
+//! because those vary per message, beside a batch-wide [`SendBulkOptions`]. Python and Java split it
 //! in the same place.
 //!
 //! **The batch is on all three surfaces, not just the client.** Python and Java are the only
@@ -158,24 +158,35 @@ where
 ///
 /// Where a single [`send`] takes its destination and payload as arguments, a batch takes
 /// [`Message`] values: the topic and the idempotency key vary per message, so they travel with the
-/// message rather than in the options. Only [`SendAllOptions`] is left, for what is uniform across
+/// message rather than in the options. Only [`SendBulkOptions`] is left, for what is uniform across
 /// the call.
 ///
 /// Python and Java expose the same as `send_bulk` on their runtime as well as their client;
 /// TypeScript and Go have no batch send at all, and a caller there writes the loop and lives with
 /// the prefix.
-pub async fn send_all<T, E>(messages: &[Message<'_, T>]) -> Result<(), E>
+///
+/// # Why `bulk` and not `_all`
+///
+/// The bulk *management* verbs here are [`cancel_all`](DBOS::cancel_all),
+/// [`resume_all`](DBOS::resume_all), [`fork_all`](DBOS::fork_all) and
+/// [`delete_all`](DBOS::delete_all), so `send_all` would have been the local rhyme. It is not the
+/// name because those four render a *pluralised noun* — Python's `cancel_workflows`, TypeScript's
+/// `cancelWorkflows`, Go's `CancelWorkflows` — into a form that reads on a type where the noun is
+/// implicit. A batch send is not that: Python and Java both chose the distinct word `bulk`, and
+/// `sysdb` already records this call under the cross-SDK step name `DBOS.sendBulk`. A method named
+/// for one word that writes another is a seam for nothing.
+pub async fn send_bulk<T, E>(messages: &[Message<'_, T>]) -> Result<(), E>
 where
     T: Serialize,
     E: DurableError,
 {
-    send_all_with(messages, SendAllOptions::default()).await
+    send_bulk_with(messages, SendBulkOptions::default()).await
 }
 
-/// [`send_all`], with [`SendAllOptions`] rather than the defaults.
-pub async fn send_all_with<T, E>(
+/// [`send_bulk`], with [`SendBulkOptions`] rather than the defaults.
+pub async fn send_bulk_with<T, E>(
     messages: &[Message<'_, T>],
-    options: SendAllOptions,
+    options: SendBulkOptions,
 ) -> Result<(), E>
 where
     T: Serialize,
@@ -306,19 +317,19 @@ impl DBOS {
 
     /// Sends many messages in one transaction, for their destinations to [`recv`] when ready.
     ///
-    /// The instance's [`send_all`], and it stands to that as [`send`](Self::send) does to the free
-    /// one: the caller for code outside a workflow that still has an instance. See [`send_all`] for
+    /// The instance's [`send_bulk`], and it stands to that as [`send`](Self::send) does to the free
+    /// one: the caller for code outside a workflow that still has an instance. See [`send_bulk`] for
     /// the batch's guarantees and how it is checkpointed.
-    pub async fn send_all<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
-        self.send_all_with(messages, SendAllOptions::default())
+    pub async fn send_bulk<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
+        self.send_bulk_with(messages, SendBulkOptions::default())
             .await
     }
 
-    /// [`send_all`](Self::send_all), with [`SendAllOptions`] rather than the defaults.
-    pub async fn send_all_with<T: Serialize>(
+    /// [`send_bulk`](Self::send_bulk), with [`SendBulkOptions`] rather than the defaults.
+    pub async fn send_bulk_with<T: Serialize>(
         &self,
         messages: &[Message<'_, T>],
-        options: SendAllOptions,
+        options: SendBulkOptions,
     ) -> Result<()> {
         let (executor, ctx) = self.sending_context()?;
         executor
@@ -329,7 +340,7 @@ impl DBOS {
 
     /// The executor to send through and the ambient caller to record against, reconciled.
     ///
-    /// Shared by [`send_with`](Self::send_with) and [`send_all_with`](Self::send_all_with) because
+    /// Shared by [`send_with`](Self::send_with) and [`send_bulk_with`](Self::send_bulk_with) because
     /// the reconciliation is the same for both and is the only thing either does before handing
     /// off. Inside a step the caller is already `None`, so nothing is checkpointed and there is
     /// nothing to disagree about — that send is plain whichever instance serves it, exactly as
@@ -386,7 +397,7 @@ impl Connection {
     /// encoding the payloads and naming the format they were encoded in. On the connection because
     /// that is where the serializer lives and a send is otherwise one insert: the free [`send`]
     /// reaches it through the ambient context's connection, [`DBOS::send`] through its executor's,
-    /// and [`Client::send_all`](crate::Client::send_all) through the only one it has. The same
+    /// and [`Client::send_bulk`](crate::Client::send_bulk) through the only one it has. The same
     /// shape [`get_event`](crate::get_event)'s three surfaces share, and named as they are.
     ///
     /// The batch is the primitive and a single send is a caller with one message — `sysdb` says so,
@@ -491,16 +502,16 @@ impl crate::Client {
     ///
     /// One payload type for the whole batch, which is what typing it costs. A batch of genuinely
     /// different shapes is a batch of `serde_json::Value`, or two calls.
-    pub async fn send_all<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
-        self.send_all_with(messages, SendAllOptions::default())
+    pub async fn send_bulk<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
+        self.send_bulk_with(messages, SendBulkOptions::default())
             .await
     }
 
-    /// [`send_all`](Self::send_all), with [`SendAllOptions`] rather than the defaults.
-    pub async fn send_all_with<T: Serialize>(
+    /// [`send_bulk`](Self::send_bulk), with [`SendBulkOptions`] rather than the defaults.
+    pub async fn send_bulk_with<T: Serialize>(
         &self,
         messages: &[Message<'_, T>],
-        options: SendAllOptions,
+        options: SendBulkOptions,
     ) -> Result<()> {
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
@@ -510,7 +521,8 @@ impl crate::Client {
 
 /// One message of a batch: a payload, the workflow it is for, and how to address it.
 ///
-/// **The element type of [`Client::send_all`](crate::Client::send_all), and only that.** A single send names its destination
+/// **The element type of the [`send_bulk`] family, and only that.** A single send names its
+/// destination
 /// and payload as arguments and everything else through [`SendOptions`] — required as parameters,
 /// optional in the bag, which is the shape [`step_with`](crate::step_with),
 /// [`run_with`](crate::WorkflowRef::run_with) and [`fork_with`](crate::DBOS::fork_with) all take. A
@@ -543,7 +555,7 @@ pub struct Message<'a, T> {
     /// database rather than delivered twice.
     ///
     /// **Per message rather than per batch, and that is why it lives here and not on
-    /// [`SendAllOptions`].** The key *is* the row's primary key, so a batch whose messages shared
+    /// [`SendBulkOptions`].** The key *is* the row's primary key, so a batch whose messages shared
     /// one would collide with itself and deliver a single message instead of all of them. Python's
     /// and Java's `SendMessage` carry it in exactly this position for the same reason.
     ///
@@ -646,7 +658,7 @@ pub struct SendOptions<'a> {
 ///
 /// Built by functional update from [`Default`], as [`SendOptions`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SendAllOptions {
+pub struct SendBulkOptions {
     /// Whether each message also reaches the workflows forked from its destination.
     ///
     /// Defaults to [`Forks::Skip`]: the destinations named, and nothing else.

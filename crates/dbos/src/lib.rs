@@ -87,7 +87,7 @@ pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, E
 pub use management::{Children, ForkFrom, ForkOptions, ResumeOptions};
 #[cfg(feature = "engine")]
 pub use message::{
-    Forks, Message, SendAllOptions, SendOptions, recv, send, send_all, send_all_with, send_with,
+    Forks, Message, SendBulkOptions, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
 };
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};

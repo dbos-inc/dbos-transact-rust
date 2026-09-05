@@ -486,7 +486,7 @@ async fn a_batch_of_messages_lands_together() {
     );
 
     client
-        .send_all(&[
+        .send_bulk(&[
             Message::new(&first, &"one"),
             Message::new(&second, &"two"),
             Message::new(&first, &"three"),
@@ -515,7 +515,7 @@ async fn a_batch_of_messages_lands_together() {
     // Nothing is delivered when one destination does not exist: the foreign key fails the whole
     // insert, which is the guarantee a batch buys over a loop of sends.
     let error = client
-        .send_all(&[
+        .send_bulk(&[
             Message::new(&first, &"four"),
             Message::new("no-such-workflow", &"five"),
         ])
