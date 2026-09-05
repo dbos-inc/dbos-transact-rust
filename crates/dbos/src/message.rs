@@ -134,15 +134,15 @@ where
     let ctx = workflow_ctx("send")?;
     // Absent inside a step, which is what makes that send plain: no id is allocated, so nothing
     // shifts the replay slots of the steps around it.
-    let caller = (!ctx.in_step()).then_some(&ctx);
-    send_one(
-        ctx.executor().connection(),
-        caller,
-        destination_id,
-        message,
-        options,
-    )
-    .await
+    let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
+    ctx.executor()
+        .connection()
+        .send(
+            &[Message::with_options(destination_id, message, options)],
+            caller,
+            options.forks,
+        )
+        .await
 }
 
 /// Sends many messages in one transaction, for their destinations to [`recv`] when they are ready.
@@ -182,8 +182,11 @@ where
     E: DurableError,
 {
     let ctx = workflow_ctx("send")?;
-    let caller = (!ctx.in_step()).then_some(&ctx);
-    send_batch(ctx.executor().connection(), caller, messages, options).await
+    let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
+    ctx.executor()
+        .connection()
+        .send(messages, caller, options.forks)
+        .await
 }
 
 /// Takes the oldest message sent to this workflow, waiting up to `timeout` for one to arrive.
@@ -291,14 +294,14 @@ impl DBOS {
         options: SendOptions<'_>,
     ) -> Result<()> {
         let (executor, ctx) = self.sending_context()?;
-        send_one(
-            executor.connection(),
-            ctx.as_ref(),
-            destination_id,
-            message,
-            options,
-        )
-        .await
+        executor
+            .connection()
+            .send(
+                &[Message::with_options(destination_id, message, options)],
+                ctx.as_ref().map(caller_for),
+                options.forks,
+            )
+            .await
     }
 
     /// Sends many messages in one transaction, for their destinations to [`recv`] when ready.
@@ -318,7 +321,10 @@ impl DBOS {
         options: SendAllOptions,
     ) -> Result<()> {
         let (executor, ctx) = self.sending_context()?;
-        send_batch(executor.connection(), ctx.as_ref(), messages, options).await
+        executor
+            .connection()
+            .send(messages, ctx.as_ref().map(caller_for), options.forks)
+            .await
     }
 
     /// The executor to send through and the ambient caller to record against, reconciled.
@@ -364,52 +370,13 @@ fn workflow_ctx<E: DurableError>(operation: &'static str) -> Result<Ctx, E> {
     })
 }
 
-/// A batch, from a surface whose messages carry their own topics and keys.
+/// Where the caller stands, for `sysdb` to checkpoint the send against.
 ///
-/// [`send_one`]'s counterpart, and thinner because a batch's messages are already in the shape
-/// `sysdb` takes: all this adds is the caller derivation the two share.
-async fn send_batch<T, E>(
-    connection: &Connection,
-    caller: Option<&Ctx>,
-    messages: &[Message<'_, T>],
-    options: SendAllOptions,
-) -> Result<(), E>
-where
-    T: Serialize,
-    E: DurableError,
-{
-    connection
-        .send(
-            messages,
-            caller.map(|ctx| (ctx.workflow_id(), ctx.next_step_id())),
-            options.forks,
-        )
-        .await
-}
-
-async fn send_one<T, E>(
-    connection: &Connection,
-    caller: Option<&Ctx>,
-    destination_id: &str,
-    message: &T,
-    options: SendOptions<'_>,
-) -> Result<(), E>
-where
-    T: Serialize,
-    E: DurableError,
-{
-    connection
-        .send(
-            &[Message {
-                destination_id,
-                message,
-                topic: options.topic,
-                idempotency_key: options.idempotency_key,
-            }],
-            caller.map(|ctx| (ctx.workflow_id(), ctx.next_step_id())),
-            options.forks,
-        )
-        .await
+/// [`event`](crate::event)'s function of the same name and the same job: it exists to name the
+/// step-id allocation, which is a *mutation* and must happen once and only where there is a caller
+/// to record against. `None` from the sites below therefore allocates nothing.
+fn caller_for(ctx: &Ctx) -> (&str, i32) {
+    (ctx.workflow_id(), ctx.next_step_id())
 }
 
 impl Connection {
@@ -499,7 +466,13 @@ impl crate::Client {
     ) -> Result<()> {
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
-        send_one(self.connection(), None, destination_id, message, options).await
+        self.connection()
+            .send(
+                &[Message::with_options(destination_id, message, options)],
+                None,
+                options.forks,
+            )
+            .await
     }
 
     /// Sends many messages in one transaction.
@@ -531,7 +504,7 @@ impl crate::Client {
     ) -> Result<()> {
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
-        send_batch(self.connection(), None, messages, options).await
+        self.connection().send(messages, None, options.forks).await
     }
 }
 
@@ -579,6 +552,25 @@ pub struct Message<'a, T> {
 }
 
 impl<'a, T> Message<'a, T> {
+    /// The message a single send builds: a destination and a payload, and the rest from its
+    /// options.
+    ///
+    /// The one place [`SendOptions`] and [`Message`] meet, and the whole of what a single send adds
+    /// over a batch of one — which is why there is no layer between the surfaces and
+    /// [`Connection::send`] beyond this and [`caller_for`].
+    pub(crate) fn with_options(
+        destination_id: &'a str,
+        message: &'a T,
+        options: SendOptions<'a>,
+    ) -> Self {
+        Self {
+            destination_id,
+            message,
+            topic: options.topic,
+            idempotency_key: options.idempotency_key,
+        }
+    }
+
     /// A message for `destination_id`, on the default topic.
     pub fn new(destination_id: &'a str, message: &'a T) -> Self {
         Self {
