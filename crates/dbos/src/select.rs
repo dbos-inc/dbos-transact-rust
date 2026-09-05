@@ -613,11 +613,11 @@ mod tests {
             let first: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
                 crate::select_step! {
                     b = step("b", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>(2u32)
                     }) => b?,
                     c = step("c", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>(3u32)
                     }) => c?,
                     a = step("a", || async { Ok::<_, crate::Error>(1u32) }) => a?
@@ -654,7 +654,7 @@ mod tests {
                 crate::select_step! {
                     quick = step("quick", || async { Ok::<_, crate::Error>(1u32) }) => quick?,
                     slow = step("slow", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>(2u32)
                     }) => slow?
                 }
@@ -682,7 +682,7 @@ mod tests {
                                 let loser_ran = Arc::clone(&loser_ran);
                                 async move {
                                     loser_ran.fetch_add(1, Ordering::SeqCst);
-                                    tokio::time::sleep(Duration::from_millis(300)).await;
+                                    std::future::pending::<()>().await;
                                     Ok::<_, crate::Error>(1u32)
                                 }
                             }
@@ -725,7 +725,7 @@ mod tests {
                             let loser_ran = Arc::clone(&loser_ran);
                             async move {
                                 loser_ran.fetch_add(1, Ordering::SeqCst);
-                                tokio::time::sleep(Duration::from_millis(300)).await;
+                                std::future::pending::<()>().await;
                                 Ok::<_, crate::Error>("slow".to_owned())
                             }
                         }
@@ -757,25 +757,25 @@ mod tests {
         async fn a_race_wider_than_any_hand_written_arity() {
             let (dbos, _db) = workflow("wf-macro-wide").await;
 
-            // Nine that sleep and one that does not, so the winner is unambiguous and last.
-            let slow = |name: &'static str| {
+            // Nine that never finish and one that returns, so the winner is unambiguous and last.
+            let never = |name: &'static str| {
                 step(name, || async {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    std::future::pending::<()>().await;
                     Ok::<_, crate::Error>(0u32)
                 })
             };
 
             let answer: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-macro-wide"), async {
                 crate::select_step! {
-                    a = slow("a") => a?,
-                    b = slow("b") => b?,
-                    c = slow("c") => c?,
-                    d = slow("d") => d?,
-                    e = slow("e") => e?,
-                    f = slow("f") => f?,
-                    g = slow("g") => g?,
-                    h = slow("h") => h?,
-                    i = slow("i") => i?,
+                    a = never("a") => a?,
+                    b = never("b") => b?,
+                    c = never("c") => c?,
+                    d = never("d") => d?,
+                    e = never("e") => e?,
+                    f = never("f") => f?,
+                    g = never("g") => g?,
+                    h = never("h") => h?,
+                    i = never("i") => i?,
                     j = step("j", || async { Ok::<_, crate::Error>(10u32) }) => j?,
                 }
             })
@@ -804,7 +804,7 @@ mod tests {
                         won + 10
                     }
                     slow = step("slow", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>(2u32)
                     }) => match slow {
                         Ok(value) => value + 1,
@@ -830,7 +830,7 @@ mod tests {
             let answer = Ctx::scope(ctx(&dbos, "wf-macro-inferred"), async {
                 crate::select_step! {
                     counted = step("counted", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>(1u32)
                     }) => counted.is_ok(),
                     named = step("named", || async {
@@ -853,11 +853,11 @@ mod tests {
             let answer: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-macro-three"), async {
                 crate::select_step! {
                     a = step("a", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>(1u32)
                     }) => a? + 100,
                     b = step("b", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<_, crate::Error>("b".to_owned())
                     }) => b.map(|_| 200u32)?,
                     c = step("c", || async { Ok::<_, crate::Error>(3u32) }) => c? + 300

@@ -728,8 +728,11 @@ async fn a_select_step_can_race_a_step_against_a_child_launch() {
             let child = child.clone();
             async move {
                 let outcome: u32 = dbos::select_step! {
+                    // Never finishes, so the launch wins however long its own row takes to
+                    // write: a loser that merely slept would be racing a wall clock against the
+                    // winner's database round trips.
                     slow = dbos::step("slow", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        std::future::pending::<()>().await;
                         Ok::<u32, Error>(0)
                     }) => slow?,
                     started = child.start(()) => {
@@ -809,8 +812,10 @@ async fn a_control_signal_winning_a_select_step_records_no_winner() {
                             workflow_id: "raced".to_owned(),
                         })
                     }) => interrupted,
+                    // Never finishes, so the interrupted branch wins whatever its own round
+                    // trip costs.
                     slow = dbos::step("slow", || async {
-                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        std::future::pending::<()>().await;
                         Ok::<u32, Error>(1)
                     }) => slow,
                 };
@@ -952,27 +957,40 @@ async fn a_losing_step_has_its_cancellation_token_fired() {
         dbos.register_workflow("workflow", move |()| {
             let released = Arc::clone(&released);
             async move {
+                // The token is handed out inside the losing body, so a loser dropped before its
+                // body starts would have nothing to observe it with. The winner waits for the
+                // loser to say it has started rather than for a sleep to expire, which is what
+                // makes the order a fact rather than a race against the database.
+                let (watching, watching_rx) = tokio::sync::oneshot::channel::<()>();
+                let mut watching = Some(watching);
+                let mut watching_rx_slot = Some(watching_rx);
                 let outcome: u32 = dbos::select_step! {
-                    // Slow enough for the loser to be inside its body when it is dropped: the
-                    // token is handed out there, and a branch dropped before its body starts has
-                    // nothing to observe it with.
-                    fast = dbos::step("fast", || async {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                        Ok::<u32, Error>(1)
-                    }) => fast?,
-                    slow = dbos::step("slow", {
-                        let released = Arc::clone(&released);
-                        move || {
-                            let released = Arc::clone(&released);
-                            async move {
-                                let token = dbos::Ctx::current().expect("in a step").cancellation();
-                                tokio::spawn(async move {
-                                    token.cancelled().await;
-                                    released.notify_one();
-                                });
-                                tokio::time::sleep(Duration::from_secs(10)).await;
-                                Ok::<u32, Error>(2)
+                    fast = dbos::step("fast", move || {
+                        // Taken by the first attempt; a step is built once and run once here.
+                        let watching_rx = watching_rx_slot.take();
+                        async move {
+                            if let Some(watching_rx) = watching_rx {
+                                let _ = watching_rx.await;
                             }
+                            Ok::<u32, Error>(1)
+                        }
+                    }) => fast?,
+                    slow = dbos::step("slow", move || {
+                        let released = Arc::clone(&released);
+                        let watching = watching.take();
+                        async move {
+                            let token = dbos::Ctx::current().expect("in a step").cancellation();
+                            tokio::spawn(async move {
+                                token.cancelled().await;
+                                released.notify_one();
+                            });
+                            // Said only once the watcher is registered, and never withdrawn:
+                            // from here the loser can be dropped and still be heard.
+                            if let Some(watching) = watching {
+                                let _ = watching.send(());
+                            }
+                            std::future::pending::<()>().await;
+                            Ok::<u32, Error>(2)
                         }
                     }) => slow?,
                 }?;
