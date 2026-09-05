@@ -1,0 +1,350 @@
+//! Workflow messages, against real databases.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use dbos::sysdb::SystemDatabase;
+use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
+use dbos::sysdb::types::WorkflowStatus;
+use dbos::{Config, DBOS, Error};
+
+use dbos_test_support::{TestDatabase, test_database};
+
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// The version each instance in this file launches with, derived from its application name — see
+/// the note on `events::app_version`, which this mirrors for the same reason.
+fn app_version(app_name: &str) -> String {
+    format!("{app_name}-1.0.0")
+}
+
+fn config(app_name: &str, db: &TestDatabase) -> Config {
+    Config {
+        migrate: false,
+        app_version: Some(app_version(app_name)),
+        ..Config::new(app_name, db.url())
+    }
+}
+
+/// A handle for reading rows behind the instance's back.
+async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
+    PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default())
+}
+
+/// The step names a workflow recorded, in step-id order.
+async fn steps(reader: &PostgresSystemDatabase, workflow_id: &str) -> Vec<(i32, String)> {
+    reader
+        .list_workflow_steps(workflow_id, true, None, None, None)
+        .await
+        .expect("read failed")
+        .into_iter()
+        .map(|step| (step.step_id, step.step_name))
+        .collect()
+}
+
+/// Waits for a workflow's row to reach `SUCCESS`.
+async fn await_success(reader: &PostgresSystemDatabase, workflow_id: &str) {
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let row = reader
+                .get_workflow(workflow_id)
+                .await
+                .expect("read failed")
+                .expect("the row exists");
+            if row.status == WorkflowStatus::Success {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the workflow never finished");
+}
+
+/// The approval pattern: a workflow waits, something outside it sends, the workflow proceeds.
+///
+/// Also pins the two checkpoints a receive writes and the order of their ids — the receive first,
+/// its deadline second — which is what a replay looks up and what another SDK replaying this
+/// workflow would expect to find.
+#[tokio::test]
+async fn a_message_from_outside_reaches_a_waiting_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("recv-app", &db));
+    let waits = dbos
+        .register_workflow("waits", |()| async {
+            let approval: Option<String> = dbos::recv(None, DEADLINE).await?;
+            Ok::<_, dbos::Error>(approval)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = waits.start(()).await.expect("start failed");
+    let workflow_id = handle.workflow_id().to_owned();
+
+    // The send races the workflow reaching its receive, deliberately: a message that arrives first
+    // waits in the database, so both orderings must deliver.
+    dbos.send(&workflow_id, &"approved".to_owned(), None)
+        .await
+        .expect("send failed");
+
+    let approval = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow never finished")
+        .expect("the workflow failed");
+    assert_eq!(approval, Some("approved".to_owned()));
+
+    let reader = reader(&db).await;
+    assert_eq!(
+        steps(&reader, &workflow_id).await,
+        [(0, "DBOS.recv".to_owned()), (1, "DBOS.sleep".to_owned())],
+        "the receive is recorded first and its deadline second",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A receive on one topic never takes a message sent on another, and finding nothing is a value.
+#[tokio::test]
+async fn topics_do_not_cross_and_absence_is_a_value() {
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("topics-app", &db));
+    let picky = {
+        let (reached, release) = (Arc::clone(&reached_gate), Arc::clone(&release_gate));
+        dbos.register_workflow("picky", move |()| {
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                // Held until the test has sent, so a `None` below is a topic that did not match
+                // rather than a message that had not arrived.
+                reached.notify_one();
+                release.notified().await;
+                let default: Option<String> = dbos::recv(None, Duration::ZERO).await?;
+                let approvals: Option<String> =
+                    dbos::recv(Some("approvals"), Duration::ZERO).await?;
+                Ok::<_, dbos::Error>((default, approvals))
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let handle = picky.start(()).await.expect("start failed");
+    let workflow_id = handle.workflow_id().to_owned();
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the workflow never reached its gate");
+
+    dbos.send(&workflow_id, &"yes".to_owned(), Some("approvals"))
+        .await
+        .expect("send failed");
+    release_gate.notify_one();
+
+    let (default, approvals) = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow never finished")
+        .expect("the workflow failed");
+    assert_eq!(
+        default, None,
+        "a receive on the default topic must not take a message sent on `approvals`",
+    );
+    assert_eq!(approvals, Some("yes".to_owned()));
+
+    dbos.shutdown().await;
+}
+
+/// A replay returns the message the first run took and does not consume a second one.
+///
+/// The property the whole checkpoint exists for: a message taken but forgotten would be gone with
+/// nothing recording it, which is the one failure a durable receive may not have.
+#[tokio::test]
+async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("replay-app", &db));
+    let receives = {
+        let (reached, release) = (Arc::clone(&reached_gate), Arc::clone(&release_gate));
+        dbos.register_workflow("receives", move |()| {
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                let first: Option<String> = dbos::recv(None, DEADLINE).await?;
+                reached.notify_one();
+                release.notified().await;
+                Ok::<_, dbos::Error>(first)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let handle = receives.start(()).await.expect("start failed");
+    let workflow_id = handle.workflow_id().to_owned();
+    // Two messages, so a replay that took another would visibly take the second.
+    dbos.send(&workflow_id, &"first".to_owned(), None)
+        .await
+        .expect("send failed");
+    dbos.send(&workflow_id, &"second".to_owned(), None)
+        .await
+        .expect("send failed");
+
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the workflow never reached its gate");
+
+    // Abandon at the gate and let recovery replay the receive.
+    dbos.shutdown().await;
+    dbos.launch().await.expect("relaunch failed");
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the recovered workflow never reached its gate again");
+    release_gate.notify_one();
+
+    let reader = reader(&db).await;
+    await_success(&reader, &workflow_id).await;
+
+    assert_eq!(
+        steps(&reader, &workflow_id).await,
+        [(0, "DBOS.recv".to_owned()), (1, "DBOS.sleep".to_owned())],
+        "the replay added no second receive",
+    );
+
+    let notifications = reader
+        .get_all_notifications(&workflow_id)
+        .await
+        .expect("read failed");
+    let consumed: Vec<bool> = notifications.iter().map(|n| n.consumed).collect();
+    assert_eq!(
+        consumed,
+        [true, false],
+        "the replay must not have consumed the second message",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A workflow's send is a checkpointed step, so a replay delivers once rather than twice.
+#[tokio::test]
+async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("send-app", &db));
+    // The destination: a workflow that exists to be sent to, and that outlives the sender's
+    // abandonment so the foreign key always has something to point at.
+    let sleeps = dbos
+        .register_workflow("sleeps", |()| async {
+            dbos::sleep(Duration::from_secs(5)).await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    let sends = {
+        let (reached, release) = (Arc::clone(&reached_gate), Arc::clone(&release_gate));
+        dbos.register_workflow("sends", move |destination: String| {
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                dbos::send(&destination, &"hello".to_owned(), None).await?;
+                reached.notify_one();
+                release.notified().await;
+                Ok::<_, dbos::Error>(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let destination = sleeps.start(()).await.expect("start failed");
+    let destination_id = destination.workflow_id().to_owned();
+    let sender = sends
+        .start(destination_id.clone())
+        .await
+        .expect("start failed");
+    let sender_id = sender.workflow_id().to_owned();
+
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the sender never reached its gate");
+
+    // Abandon after the send and let recovery replay it.
+    dbos.shutdown().await;
+    dbos.launch().await.expect("relaunch failed");
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the recovered sender never reached its gate again");
+    release_gate.notify_one();
+
+    let reader = reader(&db).await;
+    await_success(&reader, &sender_id).await;
+
+    assert_eq!(
+        steps(&reader, &sender_id).await,
+        [(0, "DBOS.send".to_owned())],
+        "the send is recorded under the cross-SDK name, once",
+    );
+    let notifications = reader
+        .get_all_notifications(&destination_id)
+        .await
+        .expect("read failed");
+    assert_eq!(
+        notifications.len(),
+        1,
+        "the replay found the recorded step and delivered nothing",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// Neither call may stand inside a step: a receive consumes and a send delivers, and a step's own
+/// checkpoint records neither.
+#[tokio::test]
+async fn neither_send_nor_recv_may_stand_inside_a_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("guard-app", &db));
+    let receives_in_step = dbos
+        .register_workflow("receives_in_step", |()| async {
+            dbos::step("read", || async {
+                let _: Option<String> = dbos::recv(None, Duration::ZERO).await?;
+                Ok(())
+            })
+            .await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    let sends_in_step = dbos
+        .register_workflow("sends_in_step", |destination: String| async move {
+            dbos::step("write", || {
+                let destination = destination.clone();
+                async move {
+                    dbos::send(&destination, &"hello".to_owned(), None).await?;
+                    Ok(())
+                }
+            })
+            .await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let err = receives_in_step
+        .run(())
+        .await
+        .expect_err("a receive inside a step should be refused");
+    assert!(
+        matches!(&err, Error::InsideStep { operation } if operation == "recv"),
+        "{err}"
+    );
+
+    let err = sends_in_step
+        .run("no-such-workflow".to_owned())
+        .await
+        .expect_err("a send inside a step should be refused");
+    assert!(
+        matches!(&err, Error::InsideStep { operation } if operation == "send"),
+        "{err}"
+    );
+
+    dbos.shutdown().await;
+}

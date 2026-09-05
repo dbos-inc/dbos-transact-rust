@@ -46,6 +46,8 @@ mod identity;
 #[cfg(feature = "engine")]
 mod management;
 #[cfg(feature = "engine")]
+mod message;
+#[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
 mod recovery;
@@ -66,7 +68,7 @@ mod workflow;
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
 // because it *is* the brand — nobody writes `tokio::TOKIO`.
 #[cfg(feature = "engine")]
-pub use client::{Client, ClientConfig, EnqueueOptions, Forks, Message};
+pub use client::{Client, ClientConfig, EnqueueOptions};
 #[cfg(feature = "engine")]
 pub use config::{Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
@@ -83,6 +85,8 @@ pub use handle::WorkflowHandle;
 pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, EXECUTOR_ID_ENV};
 #[cfg(feature = "engine")]
 pub use management::{Children, ForkFrom, ForkOptions, ResumeOptions};
+#[cfg(feature = "engine")]
+pub use message::{Forks, Message, recv, send};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
