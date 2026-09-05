@@ -137,8 +137,8 @@ where
     let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
     ctx.executor()
         .connection()
-        .send(
-            &[Message::from_options(destination_id, message, options)],
+        .send_message(
+            &Message::from_options(destination_id, message, options),
             caller,
             options.forks,
         )
@@ -196,7 +196,7 @@ where
     let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
     ctx.executor()
         .connection()
-        .send(messages, caller, options.forks)
+        .send_messages(messages, caller, options.forks)
         .await
 }
 
@@ -307,8 +307,8 @@ impl DBOS {
         let (executor, ctx) = self.sending_context()?;
         executor
             .connection()
-            .send(
-                &[Message::from_options(destination_id, message, options)],
+            .send_message(
+                &Message::from_options(destination_id, message, options),
                 ctx.as_ref().map(caller_for),
                 options.forks,
             )
@@ -334,7 +334,7 @@ impl DBOS {
         let (executor, ctx) = self.sending_context()?;
         executor
             .connection()
-            .send(messages, ctx.as_ref().map(caller_for), options.forks)
+            .send_messages(messages, ctx.as_ref().map(caller_for), options.forks)
             .await
     }
 
@@ -391,27 +391,51 @@ fn caller_for(ctx: &Ctx) -> (&str, i32) {
 }
 
 impl Connection {
-    /// The send itself, shared by every surface that has one.
+    /// One message, encoded and handed to `sysdb`'s single-send method.
     ///
-    /// `sysdb` owns the transaction, the fork fan-out and the replay skip, so what is left here is
-    /// encoding the payloads and naming the format they were encoded in. On the connection because
-    /// that is where the serializer lives and a send is otherwise one insert: the free [`send`]
-    /// reaches it through the ambient context's connection, [`DBOS::send`] through its executor's,
-    /// and [`Client::send_bulk`](crate::Client::send_bulk) through the only one it has. The same
-    /// shape [`get_event`](crate::get_event)'s three surfaces share, and named as they are.
+    /// A method apiece rather than one taking a slice, mirroring the trait: which one is called is
+    /// what chooses the recorded step name, so a batch of one records `DBOS.sendBulk` and this
+    /// records `DBOS.send`. On the connection because that is where the serializer lives — the
+    /// free [`send`] reaches it through the ambient context's connection, [`DBOS::send`] through
+    /// its executor's, and [`Client::send`](crate::Client::send) through the only one it has, the
+    /// same shape [`get_event`](crate::get_event)'s three surfaces share.
     ///
-    /// The batch is the primitive and a single send is a caller with one message — `sysdb` says so,
-    /// and derives the step name from the count. What each surface adds is the *caller*: which
-    /// ambient context to read, whether the send is checkpointed, and whether a handle's executor
-    /// has to be reconciled with it.
+    /// Generic over the caller's error channel for the same reason [`encode`] is: the failure is an
+    /// engine variant either way, and `E` only says which channel it travels in.
+    pub(crate) async fn send_message<T, E>(
+        &self,
+        message: &Message<'_, T>,
+        caller: Option<(&str, i32)>,
+        forks: Forks,
+    ) -> Result<(), E>
+    where
+        T: Serialize,
+        E: DurableError,
+    {
+        let encoded = encode(message.message, "message")?;
+        self.sysdb()
+            .send_message(
+                &EncodedMessage {
+                    destination_id: message.destination_id,
+                    topic: message.topic,
+                    message: &encoded,
+                    idempotency_key: message.idempotency_key,
+                },
+                Some(self.serializer().name()),
+                caller,
+                forks == Forks::Include,
+            )
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+
+    /// A batch, encoded and handed to `sysdb`'s batch method — see [`send_message`](Self::send_message)
+    /// for why the two are separate.
     ///
     /// Encoded up front so that nothing is sent when one payload cannot be: the whole batch is one
     /// transaction, and failing halfway through the encoding would be the prefix a batch exists to
     /// avoid.
-    ///
-    /// Generic over the caller's error channel for the same reason [`encode`] is: the failure is an
-    /// engine variant either way, and `E` only says which channel it travels in.
-    pub(crate) async fn send<T, E>(
+    pub(crate) async fn send_messages<T, E>(
         &self,
         messages: &[Message<'_, T>],
         caller: Option<(&str, i32)>,
@@ -478,8 +502,8 @@ impl crate::Client {
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
         self.connection()
-            .send(
-                &[Message::from_options(destination_id, message, options)],
+            .send_message(
+                &Message::from_options(destination_id, message, options),
                 None,
                 options.forks,
             )
@@ -515,7 +539,9 @@ impl crate::Client {
     ) -> Result<()> {
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
-        self.connection().send(messages, None, options.forks).await
+        self.connection()
+            .send_messages(messages, None, options.forks)
+            .await
     }
 }
 

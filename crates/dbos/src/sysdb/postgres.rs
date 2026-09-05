@@ -3891,6 +3891,24 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await
     }
 
+    async fn send_message(
+        &self,
+        message: &Message<'_>,
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        send_to_forks: bool,
+    ) -> Result<(), Error> {
+        // One message is a batch of one everywhere below this line; only the recorded name differs.
+        self.deliver(
+            std::slice::from_ref(message),
+            serialization,
+            caller,
+            step_names::SEND,
+            send_to_forks,
+        )
+        .await
+    }
+
     async fn send_messages(
         &self,
         messages: &[Message<'_>],
@@ -3898,197 +3916,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
     ) -> Result<(), Error> {
-        // An empty batch still records its step. The workflow spent a step id on this call, and a
-        // step id that nothing occupies is a hole a replay has to guess about: the caller would
-        // re-run the send, and a message list that came out empty once and non-empty the next
-        // time would be delivered for real. Recording it makes the replay a replay.
-        //
-        // **The two batch implementations disagree.** Python guards only its insert with
-        // `if rows` and records the step regardless; Java returns early on an empty list and
-        // records nothing. Python's is the safer half of that split, for the reason above, and
-        // an empty send is cheap to record.
-        //
-        // With nothing to send *and* no step to record, there is genuinely nothing to do.
-        if messages.is_empty() && caller.is_none() {
-            return Ok(());
-        }
-        // Two messages under one key would give two rows the same primary key, so the second
-        // would be silently discarded as a duplicate of the first. A caller who did that does not
-        // know they have sent one message, and the database cannot tell them. Both
-        // implementations with a batch API reject this — Python raises, Java throws — and
-        // neither of the two without one can.
-        //
-        // The *empty* key is ours to decide, because they disagree: Python treats `""` as falsy
-        // and so as absent, giving the message a generated id; Java treats it as a real key, so
-        // one message keys on `"::destination"` and two collide. Refusing it picks neither
-        // reading of an input that means nothing, and matches how this layer treats every other
-        // empty string.
-        let mut keys = HashSet::with_capacity(messages.len());
-        for message in messages {
-            if let Some(key) = message.idempotency_key {
-                if key.is_empty() {
-                    return Err(Error::InvalidInput {
-                        field: "idempotency_key".into(),
-                        detail: "must be absent rather than empty".to_owned(),
-                    });
-                }
-                if !keys.insert(key) {
-                    return Err(Error::InvalidInput {
-                        field: "idempotency_key".into(),
-                        detail: format!("{key} is used by more than one message"),
-                    });
-                }
-            }
-        }
-
-        // Fixed before the retry, like every other step token: ids generated per attempt would
-        // make a retry after a lost commit acknowledgement deliver everything a second time.
-        let fallback_ids: Vec<String> = messages
-            .iter()
-            .map(|_| uuid::Uuid::new_v4().to_string())
-            .collect();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
-
-        // Which API surface the caller reached for, inferred from the batch size.
-        let step_name = if messages.len() == 1 {
-            step_names::SEND
-        } else {
-            step_names::SEND_BULK
-        };
-
-        let notifications_table = self.tables.notifications.as_str();
-        let workflow_table = self.tables.workflow_status.as_str();
-        let pool = &self.pool;
-        let fallback_ids = &fallback_ids;
-
-        with_retry(&self.retry, "send_messages", move || async move {
-            let mut tx = pool.begin().await?;
-
-            // A replay must not send again — and must not be told it failed either.
-            if let Some((workflow_id, step_id)) = caller
-                && self
-                    .check_step_on(&mut tx, workflow_id, step_id, step_name)
-                    .await?
-                    .is_some()
-            {
-                tracing::debug!(
-                    workflow_id,
-                    step_id,
-                    count = messages.len(),
-                    "replaying send"
-                );
-                return Ok(());
-            }
-
-            // Inside the transaction, so the recipient set cannot go stale before the insert.
-            let forks_of = if send_to_forks {
-                let roots: Vec<&str> = messages.iter().map(|m| m.destination_id).collect();
-                Self::descendant_forks(&mut tx, workflow_table, &roots).await?
-            } else {
-                HashMap::new()
-            };
-
-            let mut destination_ids = Vec::new();
-            let mut topics = Vec::new();
-            let mut payloads = Vec::new();
-            let mut message_ids = Vec::new();
-            for (message, fallback) in messages.iter().zip(fallback_ids) {
-                let forks = forks_of
-                    .get(message.destination_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                for destination in
-                    std::iter::once(message.destination_id).chain(forks.iter().map(String::as_str))
-                {
-                    destination_ids.push(destination);
-                    topics.push(message.topic.unwrap_or(NULL_TOPIC));
-                    payloads.push(message.message);
-                    // Scoped per recipient, so one send can fan out to a whole fork tree and
-                    // still give each recipient a distinct, repeatable row — and so the id a
-                    // destination sees does not depend on whether the send fanned out.
-                    //
-                    // **Both branches have to be scoped, not just the keyed one.** The insert ends
-                    // `ON CONFLICT (message_uuid) DO NOTHING`, so an unscoped fallback shared by
-                    // the destination and its forks would collide with itself and deliver to the
-                    // destination alone — silently, since a discarded row is not an error. The
-                    // fallback stays fixed across retries because it is generated once, above the
-                    // retry, and suffixing it here does not change that.
-                    message_ids.push(match message.idempotency_key {
-                        Some(key) => format!("{key}::{destination}"),
-                        None => format!("{fallback}::{destination}"),
-                    });
-                }
-            }
-
-            // Skipped when there is nothing to insert — an empty batch, which still has a step
-            // to record below.
-            let sent = if destination_ids.is_empty() {
-                Ok(Default::default())
-            } else {
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {notifications_table} \
-                        (destination_uuid, topic, message, message_uuid, serialization) \
-                     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) \
-                        AS m(destination_uuid, topic, message, message_uuid), \
-                        (SELECT $5::text) AS s(serialization) \
-                     ON CONFLICT (message_uuid) DO NOTHING"
-                )))
-                .bind(&destination_ids)
-                .bind(&topics)
-                .bind(&payloads)
-                .bind(&message_ids)
-                .bind(serialization)
-                .execute(&mut *tx)
-                .await
-            };
-
-            match sent {
-                Ok(result) => {
-                    tracing::debug!(
-                        requested = messages.len(),
-                        delivered = result.rows_affected(),
-                        send_to_forks,
-                        "sent messages"
-                    );
-                }
-                // The foreign key is what catches an address that does not exist, so a message
-                // can never be left pointing at nothing.
-                Err(e) if is_foreign_key_violation(&e) => {
-                    let mut missing: Vec<String> = messages
-                        .iter()
-                        .map(|m| m.destination_id.to_owned())
-                        .collect();
-                    missing.sort();
-                    missing.dedup();
-                    return Err(Error::NonExistentWorkflow {
-                        workflow_ids: missing,
-                    });
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            // Recorded last and in the same transaction: a step committed without its messages
-            // would make a replay skip a send that never happened.
-            if let Some((workflow_id, step_id)) = caller {
-                self.record_step_on(
-                    &mut tx,
-                    workflow_id,
-                    step_id,
-                    step_name,
-                    Outcome::Output(None),
-                    None,
-                    Some(timing),
-                    None,
-                )
-                .await?;
-            }
-
-            tx.commit().await?;
-            Ok(())
-        })
+        self.deliver(
+            messages,
+            serialization,
+            caller,
+            step_names::SEND_BULK,
+            send_to_forks,
+        )
         .await
     }
 
@@ -6922,6 +6756,209 @@ impl SystemDatabase for PostgresSystemDatabase {
                     step_id,
                 });
             }
+            Ok(())
+        })
+        .await
+    }
+}
+
+impl PostgresSystemDatabase {
+    /// The delivery both send methods share, with the step name each records passed in.
+    ///
+    /// Everything about a send but its recorded name is the same for one message and for many —
+    /// the transaction, the fork fan-out, the replay skip, the duplicate-key check, the foreign
+    /// key — so the two trait methods are a name apiece over this. Splitting them up there rather
+    /// than inferring the name down here is what makes a one-message batch record `DBOS.sendBulk`.
+    async fn deliver(
+        &self,
+        messages: &[Message<'_>],
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        step_name: &'static str,
+        send_to_forks: bool,
+    ) -> Result<(), Error> {
+        // An empty batch still records its step. The workflow spent a step id on this call, and a
+        // step id that nothing occupies is a hole a replay has to guess about: the caller would
+        // re-run the send, and a message list that came out empty once and non-empty the next
+        // time would be delivered for real. Recording it makes the replay a replay.
+        //
+        // **The two batch implementations disagree.** Python guards only its insert with
+        // `if rows` and records the step regardless; Java returns early on an empty list and
+        // records nothing. Python's is the safer half of that split, for the reason above, and
+        // an empty send is cheap to record.
+        //
+        // With nothing to send *and* no step to record, there is genuinely nothing to do.
+        if messages.is_empty() && caller.is_none() {
+            return Ok(());
+        }
+        // Two messages under one key would give two rows the same primary key, so the second
+        // would be silently discarded as a duplicate of the first. A caller who did that does not
+        // know they have sent one message, and the database cannot tell them. Both
+        // implementations with a batch API reject this — Python raises, Java throws — and
+        // neither of the two without one can.
+        //
+        // The *empty* key is ours to decide, because they disagree: Python treats `""` as falsy
+        // and so as absent, giving the message a generated id; Java treats it as a real key, so
+        // one message keys on `"::destination"` and two collide. Refusing it picks neither
+        // reading of an input that means nothing, and matches how this layer treats every other
+        // empty string.
+        let mut keys = HashSet::with_capacity(messages.len());
+        for message in messages {
+            if let Some(key) = message.idempotency_key {
+                if key.is_empty() {
+                    return Err(Error::InvalidInput {
+                        field: "idempotency_key".into(),
+                        detail: "must be absent rather than empty".to_owned(),
+                    });
+                }
+                if !keys.insert(key) {
+                    return Err(Error::InvalidInput {
+                        field: "idempotency_key".into(),
+                        detail: format!("{key} is used by more than one message"),
+                    });
+                }
+            }
+        }
+
+        // Fixed before the retry, like every other step token: ids generated per attempt would
+        // make a retry after a lost commit acknowledgement deliver everything a second time.
+        let fallback_ids: Vec<String> = messages
+            .iter()
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        let notifications_table = self.tables.notifications.as_str();
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let fallback_ids = &fallback_ids;
+
+        with_retry(&self.retry, "send_messages", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // A replay must not send again — and must not be told it failed either.
+            if let Some((workflow_id, step_id)) = caller
+                && self
+                    .check_step_on(&mut tx, workflow_id, step_id, step_name)
+                    .await?
+                    .is_some()
+            {
+                tracing::debug!(
+                    workflow_id,
+                    step_id,
+                    count = messages.len(),
+                    "replaying send"
+                );
+                return Ok(());
+            }
+
+            // Inside the transaction, so the recipient set cannot go stale before the insert.
+            let forks_of = if send_to_forks {
+                let roots: Vec<&str> = messages.iter().map(|m| m.destination_id).collect();
+                Self::descendant_forks(&mut tx, workflow_table, &roots).await?
+            } else {
+                HashMap::new()
+            };
+
+            let mut destination_ids = Vec::new();
+            let mut topics = Vec::new();
+            let mut payloads = Vec::new();
+            let mut message_ids = Vec::new();
+            for (message, fallback) in messages.iter().zip(fallback_ids) {
+                let forks = forks_of
+                    .get(message.destination_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for destination in
+                    std::iter::once(message.destination_id).chain(forks.iter().map(String::as_str))
+                {
+                    destination_ids.push(destination);
+                    topics.push(message.topic.unwrap_or(NULL_TOPIC));
+                    payloads.push(message.message);
+                    // Scoped per recipient, so one send can fan out to a whole fork tree and
+                    // still give each recipient a distinct, repeatable row — and so the id a
+                    // destination sees does not depend on whether the send fanned out.
+                    //
+                    // **Both branches have to be scoped, not just the keyed one.** The insert ends
+                    // `ON CONFLICT (message_uuid) DO NOTHING`, so an unscoped fallback shared by
+                    // the destination and its forks would collide with itself and deliver to the
+                    // destination alone — silently, since a discarded row is not an error. The
+                    // fallback stays fixed across retries because it is generated once, above the
+                    // retry, and suffixing it here does not change that.
+                    message_ids.push(match message.idempotency_key {
+                        Some(key) => format!("{key}::{destination}"),
+                        None => format!("{fallback}::{destination}"),
+                    });
+                }
+            }
+
+            // Skipped when there is nothing to insert — an empty batch, which still has a step
+            // to record below.
+            let sent = if destination_ids.is_empty() {
+                Ok(Default::default())
+            } else {
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {notifications_table} \
+                        (destination_uuid, topic, message, message_uuid, serialization) \
+                     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) \
+                        AS m(destination_uuid, topic, message, message_uuid), \
+                        (SELECT $5::text) AS s(serialization) \
+                     ON CONFLICT (message_uuid) DO NOTHING"
+                )))
+                .bind(&destination_ids)
+                .bind(&topics)
+                .bind(&payloads)
+                .bind(&message_ids)
+                .bind(serialization)
+                .execute(&mut *tx)
+                .await
+            };
+
+            match sent {
+                Ok(result) => {
+                    tracing::debug!(
+                        requested = messages.len(),
+                        delivered = result.rows_affected(),
+                        send_to_forks,
+                        "sent messages"
+                    );
+                }
+                // The foreign key is what catches an address that does not exist, so a message
+                // can never be left pointing at nothing.
+                Err(e) if is_foreign_key_violation(&e) => {
+                    let mut missing: Vec<String> = messages
+                        .iter()
+                        .map(|m| m.destination_id.to_owned())
+                        .collect();
+                    missing.sort();
+                    missing.dedup();
+                    return Err(Error::NonExistentWorkflow {
+                        workflow_ids: missing,
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            // Recorded last and in the same transaction: a step committed without its messages
+            // would make a replay skip a send that never happened.
+            if let Some((workflow_id, step_id)) = caller {
+                self.record_step_on(
+                    &mut tx,
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    Outcome::Output(None),
+                    None,
+                    Some(timing),
+                    None,
+                )
+                .await?;
+            }
+
+            tx.commit().await?;
             Ok(())
         })
         .await
