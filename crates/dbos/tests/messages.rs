@@ -6,7 +6,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error, Forks, SendOptions};
+use dbos::{Config, DBOS, Error, Forks, Message, SendOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -446,6 +446,96 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
         delivered(&fork_id).await,
         1,
         "Forks::Include reaches the workflows forked from the destination"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A workflow's batch is one checkpoint, so a replay delivers none of it again.
+///
+/// Also pins the name `sysdb` derives from the batch size: `DBOS.sendBulk` for a batch, and
+/// `DBOS.send` for a batch of exactly one — the name distinguishes the two API surfaces rather
+/// than the two methods, so a batch whose size changed between runs is caught as a determinism
+/// error.
+#[tokio::test]
+async fn a_workflows_batch_is_one_checkpoint() {
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("bulk-app", &db));
+    let sleeps = dbos
+        .register_workflow("sleeps", |()| async {
+            dbos::sleep(Duration::from_secs(5)).await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    let broadcasts = {
+        let (reached, release) = (Arc::clone(&reached_gate), Arc::clone(&release_gate));
+        dbos.register_workflow("broadcasts", move |ids: Vec<String>| {
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                dbos::send_all(&[Message::new(&ids[0], &"one"), Message::new(&ids[1], &"two")])
+                    .await?;
+                // A batch of one, to pin the name the size chooses.
+                dbos::send_all(&[Message::new(&ids[0], &"alone")]).await?;
+                reached.notify_one();
+                release.notified().await;
+                Ok::<_, dbos::Error>(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let first = sleeps.start(()).await.expect("start failed");
+    let second = sleeps.start(()).await.expect("start failed");
+    let (first_id, second_id) = (
+        first.workflow_id().to_owned(),
+        second.workflow_id().to_owned(),
+    );
+    let sender = broadcasts
+        .start(vec![first_id.clone(), second_id.clone()])
+        .await
+        .expect("start failed");
+    let sender_id = sender.workflow_id().to_owned();
+
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the sender never reached its gate");
+
+    // Abandon after both sends and let recovery replay them.
+    dbos.shutdown().await;
+    dbos.launch().await.expect("relaunch failed");
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the recovered sender never reached its gate again");
+    release_gate.notify_one();
+
+    let reader = reader(&db).await;
+    await_success(&reader, &sender_id).await;
+
+    assert_eq!(
+        steps(&reader, &sender_id).await,
+        [(0, "DBOS.sendBulk".to_owned()), (1, "DBOS.send".to_owned())],
+        "one step per batch, named by its size",
+    );
+    assert_eq!(
+        reader
+            .get_all_notifications(&first_id)
+            .await
+            .expect("read failed")
+            .len(),
+        2,
+        "the replay delivered nothing a second time",
+    );
+    assert_eq!(
+        reader
+            .get_all_notifications(&second_id)
+            .await
+            .expect("read failed")
+            .len(),
+        1
     );
 
     dbos.shutdown().await;

@@ -8,6 +8,7 @@
 //! | | inside a workflow | outside |
 //! |---|---|---|
 //! | [`send`] | free function | [`DBOS::send`], [`Client::send`](crate::Client::send) |
+//! | [`send_all`] | free function | [`DBOS::send_all`], [`Client::send_all`](crate::Client::send_all) |
 //! | [`recv`] | free function | — |
 //!
 //! **[`recv`] has no form outside a workflow, and that is structural rather than an omission.** A
@@ -44,10 +45,14 @@
 //! `send(destination_id, message)`, with a topic, an idempotency key and the fork fan-out in
 //! [`SendOptions`] on the `_with` form — the split [`step`](crate::step)/[`step_with`](crate::step_with)
 //! and `fork`/[`fork_with`](crate::DBOS::fork_with) already make. The batch is the one exception and
-//! has to be: [`Client::send_all`](crate::Client::send_all) takes [`Message`] values carrying
-//! their own topic and key,
+//! has to be: the [`send_all`] family takes [`Message`] values carrying their own topic and key,
 //! because those vary per message, beside a batch-wide [`SendAllOptions`]. Python and Java split it
 //! in the same place.
+//!
+//! **The batch is on all three surfaces, not just the client.** Python and Java are the only
+//! references with a batch send and both expose it on their runtime as well as their client, and
+//! both checkpoint it from inside a workflow — one step for the whole batch. TypeScript and Go have
+//! no batch send to compare.
 //!
 //! All of these are thin. `sysdb` owns the transactional insert, the fork fan-out, the replay
 //! skip, the consuming read, the concurrent-receive guard and the cross-SDK step names
@@ -126,11 +131,7 @@ where
     T: Serialize,
     E: DurableError,
 {
-    let Some(ctx) = Ctx::current() else {
-        return Err(Error::NotInWorkflow {
-            operation: "send".into(),
-        });
-    };
+    let ctx = workflow_ctx("send")?;
     // Absent inside a step, which is what makes that send plain: no id is allocated, so nothing
     // shifts the replay slots of the steps around it.
     let caller = (!ctx.in_step()).then_some(&ctx);
@@ -142,6 +143,47 @@ where
         options,
     )
     .await
+}
+
+/// Sends many messages in one transaction, for their destinations to [`recv`] when they are ready.
+///
+/// **All or none**, which is the reason to prefer this over a loop of [`send`]: the batch is one
+/// insert, so a failure halfway through delivers nothing rather than a prefix.
+///
+/// The batch is checkpointed as **one** step, so a replay sends none of it again. The step is
+/// recorded as `DBOS.sendBulk` — except for a batch of exactly one message, which `sysdb` records
+/// as `DBOS.send`, since the name distinguishes the two API surfaces rather than the two methods.
+/// A workflow whose message *count* changes between runs therefore flips names and is caught as a
+/// determinism error, which is what recording the name is for.
+///
+/// Where a single [`send`] takes its destination and payload as arguments, a batch takes
+/// [`Message`] values: the topic and the idempotency key vary per message, so they travel with the
+/// message rather than in the options. Only [`SendAllOptions`] is left, for what is uniform across
+/// the call.
+///
+/// Python and Java expose the same as `send_bulk` on their runtime as well as their client;
+/// TypeScript and Go have no batch send at all, and a caller there writes the loop and lives with
+/// the prefix.
+pub async fn send_all<T, E>(messages: &[Message<'_, T>]) -> Result<(), E>
+where
+    T: Serialize,
+    E: DurableError,
+{
+    send_all_with(messages, SendAllOptions::default()).await
+}
+
+/// [`send_all`], with [`SendAllOptions`] rather than the defaults.
+pub async fn send_all_with<T, E>(
+    messages: &[Message<'_, T>],
+    options: SendAllOptions,
+) -> Result<(), E>
+where
+    T: Serialize,
+    E: DurableError,
+{
+    let ctx = workflow_ctx("send")?;
+    let caller = (!ctx.in_step()).then_some(&ctx);
+    send_batch(ctx.executor().connection(), caller, messages, options).await
 }
 
 /// Takes the oldest message sent to this workflow, waiting up to `timeout` for one to arrive.
@@ -248,10 +290,46 @@ impl DBOS {
         message: &T,
         options: SendOptions<'_>,
     ) -> Result<()> {
+        let (executor, ctx) = self.sending_context()?;
+        send_one(
+            executor.connection(),
+            ctx.as_ref(),
+            destination_id,
+            message,
+            options,
+        )
+        .await
+    }
+
+    /// Sends many messages in one transaction, for their destinations to [`recv`] when ready.
+    ///
+    /// The instance's [`send_all`], and it stands to that as [`send`](Self::send) does to the free
+    /// one: the caller for code outside a workflow that still has an instance. See [`send_all`] for
+    /// the batch's guarantees and how it is checkpointed.
+    pub async fn send_all<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
+        self.send_all_with(messages, SendAllOptions::default())
+            .await
+    }
+
+    /// [`send_all`](Self::send_all), with [`SendAllOptions`] rather than the defaults.
+    pub async fn send_all_with<T: Serialize>(
+        &self,
+        messages: &[Message<'_, T>],
+        options: SendAllOptions,
+    ) -> Result<()> {
+        let (executor, ctx) = self.sending_context()?;
+        send_batch(executor.connection(), ctx.as_ref(), messages, options).await
+    }
+
+    /// The executor to send through and the ambient caller to record against, reconciled.
+    ///
+    /// Shared by [`send_with`](Self::send_with) and [`send_all_with`](Self::send_all_with) because
+    /// the reconciliation is the same for both and is the only thing either does before handing
+    /// off. Inside a step the caller is already `None`, so nothing is checkpointed and there is
+    /// nothing to disagree about — that send is plain whichever instance serves it, exactly as
+    /// `DBOS::get_event`'s read is.
+    fn sending_context(&self) -> Result<(Arc<crate::Executor>, Option<Ctx>)> {
         let executor = self.executor("send")?;
-        // Inside a step this is already `None`, so nothing is checkpointed and there is nothing to
-        // disagree about — that send is plain whichever instance serves it, exactly as
-        // `DBOS::get_event`'s read is.
         let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
         // Exactly where the two halves would be combined: a step id is about to be taken from the
         // ambient context and recorded against `self`'s executor.
@@ -263,14 +341,7 @@ impl DBOS {
                 operation: "send".into(),
             });
         }
-        send_one(
-            executor.connection(),
-            ctx.as_ref(),
-            destination_id,
-            message,
-            options,
-        )
-        .await
+        Ok((executor, ctx))
     }
 }
 
@@ -282,6 +353,40 @@ impl DBOS {
 /// means. Taking the [`Ctx`] rather than a pre-built caller is what keeps the step id from being
 /// allocated on a path that then refuses: both callers have finished their guards by the time they
 /// reach this.
+/// The ambient workflow context a free-function send stands in, or [`Error::NotInWorkflow`].
+///
+/// The free forms have no handle to take an executor from, so being inside a workflow is what makes
+/// them callable at all — the same rule [`get_event`](crate::get_event)'s free form follows, and the
+/// reason [`DBOS::send`] exists for everyone else.
+fn workflow_ctx<E: DurableError>(operation: &'static str) -> Result<Ctx, E> {
+    Ctx::current().ok_or(Error::NotInWorkflow {
+        operation: operation.into(),
+    })
+}
+
+/// A batch, from a surface whose messages carry their own topics and keys.
+///
+/// [`send_one`]'s counterpart, and thinner because a batch's messages are already in the shape
+/// `sysdb` takes: all this adds is the caller derivation the two share.
+async fn send_batch<T, E>(
+    connection: &Connection,
+    caller: Option<&Ctx>,
+    messages: &[Message<'_, T>],
+    options: SendAllOptions,
+) -> Result<(), E>
+where
+    T: Serialize,
+    E: DurableError,
+{
+    connection
+        .send(
+            messages,
+            caller.map(|ctx| (ctx.workflow_id(), ctx.next_step_id())),
+            options.forks,
+        )
+        .await
+}
+
 async fn send_one<T, E>(
     connection: &Connection,
     caller: Option<&Ctx>,
@@ -413,12 +518,20 @@ impl crate::Client {
     ///
     /// One payload type for the whole batch, which is what typing it costs. A batch of genuinely
     /// different shapes is a batch of `serde_json::Value`, or two calls.
-    pub async fn send_all<T: Serialize>(
+    pub async fn send_all<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
+        self.send_all_with(messages, SendAllOptions::default())
+            .await
+    }
+
+    /// [`send_all`](Self::send_all), with [`SendAllOptions`] rather than the defaults.
+    pub async fn send_all_with<T: Serialize>(
         &self,
         messages: &[Message<'_, T>],
         options: SendAllOptions,
     ) -> Result<()> {
-        self.connection().send(messages, None, options.forks).await
+        // No caller: a client is never inside a workflow, so there is no step to record the batch
+        // against and nothing to replay it for.
+        send_batch(self.connection(), None, messages, options).await
     }
 }
 

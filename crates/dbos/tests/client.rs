@@ -17,7 +17,7 @@ use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
     EnqueueOptions, Error, ForkFrom, ForkOptions, Message, QueueChange, QueueConflict,
-    QueueOptions, SendAllOptions, SendOptions, StartOptions, WorkflowHandle,
+    QueueOptions, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -486,14 +486,11 @@ async fn a_batch_of_messages_lands_together() {
     );
 
     client
-        .send_all(
-            &[
-                Message::new(&first, &"one"),
-                Message::new(&second, &"two"),
-                Message::new(&first, &"three"),
-            ],
-            SendAllOptions::default(),
-        )
+        .send_all(&[
+            Message::new(&first, &"one"),
+            Message::new(&second, &"two"),
+            Message::new(&first, &"three"),
+        ])
         .await
         .expect("send failed");
 
@@ -518,13 +515,10 @@ async fn a_batch_of_messages_lands_together() {
     // Nothing is delivered when one destination does not exist: the foreign key fails the whole
     // insert, which is the guarantee a batch buys over a loop of sends.
     let error = client
-        .send_all(
-            &[
-                Message::new(&first, &"four"),
-                Message::new("no-such-workflow", &"five"),
-            ],
-            SendAllOptions::default(),
-        )
+        .send_all(&[
+            Message::new(&first, &"four"),
+            Message::new("no-such-workflow", &"five"),
+        ])
         .await
         .expect_err("a message addressed to nothing should fail");
     assert!(matches!(error, Error::SystemDatabase(_)), "{error}");
