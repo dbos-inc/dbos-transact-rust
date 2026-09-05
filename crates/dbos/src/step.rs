@@ -666,14 +666,23 @@ where
     E: DurableError,
     Fut: Future<Output = Result<T, E>>,
 {
-    if options.timeout.is_none() && !options.preemptible {
-        return ctx.in_step_scope(None, body).instrument(span).await;
-    }
-
+    // **Every attempt gets a token, and the token is cancelled however the attempt ends.** The
+    // guard fires when this future is dropped — a timeout's `select!` losing the attempt, a
+    // `select_step!` dropping a losing branch, a workflow cancelled from outside — so work the
+    // runtime cannot stop by dropping, a `spawn_blocking` thread watching
+    // `ctx.cancellation()`, learns that its step is over in every one of those cases and not only
+    // the two this function races itself. The timeout and cancellation arms below still cancel
+    // explicitly, before the losing future is dropped at the end of the `select!`, because a
+    // body that could only learn from the token should learn before its destructors run.
     let token = CancellationToken::new();
+    let _cancel_on_drop = token.clone().drop_guard();
     let attempt = ctx
         .in_step_scope(Some(token.clone()), body)
         .instrument(span);
+
+    if options.timeout.is_none() && !options.preemptible {
+        return attempt.await;
+    }
 
     // A deadline that never arrives, so the arm can be unconditional rather than duplicating the
     // whole `select!` for each combination of watchdogs.

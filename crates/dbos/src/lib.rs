@@ -152,7 +152,9 @@ pub use wait::{join_workflows, select_workflow};
 /// the recorded winner, so a race across a step and a child is as durable as one across two steps.
 ///
 /// **What losing means differs by kind, and only a step loses cleanly.** A losing step is dropped
-/// mid-body and records nothing, so a replay never runs it. A losing launch is dropped as a
+/// mid-body and records nothing, so a replay never runs it; its [`cancellation`](Ctx::cancellation)
+/// token fires on the way out, as it does for a timeout, so work it handed to a blocking thread
+/// learns to stop. A losing launch is dropped as a
 /// *future* and not as a workflow: if it was polled far enough to write its row, the child is
 /// running, durably, and nobody is waiting for it. A losing await is a dropped wait on a child that
 /// likewise keeps going. Neither is cancelled by losing — cancel from the winning arm if abandoning

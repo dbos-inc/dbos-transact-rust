@@ -221,10 +221,12 @@ impl Ctx {
     /// Fires when the running step should stop.
     ///
     /// Observe it from work the runtime cannot stop by dropping this future — a `spawn_blocking`
-    /// thread, or a client that holds its own cancel handle. **Ordinary `async` code needs
-    /// nothing**: a step that times out has its future dropped, which stops it at its next
-    /// suspension point and runs its destructors on the way out, so a connection is returned and a
-    /// guard released without the body containing a line about it. That is what TypeScript's
+    /// thread, or a client that holds its own cancel handle. It fires whenever the attempt ends
+    /// without completing: a timeout, a cancelled workflow, a [`select_step!`](crate::select_step)
+    /// that this step lost, or anything else that drops the step's future. **Ordinary `async`
+    /// code needs nothing**: a step that times out has its future dropped, which stops it at its
+    /// next suspension point and runs its destructors on the way out, so a connection is returned
+    /// and a guard released without the body containing a line about it. That is what TypeScript's
     /// `stepStatus.timeoutSignal` is for, and Rust gets the common case for free where TypeScript
     /// has to abandon the attempt and discard its eventual settlement.
     ///

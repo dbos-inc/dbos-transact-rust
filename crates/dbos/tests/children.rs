@@ -941,6 +941,60 @@ async fn a_call_built_inside_a_step_and_polled_in_the_workflow_is_refused() {
     dbos.shutdown().await;
 }
 
+/// **A losing step's cancellation token fires**, as it does for a timeout, so work the runtime
+/// cannot stop by dropping the future — a blocking thread, a task the body spawned — learns that
+/// its step is over. The token is what `ctx.cancellation()` hands out; the body here parks a task
+/// on it and the test waits for that task to be released.
+#[tokio::test]
+async fn a_losing_step_has_its_cancellation_token_fired() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("loser-cancelled-app", &db));
+    let released = Arc::new(tokio::sync::Notify::new());
+    let workflow = {
+        let released = Arc::clone(&released);
+        dbos.register_workflow("workflow", move |()| {
+            let released = Arc::clone(&released);
+            async move {
+                let outcome: u32 = dbos::select_step! {
+                    // Slow enough for the loser to be inside its body when it is dropped: the
+                    // token is handed out there, and a branch dropped before its body starts has
+                    // nothing to observe it with.
+                    fast = dbos::step("fast", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<u32, Error>(1)
+                    }) => fast?,
+                    slow = dbos::step("slow", {
+                        let released = Arc::clone(&released);
+                        move || {
+                            let released = Arc::clone(&released);
+                            async move {
+                                let token = dbos::Ctx::current().expect("in a step").cancellation();
+                                tokio::spawn(async move {
+                                    token.cancelled().await;
+                                    released.notify_one();
+                                });
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                Ok::<u32, Error>(2)
+                            }
+                        }
+                    }) => slow?,
+                }?;
+                Ok::<u32, Error>(outcome)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let outcome = workflow.run(()).await.expect("the workflow failed");
+    assert_eq!(outcome, 1, "the fast step won");
+    tokio::time::timeout(Duration::from_secs(5), released.notified())
+        .await
+        .expect("the losing step's token never fired");
+
+    dbos.shutdown().await;
+}
+
 /// A child started and never awaited is still recorded, so a recovered parent adopts it.
 ///
 /// The launch row is what makes a child adoptable, and it is written by `start` alone — nothing

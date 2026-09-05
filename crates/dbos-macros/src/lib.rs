@@ -270,7 +270,8 @@ fn expand(race: &Race) -> TokenStream2 {
                 }).await;
 
                 // Dropped before the checkpoint is written, so every loser is stopped at its next
-                // suspension point and its destructors have run before anything records that the
+                // suspension point, its destructors have run, and a losing step's cancellation
+                // token has fired for any work it handed off, before anything records that the
                 // race is over. Whatever a loser did before that, it did once and invisibly —
                 // the same trade a step timeout makes.
                 ::core::mem::drop(( #( #branch, )* ));
