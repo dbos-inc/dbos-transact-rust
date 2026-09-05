@@ -319,12 +319,12 @@ mod tests {
     }
 
     /// **The check must not fire on legitimate concurrent siblings**, which is the whole reason it
-    /// compares workflow identity and never the in-step flag.
+    /// compares workflow identity and the per-call-stack step marker rather than anything shared.
     ///
-    /// That flag is one `AtomicBool` for the workflow, so the first branch's running body sets it
-    /// while the second is still being first-polled. A check that consulted it would refuse the
-    /// very thing the eager id exists to permit — so this races two steps whose bodies overlap and
-    /// asserts both are checkpointed.
+    /// A workflow-wide flag would be set by the first branch's running body while the second is
+    /// still being first-polled, and a check that consulted it would refuse the very thing the
+    /// eager id exists to permit — so this races two steps whose bodies overlap and asserts both
+    /// are checkpointed.
     #[tokio::test]
     async fn overlapping_siblings_are_not_mistaken_for_foreign_steps() {
         let (dbos, _db) = workflow("wf-siblings").await;
@@ -349,6 +349,59 @@ mod tests {
             steps(&dbos, "wf-siblings").await,
             [(0, "a".to_owned()), (1, "b".to_owned())],
             "both siblings checkpoint, under the ids they were built with"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// **A step built while a sibling's body is in flight still takes an id.** Build A, poll A,
+    /// then build B once A's body has started: a workflow-wide in-step flag would read A's body as
+    /// B's own, classify B as nested, and let it run plainly with no checkpoint. The marker is per
+    /// call stack, so the workflow proper is still the workflow proper.
+    #[tokio::test]
+    async fn a_step_built_while_a_sibling_runs_is_still_checkpointed() {
+        let (dbos, _db) = workflow("wf-built-mid-flight").await;
+
+        let outcomes = Ctx::scope(ctx(&dbos, "wf-built-mid-flight"), async {
+            let (started, mut started_rx) = tokio::sync::oneshot::channel::<()>();
+            let mut started = Some(started);
+            let a = step("a", move || {
+                let started = started.take();
+                async move {
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Ok::<_, crate::Error>(1u32)
+                }
+            });
+            let mut a = std::pin::pin!(a);
+            // Poll A until its body has started and parked on its sleep.
+            let a_result = tokio::select! {
+                result = &mut a => Some(result),
+                _ = &mut started_rx => None,
+            };
+            assert!(
+                a_result.is_none(),
+                "A must still be in flight when B is built"
+            );
+
+            let b = step("b", || async { Ok::<_, crate::Error>(2u32) });
+            assert_eq!(
+                b.step_id(),
+                Some(1),
+                "built in the workflow proper, so it takes an id"
+            );
+            tokio::join!(a, b)
+        })
+        .await;
+
+        assert_eq!(outcomes.0.unwrap(), 1);
+        assert_eq!(outcomes.1.unwrap(), 2);
+        assert_eq!(
+            steps(&dbos, "wf-built-mid-flight").await,
+            [(0, "a".to_owned()), (1, "b".to_owned())],
+            "both checkpoint: a running sibling does not make the workflow proper look nested"
         );
 
         dbos.shutdown().await;

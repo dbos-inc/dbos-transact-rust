@@ -9,7 +9,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
@@ -45,16 +45,15 @@ pub struct Ctx {
     ///
     /// **On the `Ctx` rather than on [`WorkflowState`], which is what makes it per-call-stack.**
     /// The task-local is rebound for the duration of a step body, so a concurrently polled sibling
-    /// does not see it — where [`in_step`](WorkflowState::in_step), being one `AtomicBool` every
-    /// clone shares, is set and cleared by whichever step happens to start and finish.
+    /// does not see it. A flag on the shared state would instead be set and cleared by whichever
+    /// step happened to start and finish, and a step *built* in the workflow proper while a
+    /// sibling's body was in flight would read it as nested and take no id — silently
+    /// uncheckpointed. This is the whole of what [`in_step`](Ctx::in_step) reads.
     ///
-    /// It exists so that a step can be told whether it is being polled in the same body it was
-    /// built in. Comparing workflow ids alone cannot: a step built inside a step body and carried
-    /// out to the workflow proper has the same workflow id in both places, takes no id, and would
-    /// otherwise run undurably where a checkpoint was expected.
-    ///
-    /// It does **not** replace `in_step`, which still decides whether a step takes an id — moving
-    /// that decision here is the rest of the per-call-stack change and a larger one.
+    /// It also lets a step be told whether it is being polled in the same body it was built in.
+    /// Comparing workflow ids alone cannot: a step built inside a step body and carried out to the
+    /// workflow proper has the same workflow id in both places, takes no id, and would otherwise
+    /// run undurably where a checkpoint was expected.
     step_marker: Option<StepMarker>,
 }
 
@@ -104,22 +103,6 @@ struct WorkflowState {
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
-    /// Whether a step is on the stack right now.
-    ///
-    /// A step is a leaf: the checkpoint it writes stands for everything the body did, so a step
-    /// inside a step is a plain call. Without this the inner call would allocate a step id of its
-    /// own and every step after it would replay against the wrong slot — a correctness trap rather
-    /// than a policy question, and Go #420 draws the same line.
-    ///
-    /// **Here, and so per-workflow, which is only right while steps run one at a time.** The
-    /// question is really per-call-stack, so two steps in flight at once share an answer meant for
-    /// one — silently, and in both directions; [`step`](crate::step) documents what that costs a
-    /// caller and why sequential is the contract for now. Supporting concurrency starts by moving
-    /// this out of here: the flag belongs to the [`Ctx`] that [`Ctx::in_step_scope`] wraps the body
-    /// with, rather than to the state every clone shares, and then `WorkflowState` holds only what
-    /// genuinely belongs to the whole workflow — the id and the step counter. A count of live steps
-    /// would stay here, since refusing concurrency is a question about the workflow.
-    in_step: AtomicBool,
 }
 
 impl WorkflowState {
@@ -141,7 +124,6 @@ impl Ctx {
                 workflow_id: workflow_id.into(),
                 deadline,
                 next_step_id: AtomicI32::new(0),
-                in_step: AtomicBool::new(false),
             }),
             // A fresh workflow context is the workflow proper, not any step body.
             step_marker: None,
@@ -194,9 +176,17 @@ impl Ctx {
         &self.executor
     }
 
-    /// Whether a step is already running in this workflow.
+    /// Whether this context is inside a step body.
+    ///
+    /// **Per-call-stack, not per-workflow**: it reads the [`step_marker`](Self::step_marker) that
+    /// [`in_step_scope`](Self::in_step_scope) binds on the rebound context, so a sibling step
+    /// running concurrently does not make the workflow proper look nested. Inside a step is a
+    /// plain call — a step built here takes no id, and a workflow operation is refused. Without
+    /// this the inner call would allocate a step id of its own and every step after it would
+    /// replay against the wrong slot — a correctness trap rather than a policy question, and Go
+    /// #420 draws the same line.
     pub(crate) fn in_step(&self) -> bool {
-        self.workflow.in_step.load(Ordering::Relaxed)
+        self.step_marker.is_some()
     }
 
     /// Which step body this context is inside, if any. See [`StepMarker`].
@@ -204,27 +194,17 @@ impl Ctx {
         self.step_marker
     }
 
-    /// Runs `body` with [`in_step`](Self::in_step) set, clearing it afterwards.
+    /// Runs `body` under a context that is [`in_step`](Self::in_step).
     ///
-    /// A guard rather than a plain pair of writes, so the flag is cleared even when the body
-    /// returns early or panics — a step that failed must not leave the workflow believing it is
-    /// still inside one.
-    ///
-    /// **Clearing, not restoring**, and along this call stack the two are the same thing: [`step`]
-    /// only reaches here when no step was on the stack, so the flag was false on the way in. They
-    /// come apart only between *concurrent* steps, where one finishing clears the flag for another
-    /// still running — which is the gap [`in_step`](Self::in_step) describes, and is not something
-    /// restoring here would fix, because the flag is shared rather than per-stack in the first
-    /// place.
-    ///
-    /// [`step`]: crate::step
+    /// Nothing is set or cleared on the shared state: the body sees a rebound `Ctx` carrying a
+    /// fresh [`StepMarker`], and the task-local scope ends with the body however it ends — early
+    /// return, error, or panic. That is what makes two steps in flight at once independent, where
+    /// a shared flag would be cleared by whichever finished first.
     pub(crate) async fn in_step_scope<F: Future>(
         &self,
         cancellation: Option<CancellationToken>,
         body: F,
     ) -> F::Output {
-        let _guard = InStep(Arc::clone(&self.workflow));
-        self.workflow.in_step.store(true, Ordering::Relaxed);
         // Rebinding rather than mutating: the body must see this attempt's token, and the `Ctx`
         // the workflow body holds must not acquire one that outlives the step.
         let scoped = Ctx {
@@ -268,15 +248,6 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
-/// Clears the in-step flag however the step ends.
-struct InStep(Arc<WorkflowState>);
-
-impl Drop for InStep {
-    fn drop(&mut self) {
-        self.0.in_step.store(false, Ordering::Relaxed);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,7 +260,6 @@ mod tests {
             workflow_id: "wf-1".to_owned(),
             deadline: None,
             next_step_id: AtomicI32::new(0),
-            in_step: AtomicBool::new(false),
         }
     }
 

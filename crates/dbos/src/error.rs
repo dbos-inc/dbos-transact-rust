@@ -314,18 +314,6 @@ pub enum Error<E = EngineOnly> {
         message: String,
     },
 
-    /// A step attempt ran past its timeout and was stopped.
-    ///
-    /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
-    /// retried like any other, which is what TypeScript's `StepConfig.timeoutMS` documents. A step
-    /// whose attempts all time out fails with
-    /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) holding one of these per attempt.
-    ///
-    /// The timeout bounds **one attempt**, not the step: three attempts at five seconds may take
-    /// fifteen seconds of body time, plus backoff. Nothing here carries a numeric error code,
-    /// because the portable error shape matches on `name` and makes `code` optional — Python codes
-    /// this error 18 and TypeScript codes it 31, and neither is a value a fifth implementation
-    /// should adopt.
     /// A step was built in one place and polled somewhere that disagrees about which workflow it
     /// belongs to.
     ///
@@ -345,11 +333,6 @@ pub enum Error<E = EngineOnly> {
     /// the step is built outside the workflow it was meant for. Build it where it is used instead:
     /// `Ctx::scope(ctx, async { step(..).await })`.
     ///
-    /// **Identity is compared by workflow, never by the in-step flag.** That flag is one
-    /// `AtomicBool` for the whole workflow, so a sibling step's running body sets it while another
-    /// branch is first polled — a check that consulted it would refuse the concurrent steps this
-    /// design exists to allow.
-    ///
     /// **A step built inside another step's body is caught too**, and telling that case apart is
     /// what the per-body scope on the context is for. Such a step takes no id, by the leaf rule
     /// that makes a nested step a plain call; carried out of that body and awaited in the workflow
@@ -359,11 +342,9 @@ pub enum Error<E = EngineOnly> {
     /// as well, because its checkpoint would sit beneath a step whose own row already covers
     /// whatever its body did.
     ///
-    /// The step marker is compared, never the in-step flag, for the reason above. It is bound on the
-    /// context that `Ctx::in_step_scope` rebinds, so it is per-call-stack and a concurrent sibling
-    /// does not see it. Deciding whether a step *takes an id* still reads the shared flag, which is
-    /// the remaining half of that change and a larger one.
-    ///
+    /// The marker is bound on the context that `Ctx::in_step_scope` rebinds, so it is
+    /// per-call-stack and a concurrent sibling does not see it — the same marker decides whether a
+    /// step takes an id in the first place, so building and polling read one answer.
     #[error(
         "step {step} was built {built} but polled {polled}: a step takes its id where it is built"
     )]
@@ -376,6 +357,18 @@ pub enum Error<E = EngineOnly> {
         polled: std::borrow::Cow<'static, str>,
     },
 
+    /// A step attempt ran past its timeout and was stopped.
+    ///
+    /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
+    /// retried like any other, which is what TypeScript's `StepConfig.timeoutMS` documents. A step
+    /// whose attempts all time out fails with
+    /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) holding one of these per attempt.
+    ///
+    /// The timeout bounds **one attempt**, not the step: three attempts at five seconds may take
+    /// fifteen seconds of body time, plus backoff. Nothing here carries a numeric error code,
+    /// because the portable error shape matches on `name` and makes `code` optional — Python codes
+    /// this error 18 and TypeScript codes it 31, and neither is a value a fifth implementation
+    /// should adopt.
     #[error("the step {step} exceeded its {}ms timeout", timeout.as_millis())]
     StepTimeout {
         /// The step's name.

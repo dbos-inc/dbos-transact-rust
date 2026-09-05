@@ -14,12 +14,6 @@
 //! `__branch1`, … for as many branches as it was given, and there is no arity to run out of. What
 //! it costs is `syn` and `quote` in the build graph, which is why the `dbos` crate puts this
 //! behind a feature.
-//!
-//! # What is not here
-//!
-//! No `#[workflow]` or `#[step]` attribute. Both were prototyped and neither ships in the first
-//! preview: a workflow's registration is a value-level thing — a name, a queue, a version — and an
-//! attribute that reads well is an attribute that hides where the name came from.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span, TokenStream as TokenStream2};
@@ -308,4 +302,145 @@ fn expand(race: &Race) -> TokenStream2 {
             ),
         }
     }}
+}
+
+/// The grammar and the shape of the expansion, tested without a compiler around them.
+///
+/// A `#[proc_macro]` cannot be called from a test — `proc_macro::TokenStream` only exists while
+/// the compiler is expanding something — but everything below that entry point deals in
+/// `proc_macro2::TokenStream`, which is an ordinary value. So the two halves that hold the
+/// design are reachable: what the macro refuses, and what it writes.
+///
+/// What this cannot see is whether the expansion *compiles*, which is what the tests over in
+/// `dbos` are for.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The message a refusal reports, with the invocation's braces left off — `Race` parses the
+    /// arms, not the delimiters the compiler has already stripped.
+    fn refuse(arms: &str) -> String {
+        let tokens: TokenStream2 = arms.parse().expect("the source must tokenize");
+        match syn::parse2::<Race>(tokens) {
+            Ok(race) => panic!("expected a refusal, got {} arms", race.arms.len()),
+            Err(failed) => failed.to_string(),
+        }
+    }
+
+    fn accept(arms: &str) -> Race {
+        let tokens: TokenStream2 = arms.parse().expect("the source must tokenize");
+        syn::parse2::<Race>(tokens).expect("this should have parsed")
+    }
+
+    /// **One branch is not a race**, and the refusal is at compile time rather than at run time,
+    /// which is the one thing a macro can do that the withdrawn `Vec`-taking form could not.
+    #[test]
+    fn fewer_than_two_branches_is_refused() {
+        assert!(refuse("x = one() => x?").contains("races two or more steps"));
+        assert!(refuse("").contains("races two or more steps"));
+    }
+
+    /// Both spellings, because someone arriving from `tokio::select!` writes one and someone
+    /// arriving from `match` writes the other, and a guard is refused for the same reason either
+    /// way: the checkpoint records a *position* among the branches that exist.
+    #[test]
+    fn a_guard_is_refused_in_either_spelling() {
+        assert!(refuse("x = one(), if flag => x?, y = two() => y?").contains("takes no guards"));
+        assert!(refuse("x = one() if flag => x?, y = two() => y?").contains("takes no guards"));
+    }
+
+    /// The three tokio spellings that have no meaning in a durable race, each named.
+    #[test]
+    fn the_tokio_only_arms_are_refused_by_name() {
+        assert!(refuse("biased; x = one() => x?, y = two() => y?").contains("always biased"));
+        assert!(refuse("x = one() => x?, y = two() => y?, else => 0").contains("no `else` arm"));
+        assert!(
+            refuse("x = one() => x?, y = two() => y?, complete => 0").contains("no `complete` arm")
+        );
+    }
+
+    /// `=>` where `=` belongs — the arm reads as a `match` and is not one, so it says which half
+    /// is missing rather than reporting a failed parse.
+    #[test]
+    fn an_arm_without_its_binding_is_refused() {
+        assert!(refuse("x => one(), y = two() => y?").contains("binds its step's outcome"));
+    }
+
+    /// The comma rule is `match`'s, which means it is only *sometimes* optional — and the
+    /// message when it is not is `match`'s too.
+    #[test]
+    fn a_missing_comma_after_a_plain_body_is_refused() {
+        assert!(refuse("x = one() => x? y = two() => y?").contains("expected `,`"));
+    }
+
+    /// A body that ends in a block ends its arm, including mid-list — the thing the declarative
+    /// form had to demand a comma for.
+    #[test]
+    fn a_block_body_needs_no_comma() {
+        assert_eq!(accept("x = one() => { x? } y = two() => y?").arms.len(), 2);
+        assert_eq!(
+            accept("x = one() => match x { _ => 0 } y = two() => y?")
+                .arms
+                .len(),
+            2
+        );
+        assert_eq!(accept("x = one() => x?, y = two() => y?,").arms.len(), 2);
+    }
+
+    /// **No arity to run out of**, which is the whole reason this is a procedural macro.
+    #[test]
+    fn there_is_no_upper_bound_on_branches() {
+        let arms = (0..40)
+            .map(|at| format!("b{at} = step{at}() => b{at}?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(accept(&arms).arms.len(), 40);
+        // The last slot exists and the one past it does not, rather than a count of appearances:
+        // what matters is that the names go as wide as the arms, not how often each is written.
+        let expanded = expand(&accept(&arms)).to_string();
+        assert!(expanded.contains("__dbos_slot39"));
+        assert!(!expanded.contains("__dbos_slot40"));
+    }
+
+    /// The expansion reaches the checkpoint rather than reimplementing it, and it names a slot
+    /// per branch — the two claims the module doc makes about what is here and what is in `dbos`.
+    #[test]
+    fn the_expansion_names_a_slot_per_branch_and_calls_the_core() {
+        let expanded = expand(&accept(
+            "x = one() => x?, y = two() => y?, z = three() => z?",
+        ))
+        .to_string();
+        for called in [
+            "Branches",
+            "check_select",
+            "record_select",
+            "Racing",
+            "poll_fn",
+        ] {
+            assert!(
+                expanded.contains(called),
+                "the expansion never reaches {called}"
+            );
+        }
+        for at in 0..3 {
+            assert!(expanded.contains(&format!("__dbos_slot{at}")));
+            assert!(expanded.contains(&format!("__dbos_branch{at}")));
+        }
+        assert!(
+            !expanded.contains("__dbos_slot3"),
+            "a fourth branch was invented"
+        );
+    }
+
+    /// **Each arm's body is written once**, which is why the replay path and the fresh race meet
+    /// at one `match` on the index instead of each carrying a copy of every arm.
+    #[test]
+    fn an_arm_body_appears_once_in_the_expansion() {
+        let expanded = expand(&accept(
+            "x = one() => marker_a(x), y = two() => marker_b(y)",
+        ))
+        .to_string();
+        assert_eq!(expanded.matches("marker_a").count(), 1);
+        assert_eq!(expanded.matches("marker_b").count(), 1);
+    }
 }

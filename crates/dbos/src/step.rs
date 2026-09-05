@@ -237,12 +237,12 @@ impl<E> StepOptions<E> {
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
 /// the counter first, which is not something a replay reproduces.
 ///
-/// **What is still a rule: one step per branch.** The flag that makes a step a leaf is one
-/// `AtomicBool` on the workflow rather than one per call stack, so a step *built while another
-/// step's body is running* sees that flag and takes the plain, uncheckpointed path — and a sibling
-/// finishing clears it for a body still running. Branches that are each a single step never meet
-/// either case. Work needing several steps in one branch is a child workflow, which has a counter
-/// of its own. Making the marker per-call-stack is a later change and is what would lift this.
+/// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
+/// body runs under is rebound for that body alone, so a step built in the workflow proper while a
+/// sibling's body is in flight still takes an id and checkpoints — a workflow-wide flag would have
+/// read the sibling's body as its own and let the step run plainly. Work needing several steps in
+/// one branch is still better as a child workflow, which has a counter of its own, but that is a
+/// question of shape rather than of correctness.
 ///
 /// **A step built and dropped has still spent its id**, which is why [`PendingStep`] is
 /// `#[must_use]`. It is deterministic — the same construction sequence burns the same ids on the
@@ -434,16 +434,13 @@ enum Built {
     /// Inside a workflow but nested in one of its step bodies, so a plain call by the leaf rule.
     ///
     /// Carries *which* body, so a step carried out of it and awaited in the workflow proper is
-    /// refused rather than quietly running undurably. `marker` is `None` where the in-step flag
-    /// said we were nested but no marker was bound — the two disagree only under the concurrency
-    /// the shared flag cannot describe, and treating that as its own place keeps the comparison
-    /// exact either way.
+    /// refused rather than quietly running undurably.
     ///
     /// Named `marker` rather than `body` because in this file a step's *body* is its closure, and
     /// the field would shadow it wherever both are in scope.
     Nested {
         workflow_id: String,
-        marker: Option<StepMarker>,
+        marker: StepMarker,
     },
     /// No workflow context at all, so a plain call and ordinarily testable.
     Outside,
@@ -451,16 +448,22 @@ enum Built {
 
 impl Built {
     /// Reads where we are, taking an id if this is a place that checkpoints.
+    ///
+    /// Nested-or-not comes from the marker bound on *this* call stack's context, so a sibling
+    /// step's running body cannot make a step built in the workflow proper look nested and skip
+    /// its id.
     fn here() -> Self {
         match Ctx::current() {
-            Some(ctx) if ctx.in_step() => Built::Nested {
-                workflow_id: ctx.workflow_id().to_owned(),
-                marker: ctx.step_marker(),
+            Some(ctx) => match ctx.step_marker() {
+                Some(marker) => Built::Nested {
+                    workflow_id: ctx.workflow_id().to_owned(),
+                    marker,
+                },
+                None => {
+                    let step_id = ctx.next_step_id();
+                    Built::Claimed { ctx, step_id }
+                }
             },
-            Some(ctx) => {
-                let step_id = ctx.next_step_id();
-                Built::Claimed { ctx, step_id }
-            }
             None => Built::Outside,
         }
     }
@@ -476,21 +479,15 @@ impl Built {
     fn whereabouts(&self) -> std::borrow::Cow<'static, str> {
         match self {
             Built::Claimed { ctx, .. } => format!("in workflow {}", ctx.workflow_id()).into(),
-            Built::Nested {
-                workflow_id,
-                marker: Some(_),
-            } => format!("inside a step of workflow {workflow_id}").into(),
-            Built::Nested { workflow_id, .. } => format!("in workflow {workflow_id}").into(),
+            Built::Nested { workflow_id, .. } => {
+                format!("inside a step of workflow {workflow_id}").into()
+            }
             Built::Outside => "outside a workflow".into(),
         }
     }
 }
 
 /// How to describe where a step is being polled.
-///
-/// **The in-step flag is deliberately not consulted.** It is one `AtomicBool` for the whole
-/// workflow, so a sibling branch's running body sets it while this one is first polled — reading it
-/// here would refuse exactly the concurrent steps the eager id exists to permit.
 fn polled_in(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
     match ctx {
         Some(ctx) if ctx.step_marker().is_some() => {
@@ -516,8 +513,8 @@ where
     E: DurableError,
 {
     let name = &*name;
-    // Compared by workflow identity only — `polled_in` says why the in-step flag cannot be part of
-    // this.
+    // Compared by workflow identity and by the per-call-stack step marker, both of which a
+    // concurrently running sibling leaves alone.
     let ambient = Ctx::current();
     let (ctx, step_id) = match (&built, ambient.as_ref()) {
         // The ordinary durable case: built at a step boundary of this workflow, polled at one.
@@ -536,7 +533,7 @@ where
                 marker,
             },
             Some(here),
-        ) if here.workflow_id() == workflow_id && here.step_marker() == *marker => {
+        ) if here.workflow_id() == workflow_id && here.step_marker() == Some(*marker) => {
             tracing::debug!(
                 step_name = name,
                 "the step body runs plainly: it was built inside another step"
