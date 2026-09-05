@@ -490,12 +490,7 @@ async fn launches_driven_together_take_ids_in_build_order() {
     let db = test_database().await;
     let dbos = DBOS::new(config("joined-fan-out-app", &db));
     let child = dbos
-        .register_workflow("child", |n: u32| async move {
-            // The later-built children finish first, so a poll-time id would be assigned in the
-            // opposite order to the build.
-            tokio::time::sleep(Duration::from_millis(100 * (3 - n as u64))).await;
-            Ok::<u32, Error>(n)
-        })
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n) })
         .unwrap();
     let parent = dbos
         .register_workflow("parent", move |()| {
@@ -507,7 +502,9 @@ async fn launches_driven_together_take_ids_in_build_order() {
                     (Some(0), Some(1), Some(2)),
                     "the ids are taken at the call, in source order"
                 );
-                let (a, b, c) = tokio::join!(a, b, c);
+                // Driven in the opposite order to the build: `join!` first-polls its branches in
+                // source order, so an id taken at the first poll would number these c, b, a.
+                let (c, b, a) = tokio::join!(c, b, a);
                 let (a, b, c) = (
                     a.map_err(Error::lift)?,
                     b.map_err(Error::lift)?,
