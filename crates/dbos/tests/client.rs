@@ -17,7 +17,7 @@ use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
     EnqueueOptions, Error, ForkFrom, ForkOptions, Message, QueueChange, QueueConflict,
-    QueueOptions, SendOptions, StartOptions, WorkflowHandle,
+    QueueOptions, SendAllOptions, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -424,24 +424,26 @@ async fn a_message_waits_for_its_destination() {
     let id = destination.workflow_id().to_owned();
 
     client
-        .send(Message {
-            topic: Some("approvals"),
-            ..Message::new(&id, &"approved")
-        })
+        .send_with(
+            &id,
+            &"approved",
+            SendOptions {
+                topic: Some("approvals"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("send failed");
+    let once = SendOptions {
+        idempotency_key: Some("once"),
+        ..Default::default()
+    };
+    client
+        .send_with(&id, &"only once", once)
         .await
         .expect("send failed");
     client
-        .send(Message {
-            idempotency_key: Some("once"),
-            ..Message::new(&id, &"only once")
-        })
-        .await
-        .expect("send failed");
-    client
-        .send(Message {
-            idempotency_key: Some("once"),
-            ..Message::new(&id, &"only once")
-        })
+        .send_with(&id, &"only once", once)
         .await
         .expect("a resend under a held key is a no-op, not an error");
 
@@ -490,7 +492,7 @@ async fn a_batch_of_messages_lands_together() {
                 Message::new(&second, &"two"),
                 Message::new(&first, &"three"),
             ],
-            SendOptions::default(),
+            SendAllOptions::default(),
         )
         .await
         .expect("send failed");
@@ -521,7 +523,7 @@ async fn a_batch_of_messages_lands_together() {
                 Message::new(&first, &"four"),
                 Message::new("no-such-workflow", &"five"),
             ],
-            SendOptions::default(),
+            SendAllOptions::default(),
         )
         .await
         .expect_err("a message addressed to nothing should fail");

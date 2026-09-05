@@ -6,7 +6,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error, Forks, Message, SendOptions};
+use dbos::{Config, DBOS, Error, Forks, SendOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -83,8 +83,7 @@ async fn a_message_from_outside_reaches_a_waiting_workflow() {
 
     // The send races the workflow reaching its receive, deliberately: a message that arrives first
     // waits in the database, so both orderings must deliver.
-    let payload = "approved".to_owned();
-    dbos.send(Message::new(&workflow_id, &payload))
+    dbos.send(&workflow_id, &"approved")
         .await
         .expect("send failed");
 
@@ -137,11 +136,14 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
         .await
         .expect("the workflow never reached its gate");
 
-    let payload = "yes".to_owned();
-    dbos.send(Message {
-        topic: Some("approvals"),
-        ..Message::new(&workflow_id, &payload)
-    })
+    dbos.send_with(
+        &workflow_id,
+        &"yes",
+        SendOptions {
+            topic: Some("approvals"),
+            ..Default::default()
+        },
+    )
     .await
     .expect("send failed");
     release_gate.notify_one();
@@ -188,11 +190,10 @@ async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
     let handle = receives.start(()).await.expect("start failed");
     let workflow_id = handle.workflow_id().to_owned();
     // Two messages, so a replay that took another would visibly take the second.
-    let (first, second) = ("first".to_owned(), "second".to_owned());
-    dbos.send(Message::new(&workflow_id, &first))
+    dbos.send(&workflow_id, &"first")
         .await
         .expect("send failed");
-    dbos.send(Message::new(&workflow_id, &second))
+    dbos.send(&workflow_id, &"second")
         .await
         .expect("send failed");
 
@@ -252,8 +253,7 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
         dbos.register_workflow("sends", move |destination: String| {
             let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
             async move {
-                let payload = "hello".to_owned();
-                dbos::send(Message::new(&destination, &payload)).await?;
+                dbos::send(&destination, &"hello").await?;
                 reached.notify_one();
                 release.notified().await;
                 Ok::<_, dbos::Error>(())
@@ -335,8 +335,7 @@ async fn a_step_may_send_but_may_not_receive() {
             dbos::step("write", || {
                 let destination = destination.clone();
                 async move {
-                    let payload = "hello".to_owned();
-                    dbos::send(Message::new(&destination, &payload)).await?;
+                    dbos::send(&destination, &"hello").await?;
                     Ok(())
                 }
             })
@@ -421,8 +420,7 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
     };
 
     // The default addresses the destination alone.
-    let skipped = "skipped".to_owned();
-    dbos.send(Message::new(&original_id, &skipped))
+    dbos.send(&original_id, &"skipped")
         .await
         .expect("send failed");
     assert_eq!(delivered(&original_id).await, 1);
@@ -433,13 +431,12 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
     );
 
     // Asking for the fan-out reaches both.
-    let included = "included".to_owned();
     dbos.send_with(
-        Message::new(&original_id, &included),
-        // Written out rather than with `..Default::default()`: clippy rejects a struct update
-        // that fills in nothing, which is true only while this type has one field.
+        &original_id,
+        &"included",
         SendOptions {
             forks: Forks::Include,
+            ..Default::default()
         },
     )
     .await
