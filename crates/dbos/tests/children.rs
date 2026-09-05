@@ -9,7 +9,7 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
     Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueConflict, QueueOptions, RunOptions,
-    StartOptions, Timeout, WorkflowRef,
+    StartOptions, StepOptions, Timeout, WorkflowRef,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -1006,6 +1006,67 @@ async fn a_losing_step_has_its_cancellation_token_fired() {
     tokio::time::timeout(Duration::from_secs(5), released.notified())
         .await
         .expect("the losing step's token never fired");
+
+    dbos.shutdown().await;
+}
+
+/// **A step that completes leaves its token alone.** The token says the attempt was *abandoned*,
+/// not that the step is over: a body that reached an outcome had its chance to clean up, and work
+/// it deliberately left running is not the engine's to stop. Both return paths are checked — a
+/// plain step, and one carrying a watchdog it finished well inside.
+#[tokio::test]
+async fn a_completed_step_leaves_its_cancellation_token_alone() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("completed-token-app", &db));
+    let plain = Arc::new(std::sync::Mutex::new(None));
+    let watched = Arc::new(std::sync::Mutex::new(None));
+    let workflow = {
+        let (plain, watched) = (Arc::clone(&plain), Arc::clone(&watched));
+        dbos.register_workflow("workflow", move |()| {
+            let (plain, watched) = (Arc::clone(&plain), Arc::clone(&watched));
+            async move {
+                let remember = |slot: Arc<std::sync::Mutex<Option<_>>>| {
+                    move || {
+                        let slot = Arc::clone(&slot);
+                        async move {
+                            *slot.lock().unwrap() =
+                                Some(dbos::Ctx::current().expect("in a step").cancellation());
+                            Ok::<u32, Error>(1)
+                        }
+                    }
+                };
+                dbos::step("plain", remember(Arc::clone(&plain))).await?;
+                dbos::step_with(
+                    "watched",
+                    StepOptions {
+                        timeout: Some(Duration::from_secs(30)),
+                        ..Default::default()
+                    },
+                    remember(Arc::clone(&watched)),
+                )
+                .await?;
+                // Read once each step has returned. The guard disarms on the way out, so a token
+                // a completed body handed to its own background work stays quiet.
+                let fired =
+                    |slot: &std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>| {
+                        slot.lock()
+                            .unwrap()
+                            .as_ref()
+                            .expect("the body ran")
+                            .is_cancelled()
+                    };
+                Ok::<(bool, bool), Error>((fired(&plain), fired(&watched)))
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    assert_eq!(
+        workflow.run(()).await.expect("the workflow failed"),
+        (false, false),
+        "a step that completed cancelled its own token"
+    );
 
     dbos.shutdown().await;
 }
