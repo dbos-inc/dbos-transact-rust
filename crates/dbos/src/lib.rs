@@ -107,13 +107,13 @@ pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]
-pub use step::{PendingStep, ShouldRetry, StepOptions, step, step_with};
+pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit, WorkflowDelay};
 #[cfg(feature = "engine")]
 pub use wait::{join_workflows, select_workflow};
 
-/// Races these steps and runs the arm belonging to the one that finishes first.
+/// Races these durable calls and runs the arm belonging to the one that finishes first.
 ///
 /// The durable race, and the reason a plain `tokio::select!` over steps is a trap rather than a
 /// shortcut. Since a step takes its id when it is *built*, a `select!` over steps allocates ids
@@ -142,7 +142,25 @@ pub use wait::{join_workflows, select_workflow};
 /// An arm is `binding = step => expression`, and the comma between arms follows `match`'s rule
 /// exactly: optional after a body that ends in a block, required otherwise.
 ///
-/// # A branch is an expression, and exactly one step
+/// # A branch is a step, a launch, or an await
+///
+/// A branch is any [`Pending`]: a [`step`], a child's [`start`](WorkflowRef::start), or a
+/// handle's [`result`](WorkflowHandle::result). Each checkpoints itself under the id it was built
+/// with, and each replays from its own row when it is the recorded winner, so a race across a step
+/// and a child is as durable as one across two steps.
+///
+/// **What losing means differs by kind, and only a step loses cleanly.** A losing step is dropped
+/// mid-body and records nothing, so a replay never runs it. A losing launch is dropped as a
+/// *future* and not as a workflow: if it was polled far enough to write its row, the child is
+/// running, durably, and nobody is waiting for it. A losing await is a dropped wait on a child that
+/// likewise keeps going. Neither is cancelled by losing — cancel from the winning arm if abandoning
+/// the loser is the intent.
+///
+/// **A [`run`](WorkflowRef::run) is refused, by type.** It returns a [`PendingRun`] rather than a
+/// `Pending`, because it holds two ids and a losing run is a child that was started and recorded
+/// whose outcome the parent will never learn. Race the `start`, and await the handle in the arm.
+///
+/// # A branch is an expression, and exactly one call
 ///
 /// **An expression, where [`select_workflow!`](macro@crate::select_workflow) needs a variable.**
 /// That looks like the pair disagreeing and is not: a workflow handle is named twice, once for its
@@ -151,10 +169,10 @@ pub use wait::{join_workflows, select_workflow};
 /// builds it, owns it, polls it, drops it — so the hazard does not exist here and the form that
 /// reads like `tokio::select!` is available.
 ///
-/// **Exactly one step, not a block containing several.** The branches are built before any is
-/// polled, which is what fixes their ids; an `async` block would defer the steps inside it to its
+/// **Exactly one call, not a block containing several.** The branches are built before any is
+/// polled, which is what fixes their ids; an `async` block would defer the calls inside it to its
 /// first poll and put their ids back on poll order. Work needing several steps in one branch is a
-/// child workflow, which has a counter of its own.
+/// child workflow, which has a counter of its own — and its `start` can be the branch.
 ///
 /// # What it refuses, and why each refusal is the design
 ///
@@ -204,4 +222,4 @@ pub mod __private {
     pub use crate::select::{Branches, Racing, Recording, check_select, record_select};
 }
 #[cfg(feature = "engine")]
-pub use workflow::{DuplicationPolicy, Enqueue, RunOptions, StartOptions, Timeout};
+pub use workflow::{DuplicationPolicy, Enqueue, PendingRun, RunOptions, StartOptions, Timeout};

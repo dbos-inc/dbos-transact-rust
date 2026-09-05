@@ -749,7 +749,7 @@ where
     ///
     /// Called from inside a running workflow this runs a **child** of it, and takes two of the
     /// parent's step ids rather than one — see [`start_with`](Self::start_with).
-    pub fn run(&self, input: P) -> Pending<'_, Result<R, E>> {
+    pub fn run(&self, input: P) -> PendingRun<'_, R, E> {
         self.run_with(input, RunOptions::default())
     }
 
@@ -762,9 +762,12 @@ where
     /// launch's as it is called, and the await's is claimed right behind it, before anything is
     /// polled — so a `join!` over several `run`s numbers them exactly as a sequence of
     /// `run(..).await`s would: `{launch, await}` pairs in build order, with no await id decided by
-    /// which child happened to be recorded first. [`step_id`](Pending::step_id) reports the
+    /// which child happened to be recorded first. [`step_id`](PendingRun::step_id) reports the
     /// launch's.
-    pub fn run_with<'a>(&'a self, input: P, options: RunOptions<'a>) -> Pending<'a, Result<R, E>> {
+    ///
+    /// Returns a [`PendingRun`] rather than a [`Pending`], and the difference is what
+    /// [`select_step!`](crate::select_step) accepts — see that type.
+    pub fn run_with<'a>(&'a self, input: P, options: RunOptions<'a>) -> PendingRun<'a, R, E> {
         let start = self.start_with(input, options.into());
         // The same placement `result()` would take, taken now rather than when the handle exists.
         // An unlaunched instance is reported by the launch, which fails first.
@@ -772,10 +775,11 @@ where
             .dbos()
             .executor("run a workflow")
             .and_then(|executor| Awaiting::of(executor.connection()));
-        Pending::new(start.step_id(), async move {
+        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        PendingRun(Pending::new(name, start.step_id(), async move {
             let handle = start.await.map_err(Error::lift)?;
             handle.result_at(awaiting).await
-        })
+        }))
     }
 
     /// The running workflow this call is a child of, or `None` when it is a root.
@@ -840,7 +844,7 @@ where
     ///
     /// Called from inside a running workflow this starts a **child** of it — see
     /// [`start_with`](Self::start_with) for what that records and what it costs.
-    pub fn start(&self, input: P) -> Pending<'_, Result<WorkflowHandle<R, E>>> {
+    pub fn start(&self, input: P) -> Pending<'_, WorkflowHandle<R, E>> {
         self.start_with(input, StartOptions::default())
     }
 
@@ -905,15 +909,21 @@ where
     /// `#[must_use]` is for. And a launch is polled where it was built: one carried into another
     /// workflow, or built outside one and polled inside, is refused as
     /// [`Error::StepBuiltElsewhere`] rather than recorded under the wrong id, the same rule a
-    /// [`PendingStep`](crate::PendingStep) follows.
+    /// step follows.
+    ///
+    /// **A launch may be a branch of [`select_step!`](crate::select_step)**, since it is a
+    /// [`Pending`] like a step is. A launch that loses the race is dropped as a future and not as
+    /// a workflow: its child keeps running, durably, and the parent never awaits it unless the code
+    /// does so on purpose. Cancel it from the winning arm if abandoning it is the intent.
     pub fn start_with<'a>(
         &'a self,
         input: P,
         options: StartOptions<'a>,
-    ) -> Pending<'a, Result<WorkflowHandle<R, E>>> {
+    ) -> Pending<'a, WorkflowHandle<R, E>> {
         let launch = self.claim_launch(&options);
         let step_id = launch.as_ref().ok().and_then(Launch::step_id);
-        Pending::new(step_id, self.launch(launch, input, options))
+        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        Pending::new(name, step_id, self.launch(launch, input, options))
     }
 
     /// The rest of a launch: everything after the id is claimed.
@@ -1141,6 +1151,51 @@ where
             workflow_id,
             task,
         ))
+    }
+}
+
+/// A [`run`](WorkflowRef::run) that has taken both of its step ids and has not started.
+///
+/// A [`Pending`] in everything but name, and the name is the point: **this is the one durable
+/// call [`select_step!`](crate::select_step) refuses**, and it refuses it by type. A run holds two
+/// ids — a launch and an await — and a run that *loses* a race is a child that was started and
+/// recorded and whose outcome the parent will never learn, which is never what a race meant.
+/// Race a [`start`](WorkflowRef::start) instead, and await the handle from the arm that wants it.
+///
+/// Everything else a `Pending` offers is here: `Future`, `Unpin`, `Send`, `#[must_use]`, and
+/// [`step_id`](Self::step_id), which reports the launch's — the await's is the next one.
+#[must_use = "a run that is not awaited has spent two step ids without starting; await it, or \
+              hand it to a combinator"]
+pub struct PendingRun<'a, R, E>(Pending<'a, R, E>);
+
+impl<R, E> PendingRun<'_, R, E> {
+    /// The child workflow's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    /// The launch's step id, or `None` outside a workflow. The await's is the one after it.
+    #[must_use]
+    pub fn step_id(&self) -> Option<i32> {
+        self.0.step_id()
+    }
+}
+
+impl<R, E> Future for PendingRun<'_, R, E> {
+    type Output = Result<R, E>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
+impl<R, E> std::fmt::Debug for PendingRun<'_, R, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PendingRun").field(&self.0).finish()
     }
 }
 

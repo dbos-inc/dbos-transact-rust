@@ -45,52 +45,104 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// A durable call that has taken its step id and has not run.
 ///
-/// The non-step counterpart of [`PendingStep`](crate::PendingStep), and the same bargain: the id
-/// is spent at the call rather than at the first poll, so a set of launches or awaits built in
-/// source order and then driven together — `tokio::join!` over three `start`s — takes the same
-/// slots on a replay however their bodies interleave. Before this, every such call was an
-/// `async fn` that read the counter when first polled, and a `join!` over them was documented as
-/// a trap.
+/// Returned by [`step`](crate::step) and [`step_with`](crate::step_with), by
+/// [`start`](crate::WorkflowRef::start) and [`start_with`](crate::WorkflowRef::start_with), and by
+/// [`WorkflowHandle::result`](crate::WorkflowHandle::result). Awaiting one runs it — so
+/// `step(..).await?` and `child.start(n).await?` read as they always did. What is different is that
+/// **the step id is spent at the call rather than at the first poll**, which is what lets a set of
+/// them be built first and driven together: `tokio::join!` over three launches, or
+/// [`select_step!`](crate::select_step) over a step and a child, takes the same slots on a replay
+/// however the futures interleave.
 ///
-/// One type over a `T` rather than one per call, because the three calls that return it differ
-/// only in what comes out: a handle, a result, or both. `Unpin` and `Send` for the reason
-/// `PendingStep` is — a combinator can hold one by value and poll it through `&mut`.
-#[must_use = "a durable call that is not awaited has spent its step id without running; await it,               or hand it to a combinator"]
-pub struct Pending<'a, T> {
+/// One type for all three producers rather than one each, because a combinator holding branches
+/// has no reason to care which it holds. What every producer supplies is the same: a name, which
+/// the replay compares against; the id it claimed, or `None` where there was none to claim; and
+/// the work, which does not start until something polls it.
+///
+/// **`Future` rather than `IntoFuture`**, because a step has to be accepted everywhere a future is:
+/// `tokio::time::timeout` around one, a combinator holding several. `IntoFuture` only ever reaches
+/// the `.await` itself.
+///
+/// **`#[must_use]` is load-bearing rather than tidy.** A built call that is never polled has still
+/// taken its id, so dropping one silently shifts nothing — every later id is what it would have
+/// been — but the call itself never runs and never records.
+///
+/// **`Unpin`, and that is part of the contract rather than an accident.** The run is already
+/// behind a `Pin<Box<..>>` and the other two fields are plain data, so a combinator can hold one
+/// by value, move it into a `Vec`, and poll it through `&mut` without pinning it first. A
+/// combinator that wants a whole set of branches is the caller this is for, and requiring it to
+/// pin each one would be the difference between a poll loop and a `pin!` per branch.
+///
+/// **Polled where it was built.** The id is a claim on one position in one workflow, so a call
+/// carried into another workflow, or built outside one and polled inside, is refused as
+/// [`Error::StepBuiltElsewhere`] rather than run under the wrong id. Each producer makes that
+/// check inside its own run, which is why nothing here knows how.
+#[must_use = "a durable call that is not awaited has spent its step id without running; await it, \
+              or hand it to a combinator"]
+pub struct Pending<'a, T, E = crate::EngineOnly> {
+    /// What the call is called — the step's name, the child workflow's, or `DBOS.getResult` —
+    /// which is the name its checkpoint is checked against on replay.
+    name: Arc<str>,
+    /// The id this call claimed when it was built, or `None` where it claimed none.
     step_id: Option<i32>,
-    running: Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+    /// The run, built by the constructor and driven by whatever polls this.
+    ///
+    /// An `async fn` body does not begin until it is polled, so the future is built where the id
+    /// is taken and this field is the whole of what runs. The two above it are identity, not
+    /// state: nothing reads them to decide what happens, and nothing mutates them.
+    running: Pin<Box<dyn Future<Output = crate::Result<T, E>> + Send + 'a>>,
 }
 
-impl<'a, T> Pending<'a, T> {
-    pub(crate) fn new(step_id: Option<i32>, running: impl Future<Output = T> + Send + 'a) -> Self {
+impl<'a, T, E> Pending<'a, T, E> {
+    pub(crate) fn new(
+        name: Arc<str>,
+        step_id: Option<i32>,
+        running: impl Future<Output = crate::Result<T, E>> + Send + 'a,
+    ) -> Self {
         Self {
+            name,
             step_id,
             running: Box::pin(running),
         }
     }
 
-    /// The step id this call claimed when it was built, or `None` if it claimed none.
+    /// What this call is called — the name its checkpoint will be checked against on replay.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The id this call claimed when it was built, or `None` if it claimed none.
     ///
-    /// `None` is not a failure: outside a workflow there is no counter, and a call that was refused
-    /// at build — inside a step, or against the wrong instance — reports that when polled rather
-    /// than here.
+    /// `None` is not a failure. Outside a workflow there is no counter; a step inside another step
+    /// is a plain call by the leaf rule; an await through a [`Client`](crate::Client)'s connection
+    /// has no counter to agree with. A call that was *refused* at build — a launch inside a step,
+    /// or against the wrong instance — reports that when polled rather than here.
+    ///
+    /// **Readable here because the run cannot be asked.** Once the call is a future the id is
+    /// sealed inside it, and the callers that need to *name* one are all outside it — a race
+    /// reporting which branch a stale checkpoint meant, a dropped reservation saying which id it
+    /// burned, a `Debug` that says something.
     #[must_use]
     pub fn step_id(&self) -> Option<i32> {
         self.step_id
     }
 }
 
-impl<T> Future for Pending<'_, T> {
-    type Output = T;
+impl<T, E> Future for Pending<'_, T, E> {
+    type Output = crate::Result<T, E>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<T> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         self.get_mut().running.as_mut().poll(cx)
     }
 }
 
-impl<T> std::fmt::Debug for Pending<'_, T> {
+impl<T, E> std::fmt::Debug for Pending<'_, T, E> {
+    /// Hand-written because the run is a boxed future with nothing to show. What is worth showing
+    /// is the identity, which is why it is on the value.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pending")
+            .field("name", &self.name)
             .field("step_id", &self.step_id)
             .finish_non_exhaustive()
     }
@@ -173,7 +225,7 @@ impl Placement {
     /// Refuses to run where this placement was not built.
     ///
     /// The id is a claim on *one position in one workflow*, taken at build, and the same two
-    /// silent failures [`PendingStep`](crate::PendingStep) refuses apply here: built outside a
+    /// silent failures a step's own run refuses apply here: built outside a
     /// workflow and polled inside one, the call would run unrecorded where a checkpoint was
     /// expected; built in one workflow and polled in another, the row would land under the wrong
     /// workflow's id. `Uncheckpointed` is not checked — it records nothing wherever it runs, and

@@ -35,11 +35,11 @@
 
 use std::marker::PhantomData;
 
+use crate::checkpoint::Pending;
 use crate::checkpoint::Placement;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{decode, encode};
-use crate::step::PendingStep;
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 
 /// What [`check_select`] found: a winner already recorded, or a race still to run.
@@ -107,9 +107,12 @@ impl<E> Branches<E> {
 
     /// Records what this branch is called and which id it claimed, in build order.
     ///
-    /// Takes the step by reference: a branch is about to be raced, so this may not consume it,
-    /// and `T` is free per call while `E` is fixed by the set.
-    pub fn push<T>(&mut self, step: &PendingStep<'_, T, E>) {
+    /// Takes the branch by reference: it is about to be raced, so this may not consume it, and
+    /// `T` is free per call while `E` is fixed by the set.
+    ///
+    /// **Any [`Pending`], which is a step, a launch, or an await** — and not a
+    /// [`PendingRun`](crate::PendingRun), which is a different type for exactly this reason.
+    pub fn push<T>(&mut self, step: &Pending<'_, T, E>) {
         self.identities
             .push((step.name().to_owned(), step.step_id()));
     }
@@ -449,8 +452,7 @@ mod tests {
 
         // The inner step cannot be the outer one's *result* — a step's output must serialize — so
         // it leaves the body the way a real mistake would, through a slot the body can reach.
-        type Slot =
-            Arc<std::sync::Mutex<Option<crate::PendingStep<'static, u32, crate::EngineOnly>>>>;
+        type Slot = Arc<std::sync::Mutex<Option<crate::Pending<'static, u32, crate::EngineOnly>>>>;
         let smuggled: Slot = Arc::new(std::sync::Mutex::new(None));
 
         Ctx::scope(ctx(&dbos, "wf-carried-out"), {

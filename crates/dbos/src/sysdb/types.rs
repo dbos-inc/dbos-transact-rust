@@ -2292,7 +2292,7 @@ pub mod step_names {
     /// its step `"DBOS.select"` (`workflow.go:3082`), so the one other implementation with a
     /// durable race over steps writes the shorter string. This crate's call is `select_step!`,
     /// because a bare `select` in a Rust namespace reads as a future combinator where this one
-    /// takes only [`PendingStep`](crate::PendingStep)s, and the recorded name follows the call
+    /// takes only [`Pending`](crate::Pending)s, and the recorded name follows the call
     /// rather than diverging from it by a word.
     ///
     /// Python's could not have been borrowed at all: `asyncio_wait` records

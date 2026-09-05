@@ -18,7 +18,7 @@ use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
 use crate::serialization::{decode, encode};
-use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus};
+use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 
 /// A running — or finished — workflow, by id.
 ///
@@ -164,7 +164,7 @@ where
     /// **The step id is taken when this is called, not when the future is first polled.** That is
     /// what makes a set of handles awaited together — `tokio::join!` over three `result()`s —
     /// take the same slots on a replay however the children finish. See [`Pending`].
-    pub fn result(self) -> Pending<'static, Result<R, E>>
+    pub fn result(self) -> Pending<'static, R, E>
     where
         R: Send + 'static,
         E: Send + 'static,
@@ -173,6 +173,7 @@ where
         // await in the parent has to be the same on the replay as it was on the run.
         let awaiting = Awaiting::of(&self.conn);
         Pending::new(
+            Arc::from(step_names::GET_RESULT),
             awaiting
                 .as_ref()
                 .ok()
@@ -191,7 +192,7 @@ where
             Ok(awaiting) => awaiting,
             Err(wrong) => return Err(wrong.lift()),
         };
-        if let Err(elsewhere) = awaiting.0.check_here("DBOS.getResult") {
+        if let Err(elsewhere) = awaiting.0.check_here(step_names::GET_RESULT) {
             return Err(elsewhere.lift());
         }
         if let Some(recorded) = awaiting

@@ -3,7 +3,6 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -12,6 +11,7 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::checkpoint::Pending;
 use crate::context::{Ctx, StepMarker};
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
@@ -231,7 +231,7 @@ impl<E> StepOptions<E> {
 ///
 /// **Steps may run concurrently, and the id is what makes that sound.** This call takes the id
 /// from the workflow's counter *here*, in the caller's own sequential order, and hands back a
-/// [`PendingStep`] that has not run — so a set of steps built and then driven together gets the
+/// [`Pending`] that has not run — so a set of steps built and then driven together gets the
 /// same slots on a replay however their bodies interleave. `tokio::join!` over steps is therefore
 /// ordinary code: it builds every branch before polling any, which is exactly the order the ids
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
@@ -244,7 +244,7 @@ impl<E> StepOptions<E> {
 /// one branch is still better as a child workflow, which has a counter of its own, but that is a
 /// question of shape rather than of correctness.
 ///
-/// **A step built and dropped has still spent its id**, which is why [`PendingStep`] is
+/// **A step built and dropped has still spent its id**, which is why [`Pending`] is
 /// `#[must_use]`. It is deterministic — the same construction sequence burns the same ids on the
 /// replay — but it is no longer the no-op it was when the id was taken at the first poll.
 ///
@@ -257,7 +257,7 @@ impl<E> StepOptions<E> {
 /// `FnMut` unless it moves a captured value out — and a body that genuinely consumes what it
 /// captured fails to compile here rather than at its second attempt, which is where the mistake
 /// should be reported.
-pub fn step<'a, T, E, F, Fut>(name: &str, body: F) -> PendingStep<'a, T, E>
+pub fn step<'a, T, E, F, Fut>(name: &str, body: F) -> Pending<'a, T, E>
 where
     T: Serialize + DeserializeOwned + Send + 'a,
     E: DurableError + Send + 'a,
@@ -300,7 +300,7 @@ pub fn step_with<'a, T, E, F, Fut>(
     name: &str,
     options: StepOptions<E>,
     body: F,
-) -> PendingStep<'a, T, E>
+) -> Pending<'a, T, E>
 where
     T: Serialize + DeserializeOwned + Send + 'a,
     E: DurableError + Send + 'a,
@@ -326,101 +326,20 @@ where
     //
     // **The identity is kept on the value as well as inside the run**, which is the one thing here
     // that is stored twice. The run needs it to do its work; a caller holding the step needs it to
-    // *say what this is* — which branch of a race a stale checkpoint names, which reservation a
-    // dropped step burned, what a `Debug` prints. Sealed inside an `async fn`'s state none of that
-    // is reachable, and an `Arc<str>` makes the second copy a pointer rather than a string.
-    PendingStep {
-        name: Arc::clone(&name),
+    // *say what this is*, which is what `Pending` carries. An `Arc<str>` makes the second copy a
+    // pointer rather than a string.
+    Pending::new(
+        Arc::clone(&name),
         step_id,
-        running: Box::pin(run(
-            built,
-            name,
-            options,
-            Box::new(move || Box::pin(body())),
-        )),
-    }
+        run(built, name, options, Box::new(move || Box::pin(body()))),
+    )
 }
 
-/// A step that has taken its id and has not run.
-///
-/// Returned by [`step`] and [`step_with`], and awaiting one runs it — so `step(..).await?` reads as
-/// it always did. What changed is that the id is spent at the call rather than at the first poll,
-/// which is what lets a set of steps be built first and driven together.
-///
-/// **`Future` rather than `IntoFuture`**, because a step has to be accepted everywhere a future is:
-/// `tokio::time::timeout` around one, a combinator holding several. `IntoFuture` only ever reaches
-/// the `.await` itself.
-///
-/// **`#[must_use]` is load-bearing rather than tidy.** A built step that is never polled has still
-/// taken its id, so dropping one silently shifts nothing — every later id is what it would have
-/// been — but the step itself never runs and never records.
-///
-/// **`Unpin`, and that is part of the contract rather than an accident.** The run is already
-/// behind a `Pin<Box<..>>` and the other two fields are plain data, so a combinator can hold one
-/// by value, move it into a `Vec`, and poll it through `&mut` without pinning it first. A
-/// combinator that wants a whole set of branches is the caller this is for, and requiring it to
-/// pin each one would be the difference between a poll loop and a `pin!` per branch.
-#[must_use = "a step that is not awaited has spent its id without running; await it, or hand it to               a combinator"]
-pub struct PendingStep<'a, T, E> {
-    /// What the step is called, shared with the run rather than copied for it.
-    name: Arc<str>,
-    /// The id this step claimed when it was built, or `None` where it claimed none — outside a
-    /// workflow, or inside another step, where there is no checkpoint to make.
-    step_id: Option<i32>,
-    /// The run, built by the constructor and driven by whatever polls this.
-    ///
-    /// An `async fn` body does not begin until it is polled, so the future is built where the id
-    /// is taken and this field is the whole of what runs. The two above it are identity, not
-    /// state: nothing reads them to decide what happens, and nothing mutates them.
-    running: Running<'a, T, E>,
-}
-
-/// The erased run behind a [`PendingStep`].
+/// The erased run behind a step.
 type Running<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 
 /// The erased body, rebuilt per attempt — which is why it is `FnMut` and not `FnOnce`.
 type Body<'a, T, E> = Box<dyn FnMut() -> Running<'a, T, E> + Send + 'a>;
-
-impl<'a, T, E> PendingStep<'a, T, E> {
-    /// What this step is called — the name it will be checked against on replay.
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The id this step claimed when it was built, or `None` if it claimed none.
-    ///
-    /// `None` is not a failure: outside a workflow, and inside another step, a step is a plain call
-    /// with no checkpoint to make, so it takes no id and the counter does not move.
-    ///
-    /// **Readable here because the run cannot be asked.** Once the step is a future the id is
-    /// sealed inside it, and the callers that need to *name* a step are all outside it — a race
-    /// reporting which branch a stale checkpoint meant, a dropped reservation saying which id it
-    /// burned, a `Debug` that says something.
-    #[must_use]
-    pub fn step_id(&self) -> Option<i32> {
-        self.step_id
-    }
-}
-
-impl<T, E> Future for PendingStep<'_, T, E> {
-    type Output = Result<T, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().running.as_mut().poll(cx)
-    }
-}
-
-impl<T, E> std::fmt::Debug for PendingStep<'_, T, E> {
-    /// Hand-written because the run is a boxed closure with nothing to show. What is worth showing
-    /// is the identity, which is why it is on the value.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingStep")
-            .field("name", &self.name)
-            .field("step_id", &self.step_id)
-            .finish_non_exhaustive()
-    }
-}
 
 /// Where a step was built, which is what its id is a claim about.
 ///

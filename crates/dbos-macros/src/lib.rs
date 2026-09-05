@@ -249,7 +249,7 @@ fn expand(race: &Race) -> TokenStream2 {
                 ::core::result::Result::Ok(#at)
             }
             ::core::result::Result::Ok(::dbos::__private::Racing::Fresh(#recording)) => {
-                // `Pin::new` rather than `Box::pin`: a `PendingStep` is `Unpin`, which it
+                // `Pin::new` rather than `Box::pin`: a `Pending` is `Unpin`, which it
                 // documents as contract precisely so a combinator need not pin each branch.
                 let #at = ::core::future::poll_fn(|#cx| {
                     #(

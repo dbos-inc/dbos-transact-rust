@@ -656,9 +656,8 @@ async fn a_launch_built_outside_and_polled_inside_a_workflow_is_refused() {
 
     // Filled in after launch, since a launch needs a launched instance and a registration needs
     // one that is not yet launched.
-    type Smuggled = Arc<
-        std::sync::Mutex<Option<dbos::Pending<'static, dbos::Result<dbos::WorkflowHandle<u32>>>>>,
-    >;
+    type Smuggled =
+        Arc<std::sync::Mutex<Option<dbos::Pending<'static, dbos::WorkflowHandle<u32>>>>>;
     let smuggled: Smuggled = Arc::default();
     let parent = dbos
         .register_workflow("parent", {
@@ -711,6 +710,78 @@ async fn a_launch_built_outside_and_polled_inside_a_workflow_is_refused() {
             .expect("read failed")
             .is_empty(),
         "nothing was launched"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A race across a step and a child launch**, which `select_step!` accepts because both are
+/// `Pending`. The launch wins here; its row and the parent's launch record are written, the
+/// losing step records nothing, and the race records the winner's position. The winning arm then
+/// awaits the handle, which is a step of its own.
+#[tokio::test]
+async fn a_select_step_can_race_a_step_against_a_child_launch() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("race-child-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                let outcome: u32 = dbos::select_step! {
+                    slow = dbos::step("slow", || async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<u32, Error>(0)
+                    }) => slow?,
+                    started = child.start(()) => {
+                        // The launch won; awaiting its handle is the next step of the parent.
+                        started.map_err(Error::lift)?.result().await?
+                    }
+                }?;
+                Ok::<u32, Error>(outcome)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let outcome = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("raced"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(outcome, 7, "the launch won and the arm awaited the child");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("raced", false, None, None, None)
+        .await
+        .expect("read failed");
+    let positions: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.step_id,
+                step.step_name.as_str(),
+                step.child_workflow_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        [
+            // Id 0 is the losing step, built and dropped without a row.
+            (1, "child", Some("raced-1")),
+            (2, "DBOS.selectStep", None),
+            (3, "DBOS.getResult", Some("raced-1")),
+        ],
+        "the launch keeps its build-order id, the race records the winner, the arm's await follows"
     );
 
     dbos.shutdown().await;
