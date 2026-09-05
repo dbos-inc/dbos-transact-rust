@@ -138,7 +138,7 @@ where
     ctx.executor()
         .connection()
         .send(
-            &[Message::with_options(destination_id, message, options)],
+            &[Message::from_options(destination_id, message, options)],
             caller,
             options.forks,
         )
@@ -297,7 +297,7 @@ impl DBOS {
         executor
             .connection()
             .send(
-                &[Message::with_options(destination_id, message, options)],
+                &[Message::from_options(destination_id, message, options)],
                 ctx.as_ref().map(caller_for),
                 options.forks,
             )
@@ -468,7 +468,7 @@ impl crate::Client {
         // against and nothing to replay it for.
         self.connection()
             .send(
-                &[Message::with_options(destination_id, message, options)],
+                &[Message::from_options(destination_id, message, options)],
                 None,
                 options.forks,
             )
@@ -558,7 +558,7 @@ impl<'a, T> Message<'a, T> {
     /// The one place [`SendOptions`] and [`Message`] meet, and the whole of what a single send adds
     /// over a batch of one — which is why there is no layer between the surfaces and
     /// [`Connection::send`] beyond this and [`caller_for`].
-    pub(crate) fn with_options(
+    pub(crate) fn from_options(
         destination_id: &'a str,
         message: &'a T,
         options: SendOptions<'a>,
