@@ -63,7 +63,7 @@
 //! **The checkpoint commits with the operation**, in one transaction, because the step id travels
 //! down into the system database rather than wrapping the call here — see
 //! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows), and
-//! [`caller_for`] for the two lines that spend the id. Nothing in this module records a step of
+//! [`Pending::placed`] for where the id it spent is handed down. Nothing in this module records a step of
 //! its own, and there is no wrapper left to record one: the atomic version costs the same round
 //! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
 //! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
@@ -111,14 +111,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::checkpoint::{Pending, Placement};
 use crate::connection::Connection;
-use crate::context::Ctx;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
     Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord,
+    WorkflowRecord, step_names,
 };
 
 /// Whether an operation reaches a workflow's descendants.
@@ -280,21 +280,13 @@ impl DBOS {
     /// **The launch check comes first**, as every method on this surface expects: an unlaunched
     /// instance should say so whatever else is wrong with the call.
     ///
-    /// The context is returned rather than the caller pair, and held in a local at each call
-    /// site, because [`caller_for`] borrows from it — and because allocating the step id is what
-    /// spends it, which must not happen before a call's own argument checks have passed.
-    fn checked_executor(&self, operation: &'static str) -> Result<(Arc<Executor>, Option<Ctx>)> {
-        let executor = self.executor(operation)?;
-        let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
-        if ctx
-            .as_ref()
-            .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
-        {
-            return Err(Error::WrongInstance {
-                operation: operation.into(),
-            });
-        }
-        Ok((executor, ctx))
+    /// **The step id is spent here, at the call and not at the first poll**, which is what
+    /// [`Placement::of`] does and what lets a management call be built beside a step and driven
+    /// together. A call with its own argument checks makes them before calling this, because
+    /// spending the id is what must not happen for a call that is refused —
+    /// [`fork_all`](Self::fork_all) is the one that has any.
+    fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, Placement)> {
+        Placement::taken(self.executor(operation), operation)
     }
 
     /// A handle to a workflow this process did not start.
@@ -372,9 +364,18 @@ impl DBOS {
     /// dbos.cancel("runaway-workflow").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn cancel(&self, workflow_id: &str) -> Result<()> {
-        self.cancel_all(&[workflow_id], Children::Skip).await?;
-        Ok(())
+    pub fn cancel<'a>(&'a self, workflow_id: &'a str) -> Pending<'a, ()> {
+        Pending::placed(
+            step_names::CANCEL_WORKFLOW,
+            self.placed("cancel a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .cancel_all(&[workflow_id], Children::Skip, placement.step())
+                    .await?;
+                Ok(())
+            },
+        )
     }
 
     /// Cancels workflows, and optionally everything descended from them.
@@ -396,16 +397,21 @@ impl DBOS {
     /// dbos.cancel_all(&["fan-out-root"], dbos::Children::Include).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn cancel_all(
-        &self,
-        workflow_ids: &[&str],
+    pub fn cancel_all<'a>(
+        &'a self,
+        workflow_ids: &'a [&'a str],
         children: Children,
-    ) -> Result<Vec<String>> {
-        let (executor, ctx) = self.checked_executor("cancel a workflow")?;
-        executor
-            .connection()
-            .cancel_all(workflow_ids, children, ctx.as_ref().map(caller_for))
-            .await
+    ) -> Pending<'a, Vec<String>> {
+        Pending::placed(
+            step_names::CANCEL_WORKFLOW,
+            self.placed("cancel a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .cancel_all(workflow_ids, children, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
@@ -451,9 +457,12 @@ impl DBOS {
     /// let handle = dbos.resume::<u32, dbos::EngineOnly>("stalled-workflow").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn resume<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
+    pub fn resume<'a, R, E>(&'a self, workflow_id: &'a str) -> Pending<'a, WorkflowHandle<R, E>>
+    where
+        R: 'a,
+        E: 'a,
+    {
         self.resume_with(workflow_id, ResumeOptions::default())
-            .await
     }
 
     /// Resumes a workflow onto a queue of the caller's choosing.
@@ -469,15 +478,29 @@ impl DBOS {
     /// ).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn resume_with<R, E>(
-        &self,
-        workflow_id: &str,
-        options: ResumeOptions<'_>,
-    ) -> Result<WorkflowHandle<R, E>> {
-        self.resume_all(&[workflow_id], options)
-            .await?
-            .pop()
-            .ok_or_else(|| Error::Config(format!("resuming `{workflow_id}` produced no handle")))
+    pub fn resume_with<'a, R, E>(
+        &'a self,
+        workflow_id: &'a str,
+        options: ResumeOptions<'a>,
+    ) -> Pending<'a, WorkflowHandle<R, E>>
+    where
+        R: 'a,
+        E: 'a,
+    {
+        Pending::placed(
+            step_names::RESUME_WORKFLOW,
+            self.placed("resume a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .resume_all(&[workflow_id], options, placement.step())
+                    .await?
+                    .pop()
+                    .ok_or_else(|| {
+                        Error::Config(format!("resuming `{workflow_id}` produced no handle"))
+                    })
+            },
+        )
     }
 
     /// Resumes workflows, handing back one handle per id, in the order given.
@@ -491,28 +514,40 @@ impl DBOS {
     /// correctly. Python and Java draw the same line on the batch; **Go deliberately does not**,
     /// and says so — its `ResumeWorkflows` skips a missing id where its `ResumeWorkflow` refuses
     /// one. Following Python here keeps the batch and the single form answering the same way.
-    pub async fn resume_all<R, E>(
-        &self,
-        workflow_ids: &[&str],
-        options: ResumeOptions<'_>,
-    ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        let (executor, ctx) = self.checked_executor("resume a workflow")?;
-        executor
-            .connection()
-            .resume_all(workflow_ids, options, ctx.as_ref().map(caller_for))
-            .await
+    pub fn resume_all<'a, R, E>(
+        &'a self,
+        workflow_ids: &'a [&'a str],
+        options: ResumeOptions<'a>,
+    ) -> Pending<'a, Vec<WorkflowHandle<R, E>>>
+    where
+        R: 'a,
+        E: 'a,
+    {
+        Pending::placed(
+            step_names::RESUME_WORKFLOW,
+            self.placed("resume a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .resume_all(workflow_ids, options, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Forks a workflow from `from`, enqueueing the fork and handing back a handle to it.
     ///
     /// [`fork_with`](Self::fork_with) for the options; this is the common case.
-    pub async fn fork<R, E>(
-        &self,
-        workflow_id: &str,
-        from: ForkFrom<'_>,
-    ) -> Result<WorkflowHandle<R, E>> {
+    pub fn fork<'a, R, E>(
+        &'a self,
+        workflow_id: &'a str,
+        from: ForkFrom<'a>,
+    ) -> Pending<'a, WorkflowHandle<R, E>>
+    where
+        R: 'a,
+        E: 'a,
+    {
         self.fork_with(workflow_id, from, ForkOptions::default())
-            .await
     }
 
     /// Forks a workflow, choosing what the fork inherits and where it runs.
@@ -546,25 +581,36 @@ impl DBOS {
     /// ).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn fork_with<R, E>(
-        &self,
-        workflow_id: &str,
-        from: ForkFrom<'_>,
-        options: ForkOptions<'_>,
-    ) -> Result<WorkflowHandle<R, E>> {
-        let (executor, ctx) = self.checked_executor("fork a workflow")?;
-        executor
-            .connection()
-            .fork_all(
-                &[workflow_id],
-                from,
-                options.forked_id,
-                &options,
-                ctx.as_ref().map(caller_for),
-            )
-            .await?
-            .pop()
-            .ok_or_else(|| Error::Config(format!("forking `{workflow_id}` produced no workflow")))
+    pub fn fork_with<'a, R, E>(
+        &'a self,
+        workflow_id: &'a str,
+        from: ForkFrom<'a>,
+        options: ForkOptions<'a>,
+    ) -> Pending<'a, WorkflowHandle<R, E>>
+    where
+        R: 'a,
+        E: 'a,
+    {
+        Pending::placed(
+            step_names::FORK_WORKFLOW,
+            self.placed("fork a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .fork_all(
+                        &[workflow_id],
+                        from,
+                        options.forked_id,
+                        &options,
+                        placement.step(),
+                    )
+                    .await?
+                    .pop()
+                    .ok_or_else(|| {
+                        Error::Config(format!("forking `{workflow_id}` produced no workflow"))
+                    })
+            },
+        )
     }
 
     /// Forks workflows from the same point, handing back a handle to each fork in the order given.
@@ -584,27 +630,34 @@ impl DBOS {
     /// option applies to the whole batch, which is what makes
     /// [`app_version`](ForkOptions::app_version) useful — re-running a fan-out
     /// against the deployment that fixes it is the case this method exists for.
-    pub async fn fork_all<R, E>(
-        &self,
-        workflow_ids: &[&str],
-        from: ForkFrom<'_>,
-        options: ForkOptions<'_>,
-    ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        // Which instance is serving this, and whether a workflow is asking — before the
-        // argument checks, as every other method on this surface does: an unlaunched instance,
-        // or one that is not the caller's, should say so whatever else is wrong with the call.
-        let (executor, ctx) = self.checked_executor("fork a workflow")?;
-        refuse_forked_id_in_bulk(&options)?;
-        executor
-            .connection()
-            .fork_all(
-                workflow_ids,
-                from,
-                None,
-                &options,
-                ctx.as_ref().map(caller_for),
-            )
-            .await
+    pub fn fork_all<'a, R, E>(
+        &'a self,
+        workflow_ids: &'a [&'a str],
+        from: ForkFrom<'a>,
+        options: ForkOptions<'a>,
+    ) -> Pending<'a, Vec<WorkflowHandle<R, E>>>
+    where
+        R: 'a,
+        E: 'a,
+    {
+        // The launch check first, as every other method on this surface does: an unlaunched
+        // instance should say so whatever else is wrong with the call. The argument check comes
+        // before the placement, because the placement is what spends the step id and a call
+        // refused for its arguments must not move the counter.
+        let built = self.executor("fork a workflow").and_then(|executor| {
+            refuse_forked_id_in_bulk(&options)?;
+            Placement::taken(Ok(executor), "fork a workflow")
+        });
+        Pending::placed(
+            step_names::FORK_WORKFLOW,
+            built,
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .fork_all(workflow_ids, from, None, &options, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Removes a workflow and everything recorded against it.
@@ -627,9 +680,18 @@ impl DBOS {
     /// **A workflow cannot delete itself.** Called from inside the workflow it names, this fails
     /// with [`Error::SystemDatabase`] carrying `InvalidInput` and nothing is deleted; see
     /// [`delete_all`](Self::delete_all) for why.
-    pub async fn delete(&self, workflow_id: &str) -> Result<()> {
-        self.delete_all(&[workflow_id], Children::Skip).await?;
-        Ok(())
+    pub fn delete<'a>(&'a self, workflow_id: &'a str) -> Pending<'a, ()> {
+        Pending::placed(
+            step_names::DELETE_WORKFLOW,
+            self.placed("delete a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .delete_all(&[workflow_id], Children::Skip, placement.step())
+                    .await?;
+                Ok(())
+            },
+        )
     }
 
     /// Deletes workflows, and optionally everything descended from them.
@@ -653,12 +715,21 @@ impl DBOS {
     /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is deleted. Deleting the
     /// caller's own tree from outside it, or deleting an unrelated tree from inside a workflow,
     /// is unaffected.
-    pub async fn delete_all(&self, workflow_ids: &[&str], children: Children) -> Result<u64> {
-        let (executor, ctx) = self.checked_executor("delete a workflow")?;
-        executor
-            .connection()
-            .delete_all(workflow_ids, children, ctx.as_ref().map(caller_for))
-            .await
+    pub fn delete_all<'a>(
+        &'a self,
+        workflow_ids: &'a [&'a str],
+        children: Children,
+    ) -> Pending<'a, u64> {
+        Pending::placed(
+            step_names::DELETE_WORKFLOW,
+            self.placed("delete a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .delete_all(workflow_ids, children, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Holds a queued workflow back, or lets it go sooner.
@@ -691,12 +762,21 @@ impl DBOS {
     /// dbos.set_workflow_delay("scheduled-report", dbos::WorkflowDelay::For(Duration::from_secs(3600))).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
-        let (executor, ctx) = self.checked_executor("delay a workflow")?;
-        executor
-            .connection()
-            .set_workflow_delay(workflow_id, delay, ctx.as_ref().map(caller_for))
-            .await
+    pub fn set_workflow_delay<'a>(
+        &'a self,
+        workflow_id: &'a str,
+        delay: WorkflowDelay,
+    ) -> Pending<'a, ()> {
+        Pending::placed(
+            step_names::SET_WORKFLOW_DELAY,
+            self.placed("delay a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .set_workflow_delay(workflow_id, delay, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Replaces a workflow's attributes, or clears them with `None`.
@@ -731,16 +811,21 @@ impl DBOS {
     /// dbos.update_workflow_attributes("an-order", None).await?; // and cleared
     /// # Ok(()) }
     /// ```
-    pub async fn update_workflow_attributes(
-        &self,
-        workflow_id: &str,
-        attributes: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<()> {
-        let (executor, ctx) = self.checked_executor("update a workflow's attributes")?;
-        executor
-            .connection()
-            .update_workflow_attributes(workflow_id, attributes, ctx.as_ref().map(caller_for))
-            .await
+    pub fn update_workflow_attributes<'a>(
+        &'a self,
+        workflow_id: &'a str,
+        attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    ) -> Pending<'a, ()> {
+        Pending::placed(
+            step_names::UPDATE_WORKFLOW_ATTRIBUTES,
+            self.placed("update a workflow's attributes"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .update_workflow_attributes(workflow_id, attributes, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Reads the workflows matching a filter, oldest first unless the filter says otherwise.
@@ -773,12 +858,20 @@ impl DBOS {
     /// }).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn list_workflows(&self, filter: &WorkflowFilter<'_>) -> Result<Vec<WorkflowRecord>> {
-        let (executor, ctx) = self.checked_executor("list workflows")?;
-        executor
-            .connection()
-            .list_workflows(filter, ctx.as_ref().map(caller_for))
-            .await
+    pub fn list_workflows<'a>(
+        &'a self,
+        filter: &'a WorkflowFilter<'a>,
+    ) -> Pending<'a, Vec<WorkflowRecord>> {
+        Pending::placed(
+            step_names::LIST_WORKFLOWS,
+            self.placed("list workflows"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .list_workflows(filter, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Reads one workflow's steps, in execution order.
@@ -793,12 +886,17 @@ impl DBOS {
     ///
     /// An id with no row returns no steps rather than failing, the same as an id whose workflow
     /// has not reached its first step.
-    pub async fn list_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
-        let (executor, ctx) = self.checked_executor("list a workflow's steps")?;
-        executor
-            .connection()
-            .list_workflow_steps(workflow_id, ctx.as_ref().map(caller_for))
-            .await
+    pub fn list_workflow_steps<'a>(&'a self, workflow_id: &'a str) -> Pending<'a, Vec<StepRecord>> {
+        Pending::placed(
+            step_names::LIST_WORKFLOW_STEPS,
+            self.placed("list a workflow's steps"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .list_workflow_steps(workflow_id, placement.step())
+                    .await
+            },
+        )
     }
 }
 
@@ -1257,13 +1355,4 @@ fn refuse_forked_id_in_bulk(options: &ForkOptions<'_>) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Where the caller stands, for `sysdb` to commit the checkpoint against.
-///
-/// **Allocates the step id, so it is called exactly once per management call.** Mapping it over
-/// an `Option<Ctx>` is what keeps that true: the id is spent only when there is a workflow to
-/// spend it in.
-fn caller_for(ctx: &Ctx) -> (&str, i32) {
-    (ctx.workflow_id(), ctx.next_step_id())
 }

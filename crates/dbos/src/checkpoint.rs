@@ -41,20 +41,25 @@ use std::task::Poll;
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::Error;
+use crate::instance::Executor;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// A durable call that has taken its step id and has not run.
 ///
 /// Returned by [`step`](crate::step) and [`step_with`](crate::step_with), by
-/// [`start`](crate::WorkflowRef::start) and [`start_with`](crate::WorkflowRef::start_with), and by
-/// [`WorkflowHandle::result`](crate::WorkflowHandle::result). Awaiting one runs it — so
+/// [`start`](crate::WorkflowRef::start) and [`start_with`](crate::WorkflowRef::start_with), by
+/// [`WorkflowHandle::result`](crate::WorkflowHandle::result), by the waits
+/// [`select_workflow`](fn@crate::select_workflow) and [`join_workflows`](fn@crate::join_workflows),
+/// by
+/// [`get_event`](crate::get_event), [`set_event`](crate::set_event) and [`sleep`](crate::sleep),
+/// and by every checkpointed management call on [`DBOS`](crate::DBOS). Awaiting one runs it — so
 /// `step(..).await?` and `child.start(n).await?` read as they always did. What is different is that
 /// **the step id is spent at the call rather than at the first poll**, which is what lets a set of
 /// them be built first and driven together: `tokio::join!` over three launches, or
 /// [`select_step!`](crate::select_step) over a step and a child, takes the same slots on a replay
 /// however the futures interleave.
 ///
-/// One type for all three producers rather than one each, because a combinator holding branches
+/// One type for every producer rather than one each, because a combinator holding branches
 /// has no reason to care which it holds. What every producer supplies is the same: a name, which
 /// the replay compares against; the id it claimed, or `None` where there was none to claim; and
 /// the work, which does not start until something polls it.
@@ -104,6 +109,40 @@ impl<'a, T, E> Pending<'a, T, E> {
             step_id,
             running: Box::pin(running),
         }
+    }
+
+    /// A durable call at a placement already taken, refusing at the poll what was refused at the
+    /// build.
+    ///
+    /// **The one constructor every non-step durable call goes through**, so the shape they share
+    /// is written once: `built` is the placement taken at the call, with whatever the run needs
+    /// beside it — an executor, a second id, an encoded value — or the error the build produced.
+    /// Polled, it reports that error, refuses to run where it was not built, and only then hands
+    /// the placement to `run`. The id was spent by whoever built `built`, which is why nothing
+    /// here allocates.
+    ///
+    /// `name` is the cross-SDK step name the call records under, and what a refusal names.
+    pub(crate) fn placed<C, F, Fut>(
+        name: &'static str,
+        built: Result<(C, Placement), Error>,
+        run: F,
+    ) -> Self
+    where
+        C: Send + 'a,
+        F: FnOnce(C, Placement) -> Fut + Send + 'a,
+        Fut: Future<Output = crate::Result<T, E>> + Send + 'a,
+        T: 'a,
+        E: 'a,
+    {
+        let step_id = built
+            .as_ref()
+            .ok()
+            .and_then(|(_, placement)| placement.step_id());
+        Self::new(Arc::from(name), step_id, async move {
+            let (carried, placement) = built.map_err(Error::lift)?;
+            placement.check_here(name).map_err(Error::lift)?;
+            run(carried, placement).await
+        })
     }
 
     /// What this call is called — the name its checkpoint will be checked against on replay.
@@ -186,8 +225,7 @@ impl Placement {
             return Ok(Self::Outside);
         };
         // First, because inside a step nothing is checkpointed whoever the connection belongs to,
-        // and there is then nothing for the halves below to disagree about. `DBOS::get_event`
-        // orders its own two checks the same way.
+        // and there is then nothing for the halves below to disagree about.
         if ctx.in_step() {
             return Ok(Self::Uncheckpointed);
         }
@@ -220,6 +258,21 @@ impl Placement {
             workflow_id: ctx.workflow_id().to_owned(),
             step_id: ctx.next_step_id(),
         })
+    }
+
+    /// Where a call served by `executor` stands, with the executor kept beside it for the run.
+    ///
+    /// [`of`](Self::of) with the executor threaded through, which is the pair every
+    /// [`Pending::placed`] caller builds. `executor` is a `Result` so an instance that is not
+    /// launched, or a context that is not a workflow, is carried into the call and reported when
+    /// it is polled rather than at the build.
+    pub(crate) fn taken(
+        executor: Result<Arc<Executor>, Error>,
+        operation: &'static str,
+    ) -> Result<(Arc<Executor>, Self), Error> {
+        let executor = executor?;
+        let placement = Self::of(executor.connection(), operation)?;
+        Ok((executor, placement))
     }
 
     /// Refuses to run where this placement was not built.
@@ -272,6 +325,12 @@ impl Placement {
             } => Some((workflow_id.as_str(), *step_id)),
             _ => None,
         }
+    }
+
+    /// The step id this call is recorded under, if it is recorded at all — what a [`Pending`]
+    /// built at this placement reports as its own.
+    pub(crate) fn step_id(&self) -> Option<i32> {
+        self.step().map(|(_, step_id)| step_id)
     }
 
     /// Reads back what this call recorded, if this workflow has run this far before.

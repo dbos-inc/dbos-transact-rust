@@ -399,3 +399,120 @@ async fn set_event_refuses_to_run_outside_a_workflow_or_inside_a_step() {
 
     dbos.shutdown().await;
 }
+
+/// **A read, a wait, a management call, a publish and a sleep take their ids when they are built**, like a step
+/// does, so a set of them driven together with `join!` is numbered in source order however the
+/// futures interleave. The read is two ids (the read and its deadline), and each of the others is
+/// one; a step built after all of them lands after all of them.
+#[tokio::test]
+async fn non_step_calls_driven_together_take_ids_in_build_order() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("built-together-app", &db));
+    let publisher = dbos
+        .register_workflow("publisher", |()| async {
+            dbos::set_event("answer", &42u32).await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    let reader_wf = {
+        let dbos = dbos.clone();
+        dbos.clone()
+            .register_workflow("reader", move |publisher_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let ids = [publisher_id.as_str()];
+                    let read = dbos::get_event::<u32, dbos::EngineOnly>(
+                        &publisher_id,
+                        "answer",
+                        Duration::from_secs(5),
+                    );
+                    let joined = dbos::join_workflows::<dbos::EngineOnly>(&ids);
+                    let listed = dbos.list_workflow_steps(&publisher_id);
+                    let published = dbos::set_event::<_, dbos::EngineOnly>("progress", &1u32);
+                    let slept = dbos::sleep::<dbos::EngineOnly>(Duration::from_millis(10));
+                    let stepped = dbos::step("after", || async { Ok::<_, dbos::Error>(7u32) });
+                    assert_eq!(
+                        (
+                            read.step_id(),
+                            joined.step_id(),
+                            listed.step_id(),
+                            published.step_id(),
+                            slept.step_id(),
+                            stepped.step_id()
+                        ),
+                        (Some(0), Some(2), Some(3), Some(4), Some(5), Some(6)),
+                        "ids are taken at the call, in source order, the read taking two"
+                    );
+                    // Driven out of build order, so a poll-time allocation would number them
+                    // differently.
+                    let (seven, slept, published, rows, joined, answer) =
+                        tokio::join!(stepped, slept, published, listed, joined, read);
+                    let (seven, (), (), rows, (), answer) = (
+                        seven?,
+                        slept?,
+                        published?,
+                        rows.map_err(dbos::Error::lift)?,
+                        joined?,
+                        answer?,
+                    );
+                    assert_eq!(seven, 7);
+                    // Polled before or after the publisher's own write lands, so either count
+                    // is right; what the test pins is the id the listing recorded under.
+                    assert!(
+                        rows.len() <= 1,
+                        "the publisher records one setEvent at most"
+                    );
+                    Ok::<_, dbos::Error>(answer)
+                }
+            })
+            .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let publisher_id = publisher
+        .start(())
+        .await
+        .expect("the publisher failed to start")
+        .workflow_id()
+        .to_owned();
+    assert_eq!(
+        reader_wf
+            .run(publisher_id.clone())
+            .await
+            .expect("the reader failed"),
+        Some(42)
+    );
+
+    let reader = reader(&db).await;
+    let reader_id = reader
+        .list_workflows(&Default::default(), None)
+        .await
+        .expect("read failed")
+        .iter()
+        .find(|r| r.name.as_deref() == Some("reader"))
+        .expect("the reader ran")
+        .workflow_id
+        .clone();
+    let steps = reader
+        .list_workflow_steps(&reader_id, true, None, None, None)
+        .await
+        .expect("read failed")
+        .iter()
+        .map(|s| (s.step_id, s.step_name.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        steps,
+        [
+            (0, "DBOS.getEvent".to_owned()),
+            (1, "DBOS.sleep".to_owned()),
+            (2, "DBOS.joinWorkflows".to_owned()),
+            (3, "DBOS.listWorkflowSteps".to_owned()),
+            (4, "DBOS.setEvent".to_owned()),
+            (5, "DBOS.sleep".to_owned()),
+            (6, "after".to_owned()),
+        ],
+        "every call recorded under the id it was built with"
+    );
+
+    dbos.shutdown().await;
+}

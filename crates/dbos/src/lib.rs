@@ -142,12 +142,14 @@ pub use wait::{join_workflows, select_workflow};
 /// An arm is `binding = step => expression`, and the comma between arms follows `match`'s rule
 /// exactly: optional after a body that ends in a block, required otherwise.
 ///
-/// # A branch is a step, a launch, or an await
+/// # A branch is any pending call
 ///
-/// A branch is any [`Pending`]: a [`step`], a child's [`start`](WorkflowRef::start), or a
-/// handle's [`result`](WorkflowHandle::result). Each checkpoints itself under the id it was built
-/// with, and each replays from its own row when it is the recorded winner, so a race across a step
-/// and a child is as durable as one across two steps.
+/// A branch is any [`Pending`]: a [`step`], a child's [`start`](WorkflowRef::start), a handle's
+/// [`result`](WorkflowHandle::result), a wait over workflows ([`select_workflow`](fn@select_workflow)
+/// or [`join_workflows`](fn@join_workflows)), a [`get_event`], a [`set_event`], a [`sleep`], or a
+/// checkpointed management call on [`DBOS`]. Each
+/// checkpoints itself under the id it was built with, and each replays from its own row when it is
+/// the recorded winner, so a race across a step and a child is as durable as one across two steps.
 ///
 /// **What losing means differs by kind, and only a step loses cleanly.** A losing step is dropped
 /// mid-body and records nothing, so a replay never runs it. A losing launch is dropped as a

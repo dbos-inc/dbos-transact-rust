@@ -1,12 +1,17 @@
 //! Durable sleep: a wait that survives the process waiting it out.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::checkpoint::{Pending, Placement};
 use crate::context::Ctx;
-use crate::error::{DurableError, Error, Result};
-use crate::sysdb::types::Timestamp;
+use crate::error::{DurableError, Error};
+use crate::sysdb::types::{Timestamp, step_names};
 
 /// Waits for `duration`, resuming at the **original** wake time after a crash.
+///
+/// The step id is taken at the call rather than at the first poll — see [`Pending`] — so a sleep
+/// built beside a step and driven with it takes the same slot on every execution.
 ///
 /// The difference from [`tokio::time::sleep`] is what happens when the process dies. A plain sleep
 /// restarts from the beginning on recovery, so a workflow that sleeps an hour and crashes after
@@ -32,36 +37,45 @@ use crate::sysdb::types::Timestamp;
 ///
 /// A zero or negative duration is not an error: it records the checkpoint and returns, so a
 /// computed delay that has already elapsed behaves the same on the first run and on a replay.
-pub async fn sleep<E>(duration: Duration) -> Result<(), E>
+pub fn sleep<E>(duration: Duration) -> Pending<'static, (), E>
 where
-    E: DurableError,
+    E: DurableError + 'static,
 {
-    let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
-        tracing::debug!(
-            duration_ms = duration.as_millis(),
-            "the sleep is not checkpointed: it is outside a workflow, or inside a step"
-        );
-        tokio::time::sleep(duration).await;
-        return Ok(());
+    // **The step id is taken here, at the call**, so a sleep built beside a step and driven with
+    // it takes the same slot on every execution — see [`Pending`]. Outside a workflow, or inside
+    // a step, the placement records nothing and the sleep is a plain one.
+    let built = match Ctx::current() {
+        None => Ok((None, Placement::Outside)),
+        Some(ctx) => Placement::taken(Ok(Arc::clone(ctx.executor())), "sleep")
+            .map(|(executor, placement)| (Some(executor), placement)),
     };
+    Pending::placed(
+        step_names::SLEEP,
+        built,
+        move |executor, placement| async move {
+            let Some((executor, (workflow_id, step_id))) = executor.zip(placement.step()) else {
+                tracing::debug!(
+                    duration_ms = duration.as_millis(),
+                    "the sleep is not checkpointed: it is outside a workflow, or inside a step"
+                );
+                tokio::time::sleep(duration).await;
+                return Ok(());
+            };
 
-    let step_id = ctx.next_step_id();
-    let wake_at = ctx
-        .executor()
-        .sysdb()
-        .record_sleep(ctx.workflow_id(), step_id, duration)
-        .await
-        .map_err(Error::SystemDatabase)?;
+            let wake_at = executor
+                .sysdb()
+                .record_sleep(workflow_id, step_id, duration)
+                .await
+                .map_err(Error::SystemDatabase)?;
 
-    // From the recorded wake time, not from now: on a replay `record_sleep` gives back the instant
-    // the first run chose, and the remaining wait is whatever is left of it. A replay that woke
-    // long ago waits not at all.
-    let remaining = wake_at.duration_since(Timestamp::now()).unwrap_or_default();
-    tracing::debug!(
-        step_id,
-        remaining_ms = remaining.as_millis(),
-        "sleeping until the recorded wake time"
-    );
-    tokio::time::sleep(remaining).await;
-    Ok(())
+            let remaining = wake_at.duration_since(Timestamp::now()).unwrap_or_default();
+            tracing::debug!(
+                step_id,
+                remaining_ms = remaining.as_millis(),
+                "sleeping until the recorded wake time"
+            );
+            tokio::time::sleep(remaining).await;
+            Ok(())
+        },
+    )
 }
