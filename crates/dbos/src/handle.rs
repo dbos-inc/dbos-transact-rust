@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::checkpoint::Placement;
+use crate::checkpoint::{Pending, Placement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
@@ -160,13 +160,40 @@ where
     /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) describes
     /// costs a caller here what Go and TypeScript charge an argument for and Python and Java cannot
     /// offer at all.
-    pub async fn result(self) -> Result<R, E> {
+    ///
+    /// **The step id is taken when this is called, not when the future is first polled.** That is
+    /// what makes a set of handles awaited together — `tokio::join!` over three `result()`s —
+    /// take the same slots on a replay however the children finish. See [`Pending`].
+    pub fn result(self) -> Pending<'static, Result<R, E>>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run.
-        let awaiting = match Awaiting::of(&self.conn) {
+        let awaiting = Awaiting::of(&self.conn);
+        Pending::new(
+            awaiting
+                .as_ref()
+                .ok()
+                .and_then(|awaiting| awaiting.step_id()),
+            self.result_at(awaiting),
+        )
+    }
+
+    /// [`result`](Self::result) at a placement already claimed — by `result` itself, or by a
+    /// [`run`](crate::WorkflowRef::run) that took both of its ids at build.
+    pub(crate) async fn result_at(
+        self,
+        awaiting: std::result::Result<Awaiting, Error>,
+    ) -> Result<R, E> {
+        let awaiting = match awaiting {
             Ok(awaiting) => awaiting,
             Err(wrong) => return Err(wrong.lift()),
         };
+        if let Err(elsewhere) = awaiting.0.check_here("DBOS.getResult") {
+            return Err(elsewhere.lift());
+        }
         if let Some(recorded) = awaiting
             .check(&self.conn, &self.workflow_id)
             .await
@@ -258,7 +285,7 @@ where
 /// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
 /// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
 /// either, and Python and Go checkpoint that case too.
-struct Awaiting(Placement);
+pub(crate) struct Awaiting(pub(crate) Placement);
 
 impl Awaiting {
     /// Where this await stands, allocating its step id if it is to be recorded.
@@ -266,7 +293,7 @@ impl Awaiting {
     /// The placement rules — and the argument for each of them — are
     /// [`Placement::of`](crate::checkpoint::Placement::of)'s, shared with every other non-step
     /// durable call in the crate. What stays here is only what an *await* does with the answer.
-    fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
+    pub(crate) fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
         Placement::of(conn, "awaiting a workflow's result").map(Self)
     }
 
@@ -278,6 +305,10 @@ impl Awaiting {
 
     fn checkpoint(&self) -> Option<(&str, i32)> {
         self.0.step()
+    }
+
+    fn step_id(&self) -> Option<i32> {
+        self.0.step().map(|(_, step_id)| step_id)
     }
 
     async fn check(

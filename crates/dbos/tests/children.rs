@@ -9,7 +9,7 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
     Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueConflict, QueueOptions, RunOptions,
-    StartOptions, Timeout,
+    StartOptions, Timeout, WorkflowRef,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -414,15 +414,14 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
     dbos.shutdown().await;
 }
 
-/// The fan-out shape: children are launched one at a time and awaited one at a time, but they
-/// **run** concurrently.
+/// The fan-out shape: children launched in one loop and awaited in another, and they **run**
+/// concurrently.
 ///
-/// Sequential bookkeeping is the step counter's determinism constraint reaching a second caller —
-/// each launch and each await allocates a step id, and concurrent allocation would replay against
-/// the wrong slots. It costs nothing in wall-clock: three children that each sleep are all in
-/// flight together, so the parent takes about as long as the slowest rather than the sum. A
-/// `join!` over the *launches* is the same trap a `join!` over steps is, and is unsound for the
-/// same reason.
+/// Each launch and each await allocates a step id, and here they are allocated in the caller's
+/// own sequential order. It costs nothing in wall-clock: three children that each sleep are all
+/// in flight together, so the parent takes about as long as the slowest rather than the sum. The
+/// test after this one drives the launches with a `join!` instead, which is sound for the reason
+/// a `join!` over steps is: the id is taken when the call is built.
 #[tokio::test]
 async fn children_launched_in_a_loop_run_concurrently() {
     let db = test_database().await;
@@ -478,6 +477,241 @@ async fn children_launched_in_a_loop_run_concurrently() {
         .await
         .expect("read failed");
     assert_eq!(children.len(), 3);
+
+    dbos.shutdown().await;
+}
+
+/// **A `join!` over launches takes ids in build order**, because a launch claims its id when it
+/// is built rather than when it is first polled. Three `start`s built in source order and driven
+/// together are `{parent}-0`, `{parent}-1`, `{parent}-2` whatever order the futures reach the
+/// database — and a `join!` over the `result()`s numbers the awaits the same way.
+#[tokio::test]
+async fn launches_driven_together_take_ids_in_build_order() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("joined-fan-out-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move {
+            // The later-built children finish first, so a poll-time id would be assigned in the
+            // opposite order to the build.
+            tokio::time::sleep(Duration::from_millis(100 * (3 - n as u64))).await;
+            Ok::<u32, Error>(n)
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                let (a, b, c) = (child.start(0), child.start(1), child.start(2));
+                assert_eq!(
+                    (a.step_id(), b.step_id(), c.step_id()),
+                    (Some(0), Some(1), Some(2)),
+                    "the ids are taken at the call, in source order"
+                );
+                let (a, b, c) = tokio::join!(a, b, c);
+                let (a, b, c) = (
+                    a.map_err(Error::lift)?,
+                    b.map_err(Error::lift)?,
+                    c.map_err(Error::lift)?,
+                );
+                assert_eq!(
+                    [a.workflow_id(), b.workflow_id(), c.workflow_id()],
+                    ["joined-0", "joined-1", "joined-2"],
+                    "each child is named for the slot its launch was built into"
+                );
+                let (ra, rb, rc) = (a.result(), b.result(), c.result());
+                assert_eq!(
+                    (ra.step_id(), rb.step_id(), rc.step_id()),
+                    (Some(3), Some(4), Some(5)),
+                    "the awaits are numbered after every launch, in build order"
+                );
+                let (ra, rb, rc) = tokio::join!(ra, rb, rc);
+                Ok::<u32, Error>(ra? + rb? + rc?)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let total = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("joined"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(total, 3);
+
+    // The recorded positions say the same thing the handles did, and the replay would read them.
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("joined", false, None, None, None)
+        .await
+        .expect("read failed");
+    let launches: Vec<_> = steps
+        .iter()
+        .filter_map(|step| {
+            step.child_workflow_id
+                .as_deref()
+                .map(|child| (step.step_id, child))
+        })
+        .collect();
+    assert_eq!(
+        launches,
+        [
+            (0, "joined-0"),
+            (1, "joined-1"),
+            (2, "joined-2"),
+            (3, "joined-0"),
+            (4, "joined-1"),
+            (5, "joined-2"),
+        ],
+        "three launches then three awaits, each under the id it was built with"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A `run` takes both of its ids at the call**, so a `join!` over `run`s does not let one
+/// child's await id depend on which child was recorded first.
+#[tokio::test]
+async fn runs_driven_together_take_both_ids_in_build_order() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("joined-runs-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move {
+            tokio::time::sleep(Duration::from_millis(100 * (2 - n as u64))).await;
+            Ok::<u32, Error>(n)
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                let (a, b) = (child.run(0), child.run(1));
+                assert_eq!((a.step_id(), b.step_id()), (Some(0), Some(2)), "launch ids");
+                let (a, b) = tokio::join!(a, b);
+                Ok::<u32, Error>(a? + b?)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let total = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("joined-runs"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(total, 1);
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("joined-runs", false, None, None, None)
+        .await
+        .expect("read failed");
+    let positions: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.step_id,
+                step.child_workflow_id.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        [
+            (0, "joined-runs-0"),
+            (1, "joined-runs-0"),
+            (2, "joined-runs-2"),
+            (3, "joined-runs-2"),
+        ],
+        "each run is a {{launch, await}} pair at the ids it claimed when built, and the second \
+         child is named for its launch's id, not its ordinal"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A launch is polled where it was built.** Built outside a workflow and polled inside one —
+/// `Ctx::scope`-shaped code, or a `start` built before the parent's body and moved in — it would
+/// start a *root* workflow where the caller expected a child, with no launch record for the
+/// parent to replay. It is refused instead, as a step built the same way is.
+#[tokio::test]
+async fn a_launch_built_outside_and_polled_inside_a_workflow_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("smuggled-launch-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    // A launch borrows the reference it was built from, and the parent's body has to be
+    // `'static` to hold it — so the reference is leaked for the life of the test.
+    let child: &'static WorkflowRef<(), u32> = Box::leak(Box::new(child));
+
+    // Filled in after launch, since a launch needs a launched instance and a registration needs
+    // one that is not yet launched.
+    type Smuggled = Arc<
+        std::sync::Mutex<Option<dbos::Pending<'static, dbos::Result<dbos::WorkflowHandle<u32>>>>>,
+    >;
+    let smuggled: Smuggled = Arc::default();
+    let parent = dbos
+        .register_workflow("parent", {
+            let smuggled = Arc::clone(&smuggled);
+            move |()| {
+                let smuggled = Arc::clone(&smuggled);
+                async move {
+                    let launch = smuggled.lock().unwrap().take().expect("built by the test");
+                    let refused = launch.await.expect_err("a smuggled launch is refused");
+                    match refused {
+                        Error::StepBuiltElsewhere {
+                            step,
+                            built,
+                            polled,
+                        } => {
+                            assert_eq!(step, "child");
+                            assert_eq!(built, "outside a workflow");
+                            assert_eq!(polled, "in workflow smuggled");
+                        }
+                        other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+                    }
+                    Ok::<(), Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // Built here, with no workflow around it, so it claimed no id and would launch a root.
+    let launch = child.start(());
+    assert_eq!(launch.step_id(), None);
+    *smuggled.lock().unwrap() = Some(launch);
+
+    parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("smuggled"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent itself succeeds");
+
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow_children("smuggled")
+            .await
+            .expect("read failed")
+            .is_empty(),
+        "nothing was launched"
+    );
 
     dbos.shutdown().await;
 }

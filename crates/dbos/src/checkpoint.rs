@@ -33,12 +33,68 @@
 //! placement and the generic value-shaped write, which is what the callers with nothing special to
 //! say reach for.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::Error;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
+
+/// A durable call that has taken its step id and has not run.
+///
+/// The non-step counterpart of [`PendingStep`](crate::PendingStep), and the same bargain: the id
+/// is spent at the call rather than at the first poll, so a set of launches or awaits built in
+/// source order and then driven together — `tokio::join!` over three `start`s — takes the same
+/// slots on a replay however their bodies interleave. Before this, every such call was an
+/// `async fn` that read the counter when first polled, and a `join!` over them was documented as
+/// a trap.
+///
+/// One type over a `T` rather than one per call, because the three calls that return it differ
+/// only in what comes out: a handle, a result, or both. `Unpin` and `Send` for the reason
+/// `PendingStep` is — a combinator can hold one by value and poll it through `&mut`.
+#[must_use = "a durable call that is not awaited has spent its step id without running; await it,               or hand it to a combinator"]
+pub struct Pending<'a, T> {
+    step_id: Option<i32>,
+    running: Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+}
+
+impl<'a, T> Pending<'a, T> {
+    pub(crate) fn new(step_id: Option<i32>, running: impl Future<Output = T> + Send + 'a) -> Self {
+        Self {
+            step_id,
+            running: Box::pin(running),
+        }
+    }
+
+    /// The step id this call claimed when it was built, or `None` if it claimed none.
+    ///
+    /// `None` is not a failure: outside a workflow there is no counter, and a call that was refused
+    /// at build — inside a step, or against the wrong instance — reports that when polled rather
+    /// than here.
+    #[must_use]
+    pub fn step_id(&self) -> Option<i32> {
+        self.step_id
+    }
+}
+
+impl<T> Future for Pending<'_, T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<T> {
+        self.get_mut().running.as_mut().poll(cx)
+    }
+}
+
+impl<T> std::fmt::Debug for Pending<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending")
+            .field("step_id", &self.step_id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Where the caller of a non-step durable operation stands.
 ///
@@ -112,6 +168,41 @@ impl Placement {
             workflow_id: ctx.workflow_id().to_owned(),
             step_id: ctx.next_step_id(),
         })
+    }
+
+    /// Refuses to run where this placement was not built.
+    ///
+    /// The id is a claim on *one position in one workflow*, taken at build, and the same two
+    /// silent failures [`PendingStep`](crate::PendingStep) refuses apply here: built outside a
+    /// workflow and polled inside one, the call would run unrecorded where a checkpoint was
+    /// expected; built in one workflow and polled in another, the row would land under the wrong
+    /// workflow's id. `Uncheckpointed` is not checked — it records nothing wherever it runs, and
+    /// the client-connection case that produces it is legitimately driven from anywhere.
+    ///
+    /// `operation` is what a refusal names as the step.
+    pub(crate) fn check_here(&self, operation: &str) -> Result<(), Error> {
+        let here = Ctx::current();
+        let built: Option<std::borrow::Cow<'static, str>> = match (self, here.as_ref()) {
+            (Self::Uncheckpointed, _) => None,
+            (Self::Outside, None) => None,
+            (Self::Recorded { workflow_id, .. }, Some(here))
+                if here.workflow_id() == workflow_id && here.step_marker().is_none() =>
+            {
+                None
+            }
+            (Self::Outside, _) => Some("outside a workflow".into()),
+            (Self::Recorded { workflow_id, .. }, _) => {
+                Some(format!("in workflow {workflow_id}").into())
+            }
+        };
+        match built {
+            None => Ok(()),
+            Some(built) => Err(Error::StepBuiltElsewhere {
+                step: operation.to_owned(),
+                built,
+                polled: crate::step::polled_in(here.as_ref()),
+            }),
+        }
     }
 
     /// Whether there is a surrounding workflow — true wherever a cancelled *awaited* workflow has

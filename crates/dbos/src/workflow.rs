@@ -9,10 +9,11 @@ use serde::de::DeserializeOwned;
 use tokio::task::AbortHandle;
 use tracing::Instrument;
 
+use crate::checkpoint::{Pending, Placement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Failure, Result};
-use crate::handle::WorkflowHandle;
+use crate::handle::{Awaiting, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
@@ -748,20 +749,33 @@ where
     ///
     /// Called from inside a running workflow this runs a **child** of it, and takes two of the
     /// parent's step ids rather than one — see [`start_with`](Self::start_with).
-    pub async fn run(&self, input: P) -> Result<R, E> {
-        self.run_with(input, RunOptions::default()).await
+    pub fn run(&self, input: P) -> Pending<'_, Result<R, E>> {
+        self.run_with(input, RunOptions::default())
     }
 
     /// [`run`](Self::run), with something to say about how it starts.
     ///
     /// Takes [`RunOptions`] rather than [`StartOptions`]: a workflow cannot be both queued and
     /// waited for here, so there is no queue to name.
-    pub async fn run_with(&self, input: P, options: RunOptions<'_>) -> Result<R, E> {
-        self.start_with(input, options.into())
-            .await
-            .map_err(Error::lift)?
-            .result()
-            .await
+    ///
+    /// **Both step ids are taken here, at the call.** [`start_with`](Self::start_with) claims the
+    /// launch's as it is called, and the await's is claimed right behind it, before anything is
+    /// polled — so a `join!` over several `run`s numbers them exactly as a sequence of
+    /// `run(..).await`s would: `{launch, await}` pairs in build order, with no await id decided by
+    /// which child happened to be recorded first. [`step_id`](Pending::step_id) reports the
+    /// launch's.
+    pub fn run_with<'a>(&'a self, input: P, options: RunOptions<'a>) -> Pending<'a, Result<R, E>> {
+        let start = self.start_with(input, options.into());
+        // The same placement `result()` would take, taken now rather than when the handle exists.
+        // An unlaunched instance is reported by the launch, which fails first.
+        let awaiting = self
+            .dbos()
+            .executor("run a workflow")
+            .and_then(|executor| Awaiting::of(executor.connection()));
+        Pending::new(start.step_id(), async move {
+            let handle = start.await.map_err(Error::lift)?;
+            handle.result_at(awaiting).await
+        })
     }
 
     /// The running workflow this call is a child of, or `None` when it is a root.
@@ -779,7 +793,7 @@ where
     ///
     /// Allocating the step id here is what makes the launch position stable across a replay, and it
     /// happens before anything can fail on the way to using it.
-    fn parent(&self) -> Result<Option<Parent>> {
+    fn parent(&self, executor: &Arc<Executor>) -> Result<Option<Parent>> {
         let Some(ctx) = Ctx::current() else {
             return Ok(None);
         };
@@ -788,7 +802,7 @@ where
                 operation: "starting a workflow".into(),
             });
         }
-        if !Arc::ptr_eq(ctx.executor(), &self.dbos().executor("start a workflow")?) {
+        if !Arc::ptr_eq(ctx.executor(), executor) {
             return Err(Error::WrongInstance {
                 operation: "starting a workflow".into(),
             });
@@ -800,12 +814,34 @@ where
         }))
     }
 
+    /// Everything a launch decides **at the call rather than at the first poll**: that the
+    /// instance is launched, that the enqueue is one a queue could honour, and — the reason this
+    /// is split out — which of the parent's step ids the launch occupies.
+    ///
+    /// Errors are carried into the future rather than returned here, so `start(..).await?` reads
+    /// as it always did. The step id is the one thing that must not wait for the poll.
+    fn claim_launch(&self, options: &StartOptions<'_>) -> Result<Launch> {
+        let executor = self.dbos().executor("start a workflow")?;
+        // **Validated before anything is written**: an enqueue no queue could honour should cost
+        // a round trip, not a row. `queue::validate` refuses a queue's configuration in the same
+        // spot.
+        if let Some(enqueue) = &options.queue {
+            enqueue.validate()?;
+        }
+        // **The ambient context is what makes this a child.** Every reference overloads the same
+        // call rather than adding a `start_child`, so factoring a workflow body out into its own
+        // workflow does not change how its call sites are written — and a workflow started from
+        // outside one is unaffected by everything below.
+        let parent = self.parent(&executor)?;
+        Ok(Launch { executor, parent })
+    }
+
     /// Starts this workflow durably and returns a handle to it, without waiting.
     ///
     /// Called from inside a running workflow this starts a **child** of it — see
     /// [`start_with`](Self::start_with) for what that records and what it costs.
-    pub async fn start(&self, input: P) -> Result<WorkflowHandle<R, E>> {
-        self.start_with(input, StartOptions::default()).await
+    pub fn start(&self, input: P) -> Pending<'_, Result<WorkflowHandle<R, E>>> {
+        self.start_with(input, StartOptions::default())
     }
 
     /// [`start`](Self::start), with something to say about how.
@@ -845,11 +881,12 @@ where
     ///
     /// ## Fanning out
     ///
-    /// Children **run** concurrently — each is its own task — but a parent must **launch** them
-    /// one at a time and **await** them one at a time, because every call takes a step id from the
-    /// parent's counter and concurrent allocation is nondeterministic. So start in one loop and
-    /// collect in another, which costs nothing in wall-clock: the parent takes about as long as
-    /// the slowest child rather than the sum.
+    /// Children **run** concurrently — each is its own task — and a parent may launch and await
+    /// them together, because **the step id is taken when `start` is called, not when its future
+    /// is first polled**. A `tokio::join!` over three `start`s therefore numbers the launches in
+    /// source order however the futures interleave, which is the same slot each gets on a replay.
+    /// The two loops below are still the plainest spelling, and cost nothing in wall-clock: the
+    /// parent takes about as long as the slowest child rather than the sum.
     ///
     /// ```no_run
     /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -864,26 +901,39 @@ where
     /// # Ok(total) }
     /// ```
     ///
-    /// A `join!` over the launches — or over the awaits — is the same trap a `join!` over
-    /// [`step`](crate::step)s is, and is unsound for the same reason.
-    pub async fn start_with(
+    /// **A launch built and dropped has still spent its id**, which is what [`Pending`]'s
+    /// `#[must_use]` is for. And a launch is polled where it was built: one carried into another
+    /// workflow, or built outside one and polled inside, is refused as
+    /// [`Error::StepBuiltElsewhere`] rather than recorded under the wrong id, the same rule a
+    /// [`PendingStep`](crate::PendingStep) follows.
+    pub fn start_with<'a>(
+        &'a self,
+        input: P,
+        options: StartOptions<'a>,
+    ) -> Pending<'a, Result<WorkflowHandle<R, E>>> {
+        let launch = self.claim_launch(&options);
+        let step_id = launch.as_ref().ok().and_then(Launch::step_id);
+        Pending::new(step_id, self.launch(launch, input, options))
+    }
+
+    /// The rest of a launch: everything after the id is claimed.
+    async fn launch(
         &self,
+        launch: Result<Launch>,
         input: P,
         options: StartOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        let executor = self.dbos().executor("start a workflow")?;
-        // Borrowed rather than moved, because `options` is read again below, and **validated
-        // before anything is written**: an enqueue no queue could honour should cost a round trip,
-        // not a row. `queue::validate` refuses a queue's configuration in the same spot.
-        let enqueue = options.queue.as_ref();
-        if let Some(enqueue) = enqueue {
-            enqueue.validate()?;
+        let Launch { executor, parent } = launch?;
+        // The id is a claim on one position in one workflow, and only that workflow can honour it.
+        match &parent {
+            Some(parent) => Placement::Recorded {
+                workflow_id: parent.workflow_id.clone(),
+                step_id: parent.step_id,
+            },
+            None => Placement::Outside,
         }
-        // **The ambient context is what makes this a child.** Every reference overloads the same
-        // call rather than adding a `start_child`, so factoring a workflow body out into its own
-        // workflow does not change how its call sites are written — and a workflow started from
-        // outside one is unaffected by everything below.
-        let parent = self.parent()?;
+        .check_here(&self.key().name)?;
+        let enqueue = options.queue.as_ref();
         let input = Some(encode(&input, "argument")?);
         let attributes = encode_attributes(options.attributes)?;
 
@@ -1104,6 +1154,18 @@ struct Parent {
     step_id: i32,
     /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
     deadline: Option<Timestamp>,
+}
+
+/// What [`WorkflowRef::claim_launch`] decided before the launch's future was built.
+struct Launch {
+    executor: Arc<Executor>,
+    parent: Option<Parent>,
+}
+
+impl Launch {
+    fn step_id(&self) -> Option<i32> {
+        self.parent.as_ref().map(|parent| parent.step_id)
+    }
 }
 
 impl Parent {

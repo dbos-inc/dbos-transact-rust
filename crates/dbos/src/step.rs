@@ -488,7 +488,7 @@ impl Built {
 }
 
 /// How to describe where a step is being polled.
-fn polled_in(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
+pub(crate) fn polled_in(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
     match ctx {
         Some(ctx) if ctx.step_marker().is_some() => {
             format!("inside a step of workflow {}", ctx.workflow_id()).into()

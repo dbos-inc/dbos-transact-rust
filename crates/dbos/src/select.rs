@@ -3,7 +3,7 @@
 //! A workflow that races two steps has made a **choice**, and a choice a workflow makes has to be
 //! recorded — a replay that raced again could see the other branch finish first and take a path
 //! the first execution never took, which is the one thing a workflow may never do. That is the
-//! whole reason this exists where [`join_steps`-shaped code](crate::step) needs nothing: an
+//! whole reason this exists where a `tokio::join!` over [steps](crate::step) needs nothing: an
 //! all-wait decides nothing, so there is nothing for a replay to get differently.
 //!
 //! **A plain `tokio::select!` over steps is the trap this replaces.** Since a step takes its id
