@@ -2240,7 +2240,9 @@ pub mod step_names {
     /// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT`].
     pub const SLEEP: &str = "DBOS.sleep";
 
-    /// The step names `send_messages` records, chosen by how many messages it was given.
+    /// The step names the two send methods record, one each: `send_message` writes [`SEND`] and
+    /// `send_messages` writes [`SEND_BULK`]. The name is therefore the API surface the caller
+    /// reached for, never the batch's length — a batch of one is still a batch.
     ///
     /// `"DBOS.send"` is unanimous — all four implementations record exactly that for a single send,
     /// and a workflow replayed by another must find the name it expects or raise `UnexpectedStep`.
@@ -2250,13 +2252,10 @@ pub mod step_names {
     /// this constant family is camelCase already — `DBOS.setEvent`, `DBOS.getEvent` — so
     /// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
     ///
-    /// One system-database method serves both API surfaces, so the batch size stands in for which
-    /// one the caller reached for. A single send always carries exactly one message; anything else,
-    /// including an empty batch, came from the bulk API.
-    ///
-    /// A workflow whose message count changes between runs will flip names and be caught as
-    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep). That is nondeterminism in the
-    /// workflow, and catching it is the point of recording the name at all.
+    /// A method apiece is why: the name comes from which one was called, so nothing has to infer
+    /// it. Inferring it from the batch size — as this once did — recorded a one-message bulk send
+    /// as `DBOS.send`, which is not the call the caller made. Python and Java pass the name down
+    /// from their two surfaces in exactly the same way.
     pub const SEND: &str = "DBOS.send";
     pub const SEND_BULK: &str = "DBOS.sendBulk";
 

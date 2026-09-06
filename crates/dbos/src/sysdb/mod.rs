@@ -626,17 +626,34 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error>;
 
-    /// Delivers messages to workflows, in one transaction.
+    /// Delivers one message to a workflow.
     ///
-    /// One method rather than the `send`/`send_bulk` pair the plan lists, because the batch form
-    /// is the primitive and the single form is a caller with one message. Python says so in its
-    /// own docstring — its `send_bulk` "is the single implementation underlying both `DBOS.send`
-    /// and `send_bulk`, inside and outside a workflow" — and Java exposes only `sendBulk` too.
+    /// Records the step as `"DBOS.send"`, which is what makes this a separate method from
+    /// [`send_messages`](Self::send_messages) rather than a caller with a one-element slice: the
+    /// step name is the API surface the caller reached for, and a batch of one is still a batch.
+    /// Python and Java pass their name down from the same two surfaces
+    /// (`function_name="DBOS.send"` versus `"DBOS.send_bulk"`; `"DBOS.send"` versus
+    /// `"DBOS.sendBulk"`), and neither infers it from a count.
     ///
-    /// `caller` is the sending workflow and the step id to record against. The step *name* is
-    /// derived from the batch size rather than passed in — `"DBOS.send"` for a single message,
-    /// `"DBOS.sendBulk"` for any other count — because that is what distinguishes the two API
-    /// surfaces the references record it under.
+    /// Everything else is [`send_messages`](Self::send_messages)'s, which this shares an
+    /// implementation with — the transaction, the fork fan-out, the replay skip, the two kinds of
+    /// idempotency, and the foreign key that refuses a destination that does not exist.
+    async fn send_message(
+        &self,
+        message: &Message<'_>,
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        send_to_forks: bool,
+    ) -> Result<(), Error>;
+
+    /// Delivers many messages to workflows, in one transaction.
+    ///
+    /// Records the step as `"DBOS.sendBulk"` however many messages it is given, one and none
+    /// included — see [`send_message`](Self::send_message) for why the name is the method rather
+    /// than the count. Python writes `DBOS.send_bulk` here and Java `DBOS.sendBulk`; Java's
+    /// spelling is taken because the rest of this constant family is camelCase already.
+    ///
+    /// `caller` is the sending workflow and the step id to record against.
     ///
     /// **Two independent kinds of idempotency, for two different callers.** `caller` makes a
     /// whole batch idempotent for a *workflow*: a replay finds the step recorded and sends

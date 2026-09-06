@@ -3909,13 +3909,13 @@ async fn a_capped_read_does_not_hold_its_permit_across_the_wait() {
 
 /// One message to `wf-receiver`, from a sender outside a workflow.
 async fn send_to_receiver(sys: &PostgresSystemDatabase, topic: Option<&str>, message: &str) {
-    sys.send_messages(
-        &[Message {
+    sys.send_message(
+        &Message {
             destination_id: "wf-receiver",
             topic,
             message,
             idempotency_key: None,
-        }],
+        },
         Some("portable_json"),
         None,
         false,
@@ -4421,13 +4421,13 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
             .await
             .unwrap();
     }
-    sys.send_messages(
-        &[Message {
+    sys.send_message(
+        &Message {
             destination_id: "wf-other",
             topic: None,
             message: "\"here\"",
             idempotency_key: None,
-        }],
+        },
         Some("portable_json"),
         None,
         false,
@@ -5912,9 +5912,7 @@ async fn a_keyed_message_is_delivered_once_however_often_it_is_sent() {
         idempotency_key: Some("order-42"),
     };
     for _ in 0..3 {
-        sys.send_messages(&[message], None, None, false)
-            .await
-            .unwrap();
+        sys.send_message(&message, None, None, false).await.unwrap();
     }
 
     assert_eq!(sys.get_all_notifications("wf-once").await.unwrap().len(), 1);
@@ -5984,10 +5982,10 @@ async fn a_replayed_send_does_not_send_again() {
         idempotency_key: None,
     };
 
-    sys.send_messages(&[message], None, Some(caller), false)
+    sys.send_message(&message, None, Some(caller), false)
         .await
         .unwrap();
-    sys.send_messages(&[message], None, Some(caller), false)
+    sys.send_message(&message, None, Some(caller), false)
         .await
         .unwrap();
 
@@ -6068,13 +6066,13 @@ async fn a_message_can_follow_a_workflow_to_its_forks() {
         .unwrap()
         .remove(0);
 
-    sys.send_messages(
-        &[Message {
+    sys.send_message(
+        &Message {
             destination_id: "wf-root",
             topic: Some("t"),
             message: "\"broadcast\"",
             idempotency_key: Some("key"),
-        }],
+        },
         None,
         None,
         true,
@@ -6091,13 +6089,13 @@ async fn a_message_can_follow_a_workflow_to_its_forks() {
     }
 
     // Without the flag, only the destination hears it.
-    sys.send_messages(
-        &[Message {
+    sys.send_message(
+        &Message {
             destination_id: "wf-root",
             topic: Some("t"),
             message: "\"direct\"",
             idempotency_key: Some("key2"),
-        }],
+        },
         None,
         None,
         false,
@@ -6106,6 +6104,38 @@ async fn a_message_can_follow_a_workflow_to_its_forks() {
     .unwrap();
     assert_eq!(sys.get_all_notifications("wf-root").await.unwrap().len(), 2);
     assert_eq!(sys.get_all_notifications(&child).await.unwrap().len(), 1);
+
+    // **Without an idempotency key the fan-out must still reach every fork.** The row id is
+    // derived per recipient on both branches, and it has to be: the insert ends
+    // `ON CONFLICT (message_uuid) DO NOTHING`, so one id shared by the destination and its forks
+    // would collide with itself and deliver to the destination alone — silently, because a
+    // discarded row is not an error. That was the behaviour until the fallback was scoped the way
+    // the keyed branch already was, and every assertion above passed throughout, because every
+    // send above names a key.
+    sys.send_message(
+        &Message {
+            destination_id: "wf-root",
+            topic: Some("t"),
+            message: "\"unkeyed\"",
+            idempotency_key: None,
+        },
+        None,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    for (id, expected) in [
+        ("wf-root", 3),
+        (child.as_str(), 2),
+        (grandchild.as_str(), 2),
+    ] {
+        assert_eq!(
+            sys.get_all_notifications(id).await.unwrap().len(),
+            expected,
+            "{id} should have received the unkeyed broadcast"
+        );
+    }
 }
 
 /// An empty batch still records its step, so a replay stays a replay.
@@ -6161,8 +6191,12 @@ async fn sending_no_messages_still_records_the_step() {
 /// One system-database method serves both API surfaces, so the count is what distinguishes them.
 /// `DBOS.send` is unanimous across the references; the bulk name follows Java's spelling, since
 /// Python's `DBOS.send_bulk` would be the only snake_case name in a camelCase family.
+///
+/// The size does not enter into it: a batch of one records `DBOS.sendBulk`, because the caller
+/// reached for the batch API. Python and Java both pass the name down from the surface the same
+/// way, rather than counting.
 #[tokio::test]
-async fn the_recorded_step_name_follows_the_batch_size() {
+async fn the_recorded_step_name_follows_the_surface_not_the_size() {
     let (sys, _db) = sysdb().await;
     for id in ["wf-namer", "wf-a", "wf-b"] {
         sys.init_workflow(&workflow(id), None, Submission::Fresh)
@@ -6176,13 +6210,17 @@ async fn the_recorded_step_name_follows_the_batch_size() {
         idempotency_key: None,
     };
 
-    sys.send_messages(&[to("wf-a")], None, Some(("wf-namer", 0)), false)
+    sys.send_message(&to("wf-a"), None, Some(("wf-namer", 0)), false)
+        .await
+        .unwrap();
+    // The case the size rule got wrong: one message, but reached through the batch API.
+    sys.send_messages(&[to("wf-b")], None, Some(("wf-namer", 1)), false)
         .await
         .unwrap();
     sys.send_messages(
         &[to("wf-a"), to("wf-b")],
         None,
-        Some(("wf-namer", 1)),
+        Some(("wf-namer", 2)),
         false,
     )
     .await
@@ -6197,7 +6235,8 @@ async fn the_recorded_step_name_follows_the_batch_size() {
             .iter()
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
-        [(0, "DBOS.send"), (1, "DBOS.sendBulk")],
+        [(0, "DBOS.send"), (1, "DBOS.sendBulk"), (2, "DBOS.sendBulk"),],
+        "the name is the surface the caller reached for, and a batch of one is still a batch",
     );
 }
 
@@ -6220,9 +6259,7 @@ async fn an_unprotected_send_outside_a_workflow_delivers_every_time() {
         idempotency_key: None,
     };
     for _ in 0..3 {
-        sys.send_messages(&[message], None, None, false)
-            .await
-            .unwrap();
+        sys.send_message(&message, None, None, false).await.unwrap();
     }
 
     assert_eq!(
@@ -6235,14 +6272,20 @@ async fn an_unprotected_send_outside_a_workflow_delivers_every_time() {
     );
 }
 
-/// A replay whose batch size changed is caught, rather than sending a second time.
+/// A replay that reached for a different send API is caught, rather than sending a second time.
 ///
-/// The step name is derived from the message count, so a workflow that sent one message and then
-/// replays sending two is asking for a step that does not match what it recorded. That is
-/// nondeterminism in the workflow, and being told about it is better than the alternative — a
-/// replay that silently delivers again because it looked like a different step.
+/// The step name is the *surface*, so a workflow that sent one way and replays sending the other is
+/// asking for a step that does not match what it recorded. That is nondeterminism in the workflow,
+/// and being told about it is better than the alternative — a replay that silently delivers again
+/// because it looked like a different step.
+///
+/// **A changed batch *size* is no longer caught, and that is deliberate.** It was, back when the
+/// name was inferred from the count — which gave sends an argument-level determinism check no other
+/// step in the crate has, as an accident of the inference rather than a feature. A replay whose
+/// batch grew now finds its recorded step and delivers nothing, exactly as a step whose arguments
+/// changed does everywhere else.
 #[tokio::test]
-async fn a_replay_that_changed_its_batch_size_is_refused() {
+async fn a_replay_that_changed_its_send_surface_is_refused() {
     let (sys, _db) = sysdb().await;
     for id in ["wf-varying", "wf-x", "wf-y"] {
         sys.init_workflow(&workflow(id), None, Submission::Fresh)
@@ -6257,7 +6300,7 @@ async fn a_replay_that_changed_its_batch_size_is_refused() {
     };
 
     // The original run sends one message, recording `DBOS.send`.
-    sys.send_messages(&[to("wf-x")], None, Some(("wf-varying", 0)), false)
+    sys.send_message(&to("wf-x"), None, Some(("wf-varying", 0)), false)
         .await
         .unwrap();
 
