@@ -10,8 +10,8 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::PendingStep;
-use crate::context::{Ctx, StepMarker};
+use crate::checkpoint::{PendingStep, StepPlacement};
+use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
@@ -313,76 +313,13 @@ where
     // **The whole of what happens at the call**: read where we are, and take the id if this is a
     // place that checkpoints. Everything below is deferred into the run, which does not begin
     // until something polls it.
-    let built = Built::here();
+    let placement = StepPlacement::here();
     let name: Arc<str> = Arc::from(name);
     PendingStep::new(
         Arc::clone(&name),
-        built.step_id(),
-        run(built, name, options, body),
+        placement.step_id(),
+        run(placement, name, options, body),
     )
-}
-
-/// Where a step was built, and what id it took there.
-///
-/// Three states rather than `Option<(Ctx, i32)>`, because "took no id" collapses two situations
-/// that have to be told apart when the step is polled: *there was no workflow*, and *there was a
-/// workflow but this was built inside one of its step bodies*. Both take no id; only the first may
-/// be polled outside a workflow.
-enum Built {
-    /// Took an id: this position, in this workflow.
-    Claimed { ctx: Ctx, step_id: i32 },
-    /// Inside a workflow but nested in one of its step bodies, so a plain call by the leaf rule.
-    ///
-    /// Carries *which* body, so a step carried out of it and awaited in the workflow proper is
-    /// refused rather than quietly running undurably. Both places have the same workflow id, so
-    /// nothing coarser than the marker could tell them apart.
-    Nested {
-        workflow_id: String,
-        marker: StepMarker,
-    },
-    /// No workflow context at all, so a plain call and ordinarily testable.
-    Outside,
-}
-
-impl Built {
-    /// Reads where we are, taking an id if this is a place that checkpoints.
-    ///
-    /// Nested-or-not comes from the marker bound on *this* call stack's context, so a sibling
-    /// step's running body cannot make a step built in the workflow proper look nested and skip
-    /// the id it needs.
-    fn here() -> Self {
-        match Ctx::current() {
-            Some(ctx) => match ctx.step_marker() {
-                Some(marker) => Built::Nested {
-                    workflow_id: ctx.workflow_id().to_owned(),
-                    marker,
-                },
-                None => {
-                    let step_id = ctx.next_step_id();
-                    Built::Claimed { ctx, step_id }
-                }
-            },
-            None => Built::Outside,
-        }
-    }
-
-    fn step_id(&self) -> Option<i32> {
-        match self {
-            Built::Claimed { step_id, .. } => Some(*step_id),
-            Built::Nested { .. } | Built::Outside => None,
-        }
-    }
-
-    /// How to describe this place in [`Error::StepBuiltElsewhere`].
-    fn whereabouts(&self) -> std::borrow::Cow<'static, str> {
-        match self {
-            Built::Claimed { ctx, .. } => format!("in workflow {}", ctx.workflow_id()).into(),
-            Built::Nested { workflow_id, .. } => {
-                format!("inside a step of workflow {workflow_id}").into()
-            }
-            Built::Outside => "outside a workflow".into(),
-        }
-    }
 }
 
 /// How to describe where a step is being polled.
@@ -403,7 +340,7 @@ fn polled_in(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
 /// workflow identity *and* by the per-call-stack step marker, both of which a concurrently running
 /// sibling leaves alone.
 async fn run<T, E, F, Fut>(
-    built: Built,
+    placement: StepPlacement,
     name: Arc<str>,
     options: StepOptions<E>,
     mut body: F,
@@ -416,31 +353,29 @@ where
 {
     let name = &*name;
     let ambient = Ctx::current();
-    let (ctx, step_id) = match (&built, ambient.as_ref()) {
+    let (ctx, step_id) = match (&placement, ambient.as_ref()) {
         // The ordinary durable case: built at a step boundary of this workflow, polled at one. No
         // step body may be in scope on either side, or this is a step claimed in the workflow
         // proper and carried *into* a step body, where its checkpoint would sit beneath a step
         // whose own row already covers whatever its body did.
-        (Built::Claimed { ctx, step_id }, Some(here))
+        (StepPlacement::Recorded { ctx, step_id }, Some(here))
             if here.workflow_id() == ctx.workflow_id() && here.step_marker().is_none() =>
         {
             (ctx.clone(), *step_id)
         }
         // Took no id, and is polled in the same step body it was built in. Plain, as it always was.
-        (
-            Built::Nested {
-                workflow_id,
-                marker,
-            },
-            Some(here),
-        ) if here.workflow_id() == workflow_id && here.step_marker() == Some(*marker) => {
+        // Compared by marker alone: it is process-unique, so equal markers are the same body and
+        // therefore the same workflow. The variant's `workflow_id` is for the refusal's message.
+        (StepPlacement::InsideStep { marker, .. }, Some(here))
+            if here.step_marker() == Some(*marker) =>
+        {
             tracing::debug!(
                 step_name = name,
                 "the step body runs plainly: it was built inside another step"
             );
             return body().await;
         }
-        (Built::Outside, None) => {
+        (StepPlacement::Outside, None) => {
             tracing::debug!(
                 step_name = name,
                 "the step body runs plainly: it was built and polled outside a workflow"
@@ -448,10 +383,10 @@ where
             return body().await;
         }
         // Everything else is a claim nobody here can honour.
-        (built, here) => {
+        (placement, here) => {
             return Err(Error::StepBuiltElsewhere {
                 step: name.to_owned(),
-                built: built.whereabouts(),
+                built: placement.whereabouts(),
                 polled: polled_in(here),
             });
         }

@@ -1,4 +1,4 @@
-//! Where a call that is not a [`step`](crate::step) stands, and what that means for its replay.
+//! Where a durable call stands, and what that means for its replay.
 //!
 //! Several calls in this crate are *steps the caller never wrote*: awaiting a workflow's result,
 //! waiting on a set of handles, reading an event. Each is a single durable act that a replay must
@@ -24,7 +24,7 @@
 //! [`WorkflowHandle::result`](crate::WorkflowHandle::result), and are now shared by every caller
 //! that has the same question. The references keep the same logic in one place for the same
 //! reason: Python's `call_function_as_step`, TypeScript's `runInternalStep` and Java's
-//! `runDbosFunctionAsStep` are each one wrapper that every non-step durable call goes through.
+//! `runDbosFunctionAsStep` are each one wrapper that every library step goes through.
 //!
 //! **What is *not* shared is the write**, and deliberately. A child await records the awaited id
 //! alongside the outcome and reads it back through
@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
-use crate::context::Ctx;
+use crate::context::{Ctx, StepMarker};
 use crate::error::Error;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
@@ -139,31 +139,57 @@ impl<T, E> std::fmt::Debug for PendingStep<'_, T, E> {
     }
 }
 
-/// Where the caller of a non-step durable operation stands.
+/// Where a durable call stands: which of the workflow's step ids it occupies, if any.
 ///
-/// Decides two independent things: whether the operation is checkpointed, and whether there is a
+/// **One type for both kinds of step.** A *user step* is what [`step`](crate::step) and
+/// [`step_with`](crate::step_with) build: a body the caller wrote, a retry policy, a timeout. A
+/// *library step* is one this crate writes on the caller's behalf — awaiting a workflow's result,
+/// waiting on a set of handles, reading or setting an event, a checkpointed management call. They
+/// differ in what runs and in nothing that matters here: each occupies one step id, records its
+/// answer under it, and must not be performed twice by a replay. So both ask this question, and
+/// take their answer from [`here`](Self::here) or [`of`](Self::of).
+///
+/// Decides two independent things: whether the call is checkpointed, and whether there is a
 /// surrounding workflow that a *cancelled awaited workflow* would otherwise be confused with.
-pub(crate) enum Placement {
+pub(crate) enum StepPlacement {
     /// Not inside a workflow. Nothing is recorded, and there is no other workflow here for an
     /// awaited one to be confused with.
     Outside,
-    /// Inside a workflow, with nothing to record against. The awaited-cancelled distinction
-    /// applies, because there is a workflow to confuse it with, but nothing is checkpointed. Two
-    /// ways to land here:
+    /// Inside a step's body, so a plain call by the leaf rule: the step's own checkpoint stands
+    /// for everything its body did, and allocating an id inside one would shift every later step
+    /// onto the wrong replay slot.
     ///
-    /// - **Inside a step**: a step is a leaf, and an id-allocating call inside one would shift
-    ///   every later step onto the wrong replay slot.
-    /// - **Holding a [`Client`](crate::Client)'s connection**: a client has no step counter to
-    ///   agree with this workflow's, and no execution of its own that a recorded call could belong
-    ///   to. A handle from *another instance* is the third case and is not this one — that is
-    ///   [`Error::WrongInstance`], because two instances each have a counter and the caller meant
-    ///   one of them.
-    Uncheckpointed,
+    /// Carries *which* body, so a call built here and polled anywhere else is refused rather than
+    /// run unrecorded where a checkpoint was expected. The marker is the only thing that can tell
+    /// those two places apart, since they share a workflow id; `workflow_id` is carried for the
+    /// refusal's message and never for the comparison, which a process-unique marker settles on
+    /// its own.
+    InsideStep {
+        workflow_id: String,
+        marker: StepMarker,
+    },
+    /// Reached through a [`Client`](crate::Client)'s connection. A client has no step counter to
+    /// agree with this workflow's, and no execution of its own that a recorded call could belong
+    /// to, so the call degrades to the undurable version of itself — which is what
+    /// `Client::enqueue` documents and what `Client::get_event` already does for the read.
+    ///
+    /// A handle from *another instance* is not this case: that is [`Error::WrongInstance`],
+    /// because two instances each have a counter and the caller meant one of them.
+    ///
+    /// **A variant of its own rather than sharing an uncheckpointed one with
+    /// [`InsideStep`](Self::InsideStep)**, because the two want opposite treatment. A client's
+    /// call is legitimately driven from anywhere and nothing pins it; an in-step call has to be
+    /// held to the body it was built in. Conflating them is how the second went unchecked.
+    ClientConnection,
     /// Inside a workflow at a step boundary: this call is a step of that workflow.
-    Recorded { workflow_id: String, step_id: i32 },
+    ///
+    /// Holds the [`Ctx`] rather than a copy of its workflow id, because a user step needs it to
+    /// run the body under, and every reader of the id can take it from here. Only reachable when
+    /// the serving connection *is* this workflow's, which is what makes that sound.
+    Recorded { ctx: Ctx, step_id: i32 },
 }
 
-impl Placement {
+impl StepPlacement {
     /// Where a call reached through `conn` stands, allocating the step id if it is to be recorded.
     ///
     /// **Allocating is the point, and it happens here rather than at the write**: the position of
@@ -179,8 +205,11 @@ impl Placement {
         // First, because inside a step nothing is checkpointed whoever the connection belongs to,
         // and there is then nothing for the halves below to disagree about. `DBOS::get_event`
         // orders its own two checks the same way.
-        if ctx.in_step() {
-            return Ok(Self::Uncheckpointed);
+        if let Some(marker) = ctx.step_marker() {
+            return Ok(Self::InsideStep {
+                workflow_id: ctx.workflow_id().to_owned(),
+                marker,
+            });
         }
         // Where the two halves would be combined: a step id is about to come from this workflow's
         // counter while the write goes through the caller's own connection. What that means
@@ -196,7 +225,7 @@ impl Placement {
                 // undurable version of itself, which is what `Client::enqueue` documents about a
                 // client used from inside a workflow body and what `Client::get_event` already
                 // does for the read.
-                Owner::Client => Ok(Self::Uncheckpointed),
+                Owner::Client => Ok(Self::ClientConnection),
                 // **Another instance's is the mistake the variant was raised for.** Both
                 // instances have a step counter, the caller meant one of them, and the record
                 // would land where the workflow that allocated the id cannot see it. Refused
@@ -207,10 +236,52 @@ impl Placement {
                 }),
             };
         }
-        Ok(Self::Recorded {
-            workflow_id: ctx.workflow_id().to_owned(),
-            step_id: ctx.next_step_id(),
-        })
+        let step_id = ctx.next_step_id();
+        Ok(Self::Recorded { ctx, step_id })
+    }
+
+    /// Where a call served by the ambient workflow's own executor stands.
+    ///
+    /// [`of`](Self::of) with no second connection to disagree with, which is every *user* step:
+    /// [`step`](crate::step) is always served by the workflow it is written in, so
+    /// [`ClientConnection`](Self::ClientConnection) is unreachable and
+    /// [`Error::WrongInstance`] cannot arise. That is the whole of why this cannot fail where
+    /// `of` can.
+    ///
+    /// Allocating is the point, and it happens here rather than at the poll: the position of this
+    /// call has to be the same on the replay as it was on the run, and building is what fixes it.
+    pub(crate) fn here() -> Self {
+        let Some(ctx) = Ctx::current() else {
+            return Self::Outside;
+        };
+        if let Some(marker) = ctx.step_marker() {
+            return Self::InsideStep {
+                workflow_id: ctx.workflow_id().to_owned(),
+                marker,
+            };
+        }
+        let step_id = ctx.next_step_id();
+        Self::Recorded { ctx, step_id }
+    }
+
+    /// The id this call claimed, or `None` where it claimed none.
+    pub(crate) fn step_id(&self) -> Option<i32> {
+        match self {
+            Self::Recorded { step_id, .. } => Some(*step_id),
+            Self::Outside | Self::InsideStep { .. } | Self::ClientConnection => None,
+        }
+    }
+
+    /// How to describe this place in [`Error::StepBuiltElsewhere`].
+    pub(crate) fn whereabouts(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Recorded { ctx, .. } => format!("in workflow {}", ctx.workflow_id()).into(),
+            Self::InsideStep { workflow_id, .. } => {
+                format!("inside a step of workflow {workflow_id}").into()
+            }
+            Self::ClientConnection => "on a client's connection".into(),
+            Self::Outside => "outside a workflow".into(),
+        }
     }
 
     /// Whether there is a surrounding workflow — true wherever a cancelled *awaited* workflow has
@@ -222,10 +293,7 @@ impl Placement {
     /// The workflow and step id this call is recorded under, if it is recorded at all.
     pub(crate) fn step(&self) -> Option<(&str, i32)> {
         match self {
-            Self::Recorded {
-                workflow_id,
-                step_id,
-            } => Some((workflow_id.as_str(), *step_id)),
+            Self::Recorded { ctx, step_id } => Some((ctx.workflow_id(), *step_id)),
             _ => None,
         }
     }
@@ -240,7 +308,7 @@ impl Placement {
     /// is the pair `sysdb` already uses — `check_step`/`record_step`,
     /// `check_child_result`/`record_child_result` — and this is the thin wrapper over the first of
     /// them. It also keeps the word `Recorded` meaning one thing: it is a
-    /// [`Placement`] variant, describing where the caller stands, and a method of the same name
+    /// [`StepPlacement`] variant, describing where the caller stands, and a method of the same name
     /// describing a step row would be the same word for two unrelated things.
     pub(crate) async fn check(
         &self,

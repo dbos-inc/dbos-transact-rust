@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::checkpoint::Placement;
+use crate::checkpoint::StepPlacement;
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
@@ -258,16 +258,16 @@ where
 /// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
 /// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
 /// either, and Python and Go checkpoint that case too.
-struct Awaiting(Placement);
+struct Awaiting(StepPlacement);
 
 impl Awaiting {
     /// Where this await stands, allocating its step id if it is to be recorded.
     ///
     /// The placement rules — and the argument for each of them — are
-    /// [`Placement::of`](crate::checkpoint::Placement::of)'s, shared with every other non-step
-    /// durable call in the crate. What stays here is only what an *await* does with the answer.
+    /// [`StepPlacement::of`](crate::checkpoint::StepPlacement::of)'s, shared with every other
+    /// library step in the crate. What stays here is only what an *await* does with the answer.
     fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
-        Placement::of(conn, "awaiting a workflow's result").map(Self)
+        StepPlacement::of(conn, "awaiting a workflow's result").map(Self)
     }
 
     /// Whether a cancelled *awaited* workflow has to be distinguished from this caller being
