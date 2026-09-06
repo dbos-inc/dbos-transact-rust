@@ -498,15 +498,48 @@ where
     E: DurableError,
     Fut: Future<Output = Result<T, E>>,
 {
-    if options.timeout.is_none() && !options.preemptible {
-        return ctx.in_step_scope(None, body).instrument(span).await;
-    }
-
+    // **Every attempt gets a token, and it fires wherever the attempt is abandoned.** The guard
+    // cancels it if this future is dropped — a caller dropping the step, a combinator dropping it
+    // as a losing branch, the `select!` below losing the attempt to a watchdog — so work the
+    // runtime cannot stop by dropping, a `spawn_blocking` thread watching `ctx.cancellation()`,
+    // learns that its step is over in every one of those cases and not only the two this function
+    // races itself.
+    //
+    // **An attempt that returns disarms it**, which is what keeps the token a signal that the
+    // step was abandoned rather than a step-is-over broadcast: the body reached an outcome and
+    // had its chance to clean up, and work it deliberately left running is not this function's to
+    // stop. The two watchdog arms still cancel explicitly, before the losing future is dropped at
+    // the end of the `select!`, because a body that could only learn from the token should learn
+    // before its destructors run.
     let token = CancellationToken::new();
+    let cancel_on_drop = token.clone().drop_guard();
     let attempt = ctx
         .in_step_scope(Some(token.clone()), body)
         .instrument(span);
 
+    let outcome = if options.timeout.is_none() && !options.preemptible {
+        attempt.await
+    } else {
+        supervised(ctx, name, options, attempt, token).await
+    };
+    cancel_on_drop.disarm();
+    outcome
+}
+
+/// The watchdog half of [`supervise`], for an attempt that has a timeout or is preemptible.
+///
+/// Split out so the common case — neither watchdog — is an `await` on the attempt and nothing
+/// else, and so the token's disarm has one home rather than one per return path.
+async fn supervised<T, E>(
+    ctx: &Ctx,
+    name: &str,
+    options: &StepOptions<E>,
+    attempt: impl Future<Output = Result<T, E>>,
+    token: CancellationToken,
+) -> Result<T, E>
+where
+    E: DurableError,
+{
     // A deadline that never arrives, so the arm can be unconditional rather than duplicating the
     // whole `select!` for each combination of watchdogs.
     let deadline = async {
