@@ -6,6 +6,17 @@
 //! needs no application code at all, because `launch()` recovers whatever the previous run
 //! abandoned.
 //!
+//! **Events** is a key/value a workflow publishes as it goes, and anyone reads by name. The
+//! Workflows tab already leans on one event for its progress bar; what this tab adds is the half
+//! that bar cannot show — a read that *waits*. Ask for `shipped` before the order has shipped and
+//! the request blocks until the workflow publishes it, which is `get_event` with a timeout rather
+//! than the zero-timeout poll the progress bar uses.
+//!
+//! **Messages** is a workflow that stops and waits to be told something. An approval request runs
+//! until it reaches `recv`, and then nothing happens until a message arrives — from this tab, from
+//! another process, or from an application in another language. Approve one and it is `send`;
+//! approve every waiting one and it is `send_bulk`, which is one transaction and so all-or-nothing.
+//!
 //! **Queues** is a fan-out under a concurrency limit. Enqueue five workflows that sleep five
 //! seconds each against a queue allowing three at a time, and watch three run while two wait. The
 //! part worth pressing is the Apply button: `worker_concurrency` changes while the app is running,
@@ -34,6 +45,51 @@ const STEP_DURATION: Duration = Duration::from_secs(5);
 
 /// The queue the fan-out demo enqueues onto.
 const QUEUE_NAME: &str = "demo-queue";
+
+/// The keys the order workflow publishes, in the order it publishes them.
+///
+/// Names rather than numbers, which is the difference from the progress bar's single counter: a
+/// reader asks for `shipped` without knowing or caring which step number that was.
+const ORDER_KEYS: [&str; 3] = ["accepted", "charged", "shipped"];
+
+/// How long the order workflow spends before publishing each of its keys.
+///
+/// Three keys at three seconds is nine, which has to stay comfortably under
+/// [`EVENT_READ_TIMEOUT`]: the gesture the tab is built around is pressing Read on `shipped` before
+/// the order has shipped, and that has to *succeed* after a visible wait rather than time out.
+const ORDER_STEP: Duration = Duration::from_secs(3);
+
+/// How long a blocking `get_event` waits before reporting that the key is not there.
+///
+/// Longer than a whole order takes, so pressing Read on `shipped` the moment one starts waits for
+/// it and then succeeds. Reading a key nothing will ever publish still times out here, which is the
+/// other half worth seeing: absence is a value, and the timeout only decides how long to hope.
+const EVENT_READ_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// The topic approvals are sent on.
+///
+/// A topic rather than the default one because it is the honest shape: a workflow that waits for
+/// several kinds of message selects on the topic, and a message sent on another waits in the
+/// database rather than being handed to the wrong `recv`.
+const APPROVAL_TOPIC: &str = "approval";
+
+/// How long an approval request waits to be told something before giving up.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The name approval requests are registered under, and the name the tab lists them back by.
+const APPROVAL_WORKFLOW: &str = "ApprovalWorkflow";
+
+/// How many approval requests the tab shows, newest first.
+///
+/// A bound rather than a page: this is a demo, and the interesting requests are the recent ones.
+const APPROVAL_LIST_LIMIT: i64 = 20;
+
+/// The key an approval request publishes its outcome under, for the tab to read.
+///
+/// The workflow's *return value* is the same string, but reading a return value means holding a
+/// handle, and a restart forgets those. An event is a row, so the tab can report a decision made
+/// before the last restart — and reading one costs nothing when the answer is "still waiting".
+const DECISION_EVENT: &str = "decision";
 
 /// How many of the queue's workflows one process may run at once, to begin with.
 ///
@@ -94,6 +150,43 @@ async fn step_three() -> dbos::Result<()> {
     Ok(())
 }
 
+/// Publishes a named key at each stage of an order, for anyone to read by name.
+///
+/// The Workflows tab publishes a step *count*; this publishes what actually happened, under keys a
+/// reader asks for by name. Setting a key again would replace it — these are three distinct keys,
+/// so all three stay readable once written, including after the workflow has finished.
+async fn order_workflow(_: ()) -> dbos::Result<String> {
+    for key in ORDER_KEYS {
+        dbos::sleep(ORDER_STEP).await?;
+        dbos::set_event(key, &format!("{key} at step {}", stage_of(key) + 1)).await?;
+        println!("Order published {key}.");
+    }
+    Ok("Order complete".to_owned())
+}
+
+/// Where a key falls in [`ORDER_KEYS`], for the value the workflow publishes under it.
+fn stage_of(key: &str) -> usize {
+    ORDER_KEYS.iter().position(|k| *k == key).unwrap_or(0)
+}
+
+/// Waits to be told something, and does nothing at all until it is.
+///
+/// **The whole demo is the pause.** A workflow that reaches `recv` stops there, durably: the
+/// process can be restarted under it and the wait resumes with whatever is left of its timeout,
+/// because the deadline was checkpointed rather than held in memory. Nothing here polls, and
+/// nothing holds a connection open on the workflow's behalf.
+///
+/// The outcome is published as an event as well as returned, so the tab can report a decision it
+/// was not holding a handle for — see [`DECISION_EVENT`].
+async fn approval_workflow(_: ()) -> dbos::Result<String> {
+    let decision: Option<String> = dbos::recv(Some(APPROVAL_TOPIC), APPROVAL_TIMEOUT).await?;
+    // Absence is a value: nobody answered before the deadline, which is not a failure.
+    let outcome = decision.unwrap_or_else(|| "expired".to_owned());
+    println!("Approval request resolved: {outcome}.");
+    dbos::set_event(DECISION_EVENT, &outcome).await?;
+    Ok(outcome)
+}
+
 /// A workflow with nothing to it but a wait, which is all the queue demo needs: what it
 /// demonstrates is *when* it runs, not what it does.
 async fn enqueued_workflow(_: ()) -> dbos::Result<String> {
@@ -118,6 +211,13 @@ struct App {
     ///
     /// A `tokio` mutex because the guard is held across `status().await`.
     queued: Arc<Mutex<Vec<WorkflowHandle<String>>>>,
+    order: WorkflowRef<(), String>,
+    approval: WorkflowRef<(), String>,
+    /// The order whose keys the Events tab is reading, if one has been started.
+    ///
+    /// An id rather than a handle, because every read this tab does is by *id* — that is what an
+    /// event is for. Nothing here awaits the workflow.
+    order_id: Arc<Mutex<Option<String>>>,
 }
 
 #[tokio::main]
@@ -132,6 +232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dbos = DBOS::new(config);
     let example = dbos.register_workflow("ExampleWorkflow", example_workflow)?;
     let enqueued = dbos.register_workflow("EnqueuedWorkflow", enqueued_workflow)?;
+    let order = dbos.register_workflow("OrderWorkflow", order_workflow)?;
+    let approval = dbos.register_workflow(APPROVAL_WORKFLOW, approval_workflow)?;
 
     // Migrates, connects — and recovers whatever the previous run abandoned, which is the
     // entire crash-and-resume demonstration.
@@ -155,6 +257,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         example,
         enqueued,
         queued: Arc::default(),
+        order,
+        approval,
+        order_id: Arc::default(),
     };
     let router = Router::new()
         .route("/", get(index))
@@ -164,6 +269,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/queue/status", get(queue_status))
         .route("/queue/enqueue", post(queue_enqueue))
         .route("/queue/concurrency", post(queue_concurrency))
+        .route("/events/start", post(events_start))
+        .route("/events/status", get(events_status))
+        .route("/events/read", post(events_read))
+        .route("/messages/start", post(messages_start))
+        .route("/messages/status", get(messages_status))
+        .route("/messages/respond", post(messages_respond))
+        .route("/messages/respond-all", post(messages_respond_all))
         .with_state(app);
 
     // Loopback, not 0.0.0.0: this app ships a button that exits the process, which is a fine
@@ -309,6 +421,223 @@ async fn queue_concurrency(
         )
         .await?;
     Ok(())
+}
+
+// ============================================================
+// EVENTS TAB
+// ============================================================
+
+/// What the Events tab polls: which keys the current order has published so far.
+#[derive(Serialize)]
+struct EventsStatus {
+    workflow_id: Option<String>,
+    /// One entry per key in `ORDER_KEYS`, in order, with its value once published.
+    keys: Vec<EventKey>,
+}
+
+#[derive(Serialize)]
+struct EventKey {
+    key: String,
+    value: Option<String>,
+}
+
+/// Starts an order, replacing whatever the tab was watching.
+async fn events_start(State(app): State<App>) -> Result<String, AppError> {
+    let handle = app.order.start(()).await?;
+    let id = handle.workflow_id().to_owned();
+    *app.order_id.lock().await = Some(id.clone());
+    Ok(id)
+}
+
+/// Reads every key with a **zero** timeout: look once, do not wait.
+///
+/// This is the poll, and it is deliberately the boring half — `events_read` below is the one worth
+/// watching. A key that has not been published yet reads as `None`, which is a value and not an
+/// error.
+async fn events_status(State(app): State<App>) -> Result<Json<EventsStatus>, AppError> {
+    let workflow_id = app.order_id.lock().await.clone();
+    let mut keys = Vec::with_capacity(ORDER_KEYS.len());
+    for key in ORDER_KEYS {
+        let value = match &workflow_id {
+            Some(id) => app.dbos.get_event(id, key, Duration::ZERO).await?,
+            None => None,
+        };
+        keys.push(EventKey {
+            key: key.to_owned(),
+            value,
+        });
+    }
+    Ok(Json(EventsStatus { workflow_id, keys }))
+}
+
+#[derive(Deserialize)]
+struct ReadRequest {
+    key: String,
+}
+
+/// The result of a blocking read, with how long it actually waited.
+#[derive(Serialize)]
+struct ReadResult {
+    key: String,
+    value: Option<String>,
+    waited_ms: u128,
+}
+
+/// **The read that waits.** Asks for one key with a real timeout and blocks until it appears.
+///
+/// Press this on `shipped` while the order is still being accepted and the request sits here until
+/// the workflow publishes it — no polling, and no connection held open on the workflow's side. The
+/// elapsed time comes back so the tab can show that the wait was real.
+///
+/// A key that never arrives is `None` at the deadline rather than an error, which is the same
+/// answer `events_status` gives immediately: absence is a value either way, and the timeout only
+/// decides how long to keep hoping.
+async fn events_read(
+    State(app): State<App>,
+    Json(request): Json<ReadRequest>,
+) -> Result<Json<ReadResult>, AppError> {
+    let Some(id) = app.order_id.lock().await.clone() else {
+        return Ok(Json(ReadResult {
+            key: request.key,
+            value: None,
+            waited_ms: 0,
+        }));
+    };
+    let started = std::time::Instant::now();
+    let value: Option<String> = app
+        .dbos
+        .get_event(&id, &request.key, EVENT_READ_TIMEOUT)
+        .await?;
+    Ok(Json(ReadResult {
+        key: request.key,
+        value,
+        waited_ms: started.elapsed().as_millis(),
+    }))
+}
+
+// ============================================================
+// MESSAGES TAB
+// ============================================================
+
+/// One approval request, as the tab displays it.
+#[derive(Serialize)]
+struct Approval {
+    workflow_id: String,
+    /// The decision, once one has been made or the request expired. `None` while it is waiting.
+    decision: Option<String>,
+}
+
+/// Starts a request and leaves it waiting at its `recv`.
+///
+/// The handle is dropped: nothing here awaits the workflow, and [`messages_status`] finds it again
+/// by name rather than by having kept anything.
+async fn messages_start(State(app): State<App>) -> Result<String, AppError> {
+    let handle = app.approval.start(()).await?;
+    Ok(handle.workflow_id().to_owned())
+}
+
+/// Every approval request in the database, newest first.
+///
+/// **Queried rather than remembered, and that is the tab's point.** A list held in this process
+/// would be emptied by the crash button, and the tab would report nothing while the requests
+/// themselves were still parked at their `recv`, exactly where the last run left them. Asking the
+/// database instead means a restart changes nothing on screen — which is the claim the tab makes,
+/// so it had better be one the tab can keep.
+async fn approval_ids(app: &App) -> Result<Vec<String>, AppError> {
+    let rows = app
+        .dbos
+        .list_workflows(&dbos::sysdb::types::WorkflowFilter {
+            names: vec![APPROVAL_WORKFLOW],
+            limit: Some(APPROVAL_LIST_LIMIT),
+            sort_desc: true,
+            ..Default::default()
+        })
+        .await?;
+    Ok(rows.into_iter().map(|row| row.workflow_id).collect())
+}
+
+/// Every request in the database, newest first, each with its decision if it has one.
+async fn messages_status(State(app): State<App>) -> Result<Json<Vec<Approval>>, AppError> {
+    let ids = approval_ids(&app).await?;
+    let mut approvals = Vec::with_capacity(ids.len());
+    for workflow_id in ids {
+        let decision = app
+            .dbos
+            .get_event(&workflow_id, DECISION_EVENT, Duration::ZERO)
+            .await?;
+        approvals.push(Approval {
+            workflow_id,
+            decision,
+        });
+    }
+    Ok(Json(approvals))
+}
+
+#[derive(Deserialize)]
+struct RespondRequest {
+    workflow_id: String,
+    decision: String,
+}
+
+/// **One message to one waiting workflow.**
+///
+/// The workflow is not running when this arrives — it is parked at `recv` with nothing of it in
+/// memory — and it is the *row* this writes that wakes it. Which is why the same call works from
+/// another process, or from an application in another language sharing this database.
+async fn messages_respond(
+    State(app): State<App>,
+    Json(request): Json<RespondRequest>,
+) -> Result<(), AppError> {
+    app.dbos
+        .send_with(
+            &request.workflow_id,
+            &request.decision,
+            dbos::SendOptions {
+                topic: Some(APPROVAL_TOPIC),
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RespondAllRequest {
+    decision: String,
+}
+
+/// **Every waiting request, in one transaction.**
+///
+/// The difference from a loop of [`messages_respond`] is all-or-nothing: `send_bulk` is a single
+/// insert, so a failure part-way through delivers nothing rather than a prefix. Nobody is approved
+/// unless everybody is.
+///
+/// Requests that already have a decision are left out — sending to them would be delivered and
+/// simply never received, since their `recv` has already returned.
+async fn messages_respond_all(
+    State(app): State<App>,
+    Json(request): Json<RespondAllRequest>,
+) -> Result<String, AppError> {
+    let ids = approval_ids(&app).await?;
+    let mut waiting = Vec::new();
+    for id in ids {
+        let decided: Option<String> = app
+            .dbos
+            .get_event(&id, DECISION_EVENT, Duration::ZERO)
+            .await?;
+        if decided.is_none() {
+            waiting.push(id);
+        }
+    }
+    let messages: Vec<dbos::Message<'_, String>> = waiting
+        .iter()
+        .map(|id| dbos::Message {
+            topic: Some(APPROVAL_TOPIC),
+            ..dbos::Message::new(id, &request.decision)
+        })
+        .collect();
+    app.dbos.send_bulk(&messages).await?;
+    Ok(messages.len().to_string())
 }
 
 /// Crashes the application. For demonstration purposes only :)
