@@ -22,8 +22,8 @@ use std::result::Result as StdResult;
 use std::time::Duration;
 
 use crate::connection::Connection;
-use crate::dbos::DBOS;
 use crate::error::{Error, Result};
+use crate::instance::DBOS;
 use crate::sysdb::types::{
     Applications, Change, NewQueue, OnExistingQueue, QueueRecord, QueueUpdate, RateLimit,
 };

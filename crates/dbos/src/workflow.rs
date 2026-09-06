@@ -11,9 +11,9 @@ use tracing::Instrument;
 
 use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::dbos::Executor;
 use crate::error::{DurableError, Error, Failure, Result};
 use crate::handle::WorkflowHandle;
+use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
 use crate::sysdb::types::{

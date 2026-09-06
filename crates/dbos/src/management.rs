@@ -113,9 +113,9 @@ use std::time::Duration;
 
 use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::dbos::{DBOS, Executor};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
+use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
     Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowDelay, WorkflowFilter,
     WorkflowRecord,

@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
-use crate::dbos::Executor;
 use crate::error::Error;
+use crate::instance::Executor;
 use crate::queue::DEFAULT_POLLING_INTERVAL;
 use crate::registry::WorkflowKey;
 use crate::sysdb;

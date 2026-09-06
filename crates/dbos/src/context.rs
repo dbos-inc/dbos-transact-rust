@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::dbos::Executor;
+use crate::instance::Executor;
 use crate::sysdb::types::Timestamp;
 
 tokio::task_local! {
