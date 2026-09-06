@@ -189,6 +189,16 @@ impl Ctx {
         self.step_marker.is_some()
     }
 
+    /// Which step body this context is inside, if any.
+    ///
+    /// [`in_step`](Self::in_step) asks whether there is one; this asks *which*, and the difference
+    /// is what lets a durable call built inside a step body be refused when it is polled somewhere
+    /// else. Both places have the same workflow id, so comparing workflow identity cannot tell them
+    /// apart. See [`StepMarker`].
+    pub(crate) fn step_marker(&self) -> Option<StepMarker> {
+        self.step_marker
+    }
+
     /// Runs `body` under a context that is [`in_step`](Self::in_step).
     ///
     /// **Nothing to unset afterwards**, which is what moving the answer off the shared state

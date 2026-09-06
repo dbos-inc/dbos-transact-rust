@@ -1,10 +1,11 @@
 //! Where a call that is not a [`step`](crate::step) stands, and what that means for its replay.
 //!
-//! Several calls in this crate are *durable operations that are not steps*: awaiting a workflow's
-//! result, waiting on a set of handles, reading an event. Each is a single durable act that a
-//! replay must not perform twice, and each therefore takes a step id from the ambient workflow and
-//! records its answer under it. None of them is a step in the [`step`](crate::step) sense — there
-//! is no user body, no retry policy, no timeout — so none of them goes through `step_with`.
+//! Several calls in this crate are *steps the caller never wrote*: awaiting a workflow's result,
+//! waiting on a set of handles, reading an event. Each is a single durable act that a replay must
+//! not perform twice, so each takes a step id from the ambient workflow and records its answer
+//! under it — which is exactly what makes it a step, and why they are all [`PendingStep`]s beside
+//! the ones [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no
+//! user body, no retry policy and no timeout, so none of them goes through `step_with`.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
 //! decision is subtle enough to be worth having in one place:
@@ -32,13 +33,111 @@
 //! handles records a plain value. Each knows what its own row means. This module owns only the
 //! placement and the generic value-shaped write, which is what the callers with nothing special to
 //! say reach for.
+//!
+//! It also owns [`PendingStep`] itself, the value such a call hands back once it has taken its step
+//! id and before it has run. That belongs here rather than beside any one producer because the id
+//! and the rule it implies — *polled where it was built* — are the same whichever call took it.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::Error;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
+
+/// A durable call that has taken its step id and has not run.
+///
+/// **The id is taken where the call is written, not where it is first polled.** That is what makes
+/// a set of durable calls driven together deterministic: `tokio::join!` builds every branch before
+/// polling any, so the ids follow source order — which is the order a replay builds them in again —
+/// however the bodies then interleave. An id allocated at the first poll would instead depend on
+/// which future reached the counter first, and a replay does not reproduce that.
+///
+/// Awaiting one runs it. This is a [`Future`], so `step(..).await?` reads exactly as it did when
+/// [`step`](crate::step) was an `async fn`, and not one call site had to change.
+///
+/// **Built and dropped, it has still spent the id**, which is why this is `#[must_use]`. That is
+/// deterministic — the same construction sequence burns the same ids on the replay — but it is no
+/// longer the no-op it was when the id was taken at the first poll.
+///
+/// **Polled where it was built.** The id is a claim on one position in one workflow, so a call
+/// carried into another workflow, or built outside one and polled inside, is refused as
+/// [`Error::StepBuiltElsewhere`] rather than run under an id nothing there can honour. Each
+/// producer makes that check inside its own run, which is why nothing here knows how.
+///
+/// **`Unpin`, which is contract rather than accident**: the run is already boxed, so a combinator
+/// holding one of these as a branch can do so by `Pin::new(&mut _)` rather than pinning it a
+/// second time.
+#[must_use = "a durable call that is not awaited has spent its step id without running; await it, \
+              or hand it to a combinator"]
+pub struct PendingStep<'a, T, E = crate::EngineOnly> {
+    /// What the call is called, which is the name its checkpoint is checked against on replay.
+    name: Arc<str>,
+    /// The id this call claimed when it was built, or `None` where it claimed none.
+    step_id: Option<i32>,
+    /// The run, built by the constructor and driven by whatever polls this.
+    ///
+    /// An `async fn` body does not begin until it is polled, so the future is built where the id
+    /// is taken and this field is the whole of what runs. The two above it are identity, not
+    /// state: nothing reads them to decide what happens, and nothing mutates them.
+    running: Pin<Box<dyn Future<Output = crate::Result<T, E>> + Send + 'a>>,
+}
+
+impl<'a, T, E> PendingStep<'a, T, E> {
+    pub(crate) fn new(
+        name: Arc<str>,
+        step_id: Option<i32>,
+        running: impl Future<Output = crate::Result<T, E>> + Send + 'a,
+    ) -> Self {
+        Self {
+            name,
+            step_id,
+            running: Box::pin(running),
+        }
+    }
+
+    /// What this call is called — the name its checkpoint is checked against on replay.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The id this call claimed when it was built, or `None` if it claimed none.
+    ///
+    /// `None` is not a failure. Outside a workflow there is no counter to draw from, and a step
+    /// built inside another step is a plain call by the leaf rule.
+    ///
+    /// **Readable here because the run cannot be asked.** Once the call is a future the id is
+    /// sealed inside it, and the callers that need to *name* one are all outside it — a `Debug`
+    /// that says something, and a combinator reporting which branch a stale checkpoint meant.
+    #[must_use]
+    pub fn step_id(&self) -> Option<i32> {
+        self.step_id
+    }
+}
+
+impl<T, E> Future for PendingStep<'_, T, E> {
+    type Output = crate::Result<T, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // `get_mut` rather than a projection: every field is `Unpin`, the run because it is
+        // already a `Pin<Box<_>>`, so there is nothing here for pinning to protect.
+        self.get_mut().running.as_mut().poll(cx)
+    }
+}
+
+impl<T, E> std::fmt::Debug for PendingStep<'_, T, E> {
+    /// The identity, which is all there is to say: the run is an opaque future.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingStep")
+            .field("name", &self.name)
+            .field("step_id", &self.step_id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Where the caller of a non-step durable operation stands.
 ///
