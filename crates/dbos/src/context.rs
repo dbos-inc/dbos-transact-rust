@@ -200,11 +200,11 @@ impl Ctx {
     /// **without completing**: a timeout, a cancelled workflow, or anything else that drops the
     /// step's future. An attempt that reaches an outcome does *not* fire it, because the body has
     /// had its chance to clean up and work it deliberately left running is not the engine's to
-    /// stop. **Ordinary `async` code needs nothing**: a step that times out has its future dropped, which stops it at its next
-    /// suspension point and runs its destructors on the way out, so a connection is returned and a
-    /// guard released without the body containing a line about it. That is what TypeScript's
-    /// `stepStatus.timeoutSignal` is for, and Rust gets the common case for free where TypeScript
-    /// has to abandon the attempt and discard its eventual settlement.
+    /// stop. **Ordinary `async` code needs nothing**: a step that times out has its future dropped,
+    /// which stops it at its next suspension point and runs its destructors on the way out, so a
+    /// connection is returned and a guard released without the body containing a line about it.
+    /// That is what TypeScript's `stepStatus.timeoutSignal` is for, and Rust gets the common case
+    /// for free where TypeScript has to abandon the attempt and discard its eventual settlement.
     ///
     /// Returns a token that is never cancelled when there is no step running, so a body that is
     /// also called outside a workflow needs no second path.
