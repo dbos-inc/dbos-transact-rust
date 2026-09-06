@@ -227,20 +227,17 @@ impl<E> StepOptions<E> {
 /// ordinarily callable and ordinarily testable, and it is what Python does. Inside another step the
 /// same applies: a step is a leaf, so a nested one is a plain call rather than a second checkpoint.
 ///
-/// **A workflow body must await each step before starting the next.** The flag that makes a step a
-/// leaf lives on the workflow rather than on the call stack, so two steps in flight at once — under
-/// `tokio::join!`, `select!`, or any other concurrent combinator — see each other's. Two ways that
-/// goes wrong, and both are silent: a step that starts while another's body is running takes the
-/// plain path above and is *not* checkpointed, so a replay runs it again; and a sibling finishing
-/// clears the flag for a step still inside its body, so a step nested in that one allocates an id
-/// after all. Step ids then fall out of poll order, and a replay that interleaves differently meets
-/// a recorded step under the wrong name — which is a system-database error, so the workflow records
-/// nothing, stays `PENDING`, and is recovered until it parks.
+/// **A workflow body must await each step before starting the next.** *Nesting* is exact — the
+/// marker that makes a step a leaf lives on the call stack rather than on the workflow, so two
+/// steps in flight cannot see each other's and one finishing cannot answer for another still
+/// inside its body — but a step takes its id when it is first **polled**, and concurrent steps are
+/// polled in whatever order the combinator chooses. Step ids then follow poll order rather than
+/// source order, and a replay that interleaves differently meets a recorded step under the wrong
+/// name — which is a system-database error, so the workflow records nothing, stays `PENDING`, and
+/// is recovered until it parks.
 ///
-/// That is a known gap rather than a rule with a workaround. Concurrent steps are a later change:
-/// the flag has to become per-call-stack — a nested [`Ctx`](crate::Ctx) scope around the body, so
-/// that nesting is exact and siblings cannot see each other — and wants a count of live steps, so
-/// that genuine concurrency is refused loudly rather than degrading to a plain call. Until then,
+/// That is a known gap rather than a rule with a workaround. Closing it means taking the id where
+/// the step is *built*, which source order fixes and scheduling cannot disturb. Until then,
 /// sequential is the contract.
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
@@ -1015,6 +1012,68 @@ mod tests {
             seen,
             [(0, "outer"), (1, "after")],
             "`inner` is not a checkpoint"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// A step built in the workflow proper while a sibling's body is in flight is still a step.
+    ///
+    /// What the per-call-stack marker buys, at the only altitude that shows it: with the answer on
+    /// the shared workflow state, `held` being mid-body made `beside` read *itself* as nested, so
+    /// `beside` ran plainly and wrote no row — and every replay of this workflow ran it again.
+    ///
+    /// The two notifies are the whole of the interleaving, and there is no sleep in it: `beside` is
+    /// built only once `held` says it is inside its body, and `held` returns only once `beside` has
+    /// been awaited.
+    #[tokio::test]
+    async fn a_step_built_while_a_sibling_runs_is_still_checkpointed() {
+        let (dbos, _db) = workflow("wf-concurrent").await;
+        let inside = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        Ctx::scope(ctx(&dbos, "wf-concurrent"), async {
+            let held = step("held", {
+                let inside = Arc::clone(&inside);
+                let release = Arc::clone(&release);
+                move || {
+                    let inside = Arc::clone(&inside);
+                    let release = Arc::clone(&release);
+                    async move {
+                        inside.notify_one();
+                        release.notified().await;
+                        Ok::<_, crate::Error>(1u32)
+                    }
+                }
+            });
+            let beside = async {
+                inside.notified().await;
+                let value = step("beside", || async { Ok::<_, crate::Error>(2u32) }).await;
+                release.notify_one();
+                value
+            };
+
+            let (held, beside) = tokio::join!(held, beside);
+            assert_eq!(held.unwrap(), 1);
+            assert_eq!(beside.unwrap(), 2);
+        })
+        .await;
+
+        let steps = dbos
+            .executor("test")
+            .unwrap()
+            .sysdb()
+            .list_workflow_steps("wf-concurrent", true, None, None, None)
+            .await
+            .expect("read failed");
+        let seen: Vec<(i32, &str)> = steps
+            .iter()
+            .map(|s| (s.step_id, s.step_name.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            [(0, "held"), (1, "beside")],
+            "`beside` is the workflow's own step, not something inside `held`"
         );
 
         dbos.shutdown().await;
