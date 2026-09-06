@@ -218,14 +218,33 @@ async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
         "the replay added no second receive",
     );
 
+    // What the replay returned, which is the half the step list cannot show: a replay that
+    // consumed nothing but also remembered nothing would pass every assertion below.
+    let recovered = dbos
+        .retrieve_workflow::<Option<String>, dbos::Error>(&workflow_id)
+        .expect("retrieve failed");
+    let taken = tokio::time::timeout(DEADLINE, recovered.result())
+        .await
+        .expect("the recovered workflow never finished")
+        .expect("the workflow failed");
+    assert_eq!(
+        taken,
+        Some("first".to_owned()),
+        "the replay returned the message the first run took",
+    );
+
     let notifications = reader
         .get_all_notifications(&workflow_id)
         .await
         .expect("read failed");
-    let consumed: Vec<bool> = notifications.iter().map(|n| n.consumed).collect();
+    // A count rather than a positional `[true, false]`: `get_all_notifications` orders by
+    // `created_at_epoch_ms` alone, and two back-to-back sends can share a millisecond. Which
+    // message was taken is pinned by the returned value above, so the rows need only say how
+    // many were taken.
+    assert_eq!(notifications.len(), 2, "both messages were delivered");
     assert_eq!(
-        consumed,
-        [true, false],
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
         "the replay must not have consumed the second message",
     );
 
@@ -389,8 +408,10 @@ async fn a_step_may_send_but_may_not_receive() {
 /// forked from its destination, and with the default it does not.
 ///
 /// The fan-out itself is `sysdb`'s and is tested there. What this pins is the engine mapping —
-/// `SendOptions::forks` becoming the flag `send_messages` takes — which lives in one place
-/// (`Connection::send`) shared by all three surfaces, so exercising it through one covers them all.
+/// `SendOptions::forks` becoming the flag `sysdb` takes — which `Connection::send_message` does
+/// identically for all three single-send surfaces, so exercising it through one covers them all.
+/// `Connection::send_messages` maps it the same way for the batch, which
+/// [`a_workflows_batch_is_one_checkpoint`] reaches.
 #[tokio::test]
 async fn a_send_may_fan_out_to_the_destinations_forks() {
     let db = test_database().await;

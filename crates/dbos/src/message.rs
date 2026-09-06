@@ -33,13 +33,15 @@
 //! its connection pool alive for the life of the process. Making a workflow capture a handle in
 //! order to send a message would have made that the documented way to write one.
 //!
-//! **Every send in the crate is here, and they meet at one place.** `Connection::send` is the
-//! shared path — it encodes the payloads, names the format, and hands `sysdb` a batch — so the
-//! surfaces above it differ only in what they can say before they reach it: which ambient context
-//! to read, whether the send is checkpointed, and whether a handle's executor has to be reconciled
-//! with it. That is [`event`](crate::event)'s shape too, where `Connection::get_event` is the one
-//! read under three callers. A batch is the primitive and a single send is a caller with one
-//! message, which is what `sysdb` says and how it derives the step name.
+//! **Every send in the crate is here, and they meet at one place per surface.**
+//! `Connection::send_message` and `Connection::send_messages` are the shared paths — each encodes
+//! the payloads, names the format, and hands `sysdb` the matching call — so the surfaces above
+//! them differ only in what they can say before they reach one: which ambient context to read,
+//! whether the send is checkpointed, and whether a handle's executor has to be reconciled with it.
+//! That is [`event`](crate::event)'s shape too, where `Connection::get_event` is the one read under
+//! three callers. The single send and the batch stay separate all the way down, because which one
+//! is called is what chooses the recorded step name — `sysdb` takes it from the method rather than
+//! deriving it from a count.
 //!
 //! **Required as arguments, optional in a struct.** All three single sends read
 //! `send(destination_id, message)`, with a topic, an idempotency key and the fork fan-out in
@@ -92,9 +94,9 @@ use crate::sysdb::types::Message as EncodedMessage;
 /// The send is checkpointed under a step id, so a replay does not send twice — `sysdb` finds the
 /// recorded step and inserts nothing, in the same transaction that would have written. **That is a
 /// workflow's whole idempotency**, and it is why a workflow body rarely sets
-/// [`Message::idempotency_key`]: the step already makes the send exactly-once. The field is
-/// available here all the same, as it is in Python, and it is what a send from inside a *step* has
-/// instead.
+/// [`SendOptions::idempotency_key`]: the step already makes the send exactly-once. The key is
+/// available here all the same, through [`send_with`], as it is in Python, and it is what a send
+/// from inside a *step* has instead.
 ///
 /// The error is the *workflow's* channel, like [`step`](crate::step)'s and
 /// [`set_event`](crate::set_event)'s, so `?` needs no conversion.
@@ -104,8 +106,8 @@ use crate::sysdb::types::Message as EncodedMessage;
 /// everything its body did. The cost is real and is the references' accepted position rather than
 /// ours: a step that retries sends again, and this form has no idempotency key to stop it. Python,
 /// TypeScript and Java all do exactly this; Go alone refuses the call. A send that must happen once
-/// across retries wants a [`Message::idempotency_key`], or wants hoisting out of the step, where
-/// the step id makes it exactly-once.
+/// across retries wants [`send_with`] and a [`SendOptions::idempotency_key`], or wants hoisting out
+/// of the step, where the step id makes it exactly-once.
 ///
 /// Outside a workflow there is no context to take an executor from, so this is
 /// [`Error::NotInWorkflow`]. That is where [`DBOS::send`] is the call.
@@ -151,10 +153,11 @@ where
 /// insert, so a failure halfway through delivers nothing rather than a prefix.
 ///
 /// The batch is checkpointed as **one** step, so a replay sends none of it again. The step is
-/// recorded as `DBOS.sendBulk` — except for a batch of exactly one message, which `sysdb` records
-/// as `DBOS.send`, since the name distinguishes the two API surfaces rather than the two methods.
-/// A workflow whose message *count* changes between runs therefore flips names and is caught as a
-/// determinism error, which is what recording the name is for.
+/// recorded as `DBOS.sendBulk` however long the batch is, a batch of exactly one included: the
+/// name says which API surface was reached for, not how many messages it carried. A workflow that
+/// swaps a [`send`] for a [`send_bulk`] between runs therefore flips names and is caught as a
+/// determinism error, while one whose message *count* merely changes is not, that being no change
+/// of operation.
 ///
 /// Where a single [`send`] takes its destination and payload as arguments, a batch takes
 /// [`Message`] values: the topic and the idempotency key vary per message, so they travel with the
@@ -192,7 +195,7 @@ where
     T: Serialize,
     E: DurableError,
 {
-    let ctx = workflow_ctx("send")?;
+    let ctx = workflow_ctx("send_bulk")?;
     let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
     ctx.executor()
         .connection()
@@ -304,7 +307,7 @@ impl DBOS {
         message: &T,
         options: SendOptions<'_>,
     ) -> Result<()> {
-        let (executor, ctx) = self.sending_context()?;
+        let (executor, ctx) = self.sending_context("send")?;
         executor
             .connection()
             .send_message(
@@ -331,7 +334,7 @@ impl DBOS {
         messages: &[Message<'_, T>],
         options: SendBulkOptions,
     ) -> Result<()> {
-        let (executor, ctx) = self.sending_context()?;
+        let (executor, ctx) = self.sending_context("send_bulk")?;
         executor
             .connection()
             .send_messages(messages, ctx.as_ref().map(caller_for), options.forks)
@@ -342,11 +345,16 @@ impl DBOS {
     ///
     /// Shared by [`send_with`](Self::send_with) and [`send_bulk_with`](Self::send_bulk_with) because
     /// the reconciliation is the same for both and is the only thing either does before handing
-    /// off. Inside a step the caller is already `None`, so nothing is checkpointed and there is
-    /// nothing to disagree about — that send is plain whichever instance serves it, exactly as
-    /// `DBOS::get_event`'s read is.
-    fn sending_context(&self) -> Result<(Arc<crate::Executor>, Option<Ctx>)> {
-        let executor = self.executor("send")?;
+    /// off. `operation` is the only thing that differs, and it is a parameter so that an error
+    /// names the surface the caller reached for rather than the one they share. Inside a step the
+    /// caller is already `None`, so nothing is checkpointed and there is nothing to disagree
+    /// about — that send is plain whichever instance serves it, exactly as `DBOS::get_event`'s
+    /// read is.
+    fn sending_context(
+        &self,
+        operation: &'static str,
+    ) -> Result<(Arc<crate::Executor>, Option<Ctx>)> {
+        let executor = self.executor(operation)?;
         let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
         // Exactly where the two halves would be combined: a step id is about to be taken from the
         // ambient context and recorded against `self`'s executor.
@@ -355,21 +363,13 @@ impl DBOS {
             .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
         {
             return Err(Error::WrongInstance {
-                operation: "send".into(),
+                operation: operation.into(),
             });
         }
         Ok((executor, ctx))
     }
 }
 
-/// One message, from a surface that sends exactly one.
-///
-/// The free [`send`] and [`DBOS::send`] differ only in where the connection comes from and which
-/// guards ran before they got here; everything after that is this. `caller` present is the
-/// checkpointed send and absent is the plain one, which is exactly what `sysdb`'s optional caller
-/// means. Taking the [`Ctx`] rather than a pre-built caller is what keeps the step id from being
-/// allocated on a path that then refuses: both callers have finished their guards by the time they
-/// reach this.
 /// The ambient workflow context a free-function send stands in, or [`Error::NotInWorkflow`].
 ///
 /// The free forms have no handle to take an executor from, so being inside a workflow is what makes
@@ -594,8 +594,8 @@ impl<'a, T> Message<'a, T> {
     /// options.
     ///
     /// The one place [`SendOptions`] and [`Message`] meet, and the whole of what a single send adds
-    /// over a batch of one — which is why there is no layer between the surfaces and
-    /// [`Connection::send`] beyond this and [`caller_for`].
+    /// over the arguments a batch already carries per message — which is why there is no layer
+    /// between the surfaces and [`Connection::send_message`] beyond this and [`caller_for`].
     pub(crate) fn from_options(
         destination_id: &'a str,
         message: &'a T,
