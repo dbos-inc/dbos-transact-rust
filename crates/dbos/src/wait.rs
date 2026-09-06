@@ -167,8 +167,8 @@
 use crate::checkpoint::Placement;
 use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::dbos::DBOS;
 use crate::error::{Error, Result};
+use crate::instance::DBOS;
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 

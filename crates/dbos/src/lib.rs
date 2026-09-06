@@ -32,8 +32,6 @@ mod connection;
 #[cfg(feature = "engine")]
 mod context;
 #[cfg(feature = "engine")]
-mod dbos;
-#[cfg(feature = "engine")]
 mod dequeue;
 #[cfg(feature = "engine")]
 mod error;
@@ -43,6 +41,8 @@ mod event;
 mod handle;
 #[cfg(feature = "engine")]
 mod identity;
+#[cfg(feature = "engine")]
+mod instance;
 #[cfg(feature = "engine")]
 mod management;
 #[cfg(feature = "engine")]
@@ -74,8 +74,6 @@ pub use config::{Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
 pub use context::Ctx;
 #[cfg(feature = "engine")]
-pub use dbos::{DBOS, Executor};
-#[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
 pub use event::{get_event, set_event};
@@ -83,6 +81,8 @@ pub use event::{get_event, set_event};
 pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
 pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, EXECUTOR_ID_ENV};
+#[cfg(feature = "engine")]
+pub use instance::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use management::{Children, ForkFrom, ForkOptions, ResumeOptions};
 #[cfg(feature = "engine")]
