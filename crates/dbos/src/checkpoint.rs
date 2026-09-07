@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
-use crate::context::{Ctx, StepMarker};
+use crate::context::Ctx;
 use crate::error::Error;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
@@ -148,6 +148,22 @@ impl<T, E> std::fmt::Debug for PendingStep<'_, T, E> {
     }
 }
 
+/// Whether a call is durable where it is being polled, and what to record if it is.
+///
+/// What [`StepPlacement::check_here`] answers for a call it accepts. Two states rather than an
+/// `Option`, because the caller has to handle both and a name is what stops one being forgotten —
+/// an unnamed `None` here would quietly mean *run this undurably*. A refusal is not among them:
+/// that is the `Err` half.
+pub(crate) enum StepDurability<'a> {
+    /// Durable: record it, under this workflow and this id.
+    ///
+    /// Borrowed from the placement, which outlives the call that is asking, so nothing is cloned
+    /// to answer a question about where it stands.
+    Recorded { ctx: &'a Ctx, step_id: i32 },
+    /// Undurable, and rightly so: it claimed no id, and this is a place that expects none of it.
+    Plain,
+}
+
 /// Where a durable call stands: which of the workflow's step ids it occupies, if any.
 ///
 /// **One type for both kinds of step.** A *user step* is what [`step`](crate::step) and
@@ -168,15 +184,16 @@ pub(crate) enum StepPlacement {
     /// for everything its body did, and allocating an id inside one would shift every later step
     /// onto the wrong replay slot.
     ///
-    /// Carries *which* body, so a call built here and polled anywhere else is refused rather than
-    /// run unrecorded where a checkpoint was expected. The marker is the only thing that can tell
-    /// those two places apart, since they share a workflow id; `workflow_id` is carried for the
-    /// refusal's message and never for the comparison, which a process-unique marker settles on
-    /// its own.
-    InsideStep {
-        workflow_id: String,
-        marker: StepMarker,
-    },
+    /// Carries the body's own [`Ctx`], so a call built here and polled anywhere else is refused
+    /// rather than run unrecorded where a checkpoint was expected. Its
+    /// [`step_marker`](Ctx::step_marker) is the only thing that can tell the two places apart,
+    /// since they share a workflow id, and being process-unique it settles the comparison on its
+    /// own. The id the refusal's message needs comes off the same `Ctx`, which is why there is no
+    /// copy of it here — the same reason [`Recorded`](Self::Recorded) holds one.
+    ///
+    /// **Only ever built where that marker is present.** [`here`](Self::here) and [`of`](Self::of)
+    /// are the only constructors, and each reaches this arm only for a `Ctx` inside a step body.
+    InsideStep { ctx: Ctx },
     /// Reached through a [`Client`](crate::Client)'s connection. A client has no step counter to
     /// agree with this workflow's, and no execution of its own that a recorded call could belong
     /// to, so the call degrades to the undurable version of itself — which is what
@@ -211,14 +228,11 @@ impl StepPlacement {
         let Some(ctx) = Ctx::current() else {
             return Ok(Self::Outside);
         };
-        // First, because inside a step nothing is checkpointed whoever the connection belongs to,
-        // and there is then nothing for the halves below to disagree about. `DBOS::get_event`
-        // orders its own two checks the same way.
-        if let Some(marker) = ctx.step_marker() {
-            return Ok(Self::InsideStep {
-                workflow_id: ctx.workflow_id().to_owned(),
-                marker,
-            });
+        // Before the connection, because inside a step nothing is checkpointed whoever the
+        // connection belongs to, and there is then nothing for the halves below to disagree
+        // about. `DBOS::get_event` orders its own two checks the same way.
+        if ctx.step_marker().is_some() {
+            return Ok(Self::InsideStep { ctx });
         }
         // Where the two halves would be combined: a step id is about to come from this workflow's
         // counter while the write goes through the caller's own connection. What that means
@@ -263,11 +277,8 @@ impl StepPlacement {
         let Some(ctx) = Ctx::current() else {
             return Self::Outside;
         };
-        if let Some(marker) = ctx.step_marker() {
-            return Self::InsideStep {
-                workflow_id: ctx.workflow_id().to_owned(),
-                marker,
-            };
+        if ctx.step_marker().is_some() {
+            return Self::InsideStep { ctx };
         }
         let step_id = ctx.next_step_id();
         Self::Recorded { ctx, step_id }
@@ -282,14 +293,84 @@ impl StepPlacement {
     }
 
     /// How to describe this place in [`Error::StepBuiltElsewhere`].
+    ///
+    /// Three of the four arms are a [`Ctx`] or the absence of one, so they go through
+    /// [`describe`](Self::describe) — the same function the *polled* side of that error uses, so
+    /// the two halves of one message cannot end up in different dialects.
     pub(crate) fn whereabouts(&self) -> std::borrow::Cow<'static, str> {
         match self {
-            Self::Recorded { ctx, .. } => format!("in workflow {}", ctx.workflow_id()).into(),
-            Self::InsideStep { workflow_id, .. } => {
-                format!("inside a step of workflow {workflow_id}").into()
-            }
+            Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Self::describe(Some(ctx)),
             Self::ClientConnection => "on a client's connection".into(),
-            Self::Outside => "outside a workflow".into(),
+            Self::Outside => Self::describe(None),
+        }
+    }
+
+    /// How to describe the place a call is *standing*, given the context in scope there.
+    ///
+    /// The counterpart to [`whereabouts`](Self::whereabouts) and deliberately the same three
+    /// phrasings: a refusal names where the call was built and where it was polled, and a reader
+    /// comparing them should be comparing places rather than wordings. Reads the context rather
+    /// than building a placement from it, because placing costs a step id and describing must not.
+    pub(crate) fn describe(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
+        match ctx {
+            Some(ctx) if ctx.step_marker().is_some() => {
+                format!("inside a step of workflow {}", ctx.workflow_id()).into()
+            }
+            Some(ctx) => format!("in workflow {}", ctx.workflow_id()).into(),
+            None => "outside a workflow".into(),
+        }
+    }
+
+    /// Whether a call built here may be polled where `ambient` is the context in scope, and what
+    /// polling it there means.
+    ///
+    /// **The rule the step id implies, and it lives on the placement because every producer needs
+    /// it.** An id is a claim on one position in one workflow, so a call carried somewhere that
+    /// cannot honour it is refused rather than run: the alternatives are recording it under the
+    /// wrong workflow's id, or running it unrecorded where the surrounding workflow expects a
+    /// checkpoint and every replay would run it again. [`step`](crate::step) asks this, and so
+    /// will each library step as it moves its allocation to the call.
+    ///
+    /// `step` names the call for [`Error::StepBuiltElsewhere`].
+    pub(crate) fn check_here<E>(
+        &self,
+        step: &str,
+        ambient: Option<&Ctx>,
+    ) -> crate::Result<StepDurability<'_>, E> {
+        match (self, ambient) {
+            // The ordinary durable case: built at a step boundary of this workflow, polled at one.
+            // No step body may be in scope on either side, or this is a call claimed in the
+            // workflow proper and carried *into* a step body, where its checkpoint would sit
+            // beneath a step whose own row already covers whatever that body did.
+            (Self::Recorded { ctx, step_id }, Some(here))
+                if here.workflow_id() == ctx.workflow_id() && here.step_marker().is_none() =>
+            {
+                Ok(StepDurability::Recorded {
+                    ctx,
+                    step_id: *step_id,
+                })
+            }
+            // Took no id, and is polled in the same step body it was built in. Compared by marker
+            // alone: it is process-unique, so equal markers are the same body and therefore the
+            // same workflow. The `is_some` is what keeps that true — two absent markers are not a
+            // match, they are the workflow proper twice — and it holds by construction today.
+            (Self::InsideStep { ctx }, Some(here))
+                if ctx.step_marker().is_some() && here.step_marker() == ctx.step_marker() =>
+            {
+                Ok(StepDurability::Plain)
+            }
+            (Self::Outside, None) => Ok(StepDurability::Plain),
+            // **Pinned to nothing, on purpose.** A client's call has no counter anywhere to
+            // disagree with and no execution of its own to belong to, so it is the undurable
+            // version of itself wherever it is driven — which is the whole reason this is a
+            // variant of its own rather than an uncheckpointed one shared with `InsideStep`.
+            (Self::ClientConnection, _) => Ok(StepDurability::Plain),
+            // Everything else is a claim nobody here can honour.
+            _ => Err(Error::StepBuiltElsewhere {
+                step: step.to_owned(),
+                built: self.whereabouts(),
+                polled: Self::describe(ambient),
+            }),
         }
     }
 
@@ -368,5 +449,189 @@ impl StepPlacement {
             )
             .await
             .map_err(Error::SystemDatabase)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EngineOnly;
+
+    /// A launched instance and three contexts of one workflow: the workflow proper, and one inside
+    /// each of two different step bodies.
+    ///
+    /// A real `Ctx` needs a real `Executor`, which needs a database — but nothing below writes a
+    /// row or reads one. [`StepPlacement::check_here`] is a decision about two contexts, so these
+    /// are the whole of its input, and the placements are built by hand rather than by `here`,
+    /// which would spend a step id per case.
+    ///
+    /// **Two step bodies rather than one**, because the marker's *value* is what tells them apart
+    /// and only a second body can show that it does. Everything else the rule asks is answered by
+    /// the marker merely being there.
+    async fn contexts() -> (Ctx, Ctx, Ctx, crate::DBOS, dbos_test_support::TestDatabase) {
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..crate::Config::new("placement-test", db.url())
+        });
+        dbos.launch().await.expect("launch failed");
+        let proper = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
+        // The only way to hold one: the marker is bound by the scope, so the body reads it back
+        // out. What a step body's own calls see.
+        let body =
+            || proper.in_step_scope(None, async { Ctx::current().expect("inside the scope") });
+        let in_step = body().await;
+        let sibling = body().await;
+        assert_ne!(
+            in_step.step_marker(),
+            sibling.step_marker(),
+            "each entry into a step body is a body of its own"
+        );
+        (proper, in_step, sibling, dbos, db)
+    }
+
+    fn durability(outcome: &crate::Result<StepDurability<'_>, EngineOnly>) -> &'static str {
+        match outcome {
+            Ok(StepDurability::Recorded { .. }) => "recorded",
+            Ok(StepDurability::Plain) => "plain",
+            Err(Error::StepBuiltElsewhere { .. }) => "refused",
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// Every combination of where a call was built and where it is polled, in one place.
+    ///
+    /// The table is the point: the rule is a decision over two contexts and reading it as a table
+    /// is how a missing arm shows. Three accept and the rest refuse, which is the sentence the
+    /// error's own documentation makes.
+    #[tokio::test]
+    async fn a_call_is_durable_only_where_its_id_means_something() {
+        let (proper, in_step, sibling, dbos, _db) = contexts().await;
+        let other = Ctx::new(dbos.executor("test").expect("launched"), "wf-other", None);
+        let recorded = StepPlacement::Recorded {
+            ctx: proper.clone(),
+            step_id: 0,
+        };
+        let inside = StepPlacement::InsideStep {
+            ctx: in_step.clone(),
+        };
+
+        for (built, polled, expected, why) in [
+            (
+                &recorded,
+                Some(&proper),
+                "recorded",
+                "built and polled at a step boundary",
+            ),
+            (
+                &recorded,
+                Some(&in_step),
+                "refused",
+                "carried into a step body",
+            ),
+            (&recorded, None, "refused", "carried out of the workflow"),
+            (
+                &recorded,
+                Some(&other),
+                "refused",
+                "carried into another workflow",
+            ),
+            (&inside, Some(&in_step), "plain", "the body it was built in"),
+            (
+                &inside,
+                Some(&proper),
+                "refused",
+                "escaped to the workflow proper",
+            ),
+            (&inside, None, "refused", "escaped the workflow"),
+            // The one row the marker's *value* decides. Every other case here turns on the marker
+            // being present or absent, so a rule comparing only presence would pass them all.
+            (
+                &inside,
+                Some(&sibling),
+                "refused",
+                "carried into another step's body",
+            ),
+            (
+                &StepPlacement::Outside,
+                None,
+                "plain",
+                "no workflow either side",
+            ),
+            (
+                &StepPlacement::Outside,
+                Some(&proper),
+                "refused",
+                "built before the workflow",
+            ),
+            (
+                &StepPlacement::Outside,
+                Some(&in_step),
+                "refused",
+                "built before the step",
+            ),
+            // Pinned to nothing: a client has no counter anywhere to disagree with.
+            (
+                &StepPlacement::ClientConnection,
+                None,
+                "plain",
+                "a client's, outside",
+            ),
+            (
+                &StepPlacement::ClientConnection,
+                Some(&proper),
+                "plain",
+                "a client's, in a workflow",
+            ),
+            (
+                &StepPlacement::ClientConnection,
+                Some(&in_step),
+                "plain",
+                "a client's, in a step",
+            ),
+        ] {
+            assert_eq!(
+                durability(&built.check_here::<EngineOnly>("call", polled)),
+                expected,
+                "{why}: built {}, polled {}",
+                built.whereabouts(),
+                StepPlacement::describe(polled)
+            );
+        }
+
+        dbos.shutdown().await;
+    }
+
+    /// A refusal names two places, and it has to name them the same way.
+    ///
+    /// Both halves come from one describer, so this is what says they still do.
+    #[tokio::test]
+    async fn a_refusal_names_where_it_was_built_and_where_it_is_polled() {
+        let (proper, in_step, _sibling, dbos, _db) = contexts().await;
+        let built_inside = StepPlacement::InsideStep {
+            ctx: in_step.clone(),
+        };
+
+        let Err(Error::<EngineOnly>::StepBuiltElsewhere {
+            step,
+            built,
+            polled,
+        }) = built_inside.check_here("call", Some(&proper))
+        else {
+            panic!("a call that left its step body is refused");
+        };
+        assert_eq!(step, "call");
+        assert_eq!(built, "inside a step of workflow wf");
+        assert_eq!(polled, "in workflow wf");
+        // The same context, described from the placement and from the poll site. One function
+        // answers both, and this is what says it still does.
+        assert_eq!(
+            built_inside.whereabouts(),
+            StepPlacement::describe(Some(&in_step)),
+            "a place should read the same whichever side of the refusal names it",
+        );
+
+        dbos.shutdown().await;
     }
 }

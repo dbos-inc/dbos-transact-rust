@@ -10,7 +10,7 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::{PendingStep, StepPlacement};
+use crate::checkpoint::{PendingStep, StepDurability, StepPlacement};
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
@@ -333,23 +333,12 @@ where
     )
 }
 
-/// How to describe where a step is being polled.
-fn polled_in(ctx: Option<&Ctx>) -> std::borrow::Cow<'static, str> {
-    match ctx {
-        Some(ctx) if ctx.step_marker().is_some() => {
-            format!("inside a step of workflow {}", ctx.workflow_id()).into()
-        }
-        Some(ctx) => format!("in workflow {}", ctx.workflow_id()).into(),
-        None => "outside a workflow".into(),
-    }
-}
-
 /// The step itself, once something polls it.
 ///
 /// **The first thing it does is check that it is where it was built**, because the id it carries is
-/// a claim on one position in one workflow and nothing else can honour it. The comparison is by
-/// workflow identity *and* by the per-call-stack step marker, both of which a concurrently running
-/// sibling leaves alone.
+/// a claim on one position in one workflow and nothing else can honour it. That check is
+/// [`StepPlacement::check_here`] rather than anything written here: the rule belongs to the id, so
+/// every call that takes one asks the same question of the same code.
 async fn run<T, E, F, Fut>(
     placement: StepPlacement,
     name: Arc<str>,
@@ -364,42 +353,18 @@ where
 {
     let name = &*name;
     let ambient = Ctx::current();
-    let (ctx, step_id) = match (&placement, ambient.as_ref()) {
-        // The ordinary durable case: built at a step boundary of this workflow, polled at one. No
-        // step body may be in scope on either side, or this is a step claimed in the workflow
-        // proper and carried *into* a step body, where its checkpoint would sit beneath a step
-        // whose own row already covers whatever its body did.
-        (StepPlacement::Recorded { ctx, step_id }, Some(here))
-            if here.workflow_id() == ctx.workflow_id() && here.step_marker().is_none() =>
-        {
-            (ctx.clone(), *step_id)
-        }
-        // Took no id, and is polled in the same step body it was built in. Plain, as it always was.
-        // Compared by marker alone: it is process-unique, so equal markers are the same body and
-        // therefore the same workflow. The variant's `workflow_id` is for the refusal's message.
-        (StepPlacement::InsideStep { marker, .. }, Some(here))
-            if here.step_marker() == Some(*marker) =>
-        {
+    let (ctx, step_id) = match placement.check_here(name, ambient.as_ref())? {
+        StepDurability::Recorded { ctx, step_id } => (ctx, step_id),
+        // Outside a workflow, inside another step's body, or on a client's connection. The step
+        // claimed no id in any of them, so there is nothing to check against and nothing to
+        // record; `built` names which, rather than this deciding again.
+        StepDurability::Plain => {
             tracing::debug!(
                 step_name = name,
-                "the step body runs plainly: it was built inside another step"
+                built = %placement.whereabouts(),
+                "the step body runs plainly"
             );
             return body().await;
-        }
-        (StepPlacement::Outside, None) => {
-            tracing::debug!(
-                step_name = name,
-                "the step body runs plainly: it was built and polled outside a workflow"
-            );
-            return body().await;
-        }
-        // Everything else is a claim nobody here can honour.
-        (placement, here) => {
-            return Err(Error::StepBuiltElsewhere {
-                step: name.to_owned(),
-                built: placement.whereabouts(),
-                polled: polled_in(here),
-            });
         }
     };
 
@@ -443,7 +408,7 @@ where
         // on the workflow's own call stack, where it takes a step id from the counter, and the
         // call would then be refused by its own run for being polled inside a step body. Every
         // attempt would spend another id on the way.
-        match supervise(&ctx, name, &options, async { body().await }, span).await {
+        match supervise(ctx, name, &options, async { body().await }, span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
