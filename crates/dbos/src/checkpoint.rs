@@ -7,15 +7,14 @@
 //! [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no user body,
 //! no retry policy and no timeout, so none of them goes through `step_with`.
 //!
-//! **Being a step and being a [`PendingStep`] are not yet the same thing.** Today only `step` and
-//! `step_with` build one, taking their id through [`StepPlacement::here`] at the call. Every
-//! library step above still allocates inside its own `async fn` — through
-//! [`StepPlacement::of`] for the awaits and waits, and straight from the counter for `sleep`,
-//! the events, the messages, a child `start` and the management surface — so its id lands
-//! wherever it is first *polled*. That is the difference this module exists to close, one
-//! producer at a time; until it is closed, only [`step`](crate::step) and
-//! [`step_with`](crate::step_with) calls may be driven concurrently — *not* steps in general,
-//! which is the whole point of the paragraph above — and the `step` docs say so.
+//! **Being a step and being a [`PendingStep`] are nearly the same thing now.** `step` and
+//! `step_with` take their id through [`StepPlacement::here`] at the call; `sleep`, the events, the
+//! messages, the waits and every checkpointed management call take theirs through
+//! [`StepPlacement::of`] at the call and hand it to [`PendingStep::placed`]. What is left is a
+//! child's `start` and awaiting a handle, which still allocate inside their own `async fn` and so
+//! land their ids wherever they are first *polled*; those two are being moved the same way, and
+//! until they are, a `start` and a `result` must still be awaited one at a time rather than driven
+//! together. Everything else on this list may be built first and driven concurrently.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
 //! decision is subtle enough to be worth having in one place:
@@ -56,7 +55,19 @@ use std::task::Poll;
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::Error;
+use crate::instance::Executor;
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
+
+/// What a durable call works out at the call, before anything of it has run.
+///
+/// The placement it took — which is its step id, or the reason there is none — and beside it
+/// whatever its run will need and could only get here: an executor, a second step id, an encoded
+/// payload. `Err` is the refusal the build produced, carried into the call rather than raised, so
+/// that `dbos.cancel(id).await?` keeps its single `?`.
+///
+/// Named because [`PendingStep::placed`] and every producer that calls it spell this type, and a
+/// three-deep `Result<(_, _), _>` at each of them says less than the word does.
+pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 
 /// A durable call that has taken its step id and has not run.
 ///
@@ -89,14 +100,23 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 pub struct PendingStep<'a, T, E = crate::EngineOnly> {
     /// What the call is called, which is the name its checkpoint is checked against on replay.
     name: Arc<str>,
-    /// Where this call was built, and the id it claimed there.
+    /// Where this call was built, and the id it claimed there — `None` for one that never got
+    /// as far as being placed.
     ///
     /// **Kept beside the run rather than only inside it**, because the run can only be asked once:
     /// it checks its placement as its first act and is then past that check for the rest of its
     /// life. A value that is `Send` and `Unpin` can be polled once and then moved, so the check
     /// has to be made by whatever is doing the polling — which is [`poll`](Future::poll), on every
     /// poll. Cheap to hold: a [`Ctx`] is a couple of `Arc`s.
-    placement: StepPlacement,
+    ///
+    /// `None` is for a call that claims no position **anywhere**, which is not the same as
+    /// claiming none *here*: a build that failed before it reached the counter
+    /// ([`placed`](Self::placed)) and a call with nothing to do at all
+    /// ([`settled`](Self::settled)) both take no id in any workflow, so there is nothing for the
+    /// poll to hold them to and the run has the better answer to give. The three placements that
+    /// take no id are still `Some`, because each of them says *where* — and being carried out of
+    /// that place is exactly what they refuse.
+    placement: Option<StepPlacement>,
     /// The run, built by the constructor and driven by whatever polls this.
     ///
     /// An `async fn` body does not begin until it is polled, so the future is built where the id
@@ -112,8 +132,51 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     ) -> Self {
         Self {
             name,
-            placement,
+            placement: Some(placement),
             running: Box::pin(running),
+        }
+    }
+
+    /// A durable call whose placement was decided at the call, running whatever `built` carried.
+    ///
+    /// **The one constructor every non-step durable call goes through**, so the shape they share
+    /// is written once. `built` is what the call worked out before it had run anything: the
+    /// placement it took, with whatever the run will need beside it — an executor, a second step
+    /// id, an encoded payload — or the error that stopped it getting that far. Polled, it reports
+    /// that error and only then hands the placement to `run`.
+    ///
+    /// **Nothing here allocates.** The id was spent by whoever built `built`, in the caller's own
+    /// sequential order, which is the whole point of the exercise: a set of these built and then
+    /// driven together takes the same slots on a replay however the futures interleave.
+    ///
+    /// **It does not check [`check_here`](StepPlacement::check_here) either**, and that is not an
+    /// omission. What this returns is a [`PendingStep`], whose [`poll`](Future::poll) asks on
+    /// every poll — which is stricter than a run asking once and is the whole reason the check
+    /// lives there. A producer that wraps one of these in something else, rather than handing it
+    /// back, is the one that has to ask for itself.
+    ///
+    /// `name` is the cross-SDK step name the call records under, and what a refusal names.
+    pub(crate) fn placed<C, F, Fut>(name: &'static str, built: Built<C>, run: F) -> Self
+    where
+        C: Send + 'a,
+        F: FnOnce(C, StepPlacement) -> Fut + Send + 'a,
+        Fut: Future<Output = crate::Result<T, E>> + Send + 'a,
+        T: 'a,
+        E: 'a,
+    {
+        // Read off the placement rather than passed in, because the placement is where the id
+        // already is and two copies of one number are two chances to disagree.
+        let placement = built.as_ref().ok().map(|(_, placement)| placement.clone());
+        Self {
+            name: Arc::from(name),
+            placement,
+            running: Box::pin(async move {
+                // The build's own error, in the caller's channel. Reported at the poll rather
+                // than at the call so that `dbos.cancel(id).await?` reads as it always did,
+                // with one `?` at the end rather than one at each half.
+                let (carried, placement) = built.map_err(Error::lift)?;
+                run(carried, placement).await
+            }),
         }
     }
 
@@ -133,7 +196,32 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     /// that says something, and a combinator reporting which branch a stale checkpoint meant.
     #[must_use]
     pub fn step_id(&self) -> Option<i32> {
-        self.placement.step_id()
+        self.placement.as_ref().and_then(StepPlacement::step_id)
+    }
+}
+
+impl<'a, E> PendingStep<'a, (), E> {
+    /// A durable call that is already answered, having claimed nothing and having nothing to do.
+    ///
+    /// The one case is a wait over an empty set: [`join_workflows`](crate::join_workflows) with no
+    /// ids is a satisfied wait, so it performs nothing, records nothing and — the point — takes no
+    /// step id, which is what keeps the slots either side of it in the same places whether the set
+    /// it was given was empty or not.
+    ///
+    /// **Placed nowhere, so polled anywhere.** A call that claimed no position in any workflow has
+    /// nothing a second workflow could fail to honour, which is what separates this from the three
+    /// placements that merely record nothing: each of those says *where* it stands, and being
+    /// carried out of that place is what they refuse.
+    ///
+    /// Nothing to do means nothing to answer with, which is why this is only on the calls that
+    /// return `()`. It also keeps the future free of captures, so it is `Send` whatever the
+    /// caller's error type is.
+    pub(crate) fn settled(name: &'static str) -> Self {
+        Self {
+            name: Arc::from(name),
+            placement: None,
+            running: Box::pin(async { Ok(()) }),
+        }
     }
 }
 
@@ -156,7 +244,12 @@ impl<T, E> Future for PendingStep<'_, T, E> {
         // three atomic increments on refcounts every concurrent step of this workflow shares. The
         // first poll asks twice, once here and once inside the run, which is the price of the run
         // needing the answer rather than merely needing it to be yes.
-        if let Err(refused) = Ctx::with_current(|here| this.placement.check_here(&this.name, here))
+        //
+        // A call with no placement at all is one whose build failed before it could take an id.
+        // It claims no position anywhere, so there is nothing here to hold it to, and the run
+        // reports the build's own error — which says more than a refusal would.
+        if let Some(placement) = &this.placement
+            && let Err(refused) = Ctx::with_current(|here| placement.check_here(&this.name, here))
         {
             return Poll::Ready(Err(refused));
         }
@@ -294,6 +387,27 @@ impl StepPlacement {
         Ok(Self::Recorded { ctx, step_id })
     }
 
+    /// Where a call served by `executor` stands, with that executor kept beside the placement.
+    ///
+    /// [`of`](Self::of) with the executor threaded through, which is the pair every
+    /// [`PendingStep::placed`] caller needs: the placement says whether to record and under which
+    /// id, and the executor is what the run talks to the database through.
+    ///
+    /// **`executor` is a `Result` so that a refusal upstream of the placement is carried rather
+    /// than raised.** [`DBOS::executor`](crate::DBOS) answers [`Error::NotLaunched`] for an
+    /// instance that was never launched, and a caller that wrote `dbos.cancel(id).await?` should
+    /// meet that at the `?` it already has rather than at a second one the conversion would
+    /// otherwise force on it. Threading it through here also fixes the order: the launch is
+    /// checked before any id is taken, so a call to an unlaunched instance moves no counter.
+    pub(crate) fn taken(
+        executor: Result<Arc<Executor>, Error>,
+        operation: &'static str,
+    ) -> Result<(Arc<Executor>, Self), Error> {
+        let executor = executor?;
+        let placement = Self::of(executor.connection(), operation)?;
+        Ok((executor, placement))
+    }
+
     /// Where a call served by the ambient workflow's own executor stands.
     ///
     /// [`of`](Self::of) with no second connection to disagree with, which is every *user* step:
@@ -313,6 +427,20 @@ impl StepPlacement {
         }
         let step_id = ctx.next_step_id();
         Self::Recorded { ctx, step_id }
+    }
+
+    /// One more id from the same counter this placement drew from, or `None` where it drew none.
+    ///
+    /// **For the calls that are two steps rather than one.** A read waits, so it records the read
+    /// and its deadline under consecutive ids — `get_event` and `recv` both — and only the first
+    /// of them fits in a placement. Taking the second from here rather than from the ambient
+    /// context is what makes the pair one decision: a placement that recorded nothing has no
+    /// second id either, so the two can never disagree about whether the call is checkpointed.
+    pub(crate) fn next_step_id(&self) -> Option<i32> {
+        match self {
+            Self::Recorded { ctx, .. } => Some(ctx.next_step_id()),
+            Self::Outside | Self::InsideStep { .. } | Self::ClientConnection => None,
+        }
     }
 
     /// The id this call claimed, or `None` where it claimed none.

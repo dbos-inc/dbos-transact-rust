@@ -68,11 +68,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
+use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::Message as EncodedMessage;
+use crate::sysdb::types::step_names;
 
 /// Sends a message to a workflow, for it to [`recv`] when it is ready.
 ///
@@ -98,6 +100,11 @@ use crate::sysdb::types::Message as EncodedMessage;
 /// available here all the same, through [`send_with`], as it is in Python, and it is what a send
 /// from inside a *step* has instead.
 ///
+/// **The step id is taken at the call, not at the first poll** — see [`PendingStep`] — so a send
+/// built beside a step and driven with it by `tokio::join!` takes the same slot on every execution.
+/// The payload is encoded first, ahead of the id, so a message that cannot be encoded is a send
+/// that never happened and never moved the counter.
+///
 /// The error is the *workflow's* channel, like [`step`](crate::step)'s and
 /// [`set_event`](crate::set_event)'s, so `?` needs no conversion.
 ///
@@ -111,12 +118,12 @@ use crate::sysdb::types::Message as EncodedMessage;
 ///
 /// Outside a workflow there is no context to take an executor from, so this is
 /// [`Error::NotInWorkflow`]. That is where [`DBOS::send`] is the call.
-pub async fn send<T, E>(destination_id: &str, message: &T) -> Result<(), E>
+pub fn send<'a, T, E>(destination_id: &'a str, message: &T) -> PendingStep<'a, (), E>
 where
     T: Serialize,
-    E: DurableError,
+    E: DurableError + 'a,
 {
-    send_with(destination_id, message, SendOptions::default()).await
+    send_with(destination_id, message, SendOptions::default())
 }
 
 /// [`send`], with [`SendOptions`] rather than the defaults — a topic, an idempotency key, or the
@@ -124,27 +131,23 @@ where
 ///
 /// The same call in every respect but the options: see [`send`] for what it does, where it may
 /// stand, and what a step does to it.
-pub async fn send_with<T, E>(
-    destination_id: &str,
+pub fn send_with<'a, T, E>(
+    destination_id: &'a str,
     message: &T,
-    options: SendOptions<'_>,
-) -> Result<(), E>
+    options: SendOptions<'a>,
+) -> PendingStep<'a, (), E>
 where
     T: Serialize,
-    E: DurableError,
+    E: DurableError + 'a,
 {
-    let ctx = workflow_ctx("send")?;
-    // Absent inside a step, which is what makes that send plain: no id is allocated, so nothing
-    // shifts the replay slots of the steps around it.
-    let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
-    ctx.executor()
-        .connection()
-        .send_message(
-            &Message::from_options(destination_id, message, options),
-            caller,
-            options.forks,
-        )
-        .await
+    // Encoded before the id is taken, so a payload that cannot be encoded is a send that never
+    // happened and never moved the counter. Inside a step the placement records nothing, which is
+    // what makes that send plain: no id is allocated, so nothing shifts the replay slots of the
+    // steps around it.
+    let built = workflow_connection("send")
+        .and_then(|conn| Ok((encode_one(destination_id, message, options)?, conn)))
+        .and_then(|(encoded, conn)| place_send(encoded, conn, "send"));
+    pending_send(built, options.forks)
 }
 
 /// Sends many messages in one transaction, for their destinations to [`recv`] when they are ready.
@@ -178,29 +181,27 @@ where
 /// implicit. A batch send is not that: Python and Java both chose the distinct word `bulk`, and
 /// `sysdb` already records this call under the cross-SDK step name `DBOS.sendBulk`. A method named
 /// for one word that writes another is a seam for nothing.
-pub async fn send_bulk<T, E>(messages: &[Message<'_, T>]) -> Result<(), E>
+pub fn send_bulk<'a, T, E>(messages: &'a [Message<'a, T>]) -> PendingStep<'a, (), E>
 where
     T: Serialize,
-    E: DurableError,
+    E: DurableError + 'a,
 {
-    send_bulk_with(messages, SendBulkOptions::default()).await
+    send_bulk_with(messages, SendBulkOptions::default())
 }
 
 /// [`send_bulk`], with [`SendBulkOptions`] rather than the defaults.
-pub async fn send_bulk_with<T, E>(
-    messages: &[Message<'_, T>],
+pub fn send_bulk_with<'a, T, E>(
+    messages: &'a [Message<'a, T>],
     options: SendBulkOptions,
-) -> Result<(), E>
+) -> PendingStep<'a, (), E>
 where
     T: Serialize,
-    E: DurableError,
+    E: DurableError + 'a,
 {
-    let ctx = workflow_ctx("send_bulk")?;
-    let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
-    ctx.executor()
-        .connection()
-        .send_messages(messages, caller, options.forks)
-        .await
+    let built = workflow_connection("send_bulk")
+        .and_then(|conn| Ok((encode_all(messages)?, conn)))
+        .and_then(|(encoded, conn)| place_send(encoded, conn, "send_bulk"));
+    pending_send_bulk(built, options.forks)
 }
 
 /// Takes the oldest message sent to this workflow, waiting up to `timeout` for one to arrive.
@@ -217,8 +218,11 @@ where
 /// a timeout instead; the other three agree with this.
 ///
 /// The receive is checkpointed as two steps (the read and its deadline), so a replay returns the
-/// message the first run took, including a timeout's `None`, instead of consuming a second one. The
-/// error is the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion.
+/// message the first run took, including a timeout's `None`, instead of consuming a second one.
+/// **Both ids are taken at the call, not at the first poll** — see [`PendingStep`] — so a receive
+/// built beside another durable call and driven with it takes the same slots on every execution.
+/// The error is the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no
+/// conversion.
 ///
 /// **Two concurrent receives on one topic in one workflow is an error**, surfaced as
 /// [`Error::SystemDatabase`] carrying `sysdb`'s `ConcurrentRecv`. One message can go to only one of
@@ -245,11 +249,41 @@ where
 /// reading: Python raises from `is_workflow()`, TypeScript raises
 /// `DBOSInvalidWorkflowTransitionError` naming `step`, Go raises *"cannot call Recv within a step"*,
 /// and Java raises *"DBOS.recv() must not be called from within a step."*
-pub async fn recv<T, E>(topic: Option<&str>, timeout: Duration) -> Result<Option<T>, E>
+pub fn recv<'a, T, E>(topic: Option<&'a str>, timeout: Duration) -> PendingStep<'a, Option<T>, E>
 where
-    T: DeserializeOwned,
-    E: DurableError,
+    T: DeserializeOwned + Send + 'a,
+    E: DurableError + 'a,
 {
+    PendingStep::placed(
+        step_names::RECV,
+        build_recv(),
+        move |(executor, timeout_step_id), placement| async move {
+            // `recv` is refused anywhere that records nothing, so the placement is always
+            // `Recorded` here — `sysdb::recv` takes a required caller for the same reason, there
+            // being no uncheckpointed form of a call that consumes.
+            let Some((workflow_id, step_id)) = placement.step() else {
+                unreachable!("recv is refused outside a workflow and inside a step")
+            };
+            let found = executor
+                .sysdb()
+                .recv(workflow_id, step_id, timeout_step_id, topic, timeout)
+                .await
+                .map_err(Error::SystemDatabase)?;
+            match found {
+                None => Ok(None),
+                Some(found) => decode(Some(&found.value), "message").map(Some),
+            }
+        },
+    )
+}
+
+/// Everything [`recv`] settles before it has run anything: the two refusals, and then both ids.
+///
+/// **Two ids, and only one of them fits in a [`StepPlacement`].** Field order is the contract, as
+/// it is for [`get_event`](crate::get_event)'s caller: the read's id first, the deadline's second,
+/// matching what every SDK records and what a replay looks up. So the deadline's id comes from the
+/// counter immediately behind the one the placement took.
+fn build_recv() -> Built<(Arc<crate::Executor>, i32)> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {
             operation: "recv".into(),
@@ -260,21 +294,13 @@ where
             operation: "recv".into(),
         });
     }
-
-    // Field order is the contract, as it is for `get_event`'s caller: the read's id first, the
-    // deadline's second, matching what every SDK records and what a replay looks up.
-    let step_id = ctx.next_step_id();
-    let timeout_step_id = ctx.next_step_id();
-    let found = ctx
-        .executor()
-        .sysdb()
-        .recv(ctx.workflow_id(), step_id, timeout_step_id, topic, timeout)
-        .await
-        .map_err(Error::SystemDatabase)?;
-    match found {
-        None => Ok(None),
-        Some(found) => decode(Some(&found.value), "message").map(Some),
-    }
+    let (executor, placement) = StepPlacement::taken(Ok(Arc::clone(ctx.executor())), "recv")?;
+    // The deadline's id from the same counter the placement drew the read's from, so the pair is
+    // one decision rather than two that could disagree.
+    let timeout_step_id = placement
+        .next_step_id()
+        .expect("recv is refused anywhere that records nothing");
+    Ok(((executor, timeout_step_id), placement))
 }
 
 impl DBOS {
@@ -295,27 +321,32 @@ impl DBOS {
     /// With one exception it cannot share: this takes its executor from `self` and its step ids from
     /// the ambient context, so a handle to some *other* instance would split the two. That is
     /// [`Error::WrongInstance`] rather than a silent write into the wrong database.
-    pub async fn send<T: Serialize>(&self, destination_id: &str, message: &T) -> Result<()> {
+    pub fn send<'a, T: Serialize>(
+        &self,
+        destination_id: &'a str,
+        message: &T,
+    ) -> PendingStep<'a, ()> {
         self.send_with(destination_id, message, SendOptions::default())
-            .await
     }
 
     /// [`send`](Self::send), with [`SendOptions`] rather than the defaults.
-    pub async fn send_with<T: Serialize>(
+    pub fn send_with<'a, T: Serialize>(
         &self,
-        destination_id: &str,
+        destination_id: &'a str,
         message: &T,
-        options: SendOptions<'_>,
-    ) -> Result<()> {
-        let (executor, ctx) = self.sending_context("send")?;
-        executor
-            .connection()
-            .send_message(
-                &Message::from_options(destination_id, message, options),
-                ctx.as_ref().map(caller_for),
-                options.forks,
-            )
-            .await
+        options: SendOptions<'a>,
+    ) -> PendingStep<'a, ()> {
+        let built = encode_one(destination_id, message, options)
+            .and_then(|encoded| {
+                Ok((
+                    encoded,
+                    StepPlacement::taken(self.executor("send"), "send")?,
+                ))
+            })
+            .map(|(encoded, (executor, placement))| {
+                ((Arc::clone(executor.connection()), encoded), placement)
+            });
+        pending_send(built, options.forks)
     }
 
     /// Sends many messages in one transaction, for their destinations to [`recv`] when ready.
@@ -323,71 +354,159 @@ impl DBOS {
     /// The instance's [`send_bulk`], and it stands to that as [`send`](Self::send) does to the free
     /// one: the caller for code outside a workflow that still has an instance. See [`send_bulk`] for
     /// the batch's guarantees and how it is checkpointed.
-    pub async fn send_bulk<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
+    pub fn send_bulk<'a, T: Serialize>(
+        &self,
+        messages: &'a [Message<'a, T>],
+    ) -> PendingStep<'a, ()> {
         self.send_bulk_with(messages, SendBulkOptions::default())
-            .await
     }
 
     /// [`send_bulk`](Self::send_bulk), with [`SendBulkOptions`] rather than the defaults.
-    pub async fn send_bulk_with<T: Serialize>(
+    pub fn send_bulk_with<'a, T: Serialize>(
         &self,
-        messages: &[Message<'_, T>],
+        messages: &'a [Message<'a, T>],
         options: SendBulkOptions,
-    ) -> Result<()> {
-        let (executor, ctx) = self.sending_context("send_bulk")?;
-        executor
-            .connection()
-            .send_messages(messages, ctx.as_ref().map(caller_for), options.forks)
-            .await
-    }
-
-    /// The executor to send through and the ambient caller to record against, reconciled.
-    ///
-    /// Shared by [`send_with`](Self::send_with) and [`send_bulk_with`](Self::send_bulk_with) because
-    /// the reconciliation is the same for both and is the only thing either does before handing
-    /// off. `operation` is the only thing that differs, and it is a parameter so that an error
-    /// names the surface the caller reached for rather than the one they share. Inside a step the
-    /// caller is already `None`, so nothing is checkpointed and there is nothing to disagree
-    /// about — that send is plain whichever instance serves it, exactly as `DBOS::get_event`'s
-    /// read is.
-    fn sending_context(
-        &self,
-        operation: &'static str,
-    ) -> Result<(Arc<crate::Executor>, Option<Ctx>)> {
-        let executor = self.executor(operation)?;
-        let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
-        // Exactly where the two halves would be combined: a step id is about to be taken from the
-        // ambient context and recorded against `self`'s executor.
-        if ctx
-            .as_ref()
-            .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
-        {
-            return Err(Error::WrongInstance {
-                operation: operation.into(),
+    ) -> PendingStep<'a, ()> {
+        let built = encode_all(messages)
+            .and_then(|encoded| {
+                Ok((
+                    encoded,
+                    StepPlacement::taken(self.executor("send_bulk"), "send_bulk")?,
+                ))
+            })
+            .map(|(encoded, (executor, placement))| {
+                ((Arc::clone(executor.connection()), encoded), placement)
             });
-        }
-        Ok((executor, ctx))
+        pending_send_bulk(built, options.forks)
     }
 }
 
-/// The ambient workflow context a free-function send stands in, or [`Error::NotInWorkflow`].
+/// The ambient workflow's connection, or [`Error::NotInWorkflow`] naming the send that wanted it.
 ///
 /// The free forms have no handle to take an executor from, so being inside a workflow is what makes
 /// them callable at all — the same rule [`get_event`](crate::get_event)'s free form follows, and the
 /// reason [`DBOS::send`] exists for everyone else.
-fn workflow_ctx<E: DurableError>(operation: &'static str) -> Result<Ctx, E> {
-    Ctx::current().ok_or(Error::NotInWorkflow {
-        operation: operation.into(),
+fn workflow_connection(operation: &'static str) -> Result<Arc<Connection>> {
+    Ctx::current()
+        .map(|ctx| Arc::clone(ctx.executor().connection()))
+        .ok_or(Error::NotInWorkflow {
+            operation: operation.into(),
+        })
+}
+
+/// Where a send stands, with the payloads it has already encoded kept beside it.
+///
+/// **The order is the contract**: the payloads are encoded by the caller *before* this is reached,
+/// so a send that cannot be encoded is one that never happened and never moved the workflow's step
+/// counter. A send refused here — an unlaunched instance, another instance's handle — moves it no
+/// further.
+fn place_send<C>(
+    encoded: C,
+    conn: Arc<Connection>,
+    operation: &'static str,
+) -> Built<(Arc<Connection>, C)> {
+    let placement = StepPlacement::of(&conn, operation)?;
+    Ok(((conn, encoded), placement))
+}
+
+/// One message with its payload already encoded, which is what a send carries from its call into
+/// its run.
+///
+/// [`Message`] cannot be that: it holds a *reference* to an unencoded payload, so keeping one
+/// would make the run generic over the caller's `T` and demand `T: Sync` of every sender for no
+/// reason — the run has no use for the value, only for the string it encoded to. The three
+/// addressing fields are `&str`, so they travel as they are.
+struct Encoded<'a> {
+    destination_id: &'a str,
+    topic: Option<&'a str>,
+    idempotency_key: Option<&'a str>,
+    message: String,
+}
+
+impl<'a> Encoded<'a> {
+    /// What `sysdb` is handed, borrowing the encoded payload rather than copying it.
+    fn as_message(&self) -> EncodedMessage<'_> {
+        EncodedMessage {
+            destination_id: self.destination_id,
+            topic: self.topic,
+            message: &self.message,
+            idempotency_key: self.idempotency_key,
+        }
+    }
+}
+
+/// One message, encoded.
+///
+/// Encoded before the step id is taken, for the reason [`place_send`] gives.
+fn encode_one<'a, T: Serialize>(
+    destination_id: &'a str,
+    message: &T,
+    options: SendOptions<'a>,
+) -> Result<Encoded<'a>> {
+    Ok(Encoded {
+        destination_id,
+        topic: options.topic,
+        idempotency_key: options.idempotency_key,
+        message: encode(message, "message")?,
     })
 }
 
-/// Where the caller stands, for `sysdb` to checkpoint the send against.
+/// Every payload in a batch, encoded, or nothing.
 ///
-/// [`event`](crate::event)'s function of the same name and the same job: it exists to name the
-/// step-id allocation, which is a *mutation* and must happen once and only where there is a caller
-/// to record against. `None` from the sites below therefore allocates nothing.
-fn caller_for(ctx: &Ctx) -> (&str, i32) {
-    (ctx.workflow_id(), ctx.next_step_id())
+/// Encoded up front so that nothing is sent when one payload cannot be: the whole batch is one
+/// transaction, and failing halfway through the encoding would be the prefix a batch exists to
+/// avoid. Ahead of the step id for the reason [`place_send`] gives.
+fn encode_all<'a, T: Serialize>(messages: &'a [Message<'a, T>]) -> Result<Vec<Encoded<'a>>> {
+    messages
+        .iter()
+        .map(|message| {
+            Ok(Encoded {
+                destination_id: message.destination_id,
+                topic: message.topic,
+                idempotency_key: message.idempotency_key,
+                message: encode(message.message, "message")?,
+            })
+        })
+        .collect()
+}
+
+/// A single send as a [`PendingStep`], for the two surfaces that take a step id.
+///
+/// The free [`send`] and [`DBOS::send`] differ only in how they reach a connection and in which
+/// error channel they answer in, which is the whole of what `built` carries; a
+/// [`Client`](crate::Client)'s stays a plain `async fn`, because it takes no id and is legitimately
+/// driven from anywhere.
+fn pending_send<'a, E: DurableError + 'a>(
+    built: Built<(Arc<Connection>, Encoded<'a>)>,
+    forks: Forks,
+) -> PendingStep<'a, (), E> {
+    PendingStep::placed(
+        step_names::SEND,
+        built,
+        move |(conn, encoded), placement| async move {
+            conn.send_encoded(&encoded.as_message(), placement.step(), forks)
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+/// A batch send as a [`PendingStep`] — see [`pending_send`], of which this is the plural.
+fn pending_send_bulk<'a, E: DurableError + 'a>(
+    built: Built<(Arc<Connection>, Vec<Encoded<'a>>)>,
+    forks: Forks,
+) -> PendingStep<'a, (), E> {
+    PendingStep::placed(
+        step_names::SEND_BULK,
+        built,
+        move |(conn, encoded), placement| async move {
+            let messages: Vec<EncodedMessage<'_>> =
+                encoded.iter().map(Encoded::as_message).collect();
+            conn.send_all_encoded(&messages, placement.step(), forks)
+                .await
+                .map_err(Error::lift)
+        },
+    )
 }
 
 impl Connection {
@@ -413,14 +532,38 @@ impl Connection {
         E: DurableError,
     {
         let encoded = encode(message.message, "message")?;
+        self.send_encoded(
+            &EncodedMessage {
+                destination_id: message.destination_id,
+                topic: message.topic,
+                message: &encoded,
+                idempotency_key: message.idempotency_key,
+            },
+            caller,
+            forks,
+        )
+        .await
+    }
+
+    /// The write itself, for a caller that has already encoded.
+    ///
+    /// **Split from [`send_message`](Self::send_message) because the encoding has to happen
+    /// earlier for some callers than for others.** A surface that takes a step id encodes at the
+    /// call, ahead of the id, so that an unencodable payload moves no counter; a
+    /// [`Client`](crate::Client) has no counter to move and reaches the encoding through
+    /// `send_message` as it always did.
+    pub(crate) async fn send_encoded<E>(
+        &self,
+        message: &EncodedMessage<'_>,
+        caller: Option<(&str, i32)>,
+        forks: Forks,
+    ) -> Result<(), E>
+    where
+        E: DurableError,
+    {
         self.sysdb()
             .send_message(
-                &EncodedMessage {
-                    destination_id: message.destination_id,
-                    topic: message.topic,
-                    message: &encoded,
-                    idempotency_key: message.idempotency_key,
-                },
+                message,
                 Some(self.serializer().name()),
                 caller,
                 forks == Forks::Include,
@@ -459,9 +602,23 @@ impl Connection {
                 idempotency_key: message.idempotency_key,
             })
             .collect();
+        self.send_all_encoded(&messages, caller, forks).await
+    }
+
+    /// The batch write itself, for a caller that has already encoded — see
+    /// [`send_encoded`](Self::send_encoded) for why the two halves are separate.
+    pub(crate) async fn send_all_encoded<E>(
+        &self,
+        messages: &[EncodedMessage<'_>],
+        caller: Option<(&str, i32)>,
+        forks: Forks,
+    ) -> Result<(), E>
+    where
+        E: DurableError,
+    {
         self.sysdb()
             .send_messages(
-                &messages,
+                messages,
                 Some(self.serializer().name()),
                 caller,
                 forks == Forks::Include,
@@ -594,8 +751,9 @@ impl<'a, T> Message<'a, T> {
     /// options.
     ///
     /// The one place [`SendOptions`] and [`Message`] meet, and the whole of what a single send adds
-    /// over the arguments a batch already carries per message — which is why there is no layer
-    /// between the surfaces and [`Connection::send_message`] beyond this and [`caller_for`].
+    /// over the arguments a batch already carries per message. Only a
+    /// [`Client`](crate::Client)'s send reaches it now: the surfaces that take a step id encode
+    /// ahead of the id and travel as an [`Encoded`] instead.
     pub(crate) fn from_options(
         destination_id: &'a str,
         message: &'a T,

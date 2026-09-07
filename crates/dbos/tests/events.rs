@@ -399,3 +399,151 @@ async fn set_event_refuses_to_run_outside_a_workflow_or_inside_a_step() {
 
     dbos.shutdown().await;
 }
+
+/// **Library calls take their step ids where they are built, not where they are first polled.**
+///
+/// The property that makes `tokio::join!` over them ordinary code. `join!` builds every branch
+/// before polling any and then first-polls them in source order, so a test that builds and drives
+/// in the same order asserts nothing — it passes against poll-time ids too. These three are built
+/// `a, b, c` and handed to `join!` as `c, b, a`, which is the interleaving only a build-time id
+/// survives.
+///
+/// The rows are only half of it. A branch built last and polled first lands on the same id either
+/// way, so the ids are also read off the values **before** anything is polled — which is the
+/// invariant stated directly, and the only thing that speaks for that last branch.
+#[tokio::test]
+async fn library_calls_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("join-app", &db));
+    let joins = dbos
+        .register_workflow("joins", |()| async {
+            // Built a, b, c, d — which is the order their ids come from the counter in, and the
+            // order a replay will build them in again.
+            let a = dbos::sleep(Duration::from_millis(1));
+            let b = dbos::set_event("b", &1u32);
+            let c = dbos::get_event::<u32, _>("no-such-workflow", "nothing", Duration::ZERO);
+            let d = dbos::step("after", || async { Ok(()) });
+            assert_eq!(
+                (a.step_id(), b.step_id(), c.step_id(), d.step_id()),
+                // A read is two steps, so the one after it is two on: the deadline holds id 3.
+                (Some(0), Some(1), Some(2), Some(4)),
+                "the ids were taken at the call, in source order, before anything was polled"
+            );
+            // ...and driven d, c, b, a.
+            let (d, c, b, a) = tokio::join!(d, c, b, a);
+            assert_eq!(c?, None, "no such workflow, so no such event");
+            b?;
+            a?;
+            d?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let workflow_id = "joins-out-of-order";
+    joins
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(workflow_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(workflow_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "DBOS.sleep"),
+            (1, "DBOS.setEvent"),
+            // A read is two steps, and the deadline's id comes from the counter directly behind
+            // the read's — which is what says the pair was not split by the poll order either.
+            (2, "DBOS.getEvent"),
+            (3, "DBOS.sleep"),
+            (4, "after"),
+        ],
+        "the ids follow the order the calls were built in, not the order they were polled in",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A call that is refused moves no step counter**, so the calls around it keep their slots.
+///
+/// Each of these fails before it reaches the counter, and each fails for a reason of its own: an
+/// argument the call cannot answer, a payload that cannot be encoded, and a wait with nothing to
+/// wait for. What they have in common is that a workflow fixed to stop making them must replay
+/// onto the same slots it recorded — which is only true if they never took one.
+#[tokio::test]
+async fn a_refused_call_spends_no_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refusal-app", &db));
+    let refused = dbos
+        .register_workflow("refused", |()| async {
+            // A payload that cannot be encoded: `set_event` encodes before it places, so this
+            // never reaches the counter. `serde_json` has no spelling for a non-string map key.
+            let unencodable: std::collections::BTreeMap<(u8, u8), u8> =
+                [((1, 2), 3)].into_iter().collect();
+            let refused: dbos::Result<()> = dbos::set_event("nope", &unencodable).await;
+            assert!(
+                matches!(refused.unwrap_err(), Error::Serialization { .. }),
+                "an unencodable event value should be refused"
+            );
+
+            // A first-wait over nothing has no answer it could ever give.
+            let none: [&str; 0] = [];
+            let refused: dbos::Result<String> = dbos::select_workflow(&none).await;
+            assert!(
+                matches!(refused.unwrap_err(), Error::Config(_)),
+                "an empty select set should be refused"
+            );
+
+            // An all-wait over nothing is satisfied rather than refused — and takes no id either,
+            // there being nothing to record that it waited for.
+            dbos::join_workflows(&none).await?;
+
+            dbos::step("after", || async { Ok(()) }).await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let workflow_id = "spends-nothing";
+    refused
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(workflow_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(workflow_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "after")],
+        "a refused call took a step id the step after it should have had",
+    );
+
+    dbos.shutdown().await;
+}
