@@ -183,7 +183,8 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// The wait is checkpointed as a step, so a replay returns the same winner instead of racing
 /// again. **Its step id is taken here, at the call, not at the first poll** — see
 /// [`PendingStep`] — so a wait built beside a step and driven with it by `tokio::join!` takes the
-/// same slot on every execution, and an empty set is refused before any id is spent. The error is
+/// same slot on every execution, whatever it was passed: an empty set is placed like any other and
+/// its refusal recorded as the step's own outcome, so a replay refuses again. The error is
 /// the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion. From inside
 /// a *step* it waits plainly with no checkpoint, the step's own checkpoint standing for everything
 /// its body did.
@@ -217,8 +218,9 @@ pub fn select_workflow<'a, E: crate::DurableError + 'a>(
 ///
 /// The all-form of the free [`select_workflow`](fn@select_workflow), and the waiter a fan-out that
 /// needs every answer reaches for. Same context rules, same checkpoint, same error channel, and
-/// the same step id taken at the call — except that an **empty set takes none at all**: nothing to
-/// wait for is a satisfied wait, so it stands nowhere and may be awaited anywhere.
+/// the same step id taken at the call — an **empty set included**, because which slot a wait
+/// occupies must not depend on what it was passed. Nothing to wait for is a satisfied wait, so it
+/// is answered at once, but it is still placed and still recorded.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {

@@ -218,8 +218,8 @@ pub struct ForkOptions<'a> {
     ///
     /// **Only with a fork point that names its step** — [`ForkFrom::Beginning`] and
     /// [`ForkFrom::Step`]. The three searched points resolve the step inside the write and always
-    /// generate the id; naming one alongside them is an [`Error::Config`] rather than a value
-    /// quietly discarded.
+    /// generate the id; naming one alongside them is an [`Error::InvalidArgument`] rather than a
+    /// value quietly discarded.
     ///
     /// That line is every implementation's, drawn by having no parameter to pass an id through:
     /// Python's `fork_from_failure`, TypeScript's `forkFromFailure` and Go's `ForkFromDBInput`
