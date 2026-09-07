@@ -315,6 +315,49 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
     dbos.shutdown().await;
 }
 
+/// An empty wait inside a workflow still occupies its step id.
+///
+/// **Which slot a call takes must depend on where it was written, never on what it was passed.** A
+/// set computed from state can be empty on one execution and not on the next, so a wait that took
+/// an id in one and none in the other would shift every later step of that workflow onto a slot it
+/// did not record. So the empty case is placed and recorded like any other: `join_workflows` waits
+/// for nothing and records that it happened, and the step after it keeps the id it would have had
+/// with a full set.
+#[tokio::test]
+async fn an_empty_wait_inside_a_workflow_still_takes_its_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-empty-id-app", &db));
+    let wf = dbos
+        .register_workflow("wf", |()| async {
+            let empty: Vec<&str> = Vec::new();
+            dbos::join_workflows(&empty).await?;
+            dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+            Ok::<u32, Error>(1)
+        })
+        .expect("registration failed");
+    dbos.launch().await.expect("launch failed");
+
+    let handle = wf.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    assert_eq!(handle.result().await.expect("the workflow failed"), 1);
+
+    let steps = dbos
+        .list_workflow_steps(&id)
+        .await
+        .expect("could not read the steps");
+    let seen: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|step| (step.step_id, step.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [(0, "DBOS.joinWorkflows"), (1, "after")],
+        "the empty wait recorded its own row and left `after` on the slot it would have had anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// A repeated id is accepted by both waits, and answers with the id it names.
 ///
 /// Python and TypeScript refuse it in `waitFirst`, but only because they return the winning

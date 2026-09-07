@@ -596,11 +596,7 @@ impl crate::Client {
     ///
     /// See [`DBOS::join_workflows`]. Nothing is checkpointed, for the same reason.
     pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
-        let Some((conn, placement)) =
-            Connection::place_join_workflows(self.connection(), workflow_ids)?
-        else {
-            return Ok(());
-        };
+        let (conn, placement) = Connection::place_join_workflows(self.connection(), workflow_ids)?;
         Connection::join_workflows(&conn, placement, workflow_ids).await
     }
 }
@@ -743,32 +739,30 @@ impl Connection {
     pub(crate) fn place_join_workflows(
         conn: &Arc<Self>,
         workflow_ids: &[&str],
-    ) -> Result<Option<(Arc<Self>, StepPlacement)>> {
-        // Nothing to wait for is a satisfied wait — and, unlike the first-wait, one with an
-        // answer. Decided before the placement so an empty call spends no step id, which matches
-        // TypeScript short-circuiting its empty handle list before `runInternalStep`, and
-        // reported as `None` rather than as a placement: a wait with nothing to wait on stands
-        // nowhere in particular, so there is no place a later poll could have carried it out of.
-        if workflow_ids.is_empty() {
-            return Ok(None);
-        }
-
+    ) -> Result<(Arc<Self>, StepPlacement)> {
+        // **An empty set is placed and recorded like any other**, rather than short-circuited.
+        // Nothing to wait for is still a satisfied wait, so the answer does not change — but
+        // which step id the call takes must not depend on what it was *passed*, only on where it
+        // was written. A set computed from state can be empty on one execution and not on the
+        // next, and a call that took an id in one and none in the other would shift every later
+        // step of that workflow onto a slot it did not record.
+        //
+        // This is where TypeScript's `waitAll` differs: it returns early on an empty handle list,
+        // ahead of `runInternalStep`, and carries the same hazard for the same reason.
+        //
+        // The wait itself still costs nothing: `await_workflow_ids` answers an empty set
+        // immediately, so the id and the row are all this adds.
+        let _ = workflow_ids;
         let placement = StepPlacement::of(conn, "join_workflows")?;
-        Ok(Some((Arc::clone(conn), placement)))
+        Ok((Arc::clone(conn), placement))
     }
 
     /// The all-wait as a [`PendingStep`], the counterpart of
     /// [`pending_select_workflow`](Self::pending_select_workflow).
     pub(crate) fn pending_join_workflows<'a, E: crate::DurableError + 'a>(
-        built: Result<Option<(Arc<Self>, StepPlacement)>>,
+        built: Result<(Arc<Self>, StepPlacement)>,
         workflow_ids: &'a [&'a str],
     ) -> PendingStep<'a, (), E> {
-        let built = match built {
-            // The empty set, already answered — see `place_join_workflows`.
-            Ok(None) => return PendingStep::settled(step_names::JOIN_WORKFLOWS),
-            Ok(Some(placed)) => Ok(placed),
-            Err(refused) => Err(refused),
-        };
         PendingStep::placed(
             step_names::JOIN_WORKFLOWS,
             built,

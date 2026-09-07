@@ -111,11 +111,10 @@ pub struct PendingStep<'a, T, E = crate::EngineOnly> {
     ///
     /// `None` is for a call that claims no position **anywhere**, which is not the same as
     /// claiming none *here*: a build that failed before it reached the counter
-    /// ([`placed`](Self::placed)) and a call with nothing to do at all
-    /// ([`settled`](Self::settled)) both take no id in any workflow, so there is nothing for the
-    /// poll to hold them to and the run has the better answer to give. The three placements that
-    /// take no id are still `Some`, because each of them says *where* — and being carried out of
-    /// that place is exactly what they refuse.
+    /// ([`placed`](Self::placed)) never stood in any workflow, so there is nothing for the poll to
+    /// hold it to and the run has the better answer to give. The three placements that take no id
+    /// are still `Some`, because each of them says *where* — and being carried out of that place
+    /// is exactly what they refuse.
     placement: Option<StepPlacement>,
     /// The run, built by the constructor and driven by whatever polls this.
     ///
@@ -197,31 +196,6 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     #[must_use]
     pub fn step_id(&self) -> Option<i32> {
         self.placement.as_ref().and_then(StepPlacement::step_id)
-    }
-}
-
-impl<'a, E> PendingStep<'a, (), E> {
-    /// A durable call that is already answered, having claimed nothing and having nothing to do.
-    ///
-    /// The one case is a wait over an empty set: [`join_workflows`](crate::join_workflows) with no
-    /// ids is a satisfied wait, so it performs nothing, records nothing and — the point — takes no
-    /// step id, which is what keeps the slots either side of it in the same places whether the set
-    /// it was given was empty or not.
-    ///
-    /// **Placed nowhere, so polled anywhere.** A call that claimed no position in any workflow has
-    /// nothing a second workflow could fail to honour, which is what separates this from the three
-    /// placements that merely record nothing: each of those says *where* it stands, and being
-    /// carried out of that place is what they refuse.
-    ///
-    /// Nothing to do means nothing to answer with, which is why this is only on the calls that
-    /// return `()`. It also keeps the future free of captures, so it is `Send` whatever the
-    /// caller's error type is.
-    pub(crate) fn settled(name: &'static str) -> Self {
-        Self {
-            name: Arc::from(name),
-            placement: None,
-            running: Box::pin(async { Ok(()) }),
-        }
     }
 }
 
