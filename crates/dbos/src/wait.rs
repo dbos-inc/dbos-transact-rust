@@ -676,7 +676,11 @@ impl Connection {
         placement: StepPlacement,
         workflow_ids: &[&str],
     ) -> Result<String> {
-        if let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await? {
+        // The ids first, so the refusal below has them: `check` answers `Some` only where the
+        // placement holds a step, so inside this arm they are known rather than defaulted.
+        if let Some((workflow_id, step_id)) = placement.step()
+            && let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await?
+        {
             let winner: String = decode(
                 recorded.output.as_deref(),
                 "the id that won a select_workflow",
@@ -700,7 +704,6 @@ impl Connection {
             // free there has to be spelled — which is the whole cost of it. It reads no extra
             // state: the winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
-                let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order
                 // `Awaiting::check` builds them in.
