@@ -2039,6 +2039,66 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
     other.shutdown().await;
 }
 
+/// An empty management batch inside a workflow records its step like any other.
+///
+/// The batch takes its id where it was written, so it owes that slot an outcome whatever it was
+/// passed — the rule the empty waits follow. A list derived from state can be empty on one
+/// execution and not on the next, and a batch that spent an id without recording anything would
+/// let the replay *perform* the operation against the fuller list rather than replay the first
+/// run's answer. Recorded here, so the replay reads the row back instead.
+#[tokio::test]
+async fn an_empty_management_batch_inside_a_workflow_records_its_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-empty-batch-app", &db));
+    let operator = dbos
+        .register_workflow("operator", {
+            let dbos = dbos.clone();
+            move |()| {
+                let dbos = dbos.clone();
+                async move {
+                    let none: [&str; 0] = [];
+                    assert!(
+                        dbos.cancel_all(&none, Children::Skip).await?.is_empty(),
+                        "an empty cancel cancelled something"
+                    );
+                    assert_eq!(
+                        dbos.delete_all(&none, Children::Skip).await?,
+                        0,
+                        "an empty delete removed something"
+                    );
+                    dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = operator.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    assert_eq!(handle.result().await.expect("the workflow failed"), 1);
+
+    let steps = dbos
+        .list_workflow_steps(&id)
+        .await
+        .expect("could not read the steps");
+    let seen: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|step| (step.step_id, step.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (0, "DBOS.cancelWorkflow"),
+            (1, "DBOS.deleteWorkflow"),
+            (2, "after")
+        ],
+        "each empty batch recorded its own row and left `after` where it would have been anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **Management calls take their step ids where they are built, not where they are first polled.**
 ///
 /// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
