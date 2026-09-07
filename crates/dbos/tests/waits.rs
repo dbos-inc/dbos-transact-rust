@@ -315,6 +315,83 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
     dbos.shutdown().await;
 }
 
+/// **Waits take their step ids where they are built, not where they are first polled.**
+///
+/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
+/// branch before polling any and then first-polls them in source order, so a test that builds and
+/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
+/// handed to `join!` as `c, b, a`.
+///
+/// Both waits are over a workflow that has already settled, so neither blocks and the only thing
+/// separating a build-time id from a poll-time one is the order they were written in.
+#[tokio::test]
+async fn waits_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-join-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async { Ok::<u32, Error>(1) })
+        .unwrap();
+    let waiter = dbos
+        .register_workflow("waiter", |settled: String| async move {
+            // Built a, b, c — the order their ids come from the counter in, and the order a
+            // replay will build them in again.
+            let ids = [settled.as_str()];
+            let a = dbos::join_workflows(&ids);
+            let b = dbos::select_workflow(&ids);
+            let c = dbos::step("after", || async { Ok::<u32, Error>(1) });
+            assert_eq!(
+                (a.step_id(), b.step_id(), c.step_id()),
+                (Some(0), Some(1), Some(2)),
+                "the ids were taken at the call, in source order, before anything was polled"
+            );
+            // ...and driven c, b, a.
+            let (c, b, a) = tokio::join!(c, b, a);
+            a?;
+            assert_eq!(b?, settled, "the only member of the set did not win it");
+            c?;
+            Ok::<u32, Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let settled = target.start(()).await.expect("start failed");
+    let settled_id = settled.workflow_id().to_owned();
+    assert_eq!(settled.result().await.expect("the target failed"), 1);
+
+    let workflow_id = "waits-out-of-order";
+    waiter
+        .run_with(
+            settled_id,
+            dbos::RunOptions {
+                workflow_id: Some(workflow_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(workflow_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "DBOS.joinWorkflows"),
+            (1, "DBOS.selectWorkflow"),
+            (2, "after"),
+        ],
+        "the ids follow the order the calls were built in, not the order they were polled in",
+    );
+
+    dbos.shutdown().await;
+}
+
 /// An empty wait inside a workflow still occupies its step id.
 ///
 /// **Which slot a call takes must depend on where it was written, never on what it was passed.** A

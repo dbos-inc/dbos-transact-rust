@@ -103,6 +103,80 @@ async fn a_message_from_outside_reaches_a_waiting_workflow() {
     dbos.shutdown().await;
 }
 
+/// **Messages take their step ids where they are built, not where they are first polled.**
+///
+/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
+/// branch before polling any and then first-polls them in source order, so a test that builds and
+/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
+/// handed to `join!` as `c, b, a`.
+///
+/// The receive is what this adds to that test: it is **two** steps, and its deadline's id has to
+/// come from the counter directly behind its own however the two are driven — a pair split by the
+/// poll order would put the sleep somewhere a replay does not expect it.
+#[tokio::test]
+async fn messages_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("message-join-app", &db));
+    let talks_to_itself = dbos
+        .register_workflow("talks_to_itself", |id: String| async move {
+            // Built a, b, c — the order their ids come from the counter in, and the order a
+            // replay will build them in again.
+            let a = dbos::send(&id, &"hello");
+            let b = dbos::recv::<String, _>(None, DEADLINE);
+            let c = dbos::step("after", || async { Ok::<u32, Error>(1) });
+            assert_eq!(
+                (a.step_id(), b.step_id(), c.step_id()),
+                // A receive is two steps, so the one after it is two on: the deadline holds id 2.
+                (Some(0), Some(1), Some(3)),
+                "the ids were taken at the call, in source order, before anything was polled"
+            );
+            // ...and driven c, b, a. The send is polled last and the receive is waiting on it,
+            // which `join!` resolves by polling both until they are done.
+            let (c, b, a) = tokio::join!(c, b, a);
+            a?;
+            assert_eq!(b?.as_deref(), Some("hello"), "the message never arrived");
+            c?;
+            Ok::<u32, Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let workflow_id = "talks-to-itself";
+    talks_to_itself
+        .run_with(
+            workflow_id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(workflow_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(workflow_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "DBOS.send"),
+            // The receive and the deadline it took with it, still adjacent.
+            (1, "DBOS.recv"),
+            (2, "DBOS.sleep"),
+            (3, "after"),
+        ],
+        "the ids follow the order the calls were built in, not the order they were polled in",
+    );
+
+    dbos.shutdown().await;
+}
+
 /// A receive on one topic never takes a message sent on another, and finding nothing is a value.
 #[tokio::test]
 async fn topics_do_not_cross_and_absence_is_a_value() {
