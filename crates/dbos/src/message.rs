@@ -501,7 +501,13 @@ fn pending_send_bulk<'a, E: DurableError + 'a>(
 }
 
 impl Connection {
-    /// One message, encoded and handed to `sysdb`'s single-send method.
+    /// One message, written to `sysdb`'s single-send method.
+    ///
+    /// **Takes a payload that is already encoded, because every caller encodes before it gets
+    /// here.** The two checkpointed surfaces have to: they encode at the call, ahead of the step
+    /// id, so that an unencodable payload moves no counter. A [`Client`](crate::Client) has no
+    /// counter to move, but it encodes at the same point anyway, so there is one path to the write
+    /// rather than a generic wrapper for the one caller that could have skipped it.
     ///
     /// A method apiece rather than one taking a slice, mirroring the trait: which one is called is
     /// what chooses the recorded step name, so a batch of one records `DBOS.sendBulk` and this
@@ -512,37 +518,6 @@ impl Connection {
     ///
     /// Generic over the caller's error channel for the same reason [`encode`] is: the failure is an
     /// engine variant either way, and `E` only says which channel it travels in.
-    pub(crate) async fn send_message<T, E>(
-        &self,
-        message: &Message<'_, T>,
-        caller: Option<(&str, i32)>,
-        forks: Forks,
-    ) -> Result<(), E>
-    where
-        T: Serialize,
-        E: DurableError,
-    {
-        let encoded = encode(message.message, "message")?;
-        self.send_encoded(
-            &EncodedMessage {
-                destination_id: message.destination_id,
-                topic: message.topic,
-                message: &encoded,
-                idempotency_key: message.idempotency_key,
-            },
-            caller,
-            forks,
-        )
-        .await
-    }
-
-    /// The write itself, for a caller that has already encoded.
-    ///
-    /// **Split from [`send_message`](Self::send_message) because the encoding has to happen
-    /// earlier for some callers than for others.** A surface that takes a step id encodes at the
-    /// call, ahead of the id, so that an unencodable payload moves no counter; a
-    /// [`Client`](crate::Client) has no counter to move and reaches the encoding through
-    /// `send_message` as it always did.
     pub(crate) async fn send_encoded<E>(
         &self,
         message: &EncodedMessage<'_>,
@@ -563,41 +538,12 @@ impl Connection {
             .map_err(Error::SystemDatabase)
     }
 
-    /// A batch, encoded and handed to `sysdb`'s batch method — see [`send_message`](Self::send_message)
-    /// for why the two are separate.
+    /// The batch write, the plural of [`send_encoded`](Self::send_encoded) and encoded for the
+    /// same reasons.
     ///
-    /// Encoded up front so that nothing is sent when one payload cannot be: the whole batch is one
-    /// transaction, and failing halfway through the encoding would be the prefix a batch exists to
-    /// avoid.
-    pub(crate) async fn send_messages<T, E>(
-        &self,
-        messages: &[Message<'_, T>],
-        caller: Option<(&str, i32)>,
-        forks: Forks,
-    ) -> Result<(), E>
-    where
-        T: Serialize,
-        E: DurableError,
-    {
-        let encoded = messages
-            .iter()
-            .map(|message| encode(message.message, "message"))
-            .collect::<Result<Vec<_>, E>>()?;
-        let messages: Vec<EncodedMessage<'_>> = messages
-            .iter()
-            .zip(&encoded)
-            .map(|(message, encoded)| EncodedMessage {
-                destination_id: message.destination_id,
-                topic: message.topic,
-                message: encoded,
-                idempotency_key: message.idempotency_key,
-            })
-            .collect();
-        self.send_all_encoded(&messages, caller, forks).await
-    }
-
-    /// The batch write itself, for a caller that has already encoded — see
-    /// [`send_encoded`](Self::send_encoded) for why the two halves are separate.
+    /// Its callers encode the whole batch up front, so nothing is sent when one payload cannot be:
+    /// the batch is one transaction, and failing halfway through the encoding would be the prefix
+    /// a batch exists to avoid.
     pub(crate) async fn send_all_encoded<E>(
         &self,
         messages: &[EncodedMessage<'_>],
@@ -647,14 +593,15 @@ impl crate::Client {
         message: &T,
         options: SendOptions<'_>,
     ) -> Result<()> {
+        // Encoded here rather than inside the write, so a client reaches the payload the same way
+        // the two checkpointed surfaces do. They have to encode at the call, ahead of the step id;
+        // a client has no id to be ahead of, but one encoding path for all three is worth more
+        // than the one it saved.
+        let encoded = encode_one(destination_id, message, options)?;
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
         self.connection()
-            .send_message(
-                &Message::from_options(destination_id, message, options),
-                None,
-                options.forks,
-            )
+            .send_encoded(&encoded.as_message(), None, options.forks)
             .await
     }
 
@@ -685,10 +632,15 @@ impl crate::Client {
         messages: &[Message<'_, T>],
         options: SendBulkOptions,
     ) -> Result<()> {
+        // Encoded up front, so nothing is sent when one payload cannot be: the batch is one
+        // transaction, and failing halfway through the encoding would be the prefix a batch exists
+        // to avoid.
+        let encoded = encode_all(messages)?;
+        let messages: Vec<EncodedMessage<'_>> = encoded.iter().map(Encoded::as_message).collect();
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
         self.connection()
-            .send_messages(messages, None, options.forks)
+            .send_all_encoded(&messages, None, options.forks)
             .await
     }
 }
@@ -738,26 +690,6 @@ pub struct Message<'a, T> {
 }
 
 impl<'a, T> Message<'a, T> {
-    /// The message a single send builds: a destination and a payload, and the rest from its
-    /// options.
-    ///
-    /// The one place [`SendOptions`] and [`Message`] meet, and the whole of what a single send adds
-    /// over the arguments a batch already carries per message. Only a
-    /// [`Client`](crate::Client)'s send reaches it now: the surfaces that take a step id encode
-    /// ahead of the id and travel as an [`Encoded`] instead.
-    pub(crate) fn from_options(
-        destination_id: &'a str,
-        message: &'a T,
-        options: SendOptions<'a>,
-    ) -> Self {
-        Self {
-            destination_id,
-            message,
-            topic: options.topic,
-            idempotency_key: options.idempotency_key,
-        }
-    }
-
     /// A message for `destination_id`, on the default topic.
     pub fn new(destination_id: &'a str, message: &'a T) -> Self {
         Self {
