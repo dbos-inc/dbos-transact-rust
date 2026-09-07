@@ -590,6 +590,24 @@ impl StepPlacement {
         }
     }
 
+    /// The executor serving this call, where the placement knows one.
+    ///
+    /// **`Some` wherever there is a workflow**, including inside a step body, where the call is
+    /// plain but still has an instance behind it. `None` is [`Outside`](Self::Outside) and
+    /// [`ClientConnection`](Self::ClientConnection): the first has no instance in scope, and the
+    /// second was reached through a connection this placement never took an executor from.
+    ///
+    /// **For callers that would otherwise read the ambient context twice** — once for the
+    /// executor and once through [`here`](Self::here) for the placement. Taking both from one
+    /// value is a clone cheaper, and it is what makes "an executor and an id, or neither" hold by
+    /// construction rather than because two reads of the same task-local agreed.
+    pub(crate) fn executor(&self) -> Option<&Arc<Executor>> {
+        match self {
+            Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Some(ctx.executor()),
+            Self::Outside | Self::ClientConnection => None,
+        }
+    }
+
     /// Reads back what this call recorded, if this workflow has run this far before.
     ///
     /// `check_step` compares the recorded name, so a call whose position now holds some other

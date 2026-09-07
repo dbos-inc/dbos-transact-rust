@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
-use crate::context::Ctx;
 use crate::error::{DurableError, Error};
 use crate::sysdb::types::{Timestamp, step_names};
 
@@ -47,8 +46,12 @@ where
     // that checkpoints. A sleep is always served by the workflow it is written in, so the
     // placement has no second connection to disagree with and cannot fail — it answers `Outside`
     // for itself, which is the one case that has no executor to carry either.
-    let executor = Ctx::current().map(|ctx| Arc::clone(ctx.executor()));
-    let built = Ok((executor, StepPlacement::here()));
+    //
+    // The executor comes off the placement rather than from a second read of the ambient context,
+    // so the two cannot disagree about whether there is one: that is the invariant the run below
+    // leans on when it asks for an executor and an id together.
+    let placement = StepPlacement::here();
+    let built = Ok((placement.executor().map(Arc::clone), placement));
     PendingStep::placed(
         step_names::SLEEP,
         built,
