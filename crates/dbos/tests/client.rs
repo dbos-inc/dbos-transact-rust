@@ -1164,6 +1164,39 @@ async fn a_clients_bulk_fork_refuses_a_chosen_id() {
     client.close().await;
 }
 
+/// A searched fork point cannot name its step, so a chosen id has nothing to attach to and the
+/// client refuses it rather than forking under a generated one — the same refusal `DBOS::fork_with`
+/// makes, checked here because the two surfaces enforce it independently.
+#[tokio::test]
+async fn a_clients_fork_refuses_a_chosen_id_without_a_step() {
+    let db = test_database().await;
+    let client = client("client-fork-searched", &db).await;
+
+    for from in [
+        ForkFrom::LastFailure,
+        ForkFrom::LastStep,
+        ForkFrom::StepNamed("only"),
+    ] {
+        let error = client
+            .fork_with::<u32, EngineOnly>(
+                "has-a-step",
+                from,
+                ForkOptions {
+                    forked_id: Some("chosen"),
+                    ..ForkOptions::default()
+                },
+            )
+            .await
+            .expect_err("a chosen id was accepted for a searched fork point");
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains("forked_id")),
+            "expected a configuration refusal for {from:?}, got {error:?}"
+        );
+    }
+
+    client.close().await;
+}
+
 /// A client deletes a workflow, and the row and its steps go with it.
 #[tokio::test]
 async fn a_client_deletes_a_workflow_it_did_not_start() {

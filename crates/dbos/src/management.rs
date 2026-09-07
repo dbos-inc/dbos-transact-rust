@@ -1018,6 +1018,7 @@ impl crate::Client {
         from: ForkFrom<'_>,
         options: ForkOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
+        refuse_chosen_id_without_a_step(from, options.forked_id)?;
         self.connection()
             .fork_all(&[workflow_id], from, options.forked_id, &options, None)
             .await?
