@@ -83,10 +83,10 @@ use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
     DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
+    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
+    StreamRead, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
     is_valid_application_name, validate_attributes,
 };
@@ -823,6 +823,74 @@ impl PostgresSystemDatabase {
         }
         tx.commit().await?;
         Ok(value)
+    }
+
+    /// Records that a step started a child workflow, against a caller's connection.
+    ///
+    /// Shared by [`record_child_workflow`](SystemDatabase::record_child_workflow), which runs it
+    /// on a pooled connection of its own, and [`init_workflow`](SystemDatabase::init_workflow),
+    /// which runs it on the transaction that creates the child — so the row and the record of it
+    /// commit together. What the two share is the whole of the statement; what differs is only
+    /// what it runs on.
+    async fn record_child_workflow_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        parent_workflow_id: &str,
+        child_workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        started_at: Option<Timestamp>,
+    ) -> Result<(), Error> {
+        // Python fails loudly here rather than "silently wedging the parent on recovery": a
+        // parent that replays and finds an empty child id has no workflow to attach to.
+        if child_workflow_id.is_empty() {
+            return Err(Error::InvalidInput {
+                field: "child_workflow_id".into(),
+                detail: "must not be empty".to_owned(),
+            });
+        }
+        let steps_table = self.tables.operation_outputs.as_str();
+        // Spans the launch only — the parent does not wait for the child here, so the step is
+        // complete as soon as the child exists. Stamped only when the caller offered a start,
+        // since half a pair measures nothing. Java passes both null here.
+        let completed_at = started_at.map(|_| Timestamp::now());
+        let application_name = self.application_name.as_deref();
+
+        // Same `DO UPDATE`-to-itself trick as `record_step`, but the returned value
+        // compared is the **child id**, not the completion time. A retry stamps a new clock
+        // reading and would fail a timestamp comparison, while the child id it is trying to
+        // record is by definition the same one. Python states the rule exactly: "Same child
+        // means an idempotent db_retry; a different child means nondeterminism."
+        let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, \
+             child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
+             application_name) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
+             SET child_workflow_id = {steps_table}.child_workflow_id \
+             RETURNING child_workflow_id"
+        )))
+        .bind(parent_workflow_id)
+        .bind(step_id)
+        .bind(step_name)
+        .bind(child_workflow_id)
+        .bind(started_at.map(Timestamp::as_epoch_ms))
+        .bind(completed_at.map(Timestamp::as_epoch_ms))
+        // The launch is the parent's step, so it is stamped with the parent's application —
+        // the child's own rows carry whatever application ends up running it.
+        .bind(application_name)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if let Some(stored) = stored
+            && stored.as_deref() != Some(child_workflow_id)
+        {
+            return Err(Error::StepAlreadyRecorded {
+                workflow_id: parent_workflow_id.to_owned(),
+                step_id,
+            });
+        }
+        Ok(())
     }
 
     /// Writes the checkpoint for a step that has just done its work.
@@ -2569,6 +2637,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
         submission: Submission,
+        caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
         let workflow_table = &self.tables.workflow_status;
@@ -2628,6 +2697,20 @@ impl SystemDatabase for PostgresSystemDatabase {
             (workflow_table.as_str(), &self.pool, owner_xid.as_str());
 
         with_retry(&self.retry, "init_workflow", move || async move {
+            // **A transaction, because the caller's record has to land with the row.**
+            //
+            // This is the one thing the single `INSERT .. ON CONFLICT .. RETURNING` above could
+            // not do on its own, and it is worth being clear about what it costs: a creation with
+            // no caller — a root start, every enqueue, a dequeue's re-submission — pays a begin
+            // and a commit around what was one statement. Opened unconditionally even so, for two
+            // reasons. The paths would otherwise differ in what a failure part-way leaves behind,
+            // which is a seam nobody would remember when reading either. And it is where this
+            // method is going regardless: Python and TypeScript both write the payload to a
+            // separate `workflow_input` row — TypeScript's column comment already calls the
+            // `workflow_status` one legacy — so the day that split reaches here, every creation
+            // writes two rows and needs this.
+            let mut tx = pool.begin().await?;
+
             // The column list is Java's INSERT, in its order, plus Python's two debounce
             // columns. Columns absent from it are absent deliberately: `output`, `error`,
             // `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited`
@@ -2715,7 +2798,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(initial_attempts)
             .bind(workflow.timeout.map(|d| d.as_millis() as i64))
             .bind(workflow.deadline.map(Timestamp::as_epoch_ms))
-            .bind(workflow.parent_workflow_id)
+            // The child's own back-pointer, from the caller that is also recording the start:
+            // one value, both rows, no way for them to name different parents.
+            .bind(caller.map(|caller| caller.parent_workflow_id))
             .bind(owner_xid)
             .bind(workflow.serialization)
             .bind(workflow.attributes)
@@ -2737,7 +2822,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .bind(increment)
             .bind(claiming)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             // A unique violation here can only be the partial index on
             // `(queue_name, deduplication_id)`: the primary-key conflict is absorbed by
@@ -2815,8 +2900,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                      WHERE workflow_uuid = $1 AND status = 'PENDING'"
                 )))
                 .bind(workflow.workflow_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
+
+                // **Committed before the error, unlike every other failure here.** Parking is the
+                // one error path that is itself a write: the workflow has to come out of this call
+                // `MAX_RECOVERY_ATTEMPTS_EXCEEDED` and stay there, or the next recovery attempt
+                // finds it `PENDING` and parks it again forever. Every other early return is a
+                // refusal that wrote nothing worth keeping, and rolls back — which is a change
+                // from the statement-per-call shape this had, where the upsert had already
+                // committed by the time a conflicting name was noticed and a rejected submission
+                // still bumped the row's recovery count.
+                tx.commit().await?;
 
                 return Err(Error::MaxRecoveryAttemptsExceeded {
                     workflow_id: workflow.workflow_id.to_owned(),
@@ -2833,6 +2928,24 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "another owner holds this workflow; recorded but not claimed"
                 );
             }
+
+            // **The parent's record of the start, in the transaction that created the child.**
+            // Written for a row this call merely found as well as one it created: the parent
+            // started a child either way, and the id it needs to record is the same. A failure
+            // here takes the child's row down with it, so the caller's "the start failed" is true
+            // rather than a lie told over a workflow that exists.
+            if let Some(caller) = caller {
+                self.record_child_workflow_on(
+                    &mut tx,
+                    caller.parent_workflow_id,
+                    workflow.workflow_id,
+                    caller.step_id,
+                    caller.step_name,
+                    Some(caller.started_at),
+                )
+                .await?;
+            }
+            tx.commit().await?;
 
             Ok(WorkflowInitResult {
                 status,
@@ -6720,58 +6833,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_name: &str,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error> {
-        // Python fails loudly here rather than "silently wedging the parent on recovery": a
-        // parent that replays and finds an empty child id has no workflow to attach to.
-        if child_workflow_id.is_empty() {
-            return Err(Error::InvalidInput {
-                field: "child_workflow_id".into(),
-                detail: "must not be empty".to_owned(),
-            });
-        }
-        let steps_table = &self.tables.operation_outputs;
-        // Spans the launch only — the parent does not wait for the child here, so the step is
-        // complete as soon as the child exists. Stamped only when the caller offered a start,
-        // since half a pair measures nothing. Java passes both null here.
-        let completed_at = started_at.map(|_| Timestamp::now());
-        let (steps_table, pool) = (steps_table.as_str(), &self.pool);
-        let application_name = self.application_name.as_deref();
-
+        let pool = &self.pool;
         with_retry(&self.retry, "record_child_workflow", move || async move {
-            // Same `DO UPDATE`-to-itself trick as `record_step`, but the returned value
-            // compared is the **child id**, not the completion time. A retry stamps a new clock
-            // reading and would fail a timestamp comparison, while the child id it is trying to
-            // record is by definition the same one. Python states the rule exactly: "Same child
-            // means an idempotent db_retry; a different child means nondeterminism."
-            let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, \
-                 child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
-                 application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
-                 SET child_workflow_id = {steps_table}.child_workflow_id \
-                 RETURNING child_workflow_id"
-            )))
-            .bind(parent_workflow_id)
-            .bind(step_id)
-            .bind(step_name)
-            .bind(child_workflow_id)
-            .bind(started_at.map(Timestamp::as_epoch_ms))
-            .bind(completed_at.map(Timestamp::as_epoch_ms))
-            // The launch is the parent's step, so it is stamped with the parent's application —
-            // the child's own rows carry whatever application ends up running it.
-            .bind(application_name)
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some(stored) = stored
-                && stored.as_deref() != Some(child_workflow_id)
-            {
-                return Err(Error::StepAlreadyRecorded {
-                    workflow_id: parent_workflow_id.to_owned(),
-                    step_id,
-                });
-            }
-            Ok(())
+            let mut conn = pool.acquire().await?;
+            self.record_child_workflow_on(
+                &mut conn,
+                parent_workflow_id,
+                child_workflow_id,
+                step_id,
+                step_name,
+                started_at,
+            )
+            .await
         })
         .await
     }

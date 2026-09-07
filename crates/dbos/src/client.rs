@@ -423,7 +423,9 @@ impl Client {
             ..new_row(workflow_id, Some(&options.queue))
         };
 
-        match init_or_join(&self.0, &new, options.queue.duplication_policy).await? {
+        // A client has no step counter of its own, so an enqueue it makes records against no
+        // parent — the line drawn for every other call a client makes.
+        match init_or_join(&self.0, &new, options.queue.duplication_policy, None).await? {
             Submitted::Created(_) => {
                 tracing::debug!(
                     workflow_id,

@@ -20,7 +20,8 @@ use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
 use crate::sysdb::types::{
-    AwaitedOutcome, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp, WorkflowInitResult,
+    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
+    WorkflowInitResult,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -581,11 +582,12 @@ pub(crate) async fn init_or_join(
     conn: &Connection,
     new: &NewWorkflow<'_>,
     policy: DuplicationPolicy,
+    caller: Option<InitWorkflowCaller<'_>>,
 ) -> Result<Submitted> {
     loop {
         match conn
             .sysdb()
-            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh)
+            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh, caller)
             .await
         {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
@@ -1079,7 +1081,6 @@ where
             // would hand that path a budget nobody asked for.
             timeout: options.timeout.budget(),
             deadline,
-            parent_workflow_id: parent.as_ref().map(Parent::workflow_id),
             attributes: attributes.as_deref(),
             // The queue's five columns, and nothing below spawns the row they describe: a queue's
             // whole point is that the process which asks is not necessarily the one that runs.
@@ -1091,6 +1092,20 @@ where
             &new,
             enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
                 enqueue.duplication_policy
+            }),
+            // **The parent's record of the start travels with the row, so the two commit
+            // together.** A start is one durable act: either this parent started this child and
+            // both rows say so, or neither exists. Written as two statements it had a window —
+            // and not only a crash window, since a start is a future and a combinator that races
+            // one may drop it part-way — in which a child existed that nothing in its parent
+            // pointed at. `None` is a root start, which has no parent and no step to record.
+            parent.as_ref().map(|parent| InitWorkflowCaller {
+                parent_workflow_id: parent.workflow_id(),
+                step_id: parent.step_id,
+                // The step name is the child workflow's bare name; see `Parent::record_child`,
+                // which records the joined case under the same one.
+                step_name: &self.key().name,
+                started_at,
             }),
         )
         .await?
@@ -1126,15 +1141,9 @@ where
             }
         };
 
-        // **After the child exists, not before**, and the order is what makes a crash between the
-        // two harmless: a parent that dies here leaves a child row and no start record, and the
-        // replay re-derives the same id, finds the row owned, and joins it. The reverse order
-        // would leave a start record pointing at a workflow that was never created.
-        if let Some(parent) = &parent {
-            parent
-                .record_child(executor, &workflow_id, &self.key().name, started_at)
-                .await?;
-        }
+        // The start record is not written here: `init_or_join` carried it into the transaction
+        // that created the child, which is what makes the pair atomic. What remains below only
+        // decides which handle to hand back.
 
         // **Enqueued, so this process is not the one running it.** A polling handle is the honest
         // answer even when this executor turns out to dequeue it moments later: nothing local is
@@ -1346,7 +1355,19 @@ impl Parent<'_> {
         })
     }
 
-    /// Records the start, so the replay above finds it.
+    /// Records the start, so the replay above finds it — for the **joined** case alone.
+    ///
+    /// A start that creates its child records it inside the transaction that creates it, by
+    /// handing [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) a
+    /// [`InitWorkflowCaller`]. This is the other arm, where the insert lost the deduplication key
+    /// and there is no transaction of this call's to join: the holder's row belongs to whoever
+    /// created it, and all that is left to write is the mapping. Nothing was created here, so nothing is
+    /// left dangling if this write never happens — which is what makes a separate statement sound
+    /// in this arm and not in the other.
+    ///
+    /// The mapping only, never the holder's own `parent_workflow_id`: that column now travels on
+    /// [`InitWorkflowCaller`] and so cannot be reached from here at all, which is the asymmetry
+    /// [`DuplicationPolicy::ReturnExisting`] describes, held by the shape rather than by care.
     ///
     /// **The step name is the workflow's bare name**, not the `name`/`class_name`/`config_name`
     /// triple that identifies it — and that is four of four rather than a narrowing, including

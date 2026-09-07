@@ -449,6 +449,11 @@ pub struct WorkflowRecord {
 /// - `output`, `error`, `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and
 ///   `rate_limited` belong to execution, forking, and the rate limiter. A workflow that has
 ///   not started has no output to offer.
+/// - `parent_workflow_id` belongs to the child start, and travels on [`InitWorkflowCaller`] with
+///   the rest of what the parent contributes. A workflow has a parent exactly when its start was
+///   recorded against one — the two are one event, and one of them writing without the other is
+///   the state the pair exists to make unreachable, so there is no caller who can meaningfully
+///   set the column alone.
 ///
 /// Java draws the same line with `WorkflowStatusInternal`. Python and Go pass their full row
 /// type instead, but Go's is a package-internal call taking a transaction, and Python's carries
@@ -529,8 +534,6 @@ pub struct NewWorkflow<'a> {
     /// The role actually assumed.
     pub assumed_role: Option<&'a str>,
 
-    /// The workflow that started this one.
-    pub parent_workflow_id: Option<&'a str>,
     /// The schedule that triggered this workflow. Set only by the scheduler.
     pub schedule_name: Option<&'a str>,
     /// Caller-supplied JSON attributes, stored in a `jsonb` column.
@@ -1977,6 +1980,44 @@ pub struct GetEventCaller<'a> {
     /// start the timeout again — a read that waited fifty of its sixty seconds and crashed has ten
     /// left.
     pub timeout_step_id: i32,
+}
+
+/// The workflow an [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) creates a child
+/// on behalf of, and the step the start is recorded under.
+///
+/// Named for its one method, as [`GetEventCaller`] is, and a struct for the same reason and then a
+/// second: this carries a step *name* as well as the two ids, and the name is the child workflow's
+/// own rather than a cross-SDK constant, so `Some(("wf", 4, "checkout"))` reads as three unrelated
+/// values. `None` is a root start — a workflow begun from outside any workflow, which has no
+/// parent to record against.
+///
+/// **Everything the parent contributes is here, including the id the child's own row carries.**
+/// It was on [`NewWorkflow`] as well to begin with, which is one fact spelled twice and two
+/// chances to disagree: nothing would have caught a caller naming one parent on the row and
+/// another on the step. Grouping it here makes the agreement structural rather than checked — a
+/// row gets a parent exactly when a start is recorded against that parent, because the same value
+/// writes both — and it is where [`NewWorkflow`]'s own rule puts it, that type holding the columns
+/// a caller may meaningfully set and leaving the ones a mechanism owns to the mechanism.
+///
+/// **Passing this is what makes the two writes one.** The child's row and the parent's record of
+/// having started it commit together, so no observer and no replay ever sees a child that exists
+/// with nothing pointing at it. The alternative — the caller writing the record itself, on the
+/// next round trip — leaves a window in which a crash, or merely a dropped future, produces
+/// exactly that: a workflow nothing started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitWorkflowCaller<'a> {
+    /// The workflow doing the starting: the record is written against it, and the child's row
+    /// points back at it.
+    pub parent_workflow_id: &'a str,
+    /// The step the start occupies in the parent, claimed before this call was made.
+    pub step_id: i32,
+    /// What the step is called, which is the child workflow's bare name — see
+    /// [`record_child_workflow`](crate::sysdb::SystemDatabase::record_child_workflow), whose
+    /// column this shares.
+    pub step_name: &'a str,
+    /// When the start began, for the row's `started_at`. The completion is stamped by the write
+    /// itself, since the step spans the launch alone.
+    pub started_at: Timestamp,
 }
 
 /// An encoded payload and the format it is encoded in.

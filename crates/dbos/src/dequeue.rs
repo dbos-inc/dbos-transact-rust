@@ -684,6 +684,9 @@ async fn dispatch(
             },
             Some(MAX_RECOVERY_ATTEMPTS),
             submission,
+            // A dequeue starts nothing: the row exists and the workflow it belongs to was
+            // recorded against whatever started it, however long ago.
+            None,
         )
         .await
     {

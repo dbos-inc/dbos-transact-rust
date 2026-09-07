@@ -794,7 +794,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh)
+            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
             .await
             .expect("could not create the workflow row");
         (dbos, db)
@@ -1298,7 +1298,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new("wf-thief"), None, Submission::Fresh)
+            .init_workflow(&NewWorkflow::new("wf-thief"), None, Submission::Fresh, None)
             .await
             .expect("could not create the second workflow row");
 
