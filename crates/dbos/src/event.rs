@@ -58,7 +58,7 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    let built = build_set_event(value);
+    let built = place_set_event(value);
     PendingStep::placed(
         step_names::SET_EVENT,
         built,
@@ -91,7 +91,7 @@ where
 /// Split out because the order is the contract and a function is what keeps it readable: refuse,
 /// encode, *then* place. Written inline the `?`s would need the call's error channel, where here
 /// they are the engine's and [`PendingStep::placed`] lifts them at the poll.
-fn build_set_event<T: Serialize>(value: &T) -> Built<(Arc<crate::Executor>, String)> {
+fn place_set_event<T: Serialize>(value: &T) -> Built<(Arc<crate::Executor>, String)> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {
             operation: "set_event".into(),
@@ -147,7 +147,7 @@ where
             let timeout_step_id = placement.next_step_id();
             Ok(((executor, timeout_step_id), placement))
         });
-    read_event(built, workflow_id, key, timeout)
+    pending_get_event(built, workflow_id, key, timeout)
 }
 
 impl DBOS {
@@ -187,7 +187,7 @@ impl DBOS {
                 ((executor, timeout_step_id), placement)
             },
         );
-        read_event(built, workflow_id, key, timeout)
+        pending_get_event(built, workflow_id, key, timeout)
     }
 }
 
@@ -220,12 +220,11 @@ impl crate::Client {
     }
 }
 
-/// The read itself, once both of its ids are decided: the half [`get_event`] and
-/// [`DBOS::get_event`] share.
+/// An event read as a [`PendingStep`], for the two surfaces that take a step id.
 ///
 /// They differ only in how they reach an executor and in which error channel they answer in —
 /// which is the whole of what `built` carries — so everything after the placement is written once.
-fn read_event<'a, T, E>(
+fn pending_get_event<'a, T, E>(
     built: Built<(Arc<crate::Executor>, Option<i32>)>,
     workflow_id: &'a str,
     key: &'a str,

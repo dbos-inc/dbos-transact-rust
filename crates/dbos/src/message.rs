@@ -256,7 +256,7 @@ where
 {
     PendingStep::placed(
         step_names::RECV,
-        build_recv(),
+        place_recv(),
         move |(executor, timeout_step_id), placement| async move {
             // `recv` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — `sysdb::recv` takes a required caller for the same reason, there
@@ -283,7 +283,7 @@ where
 /// it is for [`get_event`](crate::get_event)'s caller: the read's id first, the deadline's second,
 /// matching what every SDK records and what a replay looks up. So the deadline's id comes from the
 /// counter immediately behind the one the placement took.
-fn build_recv() -> Built<(Arc<crate::Executor>, i32)> {
+fn place_recv() -> Built<(Arc<crate::Executor>, i32)> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {
             operation: "recv".into(),
