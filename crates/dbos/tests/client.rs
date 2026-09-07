@@ -1159,7 +1159,7 @@ async fn a_clients_bulk_fork_refuses_a_chosen_id() {
         )
         .await
         .expect_err("one id cannot name two forks");
-    assert!(matches!(error, Error::Config(_)), "{error}");
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
 
     client.close().await;
 }
@@ -1189,8 +1189,8 @@ async fn a_clients_fork_refuses_a_chosen_id_without_a_step() {
             .await
             .expect_err("a chosen id was accepted for a searched fork point");
         assert!(
-            matches!(&error, Error::Config(message) if message.contains("forked_id")),
-            "expected a configuration refusal for {from:?}, got {error:?}"
+            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
+            "expected an argument refusal for {from:?}, got {error:?}"
         );
     }
 

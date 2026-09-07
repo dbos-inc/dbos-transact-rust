@@ -309,7 +309,7 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
         .select_workflow(&[])
         .await
         .expect_err("an empty select_workflow should be refused");
-    assert!(matches!(err, Error::Config(_)), "{err}");
+    assert!(matches!(err, Error::InvalidArgument { .. }), "{err}");
     assert!(err.to_string().contains("no workflow ids"), "{err}");
 
     dbos.shutdown().await;
@@ -353,6 +353,60 @@ async fn an_empty_wait_inside_a_workflow_still_takes_its_step_id() {
         seen,
         [(0, "DBOS.joinWorkflows"), (1, "after")],
         "the empty wait recorded its own row and left `after` on the slot it would have had anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// An empty first-wait inside a workflow records its refusal as the step's outcome.
+///
+/// It took a step id, and a step that took one owes its slot an outcome — so the refusal is
+/// written to the row rather than happening instead of a step. A replay then reads it back
+/// instead of deciding it again, which is what makes it safe for the set to have changed since:
+/// step arguments are not checkpointed anywhere in DBOS.
+#[tokio::test]
+async fn an_empty_first_wait_records_its_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-empty-refusal-app", &db));
+    let wf = dbos
+        .register_workflow("wf", |()| async {
+            let none: [&str; 0] = [];
+            let refused: dbos::Result<String> = dbos::select_workflow(&none).await;
+            let message = match refused {
+                Err(error) => format!("{error}"),
+                Ok(id) => panic!("an empty first-wait answered with {id}"),
+            };
+            dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+            Ok::<String, Error>(message)
+        })
+        .expect("registration failed");
+    dbos.launch().await.expect("launch failed");
+
+    let handle = wf.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let message = handle.result().await.expect("the workflow failed");
+    assert!(
+        message.contains("no workflow ids") && message.contains("invalid argument"),
+        "{message}"
+    );
+
+    let steps = dbos
+        .list_workflow_steps(&id)
+        .await
+        .expect("could not read the steps");
+    let seen: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|step| (step.step_id, step.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [(0, "DBOS.selectWorkflow"), (1, "after")],
+        "the refusal occupies its own slot, leaving `after` where it would have been anyway"
+    );
+    let refusal = &steps[0];
+    assert!(
+        refusal.error.is_some() && refusal.output.is_none(),
+        "the refusal is the step's recorded outcome: {refusal:?}"
     );
 
     dbos.shutdown().await;

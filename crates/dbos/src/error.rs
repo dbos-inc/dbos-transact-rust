@@ -169,8 +169,30 @@ pub enum Error<E = EngineOnly> {
     },
 
     /// The configuration could not be used.
+    ///
+    /// How the instance, the client or a queue was *set up* — a malformed database URL, an empty
+    /// schema, a queue whose limits contradict each other. Not what a call was passed at the point
+    /// it was made, which is [`InvalidArgument`](Self::InvalidArgument).
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    /// A call was given an argument it cannot act on.
+    ///
+    /// The caller's mistake at one call site, rather than a setting that was wrong before anything
+    /// ran — waiting for the first of no workflows, or naming one forked id for a call that forks
+    /// many. Kept apart from [`Config`](Self::Config) because the two are fixed in different
+    /// places and by different people.
+    ///
+    /// **Deterministic, and recorded like any other failure** where the call took a step id: the
+    /// arguments are not checkpointed, so a replay reads the refusal back rather than deciding it
+    /// again against a set that may have changed.
+    #[error("invalid argument to {operation}: {detail}")]
+    InvalidArgument {
+        /// The call that was given it.
+        operation: Cow<'static, str>,
+        /// What was wrong with it.
+        detail: String,
+    },
 
     /// Two workflows were registered under one identity.
     ///
@@ -442,6 +464,9 @@ impl<E> Error<E> {
             Error::InsideStep { operation } => Error::InsideStep { operation },
             Error::WrongInstance { operation } => Error::WrongInstance { operation },
             Error::Config(message) => Error::Config(message),
+            Error::InvalidArgument { operation, detail } => {
+                Error::InvalidArgument { operation, detail }
+            }
             Error::AlreadyRegistered { key } => Error::AlreadyRegistered { key },
             Error::Serialization {
                 what,

@@ -500,18 +500,9 @@ async fn a_refused_call_spends_no_step_id() {
                 "an unencodable event value should be refused"
             );
 
-            // A first-wait over nothing has no answer it could ever give.
-            let none: [&str; 0] = [];
-            let refused: dbos::Result<String> = dbos::select_workflow(&none).await;
-            assert!(
-                matches!(refused.unwrap_err(), Error::Config(_)),
-                "an empty select set should be refused"
-            );
-
-            // An all-wait over nothing is satisfied rather than refused — and takes no id either,
-            // there being nothing to record that it waited for.
-            dbos::join_workflows(&none).await?;
-
+            // The waits are *not* an example of this: an empty set is a legal argument that
+            // both of them place and record, so the refusal there is the step's outcome rather
+            // than something that happened instead of a step. See `waits.rs`.
             dbos::step("after", || async { Ok(()) }).await?;
             Ok::<_, dbos::Error>(())
         })

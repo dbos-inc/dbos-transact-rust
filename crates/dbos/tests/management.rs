@@ -1113,7 +1113,7 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
         .await
         .expect_err("a chosen id was accepted for a batch");
     assert!(
-        matches!(&error, Error::Config(message) if message.contains("forked_id")),
+        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
         "expected a configuration refusal, got {error:?}"
     );
 
@@ -1178,7 +1178,7 @@ async fn forking_from_a_searched_point_refuses_a_chosen_id() {
             .await
             .expect_err("a chosen id was accepted for a searched fork point");
         assert!(
-            matches!(&error, Error::Config(message) if message.contains("forked_id")),
+            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
             "expected a configuration refusal for {from:?}, got {error:?}"
         );
     }
@@ -2170,7 +2170,7 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                         )
                         .await;
                     assert!(
-                        matches!(refused.map(|_| ()), Err(Error::Config(_))),
+                        matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
                         "a chosen id should be refused in bulk"
                     );
 
@@ -2186,7 +2186,7 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                         )
                         .await;
                     assert!(
-                        matches!(refused.map(|_| ()), Err(Error::Config(_))),
+                        matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
                         "a chosen id needs a fork point that names its step"
                     );
 

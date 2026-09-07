@@ -10,7 +10,7 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::{PendingStep, StepDurability, StepPlacement};
+use crate::checkpoint::{PendingStep, StepDurability, StepPlacement, revive};
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
@@ -708,22 +708,6 @@ async fn observe_cancellation(ctx: &Ctx) {
             std::future::pending().await
         }
     }
-}
-
-/// Rebuilds the error a recorded step failed with.
-///
-/// The same error, not a description of it: an application failure comes back as its own variant
-/// with its own fields, and an engine failure as the variant it was. The only payloads that do not
-/// survive are the `serde_json::Error` sources, which arrive absent rather than different.
-///
-/// Falls back to a plain message when the column does not hold one of ours, which is what a row
-/// written by another SDK looks like — its serializer chose its own shape, and the `serialization`
-/// column says so. A readable message beats a decode failure standing in for somebody else's error.
-fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
-    serde_json::from_str(recorded).unwrap_or_else(|_| Error::StepFailed {
-        step: step.to_owned(),
-        message: recorded.to_owned(),
-    })
 }
 
 #[cfg(test)]

@@ -1353,11 +1353,13 @@ impl Connection {
 /// accept an id call it; the bulk forms pass `None` and have nothing to refuse here.
 fn refuse_chosen_id_without_a_step(from: ForkFrom<'_>, forked_id: Option<&str>) -> Result<()> {
     if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
-        return Err(Error::Config(
-            "ForkOptions::forked_id needs a fork point that names its step: use ForkFrom::Step, \
-             or ForkFrom::Beginning, and let the searched fork points generate the id"
+        return Err(Error::InvalidArgument {
+            operation: "fork a workflow".into(),
+            detail: "ForkOptions::forked_id needs a fork point that names its step: use \
+                     ForkFrom::Step, or ForkFrom::Beginning, and let the searched fork points \
+                     generate the id"
                 .to_owned(),
-        ));
+        });
     }
     Ok(())
 }
@@ -1369,10 +1371,11 @@ fn refuse_chosen_id_without_a_step(from: ForkFrom<'_>, forked_id: Option<&str>) 
 /// batch — and both surfaces here have to say so.
 fn refuse_forked_id_in_bulk(options: &ForkOptions<'_>) -> Result<()> {
     if options.forked_id.is_some() {
-        return Err(Error::Config(
-            "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
+        return Err(Error::InvalidArgument {
+            operation: "fork_all".into(),
+            detail: "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
                 .to_owned(),
-        ));
+        });
     }
     Ok(())
 }
