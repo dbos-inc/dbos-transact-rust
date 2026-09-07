@@ -1113,7 +1113,7 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
         .await
         .expect_err("a chosen id was accepted for a batch");
     assert!(
-        matches!(&error, Error::Config(message) if message.contains("forked_id")),
+        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
         "expected a configuration refusal, got {error:?}"
     );
 
@@ -1178,7 +1178,7 @@ async fn forking_from_a_searched_point_refuses_a_chosen_id() {
             .await
             .expect_err("a chosen id was accepted for a searched fork point");
         assert!(
-            matches!(&error, Error::Config(message) if message.contains("forked_id")),
+            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
             "expected a configuration refusal for {from:?}, got {error:?}"
         );
     }
@@ -2037,4 +2037,274 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
 
     owner.shutdown().await;
     other.shutdown().await;
+}
+
+/// An empty management batch inside a workflow records its step like any other.
+///
+/// The batch takes its id where it was written, so it owes that slot an outcome whatever it was
+/// passed — the rule the empty waits follow. A list derived from state can be empty on one
+/// execution and not on the next, and a batch that spent an id without recording anything would
+/// let the replay *perform* the operation against the fuller list rather than replay the first
+/// run's answer. Recorded here, so the replay reads the row back instead.
+#[tokio::test]
+async fn an_empty_management_batch_inside_a_workflow_records_its_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-empty-batch-app", &db));
+    let operator = dbos
+        .register_workflow("operator", {
+            let dbos = dbos.clone();
+            move |()| {
+                let dbos = dbos.clone();
+                async move {
+                    let none: [&str; 0] = [];
+                    assert!(
+                        dbos.cancel_all(&none, Children::Skip).await?.is_empty(),
+                        "an empty cancel cancelled something"
+                    );
+                    assert_eq!(
+                        dbos.delete_all(&none, Children::Skip).await?,
+                        0,
+                        "an empty delete removed something"
+                    );
+                    dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = operator.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    assert_eq!(handle.result().await.expect("the workflow failed"), 1);
+
+    let steps = dbos
+        .list_workflow_steps(&id)
+        .await
+        .expect("could not read the steps");
+    let seen: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|step| (step.step_id, step.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (0, "DBOS.cancelWorkflow"),
+            (1, "DBOS.deleteWorkflow"),
+            (2, "after")
+        ],
+        "each empty batch recorded its own row and left `after` where it would have been anyway"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **Management calls take their step ids where they are built, not where they are first polled.**
+///
+/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
+/// branch before polling any and then first-polls them in source order, so a test that builds and
+/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
+/// handed to `join!` as `c, b, a`.
+#[tokio::test]
+async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-join-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("operator", {
+            let dbos = dbos.clone();
+            move |id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let filter = WorkflowFilter {
+                        workflow_ids: vec![&id],
+                        ..WorkflowFilter::default()
+                    };
+                    // Built a, b, c...
+                    let a = dbos.cancel(&id);
+                    let b = dbos.list_workflow_steps(&id);
+                    let c = dbos.list_workflows(&filter);
+                    // ...whose ids are already decided, before anything has been polled. The
+                    // rows below say the same thing from the database's side; this says it of
+                    // the values themselves, which is the only thing that speaks for the branch
+                    // built last and polled first.
+                    assert_eq!(
+                        (a.step_id(), b.step_id(), c.step_id()),
+                        (Some(0), Some(1), Some(2)),
+                        "the ids were taken at the call, in source order"
+                    );
+                    // ...and driven c, b, a.
+                    let (c, b, a) = tokio::join!(c, b, a);
+                    a?;
+                    b?;
+                    Ok::<usize, Error>(c?.len())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // The target sits on a queue nothing polls, so it is there to be cancelled.
+    let target_id = "cancelled-out-of-order";
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(target_id),
+                queue: Some(Enqueue::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let operator_id = "the-joining-operator";
+    let seen = operator
+        .run_with(
+            target_id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(operator_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator workflow failed");
+    assert_eq!(
+        seen, 1,
+        "the listing did not see the workflow it filtered on"
+    );
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(operator_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "DBOS.cancelWorkflow"),
+            (1, "DBOS.listWorkflowSteps"),
+            (2, "DBOS.listWorkflows"),
+        ],
+        "the ids follow the order the calls were built in, not the order they were polled in",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A management call refused by its own arguments moves no step counter.**
+///
+/// The launch check comes first, then the call's own argument check, and only then the step id —
+/// so `fork_all` refusing a chosen id, and `fork_with` refusing a fork point that cannot name one,
+/// leave the step after them on the slot it would have had. The instance-level refusals are
+/// covered by `management_calls_through_another_instance_are_refused`; these are the ones the
+/// method itself raises.
+#[tokio::test]
+async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-refusal-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("operator", {
+            let dbos = dbos.clone();
+            move |id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    // One id cannot name many forks.
+                    let refused = dbos
+                        .fork_all::<u32, EngineOnly>(
+                            &[&id],
+                            ForkFrom::Beginning,
+                            ForkOptions {
+                                forked_id: Some("chosen"),
+                                ..ForkOptions::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
+                        "a chosen id should be refused in bulk"
+                    );
+
+                    // And a searched fork point has no step to hang a chosen id on.
+                    let refused = dbos
+                        .fork_with::<u32, EngineOnly>(
+                            &id,
+                            ForkFrom::LastFailure,
+                            ForkOptions {
+                                forked_id: Some("chosen"),
+                                ..ForkOptions::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
+                        "a chosen id needs a fork point that names its step"
+                    );
+
+                    dbos::step("after", || async { Ok(()) }).await?;
+                    Ok::<(), Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let target_id = "never-forked";
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(target_id),
+                queue: Some(Enqueue::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let operator_id = "the-refused-operator";
+    operator
+        .run_with(
+            target_id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(operator_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator workflow failed");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(operator_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "after")],
+        "a refused fork took the step id the step after it should have had",
+    );
+    assert!(
+        reader
+            .get_workflow("chosen")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "a fork was written even though the call was refused",
+    );
+
+    dbos.shutdown().await;
 }

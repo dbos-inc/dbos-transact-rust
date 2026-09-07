@@ -164,9 +164,10 @@
 //! interval and nothing else — but where they would have to grow a parameter to bound the wait,
 //! the language already supplies it.
 
-use crate::checkpoint::StepPlacement;
+use std::sync::Arc;
+
+use crate::checkpoint::{PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
-use crate::context::Ctx;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::serialization::{decode, encode};
@@ -180,9 +181,13 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// it is why [`get_event`](crate::get_event) is a free function too.
 ///
 /// The wait is checkpointed as a step, so a replay returns the same winner instead of racing
-/// again. The error is the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no
-/// conversion. From inside a *step* it waits plainly with no checkpoint, the step's own checkpoint
-/// standing for everything its body did.
+/// again. **Its step id is taken here, at the call, not at the first poll** — see
+/// [`PendingStep`] — so a wait built beside a step and driven with it by `tokio::join!` takes the
+/// same slot on every execution, whatever it was passed: an empty set is placed like any other and
+/// its refusal recorded as the step's own outcome, so a replay refuses again. The error is
+/// the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion. From inside
+/// a *step* it waits plainly with no checkpoint, the step's own checkpoint standing for everything
+/// its body did.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -201,23 +206,21 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 ///
 /// Outside a workflow there is no context to read, so this is [`Error::NotInWorkflow`]. That is
 /// where [`DBOS::select_workflow`] is the call.
-pub async fn select_workflow<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<String, E> {
-    let Some(ctx) = Ctx::current() else {
-        return Err(Error::NotInWorkflow {
-            operation: "select_workflow".into(),
-        });
-    };
-    ctx.executor()
-        .connection()
-        .select_workflow(workflow_ids)
-        .await
-        .map_err(Error::lift)
+pub fn select_workflow<'a, E: crate::DurableError + 'a>(
+    workflow_ids: &'a [&'a str],
+) -> PendingStep<'a, String, E> {
+    let built = StepPlacement::ambient_connection("select_workflow")
+        .and_then(|conn| Connection::placed(&conn, "select_workflow"));
+    Connection::pending_select_workflow(built, workflow_ids)
 }
 
 /// Waits until every one of these workflows has finished.
 ///
 /// The all-form of the free [`select_workflow`](fn@select_workflow), and the waiter a fan-out that
-/// needs every answer reaches for. Same context rules, same checkpoint, same error channel.
+/// needs every answer reaches for. Same context rules, same checkpoint, same error channel, and
+/// the same step id taken at the call — an **empty set included**, because which slot a wait
+/// occupies must not depend on what it was passed. Nothing to wait for is a satisfied wait, so it
+/// is answered at once, but it is still placed and still recorded.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -234,17 +237,12 @@ pub async fn select_workflow<E: crate::DurableError>(workflow_ids: &[&str]) -> R
 /// }
 /// # Ok(total) }
 /// ```
-pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<(), E> {
-    let Some(ctx) = Ctx::current() else {
-        return Err(Error::NotInWorkflow {
-            operation: "join_workflows".into(),
-        });
-    };
-    ctx.executor()
-        .connection()
-        .join_workflows(workflow_ids)
-        .await
-        .map_err(Error::lift)
+pub fn join_workflows<'a, E: crate::DurableError + 'a>(
+    workflow_ids: &'a [&'a str],
+) -> PendingStep<'a, (), E> {
+    let built = StepPlacement::ambient_connection("join_workflows")
+        .and_then(|conn| Connection::placed(&conn, "join_workflows"));
+    Connection::pending_join_workflows(built, workflow_ids)
 }
 
 /// Races these workflow handles and runs the arm belonging to the one that finishes first.
@@ -536,9 +534,11 @@ impl DBOS {
     /// usable before every enqueue has committed — and what makes a mistyped id a wait that never
     /// ends. That is the trade every reference makes here, and the bound on it is dropping the
     /// future.
-    pub async fn select_workflow(&self, workflow_ids: &[&str]) -> Result<String> {
-        let executor = self.executor("select_workflow")?;
-        executor.connection().select_workflow(workflow_ids).await
+    pub fn select_workflow<'a>(&self, workflow_ids: &'a [&'a str]) -> PendingStep<'a, String> {
+        let built = self
+            .executor("select_workflow")
+            .and_then(|executor| Connection::placed(executor.connection(), "select_workflow"));
+        Connection::pending_select_workflow(built, workflow_ids)
     }
 
     /// Waits until every one of these workflows has finished.
@@ -563,9 +563,11 @@ impl DBOS {
     /// settling is a property of an id, so a repeated one is simply satisfied twice. **An empty
     /// slice returns at once** — nothing to wait for is a satisfied wait, where an empty first-wait
     /// has no answer and is refused.
-    pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
-        let executor = self.executor("join_workflows")?;
-        executor.connection().join_workflows(workflow_ids).await
+    pub fn join_workflows<'a>(&self, workflow_ids: &'a [&'a str]) -> PendingStep<'a, ()> {
+        let built = self
+            .executor("join_workflows")
+            .and_then(|executor| Connection::placed(executor.connection(), "join_workflows"));
+        Connection::pending_join_workflows(built, workflow_ids)
     }
 }
 
@@ -588,14 +590,16 @@ impl crate::Client {
     /// See [`DBOS::select_workflow`]. Nothing is checkpointed, because a client has nothing to
     /// checkpoint against.
     pub async fn select_workflow(&self, workflow_ids: &[&str]) -> Result<String> {
-        self.connection().select_workflow(workflow_ids).await
+        let (conn, placement) = Connection::placed(self.connection(), "select_workflow")?;
+        Connection::select_workflow(&conn, placement, workflow_ids).await
     }
 
     /// Waits until every one of these workflows has finished.
     ///
     /// See [`DBOS::join_workflows`]. Nothing is checkpointed, for the same reason.
     pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
-        self.connection().join_workflows(workflow_ids).await
+        let (conn, placement) = Connection::placed(self.connection(), "join_workflows")?;
+        Connection::join_workflows(&conn, placement, workflow_ids).await
     }
 }
 
@@ -618,29 +622,69 @@ fn summarize(workflow_ids: &[&str]) -> String {
 }
 
 impl Connection {
-    /// The first-wait itself, shared by both surfaces.
+    /// The connection a wait goes through, paired with where that wait stands.
+    ///
+    /// **Neither wait looks at its set here**, which is the point rather than an omission: which
+    /// slot a wait occupies must depend on where it was written, never on what it was passed. A
+    /// set computed from state can be empty on one execution and not on the next, and a call that
+    /// took an id in one and none in the other shifts every later step of that workflow onto a
+    /// slot it did not record. So an empty set is placed like any other and answered by the run —
+    /// satisfied for the all-wait, refused for the first-wait, and recorded either way.
+    /// TypeScript's `waitAll` returns early on an empty handle list, ahead of `runInternalStep`,
+    /// and carries that hazard.
+    ///
+    /// A repeated id is not looked at either: the first-wait answers with the id itself, which
+    /// names one workflow however many entries pointed at it.
+    pub(crate) fn placed(
+        conn: &Arc<Self>,
+        operation: &'static str,
+    ) -> Result<(Arc<Self>, StepPlacement)> {
+        let placement = StepPlacement::of(conn, operation)?;
+        Ok((Arc::clone(conn), placement))
+    }
+
+    /// The first-wait as a [`PendingStep`], for the two surfaces that take a step id.
+    ///
+    /// The free [`select_workflow`](fn@crate::select_workflow) and [`DBOS::select_workflow`] differ
+    /// only in how they reach a connection and in which error channel they answer in, which is the
+    /// whole of what `built` carries; a [`Client`](crate::Client)'s stays a plain `async fn`,
+    /// because it takes no id and is legitimately driven from anywhere.
+    pub(crate) fn pending_select_workflow<'a, E: crate::DurableError + 'a>(
+        built: Result<(Arc<Self>, StepPlacement)>,
+        workflow_ids: &'a [&'a str],
+    ) -> PendingStep<'a, String, E> {
+        PendingStep::placed(
+            step_names::SELECT_WORKFLOW,
+            built,
+            move |conn, placement| async move {
+                Self::select_workflow(&conn, placement, workflow_ids)
+                    .await
+                    .map_err(Error::lift)
+            },
+        )
+    }
+
+    /// The first-wait itself, once its slot is decided.
     ///
     /// On the connection because that is what it needs — a poll interval, a serializer for the
-    /// recorded winner, and the database — which is what lets a client reach it. Named as its
-    /// surface is, like every other shared internal here.
+    /// recorded winner, and the database — which is what lets a client reach it, and what makes
+    /// this the one body all three surfaces run.
     pub(crate) async fn select_workflow(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
+        placement: StepPlacement,
         workflow_ids: &[&str],
     ) -> Result<String> {
-        // Before the placement, because a call that cannot be answered should not move the
-        // workflow's step counter: a workflow that fails here and is fixed to pass a non-empty set
-        // would otherwise replay onto a different slot than it recorded.
-        //
-        // The only thing refused. Nothing here cares whether an id repeats — the answer is the id
-        // itself, which names one workflow however many entries pointed at it.
-        if workflow_ids.is_empty() {
-            return Err(Error::Config(
-                "select_workflow was given no workflow ids to wait for".to_owned(),
-            ));
-        }
-
-        let placement = StepPlacement::of(self, "select_workflow")?;
-        if let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await? {
+        // The ids first, so the refusal below has them: `check` answers `Some` only where the
+        // placement holds a step, so inside this arm they are known rather than defaulted.
+        if let Some((workflow_id, step_id)) = placement.step()
+            && let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await?
+        {
+            // A recorded failure replays as that failure. The only one this call records is the
+            // empty set below, and a replay of it must refuse again rather than look at the set it
+            // has now — the same rule that makes a recorded winner stand even when the set changed.
+            if let Some(error) = &recorded.error {
+                return Err(revive(error, step_names::SELECT_WORKFLOW));
+            }
             let winner: String = decode(
                 recorded.output.as_deref(),
                 "the id that won a select_workflow",
@@ -664,7 +708,6 @@ impl Connection {
             // free there has to be spelled — which is the whole cost of it. It reads no extra
             // state: the winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
-                let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order
                 // `Awaiting::check` builds them in.
@@ -682,6 +725,28 @@ impl Connection {
         // instant the answer was written down — the placement every other recorded call in this
         // crate takes its `started_at` from.
         let started_at = Timestamp::now();
+
+        // **A first-wait over nothing has no answer it could ever give**, so it is refused rather
+        // than parked forever — and the refusal is *recorded*, because this call took a step id
+        // and a step that took one owes its slot an outcome. A replay then reads the refusal back
+        // instead of re-deciding it, which is what every other recorded failure does. Outside a
+        // workflow there is no slot, so `record` writes nothing and this is simply the error.
+        if workflow_ids.is_empty() {
+            let refused: Error = Error::InvalidArgument {
+                operation: "select_workflow".into(),
+                detail: "no workflow ids to wait for".to_owned(),
+            };
+            let encoded = encode(&refused, "select_workflow error")?;
+            placement
+                .record(
+                    self,
+                    step_names::SELECT_WORKFLOW,
+                    Outcome::Error(&encoded),
+                    started_at,
+                )
+                .await?;
+            return Err(refused);
+        }
         let winner = self
             .sysdb()
             .await_first_workflow_id(workflow_ids, self.outcome_poll_interval())
@@ -700,19 +765,30 @@ impl Connection {
         Ok(winner)
     }
 
-    /// The all-wait itself, shared by both surfaces.
+    /// The all-wait as a [`PendingStep`], the counterpart of
+    /// [`pending_select_workflow`](Self::pending_select_workflow).
+    pub(crate) fn pending_join_workflows<'a, E: crate::DurableError + 'a>(
+        built: Result<(Arc<Self>, StepPlacement)>,
+        workflow_ids: &'a [&'a str],
+    ) -> PendingStep<'a, (), E> {
+        PendingStep::placed(
+            step_names::JOIN_WORKFLOWS,
+            built,
+            move |conn, placement| async move {
+                Self::join_workflows(&conn, placement, workflow_ids)
+                    .await
+                    .map_err(Error::lift)
+            },
+        )
+    }
+
+    /// The all-wait itself, once its slot is decided — see
+    /// [`select_workflow`](Self::select_workflow), of which this is the other half.
     pub(crate) async fn join_workflows(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
+        placement: StepPlacement,
         workflow_ids: &[&str],
     ) -> Result<()> {
-        // Nothing to wait for is a satisfied wait — and, unlike the first-wait, one with an
-        // answer. Returned before the placement so an empty call spends no step id, which matches
-        // TypeScript short-circuiting its empty handle list before `runInternalStep`.
-        if workflow_ids.is_empty() {
-            return Ok(());
-        }
-
-        let placement = StepPlacement::of(self, "join_workflows")?;
         // The row is the whole of the answer, and there is nothing in it to check the current set
         // against: an all-wait records no set, so a replay of one whose set has *grown* skips the
         // wait for the member it never waited on. That is the ordinary reading of a step whose

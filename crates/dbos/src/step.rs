@@ -10,7 +10,7 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::{PendingStep, StepDurability, StepPlacement};
+use crate::checkpoint::{PendingStep, StepDurability, StepPlacement, revive};
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
@@ -236,16 +236,16 @@ impl<E> StepOptions<E> {
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
 /// the counter first, which is not something a replay reproduces.
 ///
-/// **That is a promise about steps, and for now only about these two calls.** The crate's other
-/// durable calls are steps in every sense that matters — each claims one id and records one
-/// answer a replay must not repeat — but `sleep`, the events, the messages, a child's `start`,
-/// awaiting a handle, the waits and the management surface still take their ids at their first
-/// **poll**. Driven together they are numbered in whatever order the combinator polls them, so a
-/// replay that interleaves differently meets a recorded step under the wrong name — a
-/// system-database error, which records nothing, leaves the workflow `PENDING`, and has it
-/// recovered until it parks. Await each of those before starting the next, as the whole crate
-/// required before ids moved. Each is being converted to build its id the way a step does, and
-/// the rule retires as they are.
+/// **That is a promise about most of the crate's durable calls, and now nearly all of them.**
+/// `sleep`, the events, the messages, the waits and every checkpointed management call on
+/// [`DBOS`](crate::DBOS) take their ids at the call too, and may be built first and driven
+/// together with steps and with each other. What is left is **a child's `start` and awaiting a
+/// handle**, which still take their ids at their first **poll**: driven together they are numbered
+/// in whatever order the combinator polls them, so a replay that interleaves differently meets a
+/// recorded step under the wrong name — a system-database error, which records nothing, leaves the
+/// workflow `PENDING`, and has it recovered until it parks. Await each of those two before
+/// starting the next, as the whole crate required before ids moved. Both are being converted the
+/// same way, and the rule retires with them.
 ///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
@@ -708,22 +708,6 @@ async fn observe_cancellation(ctx: &Ctx) {
             std::future::pending().await
         }
     }
-}
-
-/// Rebuilds the error a recorded step failed with.
-///
-/// The same error, not a description of it: an application failure comes back as its own variant
-/// with its own fields, and an engine failure as the variant it was. The only payloads that do not
-/// survive are the `serde_json::Error` sources, which arrive absent rather than different.
-///
-/// Falls back to a plain message when the column does not hold one of ours, which is what a row
-/// written by another SDK looks like — its serializer chose its own shape, and the `serialization`
-/// column says so. A readable message beats a decode failure standing in for somebody else's error.
-fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
-    serde_json::from_str(recorded).unwrap_or_else(|_| Error::StepFailed {
-        step: step.to_owned(),
-        message: recorded.to_owned(),
-    })
 }
 
 #[cfg(test)]

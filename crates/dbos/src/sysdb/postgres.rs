@@ -3564,7 +3564,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         cancel_children: bool,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if workflow_ids.is_empty() {
+        // An empty batch still has to reach `run_transactional_step` when there is a caller: the
+        // step id was taken where the call was written, so returning here would leave a workflow
+        // holding an id nothing recorded, and a replay whose list is no longer empty would perform
+        // the operation instead of replaying the first run's answer. Which slot a call occupies —
+        // and whether it is recorded — must not depend on what it was passed, the rule the empty
+        // waits follow. Without a caller nothing is checked or written anyway, so the short circuit
+        // stands there and spares a client a transaction that would do nothing.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
         let started_at = Timestamp::now();
@@ -3633,7 +3640,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         queue_name: Option<&str>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if workflow_ids.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
         let workflow_table = self.tables.workflow_status.as_str();
@@ -3702,7 +3711,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         delete_children: bool,
         caller: Option<(&str, i32)>,
     ) -> Result<u64, Error> {
-        if workflow_ids.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(0);
         }
         // Descendants arrive owned from the database and are kept alive here; the roots stay
@@ -3793,7 +3804,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         options: &ForkOptions<'_>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if forks.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if forks.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
         options.validate()?;
@@ -3831,7 +3844,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         options: &ForkOptions<'_>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if workflow_ids.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
 
