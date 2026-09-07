@@ -697,7 +697,7 @@ impl Connection {
             // not bookkeeping: a workflow that changed which ids it waits on has changed what this
             // position of its code means, and handing back a winner it no longer waits on would
             // have it act on an answer to a question it stopped asking. The same check
-            // `Awaiting::check` makes against a recorded child id, for the same reason.
+            // `ChildResultPlacement::check` makes against a recorded child id, for the same reason.
             //
             // **Both references make it too, without writing it down**, because returning a
             // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
@@ -710,7 +710,7 @@ impl Connection {
             if !workflow_ids.contains(&winner.as_str()) {
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order
-                // `Awaiting::check` builds them in.
+                // `ChildResultPlacement::check` builds them in.
                 return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                     workflow_id: workflow_id.to_owned(),
                     step_id,

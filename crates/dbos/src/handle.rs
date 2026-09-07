@@ -175,12 +175,12 @@ where
         // await in the parent has to be the same on the replay as it was on the run. A refusal
         // here is carried into the future by `placed`, so `handle.result().await?` reads as it
         // always did and nothing was claimed on the way to it.
-        let built = Awaiting::of(&self.conn).map(|awaiting| {
+        let built = ChildResultPlacement::of(&self.conn).map(|awaiting| {
             let placement = awaiting.placement().clone();
             (awaiting, placement)
         });
-        // The placement is handed back beside the `Awaiting` that carries it, and the await wants
-        // the latter: it is what holds the id this call already claimed.
+        // The placement is handed back beside the `ChildResultPlacement` that carries it, and the
+        // await wants the latter: it is what holds the id this call already claimed.
         PendingStep::placed(step_names::GET_RESULT, built, move |awaiting, _| {
             self.settle(awaiting)
         })
@@ -188,12 +188,12 @@ where
 
     /// The await itself, once something polls it.
     ///
-    /// Takes the [`Awaiting`] rather than building one, because the id it holds was claimed where
-    /// the call was written. That is also what lets [`run_with`](crate::WorkflowRef::run_with)
+    /// Takes the [`ChildResultPlacement`] rather than building one, because the id it holds was
+    /// claimed where the call was written. That is also what lets [`run_with`](crate::WorkflowRef::run_with)
     /// claim the await's id immediately behind the start's and hand it here once the child
     /// exists: where an await stands is decided by the ambient context and the connection, and
     /// the handle has no say in either.
-    pub(crate) async fn settle(self, awaiting: Awaiting) -> Result<R, E> {
+    pub(crate) async fn settle(self, awaiting: ChildResultPlacement) -> Result<R, E> {
         if let Some(recorded) = awaiting
             .check(&self.conn, &self.workflow_id)
             .await
@@ -254,7 +254,8 @@ where
             // reference raises a separate awaited-cancelled error for exactly this, and it is
             // recorded like any other outcome: the child is over, and the parent has learned so.
             Err(Failure::Control(Error::WorkflowCancelled { workflow_id }))
-                if awaiting.inside_a_workflow() =>
+                // Only where there is a caller for the two to be confused with each other.
+                if awaiting.placement().inside_a_workflow() =>
             {
                 Err(Error::AwaitedWorkflowCancelled { workflow_id })
             }
@@ -264,8 +265,8 @@ where
 
     /// Turns a recorded await back into what the parent returned the first time.
     ///
-    /// Which workflow the row belongs to was settled by [`Awaiting::recorded`] before this sees
-    /// it, so what is left here is the outcome alone.
+    /// Which workflow the row belongs to was settled by [`ChildResultPlacement::check`] before
+    /// this sees it, so what is left here is the outcome alone.
     fn interpret(recorded: StepRecord, workflow_id: String) -> Result<R, E> {
         match recorded.error {
             None => decode(recorded.output.as_deref(), "result"),
@@ -282,12 +283,30 @@ where
 /// Where the caller awaiting this handle stands, which decides two independent things: whether the
 /// outcome is checkpointed, and how a cancelled *awaited* workflow is reported.
 ///
+/// **A [`StepPlacement`] and the two writes that are an await's own**, which is the whole of what
+/// it adds: [`of`](Self::of) names the operation once and [`placement`](Self::placement) hands the
+/// inner value back, while [`check`](Self::check) and [`record`](Self::record) are the pair this
+/// type exists for — [`check_child_result`](crate::sysdb::SystemDatabase::check_child_result) and
+/// [`record_child_result`](crate::sysdb::SystemDatabase::record_child_result), whose vocabulary
+/// this borrows. It is the *result* half of what a parent records about a child; the *launch* half
+/// is [`record_child_workflow`](crate::sysdb::SystemDatabase::record_child_workflow), carried by
+/// [`InitWorkflowCaller`](crate::sysdb::types::InitWorkflowCaller).
+///
+/// **A type of its own rather than a bare placement**, because
+/// [`run_with`](crate::WorkflowRef::run_with) holds two placements at once — the start's and this
+/// one, claimed an instant apart and differing only in the integer inside. Handing
+/// [`settle`](WorkflowHandle::settle) the wrong one would compile, and would record the await
+/// under the start's id; the replay would meet a recorded step under the wrong name and there is
+/// nothing before then to notice it.
+///
 /// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
 /// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
-/// either, and Python and Go checkpoint that case too.
-pub(crate) struct Awaiting(StepPlacement);
+/// either, and Python and Go checkpoint that case too. The name follows the layer below rather
+/// than that distinction — every implementation stores the awaited id in `child_workflow_id`,
+/// whoever started it.
+pub(crate) struct ChildResultPlacement(StepPlacement);
 
-impl Awaiting {
+impl ChildResultPlacement {
     /// Where this await stands, allocating its step id if it is to be recorded.
     ///
     /// The placement rules — and the argument for each of them — are
@@ -302,22 +321,12 @@ impl Awaiting {
         &self.0
     }
 
-    /// Whether a cancelled *awaited* workflow has to be distinguished from this caller being
-    /// cancelled — true wherever there is a caller for it to be confused with.
-    fn inside_a_workflow(&self) -> bool {
-        self.0.inside_a_workflow()
-    }
-
-    fn checkpoint(&self) -> Option<(&str, i32)> {
-        self.0.step()
-    }
-
     async fn check(
         &self,
         conn: &Connection,
         awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
-        let Some((workflow_id, step_id)) = self.checkpoint() else {
+        let Some((workflow_id, step_id)) = self.0.step() else {
             return Ok(None);
         };
         let Some(recorded) = conn
@@ -396,7 +405,7 @@ impl Awaiting {
         settled: &std::result::Result<Option<String>, Failure>,
         started_at: Timestamp,
     ) -> std::result::Result<(), Error> {
-        let Some((workflow_id, step_id)) = self.checkpoint() else {
+        let Some((workflow_id, step_id)) = self.0.step() else {
             return Ok(());
         };
         let cancelled;

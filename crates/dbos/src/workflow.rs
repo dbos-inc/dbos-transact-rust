@@ -15,7 +15,7 @@ use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Failure, Result};
-use crate::handle::{Awaiting, WorkflowHandle};
+use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
@@ -849,7 +849,7 @@ where
         let awaiting = built
             .as_ref()
             .ok()
-            .map(|(executor, _)| Awaiting::of(executor.connection()));
+            .map(|(executor, _)| ChildResultPlacement::of(executor.connection()));
         // The start's placement stands for both halves, which is sound because the two differ
         // only in the id they hold: `check_here` decides on the execution and the step marker,
         // and the await was placed in the same context an instant later. Holding the start's is
