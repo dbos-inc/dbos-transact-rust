@@ -116,6 +116,135 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
     dbos.shutdown().await;
 }
 
+/// A start dropped part-way still creates the child, records it, and runs it.
+///
+/// **A start creates a durable object part-way through its own future, and dropping a future does
+/// not undo a committed row.** Anything that abandons a branch — a `select!`, a `timeout` — can
+/// therefore drop a start after it has written, which before left a child that existed with
+/// nothing in its parent pointing at it and nothing running it. The writing half runs in a task of
+/// its own, so the drop takes the handle and leaves the work.
+///
+/// **Polled exactly once and then dropped**, which is what makes this a test rather than a race:
+/// one poll is enough to reach the spawn and no further, since everything after it is behind an
+/// await. A timeout would prove nothing — it might fire before or after the write.
+#[tokio::test]
+async fn a_start_dropped_after_it_begins_still_starts_the_child() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("dropped-start-app", &db));
+    let ran = Arc::new(AtomicU32::new(0));
+    let child = dbos
+        .register_workflow("child", {
+            let ran = Arc::clone(&ran);
+            move |n: u32| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(n * 2)
+                }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let mut start = child.start(21);
+                    assert_eq!(
+                        start.step_id(),
+                        Some(0),
+                        "the start claimed its id at the call"
+                    );
+                    // `Pin::new` rather than `pin!`, because a `PendingStep` is `Unpin` and says
+                    // so — which is also what lets `start` be dropped outright below rather than
+                    // held alive by a pin until the end of this body.
+                    assert!(
+                        matches!(
+                            Pin::new(&mut start).poll(&mut Context::from_waker(Waker::noop())),
+                            Poll::Pending
+                        ),
+                        "one poll should reach the spawn and stop at the await behind it",
+                    );
+                    drop(start);
+                    // The step after it keeps the id it would have had: the dropped start spent
+                    // its own, whatever became of the child.
+                    dbos::step("after", || async { Ok::<u32, Error>(1) }).await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-dropping-parent";
+    parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+
+    // The parent is done and never awaited the child, so the child settles on its own schedule.
+    let reader = reader(&db).await;
+    let child_id = format!("{id}-0");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(row) = reader.get_workflow(&child_id).await.expect("read failed")
+            && row.status == WorkflowStatus::Success
+        {
+            assert_eq!(
+                row.parent_workflow_id.as_deref(),
+                Some(id),
+                "the child points back at the parent that dropped its start",
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped start never produced a finished child",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the child body ran exactly once"
+    );
+
+    // Recorded against the parent as well, so a replay of this position joins the child rather
+    // than starting a second one — the half that would be missing if the write had been
+    // abandoned rather than detached.
+    let steps = reader
+        .list_workflow_steps(id, false, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str, Option<&str>)> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.step_id,
+                step.step_name.as_str(),
+                step.child_workflow_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "child", Some(child_id.as_str())), (1, "after", None)],
+        "the dropped start recorded its own row and left `after` where it would have been anyway",
+    );
+
+    dbos.shutdown().await;
+}
+
 /// A child that joins a held deduplication key is recorded as the workflow it joined.
 ///
 /// The interesting half is the start record. The child id this call derived — `{parent}-{step}` —

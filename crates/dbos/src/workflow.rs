@@ -557,6 +557,72 @@ pub(crate) fn new_row<'a>(workflow_id: &'a str, enqueue: Option<&Enqueue<'a>>) -
     }
 }
 
+/// Everything a start needs after the point it can no longer be abandoned, owned outright.
+///
+/// [`StartOptions`] borrows — an id, a queue's name, a partition key are all `&'a str` — and the
+/// half of a start that writes rows runs in a task of its own, which outlives the future that
+/// spawned it and so can hold nothing borrowed from it. This is that half's copy, taken while the
+/// caller's future is still there to take it from.
+///
+/// **Owned, and encoded too**, which is the one thing the name understates: the payloads are
+/// serialised here rather than in the task, so a value that cannot be serialised fails the call
+/// itself. Encoding is the one part of a start that can fail without touching the database, and it
+/// would be a poor trade to answer that from a task the caller may already have stopped listening
+/// to.
+struct OwnedStart {
+    /// The caller's chosen id, where it named one; otherwise the id is derived in the task.
+    workflow_id: Option<String>,
+    timeout: Timeout,
+    queue: Option<OwnedEnqueue>,
+    input: Option<String>,
+    attributes: Option<String>,
+    /// When the start began, which the parent's record of it is stamped with. Read here rather
+    /// than in the task so that it measures the call and not the wait for a runtime thread.
+    started_at: Timestamp,
+}
+
+/// An [`Enqueue`] with its strings owned, for the same reason [`OwnedStart`] is: see there.
+struct OwnedEnqueue {
+    name: String,
+    deduplication_id: Option<String>,
+    priority: Option<u32>,
+    partition_key: Option<String>,
+    delay: Option<Duration>,
+    duplication_policy: DuplicationPolicy,
+}
+
+impl From<&Enqueue<'_>> for OwnedEnqueue {
+    fn from(enqueue: &Enqueue<'_>) -> Self {
+        Self {
+            name: enqueue.name.to_owned(),
+            deduplication_id: enqueue.deduplication_id.map(str::to_owned),
+            priority: enqueue.priority,
+            partition_key: enqueue.partition_key.map(str::to_owned),
+            delay: enqueue.delay,
+            duplication_policy: enqueue.duplication_policy,
+        }
+    }
+}
+
+impl OwnedEnqueue {
+    /// The borrowed form back, so everything below this point reads one type.
+    ///
+    /// An inherent `as_*` rather than [`AsRef`] or [`Borrow`](std::borrow::Borrow), which both
+    /// have to hand back a reference: an [`Enqueue`] is a value *made* of references, so there is
+    /// nothing here to lend. `Encoded::as_message` in `message.rs` is the same shape for the same
+    /// reason.
+    fn as_enqueue(&self) -> Enqueue<'_> {
+        Enqueue {
+            name: &self.name,
+            deduplication_id: self.deduplication_id.as_deref(),
+            priority: self.priority,
+            partition_key: self.partition_key.as_deref(),
+            delay: self.delay,
+            duplication_policy: self.duplication_policy,
+        }
+    }
+}
+
 /// What an insert did: wrote this call's row, or resolved a collision by joining someone else's.
 pub(crate) enum Submitted {
     /// The row this call wrote, and what the system database decided about it.
@@ -942,6 +1008,14 @@ where
     /// workflow and polling it in another, or across a step-body boundary — an id is a claim on
     /// one position in one execution, and a start carried somewhere that cannot honour it is
     /// refused as [`Error::StepBuiltElsewhere`] rather than run.
+    ///
+    /// **A start that is polled and then dropped still starts the child**, which is what makes a
+    /// `select!` or a `timeout` over one safe to write. Dropping a future cannot undo a committed
+    /// row, so the half that writes rows runs detached and finishes on its own. The caller loses
+    /// the handle and nothing else: the child exists,
+    /// its start is recorded against this parent, and a replay of this position joins it rather
+    /// than starting a second. A start that is *never* polled writes nothing at all, and has still
+    /// spent its step id.
     pub fn start_with<'a>(
         &'a self,
         input: P,
@@ -970,6 +1044,20 @@ where
     /// free to be deferred, and has to be: a start that ran at the call would make
     /// `let handle = child.start(..)` start a child.
     ///
+    /// **The writing half runs in a task, and this awaits it.** A start creates a durable object
+    /// part-way through its own future, and dropping a future does not undo a committed row —
+    /// so a start driven by anything that abandons a branch, a `select!` or a `timeout`, could be
+    /// dropped between creating a child and spawning it and leave a workflow that exists, is
+    /// recorded, and that nothing is running until the process next launches. Detached, the drop
+    /// takes the [`JoinHandle`](tokio::task::JoinHandle) and leaves the work: the child is
+    /// created, its start is recorded, and it runs. What the caller loses by dropping is the
+    /// handle, which is [`select_workflow!`](crate::select_workflow)'s existing rule — a workflow
+    /// runs whether or not anything is watching it — rather than a new hazard of its own.
+    ///
+    /// Spawned through [`spawn_tracked`], so shutdown reaches it: aborted there, the transaction
+    /// rolls back and the start simply did not happen, which is what shutdown means everywhere
+    /// else in the crate.
+    ///
     /// Answers in the engine's channel and is lifted by its caller, because everything below can
     /// only fail in the engine's terms.
     async fn started(
@@ -978,228 +1066,281 @@ where
         input: P,
         options: StartOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        let executor = &placed.executor;
-        let enqueue = options.queue.as_ref();
-        // **The ambient context is what makes this a child.** Every reference overloads the same
-        // call rather than adding a `start_child`, so factoring a workflow body out into its own
-        // workflow does not change how its call sites are written — and a workflow started from
-        // outside one is unaffected by everything below.
-        let parent = placed.parent();
-        let input = Some(encode(&input, "argument")?);
-        let attributes = encode_attributes(options.attributes)?;
-
-        // The launch is recorded against the parent before anything is created, so a replay of
-        // this position finds the child it already started instead of starting a second one.
-        if let Some(parent) = &parent
-            && let Some(child) = parent.recorded_child(executor, &self.key().name).await?
-        {
-            tracing::debug!(
-                parent_workflow_id = parent.workflow_id(),
-                step_id = parent.step_id,
-                workflow_id = child,
-                "the child workflow was already started; the handle joins it"
-            );
-            // The start record is all this run read: the child's own row belongs to the earlier
-            // run that made it, and was never in front of this one. So an absent row is left as
-            // "not yet", the same answer an id from outside the process gets.
-            return Ok(WorkflowHandle::polling(
-                Arc::clone(executor.connection()),
-                child,
-                false,
-            ));
-        }
-
-        let workflow_id = match (options.workflow_id, &parent) {
-            // An application-assigned id wins over the derivation, in every reference.
-            (Some(id), _) => id.to_owned(),
-            // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
-            // parent re-derives the same id, so the launch is idempotent even when the crash
-            // landed between creating the child and recording it. Rust's step ids are zero-based
-            // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
-            // so a first child is `parent-0` here and in three of the four.
-            (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
-            (None, None) => uuid::Uuid::new_v4().to_string(),
+        // Taken before the spawn, while the borrowed options are still here to take it from — and
+        // the encoding with it, so a payload that cannot be serialised fails this call rather than
+        // a task the caller may have stopped listening to.
+        let request = OwnedStart {
+            workflow_id: options.workflow_id.map(str::to_owned),
+            timeout: options.timeout,
+            queue: options.queue.as_ref().map(OwnedEnqueue::from),
+            input: Some(encode(&input, "argument")?),
+            attributes: encode_attributes(options.attributes)?,
+            started_at: Timestamp::now(),
         };
-
-        // **A directly started workflow gets its deadline now, and the row carries it.** Python
-        // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
-        // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
-        // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
-        // not another hour, and a crash loop cannot extend the budget indefinitely.
-        //
-        // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
-        // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
-        let deadline = match (options.timeout, &parent) {
-            // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
-            // explicit timeout records the budget and leaves the deadline null for the claim
-            // statement to fill in. The wait in the queue is not part of the budget — a workflow
-            // given five minutes that sits queued for an hour still gets five minutes. Python and
-            // TypeScript both branch on the queue in exactly this spot; the claim statement this
-            // engine already ships does the other half.
-            (Timeout::Explicit(_), _) if options.queue.is_some() => None,
-            // **An explicit timeout replaces an inherited deadline**, which is Python's and
-            // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
-            // use it over any propagated deadline"*. So a child given longer than its parent has
-            // left outlives its parent — an explicit timeout on a specific child is a statement
-            // about that child, and the alternative would silently ignore what the caller asked
-            // for. Go differs by taking the earlier of the two, but not by design: its deadline
-            // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets an
-            // explicitly *set* deadline win, and is not a model there — its user-facing `deadline`
-            // is Java's alone and Rust does not have one.
-            (Timeout::Explicit(timeout), _) => Timestamp::now().checked_add(timeout),
-            // **A deliberate refusal to inherit**, which is why the option is an enum: this is a
-            // caller who decided, and `Inherit` below is a caller who said nothing. Java's
-            // `Timeout.None` clears the propagated deadline in the same words.
-            (Timeout::None, _) => None,
-            // **Inherited as an instant, not as a budget**, which is what makes it a deadline the
-            // parent and the child genuinely share: both `select!`s fire at the same moment, in
-            // different tasks and possibly in different processes, with no signal passing between
-            // them. A propagated deadline is the cancellation cascade, and needs no other one.
-            // **Inherited even onto a queue**, and this is not an oversight in Python's code: its
-            // `_get_timeout_deadline` branches on the queue only inside the explicit-timeout arm,
-            // and returns the propagated deadline unconditionally otherwise. The difference is
-            // what the two mean. A budget is a promise about how long the *work* may take, so the
-            // queue wait cannot count against it; an inherited deadline is an instant a parent is
-            // already bound by, and a child does not escape it by being queued.
-            (Timeout::Inherit, Some(parent)) => parent.deadline(),
-            (Timeout::Inherit, None) => None,
-        };
-
-        let started_at = Timestamp::now();
-        let new = NewWorkflow {
-            name: Some(&self.key().name),
-            class_name: self.key().class_name.as_deref(),
-            config_name: self.key().config_name.as_deref(),
-            input: input.as_deref(),
-            serialization: Some(executor.serializer().name()),
-            executor_id: Some(executor.executor_id()),
-            application_name: Some(executor.app_name()),
-            application_version: Some(executor.app_version()),
-            // Only a budget is written: an inherited deadline is an *instant* and has no
-            // budget behind it, and `Timeout::None` has neither. The column is what a
-            // queue recomputes a deadline from on dequeue, so filling it in for either
-            // would hand that path a budget nobody asked for.
-            timeout: options.timeout.budget(),
-            deadline,
-            attributes: attributes.as_deref(),
-            // The queue's five columns, and nothing below spawns the row they describe: a queue's
-            // whole point is that the process which asks is not necessarily the one that runs.
-            ..new_row(&workflow_id, enqueue)
-        };
-
-        let initialized = match init_or_join(
-            executor.connection(),
-            &new,
-            enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
-                enqueue.duplication_policy
-            }),
-            // **The parent's record of the start travels with the row, so the two commit
-            // together.** A start is one durable act: either this parent started this child and
-            // both rows say so, or neither exists. Written as two statements it had a window —
-            // and not only a crash window, since a start is a future and a combinator that races
-            // one may drop it part-way — in which a child existed that nothing in its parent
-            // pointed at. `None` is a root start, which has no parent and no step to record.
-            parent.as_ref().map(|parent| InitWorkflowCaller {
-                parent_workflow_id: parent.workflow_id(),
-                step_id: parent.step_id,
-                // The step name is the child workflow's bare name; see `Parent::record_child`,
-                // which records the joined case under the same one.
-                step_name: &self.key().name,
-                started_at,
-            }),
-        )
-        .await?
-        {
-            Submitted::Created(initialized) => initialized,
-            // **The start records the workflow that was joined**, not the id this call derived,
-            // so a replay of this position resolves to the same workflow instead of trying to
-            // start a child that was never created. Go records the same mapping at the same
-            // reserved step id.
-            //
-            // Only this record, and not the joined workflow's own `parent_workflow_id`: it has an
-            // owner already, and a cascade following that column must not reach a workflow this
-            // parent merely joined. [`DuplicationPolicy::ReturnExisting`] states the asymmetry.
-            //
-            // A crash between the join and this write is harmless, and for a different reason than
-            // the one below: nothing was written by the losing insert, so a replay simply asks
-            // again. It joins the same holder if the key is still held, and starts a workflow of
-            // its own if the holder has since finished — which is what the policy means at that
-            // moment, since the key deduplicates a backlog rather than a history.
-            Submitted::Joined(holder) => {
-                if let Some(parent) = &parent {
-                    parent
-                        .record_child(executor, &holder, &self.key().name, started_at)
-                        .await?;
-                }
-                // The holder's row was just read to find it, so a missing one from here is a
-                // deletion rather than a row still to come.
-                return Ok(WorkflowHandle::polling(
-                    Arc::clone(executor.connection()),
-                    holder,
-                    true,
-                ));
-            }
-        };
-
-        // The start record is not written here: `init_or_join` carried it into the transaction
-        // that created the child, which is what makes the pair atomic. What remains below only
-        // decides which handle to hand back.
-
-        // **Enqueued, so this process is not the one running it.** A polling handle is the honest
-        // answer even when this executor turns out to dequeue it moments later: nothing local is
-        // waiting on, and the row is the only thing that knows where the workflow got to.
-        if let Some(enqueue) = enqueue {
-            tracing::debug!(
-                workflow_id,
-                queue = enqueue.name,
-                "the workflow is enqueued"
-            );
-            // This call wrote the row, so the handle it hands back can say what an id from
-            // outside cannot: a row that goes missing was deleted.
-            return Ok(WorkflowHandle::polling(
-                Arc::clone(executor.connection()),
-                workflow_id,
-                true,
-            ));
-        }
-
-        // Someone else owns this row — the id was supplied and a previous run has it, or another
-        // executor claimed it first. Joining rather than erroring is what makes a retried request
-        // idempotent, and it is where Python waits too.
-        if !initialized.should_execute {
-            tracing::debug!(
-                workflow_id,
-                "the workflow is already owned; the handle joins the existing run"
-            );
-            // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read
-            // this row, and it is the case the references pass their own flag on — Python parks
-            // its unowned dispatch with `fail_if_missing=True` (`_core.py:1100`) and Go its lost
-            // start race (`workflow.go:1584`).
-            return Ok(WorkflowHandle::polling(
-                Arc::clone(executor.connection()),
-                workflow_id,
-                true,
-            ));
-        }
-
-        // The deadline the *database* holds, not the one this caller offered: `init_workflow`
-        // turns a budget into an instant against its own clock, and an existing row keeps the
-        // deadline it already had rather than taking a new one from a joining caller.
-        let task = spawn_execution(
-            executor,
+        let (executor, placement) = placed.into_parts();
+        // The caller's span rather than one of its own: this is the same start, on another
+        // thread, and its logs belong where the call was written.
+        let creating = create::<R, E>(
+            Arc::clone(&executor),
+            placement,
             self.key().clone(),
-            workflow_id.clone(),
-            input,
-            initialized.deadline,
-            // A fresh start is not a dequeue, so it holds no queue's slot.
-            None,
+            request,
+        )
+        .instrument(tracing::Span::current());
+
+        match spawn_tracked(&executor, creating).await {
+            Ok(started) => started,
+            // Only shutdown aborts this task, and an aborted transaction wrote nothing — so the
+            // start did not happen, which is the same answer an awaited workflow gives.
+            Err(join) if join.is_cancelled() => Err(Error::Interrupted {
+                workflow_id: self.key().name.clone(),
+            }),
+            Err(join) => std::panic::resume_unwind(join.into_panic()),
+        }
+    }
+}
+
+/// Everything a start writes, run detached from the future that asked for it.
+///
+/// The half of [`WorkflowRef::started`](WorkflowRef::started) that touches the database, as a free
+/// function because a task outlives the reference that spawned it: what it needs of the
+/// [`WorkflowRef`] is the key, and that it takes by value.
+///
+/// Nothing here is abandoned part-way by a caller losing interest. That is the whole point of it
+/// being here — see [`started`](WorkflowRef::started) — and it is why the order below can be read
+/// as a sequence rather than as a set of states a drop might leave behind.
+async fn create<R, E>(
+    executor: Arc<Executor>,
+    placement: StepPlacement,
+    key: WorkflowKey,
+    request: OwnedStart,
+) -> Result<WorkflowHandle<R, E>> {
+    let placed = StartPlacement::of(executor, placement);
+    let executor = &placed.executor;
+    let options = &request;
+    let owned_queue = request.queue.as_ref().map(OwnedEnqueue::as_enqueue);
+    let enqueue = owned_queue.as_ref();
+    // **The ambient context is what makes this a child.** Every reference overloads the same
+    // call rather than adding a `start_child`, so factoring a workflow body out into its own
+    // workflow does not change how its call sites are written — and a workflow started from
+    // outside one is unaffected by everything below.
+    let parent = placed.parent();
+    let input = request.input.clone();
+    let attributes = request.attributes.clone();
+
+    // The launch is recorded against the parent before anything is created, so a replay of
+    // this position finds the child it already started instead of starting a second one.
+    if let Some(parent) = &parent
+        && let Some(child) = parent.recorded_child(executor, &key.name).await?
+    {
+        tracing::debug!(
+            parent_workflow_id = parent.workflow_id(),
+            step_id = parent.step_id,
+            workflow_id = child,
+            "the child workflow was already started; the handle joins it"
         );
-        Ok(WorkflowHandle::local(
+        // The start record is all this run read: the child's own row belongs to the earlier
+        // run that made it, and was never in front of this one. So an absent row is left as
+        // "not yet", the same answer an id from outside the process gets.
+        return Ok(WorkflowHandle::polling(
+            Arc::clone(executor.connection()),
+            child,
+            false,
+        ));
+    }
+
+    let workflow_id = match (options.workflow_id.as_deref(), &parent) {
+        // An application-assigned id wins over the derivation, in every reference.
+        (Some(id), _) => id.to_owned(),
+        // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
+        // parent re-derives the same id, so the launch is idempotent even when the crash
+        // landed between creating the child and recording it. Rust's step ids are zero-based
+        // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
+        // so a first child is `parent-0` here and in three of the four.
+        (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
+        (None, None) => uuid::Uuid::new_v4().to_string(),
+    };
+
+    // **A directly started workflow gets its deadline now, and the row carries it.** Python
+    // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
+    // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
+    // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
+    // not another hour, and a crash loop cannot extend the budget indefinitely.
+    //
+    // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
+    // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
+    let deadline = match (options.timeout, &parent) {
+        // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
+        // explicit timeout records the budget and leaves the deadline null for the claim
+        // statement to fill in. The wait in the queue is not part of the budget — a workflow
+        // given five minutes that sits queued for an hour still gets five minutes. Python and
+        // TypeScript both branch on the queue in exactly this spot; the claim statement this
+        // engine already ships does the other half.
+        (Timeout::Explicit(_), _) if options.queue.is_some() => None,
+        // **An explicit timeout replaces an inherited deadline**, which is Python's and
+        // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
+        // use it over any propagated deadline"*. So a child given longer than its parent has
+        // left outlives its parent — an explicit timeout on a specific child is a statement
+        // about that child, and the alternative would silently ignore what the caller asked
+        // for. Go differs by taking the earlier of the two, but not by design: its deadline
+        // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets an
+        // explicitly *set* deadline win, and is not a model there — its user-facing `deadline`
+        // is Java's alone and Rust does not have one.
+        (Timeout::Explicit(timeout), _) => Timestamp::now().checked_add(timeout),
+        // **A deliberate refusal to inherit**, which is why the option is an enum: this is a
+        // caller who decided, and `Inherit` below is a caller who said nothing. Java's
+        // `Timeout.None` clears the propagated deadline in the same words.
+        (Timeout::None, _) => None,
+        // **Inherited as an instant, not as a budget**, which is what makes it a deadline the
+        // parent and the child genuinely share: both `select!`s fire at the same moment, in
+        // different tasks and possibly in different processes, with no signal passing between
+        // them. A propagated deadline is the cancellation cascade, and needs no other one.
+        // **Inherited even onto a queue**, and this is not an oversight in Python's code: its
+        // `_get_timeout_deadline` branches on the queue only inside the explicit-timeout arm,
+        // and returns the propagated deadline unconditionally otherwise. The difference is
+        // what the two mean. A budget is a promise about how long the *work* may take, so the
+        // queue wait cannot count against it; an inherited deadline is an instant a parent is
+        // already bound by, and a child does not escape it by being queued.
+        (Timeout::Inherit, Some(parent)) => parent.deadline(),
+        (Timeout::Inherit, None) => None,
+    };
+
+    // The caller's reading, taken before this task existed: the step spans the start as the
+    // *caller* saw it, not the wait for a runtime thread to pick the task up.
+    let started_at = request.started_at;
+    let new = NewWorkflow {
+        name: Some(&key.name),
+        class_name: key.class_name.as_deref(),
+        config_name: key.config_name.as_deref(),
+        input: input.as_deref(),
+        serialization: Some(executor.serializer().name()),
+        executor_id: Some(executor.executor_id()),
+        application_name: Some(executor.app_name()),
+        application_version: Some(executor.app_version()),
+        // Only a budget is written: an inherited deadline is an *instant* and has no
+        // budget behind it, and `Timeout::None` has neither. The column is what a
+        // queue recomputes a deadline from on dequeue, so filling it in for either
+        // would hand that path a budget nobody asked for.
+        timeout: options.timeout.budget(),
+        deadline,
+        attributes: attributes.as_deref(),
+        // The queue's five columns, and nothing below spawns the row they describe: a queue's
+        // whole point is that the process which asks is not necessarily the one that runs.
+        ..new_row(&workflow_id, enqueue)
+    };
+
+    let initialized = match init_or_join(
+        executor.connection(),
+        &new,
+        enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
+            enqueue.duplication_policy
+        }),
+        // **The parent's record of the start travels with the row, so the two commit
+        // together.** A start is one durable act: either this parent started this child and
+        // both rows say so, or neither exists. Written as two statements it had a window —
+        // and not only a crash window, since a start is a future and a combinator that races
+        // one may drop it part-way — in which a child existed that nothing in its parent
+        // pointed at. `None` is a root start, which has no parent and no step to record.
+        parent.as_ref().map(|parent| InitWorkflowCaller {
+            parent_workflow_id: parent.workflow_id(),
+            step_id: parent.step_id,
+            // The step name is the child workflow's bare name; see `Parent::record_child`,
+            // which records the joined case under the same one.
+            step_name: &key.name,
+            started_at,
+        }),
+    )
+    .await?
+    {
+        Submitted::Created(initialized) => initialized,
+        // **The start records the workflow that was joined**, not the id this call derived,
+        // so a replay of this position resolves to the same workflow instead of trying to
+        // start a child that was never created. Go records the same mapping at the same
+        // reserved step id.
+        //
+        // Only this record, and not the joined workflow's own `parent_workflow_id`: it has an
+        // owner already, and a cascade following that column must not reach a workflow this
+        // parent merely joined. [`DuplicationPolicy::ReturnExisting`] states the asymmetry.
+        //
+        // A crash between the join and this write is harmless, and for a different reason than
+        // the one below: nothing was written by the losing insert, so a replay simply asks
+        // again. It joins the same holder if the key is still held, and starts a workflow of
+        // its own if the holder has since finished — which is what the policy means at that
+        // moment, since the key deduplicates a backlog rather than a history.
+        Submitted::Joined(holder) => {
+            if let Some(parent) = &parent {
+                parent
+                    .record_child(executor, &holder, &key.name, started_at)
+                    .await?;
+            }
+            // The holder's row was just read to find it, so a missing one from here is a
+            // deletion rather than a row still to come.
+            return Ok(WorkflowHandle::polling(
+                Arc::clone(executor.connection()),
+                holder,
+                true,
+            ));
+        }
+    };
+
+    // The start record is not written here: `init_or_join` carried it into the transaction
+    // that created the child, which is what makes the pair atomic. What remains below only
+    // decides which handle to hand back.
+
+    // **Enqueued, so this process is not the one running it.** A polling handle is the honest
+    // answer even when this executor turns out to dequeue it moments later: nothing local is
+    // waiting on, and the row is the only thing that knows where the workflow got to.
+    if let Some(enqueue) = enqueue {
+        tracing::debug!(
+            workflow_id,
+            queue = enqueue.name,
+            "the workflow is enqueued"
+        );
+        // This call wrote the row, so the handle it hands back can say what an id from
+        // outside cannot: a row that goes missing was deleted.
+        return Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             workflow_id,
-            task,
-        ))
+            true,
+        ));
     }
+
+    // Someone else owns this row — the id was supplied and a previous run has it, or another
+    // executor claimed it first. Joining rather than erroring is what makes a retried request
+    // idempotent, and it is where Python waits too.
+    if !initialized.should_execute {
+        tracing::debug!(
+            workflow_id,
+            "the workflow is already owned; the handle joins the existing run"
+        );
+        // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read
+        // this row, and it is the case the references pass their own flag on — Python parks
+        // its unowned dispatch with `fail_if_missing=True` (`_core.py:1100`) and Go its lost
+        // start race (`workflow.go:1584`).
+        return Ok(WorkflowHandle::polling(
+            Arc::clone(executor.connection()),
+            workflow_id,
+            true,
+        ));
+    }
+
+    // The deadline the *database* holds, not the one this caller offered: `init_workflow`
+    // turns a budget into an instant against its own clock, and an existing row keeps the
+    // deadline it already had rather than taking a new one from a joining caller.
+    let task = spawn_execution(
+        executor,
+        key.clone(),
+        workflow_id.clone(),
+        input,
+        initialized.deadline,
+        // A fresh start is not a dequeue, so it holds no queue's slot.
+        None,
+    );
+    Ok(WorkflowHandle::local(
+        Arc::clone(executor.connection()),
+        workflow_id,
+        task,
+    ))
 }
 
 /// A [`run`](WorkflowRef::run) that has claimed its two step ids and has started nothing.
@@ -1217,8 +1358,14 @@ where
 /// running with nobody waiting on it, which is not something a race can offer as one of its
 /// outcomes. Nothing refuses this yet — there is no durable race in the crate to refuse it — and
 /// the type exists now so that the refusal, when it arrives, is a compile error at the call site
-/// rather than a runtime one. Race the [`start`](WorkflowRef::start) and await the winner's
-/// handle instead: that is the same work with the losing halves left unclaimed.
+/// rather than a runtime one.
+///
+/// **Race the [`start`](WorkflowRef::start) and await the winner's handle instead**: that is the
+/// same work with the losing halves left unclaimed, and it is sound rather than merely tidier. A
+/// dropped start finishes — the half that writes rows runs in a task of its own — so a losing
+/// branch leaves a child that exists, is recorded against its parent, and runs, which is exactly
+/// what a losing branch of [`select_workflow!`](macro@crate::select_workflow) already leaves. What it does not leave is the
+/// state a start abandoned mid-write used to: a workflow nothing pointed at and nothing ran.
 ///
 /// **`Unpin`, and the check the inner [`PendingStep`] makes on every poll is inherited** — this
 /// delegates its `poll` rather than reaching past it, so a run is held to the workflow it was
