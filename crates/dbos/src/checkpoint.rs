@@ -13,8 +13,9 @@
 //! [`StepPlacement::of`] for the awaits and waits, and straight from the counter for `sleep`,
 //! the events, the messages, a child `start` and the management surface — so its id lands
 //! wherever it is first *polled*. That is the difference this module exists to close, one
-//! producer at a time; until it is closed, only steps may be driven concurrently, and the
-//! [`step`](crate::step) docs say so.
+//! producer at a time; until it is closed, only [`step`](crate::step) and
+//! [`step_with`](crate::step_with) calls may be driven concurrently — *not* steps in general,
+//! which is the whole point of the paragraph above — and the `step` docs say so.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
 //! decision is subtle enough to be worth having in one place:
@@ -80,8 +81,8 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 /// **`Unpin`, which is contract rather than accident**: the run is already boxed, so a combinator
 /// holding one of these as a branch can do so by `Pin::new(&mut _)` rather than pinning it a
 /// second time.
-#[must_use = "a durable call that is not awaited has spent its step id without running; await it, \
-              or hand it to a combinator"]
+#[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that id \
+              is spent; await it, or hand it to a combinator"]
 pub struct PendingStep<'a, T, E = crate::EngineOnly> {
     /// What the call is called, which is the name its checkpoint is checked against on replay.
     name: Arc<str>,
@@ -342,8 +343,14 @@ impl StepPlacement {
             // No step body may be in scope on either side, or this is a call claimed in the
             // workflow proper and carried *into* a step body, where its checkpoint would sit
             // beneath a step whose own row already covers whatever that body did.
+            //
+            // By execution identity rather than by workflow id: an id is a position in one
+            // counter, and a second instance serving the same workflow, or a second execution of
+            // it, has a counter of its own that this id means nothing in. Matching strings would
+            // let the run write through the executor it captured while the workflow around it
+            // belongs to the other.
             (Self::Recorded { ctx, step_id }, Some(here))
-                if here.workflow_id() == ctx.workflow_id() && here.step_marker().is_none() =>
+                if here.is_same_execution(ctx) && here.step_marker().is_none() =>
             {
                 Ok(StepDurability::Recorded {
                     ctx,
@@ -366,10 +373,24 @@ impl StepPlacement {
             // variant of its own rather than an uncheckpointed one shared with `InsideStep`.
             (Self::ClientConnection, _) => Ok(StepDurability::Plain),
             // Everything else is a claim nobody here can honour.
+            //
+            // Both places are described the same way, except when both are step bodies: two
+            // different bodies of one workflow describe identically, and a refusal reading "built
+            // inside a step of workflow w but polled inside a step of workflow w" names one place
+            // twice and explains nothing. The marker is what told them apart, so the message says
+            // so.
             _ => Err(Error::StepBuiltElsewhere {
                 step: step.to_owned(),
                 built: self.whereabouts(),
-                polled: Self::describe(ambient),
+                polled: match ambient {
+                    Some(here)
+                        if here.step_marker().is_some()
+                            && matches!(self, Self::InsideStep { .. }) =>
+                    {
+                        format!("inside a different step of workflow {}", here.workflow_id()).into()
+                    }
+                    here => Self::describe(here),
+                },
             }),
         }
     }
@@ -509,6 +530,10 @@ mod tests {
     async fn a_call_is_durable_only_where_its_id_means_something() {
         let (proper, in_step, sibling, dbos, _db) = contexts().await;
         let other = Ctx::new(dbos.executor("test").expect("launched"), "wf-other", None);
+        // The same workflow *id* under a second context, which is what a recovery re-run is. Its
+        // step counter starts from zero again, so an id from the first execution means nothing in
+        // it — and comparing ids rather than execution identity is exactly what would miss that.
+        let rerun = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
         let recorded = StepPlacement::Recorded {
             ctx: proper.clone(),
             step_id: 0,
@@ -536,6 +561,12 @@ mod tests {
                 Some(&other),
                 "refused",
                 "carried into another workflow",
+            ),
+            (
+                &recorded,
+                Some(&rerun),
+                "refused",
+                "carried into a second execution of the same workflow id",
             ),
             (&inside, Some(&in_step), "plain", "the body it was built in"),
             (
@@ -608,7 +639,7 @@ mod tests {
     /// Both halves come from one describer, so this is what says they still do.
     #[tokio::test]
     async fn a_refusal_names_where_it_was_built_and_where_it_is_polled() {
-        let (proper, in_step, _sibling, dbos, _db) = contexts().await;
+        let (proper, in_step, sibling, dbos, _db) = contexts().await;
         let built_inside = StepPlacement::InsideStep {
             ctx: in_step.clone(),
         };
@@ -631,6 +662,17 @@ mod tests {
             StepPlacement::describe(Some(&in_step)),
             "a place should read the same whichever side of the refusal names it",
         );
+
+        // Two step bodies of one workflow describe identically, so the refusal that tells them
+        // apart has to say which one it means. Without this the message reads "built inside a step
+        // of workflow wf but polled inside a step of workflow wf", which names one place twice.
+        let Err(Error::<EngineOnly>::StepBuiltElsewhere { built, polled, .. }) =
+            built_inside.check_here("call", Some(&sibling))
+        else {
+            panic!("a call carried into another step's body is refused");
+        };
+        assert_eq!(built, "inside a step of workflow wf");
+        assert_eq!(polled, "inside a different step of workflow wf");
 
         dbos.shutdown().await;
     }

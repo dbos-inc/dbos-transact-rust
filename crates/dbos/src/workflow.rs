@@ -864,8 +864,12 @@ where
     /// # Ok(total) }
     /// ```
     ///
-    /// A `join!` over the launches — or over the awaits — is the same trap a `join!` over
-    /// [`step`](crate::step)s is, and is unsound for the same reason.
+    /// **A `join!` over the starts — or over the awaits — is unsound**, and it is now the only
+    /// half of that pair that is. A [`step`](crate::step) takes its id where it is *built*, so a
+    /// `join!` over steps is ordinary code; a start and an await still take theirs at their first
+    /// **poll**, so driven together they are numbered by whichever branch the combinator reaches
+    /// first, and a replay that interleaves differently meets a recorded step under the wrong
+    /// name. Await each before beginning the next, as the loop above does.
     pub async fn start_with(
         &self,
         input: P,

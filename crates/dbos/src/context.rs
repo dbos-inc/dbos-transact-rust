@@ -151,6 +151,23 @@ impl Ctx {
         &self.workflow.workflow_id
     }
 
+    /// Whether this and `other` are the same *execution* of the same workflow.
+    ///
+    /// **Identity, not equality of ids.** A workflow id names a row; this asks whether the two
+    /// contexts share one [`WorkflowState`], and therefore one step counter. Two things a matching
+    /// id would wave through do not share one: a second `DBOS` in the process serving the same id,
+    /// which is what [`Error::WrongInstance`](crate::Error::WrongInstance) exists to catch, and a
+    /// second *execution* of one id — a recovery re-run — whose counter restarts from zero. A
+    /// step id means nothing across either, so anything holding one has to ask this rather than
+    /// compare strings.
+    ///
+    /// Cheap: one pointer comparison. Clones of a `Ctx` share the state, so the ordinary case —
+    /// a step built and polled inside one workflow body — answers true without touching memory
+    /// the caller did not already have.
+    pub(crate) fn is_same_execution(&self, other: &Ctx) -> bool {
+        Arc::ptr_eq(&self.workflow, &other.workflow)
+    }
+
     /// When this workflow must stop, if it has a deadline at all.
     pub(crate) fn deadline(&self) -> Option<Timestamp> {
         self.workflow.deadline
