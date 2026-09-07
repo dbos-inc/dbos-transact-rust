@@ -236,16 +236,16 @@ impl<E> StepOptions<E> {
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
 /// the counter first, which is not something a replay reproduces.
 ///
-/// **That is a promise about most of the crate's durable calls, and now nearly all of them.**
-/// `sleep`, the events, the messages, the waits and every checkpointed management call on
-/// [`DBOS`](crate::DBOS) take their ids at the call too, and may be built first and driven
-/// together with steps and with each other. What is left is **a child's `start` and awaiting a
-/// handle**, which still take their ids at their first **poll**: driven together they are numbered
-/// in whatever order the combinator polls them, so a replay that interleaves differently meets a
-/// recorded step under the wrong name — a system-database error, which records nothing, leaves the
-/// workflow `PENDING`, and has it recovered until it parks. Await each of those two before
-/// starting the next, as the whole crate required before ids moved. Both are being converted the
-/// same way, and the rule retires with them.
+/// **That is now a promise about every durable call in the crate.** `sleep`, the events, the
+/// messages, the waits and every checkpointed management call on [`DBOS`](crate::DBOS) take their
+/// ids at the call, and so do a child's [`start`](crate::WorkflowRef::start), the await of its
+/// handle ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and the
+/// [`run`](crate::WorkflowRef::run) that is the two of them in sequence. Any of them may be built
+/// first and driven together with steps and with each other; `join!` over a mixture of them is
+/// ordinary code. The caveat that used to stand here — await these one at a time, because their
+/// ids land wherever they are first polled — is gone, and with it the failure it warned about: a
+/// replay that interleaved differently met a recorded step under the wrong name, which records
+/// nothing, leaves the workflow `PENDING`, and has it recovered until it parks.
 ///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a

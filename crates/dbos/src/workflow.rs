@@ -1,7 +1,9 @@
 //! Running a workflow durably.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -9,10 +11,11 @@ use serde::de::DeserializeOwned;
 use tokio::task::AbortHandle;
 use tracing::Instrument;
 
+use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Failure, Result};
-use crate::handle::WorkflowHandle;
+use crate::handle::{Awaiting, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::encode;
@@ -748,64 +751,121 @@ where
     ///
     /// Called from inside a running workflow this runs a **child** of it, and takes two of the
     /// parent's step ids rather than one — see [`start_with`](Self::start_with).
-    pub async fn run(&self, input: P) -> Result<R, E> {
-        self.run_with(input, RunOptions::default()).await
+    pub fn run(&self, input: P) -> PendingRun<'_, R, E> {
+        self.run_with(input, RunOptions::default())
     }
 
     /// [`run`](Self::run), with something to say about how it starts.
     ///
     /// Takes [`RunOptions`] rather than [`StartOptions`]: a workflow cannot be both queued and
     /// waited for here, so there is no queue to name.
-    pub async fn run_with(&self, input: P, options: RunOptions<'_>) -> Result<R, E> {
-        self.start_with(input, options.into())
-            .await
-            .map_err(Error::lift)?
-            .result()
-            .await
+    ///
+    /// **Both ids are claimed here, the await's immediately behind the start's**, which is what
+    /// makes a set of runs built and then driven together deterministic: the pairs come out
+    /// `{start, await}, {start, await}, ..` in the order the calls were *written*, whatever order
+    /// the children then finish in. Claiming the await's id when the start's future resolved
+    /// would interleave the pairs by completion instead, and a replay does not reproduce that.
+    /// The await needs no handle to be placed — where a call stands is decided by the ambient
+    /// context and the connection, neither of which the child has any say in — which is the whole
+    /// of why the second id can be taken before the first call has run.
+    pub fn run_with<'a>(&'a self, input: P, options: RunOptions<'a>) -> PendingRun<'a, R, E> {
+        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        let options: StartOptions<'a> = options.into();
+        // Carried into the future by `placed`, as [`start_with`](Self::start_with) carries its
+        // own: a run that could not be placed claimed neither id, so there is no await to place
+        // either.
+        let built = self.place(&options).map(StartPlacement::into_parts);
+        // Immediately behind the start's, and before anything runs — which is why it is taken
+        // here rather than inside the run, and why it is taken from the placement's own executor
+        // rather than by asking the instance a second time.
+        let awaiting = built
+            .as_ref()
+            .ok()
+            .map(|(executor, _)| Awaiting::of(executor.connection()));
+        // The start's placement stands for both halves, which is sound because the two differ
+        // only in the id they hold: `check_here` decides on the execution and the step marker,
+        // and the await was placed in the same context an instant later. Holding the start's is
+        // what keeps [`PendingStep::step_id`] reporting the id a reader would expect of a run —
+        // the position the pair begins at.
+        PendingRun(PendingStep::placed(
+            name,
+            built,
+            move |executor, placement| async move {
+                let handle = self
+                    .started(StartPlacement::of(executor, placement), input, options)
+                    .await
+                    .map_err(Error::lift)?;
+                // Matched rather than `?`-ed, so the engine-channel `Result` does not survive as
+                // a temporary across the await below — which is what would make this future
+                // non-`Send` for a workflow error type that is not. The `None` cannot arise: this
+                // run is only reached where the build succeeded, which is where the await was
+                // placed.
+                let awaiting = match awaiting {
+                    Some(Ok(awaiting)) => awaiting,
+                    Some(Err(refused)) => return Err(refused.lift()),
+                    None => {
+                        unreachable!("a run that could not be placed never reaches its own body")
+                    }
+                };
+                handle.settle(awaiting).await
+            },
+        ))
     }
 
-    /// The running workflow this call is a child of, or `None` when it is a root.
+    /// Everything a start settles **when it is written**: the instance that will serve it, that
+    /// the enqueue is one a queue could honour, and which of the parent's step ids it occupies.
     ///
-    /// Two refusals, both of them four-of-four, and both about the step counter:
+    /// Split out of [`start_with`](Self::start_with) for the third of those. The id has to come
+    /// from the parent's counter at the call rather than at the first poll, or a set of starts
+    /// driven together is numbered by whichever the combinator reaches first and a replay does not
+    /// reproduce it — so the half of a start that decides *where* it stands has to be a plain
+    /// function, and only the half that writes rows may be deferred into the future.
+    ///
+    /// **The two checks ahead of the placement are ahead of it on purpose**: a start refused for
+    /// its instance or its enqueue must move no counter, or the refusal shifts every later step
+    /// of the parent onto the wrong replay slot. `queue::validate` refuses a queue's own
+    /// configuration in the same spot, for the same reason it costs a round trip and not a row.
+    ///
+    /// The placement itself is [`StepPlacement::of`]'s, shared with every other library step in
+    /// the crate — including the await this start's [`run`](Self::run) pairs it with. Two of its
+    /// answers mean something particular to a start, and both are four-of-four:
     ///
     /// - **Inside a step is an error, not a plain call.** A step is a leaf whose checkpoint stands
     ///   for everything its body did, so an id-allocating call inside one would shift every later
     ///   step onto the wrong replay slot. A nested *step* degrades to a plain call because there is
-    ///   a plain version of it; there is no undurable version of starting a child.
+    ///   a plain version of it; there is no undurable version of starting a child. That is why
+    ///   [`StepPlacement::InsideStep`] — which every other producer takes as "run this plainly" —
+    ///   is turned into [`Error::InsideStep`] here.
     /// - **A `WorkflowRef` from another instance is [`Error::WrongInstance`].** The step id would
-    ///   come from this workflow's counter and the launch record would be written through the other
+    ///   come from this workflow's counter and the start record would be written through the other
     ///   instance's system database, landing where the workflow that allocated it cannot see it.
     ///   `get_event` refuses the same combination for the same reason.
-    ///
-    /// Allocating the step id here is what makes the launch position stable across a replay, and it
-    /// happens before anything can fail on the way to using it.
-    fn parent(&self) -> Result<Option<Parent>> {
-        let Some(ctx) = Ctx::current() else {
-            return Ok(None);
-        };
-        if ctx.in_step() {
+    fn place(&self, options: &StartOptions<'_>) -> Result<StartPlacement> {
+        let executor = self.dbos().executor("start a workflow")?;
+        // Borrowed rather than moved, because `options` is read again by the run, and **validated
+        // before anything is written and before the counter moves**: an enqueue no queue could
+        // honour should cost a round trip, not a row and not a step id.
+        if let Some(enqueue) = options.queue.as_ref() {
+            enqueue.validate()?;
+        }
+        let placement = StepPlacement::of(executor.connection(), "starting a workflow")?;
+        if matches!(placement, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
                 operation: "starting a workflow".into(),
             });
         }
-        if !Arc::ptr_eq(ctx.executor(), &self.dbos().executor("start a workflow")?) {
-            return Err(Error::WrongInstance {
-                operation: "starting a workflow".into(),
-            });
-        }
-        Ok(Some(Parent {
-            workflow_id: ctx.workflow_id().to_owned(),
-            step_id: ctx.next_step_id(),
-            deadline: ctx.deadline(),
-        }))
+        Ok(StartPlacement {
+            executor,
+            placement,
+        })
     }
 
     /// Starts this workflow durably and returns a handle to it, without waiting.
     ///
     /// Called from inside a running workflow this starts a **child** of it — see
     /// [`start_with`](Self::start_with) for what that records and what it costs.
-    pub async fn start(&self, input: P) -> Result<WorkflowHandle<R, E>> {
-        self.start_with(input, StartOptions::default()).await
+    pub fn start(&self, input: P) -> PendingStep<'_, WorkflowHandle<R, E>, E> {
+        self.start_with(input, StartOptions::default())
     }
 
     /// [`start`](Self::start), with something to say about how.
@@ -813,8 +873,14 @@ where
     /// Returns as soon as the workflow is recorded and spawned. If the id is already owned —
     /// another process is running it, or a previous run finished it — the handle joins the
     /// existing run rather than this being an error: the id is an idempotency key, and honouring
-    /// it is the promise (decision 13). The error is the engine's own channel, because a start
-    /// fails only in the engine's terms; the *workflow's* failures come out of the handle.
+    /// it is the promise (decision 13).
+    ///
+    /// **A start answers in the workflow's own error channel**, though it can only fail in the
+    /// engine's terms — there is no application error to report, since nothing the application
+    /// wrote has run yet, and the *workflow's* failures come out of the handle. Declaring the
+    /// caller's channel is what lets `start(..).await?` sit in a workflow body beside every other
+    /// call rather than needing a [`lift`](Error::lift) the caller has to remember; the await and
+    /// the run already answered this way, so the start was the odd one out.
     ///
     /// # Child workflows
     ///
@@ -827,7 +893,7 @@ where
     ///   unless [`workflow_id`](StartOptions::workflow_id) assigns one. Derived rather than random
     ///   so that a parent recovered mid-run re-derives the same id, finds the child it already
     ///   started, and adopts it instead of starting a second one.
-    /// - **The launch is a checkpoint of the parent.** A replayed parent gets a handle to the
+    /// - **The start is a checkpoint of the parent.** A replayed parent gets a handle to the
     ///   recorded child without starting anything — whether that child is still running, finished
     ///   while the parent was dead, or is itself awaiting recovery.
     /// - **Awaiting the handle is a second checkpoint**, recorded as `DBOS.getResult` (see
@@ -845,11 +911,14 @@ where
     ///
     /// ## Fanning out
     ///
-    /// Children **run** concurrently — each is its own task — but a parent must **launch** them
-    /// one at a time and **await** them one at a time, because every call takes a step id from the
-    /// parent's counter and concurrent allocation is nondeterministic. So start in one loop and
-    /// collect in another, which costs nothing in wall-clock: the parent takes about as long as
-    /// the slowest child rather than the sum.
+    /// Children **run** concurrently — each is its own task — and a parent may start them and
+    /// await them concurrently too. Both calls take their step id from the parent's counter
+    /// *where they are written*, so the numbering follows source order however the futures are
+    /// then driven, and a replay that builds the same calls in the same order meets the same ids.
+    ///
+    /// The loop is still the plainest way to write it, and it costs nothing in wall-clock: each
+    /// [`start`](Self::start) returns as soon as the child is recorded and spawned, so the parent
+    /// takes about as long as the slowest child rather than the sum.
     ///
     /// ```no_run
     /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -864,45 +933,71 @@ where
     /// # Ok(total) }
     /// ```
     ///
-    /// **A `join!` over the starts — or over the awaits — is unsound**, and it is now the only
-    /// half of that pair that is. A [`step`](crate::step) takes its id where it is *built*, so a
-    /// `join!` over steps is ordinary code; a start and an await still take theirs at their first
-    /// **poll**, so driven together they are numbered by whichever branch the combinator reaches
-    /// first, and a replay that interleaves differently meets a recorded step under the wrong
-    /// name. Await each before beginning the next, as the loop above does.
-    pub async fn start_with(
+    /// **A `join!` over the starts — or over the awaits, or over whole
+    /// [`run`](Self::run)s — is sound**, for the reason a `join!` over
+    /// [`step`](crate::step)s is: `join!` builds every branch before polling any, which is
+    /// exactly the order the ids were claimed in. What is *not* sound is building a start in one
+    /// workflow and polling it in another, or across a step-body boundary — an id is a claim on
+    /// one position in one execution, and a start carried somewhere that cannot honour it is
+    /// refused as [`Error::StepBuiltElsewhere`] rather than run.
+    pub fn start_with<'a>(
+        &'a self,
+        input: P,
+        options: StartOptions<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+        // The workflow's bare name, which is what the start records against the parent and
+        // therefore what a refusal should call this call.
+        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        // **A refusal is carried into the future rather than returned**, which is what `placed`
+        // does with a build that failed — so `start(..).await?` reads as it always did and a
+        // caller has one operator to write rather than two. Nothing was claimed on the way to any
+        // of `place`'s refusals, which is what makes a start that never stood anywhere safe to
+        // leave unplaced.
+        let built = self.place(&options).map(StartPlacement::into_parts);
+        PendingStep::placed(name, built, move |executor, placement| async move {
+            self.started(StartPlacement::of(executor, placement), input, options)
+                .await
+                .map_err(Error::lift)
+        })
+    }
+
+    /// The start itself, once something polls it: everything that writes a row.
+    ///
+    /// Split from [`place`](Self::place) at the line between deciding and doing. Nothing here
+    /// allocates a step id — the parent's counter moved when the call was written — so this is
+    /// free to be deferred, and has to be: a start that ran at the call would make
+    /// `let handle = child.start(..)` start a child.
+    ///
+    /// Answers in the engine's channel and is lifted by its caller, because everything below can
+    /// only fail in the engine's terms.
+    async fn started(
         &self,
+        placed: StartPlacement,
         input: P,
         options: StartOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        let executor = self.dbos().executor("start a workflow")?;
-        // Borrowed rather than moved, because `options` is read again below, and **validated
-        // before anything is written**: an enqueue no queue could honour should cost a round trip,
-        // not a row. `queue::validate` refuses a queue's configuration in the same spot.
+        let executor = &placed.executor;
         let enqueue = options.queue.as_ref();
-        if let Some(enqueue) = enqueue {
-            enqueue.validate()?;
-        }
         // **The ambient context is what makes this a child.** Every reference overloads the same
         // call rather than adding a `start_child`, so factoring a workflow body out into its own
         // workflow does not change how its call sites are written — and a workflow started from
         // outside one is unaffected by everything below.
-        let parent = self.parent()?;
+        let parent = placed.parent();
         let input = Some(encode(&input, "argument")?);
         let attributes = encode_attributes(options.attributes)?;
 
         // The launch is recorded against the parent before anything is created, so a replay of
         // this position finds the child it already started instead of starting a second one.
         if let Some(parent) = &parent
-            && let Some(child) = parent.recorded_launch(&executor, &self.key().name).await?
+            && let Some(child) = parent.recorded_child(executor, &self.key().name).await?
         {
             tracing::debug!(
-                parent_workflow_id = parent.workflow_id,
+                parent_workflow_id = parent.workflow_id(),
                 step_id = parent.step_id,
                 workflow_id = child,
                 "the child workflow was already started; the handle joins it"
             );
-            // The launch record is all this run read: the child's own row belongs to the earlier
+            // The start record is all this run read: the child's own row belongs to the earlier
             // run that made it, and was never in front of this one. So an absent row is left as
             // "not yet", the same answer an id from outside the process gets.
             return Ok(WorkflowHandle::polling(
@@ -920,7 +1015,7 @@ where
             // landed between creating the child and recording it. Rust's step ids are zero-based
             // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
             // so a first child is `parent-0` here and in three of the four.
-            (None, Some(parent)) => format!("{}-{}", parent.workflow_id, parent.step_id),
+            (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
             (None, None) => uuid::Uuid::new_v4().to_string(),
         };
 
@@ -964,7 +1059,7 @@ where
             // what the two mean. A budget is a promise about how long the *work* may take, so the
             // queue wait cannot count against it; an inherited deadline is an instant a parent is
             // already bound by, and a child does not escape it by being queued.
-            (Timeout::Inherit, Some(parent)) => parent.deadline,
+            (Timeout::Inherit, Some(parent)) => parent.deadline(),
             (Timeout::Inherit, None) => None,
         };
 
@@ -984,7 +1079,7 @@ where
             // would hand that path a budget nobody asked for.
             timeout: options.timeout.budget(),
             deadline,
-            parent_workflow_id: parent.as_ref().map(|parent| parent.workflow_id.as_str()),
+            parent_workflow_id: parent.as_ref().map(Parent::workflow_id),
             attributes: attributes.as_deref(),
             // The queue's five columns, and nothing below spawns the row they describe: a queue's
             // whole point is that the process which asks is not necessarily the one that runs.
@@ -1001,7 +1096,7 @@ where
         .await?
         {
             Submitted::Created(initialized) => initialized,
-            // **The launch records the workflow that was joined**, not the id this call derived,
+            // **The start records the workflow that was joined**, not the id this call derived,
             // so a replay of this position resolves to the same workflow instead of trying to
             // start a child that was never created. Go records the same mapping at the same
             // reserved step id.
@@ -1018,7 +1113,7 @@ where
             Submitted::Joined(holder) => {
                 if let Some(parent) = &parent {
                     parent
-                        .record_launch(&executor, &holder, &self.key().name, started_at)
+                        .record_child(executor, &holder, &self.key().name, started_at)
                         .await?;
                 }
                 // The holder's row was just read to find it, so a missing one from here is a
@@ -1032,12 +1127,12 @@ where
         };
 
         // **After the child exists, not before**, and the order is what makes a crash between the
-        // two harmless: a parent that dies here leaves a child row and no launch record, and the
+        // two harmless: a parent that dies here leaves a child row and no start record, and the
         // replay re-derives the same id, finds the row owned, and joins it. The reverse order
-        // would leave a launch record pointing at a workflow that was never created.
+        // would leave a start record pointing at a workflow that was never created.
         if let Some(parent) = &parent {
             parent
-                .record_launch(&executor, &workflow_id, &self.key().name, started_at)
+                .record_child(executor, &workflow_id, &self.key().name, started_at)
                 .await?;
         }
 
@@ -1082,7 +1177,7 @@ where
         // turns a budget into an instant against its own clock, and an existing row keeps the
         // deadline it already had rather than taking a new one from a joining caller.
         let task = spawn_execution(
-            &executor,
+            executor,
             self.key().clone(),
             workflow_id.clone(),
             input,
@@ -1098,20 +1193,129 @@ where
     }
 }
 
-/// The workflow a child is being started from: its id, and the step id the launch occupies.
+/// A [`run`](WorkflowRef::run) that has claimed its two step ids and has started nothing.
 ///
-/// Built once per `start_with` call, because building it *allocates a step id* — the parent's
-/// counter moves whether or not the launch ends up creating anything, which is what keeps a replay
-/// aligned with the run it is replaying.
-struct Parent {
-    workflow_id: String,
-    step_id: i32,
-    /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
-    deadline: Option<Timestamp>,
+/// The value [`run`](WorkflowRef::run) and [`run_with`](WorkflowRef::run_with) hand back. Awaiting
+/// one starts the child and waits for it, so `child.run(x).await?` reads exactly as it did when
+/// `run` was an `async fn`, and not one call site had to change.
+///
+/// **A newtype over [`PendingStep`] rather than a `PendingStep`, because a run is not one step.**
+/// It holds two ids — the start's and the await's, claimed in that order — and the pair is what
+/// makes the difference to a combinator that has to decide what a *losing* branch means. A losing
+/// step is dropped mid-body having recorded nothing, so a replay simply runs it again; a losing
+/// run is a child that was started, spawned and recorded, whose outcome the parent then never
+/// learns and whose second id is spent on an await that never happened. That is a workflow left
+/// running with nobody waiting on it, which is not something a race can offer as one of its
+/// outcomes. Nothing refuses this yet — there is no durable race in the crate to refuse it — and
+/// the type exists now so that the refusal, when it arrives, is a compile error at the call site
+/// rather than a runtime one. Race the [`start`](WorkflowRef::start) and await the winner's
+/// handle instead: that is the same work with the losing halves left unclaimed.
+///
+/// **`Unpin`, and the check the inner [`PendingStep`] makes on every poll is inherited** — this
+/// delegates its `poll` rather than reaching past it, so a run is held to the workflow it was
+/// written in exactly as a step is.
+#[must_use = "a run that is not awaited never starts the child, and has still spent both of its \
+              step ids; await it"]
+pub struct PendingRun<'a, R, E = crate::EngineOnly>(PendingStep<'a, R, E>);
+
+impl<R, E> Future for PendingRun<'_, R, E> {
+    type Output = Result<R, E>;
+
+    /// Delegated, which is what makes the inner check apply: see the type's documentation.
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // Every field is `Unpin`, so there is nothing here for pinning to protect.
+        Pin::new(&mut self.get_mut().0).poll(cx)
+    }
 }
 
-impl Parent {
-    /// Reads back a launch recorded at this position, if this parent has run this far before.
+impl<R, E> std::fmt::Debug for PendingRun<'_, R, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PendingRun").field(&self.0).finish()
+    }
+}
+
+/// Where a start stands, decided when the call was written.
+///
+/// Built once per start, because building it *allocates a step id* — the parent's counter moves
+/// whether or not the start ends up creating anything, which is what keeps a replay aligned with
+/// the run it is replaying. Holding the executor beside the placement is what makes it one value:
+/// the two are decided together, the placement is decided *against* that executor's connection,
+/// and handing the run one of them without the other would let it write through an instance the
+/// placement never agreed to.
+struct StartPlacement {
+    /// The instance that will serve the start, resolved before anything could fail.
+    executor: Arc<Executor>,
+    placement: StepPlacement,
+}
+
+impl StartPlacement {
+    /// The two halves back together, once the run that deferred them is polled.
+    ///
+    /// The inverse of [`into_parts`](Self::into_parts): [`PendingStep::placed`] carries a build's
+    /// placement beside whatever else the run will need, and for a start that is the executor the
+    /// placement was decided against — so the pair travels apart and arrives back here.
+    fn of(executor: Arc<Executor>, placement: StepPlacement) -> Self {
+        Self {
+            executor,
+            placement,
+        }
+    }
+
+    /// The executor and the placement, in the shape [`PendingStep::placed`] takes a build in.
+    ///
+    /// Kept as a named type either side of that rather than passed around as a bare pair, because
+    /// what makes a start's placement sound is that the executor is *the one it was decided
+    /// against* — handing the run one without the other would let it write through an instance the
+    /// placement never agreed to.
+    fn into_parts(self) -> (Arc<Executor>, StepPlacement) {
+        (self.executor, self.placement)
+    }
+
+    /// The workflow this start is a child of, or `None` where it is a root.
+    ///
+    /// A start is a child exactly where it claimed an id, so the placement already answered this
+    /// and nothing here decides it again.
+    fn parent(&self) -> Option<Parent<'_>> {
+        match &self.placement {
+            StepPlacement::Recorded { ctx, step_id } => Some(Parent {
+                ctx,
+                step_id: *step_id,
+            }),
+            // `Outside` is a root start, which is the common case. `InsideStep` never reaches
+            // here — [`WorkflowRef::place`] turns it into [`Error::InsideStep`] — and
+            // `ClientConnection` cannot arise at all, since the connection the placement was
+            // taken against is this instance's own and a client's is never that.
+            StepPlacement::Outside
+            | StepPlacement::InsideStep { .. }
+            | StepPlacement::ClientConnection => None,
+        }
+    }
+}
+
+/// The workflow a child is being started from: the context it runs in, and the step id the start
+/// occupies.
+///
+/// A borrowed view over a [`StartPlacement`] rather than a value of its own. Everything a child
+/// needs of its parent — the id it derives from, the deadline it inherits — is on the context that
+/// claimed the id, so copying any of it out would be two spellings of one fact.
+struct Parent<'a> {
+    ctx: &'a Ctx,
+    step_id: i32,
+}
+
+impl Parent<'_> {
+    /// The parent's workflow id, which is what a child's derived id and its row both point back
+    /// at.
+    fn workflow_id(&self) -> &str {
+        self.ctx.workflow_id()
+    }
+
+    /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
+    fn deadline(&self) -> Option<Timestamp> {
+        self.ctx.deadline()
+    }
+
+    /// Reads back a start recorded at this position, if this parent has run this far before.
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
     /// [`Error::UnexpectedStep`] before this sees it. What is left to check is the child id: a row
@@ -1119,18 +1323,14 @@ impl Parent {
     /// code changed — `step("charge")` became a child workflow named `charge` — and starting a
     /// child now would give this position two meanings across two runs.
     ///
-    /// **Stricter than the references here.** Python falls through to a fresh launch when the
+    /// **Stricter than the references here.** Python falls through to a fresh start when the
     /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
     /// up loud rather than wrong — the write conflicts a moment later — but only after a child row
     /// has been created and orphaned, which is a worse thing to leave behind than an error.
-    async fn recorded_launch(
-        &self,
-        executor: &Executor,
-        step_name: &str,
-    ) -> Result<Option<String>> {
+    async fn recorded_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
         let Some(recorded) = executor
             .sysdb()
-            .check_step(&self.workflow_id, self.step_id, step_name)
+            .check_step(self.workflow_id(), self.step_id, step_name)
             .await
             .map_err(Error::SystemDatabase)?
         else {
@@ -1138,15 +1338,15 @@ impl Parent {
         };
         recorded.child_workflow_id.map(Some).ok_or_else(|| {
             Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
-                workflow_id: self.workflow_id.clone(),
+                workflow_id: self.workflow_id().to_owned(),
                 step_id: self.step_id,
-                expected: format!("a child workflow launch of {step_name}"),
+                expected: format!("a child workflow start of {step_name}"),
                 recorded: format!("a plain step named {step_name}"),
             })
         })
     }
 
-    /// Records the launch, so the replay above finds it.
+    /// Records the start, so the replay above finds it.
     ///
     /// **The step name is the workflow's bare name**, not the `name`/`class_name`/`config_name`
     /// triple that identifies it — and that is four of four rather than a narrowing, including
@@ -1156,7 +1356,7 @@ impl Parent {
     /// (`DBOSExecutor.java:2035`); Go has one name to record. The qualification belongs to the
     /// child's own row, which the `init_workflow` call above fills in — this column is the
     /// *parent's* step listing, where the name is what a reader is looking for.
-    async fn record_launch(
+    async fn record_child(
         &self,
         executor: &Executor,
         child_workflow_id: &str,
@@ -1166,7 +1366,7 @@ impl Parent {
         executor
             .sysdb()
             .record_child_workflow(
-                &self.workflow_id,
+                self.workflow_id(),
                 child_workflow_id,
                 self.step_id,
                 step_name,
@@ -1599,5 +1799,68 @@ mod tests {
 
         let events = events.lock().unwrap();
         assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// A start built in one workflow and polled in another is refused, having started nothing.
+    ///
+    /// The id a start claims is a claim on one position in one execution, so carrying the value
+    /// somewhere else is the mistake the check exists for — and a start is the case where running
+    /// it anyway costs the most: it would create a durable child, spawn it, and record it against
+    /// a parent whose counter that id means nothing in. Two contexts over one executor is what a
+    /// smuggling looks like from the inside, and `Ctx::scope` is the only way to hold both.
+    ///
+    /// A unit test rather than an integration one because nothing else can enter two workflows
+    /// from one call stack: an integration test would have to move the value between two
+    /// registered bodies, which needs a channel and a `WorkflowRef` outliving both.
+    #[tokio::test]
+    async fn a_start_built_in_another_workflow_is_refused() {
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..crate::Config::new("smuggled-start", db.url())
+        });
+        let child = dbos
+            .register_workflow("child", |n: u32| async move { Ok::<u32, crate::Error>(n) })
+            .expect("registration failed");
+        dbos.launch().await.expect("launch failed");
+        let executor = dbos.executor("test").expect("launched");
+
+        // Built where the id means something: the first step of `wf-donor`. The lint reads an
+        // `async` block returning a future as a missing `.await`, which is exactly what this is:
+        // the point is to build the start inside the donor's context and carry it out unpolled.
+        #[allow(clippy::async_yields_async)]
+        let smuggled = Ctx::scope(Ctx::new(Arc::clone(&executor), "wf-donor", None), async {
+            child.start(1)
+        })
+        .await;
+        assert_eq!(smuggled.step_id(), Some(0), "the donor's counter moved");
+
+        let thief = Ctx::new(Arc::clone(&executor), "wf-thief", None);
+        match Ctx::scope(thief, smuggled).await {
+            Err(Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!((step.as_str(), &*built), ("child", "in workflow wf-donor"));
+                assert_eq!(&*polled, "in workflow wf-thief");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
+
+        // Refused before anything was written, which is the half that matters: the alternative to
+        // this check is a child running with a start record nobody can find.
+        assert!(
+            executor
+                .sysdb()
+                .get_workflow("wf-donor-0")
+                .await
+                .expect("read failed")
+                .is_none(),
+            "the refused start created no child"
+        );
+
+        dbos.shutdown().await;
     }
 }

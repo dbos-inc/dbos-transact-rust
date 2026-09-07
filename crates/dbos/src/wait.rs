@@ -313,8 +313,8 @@ pub fn join_workflows<'a, E: crate::DurableError + 'a>(
 ///
 /// **A branch is a variable holding a handle, not an arbitrary expression.** The handle is named
 /// twice, once for its id and once to consume it, and an expression would be evaluated twice —
-/// which for `child.start(n).await?` would start the workflow twice. A workflow body starts its
-/// children one at a time anyway, so they are already bound.
+/// which for `child.start(n).await?` would start the workflow twice. A handle a body means to race
+/// has been bound to a name by the time it gets here in any case.
 ///
 /// **Two branches naming the same workflow are answered by the first**, in the order the arms are
 /// written. [`select_workflow`](fn@select_workflow) accepts a repeated id for the same reason: the

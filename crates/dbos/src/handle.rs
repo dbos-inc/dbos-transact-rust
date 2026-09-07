@@ -13,12 +13,12 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::checkpoint::StepPlacement;
+use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
 use crate::serialization::{decode, encode};
-use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus};
+use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 
 /// A running — or finished — workflow, by id.
 ///
@@ -160,13 +160,40 @@ where
     /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) describes
     /// costs a caller here what Go and TypeScript charge an argument for and Python and Java cannot
     /// offer at all.
-    pub async fn result(self) -> Result<R, E> {
+    /// **The id is claimed here, where the call is written, not where the wait is first polled.**
+    /// So a `join!` over several handles' results is ordinary code — `join!` builds every branch
+    /// before polling any, which is the order the ids were taken in and the order a replay takes
+    /// them again — and the awaits are numbered by what the parent's body *says* rather than by
+    /// which child answers first. A handle built in one workflow and awaited in another, or
+    /// carried across a step-body boundary, is refused as [`Error::StepBuiltElsewhere`]: the id is
+    /// a claim on one position in one execution, and nowhere else can honour it.
+    pub fn result<'a>(self) -> PendingStep<'a, R, E>
+    where
+        R: 'a,
+    {
         // Allocated before anything can fail, and before the check it gates: the position of this
-        // await in the parent has to be the same on the replay as it was on the run.
-        let awaiting = match Awaiting::of(&self.conn) {
-            Ok(awaiting) => awaiting,
-            Err(wrong) => return Err(wrong.lift()),
-        };
+        // await in the parent has to be the same on the replay as it was on the run. A refusal
+        // here is carried into the future by `placed`, so `handle.result().await?` reads as it
+        // always did and nothing was claimed on the way to it.
+        let built = Awaiting::of(&self.conn).map(|awaiting| {
+            let placement = awaiting.placement().clone();
+            (awaiting, placement)
+        });
+        // The placement is handed back beside the `Awaiting` that carries it, and the await wants
+        // the latter: it is what holds the id this call already claimed.
+        PendingStep::placed(step_names::GET_RESULT, built, move |awaiting, _| {
+            self.settle(awaiting)
+        })
+    }
+
+    /// The await itself, once something polls it.
+    ///
+    /// Takes the [`Awaiting`] rather than building one, because the id it holds was claimed where
+    /// the call was written. That is also what lets [`run_with`](crate::WorkflowRef::run_with)
+    /// claim the await's id immediately behind the start's and hand it here once the child
+    /// exists: where an await stands is decided by the ambient context and the connection, and
+    /// the handle has no say in either.
+    pub(crate) async fn settle(self, awaiting: Awaiting) -> Result<R, E> {
         if let Some(recorded) = awaiting
             .check(&self.conn, &self.workflow_id)
             .await
@@ -258,7 +285,7 @@ where
 /// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
 /// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
 /// either, and Python and Go checkpoint that case too.
-struct Awaiting(StepPlacement);
+pub(crate) struct Awaiting(StepPlacement);
 
 impl Awaiting {
     /// Where this await stands, allocating its step id if it is to be recorded.
@@ -266,8 +293,13 @@ impl Awaiting {
     /// The placement rules — and the argument for each of them — are
     /// [`StepPlacement::of`](crate::checkpoint::StepPlacement::of)'s, shared with every other
     /// library step in the crate. What stays here is only what an *await* does with the answer.
-    fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
+    pub(crate) fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
         StepPlacement::of(conn, "awaiting a workflow's result").map(Self)
+    }
+
+    /// Where this await stands, for the [`PendingStep`] that has to ask again on every poll.
+    pub(crate) fn placement(&self) -> &StepPlacement {
+        &self.0
     }
 
     /// Whether a cancelled *awaited* workflow has to be distinguished from this caller being

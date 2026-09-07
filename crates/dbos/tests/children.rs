@@ -40,12 +40,12 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 }
 
 /// The child's id is `{parent}-{step_id}`, its row records the parent, and the parent records the
-/// launch as a step.
+/// start as a step.
 ///
 /// Zero-based, matching Go, TypeScript and Java: a parent's first child is `parent-0`. Python is
 /// the one-based outlier, which is the step-numbering inconsistency showing up in an id.
 ///
-/// **A `run` costs two step ids** — the launch and the await — so consecutive children are `-0` and
+/// **A `run` costs two step ids** — the start and the await — so consecutive children are `-0` and
 /// `-2` rather than `-0` and `-1`. Every reference numbers them the same way, for the same reason:
 /// one counter, and both halves take from it.
 #[tokio::test]
@@ -105,7 +105,7 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
         assert_eq!(
             step.child_workflow_id.as_deref(),
             Some(expected),
-            "the launch is recorded against the parent"
+            "the start is recorded against the parent"
         );
     }
 
@@ -118,7 +118,7 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
 
 /// A child that joins a held deduplication key is recorded as the workflow it joined.
 ///
-/// The interesting half is the launch record. The child id this call derived — `{parent}-{step}` —
+/// The interesting half is the start record. The child id this call derived — `{parent}-{step}` —
 /// names no row, because the insert lost the key and nothing was written under it. What the parent
 /// records at that step is the *holder's* id, so a replay of this position resolves to the same
 /// workflow instead of trying to start a child that never existed. Go records the same mapping at
@@ -207,15 +207,15 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
         .list_workflow_steps(id, false, None, None, None)
         .await
         .expect("read failed");
-    let launch = steps
+    let start = steps
         .iter()
         .find(|step| step.step_id == 0)
-        .expect("no launch step on the parent");
-    assert_eq!(launch.step_name, "child");
+        .expect("no start step on the parent");
+    assert_eq!(start.step_name, "child");
     assert_eq!(
-        launch.child_workflow_id.as_deref(),
+        start.child_workflow_id.as_deref(),
         Some("the-holder"),
-        "the launch records the workflow that was joined",
+        "the start records the workflow that was joined",
     );
 
     // The other half of the relationship is deliberately absent. `parent_workflow_id` names the
@@ -256,7 +256,7 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
 /// started rather than starting a second set.
 ///
 /// The first process starts two of three children and is killed by shutdown, leaving the parent
-/// PENDING. The second process recovers it, and the deterministic id is what makes the launches
+/// PENDING. The second process recovers it, and the deterministic id is what makes the starts
 /// idempotent: the recovered parent re-derives `parent-0` and `parent-1`, finds them recorded, and
 /// runs only the third child's body.
 #[tokio::test]
@@ -311,7 +311,7 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
         // children finished, one in flight.
         //
         // On the counter rather than on the parent's step count, which is the tempting version
-        // and is racy. The launch row is written *before* the child is spawned — that ordering is
+        // and is racy. The start row is written *before* the child is spawned — that ordering is
         // what makes a crash in the gap adoptable — so a parent showing five steps can have a
         // third child that has not been polled once, and shutdown would abort it before it
         // counted. Waiting on the thing the next assertion reads leaves no window between them.
@@ -343,7 +343,7 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
         "three bodies entered, the third still blocked when the process died"
     );
 
-    // Second process: recovery re-runs the parent, which must adopt rather than re-launch.
+    // Second process: recovery re-runs the parent, which must adopt rather than start again.
     let dbos = DBOS::new(config("recover-children-app", &db));
     let recovered_bodies = Arc::clone(&bodies);
     let child = dbos
@@ -403,7 +403,7 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
     assert_eq!(
         steps.len(),
         6,
-        "a launch and an await per child, and no second set: {steps:?}"
+        "a start and an await per child, and no second set: {steps:?}"
     );
     assert_eq!(
         bodies.load(Ordering::SeqCst),
@@ -414,20 +414,21 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
     dbos.shutdown().await;
 }
 
-/// The fan-out shape: children are launched one at a time and awaited one at a time, but they
+/// The fan-out shape: children are started one at a time and awaited one at a time, but they
 /// **run** concurrently.
 ///
 /// Sequential bookkeeping is the step counter's determinism constraint reaching a second caller —
-/// each launch and each await allocates a step id, and concurrent allocation would replay against
+/// each start and each await allocates a step id, and concurrent allocation would replay against
 /// the wrong slots. It costs nothing in wall-clock: three children that each sleep are all in
 /// flight together, so the parent takes about as long as the slowest rather than the sum.
 ///
-/// A `join!` over the child *starts* is still unsound, and it is now the only half of that pair
-/// that is: a step takes its id where it is built, so a `join!` over steps is ordinary code,
-/// while `start` takes its id at its first poll and is numbered by whichever branch the
-/// combinator reaches first.
+/// A `join!` over the child starts — or over the awaits, or over whole `run`s — is sound now
+/// that a start takes its id where it is *built*, the same as a step: `join!` builds every branch
+/// before polling any, which is exactly the order the ids were claimed in. The loop stays here
+/// because it is the plainest way to write a fan-out, not because it is the only sound one; the
+/// tests below drive the concurrent forms out of build order on purpose.
 #[tokio::test]
-async fn children_launched_in_a_loop_run_concurrently() {
+async fn children_started_in_a_loop_run_concurrently() {
     let db = test_database().await;
     let dbos = DBOS::new(config("fan-out-app", &db));
     let child = dbos
@@ -440,11 +441,11 @@ async fn children_launched_in_a_loop_run_concurrently() {
         .register_workflow("parent", move |()| {
             let child = child.clone();
             async move {
-                // Launch all three first — each `start` returns as soon as the child is recorded
+                // Start all three first — each `start` returns as soon as the child is recorded
                 // and spawned — then collect. Awaiting inside the first loop would serialize them.
                 let mut handles = Vec::new();
                 for n in 0..3 {
-                    handles.push(child.start(n).await.map_err(Error::lift)?);
+                    handles.push(child.start(n).await?);
                 }
                 let mut total = 0;
                 for handle in handles {
@@ -485,9 +486,183 @@ async fn children_launched_in_a_loop_run_concurrently() {
     dbos.shutdown().await;
 }
 
+/// Starts and awaits driven out of build order keep the ids they were built with.
+///
+/// The test that says the ids are taken at the **call** rather than at the first poll, and the
+/// only shape that says it. Branches that differ only by how long their children sleep prove
+/// nothing: a sleep changes which child *finishes* first, which no id depends on, and `join!`
+/// first-polls its branches in source order — so a start that took its id at the first poll would
+/// pass such a test too. Here the three starts are built `a, b, c` and handed to `join!` as
+/// `c, b, a`, and then the three awaits the same way. Under poll-time ids `c` would take step 0
+/// and the child ids would come out reversed.
+///
+/// Both halves are asserted from the rows rather than from inside the body, because a failed
+/// assertion inside a workflow is a panicking task rather than a failing test.
+#[tokio::test]
+async fn child_starts_and_awaits_driven_out_of_build_order_keep_their_ids() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("out-of-order-children-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                // Built `a, b, c`, so `a` holds step 0 whatever happens next.
+                let a = child.start(1);
+                let b = child.start(2);
+                let c = child.start(3);
+                // ...and driven the other way round.
+                let (c, b, a) = tokio::join!(c, b, a);
+                let (a, b, c) = (a?, b?, c?);
+                // The awaits are their own three ids, built and driven the same way.
+                let a = a.result();
+                let b = b.result();
+                let c = c.result();
+                let (c, b, a) = tokio::join!(c, b, a);
+                Ok::<u32, Error>(a? + b? + c?)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "drives-its-children-backwards";
+    let total = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(total, 6, "1 + 2 + 3");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, false, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str, Option<&str>)> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.step_id,
+                step.step_name.as_str(),
+                step.child_workflow_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "child", Some("drives-its-children-backwards-0")),
+            (1, "child", Some("drives-its-children-backwards-1")),
+            (2, "child", Some("drives-its-children-backwards-2")),
+            (3, "DBOS.getResult", Some("drives-its-children-backwards-0")),
+            (4, "DBOS.getResult", Some("drives-its-children-backwards-1")),
+            (5, "DBOS.getResult", Some("drives-its-children-backwards-2")),
+        ],
+        "the three starts hold the first three ids and the three awaits the next three, both in \
+         the order they were written"
+    );
+
+    // Which child is which: the first-built start passed 1, so `{parent}-0` is the child that
+    // returned 1. This is what a reversed numbering would show up as.
+    for (suffix, expected) in [("-0", "1"), ("-1", "2"), ("-2", "3")] {
+        let child_id = format!("{id}{suffix}");
+        let row = reader
+            .get_workflow(&child_id)
+            .await
+            .expect("read failed")
+            .unwrap_or_else(|| panic!("no row for {child_id}"));
+        assert_eq!(
+            row.output.as_deref(),
+            Some(expected),
+            "{child_id} ran the argument the start built at that position"
+        );
+    }
+
+    dbos.shutdown().await;
+}
+
+/// Runs driven out of build order keep their `{start, await}` pairs.
+///
+/// A `run` claims two ids, and it claims them together: the await's immediately behind the
+/// start's. So three runs written `a, b, c` occupy `(0, 1)`, `(2, 3)`, `(4, 5)` however they are
+/// then driven — and the same three under an await placed when the child's future resolved would
+/// interleave the pairs by whichever child answered first. `join!` is handed them backwards for
+/// the same reason the test above does.
+#[tokio::test]
+async fn runs_driven_out_of_build_order_keep_their_pairs_of_step_ids() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("out-of-order-runs-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                let a = child.run(1);
+                let b = child.run(2);
+                let c = child.run(3);
+                let (c, b, a) = tokio::join!(c, b, a);
+                Ok::<u32, Error>(a? + b? + c?)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "runs-its-children-backwards";
+    let total = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(total, 6, "1 + 2 + 3");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(id, false, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str, Option<&str>)> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.step_id,
+                step.step_name.as_str(),
+                step.child_workflow_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "child", Some("runs-its-children-backwards-0")),
+            (1, "DBOS.getResult", Some("runs-its-children-backwards-0")),
+            (2, "child", Some("runs-its-children-backwards-2")),
+            (3, "DBOS.getResult", Some("runs-its-children-backwards-2")),
+            (4, "child", Some("runs-its-children-backwards-4")),
+            (5, "DBOS.getResult", Some("runs-its-children-backwards-4")),
+        ],
+        "each run's await sits immediately behind its own start"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// A child started and never awaited is still recorded, so a recovered parent adopts it.
 ///
-/// The launch row is what makes a child adoptable, and it is written by `start` alone — nothing
+/// The start row is what makes a child adoptable, and it is written by `start` alone — nothing
 /// about awaiting the handle is what records the relationship.
 #[tokio::test]
 async fn a_child_that_is_never_awaited_is_still_recorded() {
@@ -501,7 +676,7 @@ async fn a_child_that_is_never_awaited_is_still_recorded() {
             let child = child.clone();
             async move {
                 // Started, and the handle dropped without ever being awaited.
-                child.start(()).await.map_err(Error::lift)?;
+                child.start(()).await?;
                 Ok::<u32, Error>(0)
             }
         })
@@ -525,7 +700,7 @@ async fn a_child_that_is_never_awaited_is_still_recorded() {
         .list_workflow_steps(id, false, None, None, None)
         .await
         .expect("read failed");
-    assert_eq!(steps.len(), 1, "the launch is recorded: {steps:?}");
+    assert_eq!(steps.len(), 1, "the start is recorded: {steps:?}");
     assert_eq!(
         steps[0].child_workflow_id.as_deref(),
         Some("forgets-its-child-0")
@@ -556,7 +731,7 @@ async fn a_child_that_is_never_awaited_is_still_recorded() {
 /// A child cannot be started from inside a step, in every implementation.
 ///
 /// A step is a leaf, and an id-allocating call inside one shifts every later step onto the wrong
-/// replay slot. There is no plain version of a durable launch to degrade to, so this is an error
+/// replay slot. There is no plain version of a durable start to degrade to, so this is an error
 /// rather than the quiet fallback a nested *step* gets.
 #[tokio::test]
 async fn a_child_cannot_be_started_from_inside_a_step() {
@@ -597,7 +772,7 @@ async fn a_child_cannot_be_started_from_inside_a_step() {
     dbos.shutdown().await;
 }
 
-/// An application-assigned id wins over the derivation, and the launch is still recorded.
+/// An application-assigned id wins over the derivation, and the start is still recorded.
 #[tokio::test]
 async fn an_assigned_child_id_wins_over_the_derived_one() {
     let db = test_database().await;
@@ -657,7 +832,7 @@ async fn an_assigned_child_id_wins_over_the_derived_one() {
     dbos.shutdown().await;
 }
 
-/// A workflow started outside any workflow is a root: no parent, and no launch recorded anywhere.
+/// A workflow started outside any workflow is a root: no parent, and no start recorded anywhere.
 #[tokio::test]
 async fn a_workflow_started_outside_a_workflow_has_no_parent() {
     let db = test_database().await;
@@ -729,8 +904,8 @@ async fn awaiting_a_child_is_recorded_as_a_step() {
         .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
-    assert_eq!(steps.len(), 2, "one launch, one await: {steps:?}");
-    assert_eq!(steps[0].step_name, "child", "the launch");
+    assert_eq!(steps.len(), 2, "one start, one await: {steps:?}");
+    assert_eq!(steps[0].step_name, "child", "the start");
     assert_eq!(steps[1].step_name, "DBOS.getResult", "the await");
     assert_eq!(steps[1].output.as_deref(), Some("99"));
     assert_eq!(
@@ -1217,14 +1392,14 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
     assert_eq!(
         steps.len(),
         1,
-        "the launch, and nothing for the interrupted await: {steps:?}"
+        "the start, and nothing for the interrupted await: {steps:?}"
     );
-    assert_eq!(steps[0].step_name, "child", "the launch");
+    assert_eq!(steps[0].step_name, "child", "the start");
 
     dbos.shutdown().await;
 }
 
-/// A launch position that already holds a *plain* step is an error, not a second child.
+/// A start position that already holds a *plain* step is an error, not a second child.
 ///
 /// **Stricter than every reference, deliberately.** Python falls through and starts a fresh child,
 /// and Go's `CheckChildWorkflow` returns nothing for such a row; both then collide on the write a
@@ -1236,15 +1411,15 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
 /// database is the whole of what the replay reads and the gate is what makes the write land in
 /// the same place a crash would have left it.
 #[tokio::test]
-async fn a_launch_position_holding_a_plain_step_is_refused() {
+async fn a_start_position_holding_a_plain_step_is_refused() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("stale-launch-app", &db));
+    let dbos = DBOS::new(config("stale-start-app", &db));
     let child = dbos
         .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
 
     // The parent waits before its first step id is allocated, which is the window the plain step
-    // is planted in. Nothing before this is a step, so the launch still lands on position 0.
+    // is planted in. Nothing before this is a step, so the start still lands on position 0.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let gate = Arc::new(std::sync::Mutex::new(Some(rx)));
     let parent = dbos
@@ -1288,9 +1463,9 @@ async fn a_launch_position_holding_a_plain_step_is_refused() {
             recorded,
             ..
         }) => {
-            assert_eq!(*step_id, 0, "the launch position");
+            assert_eq!(*step_id, 0, "the start position");
             assert!(
-                expected.contains("child workflow launch"),
+                expected.contains("child workflow start"),
                 "says what it wanted: {expected}"
             );
             assert!(
@@ -1317,7 +1492,7 @@ async fn a_launch_position_holding_a_plain_step_is_refused() {
 /// A `WorkflowRef` from another instance cannot start a child of this workflow.
 ///
 /// The second place [`Error::WrongInstance`] is reachable from, and the reason it exists: the step
-/// id would come from this workflow's counter while the launch record went through the other
+/// id would come from this workflow's counter while the start record went through the other
 /// instance's system database, landing where the workflow that allocated it cannot see it.
 /// `DBOS::get_event` refuses the same combination for the same reason, and is where the variant
 /// was first raised.
@@ -1358,7 +1533,7 @@ async fn a_child_started_through_another_instance_is_refused() {
         "expected a wrong-instance refusal, got {error:?}"
     );
 
-    // Refused before anything was written: no child, and no launch on the parent.
+    // Refused before anything was written: no child, and no start on the parent.
     let reader = reader(&db).await;
     assert!(
         reader
@@ -1374,7 +1549,7 @@ async fn a_child_started_through_another_instance_is_refused() {
             .await
             .expect("read failed")
             .is_empty(),
-        "and no launch recorded against the parent"
+        "and no start recorded against the parent"
     );
 
     owner.shutdown().await;
@@ -1384,7 +1559,7 @@ async fn a_child_started_through_another_instance_is_refused() {
 /// Awaiting a child from inside a step checkpoints nothing of its own, and is not an error.
 ///
 /// The asymmetry with *starting* a child is deliberate, and both halves follow from a step being a
-/// leaf. A launch inside a step allocates ids that would shift every later step onto the wrong
+/// leaf. A start inside a step allocates ids that would shift every later step onto the wrong
 /// replay slot, and there is no undurable version of it to fall back to, so it raises
 /// [`Error::InsideStep`]. An await has such a version: the enclosing step's own checkpoint already
 /// stands for whatever its body did, including the waiting, so the await simply runs plainly.
@@ -1400,8 +1575,8 @@ async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
         .register_workflow("parent", move |()| {
             let child = child.clone();
             async move {
-                // Started at a step boundary, where a launch has to happen...
-                let handle = child.start(()).await.map_err(Error::lift)?;
+                // Started at a step boundary, where a start has to happen...
+                let handle = child.start(()).await?;
                 // ...and awaited from inside a step, where there is no id to allocate. The handle
                 // is not `Clone` and `result` consumes it, so it reaches the retryable closure
                 // through a slot it takes from once.
@@ -1440,8 +1615,8 @@ async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
         .list_workflow_steps(id, true, None, None, None)
         .await
         .expect("read failed");
-    assert_eq!(steps.len(), 2, "the launch and the step: {steps:?}");
-    assert_eq!(steps[0].step_name, "child", "the launch");
+    assert_eq!(steps.len(), 2, "the start and the step: {steps:?}");
+    assert_eq!(steps[0].step_name, "child", "the start");
     assert_eq!(
         steps[0].child_workflow_id.as_deref(),
         Some("collects-inside-a-step-0")
@@ -1465,9 +1640,9 @@ async fn awaiting_a_child_inside_a_step_is_covered_by_that_step() {
 
 /// A recorded await that belongs to a *different* workflow is refused, not adopted.
 ///
-/// The other half of the launch position's own check, and the reason both exist: `check_step`
+/// The other half of the start position's own check, and the reason both exist: `check_step`
 /// compares the step name, which leaves open whose outcome the row actually holds. For a child
-/// the two cannot disagree — the handle's id came out of the launch row moments earlier — so this
+/// the two cannot disagree — the handle's id came out of the start row moments earlier — so this
 /// plants the disagreement directly, which is what a parent awaiting a handle it did not itself
 /// start could otherwise reach by changing its code.
 #[tokio::test]
@@ -1478,7 +1653,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
         .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
 
-    // The launch happens first, so its row is on disk before the gate; the await is what waits.
+    // The start happens first, so its row is on disk before the gate; the await is what waits.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let gate = Arc::new(std::sync::Mutex::new(Some(rx)));
     let parent = dbos
@@ -1486,7 +1661,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
             let child = child.clone();
             let gate = Arc::clone(&gate);
             async move {
-                let handle = child.start(()).await.map_err(Error::lift)?;
+                let handle = child.start(()).await?;
                 let rx = gate.lock().unwrap().take().expect("the parent runs once");
                 let _ = rx.await;
                 handle.result().await
@@ -1519,7 +1694,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the parent never recorded its launch"
+            "the parent never recorded its start"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

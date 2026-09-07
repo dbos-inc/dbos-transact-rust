@@ -7,14 +7,16 @@
 //! [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no user body,
 //! no retry policy and no timeout, so none of them goes through `step_with`.
 //!
-//! **Being a step and being a [`PendingStep`] are nearly the same thing now.** `step` and
-//! `step_with` take their id through [`StepPlacement::here`] at the call; `sleep`, the events, the
-//! messages, the waits and every checkpointed management call take theirs through
-//! [`StepPlacement::of`] at the call and hand it to [`PendingStep::placed`]. What is left is a
-//! child's `start` and awaiting a handle, which still allocate inside their own `async fn` and so
-//! land their ids wherever they are first *polled*; those two are being moved the same way, and
-//! until they are, a `start` and a `result` must still be awaited one at a time rather than driven
-//! together. Everything else on this list may be built first and driven concurrently.
+//! **Being a step and being a [`PendingStep`] are the same thing now.** `step` and `step_with`
+//! take their id through [`StepPlacement::here`] at the call; a child's
+//! [`start`](crate::WorkflowRef::start) and the await of a handle
+//! ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) take theirs through
+//! [`StepPlacement::of`] — which is also why [`run`](crate::WorkflowRef::run), being the two of
+//! them in sequence, claims two ids where it is written rather than two wherever it happens to be
+//! driven; and `sleep`, the events, the messages, the waits and every checkpointed management call
+//! take theirs through [`StepPlacement::of`] at the call and hand it to [`PendingStep::placed`].
+//! Nothing is left that allocates inside its own `async fn`, so any of these may be built first
+//! and driven concurrently, with steps and with each other.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
 //! decision is subtle enough to be worth having in one place:
@@ -154,8 +156,11 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     /// lives there. A producer that wraps one of these in something else, rather than handing it
     /// back, is the one that has to ask for itself.
     ///
-    /// `name` is the cross-SDK step name the call records under, and what a refusal names.
-    pub(crate) fn placed<C, F, Fut>(name: &'static str, built: Built<C>, run: F) -> Self
+    /// `name` is the step name the call records under, and what a refusal names: the cross-SDK
+    /// constant for the library's own calls, and the workflow's own name where the call is a
+    /// child start — which is why this takes anything that becomes an [`Arc<str>`] rather than a
+    /// `&'static str`.
+    pub(crate) fn placed<C, F, Fut>(name: impl Into<Arc<str>>, built: Built<C>, run: F) -> Self
     where
         C: Send + 'a,
         F: FnOnce(C, StepPlacement) -> Fut + Send + 'a,
@@ -167,7 +172,7 @@ impl<'a, T, E> PendingStep<'a, T, E> {
         // already is and two copies of one number are two chances to disagree.
         let placement = built.as_ref().ok().map(|(_, placement)| placement.clone());
         Self {
-            name: Arc::from(name),
+            name: name.into(),
             placement,
             running: Box::pin(async move {
                 // The build's own error, in the caller's channel. Reported at the poll rather
