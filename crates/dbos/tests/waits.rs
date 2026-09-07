@@ -12,7 +12,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Client, ClientConfig, Config, DBOS, Error, StartOptions};
+use dbos::{Client, ClientConfig, Config, DBOS, Error, ForkFrom, StartOptions, WorkflowHandle};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -536,6 +536,120 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
     assert_eq!(steps[3].error, None);
 
     dbos.shutdown().await;
+}
+
+/// A recorded refusal replays as that refusal, against whatever set the second execution has.
+///
+/// **Step arguments are not checkpointed anywhere in DBOS**, so a replay answers the question the
+/// first run asked rather than the one it is holding now. That is what makes recording the empty
+/// first-wait's refusal the right thing rather than merely a tidy one: the second execution here
+/// carries a set with a settled workflow in it, which would have a winner to report — and reports
+/// the refusal instead, because that is what this position of the code decided.
+///
+/// The second execution is a fork from step 1, which carries step 0's row across and re-runs from
+/// there, so the wait at position zero meets its own recorded outcome.
+#[tokio::test]
+async fn a_recorded_refusal_replays_rather_than_being_decided_again() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-replay-app", &db));
+
+    let quick = dbos
+        .register_workflow("quick", |()| async { Ok::<u32, Error>(1) })
+        .unwrap();
+    // Empty on the first execution and not on the second, which is the whole point: a set built
+    // from state is exactly what changes between a run and its replay.
+    let settled: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let executions = Arc::new(AtomicU32::new(0));
+    let parent = dbos
+        .register_workflow("parent", {
+            let (settled, executions) = (Arc::clone(&settled), Arc::clone(&executions));
+            move |()| {
+                let (settled, executions) = (Arc::clone(&settled), Arc::clone(&executions));
+                async move {
+                    let ids: Vec<String> = if executions.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Vec::new()
+                    } else {
+                        settled.lock().unwrap().clone()
+                    };
+                    let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+                    let outcome: dbos::Result<String> = dbos::select_workflow(&borrowed).await;
+                    let described = match outcome {
+                        Err(error) => format!("{error}"),
+                        Ok(winner) => format!("won by {winner}"),
+                    };
+                    dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+                    Ok::<String, Error>(described)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // A workflow that has already settled, so a second execution that *did* race would have a
+    // winner to report rather than hanging — which is what makes the assertion below sharp.
+    let done = quick.start(()).await.expect("start failed");
+    let done_id = done.workflow_id().to_owned();
+    done.result().await.expect("quick failed");
+    settled.lock().unwrap().push(done_id.clone());
+
+    let first = parent.start(()).await.expect("start failed");
+    let parent_id = first.workflow_id().to_owned();
+    let described = tokio::time::timeout(DEADLINE, first.result())
+        .await
+        .expect("the parent never finished")
+        .expect("the parent failed");
+    assert!(described.contains("no workflow ids"), "{described}");
+
+    let forked: WorkflowHandle<String, Error> = dbos
+        .fork(&parent_id, ForkFrom::Step(1))
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(DEADLINE, forked.result())
+        .await
+        .expect("the fork never finished")
+        .expect("the fork failed");
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        2,
+        "the fork should have run the body a second time"
+    );
+    assert_eq!(
+        replayed, described,
+        "the replay reported {replayed} against a set holding {done_id}, instead of reading back \
+         the refusal it recorded"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A client's waits answer an empty set the same way, having no workflow to record against.
+///
+/// The refusal and the satisfaction are properties of the call rather than of the checkpoint, so
+/// they read the same from a surface that never takes a step id.
+#[tokio::test]
+async fn a_clients_empty_waits_answer_without_a_slot() {
+    let db = test_database().await;
+    let client = Client::connect(ClientConfig {
+        app_name: Some("wait-client-empty-app".to_owned()),
+        outcome_poll_interval: Some(Duration::from_millis(50)),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+
+    client
+        .join_workflows(&[])
+        .await
+        .expect("an empty all-wait is satisfied for a client too");
+
+    let error = client
+        .select_workflow(&[])
+        .await
+        .expect_err("an empty first-wait is refused for a client too");
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
+    assert!(error.to_string().contains("no workflow ids"), "{error}");
+
+    client.close().await;
 }
 
 /// The same two waits from a client, which has no workflow to checkpoint against.
