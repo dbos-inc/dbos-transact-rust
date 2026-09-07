@@ -44,13 +44,11 @@ where
     E: DurableError + 'static,
 {
     // The whole of what happens at the call: read where we are, and take the id if this is a place
-    // that checkpoints. Outside a workflow there is no executor to take either, which is the one
-    // case that has nothing to carry.
-    let built = match Ctx::current() {
-        None => Ok((None, StepPlacement::Outside)),
-        Some(ctx) => StepPlacement::taken(Ok(Arc::clone(ctx.executor())), "sleep")
-            .map(|(executor, placement)| (Some(executor), placement)),
-    };
+    // that checkpoints. A sleep is always served by the workflow it is written in, so the
+    // placement has no second connection to disagree with and cannot fail — it answers `Outside`
+    // for itself, which is the one case that has no executor to carry either.
+    let executor = Ctx::current().map(|ctx| Arc::clone(ctx.executor()));
+    let built = Ok((executor, StepPlacement::here()));
     PendingStep::placed(
         step_names::SLEEP,
         built,

@@ -587,7 +587,10 @@ impl DBOS {
         // cannot name a chosen id refuses the call without moving the workflow's step counter.
         let built = self.executor("fork a workflow").and_then(|executor| {
             refuse_chosen_id_without_a_step(from, options.forked_id)?;
-            StepPlacement::taken(Ok(executor), "fork a workflow")
+            // The executor came from this handle rather than from the ambient context, so the two
+            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
+            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
+            Ok((executor, placement))
         });
         PendingStep::placed(
             step_names::FORK_WORKFLOW,
@@ -640,7 +643,10 @@ impl DBOS {
         // many forks moves the workflow's counter no more than an unlaunched one does.
         let built = self.executor("fork a workflow").and_then(|executor| {
             refuse_forked_id_in_bulk(&options)?;
-            StepPlacement::taken(Ok(executor), "fork a workflow")
+            // The executor came from this handle rather than from the ambient context, so the two
+            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
+            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
+            Ok((executor, placement))
         });
         PendingStep::placed(
             step_names::FORK_WORKFLOW,
