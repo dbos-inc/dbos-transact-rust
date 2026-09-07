@@ -168,7 +168,6 @@ use std::sync::Arc;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
-use crate::context::Ctx;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::serialization::{decode, encode};
@@ -209,7 +208,7 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 pub fn select_workflow<'a, E: crate::DurableError + 'a>(
     workflow_ids: &'a [&'a str],
 ) -> PendingStep<'a, String, E> {
-    let built = ambient_connection("select_workflow")
+    let built = StepPlacement::ambient_connection("select_workflow")
         .and_then(|conn| Connection::place_select_workflow(&conn, workflow_ids));
     Connection::pending_select_workflow(built, workflow_ids)
 }
@@ -239,22 +238,9 @@ pub fn select_workflow<'a, E: crate::DurableError + 'a>(
 pub fn join_workflows<'a, E: crate::DurableError + 'a>(
     workflow_ids: &'a [&'a str],
 ) -> PendingStep<'a, (), E> {
-    let built = ambient_connection("join_workflows")
+    let built = StepPlacement::ambient_connection("join_workflows")
         .and_then(|conn| Connection::place_join_workflows(&conn, workflow_ids));
     Connection::pending_join_workflows(built, workflow_ids)
-}
-
-/// The ambient workflow's connection, or [`Error::NotInWorkflow`] naming the wait that wanted it.
-///
-/// The free waits have no handle to take an executor from, so standing inside a workflow is what
-/// makes them callable at all — the same rule [`set_event`](crate::set_event) follows, and the
-/// reason [`DBOS::select_workflow`] exists for everyone else.
-fn ambient_connection(operation: &'static str) -> Result<Arc<Connection>> {
-    Ctx::current()
-        .map(|ctx| Arc::clone(ctx.executor().connection()))
-        .ok_or(Error::NotInWorkflow {
-            operation: operation.into(),
-        })
 }
 
 /// Races these workflow handles and runs the arm belonging to the one that finishes first.

@@ -408,6 +408,29 @@ impl StepPlacement {
         Ok((executor, placement))
     }
 
+    /// The ambient workflow's connection, or [`Error::NotInWorkflow`] naming the call that
+    /// wanted it.
+    ///
+    /// **What the *free* forms of the library calls stand on.** `send`, `send_bulk`,
+    /// `select_workflow` and `join_workflows` have no handle to take an executor from, so being
+    /// inside a workflow is the whole of what makes them callable — which is why each has a
+    /// [`DBOS`](crate::DBOS) form for everyone else, and why
+    /// [`get_event`](crate::get_event)'s free form follows the same rule.
+    ///
+    /// Here rather than in each of those modules because it is one function, and it was two
+    /// copies under two names before: the question of how a call reaches the executor that will
+    /// serve it belongs beside [`taken`](Self::taken), which asks the other half of it.
+    ///
+    /// `operation` names the caller for the error, which is the only thing that differs between
+    /// them.
+    pub(crate) fn ambient_connection(operation: &'static str) -> Result<Arc<Connection>, Error> {
+        Ctx::current()
+            .map(|ctx| Arc::clone(ctx.executor().connection()))
+            .ok_or(Error::NotInWorkflow {
+                operation: operation.into(),
+            })
+    }
+
     /// Where a call served by the ambient workflow's own executor stands.
     ///
     /// [`of`](Self::of) with no second connection to disagree with, which is every *user* step:

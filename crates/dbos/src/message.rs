@@ -144,7 +144,7 @@ where
     // happened and never moved the counter. Inside a step the placement records nothing, which is
     // what makes that send plain: no id is allocated, so nothing shifts the replay slots of the
     // steps around it.
-    let built = workflow_connection("send")
+    let built = StepPlacement::ambient_connection("send")
         .and_then(|conn| Ok((encode_one(destination_id, message, options)?, conn)))
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send"));
     pending_send(built, options.forks)
@@ -198,7 +198,7 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    let built = workflow_connection("send_bulk")
+    let built = StepPlacement::ambient_connection("send_bulk")
         .and_then(|conn| Ok((encode_all(messages)?, conn)))
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send_bulk"));
     pending_send_bulk(built, options.forks)
@@ -379,19 +379,6 @@ impl DBOS {
             });
         pending_send_bulk(built, options.forks)
     }
-}
-
-/// The ambient workflow's connection, or [`Error::NotInWorkflow`] naming the send that wanted it.
-///
-/// The free forms have no handle to take an executor from, so being inside a workflow is what makes
-/// them callable at all — the same rule [`get_event`](crate::get_event)'s free form follows, and the
-/// reason [`DBOS::send`] exists for everyone else.
-fn workflow_connection(operation: &'static str) -> Result<Arc<Connection>> {
-    Ctx::current()
-        .map(|ctx| Arc::clone(ctx.executor().connection()))
-        .ok_or(Error::NotInWorkflow {
-            operation: operation.into(),
-        })
 }
 
 /// Where a send stands, with the payloads it has already encoded kept beside it.
