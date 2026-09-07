@@ -146,6 +146,26 @@ impl Ctx {
         CURRENT.try_with(Ctx::clone).ok()
     }
 
+    /// [`current`](Self::current) without the clone: runs `f` on the ambient context, or on
+    /// `None`.
+    ///
+    /// **For callers that only want to look.** `current` hands back an owned `Ctx`, which costs
+    /// three atomic increments and three decrements — the executor, the workflow state, and the
+    /// attempt's cancellation token are each behind an `Arc`. Those refcounts are shared by every
+    /// concurrent step of the workflow, so they are exactly the words under contention when steps
+    /// run together, and paying for them to answer a question that borrows is waste. A step's
+    /// `poll` asks where it stands on every poll, which is what makes that waste worth a second
+    /// accessor.
+    pub(crate) fn with_current<R>(f: impl FnOnce(Option<&Ctx>) -> R) -> R {
+        // The `Option` is what lets one `FnOnce` serve both arms: `try_with` runs the closure
+        // exactly when it returns `Ok`, so precisely one of these two takes finds a value.
+        let mut f = Some(f);
+        match CURRENT.try_with(|ctx| f.take().expect("the closure runs once")(Some(ctx))) {
+            Ok(answer) => answer,
+            Err(_) => f.take().expect("the closure runs once")(None),
+        }
+    }
+
     /// The id of the workflow this context belongs to.
     pub fn workflow_id(&self) -> &str {
         &self.workflow.workflow_id

@@ -73,10 +73,13 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 /// deterministic — the same construction sequence burns the same ids on the replay — but it is no
 /// longer the no-op it was when the id was taken at the first poll.
 ///
-/// **Polled where it was built.** The id is a claim on one position in one workflow, so a call
-/// carried into another workflow, or built outside one and polled inside, is refused as
-/// [`Error::StepBuiltElsewhere`] rather than run under an id nothing there can honour. Each
-/// producer makes that check inside its own run, which is why nothing here knows how.
+/// **Polled where it was built, and asked again on every poll.** The id is a claim on one position
+/// in one workflow, so a call carried into another workflow, or built outside one and polled
+/// inside, is refused as [`Error::StepBuiltElsewhere`] rather than run under an id nothing there
+/// can honour. Asking once would not be enough: the run makes that check as its first act and is
+/// then past it, and this is `Send` and `Unpin`, so a call polled once where it belongs and then
+/// moved would go on running under the context it captured. Being polled is the only moment
+/// anything can tell where the call now stands.
 ///
 /// **`Unpin`, which is contract rather than accident**: the run is already boxed, so a combinator
 /// holding one of these as a branch can do so by `Pin::new(&mut _)` rather than pinning it a
@@ -86,25 +89,30 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 pub struct PendingStep<'a, T, E = crate::EngineOnly> {
     /// What the call is called, which is the name its checkpoint is checked against on replay.
     name: Arc<str>,
-    /// The id this call claimed when it was built, or `None` where it claimed none.
-    step_id: Option<i32>,
+    /// Where this call was built, and the id it claimed there.
+    ///
+    /// **Kept beside the run rather than only inside it**, because the run can only be asked once:
+    /// it checks its placement as its first act and is then past that check for the rest of its
+    /// life. A value that is `Send` and `Unpin` can be polled once and then moved, so the check
+    /// has to be made by whatever is doing the polling — which is [`poll`](Future::poll), on every
+    /// poll. Cheap to hold: a [`Ctx`] is a couple of `Arc`s.
+    placement: StepPlacement,
     /// The run, built by the constructor and driven by whatever polls this.
     ///
     /// An `async fn` body does not begin until it is polled, so the future is built where the id
-    /// is taken and this field is the whole of what runs. The two above it are identity, not
-    /// state: nothing reads them to decide what happens, and nothing mutates them.
+    /// is taken and this field is the whole of what runs.
     running: Pin<Box<dyn Future<Output = crate::Result<T, E>> + Send + 'a>>,
 }
 
 impl<'a, T, E> PendingStep<'a, T, E> {
     pub(crate) fn new(
         name: Arc<str>,
-        step_id: Option<i32>,
+        placement: StepPlacement,
         running: impl Future<Output = crate::Result<T, E>> + Send + 'a,
     ) -> Self {
         Self {
             name,
-            step_id,
+            placement,
             running: Box::pin(running),
         }
     }
@@ -125,7 +133,7 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     /// that says something, and a combinator reporting which branch a stale checkpoint meant.
     #[must_use]
     pub fn step_id(&self) -> Option<i32> {
-        self.step_id
+        self.placement.step_id()
     }
 }
 
@@ -135,7 +143,24 @@ impl<T, E> Future for PendingStep<'_, T, E> {
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         // `get_mut` rather than a projection: every field is `Unpin`, the run because it is
         // already a `Pin<Box<_>>`, so there is nothing here for pinning to protect.
-        self.get_mut().running.as_mut().poll(cx)
+        let this = self.get_mut();
+        // **Every poll, not only the first.** The run checks its placement as its first act, but
+        // it is past that check forever after, and this value is `Send` and `Unpin` — so a call
+        // polled once where it belongs and then moved would go on running under the context it
+        // captured, recording under a workflow that is no longer the one around it. Being polled
+        // is the only moment anything can tell where this call now stands, so the question is
+        // asked here and asked again each time.
+        //
+        // Affordable at that rate because it borrows: `with_current` rather than `current`, so
+        // the check is a thread-local read and two pointer comparisons rather than a `Ctx` clone's
+        // three atomic increments on refcounts every concurrent step of this workflow shares. The
+        // first poll asks twice, once here and once inside the run, which is the price of the run
+        // needing the answer rather than merely needing it to be yes.
+        if let Err(refused) = Ctx::with_current(|here| this.placement.check_here(&this.name, here))
+        {
+            return Poll::Ready(Err(refused));
+        }
+        this.running.as_mut().poll(cx)
     }
 }
 
@@ -144,7 +169,7 @@ impl<T, E> std::fmt::Debug for PendingStep<'_, T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingStep")
             .field("name", &self.name)
-            .field("step_id", &self.step_id)
+            .field("step_id", &self.step_id())
             .finish_non_exhaustive()
     }
 }
@@ -177,6 +202,11 @@ pub(crate) enum StepDurability<'a> {
 ///
 /// Decides two independent things: whether the call is checkpointed, and whether there is a
 /// surrounding workflow that a *cancelled awaited workflow* would otherwise be confused with.
+///
+/// `Clone` because a [`PendingStep`] holds one and hands another to its run: the run needs the
+/// answer, and the poll needs to ask again. A [`Ctx`] is a couple of `Arc`s, so a copy is cheap
+/// and both halves see one placement, never two that could disagree.
+#[derive(Clone)]
 pub(crate) enum StepPlacement {
     /// Not inside a workflow. Nothing is recorded, and there is no other workflow here for an
     /// awaited one to be confused with.

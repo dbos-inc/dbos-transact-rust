@@ -326,9 +326,11 @@ where
     // until something polls it.
     let placement = StepPlacement::here();
     let name: Arc<str> = Arc::from(name);
+    // The placement is held by both halves: the run needs the answer it gives, and the
+    // `PendingStep` needs to ask it again on every poll. Cloning it is a couple of `Arc` bumps.
     PendingStep::new(
         Arc::clone(&name),
-        placement.step_id(),
+        placement.clone(),
         run(placement, name, options, body),
     )
 }
@@ -352,8 +354,9 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     let name = &*name;
-    let ambient = Ctx::current();
-    let (ctx, step_id) = match placement.check_here(name, ambient.as_ref())? {
+    // Borrowed, not cloned: the answer is about where this stands, and `StepDurability` borrows
+    // the placement rather than the ambient context, so nothing here needs to own one.
+    let (ctx, step_id) = match Ctx::with_current(|here| placement.check_here(name, here))? {
         StepDurability::Recorded { ctx, step_id } => (ctx, step_id),
         // Outside a workflow, inside another step's body, or on a client's connection. The step
         // claimed no id in any of them, so there is nothing to check against and nothing to
@@ -1093,6 +1096,47 @@ mod tests {
             ids(&steps(&dbos, "wf-nested").await),
             [(0, "outer"), (1, "after")],
             "`inner` is not a checkpoint"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// One poll in the right place does not buy a second somewhere else.
+    ///
+    /// The run checks its placement as its first act and is then past that check, so a step that
+    /// is polled once where it belongs and *then* moved would go on running under the context it
+    /// captured — recording beneath a step whose own row already covers whatever its body did,
+    /// which is the case `StepBuiltElsewhere` exists to refuse. `PendingStep` is `Send` and
+    /// `Unpin`, so nothing but the poll can catch that, and it has to catch it every time.
+    ///
+    /// The first poll is driven by hand because that is the only way to leave a step started and
+    /// still holdable; ordinary `await` runs it to completion where it stands.
+    #[tokio::test]
+    async fn a_step_polled_once_is_refused_when_it_moves() {
+        let (dbos, _db) = workflow("wf-relocated").await;
+        let c = ctx(&dbos, "wf-relocated");
+
+        let outcome = Ctx::scope(c.clone(), async {
+            let mut built = step("moved", || async { Ok::<_, crate::Error>(1u32) });
+            let started = std::pin::Pin::new(&mut built)
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            assert!(
+                started.is_pending(),
+                "the first poll should reach the database and suspend, leaving the run started"
+            );
+            // Now somewhere its id cannot be honoured: a step body, whose own checkpoint already
+            // stands for everything it does.
+            c.in_step_scope(None, built).await
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, Err(Error::StepBuiltElsewhere { .. })),
+            "a started step is still refused where it moves: {outcome:?}"
+        );
+        assert!(
+            steps(&dbos, "wf-relocated").await.is_empty(),
+            "and it records nothing under the workflow it was built in"
         );
 
         dbos.shutdown().await;
