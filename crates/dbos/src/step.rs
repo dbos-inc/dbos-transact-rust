@@ -424,7 +424,15 @@ where
         let attempt = failures.len() as u32 + 1;
         // The span nests inside the workflow's, so anything the body logs carries both ids.
         let span = tracing::info_span!("step", step_id, step_name = name, attempt);
-        match supervise(&ctx, name, &options, body(), span).await {
+        // **The closure is called inside the step's scope, not beside it.** An `async` block
+        // does nothing until it is polled, and `in_step_scope` is what polls this one, so a body
+        // that *builds* a durable call as its first act — `|| step("inner", ..)`, or a helper
+        // that hands one back — makes that call with this attempt's marker in scope and is a
+        // plain nested call by the leaf rule. Passing `body()` here instead would run the closure
+        // on the workflow's own call stack, where it takes a step id from the counter, and the
+        // call would then be refused by its own run for being polled inside a step body. Every
+        // attempt would spend another id on the way.
+        match supervise(&ctx, name, &options, async { body().await }, span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
@@ -1127,6 +1135,40 @@ mod tests {
             seen,
             [(0, "outer"), (1, "after")],
             "`inner` is not a checkpoint"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// The leaf rule again, for a body that *builds* its inner step rather than awaiting one it
+    /// wrote inline.
+    ///
+    /// `|| step("inner", ..)` hands the inner step back as the attempt's whole future, so the
+    /// closure does its work where it is *called* rather than where that future is polled. Called
+    /// outside the step's scope it would take an id from the workflow's counter, be refused for
+    /// then being polled inside a step body, and spend another id on every retry — so this is the
+    /// one shape that says the closure runs where the attempt does.
+    #[tokio::test]
+    async fn a_body_that_builds_its_step_builds_it_inside_the_attempt() {
+        let (dbos, _db) = workflow("wf-built-in-body").await;
+
+        let outer = Ctx::scope(ctx(&dbos, "wf-built-in-body"), async {
+            let outer = step("outer", || {
+                step("inner", || async { Ok::<_, crate::Error>(1u32) })
+            })
+            .await;
+            step("after", || async { Ok::<_, crate::Error>(9u32) })
+                .await
+                .unwrap();
+            outer
+        })
+        .await;
+
+        assert_eq!(outer.unwrap(), 1);
+        assert_eq!(
+            steps(&dbos, "wf-built-in-body").await,
+            [(0, "outer".to_owned()), (1, "after".to_owned())],
+            "`inner` is a plain call, so it takes no id and `after` keeps the next one"
         );
 
         dbos.shutdown().await;
