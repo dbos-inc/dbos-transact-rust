@@ -777,7 +777,8 @@ impl Connection {
         let built = match built {
             // The empty set, already answered — see `place_join_workflows`.
             Ok(None) => return PendingStep::settled(step_names::JOIN_WORKFLOWS),
-            other => other.map(|placed| placed.expect("the empty set is answered above")),
+            Ok(Some(placed)) => Ok(placed),
+            Err(refused) => Err(refused),
         };
         PendingStep::placed(
             step_names::JOIN_WORKFLOWS,
