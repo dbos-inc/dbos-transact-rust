@@ -3,9 +3,18 @@
 //! Several calls in this crate are *steps the caller never wrote*: awaiting a workflow's result,
 //! waiting on a set of handles, reading an event. Each is a single durable act that a replay must
 //! not perform twice, so each takes a step id from the ambient workflow and records its answer
-//! under it — which is exactly what makes it a step, and why they are all [`PendingStep`]s beside
-//! the ones [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no
-//! user body, no retry policy and no timeout, so none of them goes through `step_with`.
+//! under it — which is exactly what makes it a step, and what puts it here beside the ones
+//! [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no user body,
+//! no retry policy and no timeout, so none of them goes through `step_with`.
+//!
+//! **Being a step and being a [`PendingStep`] are not yet the same thing.** Today only `step` and
+//! `step_with` build one, taking their id through [`StepPlacement::here`] at the call. Every
+//! library step above still allocates inside its own `async fn` — through
+//! [`StepPlacement::of`] for the awaits and waits, and straight from the counter for `sleep`,
+//! the events, the messages, a child `start` and the management surface — so its id lands
+//! wherever it is first *polled*. That is the difference this module exists to close, one
+//! producer at a time; until it is closed, only steps may be driven concurrently, and the
+//! [`step`](crate::step) docs say so.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
 //! decision is subtle enough to be worth having in one place:

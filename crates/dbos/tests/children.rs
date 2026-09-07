@@ -420,9 +420,12 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
 /// Sequential bookkeeping is the step counter's determinism constraint reaching a second caller —
 /// each launch and each await allocates a step id, and concurrent allocation would replay against
 /// the wrong slots. It costs nothing in wall-clock: three children that each sleep are all in
-/// flight together, so the parent takes about as long as the slowest rather than the sum. A
-/// `join!` over the *launches* is the same trap a `join!` over steps is, and is unsound for the
-/// same reason.
+/// flight together, so the parent takes about as long as the slowest rather than the sum.
+///
+/// A `join!` over the child *starts* is still unsound, and it is now the only half of that pair
+/// that is: a step takes its id where it is built, so a `join!` over steps is ordinary code,
+/// while `start` takes its id at its first poll and is numbered by whichever branch the
+/// combinator reaches first.
 #[tokio::test]
 async fn children_launched_in_a_loop_run_concurrently() {
     let db = test_database().await;

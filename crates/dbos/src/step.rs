@@ -236,6 +236,17 @@ impl<E> StepOptions<E> {
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
 /// the counter first, which is not something a replay reproduces.
 ///
+/// **That is a promise about steps, and for now only about these two calls.** The crate's other
+/// durable calls are steps in every sense that matters — each claims one id and records one
+/// answer a replay must not repeat — but `sleep`, the events, the messages, a child's `start`,
+/// awaiting a handle, the waits and the management surface still take their ids at their first
+/// **poll**. Driven together they are numbered in whatever order the combinator polls them, so a
+/// replay that interleaves differently meets a recorded step under the wrong name — a
+/// system-database error, which records nothing, leaves the workflow `PENDING`, and has it
+/// recovered until it parks. Await each of those before starting the next, as the whole crate
+/// required before ids moved. Each is being converted to build its id the way a step does, and
+/// the rule retires as they are.
+///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
 /// sibling's body is in flight still takes an id and checkpoints.
