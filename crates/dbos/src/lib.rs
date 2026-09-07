@@ -68,6 +68,8 @@ mod workflow;
 // `dbos::Error` rather than `dbos::config::Config`. `DBOS` is the one type that spells the brand,
 // because it *is* the brand — nobody writes `tokio::TOKIO`.
 #[cfg(feature = "engine")]
+pub use checkpoint::PendingStep;
+#[cfg(feature = "engine")]
 pub use client::{Client, ClientConfig, EnqueueOptions};
 #[cfg(feature = "engine")]
 pub use config::{Config, DATABASE_URL_ENV, Serializer};

@@ -111,7 +111,7 @@
 //!
 //! Outside a workflow neither is checkpointed and both are plain waits, which is the operator's
 //! and the client's case. Inside a *step* they are plain too, by the leaf rule every id-allocating
-//! call in this crate follows. [`Placement`] owns those rules and the argument for each.
+//! call in this crate follows. [`StepPlacement`] owns those rules and the argument for each.
 //!
 //! # Three surfaces, split by where the caller stands
 //!
@@ -164,7 +164,7 @@
 //! interval and nothing else — but where they would have to grow a parameter to bound the wait,
 //! the language already supplies it.
 
-use crate::checkpoint::Placement;
+use crate::checkpoint::StepPlacement;
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{Error, Result};
@@ -639,7 +639,7 @@ impl Connection {
             ));
         }
 
-        let placement = Placement::of(self, "select_workflow")?;
+        let placement = StepPlacement::of(self, "select_workflow")?;
         if let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await? {
             let winner: String = decode(
                 recorded.output.as_deref(),
@@ -712,7 +712,7 @@ impl Connection {
             return Ok(());
         }
 
-        let placement = Placement::of(self, "join_workflows")?;
+        let placement = StepPlacement::of(self, "join_workflows")?;
         // The row is the whole of the answer, and there is nothing in it to check the current set
         // against: an all-wait records no set, so a replay of one whose set has *grown* skips the
         // wait for the member it never waited on. That is the ordinary reading of a step whose

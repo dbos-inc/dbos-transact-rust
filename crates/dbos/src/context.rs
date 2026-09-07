@@ -146,9 +146,46 @@ impl Ctx {
         CURRENT.try_with(Ctx::clone).ok()
     }
 
+    /// [`current`](Self::current) without the clone: runs `f` on the ambient context, or on
+    /// `None`.
+    ///
+    /// **For callers that only want to look.** `current` hands back an owned `Ctx`, which costs
+    /// three atomic increments and three decrements — the executor, the workflow state, and the
+    /// attempt's cancellation token are each behind an `Arc`. Those refcounts are shared by every
+    /// concurrent step of the workflow, so they are exactly the words under contention when steps
+    /// run together, and paying for them to answer a question that borrows is waste. A step's
+    /// `poll` asks where it stands on every poll, which is what makes that waste worth a second
+    /// accessor.
+    pub(crate) fn with_current<R>(f: impl FnOnce(Option<&Ctx>) -> R) -> R {
+        // The `Option` is what lets one `FnOnce` serve both arms: `try_with` runs the closure
+        // exactly when it returns `Ok`, so precisely one of these two takes finds a value.
+        let mut f = Some(f);
+        match CURRENT.try_with(|ctx| f.take().expect("the closure runs once")(Some(ctx))) {
+            Ok(answer) => answer,
+            Err(_) => f.take().expect("the closure runs once")(None),
+        }
+    }
+
     /// The id of the workflow this context belongs to.
     pub fn workflow_id(&self) -> &str {
         &self.workflow.workflow_id
+    }
+
+    /// Whether this and `other` are the same *execution* of the same workflow.
+    ///
+    /// **Identity, not equality of ids.** A workflow id names a row; this asks whether the two
+    /// contexts share one [`WorkflowState`], and therefore one step counter. Two things a matching
+    /// id would wave through do not share one: a second `DBOS` in the process serving the same id,
+    /// which is what [`Error::WrongInstance`](crate::Error::WrongInstance) exists to catch, and a
+    /// second *execution* of one id — a recovery re-run — whose counter restarts from zero. A
+    /// step id means nothing across either, so anything holding one has to ask this rather than
+    /// compare strings.
+    ///
+    /// Cheap: one pointer comparison. Clones of a `Ctx` share the state, so the ordinary case —
+    /// a step built and polled inside one workflow body — answers true without touching memory
+    /// the caller did not already have.
+    pub(crate) fn is_same_execution(&self, other: &Ctx) -> bool {
+        Arc::ptr_eq(&self.workflow, &other.workflow)
     }
 
     /// When this workflow must stop, if it has a deadline at all.
@@ -187,6 +224,16 @@ impl Ctx {
     /// has just finished.
     pub(crate) fn in_step(&self) -> bool {
         self.step_marker.is_some()
+    }
+
+    /// Which step body this context is inside, if any.
+    ///
+    /// [`in_step`](Self::in_step) asks whether there is one; this asks *which*, and the difference
+    /// is what lets a durable call built inside a step body be refused when it is polled somewhere
+    /// else. Both places have the same workflow id, so comparing workflow identity cannot tell them
+    /// apart. See [`StepMarker`].
+    pub(crate) fn step_marker(&self) -> Option<StepMarker> {
+        self.step_marker
     }
 
     /// Runs `body` under a context that is [`in_step`](Self::in_step).

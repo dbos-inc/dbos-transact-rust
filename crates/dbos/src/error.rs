@@ -314,6 +314,59 @@ pub enum Error<E = EngineOnly> {
         message: String,
     },
 
+    /// A step was polled somewhere its step id cannot be honoured.
+    ///
+    /// A step takes its id from the workflow's counter **where it is built**, which is a claim on
+    /// one position in one workflow. So there are only four places a built step may be polled,
+    /// and **everything else is refused** rather than run under an id nothing there can honour:
+    ///
+    /// - at a step boundary of the workflow it was built in, which is the ordinary case and the
+    ///   only one that records anything;
+    /// - inside the very step body it was built in, where the leaf rule makes it a plain call;
+    /// - outside a workflow, if that is also where it was built, which is what makes a function
+    ///   built from steps ordinarily testable;
+    /// - anywhere at all, if it was reached through a [`Client`](crate::Client)'s connection: a
+    ///   client has no step counter anywhere to disagree with, so its calls are pinned to nothing.
+    ///
+    /// The refusals worth naming, because they are the ones code reaches by accident:
+    ///
+    /// - **Built outside a workflow, awaited inside one.** It took no id, so it would run
+    ///   unrecorded where the surrounding workflow plainly expects a checkpoint, and every replay
+    ///   would run it again. Easy to reach by accident — `Ctx::scope(ctx, step(..))` evaluates the
+    ///   step before the scope exists.
+    /// - **Built in one workflow, polled in another.** Its row would land under the wrong
+    ///   workflow's id.
+    /// - **Built inside a step body, awaited in the workflow proper**, or inside a *different*
+    ///   body. By the leaf rule it took no id inside the body it was built in, so it would run
+    ///   unrecorded where a checkpoint was expected.
+    /// - **Built in the workflow proper, carried into a step body.** Its checkpoint would sit
+    ///   beneath a step whose own row already stands for whatever its body did.
+    /// - **Polled where there is no context at all**, which in practice means
+    ///   `tokio::spawn(step(..))`. A spawned task inherits no workflow, so the step would run
+    ///   undurably wherever it was built — and a step built in the workflow proper has already
+    ///   spent an id that nothing will ever record against. Await the step in the workflow, or
+    ///   spawn work that is not a step.
+    ///
+    /// The first two were silent before ids were taken at the call; the next two are what the
+    /// per-call-stack step marker made distinguishable; the last ran plainly. `built` and `polled`
+    /// name the two places, so a refusal reads "built inside a step of workflow w but polled in
+    /// workflow w" rather than naming the same place twice.
+    ///
+    /// **Not a control signal.** It is a mistake in the code rather than a failure of the engine's
+    /// substrate, it is deterministic, and a replay reaches it again — so it is the workflow's
+    /// outcome like any other failure.
+    #[error(
+        "step {step} was built {built} but polled {polled}: a step takes its id where it is built"
+    )]
+    StepBuiltElsewhere {
+        /// The step's name, which is the only thing a caller can find it by.
+        step: String,
+        /// Where its id came from, or that it has none.
+        built: std::borrow::Cow<'static, str>,
+        /// Where it was polled instead.
+        polled: std::borrow::Cow<'static, str>,
+    },
+
     /// A step attempt ran past its timeout and was stopped.
     ///
     /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
@@ -431,6 +484,15 @@ impl<E> Error<E> {
             },
             Error::StepFailed { step, message } => Error::StepFailed { step, message },
             Error::StepTimeout { step, timeout } => Error::StepTimeout { step, timeout },
+            Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            } => Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            },
             Error::MaxStepRetriesExceeded {
                 step,
                 attempts,
