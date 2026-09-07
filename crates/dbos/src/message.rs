@@ -295,10 +295,10 @@ fn place_recv() -> Built<(Arc<crate::Executor>, i32)> {
         });
     }
     // The refusals above settled that this stands at a step boundary of its own workflow, served
-    // by its own executor, so there is no second connection to disagree with — which is what makes
-    // [`StepPlacement::here`] the constructor rather than one that can fail.
+    // by its own executor, so there is no second connection to disagree with and the placement
+    // cannot fail. It takes the context those refusals read rather than reading it again.
     let executor = Arc::clone(ctx.executor());
-    let placement = StepPlacement::here();
+    let placement = StepPlacement::at(ctx);
     // The deadline's id from the same counter the placement drew the read's from, so the pair is
     // one decision rather than two that could disagree.
     let timeout_step_id = placement

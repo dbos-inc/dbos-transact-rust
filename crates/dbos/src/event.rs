@@ -104,10 +104,11 @@ fn place_set_event<T: Serialize>(value: &T) -> Built<(Arc<crate::Executor>, Stri
     }
     let encoded = encode(value, "event value")?;
     // The refusals above already settled that this stands at a step boundary of its own workflow,
-    // served by its own executor — which is [`StepPlacement::here`]'s whole remit: no second
-    // connection to disagree with, so it cannot fail and none has to be handed to it.
+    // served by its own executor, so the placement has no second connection to disagree with and
+    // cannot fail. It takes the context those refusals read rather than reading it again, so the
+    // one that refused and the one that places are the same value.
     let executor = Arc::clone(ctx.executor());
-    Ok(((executor, encoded), StepPlacement::here()))
+    Ok(((executor, encoded), StepPlacement::at(ctx)))
 }
 
 /// Reads a key a workflow published, waiting up to `timeout` for it to appear.
@@ -144,9 +145,10 @@ where
         .map(|ctx| {
             // Served by the ambient workflow's own executor, so there is no second connection for
             // the placement to disagree with and nothing here can fail. Inside a step it answers
-            // `InsideStep`, which takes no id and is what makes the read plain there.
+            // `InsideStep`, which takes no id and is what makes the read plain there. The context
+            // is handed over rather than read a second time, so this is one read in total.
             let executor = Arc::clone(ctx.executor());
-            let placement = StepPlacement::here();
+            let placement = StepPlacement::at(ctx);
             // Field order is the contract: the read's id first, the deadline's second, matching
             // what every SDK records and what a replay looks up.
             let timeout_step_id = placement.next_step_id();

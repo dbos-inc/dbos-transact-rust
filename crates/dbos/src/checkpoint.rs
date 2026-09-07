@@ -442,9 +442,20 @@ impl StepPlacement {
     /// Allocating is the point, and it happens here rather than at the poll: the position of this
     /// call has to be the same on the replay as it was on the run, and building is what fixes it.
     pub(crate) fn here() -> Self {
-        let Some(ctx) = Ctx::current() else {
-            return Self::Outside;
-        };
+        Ctx::current().map_or(Self::Outside, Self::at)
+    }
+
+    /// [`here`](Self::here) for a caller that is already holding the context.
+    ///
+    /// The same decision, minus the read of the ambient context that `here` makes for itself.
+    /// Several library calls refuse from that context before they may place — a call outside a
+    /// workflow, or inside a step, or one whose payload will not encode — and the refusals have to
+    /// happen before the id is claimed, so those callers hold a [`Ctx`] by the time they get here.
+    /// Handing it over means one read rather than two, and means the context that refused and the
+    /// context that placed are the same value rather than two reads that agreed.
+    ///
+    /// `here` is this composed with that read, which is why `Outside` is the only answer it adds.
+    pub(crate) fn at(ctx: Ctx) -> Self {
         if ctx.step_marker().is_some() {
             return Self::InsideStep { ctx };
         }
