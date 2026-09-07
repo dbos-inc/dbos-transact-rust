@@ -788,7 +788,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::sysdb::types::{NewWorkflow, Submission};
+    use crate::sysdb::types::{NewWorkflow, StepRecord, Submission};
     use crate::{Config, DBOS};
 
     /// A launched instance and a workflow row to hang steps off.
@@ -818,15 +818,24 @@ mod tests {
     }
 
     /// The step rows a workflow recorded, in id order.
-    async fn steps(dbos: &DBOS, id: &str) -> Vec<(i32, String)> {
+    async fn steps(dbos: &DBOS, id: &str) -> Vec<StepRecord> {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
             .list_workflow_steps(id, true, None, None, None)
             .await
             .expect("read failed")
-            .into_iter()
-            .map(|step| (step.step_id, step.step_name))
+    }
+
+    /// What most of these tests actually assert on: which ids were claimed, and by what.
+    ///
+    /// Split from [`steps`] rather than folded into it because a test that also reads a row's
+    /// output needs the rows themselves, and reading them twice to see both halves is worse than
+    /// projecting once here.
+    fn ids(steps: &[StepRecord]) -> Vec<(i32, &str)> {
+        steps
+            .iter()
+            .map(|step| (step.step_id, step.step_name.as_str()))
             .collect()
     }
 
@@ -927,13 +936,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(failed, Error::SystemDatabase(_)), "{failed}");
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-blip", true, None, None, None)
-            .await
-            .expect("read failed");
+        let steps = steps(&dbos, "wf-blip").await;
         assert!(
             steps.is_empty(),
             "a database failure must not be checkpointed as the step's outcome: {steps:?}"
@@ -1058,18 +1061,8 @@ mod tests {
         })
         .await;
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-order", true, None, None, None)
-            .await
-            .expect("read failed");
-        let seen: Vec<(i32, &str)> = steps
-            .iter()
-            .map(|s| (s.step_id, s.step_name.as_str()))
-            .collect();
-        assert_eq!(seen, [(0, "one"), (1, "two"), (2, "three")]);
+        let steps = steps(&dbos, "wf-order").await;
+        assert_eq!(ids(&steps), [(0, "one"), (1, "two"), (2, "three")]);
         assert_eq!(steps[2].output.as_deref(), Some("3"));
 
         dbos.shutdown().await;
@@ -1096,19 +1089,8 @@ mod tests {
         })
         .await;
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-nested", true, None, None, None)
-            .await
-            .expect("read failed");
-        let seen: Vec<(i32, &str)> = steps
-            .iter()
-            .map(|s| (s.step_id, s.step_name.as_str()))
-            .collect();
         assert_eq!(
-            seen,
+            ids(&steps(&dbos, "wf-nested").await),
             [(0, "outer"), (1, "after")],
             "`inner` is not a checkpoint"
         );
@@ -1142,8 +1124,8 @@ mod tests {
 
         assert_eq!(outer.unwrap(), 1);
         assert_eq!(
-            steps(&dbos, "wf-built-in-body").await,
-            [(0, "outer".to_owned()), (1, "after".to_owned())],
+            ids(&steps(&dbos, "wf-built-in-body").await),
+            [(0, "outer"), (1, "after")],
             "`inner` is a plain call, so it takes no id and `after` keeps the next one"
         );
 
@@ -1192,19 +1174,8 @@ mod tests {
         })
         .await;
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-concurrent", true, None, None, None)
-            .await
-            .expect("read failed");
-        let seen: Vec<(i32, &str)> = steps
-            .iter()
-            .map(|s| (s.step_id, s.step_name.as_str()))
-            .collect();
         assert_eq!(
-            seen,
+            ids(&steps(&dbos, "wf-concurrent").await),
             [(0, "held"), (1, "beside")],
             "`beside` is the workflow's own step, not something inside `held`"
         );
@@ -1253,12 +1224,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            steps(&dbos, "wf-out-of-order").await,
-            [
-                (0, "a".to_owned()),
-                (1, "b".to_owned()),
-                (2, "c".to_owned())
-            ],
+            ids(&steps(&dbos, "wf-out-of-order").await),
+            [(0, "a"), (1, "b"), (2, "c")],
             "the ids follow source order, which is what a replay builds again"
         );
 
