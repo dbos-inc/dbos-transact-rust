@@ -135,7 +135,7 @@ pub fn get_event<'a, T, E>(
     timeout: Duration,
 ) -> PendingStep<'a, Option<T>, E>
 where
-    T: DeserializeOwned + Send + 'a,
+    T: DeserializeOwned + 'a,
     E: DurableError + 'a,
 {
     let built = Ctx::current()
@@ -177,7 +177,7 @@ impl DBOS {
     /// With one exception it cannot share: this takes its executor from `self` and its step ids
     /// from the ambient context, so a handle to some *other* instance would split the two. That is
     /// [`Error::WrongInstance`] rather than a silent write into the wrong database.
-    pub fn get_event<'a, T: DeserializeOwned + Send + 'a>(
+    pub fn get_event<'a, T: DeserializeOwned + 'a>(
         &self,
         workflow_id: &'a str,
         key: &'a str,
@@ -238,7 +238,7 @@ fn pending_get_event<'a, T, E>(
     timeout: Duration,
 ) -> PendingStep<'a, Option<T>, E>
 where
-    T: DeserializeOwned + Send + 'a,
+    T: DeserializeOwned + 'a,
     E: DurableError + 'a,
 {
     PendingStep::placed(

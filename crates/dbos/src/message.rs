@@ -251,7 +251,7 @@ where
 /// and Java raises *"DBOS.recv() must not be called from within a step."*
 pub fn recv<'a, T, E>(topic: Option<&'a str>, timeout: Duration) -> PendingStep<'a, Option<T>, E>
 where
-    T: DeserializeOwned + Send + 'a,
+    T: DeserializeOwned + 'a,
     E: DurableError + 'a,
 {
     PendingStep::placed(
