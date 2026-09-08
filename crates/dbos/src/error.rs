@@ -575,8 +575,8 @@ impl Error<EngineOnly> {
     /// needing a panic or a fallback for a case that cannot occur.
     ///
     /// Public because a workflow with its own error type sometimes holds an engine-channel
-    /// result — [`WorkflowRef::start`](crate::WorkflowRef::start) is one, and
-    /// [`DBOS::get_event`](crate::DBOS::get_event) called from inside a workflow another — and
+    /// result — the management calls are, and
+    /// [`DBOS::get_event`](crate::DBOS::get_event) called from inside a workflow is another — and
     /// `?` cannot lift `Error<EngineOnly>` into `Error<E>` on its own: the blanket conversion
     /// would wrap the whole error as the application's. This is the conversion written out:
     ///
@@ -584,10 +584,18 @@ impl Error<EngineOnly> {
     /// let status = child.status().await.map_err(Error::lift)?;
     /// ```
     ///
-    /// The workflow-facing calls do not need it: [`step`](crate::step),
-    /// [`set_event`](crate::set_event), [`get_event`](crate::get_event), a child's
-    /// [`start`](crate::WorkflowRef::start), [`run`](crate::WorkflowRef::run) and the await of a
-    /// handle are all generic over the caller's channel, so `?` works on them directly.
+    /// The workflow's own calls do not need it: [`step`](crate::step),
+    /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) answer in the caller's
+    /// channel, so `?` works on them directly. A child's [`start`](crate::WorkflowRef::start),
+    /// [`run`](crate::WorkflowRef::run) and the await of its handle answer in the *child's*
+    /// channel, which is the same channel whenever parent and child fail the same way — the common
+    /// case, and the one those calls read as written for.
+    ///
+    /// Where the two differ, only the start is this conversion's business: it can fail in nothing
+    /// but the engine's terms, so [`PendingStart::lift`](crate::PendingStart::lift) re-declares
+    /// which channel it answers in, before the await rather than converting after it. A `run` or a
+    /// handle's await carries the child's own application failure, which no lift can reach: that
+    /// one is a real error of the child's type, and the parent writes out what it makes of it.
     pub fn lift<E>(self) -> Error<E> {
         self.map_application(|impossible| match impossible {})
     }
