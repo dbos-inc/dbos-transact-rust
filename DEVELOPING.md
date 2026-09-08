@@ -145,9 +145,9 @@ and the tooling moves both together.
 than claiming to be a version that shipped, and a stray `cargo publish` from `main` fails the
 exact-version pin instead of quietly shipping a release-numbered build.
 
-Released lines live on their own branches. A final release cuts `release/vX.Y` at the release
-commit, and patches to that line are made there rather than on `main` — the same layout the Java
-and Python SDKs use.
+Released lines live on their own branches. `scripts/release.sh release` creates `release/vX.Y` at
+the release commit and pushes it, and patches to that line are made there rather than on `main` —
+the same layout the Java and Python SDKs use.
 
 Cargo will **never** resolve a caret requirement to a prerelease. Someone who writes
 `dbos = "0.5"` will not get `0.5.0-rc.1`; they have to ask for it by exact version. That is what
@@ -183,10 +183,18 @@ scripts/release.sh release --dry-run   # print every step, change nothing
 scripts/release.sh release             # 0.5.0-dev -> 0.5.0, then main -> 0.6.0-dev
 ```
 
-This bumps the workspace version and the exact-version pin, commits, tags `v<version>`, publishes
-`dbos-macros`, waits for it to appear on the index, publishes `dbos`, and pushes. It then does two
-things that matter later: it cuts `release/v0.5` at the release commit, which is the branch any
-patch to that line is built on, and it commits `main` at the next `-dev` version and pushes again.
+The script does all of this, in order. There are no manual git steps:
+
+1. Bumps the workspace version and the exact-version pin, from `0.5.0-dev` to `0.5.0`.
+2. Commits, and tags the commit `v0.5.0`.
+3. Publishes `dbos-macros`, waits for it to appear on the index, then publishes `dbos`.
+4. Pushes `main` and the tag.
+5. **Creates the branch `release/v0.5`** at the release commit and pushes it. Patches to the
+   `0.5` line are cut from there, so the branch is made now rather than when it is first needed.
+6. Commits `main` at `0.6.0-dev` and pushes again.
+
+Steps 5 and 6 run only for a final release. An `rc` stops after step 4, and so does a `patch` on
+a release branch.
 
 The publish order is not optional: `dbos` requires `=<version>` of `dbos-macros` to already be on
 the index, so publishing them the other way round fails verification.
@@ -247,8 +255,9 @@ convention: the moment `0.5.0` ships, `main` declares `0.6.0-dev`, so there is n
 from which `0.5.1` is the next version. `scripts/release.sh` refuses `patch` anywhere but a
 release branch for that reason.
 
-Every final release cuts its own branch, `release/vX.Y`, at the release commit, so the branch you
-need already exists. Check out the one for the line being patched, put the fix on it, and release:
+`scripts/release.sh release` creates `release/vX.Y` and pushes it as part of every final
+release, so the branch you need already exists and there is nothing to set up. Check out the one
+for the line being patched, put the fix on it, and release:
 
 ```bash
 git switch release/v0.5
