@@ -162,18 +162,6 @@ cargo install cargo-release
 cargo login   # a crates.io token with the publish scope
 ```
 
-Publishing rights come from crate ownership. Both crates are owned by the `dbos-eng` GitHub team
-alongside individual owners, so any team member can publish. Adding the team is a one-time step
-per crate, run by a user owner with a token carrying the `change-owners` scope:
-
-```bash
-cargo owner --add github:dbos-inc:dbos-eng dbos
-cargo owner --add github:dbos-inc:dbos-eng dbos-macros
-cargo owner --list dbos
-```
-
-Teams can publish and yank but cannot manage ownership, which is why individual owners stay.
-
 ### Creating a release
 
 From a clean `main`:
