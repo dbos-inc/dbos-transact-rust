@@ -3429,20 +3429,26 @@ impl SystemDatabase for PostgresSystemDatabase {
              WHERE workflow_uuid = ANY($1) AND status NOT IN ({UNSETTLED})"
         );
         let select = &select;
-        let mut outstanding: Vec<String> = workflow_ids.iter().map(|id| (*id).to_owned()).collect();
         // **Where the first-form's caller rejects duplicates, this one accepts them**, because
         // settling is a property of an id rather than a choice between ids — so a repeat is simply
-        // satisfied twice, and this is the wait that actually receives one.
+        // satisfied twice, and this is the wait that actually receives one. A set is what collapses
+        // them, and it collapses them on the way in rather than over the first pass or two.
         //
-        // Correctness never depended on the dedup: `retain` below drops *every* copy of an id that
-        // settles, so duplicates would fall out on their own the first pass one of them did. What
-        // it saves is the array bytes until then. The sort is not an ordering decision — `dedup`
-        // only removes *consecutive* duplicates, and that is the whole of what it is for.
-        outstanding.sort_unstable();
-        outstanding.dedup();
+        // **It is also what keeps the narrowing linear.** A pass removes every id it watched
+        // settle, and over a `Vec` each removal is a scan of the whole outstanding list — a fan-out
+        // of a few thousand pays that once per settled member per pass. TypeScript's
+        // `awaitWorkflowIds` carries its outstanding ids in a `Set` and deletes from it for the
+        // same reason; this is that, spelled in the type.
+        let mut outstanding: HashSet<String> =
+            workflow_ids.iter().map(|id| (*id).to_owned()).collect();
 
         while !outstanding.is_empty() {
-            let ids = &outstanding;
+            // The bind wants a slice, so each pass materialises the ids it is about to ask about.
+            // TypeScript spreads its set into an array in the same spot, for the same reason —
+            // borrowed rather than cloned, because the set outlives the pass and a long fan-out
+            // would otherwise copy every outstanding id once per interval.
+            let ids: Vec<&str> = outstanding.iter().map(String::as_str).collect();
+            let ids = &ids;
             let settled = with_retry(&self.retry, "await_workflow_ids", move || async move {
                 let _permit = polling
                     .acquire()
@@ -3457,9 +3463,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             for row in &settled {
                 let id: String = row.try_get("workflow_uuid")?;
-                // A linear scan of a list that is only ever shrinking, over a set small enough to
-                // name in one query — a hash set would cost more to build than it saves.
-                outstanding.retain(|outstanding| *outstanding != id);
+                outstanding.remove(&id);
             }
             if outstanding.is_empty() {
                 break;

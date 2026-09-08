@@ -1054,8 +1054,11 @@ async fn awaiting_a_child_is_recorded_as_a_step() {
 
 /// A replayed parent takes the recorded outcome instead of waiting on the child again.
 ///
-/// The child is deleted out from under the recovered parent — a workflow that no longer exists
-/// cannot be awaited, so finishing anyway is only possible from the recorded value.
+/// The child is deleted out from under the recovered parent, which is how the test tells the two
+/// apart: a workflow that no longer exists cannot be awaited, so finishing anyway is only possible
+/// from the recorded value. **The deletion is the instrument, not the subject.** Removing a
+/// workflow another one is still replaying through is outside what the engine defines — this pins
+/// where the value is read from, not a promise that a parent survives losing its children.
 #[tokio::test]
 async fn a_replayed_parent_reads_the_recorded_outcome_rather_than_waiting_again() {
     let db = test_database().await;

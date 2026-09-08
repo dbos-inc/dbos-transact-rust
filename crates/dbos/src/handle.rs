@@ -126,9 +126,17 @@ where
     ///
     /// **Awaited from inside the workflow that started it, this is a durable step.** The parent
     /// records what the child returned, so a replayed parent continues from a value it already has
-    /// rather than waiting again on a workflow that may since have been forked or deleted — and the
-    /// wait costs one row read instead of a poll to completion. All four implementations record it,
-    /// under the same name, `DBOS.getResult`.
+    /// rather than waiting again on a workflow that may since have been forked — and the wait costs
+    /// one row read instead of a poll to completion. All four implementations record it, under the
+    /// same name, `DBOS.getResult`.
+    ///
+    /// **That the row survives its child is a property of the recording, not a guarantee against
+    /// deletion.** The value lives in the *parent's* `operation_outputs`, so a replay that has
+    /// reached this step reads it back whether or not the child's own row is still there. What that
+    /// buys is real and it is worth knowing, but it is not a licence: deleting a workflow something
+    /// live still replays through is collecting what is not garbage, and what the parent does then
+    /// is undefined — this call happens to finish, and a
+    /// [`join_workflows`](crate::join_workflows()) over the same child does not.
     ///
     /// **A handle from a [`Client`](crate::Client) awaited there is a plain wait**, because a
     /// client has no step counter of its own to agree with the workflow's: nothing is recorded,
