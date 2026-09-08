@@ -145,6 +145,10 @@ and the tooling moves both together.
 than claiming to be a version that shipped, and a stray `cargo publish` from `main` fails the
 exact-version pin instead of quietly shipping a release-numbered build.
 
+Released lines live on their own branches. A final release cuts `release/vX.Y` at the release
+commit, and patches to that line are made there rather than on `main` — the same layout the Java
+and Python SDKs use.
+
 Cargo will **never** resolve a caret requirement to a prerelease. Someone who writes
 `dbos = "0.5"` will not get `0.5.0-rc.1`; they have to ask for it by exact version. That is what
 makes release candidates safe to publish.
@@ -180,14 +184,15 @@ scripts/release.sh release             # 0.5.0-dev -> 0.5.0, then main -> 0.6.0-
 ```
 
 This bumps the workspace version and the exact-version pin, commits, tags `v<version>`, publishes
-`dbos-macros`, waits for it to appear on the index, publishes `dbos`, pushes, and then commits
-`main` at the next `-dev` version and pushes again.
+`dbos-macros`, waits for it to appear on the index, publishes `dbos`, and pushes. It then does two
+things that matter later: it cuts `release/v0.5` at the release commit, which is the branch any
+patch to that line is built on, and it commits `main` at the next `-dev` version and pushes again.
 
-The order is not optional: `dbos` requires `=<version>` of `dbos-macros` to already be on the
-index, so publishing them the other way round fails verification.
+The publish order is not optional: `dbos` requires `=<version>` of `dbos-macros` to already be on
+the index, so publishing them the other way round fails verification.
 [cargo-release](https://github.com/crate-ci/cargo-release), configured in
 [`release.toml`](./release.toml), handles the ordering and the index wait. It also refuses to
-release from any branch but `main` or from a dirty tree.
+release from a dirty tree, or from any branch but `main` and `release/v*`.
 
 **Run the dry run first.** A crates.io publish is permanent. A version can be yanked, which stops
 new resolutions from selecting it, but it cannot be deleted or replaced.
@@ -237,10 +242,29 @@ change then means retargeting `main` to `2.0.0-dev`, never shipping it in a mino
 
 ### Patch releases
 
-`cargo release patch` cuts one, but only from a `main` that has not yet moved past the release
-being patched. Backporting a fix onto an older minor version needs a release branch, and that
-flow is not set up: no release branches exist, and `scripts/release.sh` does not know about them.
-Add it when a release actually needs patching rather than in advance.
+Patches are cut from a release branch, never from `main`. This is forced by the `-dev`
+convention: the moment `0.5.0` ships, `main` declares `0.6.0-dev`, so there is no point on `main`
+from which `0.5.1` is the next version. `scripts/release.sh` refuses `patch` anywhere but a
+release branch for that reason.
+
+Every final release cuts its own branch, `release/vX.Y`, at the release commit, so the branch you
+need already exists. Check out the one for the line being patched, put the fix on it, and release:
+
+```bash
+git switch release/v0.5
+git cherry-pick <sha>          # the fix, already reviewed and merged to main
+scripts/release.sh patch       # 0.5.0 -> 0.5.1, then 0.5.1 -> 0.5.2, ...
+```
+
+Fix on `main` first, then cherry-pick onto the release branch. A fix that lands only on the
+release branch is a fix that comes back as a regression in the next minor.
+
+A release branch carries plain released versions with no `-dev` suffix, and `patch` bumps
+straight off the last one. Nothing is merged back to `main`: the branch exists to hold the
+released line, and the fix is already on `main` by way of the cherry-pick's source.
+
+Older lines stay patchable indefinitely, since each has its own branch. Patching `0.4.2` after
+`0.6.0` has shipped means checking out `release/v0.4` and running the same command.
 
 ### Publishing from CI
 

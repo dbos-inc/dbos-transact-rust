@@ -13,7 +13,10 @@
 # in `[workspace.dependencies]` is rewritten alongside it.
 shared-version = true
 consolidate-commits = true
-allow-branch = ["main"]
+# `release/v*` is where patch releases are cut: a final release from `main` opens the branch for
+# its minor line, and later fixes are cherry-picked onto it. Which level belongs to which branch
+# is enforced by `scripts/release.sh`, which is the only thing that can tell them apart.
+allow-branch = ["main", "release/v*"]
 tag-name = "v{{version}}"
 # Also used by `scripts/release.sh` for the post-release dev bump commit.
 pre-release-commit-message = "Version {{version}}"
