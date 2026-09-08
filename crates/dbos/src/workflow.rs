@@ -570,8 +570,9 @@ pub(crate) fn new_row<'a>(workflow_id: &'a str, enqueue: Option<&Enqueue<'a>>) -
 /// would be a poor trade to answer that from a task the caller may already have stopped listening
 /// to.
 struct OwnedStart {
-    /// The caller's chosen id, where it named one; otherwise the id is derived in the task.
-    workflow_id: Option<String>,
+    /// The id the child will have, resolved before the task is spawned — see
+    /// [`child_workflow_id`] for why it is settled at the call rather than in the task.
+    workflow_id: String,
     timeout: Timeout,
     queue: Option<OwnedEnqueue>,
     input: Option<String>,
@@ -1069,8 +1070,12 @@ where
         // Taken before the spawn, while the borrowed options are still here to take it from — and
         // the encoding with it, so a payload that cannot be serialised fails this call rather than
         // a task the caller may have stopped listening to.
+        // Resolved while the placement is still whole, since deriving an id needs the parent it
+        // is derived from — and resolved *here* rather than in the task so that this call can name
+        // the workflow whatever becomes of the task.
+        let workflow_id = child_workflow_id(options.workflow_id, placed.parent().as_ref());
         let request = OwnedStart {
-            workflow_id: options.workflow_id.map(str::to_owned),
+            workflow_id: workflow_id.clone(),
             timeout: options.timeout,
             queue: options.queue.as_ref().map(OwnedEnqueue::from),
             input: Some(encode(&input, "argument")?),
@@ -1092,11 +1097,33 @@ where
             Ok(started) => started,
             // Only shutdown aborts this task, and an aborted transaction wrote nothing — so the
             // start did not happen, which is the same answer an awaited workflow gives.
-            Err(join) if join.is_cancelled() => Err(Error::Interrupted {
-                workflow_id: self.key().name.clone(),
-            }),
+            Err(join) if join.is_cancelled() => Err(Error::Interrupted { workflow_id }),
             Err(join) => std::panic::resume_unwind(join.into_panic()),
         }
+    }
+}
+
+/// The id the child will have: the one the caller named, or one derived from where the start
+/// stands.
+///
+/// Settled at the call rather than in the task that writes the row, because the task can be
+/// aborted by shutdown and the caller still has to be told *which* start was interrupted. The
+/// answer is the same either way — nothing below reads anything the task could have changed.
+///
+/// A dedup that joins an existing holder runs under a different id than this one, and that is not
+/// a disagreement: this is the id the start would create, which is exactly what a caller learns
+/// from and what a replay of this position derives again.
+fn child_workflow_id(chosen: Option<&str>, parent: Option<&Parent<'_>>) -> String {
+    match (chosen, parent) {
+        // An application-assigned id wins over the derivation, in every reference.
+        (Some(id), _) => id.to_owned(),
+        // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
+        // parent re-derives the same id, so the launch is idempotent even when the crash
+        // landed between creating the child and recording it. Rust's step ids are zero-based
+        // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
+        // so a first child is `parent-0` here and in three of the four.
+        (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
+        (None, None) => uuid::Uuid::new_v4().to_string(),
     }
 }
 
@@ -1121,7 +1148,7 @@ async fn create<R, E>(
     // attributes by reference and then hands the payload on to the run, so owning them here is
     // what keeps a start from copying its own arguments.
     let OwnedStart {
-        workflow_id: chosen_id,
+        workflow_id,
         timeout,
         queue,
         input,
@@ -1158,18 +1185,6 @@ async fn create<R, E>(
             false,
         ));
     }
-
-    let workflow_id = match (chosen_id.as_deref(), &parent) {
-        // An application-assigned id wins over the derivation, in every reference.
-        (Some(id), _) => id.to_owned(),
-        // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
-        // parent re-derives the same id, so the launch is idempotent even when the crash
-        // landed between creating the child and recording it. Rust's step ids are zero-based
-        // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
-        // so a first child is `parent-0` here and in three of the four.
-        (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
-        (None, None) => uuid::Uuid::new_v4().to_string(),
-    };
 
     // **A directly started workflow gets its deadline now, and the row carries it.** Python
     // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
