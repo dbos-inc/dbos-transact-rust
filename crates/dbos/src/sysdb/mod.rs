@@ -349,6 +349,12 @@ pub trait SystemDatabase: Send + Sync {
     /// removes them either — [`join_workflows`](crate::DBOS::join_workflows) passes the caller's
     /// slice through as it was given — so an implementation must expect them.
     ///
+    /// **Nothing above checkpoints this wait**, where
+    /// [`await_first_workflow_id`](Self::await_first_workflow_id) is recorded when a workflow makes
+    /// it: an all-wait decides nothing, so a replay simply asks again and is answered by a set that
+    /// has already settled. TypeScript records its `waitAll` and this does not — the
+    /// free [`join_workflows`](crate::join_workflows()) sets out why.
+    ///
     /// Narrowing the array it sends is then an implementation's own business rather than a
     /// contract: the Postgres one de-duplicates once before its first pass, which buys array bytes
     /// and nothing else, since the narrowing above drops *every* copy of an id the moment one of
