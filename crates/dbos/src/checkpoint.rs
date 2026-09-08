@@ -4,7 +4,7 @@
 //! waiting on a set of handles, reading an event. Each is a single durable act that a replay must
 //! not perform twice, so each takes a step id from the ambient workflow and records its answer
 //! under it — which is exactly what makes it a step, and what puts it here beside the ones
-//! [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no user body,
+//! [`step`](crate::step()) builds. What none of them is is a `step` *call*: there is no user body,
 //! no retry policy and no timeout, so none of them goes through `step_with`.
 //!
 //! **Being a step and being a [`PendingStep`] are the same thing.** `step` and `step_with` take
@@ -403,7 +403,7 @@ pub(crate) fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
 
 /// Where a durable call stands: which of the workflow's step ids it occupies, if any.
 ///
-/// **One type for both kinds of step.** A *user step* is what [`step`](crate::step) and
+/// **One type for both kinds of step.** A *user step* is what [`step`](crate::step()) and
 /// [`step_with`](crate::step_with) build: a body the caller wrote, a retry policy, a timeout. A
 /// *library step* is one this crate writes on the caller's behalf — awaiting a workflow's result,
 /// waiting on a set of handles, reading or setting an event, a checkpointed management call. They
@@ -552,7 +552,7 @@ impl StepPlacement {
     /// Where a call served by the ambient workflow's own executor stands.
     ///
     /// [`of`](Self::of) with no second connection to disagree with, which is every *user* step:
-    /// [`step`](crate::step) is always served by the workflow it is written in, so
+    /// [`step`](crate::step()) is always served by the workflow it is written in, so
     /// [`ClientConnection`](Self::ClientConnection) is unreachable and
     /// [`Error::WrongInstance`] cannot arise. That is the whole of why this cannot fail where
     /// `of` can.
@@ -639,7 +639,7 @@ impl StepPlacement {
     /// it.** An id is a claim on one position in one workflow, so a call carried somewhere that
     /// cannot honour it is refused rather than run: the alternatives are recording it under the
     /// wrong workflow's id, or running it unrecorded where the surrounding workflow expects a
-    /// checkpoint and every replay would run it again. [`step`](crate::step) asks this at the
+    /// checkpoint and every replay would run it again. [`step`](crate::step()) asks this at the
     /// run, and [`PendingStep`]'s poll asks it for every placed call.
     ///
     /// `step` names the call for [`Error::StepBuiltElsewhere`].

@@ -3,7 +3,7 @@
 //! A workflow that races two steps has made a **choice**, and a choice a workflow makes has to be
 //! recorded — a replay that raced again could see the other branch finish first and take a path
 //! the first execution never took, which is the one thing a workflow may never do. That is the
-//! whole reason this module exists where a `tokio::join!` over [steps](crate::step) needs nothing:
+//! whole reason this module exists where a `tokio::join!` over [steps](crate::step()) needs nothing:
 //! an all-wait decides nothing, so there is nothing for a replay to get differently.
 //!
 //! **A plain `tokio::select!` over steps is the trap this replaces.** Since a step takes its id
@@ -38,7 +38,7 @@
 //! be:
 //!
 //! - *Infer the winner from the branch that recorded.* A row does not mean a branch finished.
-//!   [`sleep`](crate::sleep) checkpoints the instant it will wake at and waits afterwards, so a
+//!   [`sleep`](crate::sleep()) checkpoints the instant it will wake at and waits afterwards, so a
 //!   **losing** sleep leaves a row that is, in the row, indistinguishable from a winner's — and a
 //!   losing sleep is what a timeout race has. Nothing in the row separates them: a durable sleep
 //!   is stamped complete at its wake time, which a later recovery reads as long past, and a
@@ -71,8 +71,8 @@
 //!
 //! # What may be a branch
 //!
-//! A [`PendingStep`] — a [`step`](crate::step), a
-//! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep), an event, a wait,
+//! A [`PendingStep`] — a [`step`](crate::step()), a
+//! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep()), an event, a wait,
 //! a management call. Every one of them **observes**: it claims one id, records one row, and a
 //! replay of it reads that row back rather than doing the thing again.
 //!
@@ -299,7 +299,7 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
 /// Takes a control signal out of the winning branch's slot, if that is what it holds.
 ///
 /// **A control signal is not the race's decision.** A step that ends in a cancellation, an
-/// interruption or a database failure records nothing — [`step`](crate::step) hands it back with
+/// interruption or a database failure records nothing — [`step`](crate::step()) hands it back with
 /// the row untouched, so the workflow stays pending and is recovered — and the race it won has to
 /// do the same. Recording that branch as the winner would pin every recovery to a branch that
 /// never ran its body and never race the others again; and a control signal tends to arrive

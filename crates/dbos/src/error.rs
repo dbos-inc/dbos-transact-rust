@@ -583,7 +583,7 @@ impl Error<EngineOnly> {
     /// let status = child.status().await.map_err(Error::lift)?;
     /// ```
     ///
-    /// The workflow's own calls do not need it: [`step`](crate::step),
+    /// The workflow's own calls do not need it: [`step`](crate::step()),
     /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) answer in the caller's
     /// channel, so `?` works on them directly. A child's [`start`](crate::WorkflowRef::start),
     /// [`run`](crate::WorkflowRef::run) and the await of its handle answer in the *child's*

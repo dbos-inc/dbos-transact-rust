@@ -276,7 +276,7 @@ impl<E> StepOptions<E> {
 /// **A step is polled where it was built.** The id is a claim on one position in one workflow, so
 /// a step built outside a workflow and awaited inside one, carried into a second workflow, or
 /// carried across a step-body boundary in either direction is refused as
-/// [`Error::StepBuiltElsewhere`](crate::Error::StepBuiltElsewhere) rather than run under an id
+/// [`Error::StepBuiltElsewhere`] rather than run under an id
 /// nothing there can honour. The everyday way to trip it is building the step before the workflow
 /// runs — in the handler that then starts it, say — and awaiting it inside.
 ///

@@ -41,7 +41,7 @@
 //!
 //! **They return handles; these return ids.** `DBOS.waitFirst` hands back the handle that won,
 //! which in a language without ownership costs nothing: the caller still holds the others. Handing
-//! back an owned [`WorkflowHandle`] here would mean taking the whole set by value and dropping
+//! back an owned [`WorkflowHandle`](crate::WorkflowHandle) here would mean taking the whole set by value and dropping
 //! every loser, which is precisely the wrong thing for the loop the call exists for. So the answer
 //! is the winner's **id** — the identity the handle carried anyway, and the same thing the
 //! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
@@ -75,7 +75,7 @@
 //! learn for nothing.
 //!
 //! **The recorded step name follows the call**, which is the one place in
-//! [`step_names`](crate::sysdb::types::step_names) that a reference's string is not taken:
+//! [`step_names`] that a reference's string is not taken:
 //! `DBOS.selectWorkflow` where Python and TypeScript write `DBOS.waitFirst`. A step listing should
 //! name the call the caller wrote, and nothing across the SDKs reads another's step names to
 //! decide anything — a replay checks its own workflow's rows. The cost is that one operation has
@@ -120,7 +120,7 @@
 //! whether the recorded winner is still in the set, because the winner is what it recorded anyway.
 //! Step *inputs* are not checkpointed anywhere in DBOS — no implementation's step row has a column
 //! for them — so a replay whose arguments changed reads back the answer to the question it asked
-//! the first time, exactly as a [`sleep`](crate::sleep) whose duration changed keeps the deadline
+//! the first time, exactly as a [`sleep`](crate::sleep()) whose duration changed keeps the deadline
 //! it recorded.
 //!
 //! Outside a workflow the first-wait is not checkpointed either, which is the operator's and the
@@ -200,7 +200,7 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// [`PendingStep`] — so a wait built beside a step and driven with it by `tokio::join!` takes the
 /// same slot on every execution, whatever it was passed: an empty set is placed like any other and
 /// its refusal recorded as the step's own outcome, so a replay refuses again. The error is
-/// the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion. From inside
+/// the *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no conversion. From inside
 /// a *step* it waits plainly with no checkpoint, the step's own checkpoint standing for everything
 /// its body did.
 ///
@@ -361,7 +361,7 @@ pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> cr
 /// written. [`select_workflow`](fn@select_workflow) accepts a repeated id for the same reason: the
 /// answer names one workflow however many entries pointed at it.
 ///
-/// The value is a [`Result`](crate::Result), because the wait itself can fail. Each arm binds its
+/// The value is a [`Result`], because the wait itself can fail. Each arm binds its
 /// own handle's result, so an arm decides for itself whether to `?` it, match it, or report it.
 #[macro_export]
 macro_rules! select_workflow {
