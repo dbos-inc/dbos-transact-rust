@@ -71,9 +71,10 @@ pub struct StepOptions<E = EngineOnly> {
     /// attempts at five seconds may spend fifteen seconds in the body. Python states the same
     /// layering where it puts the supervisor inside the retry loop.
     ///
-    /// Before the future is dropped, [`Ctx::cancellation`](crate::Ctx::cancellation) fires, so work
-    /// the runtime cannot reach by dropping a future — a `spawn_blocking` thread, a client holding
-    /// its own cancel handle — can still be told. Ordinary `async` bodies need nothing.
+    /// Before the future is dropped, the attempt's cancellation token fires. Nothing public
+    /// observes it yet — Python exposes no step-cancellation API either — so what this buys today
+    /// is that ordinary `async` bodies stop at their next suspension point and run their
+    /// destructors, returning connections and releasing guards without the body saying so.
     ///
     /// **Unlike Python, this is not restricted to some kinds of step.** py #826 rejects a timeout
     /// on a sync step because *"Python has no preemption mechanism for sync steps"*; every step
@@ -432,7 +433,7 @@ where
         // on the workflow's own call stack, where it takes a step id from the counter, and the
         // call would then be refused by its own run for being polled inside a step body. Every
         // attempt would spend another id on the way.
-        match supervise(ctx, name, &options, async { body().await }, span).await {
+        match supervise(ctx, name, step_id, &options, async { body().await }, span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
@@ -581,6 +582,7 @@ where
 async fn supervise<T, E, Fut>(
     ctx: &Ctx,
     name: &str,
+    step_id: i32,
     options: &StepOptions<E>,
     body: Fut,
     span: tracing::Span,
@@ -605,7 +607,7 @@ where
     let token = CancellationToken::new();
     let cancel_on_drop = token.clone().drop_guard();
     let attempt = ctx
-        .in_step_scope(Some(token.clone()), body)
+        .in_step_scope(Some(token.clone()), step_id, body)
         .instrument(span);
 
     let outcome = if options.timeout.is_none() && !options.preemptible {
@@ -1142,7 +1144,7 @@ mod tests {
             );
             // Now somewhere its id cannot be honoured: a step body, whose own checkpoint already
             // stands for everything it does.
-            c.in_step_scope(None, built).await
+            c.in_step_scope(None, 0, built).await
         })
         .await;
 

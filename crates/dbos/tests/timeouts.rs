@@ -113,52 +113,6 @@ async fn a_timed_out_body_stops_rather_than_continuing() {
     dbos.shutdown().await;
 }
 
-/// The token fires before the future is dropped, so detached work can be told.
-#[tokio::test]
-async fn the_cancellation_token_fires_before_the_body_is_dropped() {
-    let db = test_database().await;
-    let dbos = DBOS::new(config("token-app", &db));
-    let observed = Arc::new(AtomicBool::new(false));
-    let dbos_observed = Arc::clone(&observed);
-    let workflow = dbos
-        .register_workflow("watches", move |()| {
-            let observed = Arc::clone(&dbos_observed);
-            async move {
-                let options = StepOptions {
-                    timeout: Some(Duration::from_millis(50)),
-                    ..Default::default()
-                };
-                dbos::step_with("watches", options, || {
-                    let observed = Arc::clone(&observed);
-                    async move {
-                        let token = dbos::Ctx::current().unwrap().cancellation();
-                        // Work the runtime could not stop by dropping this future: it lives on a
-                        // task of its own and only the token can reach it.
-                        let watcher = tokio::spawn(async move {
-                            token.cancelled().await;
-                            observed.store(true, Ordering::SeqCst);
-                        });
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                        drop(watcher);
-                        Ok::<u32, dbos::Error>(1)
-                    }
-                })
-                .await
-            }
-        })
-        .unwrap();
-    dbos.launch().await.expect("launch failed");
-
-    workflow.run(()).await.expect_err("the workflow succeeded");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        observed.load(Ordering::SeqCst),
-        "detached work was never told the step had timed out"
-    );
-
-    dbos.shutdown().await;
-}
-
 /// A timeout is an ordinary retryable failure, and each attempt gets a fresh one.
 #[tokio::test]
 async fn a_timed_out_attempt_is_retried_with_a_fresh_timeout() {
@@ -359,9 +313,52 @@ async fn a_plain_step_is_not_preemptible() {
     dbos.shutdown().await;
 }
 
-/// **A step abandoned mid-body fires its cancellation token**, so work the runtime cannot stop by
-/// dropping the future — a blocking thread, a task the body spawned — learns that its step is over.
-///
+/// The token fires before the future is dropped, so detached work can be told.
+#[tokio::test]
+async fn the_cancellation_token_fires_before_the_body_is_dropped() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("token-app", &db));
+    let observed = Arc::new(AtomicBool::new(false));
+    let dbos_observed = Arc::clone(&observed);
+    let workflow = dbos
+        .register_workflow("watches", move |()| {
+            let observed = Arc::clone(&dbos_observed);
+            async move {
+                let options = StepOptions {
+                    timeout: Some(Duration::from_millis(50)),
+                    ..Default::default()
+                };
+                dbos::step_with("watches", options, || {
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        let token = dbos::cancellation_token();
+                        // Work the runtime could not stop by dropping this future: it lives on a
+                        // task of its own and only the token can reach it.
+                        let watcher = tokio::spawn(async move {
+                            token.cancelled().await;
+                            observed.store(true, Ordering::SeqCst);
+                        });
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        drop(watcher);
+                        Ok::<u32, dbos::Error>(1)
+                    }
+                })
+                .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    workflow.run(()).await.expect_err("the workflow succeeded");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "detached work was never told the step had timed out"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// The timeout and preemption paths cancel the token themselves, but a step can be abandoned in
 /// other ways: a caller dropping it, or a combinator dropping it as a losing branch. Those left the
 /// token silent, and a step with neither watchdog had no token to fire at all. Here the step is
@@ -387,7 +384,7 @@ async fn a_dropped_step_fires_its_cancellation_token() {
                         let released = Arc::clone(&released);
                         let started = started.take();
                         async move {
-                            let token = dbos::Ctx::current().expect("in a step").cancellation();
+                            let token = dbos::cancellation_token();
                             tokio::spawn(async move {
                                 token.cancelled().await;
                                 released.notify_one();
@@ -434,8 +431,7 @@ async fn a_completed_step_leaves_its_cancellation_token_alone() {
                     move || {
                         let slot = Arc::clone(&slot);
                         async move {
-                            *slot.lock().unwrap() =
-                                Some(dbos::Ctx::current().expect("in a step").cancellation());
+                            *slot.lock().unwrap() = Some(dbos::cancellation_token());
                             Ok::<u32, Error>(1)
                         }
                     }
@@ -452,14 +448,13 @@ async fn a_completed_step_leaves_its_cancellation_token_alone() {
                 .await?;
                 // Read once each step has returned. The guard disarms on the way out, so a token a
                 // completed body handed to its own background work stays quiet.
-                let fired =
-                    |slot: &std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>| {
-                        slot.lock()
-                            .unwrap()
-                            .as_ref()
-                            .expect("the body ran")
-                            .is_cancelled()
-                    };
+                let fired = |slot: &std::sync::Mutex<Option<dbos::CancellationToken>>| {
+                    slot.lock()
+                        .unwrap()
+                        .as_ref()
+                        .expect("the body ran")
+                        .is_cancelled()
+                };
                 Ok::<(bool, bool), Error>((fired(&plain), fired(&watched)))
             }
         })
@@ -470,7 +465,7 @@ async fn a_completed_step_leaves_its_cancellation_token_alone() {
     assert_eq!(
         workflow.run(()).await.expect("the workflow failed"),
         (false, false),
-        "a step that completed cancelled its own token"
+        "a completed step cancelled its own token"
     );
 
     dbos.shutdown().await;

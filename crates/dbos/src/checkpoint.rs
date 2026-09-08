@@ -861,7 +861,7 @@ mod tests {
         // The only way to hold one: the marker is bound by the scope, so the body reads it back
         // out. What a step body's own calls see.
         let body =
-            || proper.in_step_scope(None, async { Ctx::current().expect("inside the scope") });
+            || proper.in_step_scope(None, 0, async { Ctx::current().expect("inside the scope") });
         let in_step = body().await;
         let sibling = body().await;
         assert_ne!(
