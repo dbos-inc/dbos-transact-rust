@@ -154,6 +154,13 @@ pub use wait::{join_workflows, select_workflow};
 /// with and replays from its own row when it is the recorded winner, so a race between a step and
 /// the await of a child is as durable as one between two steps.
 ///
+/// **Where *every* branch is a workflow's outcome, reach for
+/// [`select_workflow!`](macro@crate::select_workflow) instead.** Both are durable; the difference
+/// is what they cost. One wait settles the whole set — one query per poll interval however many
+/// handles it is given — where N awaits raced here are N pollers asking separately. This macro is
+/// for a race whose branches are *not* all of one kind: a step against an await, a sleep against
+/// an event.
+///
 /// **A [`start`](WorkflowRef::start) and a [`run`](WorkflowRef::run) are refused, by type.** Both
 /// hand back a [`PendingWorkflow`] rather than a `PendingStep`, and both *create* a workflow: only
 /// the winner is polled on a replay, so whether a child exists at all would follow the timing of

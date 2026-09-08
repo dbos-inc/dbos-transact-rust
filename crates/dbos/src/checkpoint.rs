@@ -65,15 +65,21 @@
 //!
 //! What to reach for instead, inside a workflow body:
 //!
+//! - **Racing durable calls**: [`select_step!`](crate::select_step), which is `tokio::select!`'s
+//!   answer here — it records *which branch won* and a replay polls only that one, so the choice
+//!   is replayed rather than made again.
 //! - **Racing workflows**: [`select_workflow!`](macro@crate::select_workflow), which records the
-//!   winner and awaits only it.
+//!   winner and awaits only it. Where every branch is a workflow's outcome this is the call to
+//!   reach for rather than `select_step!` over the handles' awaits: it settles the whole set with
+//!   one query per poll interval, where N racing awaits poll N times.
 //! - **Bounding how long something may take**: the call's own deadline —
 //!   [`get_event`](crate::get_event) and [`recv`](crate::recv) take one, a step carries its
 //!   timeout, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout).
 //!   Each of those is recorded; a `timeout` around the future is not.
-//! - **Racing anything else**: put the race *inside a step*. A step is a leaf whose checkpoint
-//!   stands for everything its body did, so a `select!` or a `timeout` in there is replayed as the
-//!   one answer the step recorded, and nothing about how it was reached has to be reproduced.
+//! - **Racing anything else** — a future this crate knows nothing about, or a wall clock: put the
+//!   race *inside a step*. A step is a leaf whose checkpoint stands for everything its body did,
+//!   so a `select!` or a `timeout` in there is replayed as the one answer the step recorded, and
+//!   nothing about how it was reached has to be reproduced.
 //!
 //! That last line is the general rule and the reason the others are narrow: **the ban is on racing
 //! in a workflow body, not on racing.** Inside a step body, or outside a workflow entirely, the
@@ -83,10 +89,11 @@
 //! above: [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a
 //! workflow, and a race polls in source order and stops at the first branch that is ready — so
 //! whether the child exists at all would follow the timing of some other branch. Start outside the
-//! race; race what observes the result. Being their own types keeps them out of everything here
-//! that is typed on a [`PendingStep`], but a race is not one of those: `select!` takes any future,
-//! so this paragraph is what stands between a body and that mistake, exactly as it does for every
-//! other call above.
+//! race; race what observes the result. Being their own types is what keeps them out of a durable
+//! race in particular: [`select_step!`](crate::select_step) pushes each branch onto a set that
+//! takes a [`PendingStep`], so a start handed to one is a type error rather than a paragraph
+//! ignored. What no type stops is `tokio::select!`, which takes any future — there this paragraph
+//! is what stands between a body and the mistake, exactly as it does for every other call above.
 //!
 
 use std::future::Future;
@@ -142,8 +149,10 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// first execution never took. A `timeout` is that same race against a clock, and the clock is not
 /// replayed either. An all-wait decides nothing, which is why `join!` needs no help.
 ///
-/// Inside a workflow body, reach for these instead: race workflows with
-/// [`select_workflow!`](macro@crate::select_workflow), which records its winner; bound a call with
+/// Inside a workflow body, reach for these instead: race durable calls with
+/// [`select_step!`](crate::select_step), which records which branch won and replays only that one;
+/// race workflows with [`select_workflow!`](macro@crate::select_workflow), which records its
+/// winner and is the cheaper call where every branch is a workflow's outcome; bound a call with
 /// the deadline it already takes — [`get_event`](crate::get_event) and [`recv`](crate::recv) take
 /// one, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout); and put
 /// any other race **inside a step**, whose checkpoint stands for however its body reached the
