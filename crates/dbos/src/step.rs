@@ -277,8 +277,8 @@ impl<E> StepOptions<E> {
 /// a step built outside a workflow and awaited inside one, carried into a second workflow, or
 /// carried across a step-body boundary in either direction is refused as
 /// [`Error::StepBuiltElsewhere`](crate::Error::StepBuiltElsewhere) rather than run under an id
-/// nothing there can honour. The everyday way to trip it is evaluating the step before the context
-/// exists: `Ctx::scope(ctx, step(..))` builds it outside and polls it inside.
+/// nothing there can honour. The everyday way to trip it is building the step before the workflow
+/// runs — in the handler that then starts it, say — and awaiting it inside.
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.
@@ -597,7 +597,7 @@ where
     // **Every attempt gets a token, and it fires wherever the attempt is abandoned.** The guard
     // cancels it if this future is dropped — a caller dropping the step, a combinator dropping it
     // as a losing branch, the `select!` below losing the attempt to a watchdog — so work the
-    // runtime cannot stop by dropping, a `spawn_blocking` thread watching `ctx.cancellation()`,
+    // runtime cannot stop by dropping, a `spawn_blocking` thread watching `cancellation_token()`,
     // learns that its step is over in every one of those cases and not only the two this function
     // races itself.
     //

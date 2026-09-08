@@ -28,11 +28,10 @@ tokio::task_local! {
 /// an id allocated through the other.
 ///
 /// **Internal.** Everything a workflow may ask about itself is a free function —
-/// [`workflow_id`](crate::workflow_id), [`step_id`](crate::step_id) and
-/// [`cancellation_token`](crate::cancellation_token) — so user code never names this type or
-/// reaches through it. That keeps the ambient context an implementation detail: the questions are
-/// stable API, the
-/// thing that answers them is not.
+/// [`workflow_id`](crate::workflow_id), [`step_id`](crate::step_id),
+/// [`step_status`](crate::step_status) and [`cancellation_token`](crate::cancellation_token) — so
+/// user code never names this type or reaches through it. That keeps the ambient context an
+/// implementation detail: the questions are stable API, the thing that answers them is not.
 #[derive(Clone)]
 pub(crate) struct Ctx {
     executor: Arc<Executor>,
@@ -378,24 +377,14 @@ impl Ctx {
         CURRENT.scope(scoped, body).await
     }
 
-    /// Fires when the running step should stop.
+    /// Fires when the running step should stop: the attempt's token, or one that never fires when
+    /// there is no step running.
     ///
-    /// Observe it from work the runtime cannot stop by dropping this future — a `spawn_blocking`
-    /// thread, or a client that holds its own cancel handle. It fires whenever the attempt ends
-    /// **without completing**: a timeout, a cancelled workflow, or anything else that drops the
-    /// step's future. An attempt that reaches an outcome does *not* fire it, because the body has
-    /// had its chance to clean up and work it deliberately left running is not the engine's to
-    /// stop. **Ordinary `async` code needs nothing**: a step that times out has its future dropped,
-    /// which stops it at its next suspension point and runs its destructors on the way out, so a
-    /// connection is returned and a guard released without the body containing a line about it.
-    /// That is what TypeScript's `stepStatus.timeoutSignal` is for, and Rust gets the common case
-    /// for free where TypeScript has to abandon the attempt and discard its eventual settlement.
-    ///
-    /// Returns a token that is never cancelled when there is no step running, so a body that is
-    /// also called outside a workflow needs no second path.
+    /// What [`cancellation_token`](crate::cancellation_token) hands out; its documentation says
+    /// when the token fires and who should watch it.
     pub(crate) fn cancellation(&self) -> CancellationToken {
-        // `unwrap_or_default` means exactly one thing now: there is no step here, and a token
-        // that never fires is the honest answer.
+        // `unwrap_or_default` means exactly one thing: there is no step here, and a token that
+        // never fires is the honest answer.
         self.step
             .as_ref()
             .map(|step| step.cancellation.clone())

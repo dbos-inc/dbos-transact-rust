@@ -354,8 +354,8 @@ pub enum Error<E = EngineOnly> {
     ///
     /// - **Built outside a workflow, awaited inside one.** It took no id, so it would run
     ///   unrecorded where the surrounding workflow plainly expects a checkpoint, and every replay
-    ///   would run it again. Easy to reach by accident — `Ctx::scope(ctx, step(..))` evaluates the
-    ///   step before the scope exists.
+    ///   would run it again. Easy to reach by accident: a step built in the handler that then
+    ///   starts the workflow, and awaited from the workflow body.
     /// - **Built in one workflow, polled in another.** Its row would land under the wrong
     ///   workflow's id.
     /// - **Built inside a step body, awaited in the workflow proper**, or inside a *different*
