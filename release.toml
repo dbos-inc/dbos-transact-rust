@@ -1,0 +1,21 @@
+# `cargo release` configuration. Releases are cut by `scripts/release.sh`, which runs
+# `cargo release` and then moves `main` on to the next `-dev` version (cargo-release 1.x has no
+# built-in post-release bump). Version levels, from a `main` at `0.5.0-dev`:
+#
+#     scripts/release.sh rc       # 0.5.0-dev  -> 0.5.0-rc.1, then 0.5.0-rc.1 -> 0.5.0-rc.2 ...
+#     scripts/release.sh release  # 0.5.0-dev or 0.5.0-rc.N -> 0.5.0, then main -> 0.6.0-dev
+#
+# Only `dbos-macros` and `dbos` are published, in that order: `dbos` requires `=<version>` of
+# the macros, which must already be on the index, and cargo-release waits for it to appear.
+# `test-support` and the demo apps are `publish = false` and only have their version moved.
+
+# Every member inherits `workspace.package.version`, and the `dbos-macros = "=..."` requirement
+# in `[workspace.dependencies]` is rewritten alongside it.
+shared-version = true
+consolidate-commits = true
+allow-branch = ["main"]
+tag-name = "v{{version}}"
+# Also used by `scripts/release.sh` for the post-release dev bump commit.
+pre-release-commit-message = "Version {{version}}"
+publish = true
+push = true
