@@ -79,11 +79,14 @@
 //! in a workflow body, not on racing.** Inside a step body, or outside a workflow entirely, the
 //! whole of tokio is available.
 //!
-//! Two calls are kept out of a durable race by their own types rather than by this paragraph, and
-//! for a different reason than the one above: [`PendingStart`](crate::PendingStart) and
-//! [`PendingRun`](crate::PendingRun) *create* a workflow, and a race polls in source order and
-//! stops at the first branch that is ready — so whether the child exists at all would follow the
-//! timing of some other branch. Start outside the race; race what observes the result.
+//! Two calls are named for this rule by their own types, and for a different reason than the one
+//! above: [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a
+//! workflow, and a race polls in source order and stops at the first branch that is ready — so
+//! whether the child exists at all would follow the timing of some other branch. Start outside the
+//! race; race what observes the result. Being their own types keeps them out of everything here
+//! that is typed on a [`PendingStep`], but a race is not one of those: `select!` takes any future,
+//! so this paragraph is what stands between a body and that mistake, exactly as it does for every
+//! other call above.
 //!
 
 use std::future::Future;

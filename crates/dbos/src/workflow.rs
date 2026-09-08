@@ -1010,13 +1010,18 @@ where
     /// one position in one execution, and a start carried somewhere that cannot honour it is
     /// refused as [`Error::StepBuiltElsewhere`] rather than run.
     ///
-    /// **A start that is polled and then dropped still starts the child**, which is what makes a
-    /// `select!` or a `timeout` over one safe to write. Dropping a future cannot undo a committed
-    /// row, so the half that writes rows runs detached and finishes on its own. The caller loses
-    /// the handle and nothing else: the child exists,
-    /// its start is recorded against this parent, and a replay of this position joins it rather
-    /// than starting a second. A start that is *never* polled writes nothing at all, and has still
-    /// spent its step id.
+    /// **A start that is polled and then dropped still starts the child.** Dropping a future
+    /// cannot undo a committed row, so the half that writes rows runs detached and finishes on its
+    /// own. The caller loses the handle and nothing else: the child exists, its start is recorded
+    /// against this parent, and a replay of this position joins it rather than starting a second.
+    /// A start that is *never* polled writes nothing at all, and has still spent its step id.
+    ///
+    /// That is what makes an *interrupted* start harmless; it is not licence to race one. **A
+    /// `select!` or a `timeout` over a start is forbidden** for a reason drops do not reach: a
+    /// race stops at the first branch that is ready, so whether this branch was polled at all
+    /// follows the timing of another — and a child that exists on one execution and not on its
+    /// replay is a side effect no replay reproduces. Start outside the race and race what
+    /// *observes* the result; [`PendingWorkflow`] has the whole of it.
     pub fn start_with<'a>(&'a self, input: P, options: StartOptions<'a>) -> PendingStart<'a, R, E> {
         // The workflow's bare name, which is what the start records against the parent and
         // therefore what a refusal should call this call.
@@ -1379,8 +1384,8 @@ async fn create<R, E>(
 /// read. Awaiting one starts the workflow, so `child.start(x).await?` and `child.run(x).await?`
 /// read exactly as they did when both were `async fn`s, and not one call site had to change.
 ///
-/// **A newtype over [`PendingStep`] rather than a `PendingStep`, so a durable race cannot take
-/// one**, and the reason is not that dropping one leaves anything broken. It does not: dropped
+/// **A newtype over [`PendingStep`] rather than a `PendingStep`, because a durable race must not
+/// take one**, and the reason is not that dropping one leaves anything broken. It does not: dropped
 /// before its first poll it writes nothing, and dropped after one it finishes on its own — see
 /// [`start_with`](WorkflowRef::start_with). The reason is that a race would make a **workflow's
 /// existence depend on poll order**. A durable race polls its branches in source order and stops
@@ -1395,6 +1400,13 @@ async fn create<R, E>(
 /// the winner however many handles it is given; where a workflow is raced against a step it is the
 /// handle's [`result`](crate::WorkflowHandle::result) that belongs in the arm. Either way the
 /// workflows are created before the race, and the race decides only which one is watched.
+///
+/// **The type states the rule; it does not enforce it.** This implements [`Future`], as anything
+/// awaited must, and `tokio::select!` takes any future — so a race over a start compiles, and no
+/// diagnostic stands between a body and the hazard above. What the newtype buys is narrower and
+/// still worth having: a start is not a [`PendingStep`], so nothing in the crate that is typed on
+/// one can be handed a call that creates a workflow, and a reader looking at a raced branch finds
+/// the rule on the type the branch names.
 ///
 /// **`Unpin`, and the check the inner [`PendingStep`] makes on every poll is inherited** — this
 /// delegates its `poll` rather than reaching past it, so a start is held to the workflow it was
