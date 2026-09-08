@@ -205,6 +205,36 @@ when external testers want something more stable than a git branch.
 Unlike a final release, an `rc` leaves `main` at the candidate version rather than bumping to
 `-dev`. The next `rc` or the `release` that finalises it moves `main` on.
 
+### Major releases
+
+Nothing is ever promoted to a new major version automatically. A release from a `main` at
+`0.9.0-dev` produces `0.9.0`, and the post-release bump moves `main` to `0.10.0-dev`, not to
+`1.0.0-dev`. Crossing to `1.0` is always a deliberate act.
+
+Because the `-dev` version on `main` *declares* what ships next, that is where the decision is
+recorded. Retarget `main` in an ordinary reviewed PR:
+
+```bash
+cargo release version 1.0.0-dev --execute
+```
+
+That rewrites the workspace version and the exact-version pin together. Commit, review, merge.
+This is the natural place to land the breaking-change notes, since merging it is the moment the
+team agrees the next release is a major one. Then release exactly as usual: `scripts/release.sh rc`
+for candidates, then `scripts/release.sh release` to ship `1.0.0` and move `main` to `1.1.0-dev`.
+
+`cargo release major` would also get from `0.9.0-dev` to `1.0.0` in one step, but it decides the
+bump at release time, on one person's machine, in a command nobody reviews. `scripts/release.sh`
+accepts only `rc` and `release` for that reason. The same applies to `2.0` later: retarget `main`
+to `2.0.0-dev` and release.
+
+**Cargo's compatibility rules change at `1.0`.** Below it, every minor bump is breaking, so
+`dbos = "0.5"` will not pick up `0.6` and each release is an explicit upgrade for users. From
+`1.0` onward, minor and patch releases are compatible: `dbos = "1"` follows every `1.x`
+automatically, and only a major bump asks users to do anything. So the post-release `-dev` bump
+means something new after `1.0` — `1.1.0-dev` promises the next release is additive. A breaking
+change then means retargeting `main` to `2.0.0-dev`, never shipping it in a minor.
+
 ### Patch releases
 
 `cargo release patch` cuts one, but only from a `main` that has not yet moved past the release
