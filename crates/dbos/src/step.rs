@@ -1110,12 +1110,23 @@ mod tests {
         let c = ctx(&dbos, "wf-relocated");
 
         let outcome = Ctx::scope(c.clone(), async {
-            let mut built = step("moved", || async { Ok::<_, crate::Error>(1u32) });
+            // The body never finishes, so it does not matter how far one poll gets: whether it
+            // suspends in the round trip that asks whether this step has already run or in the
+            // body itself, nothing has been written when the step is moved. A body that returns
+            // immediately leaves that to scheduling — one poll runs until the first suspension,
+            // and on a loaded machine the reply to that round trip can already be waiting, which
+            // carries the poll through the body and into the checkpoint's own write. The
+            // assertion below would then be about which read happened to be ready rather than
+            // about the rule, and it has failed in CI for exactly that.
+            let mut built = step("moved", || async {
+                std::future::pending::<()>().await;
+                Ok::<_, crate::Error>(1u32)
+            });
             let started = std::pin::Pin::new(&mut built)
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
             assert!(
                 started.is_pending(),
-                "the first poll should reach the database and suspend, leaving the run started"
+                "the first poll should suspend, leaving the run started"
             );
             // Now somewhere its id cannot be honoured: a step body, whose own checkpoint already
             // stands for everything it does.
