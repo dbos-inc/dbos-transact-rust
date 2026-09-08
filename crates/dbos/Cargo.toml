@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = ["engine"]
+default = ["engine", "macros"]
 # Gates the durable execution engine: the lifecycle, registry, contexts, workflows, steps,
 # events, recovery, queues and the client so far, with the scheduler and messaging to come.
 # With it off, what remains is the system database and Conductor layers — the surface a future
@@ -23,10 +23,21 @@ default = ["engine"]
 # dev-dependencies happened to turn the feature on for the test build — which `cargo doc` and
 # `--no-default-features` both see through.
 engine = ["tokio/rt", "tokio/macros"]
-# A `macros` feature (implying `engine`) arrives with the `dbos-macros` crate. Adding a
-# feature is not a breaking change, so it waits until it re-exports something.
+# Re-exports `select_step!` from `dbos-macros`. Implies `engine`, because the expansion is engine
+# code — it names the race's checkpoint through `dbos::__private`.
+#
+# **Default-on**, which is a decision about what a durable race is: not an advanced corner of the
+# API but the only sound way to race inside a workflow body, and a macro nobody enabled is a trap
+# rather than a feature — the mistake it exists to prevent is the one a caller reaches for when it
+# is missing. What it costs is `syn` and `quote` at build time, in a crate the compiler loads and
+# links into nothing, and a build that would rather not pay it can turn the feature off.
+macros = ["engine", "dep:dbos-macros"]
 
 [dependencies]
+# `select_step!`, behind the `macros` feature. Version-locked with `=` because the expansion names
+# `dbos::__private`, which is this crate's own unstable surface: a macro crate one version out of
+# step with the crate it expands into would name paths that are not there.
+dbos-macros = { path = "../dbos-macros", version = "=0.1.2", optional = true }
 # The system database layer talks to PostgreSQL directly. `AssertSqlSafe` in 0.9 means any
 # runtime-built SQL — every rendered migration — must be explicitly vouched for.
 sqlx = { version = "0.9", default-features = false, features = [
