@@ -9,6 +9,7 @@ members = [
     "crates/dbos-macros",
     "crates/test-support",
     "demo-apps/dbos-rust-starter",
+    "demo-apps/dbos-rust-widget-store",
 ]
 
 [workspace.package]

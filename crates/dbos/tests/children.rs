@@ -2137,7 +2137,7 @@ async fn a_losing_step_has_its_cancellation_token_fired() {
                         let released = Arc::clone(&released);
                         let watching = watching.take();
                         async move {
-                            let token = dbos::Ctx::current().expect("in a step").cancellation();
+                            let token = dbos::cancellation_token();
                             tokio::spawn(async move {
                                 token.cancelled().await;
                                 released.notify_one();

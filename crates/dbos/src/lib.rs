@@ -86,7 +86,7 @@ pub use client::{Client, ClientConfig, EnqueueOptions};
 #[cfg(feature = "engine")]
 pub use config::{Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
-pub use context::Ctx;
+pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
@@ -113,6 +113,15 @@ pub use sleep::sleep;
 pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit, WorkflowDelay};
+// Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
+// oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so
+// this makes `tokio-util` a public dependency rather than sparing anyone one — a major bump of it
+// is a breaking change here, and an application on a different major sees a type mismatch the
+// moment it passes a token across this boundary. The alternative, a newtype, would have to
+// reimplement the half of `CancellationToken` a body actually waits on, to hide a coupling that
+// watching a token is anyway.
+#[cfg(feature = "engine")]
+pub use tokio_util::sync::CancellationToken;
 #[cfg(feature = "engine")]
 pub use wait::{join_workflows, select_workflow};
 
@@ -182,7 +191,7 @@ pub use wait::{join_workflows, select_workflow};
 /// was meant.
 ///
 /// **What losing means.** A losing step is dropped mid-body and records nothing, so a replay never
-/// runs it; its [`cancellation`](Ctx::cancellation) token fires on the way out, as it does for a
+/// runs it; its [`cancellation_token`] fires on the way out, as it does for a
 /// timeout, so work it handed to a blocking thread learns to stop. A losing [`sleep`]
 /// is the exception that does leave a row: it checkpoints the instant it will wake at *before*
 /// waiting on it, so what stays behind records an abandoned wait rather than an outcome. A losing
