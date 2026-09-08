@@ -380,6 +380,13 @@ mod tests {
         .await;
 
         assert_eq!(answer.unwrap(), "the namer won with hello");
+        // Polled once, in source order, before the winner was reached: the loser really did start,
+        // so "records nothing" is about the drop rather than about never having run.
+        assert_eq!(
+            loser_ran.load(Ordering::SeqCst),
+            1,
+            "the loser was polled and started before the winner finished"
+        );
         // The loser was *built*, so it spent id 0, and dropped without recording — which is what
         // keeps the numbering stable across a replay that never runs it.
         assert_eq!(

@@ -34,10 +34,9 @@ engine = ["tokio/rt", "tokio/macros"]
 macros = ["engine", "dep:dbos-macros"]
 
 [dependencies]
-# `select_step!`, behind the `macros` feature. Version-locked with `=` because the expansion names
-# `dbos::__private`, which is this crate's own unstable surface: a macro crate one version out of
-# step with the crate it expands into would name paths that are not there.
-dbos-macros = { path = "../dbos-macros", version = "=0.1.2", optional = true }
+# `select_step!`, behind the `macros` feature. The `=` version lock lives in the workspace
+# manifest, beside the version it locks to, so that a bump cannot move one without the other.
+dbos-macros = { workspace = true, optional = true }
 # The system database layer talks to PostgreSQL directly. `AssertSqlSafe` in 0.9 means any
 # runtime-built SQL — every rendered migration — must be explicitly vouched for.
 sqlx = { version = "0.9", default-features = false, features = [

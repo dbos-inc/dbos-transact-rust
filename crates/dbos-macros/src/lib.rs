@@ -93,6 +93,9 @@ impl Parse for Arm {
         refuse_at_arm_start(input)?;
 
         let binding = Pat::parse_multi_with_leading_vert(input)?;
+        if !always_matches(&binding) {
+            return Err(Error::new(binding.span(), REFUTABLE));
+        }
         if input.peek(Token![=>]) {
             return Err(Error::new(
                 input.span(),
@@ -171,6 +174,38 @@ const GUARD: &str = "select_step! takes no guards. A branch that is present on t
                      longer there — so the set of branches has to be a property of the code, not \
                      of a condition. Decide before the race and pick the call, or race one that \
                      returns early.";
+
+/// Whether a pattern always matches, which an arm's binding has to.
+///
+/// The expansion binds with `let`, so a pattern that can fail has nowhere to fall to — and left to
+/// `rustc` it is an `E0005` about a `let` the caller never wrote, with a `let...else` suggestion
+/// pointing into the expansion. Refused here instead, at the pattern.
+///
+/// One shape gets past it: a bare `None`, which is a unit variant to `rustc` and an ordinary
+/// binding to a parser that cannot resolve names. That one still lands on `E0005`, and it is not
+/// the spelling anybody reaches for over a `Result`.
+fn always_matches(pat: &Pat) -> bool {
+    match pat {
+        Pat::Wild(_) | Pat::Rest(_) => true,
+        Pat::Ident(name) => name
+            .subpat
+            .as_ref()
+            .is_none_or(|(_, sub)| always_matches(sub)),
+        Pat::Paren(inner) => always_matches(&inner.pat),
+        Pat::Reference(inner) => always_matches(&inner.pat),
+        Pat::Type(inner) => always_matches(&inner.pat),
+        Pat::Tuple(tuple) => tuple.elems.iter().all(always_matches),
+        _ => false,
+    }
+}
+
+const REFUTABLE: &str = "select_step! binds its branch's whole outcome, so the binding is a name \
+                         rather than a pattern that can fail to match — there is no other arm for \
+                         it to fall to when it does not. `tokio::select!` allows one because a \
+                         branch that fails the pattern is simply disabled, and a disabled branch \
+                         is a branch the replay would not find. Bind the `Result` and take it \
+                         apart in the body: `outcome = call => match outcome { .. }`, or \
+                         `outcome?` to let a failure end the workflow.";
 
 /// Whether a body needs no comma after it, which is `match`'s rule and the list `rustc` uses for
 /// it: an expression that ends in a block ends the arm too.
@@ -475,5 +510,29 @@ mod tests {
         .to_string();
         assert_eq!(expanded.matches("marker_a").count(), 1);
         assert_eq!(expanded.matches("marker_b").count(), 1);
+    }
+
+    /// A refutable binding is the `tokio::select!` reflex, and it is refused at the pattern —
+    /// where `rustc` would have reported `E0005` against a `let` in code the caller never wrote.
+    #[test]
+    fn a_refutable_binding_is_refused() {
+        for arms in [
+            "Ok(a) = one() => a, y = two() => y?",
+            "Err(e) = one() => 0, y = two() => y?",
+            "1 = one() => 0, y = two() => y?",
+            "a | b = one() => 0, y = two() => y?",
+            "got @ Ok(_) = one() => got, y = two() => y?",
+        ] {
+            assert!(refuse(arms).contains("whole outcome"), "{arms}");
+        }
+    }
+
+    /// The bindings that are not a bare name but still always match are left alone — the refusal
+    /// is about matching, not about spelling.
+    #[test]
+    fn an_irrefutable_binding_is_accepted() {
+        assert_eq!(accept("_ = one() => 0, y = two() => y?").arms.len(), 2);
+        assert_eq!(accept("mut x = one() => x?, y = two() => y?").arms.len(), 2);
+        assert_eq!(accept("(a, b) = one() => 0, y = two() => y?").arms.len(), 2);
     }
 }

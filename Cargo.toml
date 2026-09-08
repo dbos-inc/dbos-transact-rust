@@ -24,3 +24,11 @@ authors = ["DBOS, Inc."]
 # `repository` is deliberately unset while dbos-inc/dbos-transact-rust is private: a
 # repository link that 404s is worse than none. Set it when the repo goes public, which
 # has to happen before any non-placeholder release anyway.
+
+[workspace.dependencies]
+# `dbos-macros` expands into `dbos::__private`, this workspace's own unstable surface, so the two
+# are locked to one version with `=`. The pin lives here, next to `workspace.package.version`
+# above, because it has to be bumped in the same edit — a release that moves the workspace version
+# and leaves this behind either fails to publish `dbos` or resolves a macro naming paths that have
+# moved.
+dbos-macros = { path = "crates/dbos-macros", version = "=0.1.2" }
