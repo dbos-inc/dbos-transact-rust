@@ -3444,8 +3444,10 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         while !outstanding.is_empty() {
             // The bind wants a slice, so each pass materialises the ids it is about to ask about.
-            // TypeScript spreads its set into an array in the same spot, for the same reason.
-            let ids: Vec<String> = outstanding.iter().cloned().collect();
+            // TypeScript spreads its set into an array in the same spot, for the same reason —
+            // borrowed rather than cloned, because the set outlives the pass and a long fan-out
+            // would otherwise copy every outstanding id once per interval.
+            let ids: Vec<&str> = outstanding.iter().map(String::as_str).collect();
             let ids = &ids;
             let settled = with_retry(&self.retry, "await_workflow_ids", move || async move {
                 let _permit = polling
