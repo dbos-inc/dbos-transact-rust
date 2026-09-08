@@ -495,6 +495,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbos-rust-widget-store"
+version = "0.1.2"
+dependencies = [
+ "axum",
+ "dbos",
+ "serde",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "dbos-test-support"
 version = "0.1.2"
 dependencies = [

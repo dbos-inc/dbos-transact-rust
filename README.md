@@ -40,6 +40,29 @@ exist, and the standard libpq variables (`PGUSER`, `PGPASSWORD`) apply; point it
 with `DBOS_DATABASE_URL`. See the [starter's README](./demo-apps/dbos-rust-starter/README.md) for
 details.
 
+## Try the widget store
+
+The [widget store](./demo-apps/dbos-rust-widget-store) is an online storefront that survives any
+failure. Buy a widget and watch the order go out; press the crash button while it is being
+dispatched, restart the app, and the same order carries on from where it stopped — with the
+inventory count still right, and no application code taking part in the recovery.
+
+It is the Rust port of the widget store that already exists in Python, TypeScript, Go and Java,
+against the same application schema.
+
+With a Postgres listening on `localhost:5432`:
+
+```bash
+cargo run -p dbos-rust-widget-store
+```
+
+Then open <http://localhost:8080>. The app creates its `dbos_rust_widget_store` database and its
+own `products` and `orders` tables on first run, so there is nothing to migrate by hand; point it
+at another server with `DBOS_DATABASE_URL`. The workflow worth reading is the checkout, which
+reserves a widget and then *stops* until a payment webhook tells it whether the card was charged —
+a wait that outlives the process. See the [widget store's
+README](./demo-apps/dbos-rust-widget-store/README.md) for what to try.
+
 ## Community
 
 If you want to ask questions or hang out with the community, join us on [Discord](https://discord.gg/fMwQjeW5zg)!
