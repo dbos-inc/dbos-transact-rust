@@ -71,10 +71,11 @@ pub struct StepOptions<E = EngineOnly> {
     /// attempts at five seconds may spend fifteen seconds in the body. Python states the same
     /// layering where it puts the supervisor inside the retry loop.
     ///
-    /// Before the future is dropped, the attempt's cancellation token fires. Nothing public
-    /// observes it yet — Python exposes no step-cancellation API either — so what this buys today
-    /// is that ordinary `async` bodies stop at their next suspension point and run their
-    /// destructors, returning connections and releasing guards without the body saying so.
+    /// Before the future is dropped, the attempt's cancellation token fires, which
+    /// [`cancellation_token`](crate::cancellation_token) hands to the body — the way to stop work
+    /// that dropping the future cannot reach, such as a blocking thread. Ordinary `async` bodies
+    /// need none of it: they stop at their next suspension point and run their destructors,
+    /// returning connections and releasing guards without the body saying so.
     ///
     /// **Unlike Python, this is not restricted to some kinds of step.** py #826 rejects a timeout
     /// on a sync step because *"Python has no preemption mechanism for sync steps"*; every step

@@ -29,8 +29,9 @@ tokio::task_local! {
 ///
 /// **Internal.** Everything a workflow may ask about itself is a free function —
 /// [`workflow_id`](crate::workflow_id), [`step_id`](crate::step_id) and
-/// [`cancellation`](crate::cancellation) — so user code never names this type or reaches through
-/// it. That keeps the ambient context an implementation detail: the questions are stable API, the
+/// [`cancellation_token`](crate::cancellation_token) — so user code never names this type or
+/// reaches through it. That keeps the ambient context an implementation detail: the questions are
+/// stable API, the
 /// thing that answers them is not.
 #[derive(Clone)]
 pub(crate) struct Ctx {
@@ -105,18 +106,6 @@ pub(crate) struct StepScope {
 /// copy from its own counters on every attempt — but against the *appearance* of one: a settable
 /// `max_attempts` that silently changed nothing would be worse than no field at all. A step decides
 /// how many attempts it gets through [`StepOptions`](crate::StepOptions), before it runs.
-#[cfg(test)]
-impl StepStatus {
-    /// A first attempt at `step_id`, for tests that only care which step they are inside.
-    pub(crate) fn first(step_id: i32) -> Self {
-        Self {
-            step_id,
-            current_attempt: 1,
-            max_attempts: 1,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepStatus {
     /// The step's ordinal position in its workflow, counting from zero — the same number
@@ -136,6 +125,12 @@ pub struct StepStatus {
     /// same loop with `max_attempts` defaulting to 1, so a plain step is honestly attempt 1 of 1 —
     /// and "does this step retry?" is `max_attempts() > 1` rather than a second `Option` to unwrap
     /// inside one.
+    ///
+    /// **A ceiling, not a promise.** The loop can also end early: a failure that
+    /// [`should_retry`](crate::StepOptions::should_retry) declines is the step's last whatever the
+    /// count says, so `current_attempt() == max_attempts()` means "no attempts left *by count*",
+    /// not "certainly the last". A body cannot know it is on its last attempt before it fails,
+    /// because the predicate is only asked once there is a failure to show it.
     pub(crate) max_attempts: u32,
 }
 
@@ -150,9 +145,22 @@ impl StepStatus {
         self.current_attempt
     }
 
-    /// How many attempts the policy allows in total.
+    /// How many attempts the policy allows in total — a ceiling the
+    /// [`should_retry`](crate::StepOptions::should_retry) predicate may stop short of.
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
+    }
+}
+
+#[cfg(test)]
+impl StepStatus {
+    /// A first attempt at `step_id`, for tests that only care which step they are inside.
+    pub(crate) fn first(step_id: i32) -> Self {
+        Self {
+            step_id,
+            current_attempt: 1,
+            max_attempts: 1,
+        }
     }
 }
 
@@ -386,7 +394,6 @@ impl Ctx {
     ///
     /// Returns a token that is never cancelled when there is no step running, so a body that is
     /// also called outside a workflow needs no second path.
-    ///
     pub(crate) fn cancellation(&self) -> CancellationToken {
         // `unwrap_or_default` means exactly one thing now: there is no step here, and a token
         // that never fires is the honest answer.
@@ -440,6 +447,12 @@ pub fn workflow_id() -> Option<String> {
 /// executing, which includes the retries of a step — every attempt of one step reports that
 /// step's id.
 ///
+/// **A step called from inside another step reports the enclosing step's id**, because a nested
+/// call is not a step of its own: it takes no id, writes no checkpoint, and is replayed as part of
+/// the body that called it. Reporting the durable step the work belongs to is the only answer with
+/// a checkpoint row behind it. Python, TypeScript, Go and Java all run a nested step as a plain
+/// call in the caller's context, and so answer the same way.
+///
 /// ```no_run
 /// async fn charge() -> dbos::Result<()> {
 ///     // Inside a step body, so this is the id of the step being run.
@@ -465,13 +478,22 @@ pub fn step_id() -> Option<i32> {
 /// [`step_id`](crate::step_id) is — a status belongs to a step, and between two steps a workflow is
 /// inside neither.
 ///
+/// **Inside a step called from another step, this describes the enclosing step** — its id, its
+/// attempt, its cap — for the reason [`step_id`](crate::step_id) gives: the nested call is part of
+/// that step and has no attempt of its own. Worth knowing before a shared helper branches on it,
+/// since "the last attempt" it reads is its caller's, and can be the last attempt of a step the
+/// helper itself has never failed.
+///
 /// ```no_run
 /// # #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 /// # #[error("upstream is down")]
 /// # struct Upstream;
 /// async fn charge() -> dbos::Result<(), Upstream> {
-///     let status = dbos::step_status().expect("inside a step");
-///     if status.current_attempt() == status.max_attempts() {
+///     // Matched rather than unwrapped: called outside a workflow this body still runs, plainly,
+///     // and there is no attempt to describe — which is what keeps it testable on its own.
+///     if let Some(status) = dbos::step_status()
+///         && status.current_attempt() == status.max_attempts()
+///     {
 ///         tracing::warn!(step = status.step_id(), "last attempt; the step is about to fail");
 ///     }
 ///     Err(Upstream)?
@@ -487,9 +509,10 @@ pub fn step_status() -> Option<StepStatus> {
 /// A token that fires when the step this code is running inside is abandoned.
 ///
 /// **This receives a cancellation; it does not raise one.** The engine holds the token and fires
-/// it — on a step's timeout, on a workflow cancelled elsewhere, and on any other path that drops
-/// an attempt. What this hands back is a clone to watch, and nothing a body does with it cancels
-/// anything.
+/// it — on a step's timeout, on the preemption of a
+/// [`preemptible`](crate::StepOptions::preemptible) step whose workflow was cancelled elsewhere,
+/// and on any other path that abandons an attempt. What this hands back is a clone to watch, and
+/// nothing a body does with it cancels anything.
 ///
 /// Watch it from work the runtime cannot stop by dropping the step's future — a
 /// [`spawn_blocking`](tokio::task::spawn_blocking) thread, or a client holding its own cancel
@@ -500,9 +523,15 @@ pub fn step_status() -> Option<StepStatus> {
 /// abandoned promise eventually settles to — and this covers the remainder Rust cannot reach by
 /// dropping.
 ///
-/// It fires whenever an attempt ends **without completing**. An attempt that reaches an outcome
-/// does *not* fire it: the body has had its chance to clean up, and work it deliberately left
-/// running is not the engine's to stop.
+/// It fires whenever the engine **abandons** an attempt. An attempt that reaches an outcome does
+/// *not* fire it: the body has had its chance to clean up, and work it deliberately left running is
+/// not the engine's to stop.
+///
+/// **A cancellation from outside only reaches a step that asked to notice it.** Cancelling a
+/// workflow marks its status row; a step reads that row only under
+/// [`preemptible`](crate::StepOptions::preemptible), so a default step runs to its outcome and its
+/// token stays quiet, even though the workflow is already `CANCELLED`. A body on a blocking thread
+/// that must learn about an out-of-process cancellation needs that option set.
 ///
 /// Returns a token that is never cancelled when there is no step running, so a body that is also
 /// called outside a workflow needs no second path — which is why this is a [`CancellationToken`]

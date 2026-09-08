@@ -359,6 +359,9 @@ async fn the_cancellation_token_fires_before_the_body_is_dropped() {
     dbos.shutdown().await;
 }
 
+/// **A step abandoned mid-body fires its cancellation token**, so work the runtime cannot stop by
+/// dropping the future — a blocking thread, a task the body spawned — learns that its step is over.
+///
 /// The timeout and preemption paths cancel the token themselves, but a step can be abandoned in
 /// other ways: a caller dropping it, or a combinator dropping it as a losing branch. Those left the
 /// token silent, and a step with neither watchdog had no token to fire at all. Here the step is

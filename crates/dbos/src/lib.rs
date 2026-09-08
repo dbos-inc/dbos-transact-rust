@@ -114,7 +114,12 @@ pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit, WorkflowDelay};
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
-// oblige an application to depend on `tokio-util` and keep its version in step with this crate's.
+// oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so
+// this makes `tokio-util` a public dependency rather than sparing anyone one — a major bump of it
+// is a breaking change here, and an application on a different major sees a type mismatch the
+// moment it passes a token across this boundary. The alternative, a newtype, would have to
+// reimplement the half of `CancellationToken` a body actually waits on, to hide a coupling that
+// watching a token is anyway.
 #[cfg(feature = "engine")]
 pub use tokio_util::sync::CancellationToken;
 #[cfg(feature = "engine")]

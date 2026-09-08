@@ -308,3 +308,162 @@ async fn there_is_no_step_status_outside_a_step() {
     assert!(before, "the workflow body is not inside a step");
     assert!(after, "a finished step's status does not leak out of it");
 }
+
+/// What one attempt of the enclosing step saw: its own status, the nested body's, and the id the
+/// nested body read.
+type NestedTrace = (Option<StepStatus>, Option<StepStatus>, Option<i32>);
+
+/// A step called from inside a step reports the step that encloses it, not one of its own.
+///
+/// **A nested call is not a step**: it takes no id, writes no checkpoint, and is replayed as part
+/// of the body that called it, so the only id with a row behind it is the outer one — and the
+/// attempt being counted is the outer step's too. Python, TypeScript, Go and Java each run a
+/// nested step as a plain call in the caller's context and answer the same way; this pins the
+/// agreement, because the answer comes from the plain path *not* opening a scope of its own, which
+/// is exactly the kind of thing a later refactor flips without noticing.
+#[tokio::test]
+async fn a_nested_step_reports_the_step_that_encloses_it() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("nested-status-app", &db));
+    let attempts = Arc::new(AtomicU32::new(0));
+    // Captured rather than returned, because `StepStatus` does not cross a step boundary: it is
+    // deliberately not serializable, and the nested id travels with it for the same reason.
+    let seen: Arc<std::sync::Mutex<Vec<NestedTrace>>> = Arc::default();
+    let workflow = {
+        let attempts = Arc::clone(&attempts);
+        let seen = Arc::clone(&seen);
+        dbos.register_workflow("nested", move |()| {
+            let attempts = Arc::clone(&attempts);
+            let seen = Arc::clone(&seen);
+            async move {
+                // A step of its own first, so the enclosing step below is step 1 rather than 0 and
+                // an inner id that matched by accident would still be caught.
+                dbos::step("first", || async { dbos::Result::<(), Flaky>::Ok(()) }).await?;
+                dbos::step_with(
+                    "outer",
+                    StepOptions {
+                        max_attempts: 2,
+                        interval: Duration::from_millis(1),
+                        ..StepOptions::default()
+                    },
+                    move || {
+                        let attempts = Arc::clone(&attempts);
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            let outer = dbos::step_status();
+                            // Called from inside a step body, so this one runs plainly.
+                            dbos::step("inner", || async {
+                                seen.lock().unwrap().push((
+                                    outer,
+                                    dbos::step_status(),
+                                    dbos::step_id(),
+                                ));
+                                dbos::Result::<(), Flaky>::Ok(())
+                            })
+                            .await?;
+                            // Fail once, so the second attempt reads an attempt number the first
+                            // did not and the nested body has to follow it.
+                            match attempts.fetch_add(1, Ordering::SeqCst) {
+                                0 => Err(Flaky)?,
+                                _ => dbos::Result::<(), Flaky>::Ok(()),
+                            }
+                        }
+                    },
+                )
+                .await
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    workflow.run(()).await.expect("the workflow failed");
+    let seen = seen.lock().unwrap();
+    let observed: Vec<_> = seen
+        .iter()
+        .map(|(outer, inner, step_id)| {
+            let outer = outer.expect("inside the enclosing step");
+            let inner = inner.expect("a nested step is still inside the enclosing one");
+            assert_eq!(
+                inner, outer,
+                "a nested step should report the enclosing step's status, whole"
+            );
+            (
+                inner.step_id(),
+                inner.current_attempt(),
+                inner.max_attempts(),
+                *step_id,
+            )
+        })
+        .collect();
+    assert_eq!(
+        observed,
+        vec![(1, 1, 2, Some(1)), (1, 2, 2, Some(1))],
+        "the nested body should follow the enclosing step across its two attempts, id held still"
+    );
+}
+
+/// Outside a step there is a token, and it never fires.
+///
+/// **The property that lets this be a token rather than an `Option` of one**, unlike
+/// [`dbos::workflow_id`] and [`dbos::step_id`], which both answer `None` in the same two places: a
+/// body that also runs outside a workflow watches the same handle and simply waits forever on it,
+/// with no second path. The default is what a refactor of the `unwrap_or_default` behind it would
+/// break, and break quietly — a token that never fires is indistinguishable, at a glance, from one
+/// whose step has not been abandoned yet.
+///
+/// Checked by waiting on it rather than by reading `is_cancelled`, because the claim is about the
+/// whole life of the token, not the instant of the call. The step in the middle blows its deadline
+/// and fires a token of its own, which is the case that separates a genuine never-firing default
+/// from a body that was quietly handed the step's token.
+#[tokio::test]
+async fn a_cancellation_token_outside_a_step_never_fires() {
+    /// Long enough that a token about to fire would have, short enough to pay in every run.
+    const QUIET: Duration = Duration::from_millis(50);
+
+    async fn stayed_quiet(token: dbos::CancellationToken) -> bool {
+        tokio::time::timeout(QUIET, token.cancelled())
+            .await
+            .is_err()
+    }
+
+    assert!(
+        stayed_quiet(dbos::cancellation_token()).await,
+        "outside a workflow there is no attempt to abandon"
+    );
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("quiet-token-app", &db));
+    let workflow = dbos
+        .register_workflow("quiet", |()| async move {
+            let body = dbos::cancellation_token();
+            // A step that is abandoned mid-body, so a token wired to the step rather than to the
+            // workflow body would be cancelled by the time this returns.
+            let abandoned = dbos::step_with(
+                "times-out",
+                StepOptions {
+                    timeout: Some(Duration::from_millis(20)),
+                    ..StepOptions::default()
+                },
+                || async {
+                    std::future::pending::<()>().await;
+                    dbos::Result::<(), Flaky>::Ok(())
+                },
+            )
+            .await;
+            assert!(
+                abandoned.is_err(),
+                "the step should have blown its deadline"
+            );
+            dbos::Result::<_, Flaky>::Ok(stayed_quiet(body).await)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    assert!(
+        workflow.run(()).await.expect("the workflow failed"),
+        "the workflow body's token should outlive an abandoned step of its own, unfired"
+    );
+
+    dbos.shutdown().await;
+}
