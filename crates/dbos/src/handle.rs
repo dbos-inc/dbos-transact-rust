@@ -160,11 +160,13 @@ where
     /// so the hazard [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result)
     /// describes costs a caller here what Go and TypeScript charge an argument for and Python and
     /// Java cannot offer at all. **Inside the workflow that started the child it is neither**, for
-    /// the reason [`PendingStep`] gives every durable call: the race decides which branch won and
-    /// records nothing, so a replay may decide it the other way. Bound the child where its bound
-    /// belongs — [`StartOptions::timeout`](crate::StartOptions::timeout), or the deadline it
-    /// inherits — and if a wait really has to be raced against something, race it inside a step,
-    /// whose own checkpoint stands for however it reached the answer.
+    /// the reason [`PendingStep`] gives every durable call: a `timeout` is a race nothing records,
+    /// so a replay is free to decide it the other way and continue from a wait this execution
+    /// abandoned. What is wrong there is the *unrecorded* decision and not the racing — bound the
+    /// child where its bound belongs, with [`StartOptions::timeout`](crate::StartOptions::timeout)
+    /// or the deadline it inherits, and race this wait against other waits with
+    /// [`select_workflow!`](macro@crate::select_workflow), which checkpoints the winner and then
+    /// awaits that handle alone, on the run and on the replay both.
     ///
     /// **The id is claimed here, where the call is written, not where the wait is first polled.**
     /// So a `join!` over several handles' results is ordinary code — `join!` builds every branch

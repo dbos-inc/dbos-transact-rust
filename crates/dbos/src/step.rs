@@ -247,14 +247,22 @@ impl<E> StepOptions<E> {
 /// replay that interleaved differently met a recorded step under the wrong name, which records
 /// nothing, leaves the workflow `PENDING`, and has it recovered until it parks.
 ///
-/// **`join!` is the combinator that promise is about, and `select!` is not.** An all-wait decides
-/// nothing, so a replay has nothing to get differently; a race decides which branch won and
-/// nothing records it, so a replay may choose the other one — and `tokio::time::timeout` is that
-/// same race against a clock no replay reproduces. Neither belongs in a workflow body: race
-/// workflows with [`select_workflow!`](macro@crate::select_workflow), bound a call with the
-/// deadline it already takes, and put any other race *inside a step*, where the step's own
-/// checkpoint stands for however its body reached the answer. [`PendingStep`] says the same for
-/// every durable call, not only steps.
+/// **`join!` needs nothing of a race; a race needs its winner recorded.** An all-wait decides
+/// nothing, so a replay has nothing to get differently and `join!` over durable calls is ordinary
+/// code. A race decides something — which branch won — and that decision has to survive to the
+/// replay like any other, or the replay is free to decide it the other way and continue from a
+/// branch this execution abandoned. So what a workflow body has no use for is the *unrecorded*
+/// race: a bare `tokio::select!` over durable calls, and `tokio::time::timeout`, which is that
+/// same race against a clock no replay reproduces.
+///
+/// Recorded races are the supported ones. [`select_workflow!`](macro@crate::select_workflow) is
+/// the one that exists: it checkpoints which handle won and then awaits that one alone, so the
+/// replay takes the arm the run took. A call that carries its own deadline is the other — the
+/// bound is part of what gets recorded rather than a second branch. And a race that belongs to
+/// neither can go *inside a step*, whose checkpoint stands for however its body reached the
+/// answer. [`PendingStep`] says all of this for every durable call, not only steps, and ids taken
+/// at the call are what let a race be recorded at all: a losing branch has already spent its id,
+/// and spends the same one on the replay, whether or not it is ever polled.
 ///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
