@@ -1095,8 +1095,15 @@ where
 
         match spawn_tracked(&executor, creating).await {
             Ok(started) => started,
-            // Only shutdown aborts this task, and an aborted transaction wrote nothing — so the
-            // start did not happen, which is the same answer an awaited workflow gives.
+            // Only shutdown aborts this task, and what the abort leaves behind depends on where
+            // it landed. Before the transaction committed, nothing was written and the start did
+            // not happen. After it, the child exists and is recorded against this parent — what
+            // `InitWorkflowCaller` makes atomic is the pair of rows, not the caller's knowledge of
+            // them, and an abort between the commit and this answer is a start the caller was
+            // never told about. Nothing is lost either way: the child is `PENDING` and recovers,
+            // and a replay of this position finds the record and joins it rather than starting a
+            // second. So this reports what is true of both — that this caller stopped being the
+            // one waiting, which is what `Interrupted` says everywhere else.
             Err(join) if join.is_cancelled() => Err(Error::Interrupted { workflow_id }),
             Err(join) => std::panic::resume_unwind(join.into_panic()),
         }
