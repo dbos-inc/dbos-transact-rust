@@ -410,9 +410,9 @@ pub enum Error<E = EngineOnly> {
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
-    /// not Java's, which rethrows the final failure untyped.
-    /// The first failure is usually the informative one and the last is usually a timeout,
-    /// so keeping only one loses the half that explains the other.
+    /// not Java's, which rethrows the final failure untyped. The first failure is usually the
+    /// informative one and the last is usually a timeout, so keeping only one loses the half that
+    /// explains the other.
     ///
     /// Raised only where retries were actually asked for. A step left at the default
     /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its one

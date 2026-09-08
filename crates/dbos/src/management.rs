@@ -84,10 +84,9 @@
 //! are transactional here too: a listing that replays the snapshot it recorded is worth the same
 //! one transaction, and it leaves one shape for the whole module rather than two.
 //!
-//! The recorded names are the cross-SDK spellings, in
-//! [`step_names`] beside every other name this crate records,
-//! with what each one cost to settle. One call is one step, and the singular forms delegate to the
-//! bulk ones, so `cancel` and `cancel_all` spend the same one step id.
+//! The recorded names are the cross-SDK spellings, in [`step_names`] beside every other name this
+//! crate records, with what each one cost to settle. One call is one step, and the singular forms
+//! delegate to the bulk ones, so `cancel` and `cancel_all` spend the same one step id.
 //!
 //! Three edges, all shared with the references. Outside a workflow there is nothing to checkpoint
 //! against and the call is a plain one, which is what an operator's tool does. Inside a *step* it
@@ -913,13 +912,12 @@ impl DBOS {
 ///
 /// Every method here is [`DBOS`]'s, and the differences are the two a client always has. **There is
 /// no launch check**, because a client is connected or it does not exist — `connect` hands back a
-/// usable client or an error, so none of these can fail with
-/// [`Error::NotLaunched`]. And **nothing is checkpointed**: called from
-/// inside a workflow, a client's management call runs again on replay, where the same call on
-/// `DBOS` would replay its recorded step. A client has no step counter of its own to agree with the
-/// workflow's, and the ambient context belongs to an instance this client is not — the line
-/// [`WorkflowHandle::result`](crate::WorkflowHandle::result) already draws for a client's handle
-/// awaited inside a workflow.
+/// usable client or an error, so none of these can fail with [`Error::NotLaunched`]. And
+/// **nothing is checkpointed**: called from inside a workflow, a client's management call runs
+/// again on replay, where the same call on `DBOS` would replay its recorded step. A client has no
+/// step counter of its own to agree with the workflow's, and the ambient context belongs to an
+/// instance this client is not — the line [`WorkflowHandle::result`](crate::WorkflowHandle::result)
+/// already draws for a client's handle awaited inside a workflow.
 ///
 /// **Scope follows the client's application name.** A nameless client reads and writes across every
 /// application sharing the database, which is what a cross-application operator's tool wants and

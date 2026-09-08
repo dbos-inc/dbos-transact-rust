@@ -219,7 +219,7 @@ impl Notifier {
                 // Not retried through [`with_retry`](crate::sysdb::retry::with_retry) either, for
                 // the same reason: it has no attempt limit, so a channel that cannot be pushed
                 // would hold the loop rather than the queue. Python, TypeScript and Java do not
-                // retry; Go does, bounded.
+                // retry; Go does, for errors its dialect calls transient, with no attempt limit.
                 tracing::warn!(
                     channel,
                     count = payloads.len(),

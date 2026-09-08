@@ -685,10 +685,10 @@ async fn a_client_manages_queues() {
 /// A client that is dropped rather than closed lets go of its connections.
 ///
 /// Dropping is the ordinary end of a client — it is a value in someone's application state, not
-/// something with a lifecycle — and it is the case that leaks if the drop does not close the pool:
-/// the listener task holds its own clone, so the pool cannot close itself, and the listener's only
-/// way out of its loop is that close. An abandoned client would mean a `LISTEN` connection and two
-/// tasks for the life of the process.
+/// something with a lifecycle — and it is the case that leaks unless the drop aborts the listener:
+/// that task holds its own clone of the pool, so the pool cannot close itself, and the listener's
+/// only way out of its loop is that close. An abandoned client would mean a `LISTEN` connection
+/// and two tasks for the life of the process.
 #[tokio::test]
 async fn a_dropped_client_releases_its_connections() {
     // Tagged so this counts its own connections and not another test's, on a shared server.

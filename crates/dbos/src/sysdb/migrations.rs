@@ -856,7 +856,8 @@ mod tests {
     /// string comparison wanting the unquoted name — beside an `ALTER` wanting the quoted
     /// identifier. Rendering the quoted form into both produces valid-looking SQL whose guard
     /// silently never matches, so a migration whose whole purpose is idempotence runs
-    /// unconditionally. Migration 10 is a runner check for exactly that reason.
+    /// unconditionally. Migration 10's guard is a probe the runner executes with the schema bound
+    /// as `$1` (`MIGRATION_10_PK_PROBE`) for exactly that reason.
     ///
     /// Asserted so a migration that reintroduces a bare-name comparison is caught here
     /// rather than at runtime.

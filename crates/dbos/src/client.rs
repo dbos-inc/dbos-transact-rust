@@ -19,9 +19,9 @@
 //! calls it with no executor in sight.
 //!
 //! The type system then makes the boundary concrete twice over. Nothing on this type can fail with
-//! [`Error::NotLaunched`], because **a client is always connected** —
-//! [`connect`](Client::connect) hands back a usable client or an error, with no second state to
-//! check afterwards. And nothing on it can run a workflow, because it holds nothing that could.
+//! [`Error::NotLaunched`], because **a client is always connected** — [`connect`](Client::connect)
+//! hands back a usable client or an error, with no second state to check afterwards. And nothing
+//! on it can run a workflow, because it holds nothing that could.
 //!
 //! # What a client is not
 //!
@@ -492,15 +492,13 @@ impl Client {
     /// reason a client has it is that a queue is a row: a fleet may be configured by the tool that
     /// deploys it rather than by the code that drains it.
     ///
-    /// The limits and the policy are the same [`QueueOptions`] and
-    /// [`QueueConflict`] an application states — but
-    /// [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
-    /// [`Error::Config`] here rather than a registration: a client runs none of the application's
-    /// code, so there is no version of it to be the latest of. Ask for
+    /// The limits and the policy are the same [`QueueOptions`] and [`QueueConflict`] an
+    /// application states — but [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion)
+    /// is [`Error::Config`] here rather than a registration: a client runs none of the
+    /// application's code, so there is no version of it to be the latest of. Ask for
     /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate), which is what Python's and
-    /// TypeScript's clients default to, or
-    /// [`NeverUpdate`](crate::QueueConflict::NeverUpdate). They refuse the same combination
-    /// (`_client.py:455`, `client.ts:561`).
+    /// TypeScript's clients default to, or [`NeverUpdate`](crate::QueueConflict::NeverUpdate).
+    /// They refuse the same combination (`_client.py:455`, `client.ts:561`).
     ///
     /// **A client with no application name of its own registers over a peer's queue rather than
     /// being refused**, replacing its stored limits — the ownership check every implementation

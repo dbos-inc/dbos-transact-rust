@@ -2850,8 +2850,8 @@ async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
     );
 }
 
-/// Scoped like the pending-workflows filter: another executor's, another version's, and finished
-/// work are all left alone.
+/// Scoped by executor and version: another executor's, another version's, and finished work are
+/// all left alone.
 #[tokio::test]
 async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
     let (sys, _db) = sysdb().await;

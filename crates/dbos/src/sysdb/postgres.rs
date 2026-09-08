@@ -2133,8 +2133,8 @@ impl PostgresSystemDatabase {
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
         // TODO(dbos-team): UPSTREAM item 6, clearing `started_at_epoch_ms` here. The rate limiter
         // is the usual justification and does not apply: this statement sets `queue_name = NULL`
-        // on the same line, and the count is scoped `WHERE queue_name = $1`, so the row leaves the
-        // limiter through the name rather than through the start time. A workflow that was running
+        // on the same line, and the count is scoped by `queue_name`, so the row leaves the limiter
+        // through the name rather than through the start time. A workflow that was running
         // when it was cancelled *did* start, so clearing the column discards true information and
         // hides the row from `started_after`/`started_before`. Kept anyway — diverging from four
         // implementations on a durable column is the worse trade.

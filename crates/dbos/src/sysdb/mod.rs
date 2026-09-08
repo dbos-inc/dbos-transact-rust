@@ -1282,9 +1282,10 @@ pub trait SystemDatabase: Send + Sync {
     /// through to [`Debounce::Held`] instead, which describes the holder well enough for a caller
     /// to tell a collision from a coincidence.
     ///
-    /// TODO(dbos-team): UPSTREAM item 11. No implementation keys a debounce on all three parts of
-    /// a workflow's identity, so a bounce for one configured instance can extend another's
-    /// workflow and replace its inputs.
+    /// TODO(dbos-team): UPSTREAM item 11. No reference keys a debounce on all three parts of a
+    /// workflow's identity — TypeScript matches name and class, Python the name alone — so there
+    /// a bounce for one configured instance can extend another's workflow and replace its inputs.
+    /// This implementation matches all three.
     ///
     /// [`DebounceRequest::application_name`] is the application the bounce acts *for*; `None` means
     /// this handle's own. Only that application's holders and unclaimed ones are extended, and an

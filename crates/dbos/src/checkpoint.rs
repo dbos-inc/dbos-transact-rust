@@ -639,8 +639,8 @@ impl StepPlacement {
     /// it.** An id is a claim on one position in one workflow, so a call carried somewhere that
     /// cannot honour it is refused rather than run: the alternatives are recording it under the
     /// wrong workflow's id, or running it unrecorded where the surrounding workflow expects a
-    /// checkpoint and every replay would run it again. [`step`](crate::step) asks this, and so
-    /// does every library step.
+    /// checkpoint and every replay would run it again. [`step`](crate::step) asks this at the
+    /// run, and [`PendingStep`]'s poll asks it for every placed call.
     ///
     /// `step` names the call for [`Error::StepBuiltElsewhere`].
     pub(crate) fn check_here<E>(
