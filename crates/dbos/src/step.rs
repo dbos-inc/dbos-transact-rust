@@ -255,14 +255,18 @@ impl<E> StepOptions<E> {
 /// race: a bare `tokio::select!` over durable calls, and `tokio::time::timeout`, which is that
 /// same race against a clock no replay reproduces.
 ///
-/// Recorded races are the supported ones. [`select_workflow!`](macro@crate::select_workflow) is
-/// the one that exists: it checkpoints which handle won and then awaits that one alone, so the
-/// replay takes the arm the run took. A call that carries its own deadline is the other — the
-/// bound is part of what gets recorded rather than a second branch. And a race that belongs to
-/// neither can go *inside a step*, whose checkpoint stands for however its body reached the
-/// answer. [`PendingStep`] says all of this for every durable call, not only steps, and ids taken
-/// at the call are what let a race be recorded at all: a losing branch has already spent its id,
-/// and spends the same one on the replay, whether or not it is ever polled.
+/// Recorded races are the supported ones, and there are three of them.
+/// [`select_step!`](crate::select_step) is the general one: it checkpoints *which branch* won, and
+/// a replay polls that branch alone — which is `tokio::select!`'s shape with the decision written
+/// down. [`select_workflow!`](macro@crate::select_workflow) is the specialised one, for a race
+/// whose branches are all workflows: it checkpoints which handle won and settles the whole set
+/// with one wait rather than one per handle. A call that carries its own deadline is the third —
+/// there the bound is part of what gets recorded rather than a second branch. And a race over
+/// futures this crate knows nothing about can still go *inside a step*, whose checkpoint stands
+/// for however its body reached the answer. [`PendingStep`] says all of this for every durable
+/// call, not only steps, and ids taken at the call are what let a race be recorded at all: a
+/// losing branch has already spent its id, and spends the same one on the replay, whether or not
+/// it is ever polled.
 ///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
