@@ -472,6 +472,8 @@
          =========================================== -->
     <div
       x-show="connectionLost"
+      role="alert"
+      aria-live="assertive"
       x-transition:enter="transition ease-out duration-300"
       x-transition:enter-start="opacity-0 transform -translate-y-2"
       x-transition:enter-end="opacity-100 transform translate-y-0"
@@ -688,7 +690,7 @@
                       </div>
                       <div class="flex justify-between items-center">
                         <span class="font-medium text-gray-700">Status:</span>
-                        <span class="status-badge" :class="'status-' + order.status.toLowerCase()" x-text="order.status"></span>
+                        <span class="status-badge" :class="order.status ? 'status-' + order.status.toLowerCase() : ''" x-text="order.status"></span>
                       </div>
                       <div class="flex justify-between items-center">
                         <span class="font-medium text-gray-700">Last Updated:</span>

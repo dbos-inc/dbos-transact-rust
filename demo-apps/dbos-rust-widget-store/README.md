@@ -10,7 +10,6 @@ A step that was *interrupted* runs again, which for the writes here means at-lea
 exactly-once — see the note on transactional steps below for what that costs.
 
 This is the Rust port of the widget store that already exists in Python, TypeScript, Go and Java.
-Same application schema, same HTTP surface, same frontend.
 
 ## Running it
 
