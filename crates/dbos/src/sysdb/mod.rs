@@ -59,11 +59,12 @@ use std::time::Duration;
 use types::step_names;
 use types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EncodedValue,
-    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule,
-    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
-    QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
+    NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite,
+    QueueRecord, QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord,
+    ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
+    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
+    WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -109,11 +110,34 @@ pub trait SystemDatabase: Send + Sync {
     /// passed in, and generated once per call — before any retry the implementation makes. A
     /// retry that generated a fresh identity after a lost commit acknowledgement would fail to
     /// recognise its own write and conclude another executor owned the row.
+    ///
+    /// **`caller` makes the child's row and the parent's record of it one write.** A start from
+    /// inside a workflow is a step of that workflow, and as two statements the pair has a gap: a
+    /// crash between them — or a dropped future, since a start is a future and any combinator that
+    /// races one may drop it — leaves a child workflow that exists, carries a
+    /// `parent_workflow_id`, and has nothing in the parent pointing at it.
+    ///
+    /// A replaying parent survives that, and it is worth being exact about why: the child's id is
+    /// derived from the parent's and this step's, so the replay re-derives it, finds the row owned,
+    /// and joins the child it already made rather than starting a second one. What does *not*
+    /// survive is the pair coming apart in the other direction. If the record fails permanently
+    /// where the row succeeded, the caller is told its start failed while the child exists and is
+    /// `PENDING` — a workflow that will run, reported as one that never began. And a parent that
+    /// never replays, because it finished or because the losing branch of a race dropped the start,
+    /// leaves that child unreferenced by anything but its own parent column.
+    ///
+    /// Passing the caller closes both: the two rows commit together or neither does. `None` is a
+    /// root start, which has no parent to record against.
+    ///
+    /// This is the shape [`fork_workflows`](Self::fork_workflows) and the management calls already
+    /// use — the checkpoint committing with the operation it records — reaching the one operation
+    /// that creates a workflow.
     async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
         submission: Submission,
+        caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.

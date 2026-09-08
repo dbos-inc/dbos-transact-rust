@@ -544,8 +544,9 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
             move |()| {
                 let quick = quick.clone();
                 async move {
-                    // Launched one at a time, as a parent must: every call takes a step id from
-                    // the parent's counter.
+                    // A loop rather than a `join!` because that is the plainest way to write it
+                    // — each start takes its step id where it is written, so driving them
+                    // together would number them the same way.
                     let mut children = Vec::new();
                     for which in 0..2u32 {
                         children.push(quick.start(which).await?);

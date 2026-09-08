@@ -13,12 +13,12 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::checkpoint::StepPlacement;
+use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, Error, Failure, Result};
 use crate::serialization::{decode, encode};
-use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus};
+use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 
 /// A running — or finished — workflow, by id.
 ///
@@ -155,18 +155,53 @@ where
     /// case none of them can avoid: an id whose row this process has never seen, where "deleted"
     /// and "not yet" are the same observation.
     ///
-    /// **A wait that could go on forever is bounded by dropping it.** `tokio::time::timeout` around
-    /// this future, or dropping the future outright, ends the poll — so the hazard
-    /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) describes
-    /// costs a caller here what Go and TypeScript charge an argument for and Python and Java cannot
-    /// offer at all.
-    pub async fn result(self) -> Result<R, E> {
+    /// **A wait that could go on forever is bounded by dropping it, outside a workflow.**
+    /// `tokio::time::timeout` around this future, or dropping the future outright, ends the poll —
+    /// so the hazard [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result)
+    /// describes costs a caller here what Go and TypeScript charge an argument for and Python and
+    /// Java cannot offer at all. **Inside the workflow that started the child it is neither**, for
+    /// the reason [`PendingStep`] gives every durable call: a `timeout` is a race nothing records,
+    /// so a replay is free to decide it the other way and continue from a wait this execution
+    /// abandoned. What is wrong there is the *unrecorded* decision and not the racing — bound the
+    /// child where its bound belongs, with [`StartOptions::timeout`](crate::StartOptions::timeout)
+    /// or the deadline it inherits, and race this wait against other waits with
+    /// [`select_workflow!`](macro@crate::select_workflow), which checkpoints the winner and then
+    /// awaits that handle alone, on the run and on the replay both.
+    ///
+    /// **The id is claimed here, where the call is written, not where the wait is first polled.**
+    /// So a `join!` over several handles' results is ordinary code — `join!` builds every branch
+    /// before polling any, which is the order the ids were taken in and the order a replay takes
+    /// them again — and the awaits are numbered by what the parent's body *says* rather than by
+    /// which child answers first. A handle built in one workflow and awaited in another, or
+    /// carried across a step-body boundary, is refused as [`Error::StepBuiltElsewhere`]: the id is
+    /// a claim on one position in one execution, and nowhere else can honour it.
+    pub fn result<'a>(self) -> PendingStep<'a, R, E>
+    where
+        R: 'a,
+    {
         // Allocated before anything can fail, and before the check it gates: the position of this
-        // await in the parent has to be the same on the replay as it was on the run.
-        let awaiting = match Awaiting::of(&self.conn) {
-            Ok(awaiting) => awaiting,
-            Err(wrong) => return Err(wrong.lift()),
-        };
+        // await in the parent has to be the same on the replay as it was on the run. A refusal
+        // here is carried into the future by `placed`, so `handle.result().await?` reads as it
+        // always did and nothing was claimed on the way to it.
+        let built = ChildResultPlacement::of(&self.conn).map(|awaiting| {
+            let placement = awaiting.placement().clone();
+            (awaiting, placement)
+        });
+        // The placement is handed back beside the `ChildResultPlacement` that carries it, and the
+        // await wants the latter: it is what holds the id this call already claimed.
+        PendingStep::placed(step_names::GET_RESULT, built, move |awaiting, _| {
+            self.settle(awaiting)
+        })
+    }
+
+    /// The await itself, once something polls it.
+    ///
+    /// Takes the [`ChildResultPlacement`] rather than building one, because the id it holds was
+    /// claimed where the call was written. That is also what lets [`run_with`](crate::WorkflowRef::run_with)
+    /// claim the await's id immediately behind the start's and hand it here once the child
+    /// exists: where an await stands is decided by the ambient context and the connection, and
+    /// the handle has no say in either.
+    pub(crate) async fn settle(self, awaiting: ChildResultPlacement) -> Result<R, E> {
         if let Some(recorded) = awaiting
             .check(&self.conn, &self.workflow_id)
             .await
@@ -227,7 +262,8 @@ where
             // reference raises a separate awaited-cancelled error for exactly this, and it is
             // recorded like any other outcome: the child is over, and the parent has learned so.
             Err(Failure::Control(Error::WorkflowCancelled { workflow_id }))
-                if awaiting.inside_a_workflow() =>
+                // Only where there is a caller for the two to be confused with each other.
+                if awaiting.placement().inside_a_workflow() =>
             {
                 Err(Error::AwaitedWorkflowCancelled { workflow_id })
             }
@@ -237,8 +273,8 @@ where
 
     /// Turns a recorded await back into what the parent returned the first time.
     ///
-    /// Which workflow the row belongs to was settled by [`Awaiting::recorded`] before this sees
-    /// it, so what is left here is the outcome alone.
+    /// Which workflow the row belongs to was settled by [`ChildResultPlacement::check`] before
+    /// this sees it, so what is left here is the outcome alone.
     fn interpret(recorded: StepRecord, workflow_id: String) -> Result<R, E> {
         match recorded.error {
             None => decode(recorded.output.as_deref(), "result"),
@@ -255,29 +291,42 @@ where
 /// Where the caller awaiting this handle stands, which decides two independent things: whether the
 /// outcome is checkpointed, and how a cancelled *awaited* workflow is reported.
 ///
+/// **A [`StepPlacement`] and the two writes that are an await's own**, which is the whole of what
+/// it adds: [`of`](Self::of) names the operation once and [`placement`](Self::placement) hands the
+/// inner value back, while [`check`](Self::check) and [`record`](Self::record) are the pair this
+/// type exists for — [`check_child_result`](crate::sysdb::SystemDatabase::check_child_result) and
+/// [`record_child_result`](crate::sysdb::SystemDatabase::record_child_result), whose vocabulary
+/// this borrows. It is the *result* half of what a parent records about a child; the *launch* half
+/// is [`record_child_workflow`](crate::sysdb::SystemDatabase::record_child_workflow), carried by
+/// [`InitWorkflowCaller`](crate::sysdb::types::InitWorkflowCaller).
+///
+/// **A type of its own rather than a bare placement**, because
+/// [`run_with`](crate::WorkflowRef::run_with) holds two placements at once — the start's and this
+/// one, claimed an instant apart and differing only in the integer inside. Handing
+/// [`settle`](WorkflowHandle::settle) the wrong one would compile, and would record the await
+/// under the start's id; the replay would meet a recorded step under the wrong name and there is
+/// nothing before then to notice it.
+///
 /// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
 /// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
-/// either, and Python and Go checkpoint that case too.
-struct Awaiting(StepPlacement);
+/// either, and Python and Go checkpoint that case too. The name follows the layer below rather
+/// than that distinction — every implementation stores the awaited id in `child_workflow_id`,
+/// whoever started it.
+pub(crate) struct ChildResultPlacement(StepPlacement);
 
-impl Awaiting {
+impl ChildResultPlacement {
     /// Where this await stands, allocating its step id if it is to be recorded.
     ///
     /// The placement rules — and the argument for each of them — are
     /// [`StepPlacement::of`](crate::checkpoint::StepPlacement::of)'s, shared with every other
     /// library step in the crate. What stays here is only what an *await* does with the answer.
-    fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
+    pub(crate) fn of(conn: &Arc<Connection>) -> std::result::Result<Self, Error> {
         StepPlacement::of(conn, "awaiting a workflow's result").map(Self)
     }
 
-    /// Whether a cancelled *awaited* workflow has to be distinguished from this caller being
-    /// cancelled — true wherever there is a caller for it to be confused with.
-    fn inside_a_workflow(&self) -> bool {
-        self.0.inside_a_workflow()
-    }
-
-    fn checkpoint(&self) -> Option<(&str, i32)> {
-        self.0.step()
+    /// Where this await stands, for the [`PendingStep`] that has to ask again on every poll.
+    pub(crate) fn placement(&self) -> &StepPlacement {
+        &self.0
     }
 
     async fn check(
@@ -285,7 +334,7 @@ impl Awaiting {
         conn: &Connection,
         awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
-        let Some((workflow_id, step_id)) = self.checkpoint() else {
+        let Some((workflow_id, step_id)) = self.0.step() else {
             return Ok(None);
         };
         let Some(recorded) = conn
@@ -364,7 +413,7 @@ impl Awaiting {
         settled: &std::result::Result<Option<String>, Failure>,
         started_at: Timestamp,
     ) -> std::result::Result<(), Error> {
-        let Some((workflow_id, step_id)) = self.checkpoint() else {
+        let Some((workflow_id, step_id)) = self.0.step() else {
             return Ok(());
         };
         let cancelled;

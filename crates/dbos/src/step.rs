@@ -236,16 +236,33 @@ impl<E> StepOptions<E> {
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
 /// the counter first, which is not something a replay reproduces.
 ///
-/// **That is a promise about most of the crate's durable calls, and now nearly all of them.**
-/// `sleep`, the events, the messages, the waits and every checkpointed management call on
-/// [`DBOS`](crate::DBOS) take their ids at the call too, and may be built first and driven
-/// together with steps and with each other. What is left is **a child's `start` and awaiting a
-/// handle**, which still take their ids at their first **poll**: driven together they are numbered
-/// in whatever order the combinator polls them, so a replay that interleaves differently meets a
-/// recorded step under the wrong name — a system-database error, which records nothing, leaves the
-/// workflow `PENDING`, and has it recovered until it parks. Await each of those two before
-/// starting the next, as the whole crate required before ids moved. Both are being converted the
-/// same way, and the rule retires with them.
+/// **That is now a promise about every durable call in the crate.** `sleep`, the events, the
+/// messages, the waits and every checkpointed management call on [`DBOS`](crate::DBOS) take their
+/// ids at the call, and so do a child's [`start`](crate::WorkflowRef::start), the await of its
+/// handle ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and the
+/// [`run`](crate::WorkflowRef::run) that is the two of them in sequence. Any of them may be built
+/// first and driven together with steps and with each other; `join!` over a mixture of them is
+/// ordinary code. The caveat that used to stand here — await these one at a time, because their
+/// ids land wherever they are first polled — is gone, and with it the failure it warned about: a
+/// replay that interleaved differently met a recorded step under the wrong name, which records
+/// nothing, leaves the workflow `PENDING`, and has it recovered until it parks.
+///
+/// **`join!` needs nothing of a race; a race needs its winner recorded.** An all-wait decides
+/// nothing, so a replay has nothing to get differently and `join!` over durable calls is ordinary
+/// code. A race decides something — which branch won — and that decision has to survive to the
+/// replay like any other, or the replay is free to decide it the other way and continue from a
+/// branch this execution abandoned. So what a workflow body has no use for is the *unrecorded*
+/// race: a bare `tokio::select!` over durable calls, and `tokio::time::timeout`, which is that
+/// same race against a clock no replay reproduces.
+///
+/// Recorded races are the supported ones. [`select_workflow!`](macro@crate::select_workflow) is
+/// the one that exists: it checkpoints which handle won and then awaits that one alone, so the
+/// replay takes the arm the run took. A call that carries its own deadline is the other — the
+/// bound is part of what gets recorded rather than a second branch. And a race that belongs to
+/// neither can go *inside a step*, whose checkpoint stands for however its body reached the
+/// answer. [`PendingStep`] says all of this for every durable call, not only steps, and ids taken
+/// at the call are what let a race be recorded at all: a losing branch has already spent its id,
+/// and spends the same one on the replay, whether or not it is ever polled.
 ///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
@@ -794,7 +811,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh)
+            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
             .await
             .expect("could not create the workflow row");
         (dbos, db)
@@ -1101,12 +1118,23 @@ mod tests {
         let c = ctx(&dbos, "wf-relocated");
 
         let outcome = Ctx::scope(c.clone(), async {
-            let mut built = step("moved", || async { Ok::<_, crate::Error>(1u32) });
+            // The body never finishes, so it does not matter how far one poll gets: whether it
+            // suspends in the round trip that asks whether this step has already run or in the
+            // body itself, nothing has been written when the step is moved. A body that returns
+            // immediately leaves that to scheduling — one poll runs until the first suspension,
+            // and on a loaded machine the reply to that round trip can already be waiting, which
+            // carries the poll through the body and into the checkpoint's own write. The
+            // assertion below would then be about which read happened to be ready rather than
+            // about the rule, and it has failed in CI for exactly that.
+            let mut built = step("moved", || async {
+                std::future::pending::<()>().await;
+                Ok::<_, crate::Error>(1u32)
+            });
             let started = std::pin::Pin::new(&mut built)
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
             assert!(
                 started.is_pending(),
-                "the first poll should reach the database and suspend, leaving the run started"
+                "the first poll should suspend, leaving the run started"
             );
             // Now somewhere its id cannot be honoured: a step body, whose own checkpoint already
             // stands for everything it does.
@@ -1298,7 +1326,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new("wf-thief"), None, Submission::Fresh)
+            .init_workflow(&NewWorkflow::new("wf-thief"), None, Submission::Fresh, None)
             .await
             .expect("could not create the second workflow row");
 

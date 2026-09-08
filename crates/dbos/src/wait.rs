@@ -313,8 +313,8 @@ pub fn join_workflows<'a, E: crate::DurableError + 'a>(
 ///
 /// **A branch is a variable holding a handle, not an arbitrary expression.** The handle is named
 /// twice, once for its id and once to consume it, and an expression would be evaluated twice —
-/// which for `child.start(n).await?` would start the workflow twice. A workflow body starts its
-/// children one at a time anyway, so they are already bound.
+/// which for `child.start(n).await?` would start the workflow twice. A handle a body means to race
+/// has been bound to a name by the time it gets here in any case.
 ///
 /// **Two branches naming the same workflow are answered by the first**, in the order the arms are
 /// written. [`select_workflow`](fn@select_workflow) accepts a repeated id for the same reason: the
@@ -697,7 +697,7 @@ impl Connection {
             // not bookkeeping: a workflow that changed which ids it waits on has changed what this
             // position of its code means, and handing back a winner it no longer waits on would
             // have it act on an answer to a question it stopped asking. The same check
-            // `Awaiting::check` makes against a recorded child id, for the same reason.
+            // `ChildResultPlacement::check` makes against a recorded child id, for the same reason.
             //
             // **Both references make it too, without writing it down**, because returning a
             // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
@@ -710,7 +710,7 @@ impl Connection {
             if !workflow_ids.contains(&winner.as_str()) {
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order
-                // `Awaiting::check` builds them in.
+                // `ChildResultPlacement::check` builds them in.
                 return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                     workflow_id: workflow_id.to_owned(),
                     step_id,

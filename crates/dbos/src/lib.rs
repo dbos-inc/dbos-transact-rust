@@ -104,4 +104,7 @@ pub use sysdb::types::{Change, RateLimit, WorkflowDelay};
 #[cfg(feature = "engine")]
 pub use wait::{join_workflows, select_workflow};
 #[cfg(feature = "engine")]
-pub use workflow::{DuplicationPolicy, Enqueue, RunOptions, StartOptions, Timeout};
+pub use workflow::{
+    DuplicationPolicy, Enqueue, PendingRun, PendingStart, PendingWorkflow, RunOptions,
+    StartOptions, Timeout,
+};

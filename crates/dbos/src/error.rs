@@ -581,12 +581,13 @@ impl Error<EngineOnly> {
     /// would wrap the whole error as the application's. This is the conversion written out:
     ///
     /// ```ignore
-    /// let child = checkout.start(order).await.map_err(Error::lift)?;
+    /// let status = child.status().await.map_err(Error::lift)?;
     /// ```
     ///
     /// The workflow-facing calls do not need it: [`step`](crate::step),
-    /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) are all generic over
-    /// the caller's channel, so `?` works on them directly.
+    /// [`set_event`](crate::set_event), [`get_event`](crate::get_event), a child's
+    /// [`start`](crate::WorkflowRef::start), [`run`](crate::WorkflowRef::run) and the await of a
+    /// handle are all generic over the caller's channel, so `?` works on them directly.
     pub fn lift<E>(self) -> Error<E> {
         self.map_application(|impossible| match impossible {})
     }
