@@ -247,6 +247,15 @@ impl<E> StepOptions<E> {
 /// replay that interleaved differently met a recorded step under the wrong name, which records
 /// nothing, leaves the workflow `PENDING`, and has it recovered until it parks.
 ///
+/// **`join!` is the combinator that promise is about, and `select!` is not.** An all-wait decides
+/// nothing, so a replay has nothing to get differently; a race decides which branch won and
+/// nothing records it, so a replay may choose the other one — and `tokio::time::timeout` is that
+/// same race against a clock no replay reproduces. Neither belongs in a workflow body: race
+/// workflows with [`select_workflow!`](macro@crate::select_workflow), bound a call with the
+/// deadline it already takes, and put any other race *inside a step*, where the step's own
+/// checkpoint stands for however its body reached the answer. [`PendingStep`] says the same for
+/// every durable call, not only steps.
+///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
 /// sibling's body is in flight still takes an id and checkpoints.

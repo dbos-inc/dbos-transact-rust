@@ -48,6 +48,43 @@
 //! It also owns [`PendingStep`] itself, the value such a call hands back once it has taken its step
 //! id and before it has run. That belongs here rather than beside any one producer because the id
 //! and the rule it implies — *polled where it was built* — are the same whichever call took it.
+//!
+//! # Racing, and what a workflow body may not use
+//!
+//! **`tokio::join!` over durable calls is ordinary code; `tokio::select!` is not, and neither is
+//! `tokio::time::timeout`.** The difference is not the ids — those are taken where each call is
+//! written and a replay rebuilds the same ones in the same order, which is what this module is
+//! for. It is that a race **decides something**, and nothing records what it decided. A replay
+//! that races again may see the other branch answer first and take a path the first execution
+//! never took, which is the one thing a workflow may never do; a `timeout` is the same race
+//! against the wall clock, and the clock is not replayed either.
+//!
+//! An all-wait decides nothing, which is why `join!` needs no help: every branch runs, and the
+//! only question a replay could get differently — which id each call holds — was settled at the
+//! call.
+//!
+//! What to reach for instead, inside a workflow body:
+//!
+//! - **Racing workflows**: [`select_workflow!`](macro@crate::select_workflow), which records the
+//!   winner and awaits only it.
+//! - **Bounding how long something may take**: the call's own deadline —
+//!   [`get_event`](crate::get_event) and [`recv`](crate::recv) take one, a step carries its
+//!   timeout, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout).
+//!   Each of those is recorded; a `timeout` around the future is not.
+//! - **Racing anything else**: put the race *inside a step*. A step is a leaf whose checkpoint
+//!   stands for everything its body did, so a `select!` or a `timeout` in there is replayed as the
+//!   one answer the step recorded, and nothing about how it was reached has to be reproduced.
+//!
+//! That last line is the general rule and the reason the others are narrow: **the ban is on racing
+//! in a workflow body, not on racing.** Inside a step body, or outside a workflow entirely, the
+//! whole of tokio is available.
+//!
+//! Two calls are kept out of a durable race by their own types rather than by this paragraph, and
+//! for a different reason than the one above: [`PendingStart`](crate::PendingStart) and
+//! [`PendingRun`](crate::PendingRun) *create* a workflow, and a race polls in source order and
+//! stops at the first branch that is ready — so whether the child exists at all would follow the
+//! timing of some other branch. Start outside the race; race what observes the result.
+//!
 
 use std::future::Future;
 use std::pin::Pin;
@@ -93,6 +130,23 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// then past it, and this is `Send` and `Unpin`, so a call polled once where it belongs and then
 /// moved would go on running under the context it captured. Being polled is the only moment
 /// anything can tell where the call now stands.
+///
+/// **A workflow body may `join!` these; it may not `select!` over them, and may not wrap one in
+/// `tokio::time::timeout`.** The ids are not the problem — those were taken where each call was
+/// written, and a replay rebuilds the same ones in the same order, which is the whole point of
+/// this type. The problem is that a race **decides** something and nothing records what it
+/// decided, so a replay that races again may see the other branch answer first and take a path the
+/// first execution never took. A `timeout` is that same race against a clock, and the clock is not
+/// replayed either. An all-wait decides nothing, which is why `join!` needs no help.
+///
+/// Inside a workflow body, reach for these instead: race workflows with
+/// [`select_workflow!`](macro@crate::select_workflow), which records its winner; bound a call with
+/// the deadline it already takes — [`get_event`](crate::get_event) and [`recv`](crate::recv) take
+/// one, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout); and put
+/// any other race **inside a step**, whose checkpoint stands for however its body reached the
+/// answer. That last is the general rule and the reason the others are narrow: the restriction is
+/// on racing *in a workflow body*, not on racing. In a step body, or outside a workflow, the whole
+/// of tokio is available.
 ///
 /// **`Unpin`, which is contract rather than accident**: the run is already boxed, so a combinator
 /// holding one of these as a branch can do so by `Pin::new(&mut _)` rather than pinning it a

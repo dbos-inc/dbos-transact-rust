@@ -855,7 +855,7 @@ where
         // and the await was placed in the same context an instant later. Holding the start's is
         // what keeps [`PendingStep::step_id`] reporting the id a reader would expect of a run —
         // the position the pair begins at.
-        PendingRun(PendingStep::placed(
+        PendingWorkflow(PendingStep::placed(
             name,
             built,
             move |executor, placement| async move {
@@ -932,7 +932,7 @@ where
     ///
     /// Called from inside a running workflow this starts a **child** of it — see
     /// [`start_with`](Self::start_with) for what that records and what it costs.
-    pub fn start(&self, input: P) -> PendingStep<'_, WorkflowHandle<R, E>, E> {
+    pub fn start(&self, input: P) -> PendingStart<'_, R, E> {
         self.start_with(input, StartOptions::default())
     }
 
@@ -1016,11 +1016,7 @@ where
     /// its start is recorded against this parent, and a replay of this position joins it rather
     /// than starting a second. A start that is *never* polled writes nothing at all, and has still
     /// spent its step id.
-    pub fn start_with<'a>(
-        &'a self,
-        input: P,
-        options: StartOptions<'a>,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    pub fn start_with<'a>(&'a self, input: P, options: StartOptions<'a>) -> PendingStart<'a, R, E> {
         // The workflow's bare name, which is what the start records against the parent and
         // therefore what a refusal should call this call.
         let name: Arc<str> = Arc::from(self.key().name.as_str());
@@ -1030,11 +1026,15 @@ where
         // of `place`'s refusals, which is what makes a start that never stood anywhere safe to
         // leave unplaced.
         let built = self.place(&options).map(StartPlacement::into_parts);
-        PendingStep::placed(name, built, move |executor, placement| async move {
-            self.started(StartPlacement::of(executor, placement), input, options)
-                .await
-                .map_err(Error::lift)
-        })
+        PendingWorkflow(PendingStep::placed(
+            name,
+            built,
+            move |executor, placement| async move {
+                self.started(StartPlacement::of(executor, placement), input, options)
+                    .await
+                    .map_err(Error::lift)
+            },
+        ))
     }
 
     /// The start itself, once something polls it: everything that writes a row.
@@ -1343,39 +1343,65 @@ async fn create<R, E>(
     ))
 }
 
-/// A [`run`](WorkflowRef::run) that has claimed its two step ids and has started nothing.
+/// A call that creates a workflow, has claimed the step ids that costs, and has started nothing.
 ///
-/// The value [`run`](WorkflowRef::run) and [`run_with`](WorkflowRef::run_with) hand back. Awaiting
-/// one starts the child and waits for it, so `child.run(x).await?` reads exactly as it did when
-/// `run` was an `async fn`, and not one call site had to change.
+/// What [`start`](WorkflowRef::start) and [`run`](WorkflowRef::run) hand back — as
+/// [`PendingStart`] and [`PendingRun`], which are this type under the two names their callers
+/// read. Awaiting one starts the workflow, so `child.start(x).await?` and `child.run(x).await?`
+/// read exactly as they did when both were `async fn`s, and not one call site had to change.
 ///
-/// **A newtype over [`PendingStep`] rather than a `PendingStep`, because a run is not one step.**
-/// It holds two ids — the start's and the await's, claimed in that order — and the pair is what
-/// makes the difference to a combinator that has to decide what a *losing* branch means. A losing
-/// step is dropped mid-body having recorded nothing, so a replay simply runs it again; a losing
-/// run is a child that was started, spawned and recorded, whose outcome the parent then never
-/// learns and whose second id is spent on an await that never happened. That is a workflow left
-/// running with nobody waiting on it, which is not something a race can offer as one of its
-/// outcomes. Nothing refuses this yet — there is no durable race in the crate to refuse it — and
-/// the type exists now so that the refusal, when it arrives, is a compile error at the call site
-/// rather than a runtime one.
+/// **A newtype over [`PendingStep`] rather than a `PendingStep`, so a durable race cannot take
+/// one**, and the reason is not that dropping one leaves anything broken. It does not: dropped
+/// before its first poll it writes nothing, and dropped after one it finishes on its own — see
+/// [`start_with`](WorkflowRef::start_with). The reason is that a race would make a **workflow's
+/// existence depend on poll order**. A durable race polls its branches in source order and stops
+/// at the first that is ready, so a branch that creates a workflow may or may not have been polled
+/// before the winner answered — and a child that exists on one execution and not the next is a
+/// side effect no replay reproduces. A branch that only *observes* a workflow
+/// ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) has no such problem, and is what a
+/// race should hold.
 ///
-/// **Race the [`start`](WorkflowRef::start) and await the winner's handle instead**: that is the
-/// same work with the losing halves left unclaimed, and it is sound rather than merely tidier. A
-/// dropped start finishes — the half that writes rows runs in a task of its own — so a losing
-/// branch leaves a child that exists, is recorded against its parent, and runs, which is exactly
-/// what a losing branch of [`select_workflow!`](macro@crate::select_workflow) already leaves. What it does not leave is the
-/// state a start abandoned mid-write used to: a workflow nothing pointed at and nothing ran.
+/// **Start outside the race, then race what observes it.** For workflows alone that is
+/// [`select_workflow!`](macro@crate::select_workflow), which spends one id on the wait and one on
+/// the winner however many handles it is given; where a workflow is raced against a step it is the
+/// handle's [`result`](crate::WorkflowHandle::result) that belongs in the arm. Either way the
+/// workflows are created before the race, and the race decides only which one is watched.
 ///
 /// **`Unpin`, and the check the inner [`PendingStep`] makes on every poll is inherited** — this
-/// delegates its `poll` rather than reaching past it, so a run is held to the workflow it was
+/// delegates its `poll` rather than reaching past it, so a start is held to the workflow it was
 /// written in exactly as a step is.
-#[must_use = "a run that is not awaited never starts the child, and has still spent both of its \
-              step ids; await it"]
-pub struct PendingRun<'a, R, E = crate::EngineOnly>(PendingStep<'a, R, E>);
+#[must_use = "a start or a run that is not awaited never starts the workflow, and has still spent \
+              the step ids it claimed; await it"]
+pub struct PendingWorkflow<'a, T, E = crate::EngineOnly>(PendingStep<'a, T, E>);
 
-impl<R, E> Future for PendingRun<'_, R, E> {
-    type Output = Result<R, E>;
+/// A [`start`](WorkflowRef::start) that has claimed its step id and has started nothing.
+///
+/// One id, and it answers with a handle: the workflow's outcome is the handle's to give, through
+/// [`result`](crate::WorkflowHandle::result), which claims an id of its own where it is written.
+pub type PendingStart<'a, R, E = crate::EngineOnly> = PendingWorkflow<'a, WorkflowHandle<R, E>, E>;
+
+/// A [`run`](WorkflowRef::run) that has claimed its two step ids and has started nothing.
+///
+/// **Two ids, the start's and the await's**, claimed in that order and before either has run —
+/// which is what makes a `join!` over runs yield `{start, await}` pairs in the order the calls
+/// were written rather than pairs interleaved by whichever child finished first. That second id is
+/// the other half of why a run is not a [`PendingStep`]: everything a race could hold spends
+/// exactly one.
+pub type PendingRun<'a, R, E = crate::EngineOnly> = PendingWorkflow<'a, R, E>;
+
+impl<T, E> PendingWorkflow<'_, T, E> {
+    /// The id this call claimed when it was written, or `None` if it claimed none.
+    ///
+    /// [`PendingStep::step_id`]'s, forwarded. For a [`PendingRun`] that is the *start's* id — the
+    /// position the pair begins at — since the await's follows it directly.
+    #[must_use]
+    pub fn step_id(&self) -> Option<i32> {
+        self.0.step_id()
+    }
+}
+
+impl<T, E> Future for PendingWorkflow<'_, T, E> {
+    type Output = Result<T, E>;
 
     /// Delegated, which is what makes the inner check apply: see the type's documentation.
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
@@ -1384,9 +1410,9 @@ impl<R, E> Future for PendingRun<'_, R, E> {
     }
 }
 
-impl<R, E> std::fmt::Debug for PendingRun<'_, R, E> {
+impl<T, E> std::fmt::Debug for PendingWorkflow<'_, T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("PendingRun").field(&self.0).finish()
+        f.debug_tuple("PendingWorkflow").field(&self.0).finish()
     }
 }
 
