@@ -3384,8 +3384,8 @@ async fn replaying_set_event_does_not_republish() {
     assert_eq!(rows.0, 1, "the replay added no history row either");
 }
 
-/// How long the blocking reads wait between looks. Nothing pushes yet, so it is also how long a
-/// value takes to arrive.
+/// How long the blocking reads wait between looks, and so how long a value takes to arrive when
+/// nothing wakes the reader.
 const RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Publisher and reader, both initialised, sharing one handle.
@@ -3431,10 +3431,16 @@ async fn an_event_already_published_returns_at_once() {
 
 /// A value published *after* the wait began still arrives — which is the whole feature.
 ///
-/// **Nothing pushes.** No listener is running here and no trigger fires into this process, so
-/// what delivers is the re-query, exactly as it does on CockroachDB in every SDK. If this passed
-/// only with the listener running, the transport would have become load-bearing and the design
-/// gone wrong.
+/// **Nothing wakes the reader.** The publisher writes through a handle of its own, so the
+/// registry it signals on the way out is not the one the reader subscribed to; no listener is
+/// running and no trigger fires into this process. What delivers is the re-query, exactly as it
+/// does on CockroachDB in every SDK. If this passed only with the listener running, the transport
+/// would have become load-bearing and the design gone wrong.
+///
+/// The shared-handle case has its own test,
+/// `a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing`. Publishing through `sys` here
+/// would quietly retest that one instead, and a re-query loop that had stopped working would
+/// still pass.
 #[tokio::test]
 async fn a_value_published_during_the_wait_still_arrives() {
     let db = test_database().await;
@@ -3442,15 +3448,17 @@ async fn a_value_published_during_the_wait_still_arrives() {
         db.pool().await,
         &Settings::default(),
     ));
+    // Two handles over one database: separate registries, so the wake `set_event` does on its way
+    // out lands where the reader is not subscribed and only the row itself crosses between them.
+    let publisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
 
-    let publishing = {
-        let sys = std::sync::Arc::clone(&sys);
-        tokio::spawn(async move {
-            // Long enough that the reader's first look has already found nothing, so the value can
-            // only be delivered by a later pass of the loop.
-            tokio::time::sleep(BRIEFLY).await;
-            sys.set_event(
+    let publishing = tokio::spawn(async move {
+        // Long enough that the reader's first look has already found nothing, so the value can
+        // only be delivered by a later pass of the loop.
+        tokio::time::sleep(BRIEFLY).await;
+        publisher
+            .set_event(
                 "wf-publisher",
                 0,
                 "progress",
@@ -3459,12 +3467,11 @@ async fn a_value_published_during_the_wait_still_arrives() {
             )
             .await
             .unwrap();
-        })
-    };
+    });
 
     // The read is given ten minutes, so its deadline cannot be what ends the wait — only the loop
-    // finding the value can be. Bounded at ten intervals, because a looser bound would also pass
-    // on the polling fallback alone: "eventually" is the regression.
+    // finding the value can be. Bounded at ten intervals so that a loop which has slowed to some
+    // longer period fails here rather than passing: "eventually" is the regression.
     let began = Timestamp::now();
     let found = tokio::time::timeout(
         RECHECK * 10,
@@ -4283,7 +4290,7 @@ async fn a_second_receiver_on_one_topic_is_refused() {
 /// consumed between the two, and one answer, whether it was delivered once or twice.
 ///
 /// **What this does not pin:** the `consumed = FALSE` predicate itself. Removing it and re-running
-/// this test passes, because the transaction covers the same case — verified by mutation. The
+/// this test still passes, because the transaction covers the same case. The
 /// predicate stays for the reasons given where it is written, but no test here can tell it apart,
 /// and claiming otherwise would be worse than saying so.
 #[tokio::test]

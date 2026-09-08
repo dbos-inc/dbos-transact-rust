@@ -587,11 +587,12 @@ impl TestServer {
                 GenericImage::new(COCKROACH_IMAGE.0, COCKROACH_IMAGE.1)
                     .with_exposed_port(COCKROACH_PORT.tcp())
                     // An in-memory store, because nothing here outlives the container and
-                    // CockroachDB's cost is dominated by DDL: the corpus carries 56 migrations that
-                    // do work, each an online schema change, and the suite applies it once per
-                    // pooled database plus once per migration test. Measured over the whole
-                    // CockroachDB leg it is worth more than half the wall clock — 4m09s to 1m53s
-                    // locally — and two seconds off container startup besides.
+                    // CockroachDB's cost is dominated by DDL: the corpus is dozens of online
+                    // schema changes, replayed in full to build a process's baseline and again
+                    // for every migration test. It was measured at 4m09s to 1m53s over the whole
+                    // CockroachDB leg — before pooled databases were cloned from that baseline,
+                    // so there is less replaying to save now — and it takes two seconds off
+                    // container startup besides.
                     //
                     // The size is a ceiling rather than a reservation. The suite's data is a few
                     // thousand rows; the headroom is for CockroachDB's own system ranges and the
