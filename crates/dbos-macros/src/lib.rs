@@ -251,7 +251,20 @@ fn expand(race: &Race) -> TokenStream2 {
                         #count
                     ),
                 }
-                ::core::result::Result::Ok(#at)
+
+                // Checked on the replay exactly as on a fresh race. A replayed branch still reads
+                // its own row, so a cancellation, an interruption or a database failure arrives
+                // here too — and handing one to the arm would let a transient failure decide what
+                // the arm did, which is the divergence the recorded winner exists to prevent.
+                // Nothing is recorded either way: this select already has its row.
+                let #failed = match #at {
+                    #( #index => ::dbos::__private::control_error(&mut #slot), )*
+                    _ => ::core::option::Option::None,
+                };
+                match #failed {
+                    ::core::option::Option::Some(#failed) => ::core::result::Result::Err(#failed),
+                    ::core::option::Option::None => ::core::result::Result::Ok(#at),
+                }
             }
             ::core::result::Result::Ok(::dbos::__private::Racing::Fresh(#recording)) => {
                 // `Pin::new` rather than `Box::pin`: a `PendingStep` is `Unpin`, which it

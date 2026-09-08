@@ -159,7 +159,7 @@ impl<E> Branches<E> {
 ///
 /// The `check` half of the pair [`check_step`](crate::sysdb::SystemDatabase::check_step) and
 /// [`record_step`](crate::sysdb::SystemDatabase::record_step) name at the layer below, doing a
-/// little more than they do: it takes the [`StepPlacement`] as well as reading the row, and it
+/// little more than they do: it takes the `StepPlacement` as well as reading the row, and it
 /// holds a recorded winner to the branches that exist now.
 ///
 /// **Called after every branch is built**, and that ordering is the contract rather than a
@@ -172,7 +172,7 @@ impl<E> Branches<E> {
 /// compile time, which is the one refusal a macro can make that a `Vec`-taking function would have
 /// had to make at run time.
 ///
-/// **[`StepPlacement::here`], so a race inside a step body is a plain race.** The leaf rule the
+/// **`StepPlacement::here`, so a race inside a step body is a plain race.** The leaf rule the
 /// whole crate follows: the step's own checkpoint stands for everything its body did, and outside
 /// a workflow there is no counter at all. Both fall through to [`Racing::Fresh`] with a placement
 /// that records nothing, which is what makes `select_step!` mean the same thing wherever it is
@@ -231,7 +231,7 @@ pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Rac
 /// to decide which is true. What only this step knows is which branch won.
 ///
 /// Where nothing is checkpointed — outside a workflow, or inside a step body — this writes nothing
-/// and the race was a plain one, which is the fall-through [`StepPlacement::record`] gives every
+/// and the race was a plain one, which is the fall-through `StepPlacement::record` gives every
 /// other call.
 pub async fn record_select<E: DurableError>(recording: Recording, winner: usize) -> Result<(), E> {
     let Recording {
