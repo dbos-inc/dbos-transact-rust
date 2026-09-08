@@ -11,7 +11,7 @@ use tracing::Instrument;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{PendingStep, StepDurability, StepPlacement, revive};
-use crate::context::Ctx;
+use crate::context::{Ctx, StepStatus};
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
@@ -423,6 +423,13 @@ where
     let mut failures: Vec<Error<E>> = Vec::new();
     let outcome = loop {
         let attempt = failures.len() as u32 + 1;
+        // Rebuilt per attempt, because `current_attempt` is the field that moves: the id and the
+        // cap are the step's, the attempt number is this try's.
+        let status = StepStatus {
+            step_id,
+            current_attempt: attempt,
+            max_attempts: attempts,
+        };
         // The span nests inside the workflow's, so anything the body logs carries both ids.
         let span = tracing::info_span!("step", step_id, step_name = name, attempt);
         // **The closure is called inside the step's scope, not beside it.** An `async` block
@@ -433,7 +440,7 @@ where
         // on the workflow's own call stack, where it takes a step id from the counter, and the
         // call would then be refused by its own run for being polled inside a step body. Every
         // attempt would spend another id on the way.
-        match supervise(ctx, name, step_id, &options, async { body().await }, span).await {
+        match supervise(ctx, name, status, &options, async { body().await }, span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
@@ -582,7 +589,7 @@ where
 async fn supervise<T, E, Fut>(
     ctx: &Ctx,
     name: &str,
-    step_id: i32,
+    status: StepStatus,
     options: &StepOptions<E>,
     body: Fut,
     span: tracing::Span,
@@ -607,7 +614,7 @@ where
     let token = CancellationToken::new();
     let cancel_on_drop = token.clone().drop_guard();
     let attempt = ctx
-        .in_step_scope(Some(token.clone()), step_id, body)
+        .in_step_scope(token.clone(), status, body)
         .instrument(span);
 
     let outcome = if options.timeout.is_none() && !options.preemptible {
@@ -1144,7 +1151,8 @@ mod tests {
             );
             // Now somewhere its id cannot be honoured: a step body, whose own checkpoint already
             // stands for everything it does.
-            c.in_step_scope(None, 0, built).await
+            c.in_step_scope(CancellationToken::new(), StepStatus::first(0), built)
+                .await
         })
         .await;
 

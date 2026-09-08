@@ -86,7 +86,7 @@ pub use client::{Client, ClientConfig, EnqueueOptions};
 #[cfg(feature = "engine")]
 pub use config::{Config, DATABASE_URL_ENV, Serializer};
 #[cfg(feature = "engine")]
-pub use context::{cancellation_token, step_id, workflow_id};
+pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]

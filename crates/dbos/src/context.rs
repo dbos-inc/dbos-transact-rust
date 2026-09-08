@@ -36,22 +36,6 @@ tokio::task_local! {
 pub(crate) struct Ctx {
     executor: Arc<Executor>,
     workflow: Arc<WorkflowState>,
-    /// Fires when the step running under this context should stop.
-    ///
-    /// **On the `Ctx` rather than on [`WorkflowState`], because it belongs to one attempt.** A
-    /// retried step gets a fresh token per attempt, and the shared state is exactly what must not
-    /// carry it — a token cancelled by attempt one would arrive already-cancelled at attempt two.
-    /// [`in_step_scope`](Self::in_step_scope) rebinds the task-local with a `Ctx` holding the
-    /// attempt's token, which works because cloning a `Ctx` shares the workflow state that has to
-    /// be shared and copies only what belongs to the attempt.
-    ///
-    /// `None` outside a step, and outside a step there is nothing to cancel.
-    ///
-    /// **This is the receiving end, and only that.** The engine raises a cancellation on the token
-    /// it holds itself; what lands here is a clone, handed to the body so it can watch — see
-    /// [`cancellation_token`](crate::cancellation_token). Nothing a body does with this cancels
-    /// anything.
-    step_cancellation: Option<CancellationToken>,
     /// Which step body this context is inside, or `None` in the workflow proper.
     ///
     /// A step is a leaf: the checkpoint it writes stands for everything the body did, so a step
@@ -70,25 +54,106 @@ pub(crate) struct Ctx {
 
 /// What a context inside a step body knows about that body.
 ///
-/// **One `Option` for both, because a context has both or neither.** The marker and the id are
+/// **One `Option` for both, because a context has both or neither.** The marker and the status are
 /// bound together by [`in_step_scope`](Ctx::in_step_scope) and go out of scope together, and that
 /// invariant is worth more as a type than as a convention two fields keep by agreement: nothing can
-/// leave a context holding an id it is no longer inside, or a marker with no id to report.
+/// leave a context holding a status it is no longer inside, or a marker with nothing to report.
 ///
 /// They stay *distinct* inside it, because they answer different questions on different clocks —
-/// see [`StepMarker`] for the one that is per attempt, and [`id`](Self::id) for the one that is per
-/// step.
-#[derive(Clone, Copy, Debug)]
+/// see [`StepMarker`] for the one that is per attempt, and [`StepStatus`] for what the body may
+/// read about itself.
+#[derive(Clone, Debug)]
 pub(crate) struct StepScope {
     /// Which body, for the leaf rule. Opaque, and never compared across runs.
     marker: StepMarker,
-    /// The ordinal [`step_id`](crate::step_id) reports, and half a checkpoint row's key.
+    /// What [`step_status`](crate::step_status) reports.
     ///
-    /// **Per step, where the marker is per attempt.** A retry enters a new scope with a fresh
-    /// marker and *this same id*: the attempts are different bodies, and they are attempts at one
-    /// step, competing to record under one row. That difference is the whole reason these are two
-    /// values rather than one.
-    id: i32,
+    /// **The id inside it is per step, where the marker is per attempt.** A retry enters a new
+    /// scope with a fresh marker and the *same* id: the attempts are different bodies, and they are
+    /// attempts at one step, competing to record under one row. `current_attempt` is the field that
+    /// moves between them.
+    status: StepStatus,
+    /// Fires when the body running under this scope should stop.
+    ///
+    /// **Per attempt, like the marker beside it.** A retried step gets a fresh token, and shared
+    /// state is exactly what must not carry one — a token cancelled by attempt one would arrive
+    /// already-cancelled at attempt two.
+    ///
+    /// **Not an `Option`, because a step body always has one.** The engine mints a token for every
+    /// attempt whether or not anything watches it, so "in a step" and "has a token" are the same
+    /// condition, and one `Option` on the `Ctx` says it once.
+    ///
+    /// **This is the receiving end, and only that.** The engine raises a cancellation on the token
+    /// it holds itself; what lands here is a clone, handed to the body so it can watch — see
+    /// [`cancellation_token`](crate::cancellation_token). Nothing a body does with this cancels
+    /// anything.
+    cancellation: CancellationToken,
+}
+
+/// What a step body can learn about the attempt it is running as.
+///
+/// Read with [`step_status`](crate::step_status). The equivalent is `DBOS.step_status` in Python
+/// and `DBOS.stepStatus` in TypeScript; Go and Java expose nothing like it.
+///
+/// TypeScript's carries a fourth field, `timeoutSignal`, which here is
+/// [`cancellation_token`](crate::cancellation_token) — a free function rather than a field, because
+/// it is useful to a body that has no interest in which attempt it is.
+///
+/// **A read-only snapshot, and read-only by construction.** The fields are behind accessors rather
+/// than public, so there is no way to write one. That is not a guard against a body changing its
+/// own retry policy — it could not anyway, since this is `Copy` and the engine rebuilds its own
+/// copy from its own counters on every attempt — but against the *appearance* of one: a settable
+/// `max_attempts` that silently changed nothing would be worse than no field at all. A step decides
+/// how many attempts it gets through [`StepOptions`](crate::StepOptions), before it runs.
+#[cfg(test)]
+impl StepStatus {
+    /// A first attempt at `step_id`, for tests that only care which step they are inside.
+    pub(crate) fn first(step_id: i32) -> Self {
+        Self {
+            step_id,
+            current_attempt: 1,
+            max_attempts: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepStatus {
+    /// The step's ordinal position in its workflow, counting from zero — the same number
+    /// [`step_id`](crate::step_id) reports, and half a checkpoint row's key.
+    pub(crate) step_id: i32,
+    /// Which attempt is running, counting from **one**.
+    ///
+    /// **One-based, matching TypeScript, whose `attemptNum` reaches the body as 1 on the first
+    /// try.** Python is the outlier and documents its own as zero-indexed, which makes a plain step
+    /// "attempt 0 of 1"; this crate already spells the same number one-based in a step's tracing
+    /// span, and a body that logs "attempt 2 of 3" should not have to add one to say so.
+    pub(crate) current_attempt: u32,
+    /// How many attempts the policy allows in total, so a body can tell it is on its last.
+    ///
+    /// **Always a number, where Python and TypeScript both report nothing for a step that does not
+    /// retry.** They have to: their step config leaves the count unset. Here every step runs the
+    /// same loop with `max_attempts` defaulting to 1, so a plain step is honestly attempt 1 of 1 —
+    /// and "does this step retry?" is `max_attempts() > 1` rather than a second `Option` to unwrap
+    /// inside one.
+    pub(crate) max_attempts: u32,
+}
+
+impl StepStatus {
+    /// The step's ordinal position in its workflow, counting from zero.
+    pub fn step_id(&self) -> i32 {
+        self.step_id
+    }
+
+    /// Which attempt is running, counting from one.
+    pub fn current_attempt(&self) -> u32 {
+        self.current_attempt
+    }
+
+    /// How many attempts the policy allows in total.
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
 }
 
 /// Which step body a context is inside.
@@ -163,7 +228,6 @@ impl Ctx {
                 deadline,
                 next_step_id: AtomicI32::new(0),
             }),
-            step_cancellation: None,
             step: None,
         }
     }
@@ -206,7 +270,12 @@ impl Ctx {
 
     /// The id of the step body this context is inside, or `None` in the workflow proper.
     pub(crate) fn step_id(&self) -> Option<i32> {
-        self.step.map(|step| step.id)
+        self.step.as_ref().map(|step| step.status.step_id)
+    }
+
+    /// What the body this context is inside may read about its own attempt, or `None` outside one.
+    pub(crate) fn step_status(&self) -> Option<StepStatus> {
+        self.step.as_ref().map(|step| step.status)
     }
 
     /// Whether this and `other` are the same *execution* of the same workflow.
@@ -271,7 +340,7 @@ impl Ctx {
     /// else. Both places have the same workflow id, so comparing workflow identity cannot tell them
     /// apart. See [`StepMarker`].
     pub(crate) fn step_marker(&self) -> Option<StepMarker> {
-        self.step.map(|step| step.marker)
+        self.step.as_ref().map(|step| step.marker)
     }
 
     /// Runs `body` under a context that is [`in_step`](Self::in_step).
@@ -284,8 +353,8 @@ impl Ctx {
     /// answer to another.
     pub(crate) async fn in_step_scope<F: Future>(
         &self,
-        cancellation: Option<CancellationToken>,
-        step_id: i32,
+        cancellation: CancellationToken,
+        status: StepStatus,
         body: F,
     ) -> F::Output {
         // Rebinding rather than mutating: the body must see this attempt's token, its own marker
@@ -293,10 +362,10 @@ impl Ctx {
         let scoped = Ctx {
             executor: Arc::clone(&self.executor),
             workflow: Arc::clone(&self.workflow),
-            step_cancellation: cancellation,
             step: Some(StepScope {
                 marker: StepMarker(NEXT_STEP_MARKER.fetch_add(1, Ordering::Relaxed)),
-                id: step_id,
+                status,
+                cancellation,
             }),
         };
         CURRENT.scope(scoped, body).await
@@ -319,7 +388,12 @@ impl Ctx {
     /// also called outside a workflow needs no second path.
     ///
     pub(crate) fn cancellation(&self) -> CancellationToken {
-        self.step_cancellation.clone().unwrap_or_default()
+        // `unwrap_or_default` means exactly one thing now: there is no step here, and a token
+        // that never fires is the honest answer.
+        self.step
+            .as_ref()
+            .map(|step| step.cancellation.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -378,6 +452,36 @@ pub fn workflow_id() -> Option<String> {
 /// `dbos.GetStepID(ctx)` in Go and `DBOS.stepId()` in Java.
 pub fn step_id() -> Option<i32> {
     Ctx::with_current(|ctx| ctx.and_then(Ctx::step_id))
+}
+
+/// What the step this code is running inside knows about its own attempt, or `None` outside one.
+///
+/// [`step_id`](crate::step_id) is the common case and stays its own function; this is the rest of
+/// what a body may ask — chiefly **which attempt it is**, so a step can behave differently on its
+/// last one: log the failure loudly, fall back to a cheaper path, or stop paying for a cache it is
+/// about to give up on.
+///
+/// `None` in the workflow body proper and outside a workflow, exactly as
+/// [`step_id`](crate::step_id) is — a status belongs to a step, and between two steps a workflow is
+/// inside neither.
+///
+/// ```no_run
+/// # #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+/// # #[error("upstream is down")]
+/// # struct Upstream;
+/// async fn charge() -> dbos::Result<(), Upstream> {
+///     let status = dbos::step_status().expect("inside a step");
+///     if status.current_attempt() == status.max_attempts() {
+///         tracing::warn!(step = status.step_id(), "last attempt; the step is about to fail");
+///     }
+///     Err(Upstream)?
+/// }
+/// ```
+///
+/// The equivalent is `DBOS.step_status` in Python and `DBOS.stepStatus` in TypeScript. See
+/// [`StepStatus`] for where the three fields differ from theirs.
+pub fn step_status() -> Option<StepStatus> {
+    Ctx::with_current(|ctx| ctx.and_then(Ctx::step_status))
 }
 
 /// A token that fires when the step this code is running inside is abandoned.
@@ -558,7 +662,7 @@ mod tests {
                 "the body reads the deadline its row carries"
             );
             inner
-                .in_step_scope(None, 0, async {
+                .in_step_scope(CancellationToken::new(), StepStatus::first(0), async {
                     assert_eq!(
                         Ctx::current().expect("inside a step").deadline(),
                         Some(deadline),
@@ -584,7 +688,7 @@ mod tests {
         let (inside, wait_for_inside) = tokio::sync::oneshot::channel();
         let (done, wait_for_done) = tokio::sync::oneshot::channel();
 
-        let long = ctx.in_step_scope(None, 0, async move {
+        let long = ctx.in_step_scope(CancellationToken::new(), StepStatus::first(0), async move {
             inside.send(()).expect("the sibling is waiting on this");
             wait_for_done.await.expect("the sibling ran to completion");
             Ctx::current().expect("inside a step").in_step()
@@ -594,7 +698,12 @@ mod tests {
                 .await
                 .expect("the long step reached its body");
             // A whole step scope opens and closes while the other one is suspended inside its own.
-            ctx.in_step_scope(None, 0, std::future::ready(())).await;
+            ctx.in_step_scope(
+                CancellationToken::new(),
+                StepStatus::first(0),
+                std::future::ready(()),
+            )
+            .await;
             done.send(()).expect("the long step is waiting on this");
         };
 
@@ -621,12 +730,16 @@ mod tests {
 
         let stepping = ctx.clone();
         Ctx::scope(ctx, async move {
-            let held = stepping.in_step_scope(None, 0, async move {
-                inside
-                    .send(())
-                    .expect("the workflow body is waiting on this");
-                wait_for_look.await.expect("the workflow body looked");
-            });
+            let held = stepping.in_step_scope(
+                CancellationToken::new(),
+                StepStatus::first(0),
+                async move {
+                    inside
+                        .send(())
+                        .expect("the workflow body is waiting on this");
+                    wait_for_look.await.expect("the workflow body looked");
+                },
+            );
             let proper = async {
                 wait_for_inside.await.expect("the step reached its body");
                 let seen = Ctx::current().expect("inside the workflow").in_step();

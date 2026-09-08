@@ -837,6 +837,8 @@ impl StepPlacement {
 mod tests {
     use super::*;
     use crate::EngineOnly;
+    use crate::context::StepStatus;
+    use tokio_util::sync::CancellationToken;
 
     /// A launched instance and three contexts of one workflow: the workflow proper, and one inside
     /// each of two different step bodies.
@@ -860,8 +862,11 @@ mod tests {
         let proper = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
         // The only way to hold one: the marker is bound by the scope, so the body reads it back
         // out. What a step body's own calls see.
-        let body =
-            || proper.in_step_scope(None, 0, async { Ctx::current().expect("inside the scope") });
+        let body = || {
+            proper.in_step_scope(CancellationToken::new(), StepStatus::first(0), async {
+                Ctx::current().expect("inside the scope")
+            })
+        };
         let in_step = body().await;
         let sibling = body().await;
         assert_ne!(

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use dbos::{Config, DBOS, StepOptions};
+use dbos::{Config, DBOS, StepOptions, StepStatus};
 use std::time::Duration;
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -185,4 +185,126 @@ async fn every_attempt_of_a_step_sees_the_same_id() {
         seen.iter().all(|id| *id == Some(1)),
         "every attempt reports the same step id, got {seen:?}"
     );
+}
+
+/// A plain step reports attempt 1 of 1, where Python and TypeScript both report nothing.
+///
+/// The divergence is deliberate: every step here runs the same retry loop with `max_attempts`
+/// defaulting to 1, so there is an honest answer to give, and "does this retry?" is
+/// `max_attempts > 1` rather than an `Option` to unwrap inside an `Option`.
+#[tokio::test]
+async fn a_plain_step_reports_one_attempt_of_one() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("plain-status-app", &db));
+    // Captured rather than returned: `StepStatus` is deliberately not serializable, because it
+    // describes the attempt rather than its outcome and has no business in a checkpoint row.
+    let seen: Arc<std::sync::Mutex<Option<StepStatus>>> = Arc::default();
+    let workflow = {
+        let seen = Arc::clone(&seen);
+        dbos.register_workflow("plain", move |()| {
+            let seen = Arc::clone(&seen);
+            async move {
+                dbos::step("only", || async {
+                    *seen.lock().unwrap() = dbos::step_status();
+                    dbos::Result::<(), Flaky>::Ok(())
+                })
+                .await
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    workflow.run(()).await.expect("the workflow failed");
+    let status = seen.lock().unwrap().expect("inside a step");
+    assert_eq!(
+        (
+            status.step_id(),
+            status.current_attempt(),
+            status.max_attempts()
+        ),
+        (0, 1, 1)
+    );
+}
+
+/// **The attempt number moves and the id does not**, which is the whole point of the status
+/// carrying both. One-based, so the last attempt of three reports 3 rather than 2.
+#[tokio::test]
+async fn the_attempt_number_counts_from_one_and_the_id_holds_still() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("status-retry-app", &db));
+    let seen: Arc<std::sync::Mutex<Vec<StepStatus>>> = Arc::default();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let workflow = {
+        let seen = Arc::clone(&seen);
+        let attempts = Arc::clone(&attempts);
+        dbos.register_workflow("retries", move |()| {
+            let seen = Arc::clone(&seen);
+            let attempts = Arc::clone(&attempts);
+            async move {
+                // A step ahead of it, so a step id that never moved would be indistinguishable
+                // from one that was always zero.
+                dbos::step("first", || async { dbos::Result::<(), Flaky>::Ok(()) }).await?;
+                let options = StepOptions {
+                    max_attempts: 3,
+                    interval: Duration::from_millis(1),
+                    max_interval: Duration::from_millis(5),
+                    ..Default::default()
+                };
+                dbos::step_with("flaky", options, || {
+                    let seen = Arc::clone(&seen);
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(dbos::step_status().expect("inside a step"));
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            Err(Flaky)?
+                        }
+                        Ok(())
+                    }
+                })
+                .await?;
+                dbos::Result::<(), Flaky>::Ok(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    workflow.run(()).await.expect("the workflow failed");
+
+    let seen: Vec<(i32, u32, u32)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| (s.step_id(), s.current_attempt(), s.max_attempts()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![(1, 1, 3), (1, 2, 3), (1, 3, 3)],
+        "the attempt should count 1..=3 while the id stays put"
+    );
+}
+
+/// A status belongs to a step, so the workflow body between two of them has none — the same place
+/// `step_id` answers `None`, and for the same reason.
+#[tokio::test]
+async fn there_is_no_step_status_outside_a_step() {
+    assert_eq!(dbos::step_status(), None);
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("status-gap-app", &db));
+    let workflow = dbos
+        .register_workflow("gap", |()| async move {
+            let before = dbos::step_status().is_none();
+            dbos::step("only", || async { dbos::Result::<(), Flaky>::Ok(()) }).await?;
+            dbos::Result::<_, Flaky>::Ok((before, dbos::step_status().is_none()))
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let (before, after) = workflow.run(()).await.expect("the workflow failed");
+    assert!(before, "the workflow body is not inside a step");
+    assert!(after, "a finished step's status does not leak out of it");
 }
