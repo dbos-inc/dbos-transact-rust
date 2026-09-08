@@ -1,10 +1,10 @@
 //! The durable race over steps: what it records, and the pair the macro's expansion calls.
 //!
 //! A workflow that races two steps has made a **choice**, and a choice a workflow makes has to be
-//! recorded — a replay that raced again could see the other branch finish first and take a path
-//! the first execution never took, which is the one thing a workflow may never do. That is the
-//! whole reason this module exists where a `tokio::join!` over [steps](crate::step()) needs nothing:
-//! an all-wait decides nothing, so there is nothing for a replay to get differently.
+//! recorded — a replay that raced again could see the other branch finish first and take a path the
+//! first execution never took, which is the one thing a workflow may never do. That is the whole
+//! reason this module exists where a `tokio::join!` over [steps](crate::step()) needs nothing: an
+//! all-wait decides nothing, so there is nothing for a replay to get differently.
 //!
 //! **A plain `tokio::select!` over steps is the trap this replaces.** Since a step takes its id
 //! when it is built rather than at its first poll, the ids under a `select!` are already
@@ -40,11 +40,11 @@
 //! - *Infer the winner from the branch that recorded.* A row does not mean a branch finished.
 //!   [`sleep`](crate::sleep()) checkpoints the instant it will wake at and waits afterwards, so a
 //!   **losing** sleep leaves a row that is, in the row, indistinguishable from a winner's — and a
-//!   losing sleep is what a timeout race has. Nothing in the row separates them: a durable sleep
-//!   is stamped complete at its wake time, which a later recovery reads as long past, and a
-//!   deadline is stamped complete the moment it is written. Making this sound needs a bit on the
-//!   call itself, saying whether its row would mean it finished, which is a change to every
-//!   durable call's contract in service of one caller.
+//!   losing sleep is what a timeout race has. Nothing in the row separates them: a durable sleep is
+//!   stamped complete at its wake time, which a later recovery reads as long past, and a deadline
+//!   is stamped complete the moment it is written. Making this sound needs a bit on the call
+//!   itself, saying whether its row would mean it finished, which is a change to every durable
+//!   call's contract in service of one caller.
 //! - *Write both rows in one transaction.* There is no single write to join. An application step
 //!   records through `record_step`, a child's result through `record_child_result`, a sleep
 //!   through `record_sleep` before the wait it is checkpointing, and a child's start inside
@@ -72,9 +72,9 @@
 //! # What may be a branch
 //!
 //! A [`PendingStep`] — a [`step`](crate::step()), a
-//! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep()), an event, a wait,
-//! a management call. Every one of them **observes**: it claims one id, records one row, and a
-//! replay of it reads that row back rather than doing the thing again.
+//! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep()), an event, a
+//! wait, a management call. Every one of them **observes**: it claims one id, records one row, and
+//! a replay of it reads that row back rather than doing the thing again.
 //!
 //! A child's [`start`](crate::WorkflowRef::start) or [`run`](crate::WorkflowRef::run) — a
 //! [`PendingStart`](crate::PendingStart) and a [`PendingWorkflow`](crate::PendingWorkflow) — is
@@ -301,10 +301,9 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
 /// **A control signal is not the race's decision.** A step that ends in a cancellation, an
 /// interruption or a database failure records nothing — [`step`](crate::step()) hands it back with
 /// the row untouched, so the workflow stays pending and is recovered — and the race it won has to
-/// do the same. Recording that branch as the winner would pin every recovery to a branch that
-/// never ran its body and never race the others again; and a control signal tends to arrive
-/// *fast*, one failed round trip ahead of any branch doing real work, so it would win exactly when
-/// it matters.
+/// do the same. Recording that branch as the winner would pin every recovery to a branch that never
+/// ran its body and never race the others again; and a control signal tends to arrive *fast*, one
+/// failed round trip ahead of any branch doing real work, so it would win exactly when it matters.
 ///
 /// An application error is different and is left where it is: the branch recorded it under its own
 /// id, so recording it as the winner is a faithful account and a replay reproduces it.

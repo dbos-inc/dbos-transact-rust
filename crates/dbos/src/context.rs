@@ -27,11 +27,10 @@ tokio::task_local! {
 /// same step counter, which is the point, because a step allocated through either must not reuse
 /// an id allocated through the other.
 ///
-/// **Internal.** Everything a workflow may ask about itself is a free function —
-/// [`workflow_id`], [`step_id`],
-/// [`step_status`] and [`cancellation_token`] — so
-/// user code never names this type or reaches through it. That keeps the ambient context an
-/// implementation detail: the questions are stable API, the thing that answers them is not.
+/// **Internal.** Everything a workflow may ask about itself is a free function — [`workflow_id`],
+/// [`step_id`], [`step_status`] and [`cancellation_token`] — so user code never names this type or
+/// reaches through it. That keeps the ambient context an implementation detail: the questions are
+/// stable API, the thing that answers them is not.
 #[derive(Clone)]
 pub(crate) struct Ctx {
     executor: Arc<Executor>,
@@ -85,8 +84,7 @@ pub(crate) struct StepScope {
     ///
     /// **This is the receiving end, and only that.** The engine raises a cancellation on the token
     /// it holds itself; what lands here is a clone, handed to the body so it can watch — see
-    /// [`cancellation_token`]. Nothing a body does with this cancels
-    /// anything.
+    /// [`cancellation_token`]. Nothing a body does with this cancels anything.
     cancellation: CancellationToken,
 }
 
@@ -457,20 +455,20 @@ pub fn step_id() -> Option<i32> {
 
 /// What the step this code is running inside knows about its own attempt, or `None` outside one.
 ///
-/// [`step_id`] is the common case and stays its own function; this is the rest of
-/// what a body may ask — chiefly **which attempt it is**, so a step can behave differently on its
-/// last one: log the failure loudly, fall back to a cheaper path, or stop paying for a cache it is
-/// about to give up on.
+/// [`step_id`] is the common case and stays its own function; this is the rest of what a body may
+/// ask — chiefly **which attempt it is**, so a step can behave differently on its last one: log the
+/// failure loudly, fall back to a cheaper path, or stop paying for a cache it is about to give up
+/// on.
 ///
 /// `None` in the workflow body proper and outside a workflow, exactly as
 /// [`step_id`] is — a status belongs to a step, and between two steps a workflow is
 /// inside neither.
 ///
 /// **Inside a step called from another step, this describes the enclosing step** — its id, its
-/// attempt, its cap — for the reason [`step_id`] gives: the nested call is part of
-/// that step and has no attempt of its own. Worth knowing before a shared helper branches on it,
-/// since "the last attempt" it reads is its caller's, and can be the last attempt of a step the
-/// helper itself has never failed.
+/// attempt, its cap — for the reason [`step_id`] gives: the nested call is part of that step and
+/// has no attempt of its own. Worth knowing before a shared helper branches on it, since "the last
+/// attempt" it reads is its caller's, and can be the last attempt of a step the helper itself has
+/// never failed.
 ///
 /// ```no_run
 /// # #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
@@ -502,16 +500,15 @@ pub fn step_status() -> Option<StepStatus> {
 /// and on any other path that abandons an attempt. What this hands back is a clone to watch.
 ///
 /// **A clone is not a read-only handle, and cancelling one reaches no further than the body's own
-/// watchers.** `cancel()` and `drop_guard()` are public on
-/// [`CancellationToken`], so a body *can* fire the token it
-/// was handed, and every other clone of it — including ones the body passed to its own detached
-/// work — will see cancelled. Nothing else changes: the engine never waits on this token, it only
-/// fires it, so a body cannot end its own attempt, fail its step or cancel its workflow this way.
-/// A step ends by returning, and a workflow is cancelled through
-/// [`DBOS::cancel`](crate::DBOS::cancel). Firing it yourself only tells your own
-/// watchers that an attempt was abandoned when it was not, which is a lie worth not telling; the
-/// type stays `CancellationToken` rather than a wrapper because hiding `cancel()` would mean
-/// reimplementing the half of it a body actually waits on.
+/// watchers.** `cancel()` and `drop_guard()` are public on [`CancellationToken`], so a body *can*
+/// fire the token it was handed, and every other clone of it — including ones the body passed to
+/// its own detached work — will see cancelled. Nothing else changes: the engine never waits on this
+/// token, it only fires it, so a body cannot end its own attempt, fail its step or cancel its
+/// workflow this way. A step ends by returning, and a workflow is cancelled through
+/// [`DBOS::cancel`](crate::DBOS::cancel). Firing it yourself only tells your own watchers that an
+/// attempt was abandoned when it was not, which is a lie worth not telling; the type stays
+/// `CancellationToken` rather than a wrapper because hiding `cancel()` would mean reimplementing
+/// the half of it a body actually waits on.
 ///
 /// Watch it from work the runtime cannot stop by dropping the step's future — a
 /// [`spawn_blocking`](tokio::task::spawn_blocking) thread, or a client holding its own cancel

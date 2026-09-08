@@ -273,12 +273,12 @@ impl<E> StepOptions<E> {
 /// It is deterministic — the same construction sequence burns the same ids on a replay — but it is
 /// not a no-op.
 ///
-/// **A step is polled where it was built.** The id is a claim on one position in one workflow, so
-/// a step built outside a workflow and awaited inside one, carried into a second workflow, or
-/// carried across a step-body boundary in either direction is refused as
-/// [`Error::StepBuiltElsewhere`] rather than run under an id
-/// nothing there can honour. The everyday way to trip it is building the step before the workflow
-/// runs — in the handler that then starts it, say — and awaiting it inside.
+/// **A step is polled where it was built.** The id is a claim on one position in one workflow, so a
+/// step built outside a workflow and awaited inside one, carried into a second workflow, or carried
+/// across a step-body boundary in either direction is refused as [`Error::StepBuiltElsewhere`]
+/// rather than run under an id nothing there can honour. The everyday way to trip it is building
+/// the step before the workflow runs — in the handler that then starts it, say — and awaiting it
+/// inside.
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.

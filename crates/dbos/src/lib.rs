@@ -162,12 +162,13 @@ pub use wait::{join_workflows, select_workflow};
 ///
 /// # A branch is any pending call that observes
 ///
-/// A branch is any [`PendingStep`]: a [`step`](step()), a handle's [`result`](WorkflowHandle::result), a
-/// wait over workflows ([`select_workflow`](fn@select_workflow) or
-/// [`join_workflows`](fn@join_workflows)), a [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a
-/// checkpointed management call on [`DBOS`]. Each checkpoints itself under the id it was built
-/// with and replays from its own row when it is the recorded winner, so a race between a step and
-/// the await of a child is as durable as one between two steps.
+/// A branch is any [`PendingStep`]: a [`step`](step()), a handle's
+/// [`result`](WorkflowHandle::result), a wait over workflows
+/// ([`select_workflow`](fn@select_workflow) or [`join_workflows`](fn@join_workflows)), a
+/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a checkpointed management call on
+/// [`DBOS`]. Each checkpoints itself under the id it was built with and replays from its own row
+/// when it is the recorded winner, so a race between a step and the await of a child is as durable
+/// as one between two steps.
 ///
 /// **Where *every* branch is a workflow's outcome, reach for
 /// [`select_workflow!`](macro@crate::select_workflow) instead.** Both are durable; the difference
@@ -186,11 +187,10 @@ pub use wait::{join_workflows, select_workflow};
 /// was meant.
 ///
 /// **What losing means.** A losing step is dropped mid-body and records nothing, so a replay never
-/// runs it; its [`cancellation_token`] fires on the way out, as it does for a
-/// timeout, so work it handed to a blocking thread learns to stop. A losing [`sleep`](sleep())
-/// is the exception that does leave a row: it checkpoints the instant it will wake at *before*
-/// waiting on it, so what stays behind records an abandoned wait rather than an outcome. A losing
-/// *await* is a dropped
+/// runs it; its [`cancellation_token`] fires on the way out, as it does for a timeout, so work it
+/// handed to a blocking thread learns to stop. A losing [`sleep`](sleep()) is the exception that
+/// does leave a row: it checkpoints the instant it will wake at *before* waiting on it, so what
+/// stays behind records an abandoned wait rather than an outcome. A losing *await* is a dropped
 /// wait on a child that keeps going, durably, with nobody watching it — losing the race does not
 /// cancel it. Cancel from the winning arm if abandoning the loser is the intent.
 ///

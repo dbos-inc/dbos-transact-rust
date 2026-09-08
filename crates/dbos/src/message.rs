@@ -572,9 +572,9 @@ impl crate::Client {
     ///
     /// The message waits in the database until the destination reads it, so sending to a workflow
     /// that has not reached its receive — or is not running at all — is normal rather than an
-    /// error. Sending to a workflow that *does not exist* is [`Error::SystemDatabase`] carrying
-    /// the system database's non-existent-workflow error: the foreign key catches it, so a
-    /// message is never left addressed to nothing.
+    /// error. Sending to a workflow that *does not exist* is [`Error::SystemDatabase`] carrying the
+    /// system database's non-existent-workflow error: the foreign key catches it, so a message is
+    /// never left addressed to nothing.
     ///
     /// **A client's send is not a step**, and that is the difference from a workflow's. A
     /// workflow's send is checkpointed, so a replay does not send twice; a client has no replay and

@@ -553,9 +553,8 @@ impl StepPlacement {
     ///
     /// [`of`](Self::of) with no second connection to disagree with, which is every *user* step:
     /// [`step`](crate::step()) is always served by the workflow it is written in, so
-    /// [`ClientConnection`](Self::ClientConnection) is unreachable and
-    /// [`Error::WrongInstance`] cannot arise. That is the whole of why this cannot fail where
-    /// `of` can.
+    /// [`ClientConnection`](Self::ClientConnection) is unreachable and [`Error::WrongInstance`]
+    /// cannot arise. That is the whole of why this cannot fail where `of` can.
     ///
     /// Allocating is the point, and it happens here rather than at the poll: the position of this
     /// call has to be the same on the replay as it was on the run, and building is what fixes it.

@@ -1283,8 +1283,8 @@ pub trait SystemDatabase: Send + Sync {
     /// to tell a collision from a coincidence.
     ///
     /// TODO(dbos-team): UPSTREAM item 11. No reference keys a debounce on all three parts of a
-    /// workflow's identity — TypeScript matches name and class, Python the name alone — so there
-    /// a bounce for one configured instance can extend another's workflow and replace its inputs.
+    /// workflow's identity — TypeScript matches name and class, Python the name alone — so there a
+    /// bounce for one configured instance can extend another's workflow and replace its inputs.
     /// This implementation matches all three.
     ///
     /// [`DebounceRequest::application_name`] is the application the bounce acts *for*; `None` means

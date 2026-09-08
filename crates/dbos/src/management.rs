@@ -912,12 +912,12 @@ impl DBOS {
 ///
 /// Every method here is [`DBOS`]'s, and the differences are the two a client always has. **There is
 /// no launch check**, because a client is connected or it does not exist — `connect` hands back a
-/// usable client or an error, so none of these can fail with [`Error::NotLaunched`]. And
-/// **nothing is checkpointed**: called from inside a workflow, a client's management call runs
-/// again on replay, where the same call on `DBOS` would replay its recorded step. A client has no
-/// step counter of its own to agree with the workflow's, and the ambient context belongs to an
-/// instance this client is not — the line [`WorkflowHandle::result`](crate::WorkflowHandle::result)
-/// already draws for a client's handle awaited inside a workflow.
+/// usable client or an error, so none of these can fail with [`Error::NotLaunched`]. And **nothing
+/// is checkpointed**: called from inside a workflow, a client's management call runs again on
+/// replay, where the same call on `DBOS` would replay its recorded step. A client has no step
+/// counter of its own to agree with the workflow's, and the ambient context belongs to an instance
+/// this client is not — the line [`WorkflowHandle::result`](crate::WorkflowHandle::result) already
+/// draws for a client's handle awaited inside a workflow.
 ///
 /// **Scope follows the client's application name.** A nameless client reads and writes across every
 /// application sharing the database, which is what a cross-application operator's tool wants and
