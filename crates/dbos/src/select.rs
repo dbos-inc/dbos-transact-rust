@@ -12,6 +12,48 @@
 //! and nothing stops the replay choosing again. The failure is silent, which is why the macro over
 //! this refuses to be spelled like tokio's.
 //!
+//! # Two writes, and the window between them
+//!
+//! A decided race leaves **two** rows, and they are two commits. The winning branch records its
+//! own outcome under its own id, because it is an ordinary durable call and does what one does;
+//! this select then records *which* branch that was, under the id it claimed for itself. An
+//! execution that stops between them leaves a branch row under a select with none — and a select
+//! with no row is a select that has not run, so a recovery races again.
+//!
+//! **What that risks is a recovery disagreeing with the record**, not a path taken twice and not
+//! work done twice. The select's row is written before any arm body, so an execution that stopped
+//! in this window ran no arm at all; and a branch that recorded replays from its row rather than
+//! running again. What can differ is which arm the recovery takes — a charge that succeeded and
+//! recorded, raced against a timeout, and a second race that takes the timeout arm while the
+//! charge's row says the money moved.
+//!
+//! **There is no timing argument that makes this rare.** A recovery usually comes long after the
+//! crash, by which time a losing sleep's recorded wake time is in the past, so it replays as
+//! immediately as the winner does and which lands first is a coin toss. The race that most wants
+//! protection is the one least protected by luck.
+//!
+//! # Why this is documented rather than fixed
+//!
+//! Both of the obvious repairs were tried on this branch and neither survives contact with the
+//! three kinds of durable call a branch can be, so the reasoning is kept here rather than
+//! rediscovered:
+//!
+//! - *Infer the winner from the branch that recorded.* A row does not mean a branch finished.
+//!   [`sleep`](crate::sleep) checkpoints the instant it will wake at and waits afterwards, so a
+//!   **losing** sleep leaves a row that is, in the row, indistinguishable from a winner's — and a
+//!   losing sleep is what a timeout race has. Nothing in the row separates them: a durable sleep
+//!   is stamped complete at its wake time, which a later recovery reads as long past, and a
+//!   deadline is stamped complete the moment it is written. Making this sound needs a bit on the
+//!   call itself, saying whether its row would mean it finished, which is a change to every
+//!   durable call's contract in service of one caller.
+//! - *Write both rows in one transaction.* There is no single write to join. An application step
+//!   records through `record_step`, a child's result through `record_child_result`, a sleep
+//!   through `checkpoint_sleep` before the wait it is checkpointing, and a child's start inside
+//!   the transaction that creates the child. The select would have to reach into all four.
+//!
+//! So the window stands, with its shape written down. If it is closed later, the bit on the call
+//! is the way in, and the losing sleep is the test that says whether it worked.
+//!
 //! # The split, and why the checkpoint is not in the macro
 //!
 //! [`check_select`] and [`record_select`] are ordinary `async fn`s dealing only in **indices**,
@@ -486,6 +528,110 @@ mod tests {
             loser_ran.load(Ordering::SeqCst),
             started_once,
             "the loser recorded nothing the first time, so a replay must not run it now"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// **The window between the winner's row and the select's**, from the recovery's side: the
+    /// race is run again, and the branch that recorded replays rather than running a second time.
+    ///
+    /// The state is planted rather than reached by crashing an execution, because what has to be
+    /// tested is what a recovery *finds* — a branch row under a select with none — however it got
+    /// there. What this pins is the half that holds whatever the timing does: no step runs twice.
+    /// Which arm a recovery takes is the part the module documentation describes and this cannot
+    /// assert, since with an elapsed deadline in the race it is a coin toss.
+    #[tokio::test]
+    async fn a_race_re_run_in_the_window_replays_the_branch_that_recorded() {
+        let (dbos, _db) = workflow("wf-window").await;
+        let executor = dbos.executor("test").expect("launched");
+        let quick_ran = Arc::new(AtomicU32::new(0));
+
+        // What the interrupted execution left behind: the branch that won recorded, and nothing
+        // recorded that it won.
+        executor
+            .sysdb()
+            .record_step(
+                "wf-window",
+                1,
+                "quick",
+                Outcome::Output(Some(
+                    &encode::<_, crate::Error>(&"hello".to_owned(), "the winner").expect("encodes"),
+                )),
+                Some(executor.connection().serializer().name()),
+                None,
+            )
+            .await
+            .expect("could not plant the winner's row");
+
+        let answer: crate::Result<String> = Ctx::scope(ctx(&dbos, "wf-window"), {
+            let quick_ran = Arc::clone(&quick_ran);
+            async move {
+                crate::select_step! {
+                    slow = never("slow") => format!("slow: {}", slow?),
+                    quick = step("quick", {
+                        let quick_ran = Arc::clone(&quick_ran);
+                        move || {
+                            let quick_ran = Arc::clone(&quick_ran);
+                            async move {
+                                quick_ran.fetch_add(1, Ordering::SeqCst);
+                                Ok::<_, crate::Error>("hello".to_owned())
+                            }
+                        }
+                    }) => format!("the namer won with {}", quick?)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(answer.unwrap(), "the namer won with hello");
+        assert_eq!(
+            quick_ran.load(Ordering::SeqCst),
+            0,
+            "the branch that recorded replays from its row; the window costs no second execution"
+        );
+        // And the select has the row it was missing, so the next recovery reads a decision rather
+        // than racing a third time.
+        assert_eq!(
+            steps(&dbos, "wf-window").await,
+            [(1, "quick".to_owned()), (2, "DBOS.selectStep".to_owned())],
+            "the winner's row, and the select row that was missing"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// **A losing sleep leaves a row**, which is the fact behind the module documentation's
+    /// refusal to read branch rows as the race's answer.
+    ///
+    /// `checkpoint_sleep` writes when the sleep is first polled and the wait comes after it, so
+    /// what this asserts is a row for a wait that was abandoned — beside the winner's, and
+    /// indistinguishable from one.
+    #[tokio::test]
+    async fn a_losing_sleep_leaves_a_row_for_a_wait_it_never_finished() {
+        let (dbos, _db) = workflow("wf-losing-sleep").await;
+
+        let answer: crate::Result<String> = Ctx::scope(ctx(&dbos, "wf-losing-sleep"), async {
+            crate::select_step! {
+                timeout = crate::sleep(std::time::Duration::from_secs(30)) => {
+                    timeout?;
+                    "timed out".to_owned()
+                }
+                quick = step("quick", || async { Ok::<_, crate::Error>("hello".to_owned()) })
+                    => format!("the namer won with {}", quick?)
+            }
+        })
+        .await;
+
+        assert_eq!(answer.unwrap(), "the namer won with hello");
+        assert_eq!(
+            steps(&dbos, "wf-losing-sleep").await,
+            [
+                (0, "DBOS.sleep".to_owned()),
+                (1, "quick".to_owned()),
+                (2, "DBOS.selectStep".to_owned())
+            ],
+            "the sleep lost and still recorded, which is why a branch row is not a winner"
         );
 
         dbos.shutdown().await;

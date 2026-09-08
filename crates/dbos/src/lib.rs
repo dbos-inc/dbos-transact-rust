@@ -140,6 +140,17 @@ pub use wait::{join_workflows, select_workflow};
 /// # }
 /// ```
 ///
+/// # This crate may not be renamed
+///
+/// The expansion names `::dbos` — this crate, by that name — so a dependency renamed with
+/// `dbos_sdk = { package = "dbos" }` puts only `dbos_sdk` in the extern prelude and the expansion
+/// resolves to nothing. Resolving the downstream name instead means `proc_macro_crate`, which
+/// reads the dependent's manifest and so brings a TOML parser into the build graph — against the
+/// whole point of the `macros` feature, which exists so that a build can decline `syn` and
+/// `quote`. `tokio` makes the same trade for `#[tokio::main]`. If a rename ever has to be
+/// supported, the cheap way is `tokio`'s: an optional `crate = path` at the head of the macro,
+/// which costs no dependency.
+///
 /// # Arms, and the one place this is not `match`
 ///
 /// An arm is `binding = call => expression`, and the comma between arms follows `match`'s rule
@@ -172,7 +183,10 @@ pub use wait::{join_workflows, select_workflow};
 ///
 /// **What losing means.** A losing step is dropped mid-body and records nothing, so a replay never
 /// runs it; its [`cancellation`](Ctx::cancellation) token fires on the way out, as it does for a
-/// timeout, so work it handed to a blocking thread learns to stop. A losing *await* is a dropped
+/// timeout, so work it handed to a blocking thread learns to stop. A losing [`sleep`]
+/// is the exception that does leave a row: it checkpoints the instant it will wake at *before*
+/// waiting on it, so what stays behind records an abandoned wait rather than an outcome. A losing
+/// *await* is a dropped
 /// wait on a child that keeps going, durably, with nobody watching it — losing the race does not
 /// cancel it. Cancel from the winning arm if abandoning the loser is the intent.
 ///

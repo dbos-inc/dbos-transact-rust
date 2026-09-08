@@ -271,9 +271,11 @@ fn expand(race: &Race) -> TokenStream2 {
 
         let #winner = match ::dbos::__private::check_select(&#branches).await {
             ::core::result::Result::Err(#failed) => ::core::result::Result::Err(#failed),
-            // **Only the winner is polled.** The losers recorded nothing on the first execution,
-            // so running them now would be running them for the first time. They were still
-            // *built*, which is what keeps their ids spent and the numbering stable.
+            // **Only the winner is polled.** The race is already decided, so nothing a loser
+            // would do now is part of it: one that recorded nothing would be running for the
+            // first time, and a `sleep` — the one branch that leaves a row without having
+            // finished — would serve out a wait nobody is waiting on. They were still *built*,
+            // which is what keeps their ids spent and the numbering stable.
             ::core::result::Result::Ok(::dbos::__private::Racing::Replay(#at)) => {
                 match #at {
                     #(
@@ -325,8 +327,11 @@ fn expand(race: &Race) -> TokenStream2 {
                 // Dropped before the checkpoint is written, so every loser is stopped at its next
                 // suspension point, its destructors have run, and a losing step's cancellation
                 // token has fired for any work it handed off, before anything records that the
-                // race is over. Whatever a loser did before that, it did once and invisibly — the
-                // same trade a step timeout makes.
+                // race is over. Whatever a loser did before that, it did once — and did it
+                // invisibly wherever the row is written only at the end, which is everything but a
+                // `sleep`: that one records the instant it will wake at before waiting on it, so a
+                // losing sleep leaves a row for a wait that was abandoned. The same trade a step
+                // timeout makes.
                 ::core::mem::drop(( #( #branch, )* ));
 
                 // A control signal — a cancellation, an interruption, a database failure — is not

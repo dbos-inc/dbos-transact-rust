@@ -2355,14 +2355,14 @@ pub mod step_names {
 
     /// The step name a durable race over steps records.
     ///
-    /// **A third name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] and
-    /// [`JOIN_WORKFLOWS`] above and for the same reason. Go's `Select` records `"DBOS.select"`
+    /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above
+    /// and for the same reason. Go's `Select` records `"DBOS.select"`
     /// (`workflow.go:3082`); this crate's call is [`select_step!`](crate::select_step), because a
     /// bare `select` in a Rust namespace reads as a future combinator where this one takes only
     /// steps, and the recorded name follows the call a reader wrote. Python's `asyncio_wait`
     /// records `"DBOS.asyncio_wait"` and could not have been borrowed at all.
     ///
-    /// Affordable for the reason the pair above states in full: nothing reads a step name across
+    /// Affordable for the reason [`SELECT_WORKFLOW`] states in full: nothing reads a step name across
     /// implementations, since a workflow only crosses one by enqueue and an enqueued workflow
     /// starts from step zero. The divergence is the word and not the shape.
     ///
