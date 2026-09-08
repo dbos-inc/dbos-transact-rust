@@ -1,10 +1,14 @@
-//! The widget store: an online storefront resilient to any failure.
+//! The widget store: an online storefront that survives being killed mid-checkout.
 //!
 //! Buy a widget and watch the order go out. Then press the crash button — at any point, including
 //! halfway through a dispatch — and start the app again. The order resumes from the last step that
-//! finished, the inventory count is still right, and nothing here does anything to make that
-//! happen: `launch()` recovers what the previous run abandoned, and each step replays from its
-//! checkpoint rather than running a second time.
+//! finished, and nothing here does anything to make that happen: `launch()` recovers what the
+//! previous run abandoned, and a step that finished replays from its checkpoint rather than
+//! running a second time.
+//!
+//! A step *interrupted* mid-write is the exception, and `store.rs` is where it is spelled out: its
+//! checkpoint and its row are two separate commits while Rust has no transactional step, so those
+//! writes are at-least-once and a badly timed crash can miscount the inventory.
 //!
 //! The Rust port of the widget store that already exists in Python, TypeScript, Go and Java. Same
 //! application schema, same HTTP surface, same frontend, so the five can be read against each

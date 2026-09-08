@@ -511,8 +511,19 @@ pub fn step_status() -> Option<StepStatus> {
 /// **This receives a cancellation; it does not raise one.** The engine holds the token and fires
 /// it — on a step's timeout, on the preemption of a
 /// [`preemptible`](crate::StepOptions::preemptible) step whose workflow was cancelled elsewhere,
-/// and on any other path that abandons an attempt. What this hands back is a clone to watch, and
-/// nothing a body does with it cancels anything.
+/// and on any other path that abandons an attempt. What this hands back is a clone to watch.
+///
+/// **A clone is not a read-only handle, and cancelling one reaches no further than the body's own
+/// watchers.** `cancel()` and `drop_guard()` are public on
+/// [`CancellationToken`](tokio_util::sync::CancellationToken), so a body *can* fire the token it
+/// was handed, and every other clone of it — including ones the body passed to its own detached
+/// work — will see cancelled. Nothing else changes: the engine never waits on this token, it only
+/// fires it, so a body cannot end its own attempt, fail its step or cancel its workflow this way.
+/// A step ends by returning, and a workflow is cancelled through
+/// [`DBOS::cancel`](crate::DBOS::cancel). Firing it yourself only tells your own
+/// watchers that an attempt was abandoned when it was not, which is a lie worth not telling; the
+/// type stays `CancellationToken` rather than a wrapper because hiding `cancel()` would mean
+/// reimplementing the half of it a body actually waits on.
 ///
 /// Watch it from work the runtime cannot stop by dropping the step's future — a
 /// [`spawn_blocking`](tokio::task::spawn_blocking) thread, or a client holding its own cancel

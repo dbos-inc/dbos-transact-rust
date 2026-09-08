@@ -42,10 +42,13 @@ details.
 
 ## Try the widget store
 
-The [widget store](./demo-apps/dbos-rust-widget-store) is an online storefront that survives any
-failure. Buy a widget and watch the order go out; press the crash button while it is being
-dispatched, restart the app, and the same order carries on from where it stopped — with the
-inventory count still right, and no application code taking part in the recovery.
+The [widget store](./demo-apps/dbos-rust-widget-store) is an online storefront that survives being
+killed mid-checkout. Buy a widget and watch the order go out; press the crash button while it is
+being dispatched, restart the app, and the same order carries on from where it stopped, with no
+application code taking part in the recovery.
+
+Its writes are at-least-once rather than exactly-once, because Rust has no transactional step yet:
+the demo's README says where the window is and what it costs.
 
 It is the Rust port of the widget store that already exists in Python, TypeScript, Go and Java,
 against the same application schema.

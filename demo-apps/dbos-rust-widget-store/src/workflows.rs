@@ -3,13 +3,19 @@
 //! **The demo is the crash button.** Buy a widget, and while the order is being dispatched, kill
 //! the process. Start it again and the order carries on arriving from where it stopped — no
 //! application code takes part in that, because `launch()` recovers whatever the previous run
-//! abandoned and each step replays from its checkpoint rather than running again.
+//! abandoned and a step that finished replays from its checkpoint rather than running again.
 //!
 //! The checkout is the interesting half. It reserves inventory, then *stops* and waits to be told
 //! whether the card was charged — a wait that outlives the process, because the deadline is a row
-//! rather than a timer in memory. Whichever way the answer goes, the workflow is what guarantees
-//! the books balance: a payment that fails puts the widget back on the shelf, and a payment that
-//! never comes does the same when the deadline passes.
+//! rather than a timer in memory. Whichever way the answer goes, the workflow is what puts the
+//! books back: a payment that fails returns the widget to the shelf, and a payment that never
+//! comes does the same when the deadline passes.
+//!
+//! **Compensation, not a guarantee.** That pairing balances the books against a *failed payment*,
+//! which is the case it is written for. It does not close the window `store.rs` describes: a step
+//! interrupted between its write and its checkpoint runs again, so a crash placed just so can
+//! decrement inventory twice against a single compensating increment. Rust has no transactional
+//! step yet, and this demo shows recovery rather than papering over that.
 
 use std::time::Duration;
 

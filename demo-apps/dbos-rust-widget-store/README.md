@@ -1,11 +1,13 @@
 # DBOS Rust Widget Store
 
-An online storefront that is resilient to any failure. Buy a widget and watch the order go out;
-press the crash button at any point — including halfway through a dispatch — and start the app
-again. The order resumes from the last step that finished, and the inventory count is still right.
+An online storefront that survives being killed mid-checkout. Buy a widget and watch the order go
+out; press the crash button at any point — including halfway through a dispatch — and start the app
+again. The order resumes from the last step that finished.
 
 No application code takes part in that recovery. `launch()` picks up whatever the previous run
-abandoned, and each step replays from its checkpoint instead of running a second time.
+abandoned, and a step that finished replays from its checkpoint instead of running a second time.
+A step that was *interrupted* runs again, which for the writes here means at-least-once rather than
+exactly-once — see the note on transactional steps below for what that costs.
 
 This is the Rust port of the widget store that already exists in Python, TypeScript, Go and Java.
 Same application schema, same HTTP surface, same frontend.
@@ -61,7 +63,14 @@ surface.
 
 Rust does not have transactional steps yet. Every database write here runs inside an ordinary
 `dbos::step`, so the step's checkpoint and the row it writes are **two separate commits** rather
-than one. A crash in the window between them replays the step, so each write is either safe to
-repeat or is one the workflow accounts for — see the note on `update_order_progress` in
-`src/store.rs`. The other four widget stores use a transactional step for these, and this is the
-one place the ports differ.
+than one. A crash in the window between them replays a step whose write already committed, so the
+inventory decrement, its compensating increment and the order insert are each **at-least-once**: a
+badly timed crash can take two widgets off the shelf for one order, put one back twice, or leave a
+second order stranded at PENDING. The other four widget stores use a transactional step for these
+and have no such window; this is the one place the ports differ.
+
+The gap closes when Rust gains datasources and the transactional step built on them, which commit
+the application write and the step's checkpoint together. Until then the demo leaves the window
+open rather than hiding it behind hand-rolled idempotency keys, because what it exists to show is
+recovery — the workflow resuming mid-checkout across a process death — and an honest note costs
+less than machinery that obscures the mechanism.
