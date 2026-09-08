@@ -1,6 +1,7 @@
 //! Running a workflow durably.
 
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
@@ -944,12 +945,15 @@ where
     /// existing run rather than this being an error: the id is an idempotency key, and honouring
     /// it is the promise (decision 13).
     ///
-    /// **A start answers in the workflow's own error channel**, though it can only fail in the
+    /// **A start answers in the child's error channel by default**, though it can only fail in the
     /// engine's terms — there is no application error to report, since nothing the application
-    /// wrote has run yet, and the *workflow's* failures come out of the handle. Declaring the
-    /// caller's channel is what lets `start(..).await?` sit in a workflow body beside every other
+    /// wrote has run yet, and the *workflow's* failures come out of the handle. Declaring a
+    /// channel at all is what lets `start(..).await?` sit in a workflow body beside every other
     /// call rather than needing a [`lift`](Error::lift) the caller has to remember; the await and
-    /// the run already answered this way, so the start was the odd one out.
+    /// the run already answered this way, so the start was the odd one out. A parent whose own
+    /// error type is *not* its child's says so with [`PendingStart::lift`], which re-declares the
+    /// channel before the await — the one case the default cannot cover, since no conversion
+    /// exists between two application channels.
     ///
     /// # Child workflows
     ///
@@ -1032,15 +1036,21 @@ where
         // of `place`'s refusals, which is what makes a start that never stood anywhere safe to
         // leave unplaced.
         let built = self.place(&options).map(StartPlacement::into_parts);
-        PendingWorkflow(PendingStep::placed(
-            name,
-            built,
-            move |executor, placement| async move {
-                self.started(StartPlacement::of(executor, placement), input, options)
-                    .await
-                    .map_err(Error::lift)
-            },
-        ))
+        // **Left in the engine's channel rather than lifted here**, which is what makes
+        // [`PendingStart::lift`] sound: the error this can answer with is engine-only whatever
+        // channel the type declares, so re-declaring it loses nothing. The lift happens once, at
+        // the poll, in whichever channel the caller asked for.
+        PendingStart {
+            starting: PendingWorkflow(PendingStep::placed(
+                name,
+                built,
+                move |executor, placement| async move {
+                    self.started(StartPlacement::of(executor, placement), input, options)
+                        .await
+                },
+            )),
+            channel: PhantomData,
+        }
     }
 
     /// The start itself, once something polls it: everything that writes a row.
@@ -1383,10 +1393,11 @@ async fn create<R, E>(
 
 /// A call that creates a workflow, has claimed the step ids that costs, and has started nothing.
 ///
-/// What [`start`](WorkflowRef::start) and [`run`](WorkflowRef::run) hand back — as
-/// [`PendingStart`] and [`PendingRun`], which are this type under the two names their callers
-/// read. Awaiting one starts the workflow, so `child.start(x).await?` and `child.run(x).await?`
-/// read exactly as they did when both were `async fn`s, and not one call site had to change.
+/// What [`run`](WorkflowRef::run) hands back as [`PendingRun`], and what a
+/// [`start`](WorkflowRef::start) is built on — [`PendingStart`] holds one of these and declares
+/// the channel it reports in. Awaiting either starts the workflow, so `child.start(x).await?` and
+/// `child.run(x).await?` read exactly as they did when both were `async fn`s, and not one call
+/// site had to change.
 ///
 /// **A newtype over [`PendingStep`] rather than a `PendingStep`, because a durable race must not
 /// take one**, and the reason is not that dropping one leaves anything broken. It does not: dropped
@@ -1423,7 +1434,83 @@ pub struct PendingWorkflow<'a, T, E = crate::EngineOnly>(PendingStep<'a, T, E>);
 ///
 /// One id, and it answers with a handle: the workflow's outcome is the handle's to give, through
 /// [`result`](crate::WorkflowHandle::result), which claims an id of its own where it is written.
-pub type PendingStart<'a, R, E = crate::EngineOnly> = PendingWorkflow<'a, WorkflowHandle<R, E>, E>;
+///
+/// **Two error types, because a start deals in two.** `E` is the *child's* — it is what the handle
+/// will report when the child finishes, and none of it is in play yet. `C` is the channel this
+/// call itself answers in, and a start can only fail in the engine's terms: the child's body has
+/// not run, so there is no application error for it to have. Holding one parameter for both, as
+/// this type once did, forces a parent to fail the way its child does — and a parent whose error
+/// type differs from its child's then has no way to report a start failure at all, since `?`
+/// cannot convert between two application channels and [`Error::lift`] starts from
+/// [`EngineOnly`](crate::EngineOnly).
+///
+/// `C` **defaults to `E`**, which is the common case written without saying anything: a workflow
+/// starting a child that fails the way it does writes `child.start(x).await?` and nothing else.
+/// Where the two differ, [`lift`](Self::lift) re-declares the channel before the await.
+#[must_use = "a start that is not awaited never starts the workflow, and has still spent the step \
+              id it claimed; await it"]
+pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
+    /// The start itself, in the engine's channel — see [`PendingWorkflow`] for why a start is a
+    /// newtype and not a [`PendingStep`].
+    starting: PendingWorkflow<'a, WorkflowHandle<R, E>, crate::EngineOnly>,
+    /// The channel the caller asked to hear about a failure in, which is a claim about *reporting*
+    /// and not about what is stored: nothing of `C` is ever constructed, since the error being
+    /// re-declared is engine-only. `fn() -> C` rather than `C` so the marker adds no drop
+    /// obligation and no `Send`/`Sync` bound of its own.
+    channel: PhantomData<fn() -> C>,
+}
+
+impl<'a, R, E, C> PendingStart<'a, R, E, C> {
+    /// The id this start claimed when it was written, or `None` if it claimed none.
+    ///
+    /// [`PendingWorkflow::step_id`]'s, forwarded.
+    #[must_use]
+    pub fn step_id(&self) -> Option<i32> {
+        self.starting.step_id()
+    }
+
+    /// Re-declares which channel this start answers in.
+    ///
+    /// **For a parent whose error type is not its child's.** `child.start(x).await?` needs the
+    /// start to fail the way the *parent* does; by default it fails the way the child does, which
+    /// is right whenever the two agree and impossible to convert when they do not. This says so
+    /// before the await, where the declaration still can be changed:
+    ///
+    /// ```ignore
+    /// let handle = shipping.start(order).lift().await?;   // in a workflow that fails as `Billing`
+    /// ```
+    ///
+    /// Nothing is converted and nothing can be lost: what the future holds is an engine error
+    /// whatever this type declares, so this swaps a marker and the [`Error::lift`] at the poll
+    /// does the rest. It is [`Error::lift`]'s own argument, made one step earlier — with the
+    /// child's errors untouched, since those come out of the handle rather than out of this.
+    pub fn lift<C2>(self) -> PendingStart<'a, R, E, C2> {
+        PendingStart {
+            starting: self.starting,
+            channel: PhantomData,
+        }
+    }
+}
+
+impl<R, E, C> Future for PendingStart<'_, R, E, C> {
+    type Output = Result<WorkflowHandle<R, E>, C>;
+
+    /// Delegated to the start, and lifted into `C` on the way out — the one place the declared
+    /// channel is paid for.
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // Every field is `Unpin` — the marker holds nothing — so there is nothing here for pinning
+        // to protect.
+        Pin::new(&mut self.get_mut().starting)
+            .poll(cx)
+            .map(|started| started.map_err(Error::lift))
+    }
+}
+
+impl<R, E, C> std::fmt::Debug for PendingStart<'_, R, E, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PendingStart").field(&self.starting).finish()
+    }
+}
 
 /// A [`run`](WorkflowRef::run) that has claimed its two step ids and has started nothing.
 ///

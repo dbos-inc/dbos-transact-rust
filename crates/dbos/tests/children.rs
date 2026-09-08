@@ -1871,3 +1871,80 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
 
     dbos.shutdown().await;
 }
+
+/// **A parent may start a child that fails differently from it**, which is the case a start's own
+/// error channel exists for.
+///
+/// What stands between the two channels is a *declaration* rather than a conversion: a start can
+/// only fail in the engine's terms — nothing the child's application wrote has run yet — so
+/// [`PendingStart::lift`] re-declares which channel this call reports in, before the await, and
+/// `?` takes it from there. Without it the start would answer as the child fails, and a parent
+/// that fails otherwise could not report a start failure at all: `?` has no conversion between two
+/// application types, and `Error::lift` starts from the engine's channel.
+///
+/// The child's *own* failure is the other half, and it stays the handle's: that one really is an
+/// application error, so the parent writes out what it makes of it.
+///
+/// A start that genuinely fails — attempted inside a step, where no durable start exists — is the
+/// third: the refusal is the engine's, and it has to come back in the parent's channel rather than
+/// the child's, which is the declaration being paid for at the poll rather than only made.
+#[tokio::test]
+async fn a_child_that_fails_differently_is_started_through_lift() {
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    #[error("the shipment was refused")]
+    struct Refused;
+
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    #[error("billing gave up")]
+    struct GaveUp;
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("mixed-channels-app", &db));
+    let ship = dbos
+        .register_workflow("ship", |()| async {
+            Err::<u32, Error<Refused>>(Error::Application(Refused))
+        })
+        .unwrap();
+    let bill = dbos
+        .register_workflow("bill", {
+            let ship = ship.clone();
+            move |()| {
+                let ship = ship.clone();
+                async move {
+                    // The whole of the test is that this line compiles: `lift` puts the start in
+                    // the parent's channel, so `?` reaches for `Error<GaveUp>` and finds it.
+                    let handle = ship.start(()).lift().await?;
+                    // The child's error is the handle's and crosses no channel on its own — the
+                    // parent decides what it means, which is what the type made it say.
+                    let refused = matches!(handle.result().await, Err(Error::Application(Refused)));
+                    if !refused {
+                        Err(GaveUp)?;
+                    }
+                    // A start that actually fails, so the lift is paid rather than only declared:
+                    // inside a step there is no durable start to make, and the engine's refusal
+                    // still has to arrive in the parent's channel — `Error<GaveUp>` here — which
+                    // is the conversion `PendingStart`'s poll does on the way out.
+                    let refused_start = dbos::step::<(), GaveUp, _, _>("tries_to_start", || {
+                        let ship = ship.clone();
+                        async move { ship.start(()).lift::<GaveUp>().await.map(|_| ()) }
+                    })
+                    .await;
+                    assert!(
+                        matches!(refused_start, Err(Error::InsideStep { .. })),
+                        "expected an inside-a-step refusal in the parent's channel, \
+                         got {refused_start:?}"
+                    );
+                    Ok::<_, Error<GaveUp>>(refused)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    assert!(
+        bill.run(()).await.expect("the parent failed"),
+        "the parent started a child of another error type and read its refusal back"
+    );
+
+    dbos.shutdown().await;
+}
