@@ -250,16 +250,16 @@ pub fn select_workflow<'a, E: crate::DurableError + 'a>(
 /// took a step id — a set computed from state could be empty on one execution and not the next,
 /// shifting every later step — and costs nothing now that it takes none.
 ///
-/// **A replay waits on the set again, so it does not carry
-/// [`result`](crate::WorkflowHandle::result)'s guarantee about a deleted member.** Awaiting a child
-/// one at a time records its outcome against the *parent*, so a replayed parent finishes from that
-/// row without the child's own row having to exist — a workflow deleted in the meantime is read
-/// back rather than waited for, which `children::a_replayed_parent_reads_the_recorded_outcome_rather_than_waiting_again`
-/// holds to. A join in front of those reads has no such row of its own to return from: it asks the
-/// database again, and a member whose row has been deleted never settles, so the replay waits where
-/// awaiting each handle in turn would have finished. Deleting a workflow out from under a parent
-/// that joined it is operator surgery, and this is its cost — a fan-out that has to survive it
-/// should await its handles rather than join them first.
+/// **A replay asks the set again, rather than returning from anything it recorded.** That is the
+/// point of taking no step id, and it is what makes the members' *current* state the answer. The
+/// case where it shows is a member deleted between one execution and the next: it never settles, so
+/// the replayed join keeps waiting, where [`result`](crate::WorkflowHandle::result) on the same
+/// handle would have read the outcome back out of the parent's own row.
+///
+/// Neither is the defined behaviour of a deleted workflow. Removing one that a parent is still
+/// replaying through is collecting what is not garbage — the parent's recorded outcomes make some
+/// paths survive it, this one does not, and the difference is not a contract either way. A fan-out
+/// that must tolerate it should await its handles rather than join them first.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
