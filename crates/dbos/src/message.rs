@@ -45,7 +45,7 @@
 //!
 //! **Required as arguments, optional in a struct.** All three single sends read
 //! `send(destination_id, message)`, with a topic, an idempotency key and the fork fan-out in
-//! [`SendOptions`] on the `_with` form — the split [`step`](crate::step)/[`step_with`](crate::step_with)
+//! [`SendOptions`] on the `_with` form — the split [`step`](crate::step())/[`step_with`](crate::step_with)
 //! and `fork`/[`fork_with`](crate::DBOS::fork_with) already make. The batch is the one exception and
 //! has to be: the [`send_bulk`] family takes [`Message`] values carrying their own topic and key,
 //! because those vary per message, beside a batch-wide [`SendBulkOptions`]. Python and Java split it
@@ -105,7 +105,7 @@ use crate::sysdb::types::step_names;
 /// The payload is encoded first, ahead of the id, so a message that cannot be encoded is a send
 /// that never happened and never moved the counter.
 ///
-/// The error is the *workflow's* channel, like [`step`](crate::step)'s and
+/// The error is the *workflow's* channel, like [`step`](crate::step())'s and
 /// [`set_event`](crate::set_event)'s, so `?` needs no conversion.
 ///
 /// **From inside a step it sends plainly, with no checkpoint** — the leaf rule
@@ -221,7 +221,7 @@ where
 /// message the first run took, including a timeout's `None`, instead of consuming a second one.
 /// **Both ids are taken at the call, not at the first poll** — see [`PendingStep`] — so a receive
 /// built beside another durable call and driven with it takes the same slots on every execution.
-/// The error is the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no
+/// The error is the *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no
 /// conversion.
 ///
 /// **Two concurrent receives on one topic in one workflow is an error**, surfaced as
@@ -573,7 +573,7 @@ impl crate::Client {
     /// The message waits in the database until the destination reads it, so sending to a workflow
     /// that has not reached its receive — or is not running at all — is normal rather than an
     /// error. Sending to a workflow that *does not exist* is
-    /// [`Error::SystemDatabase`](crate::Error::SystemDatabase) carrying the system database's
+    /// [`Error::SystemDatabase`] carrying the system database's
     /// non-existent-workflow error: the foreign key catches it, so a message is never left
     /// addressed to nothing.
     ///
@@ -705,7 +705,7 @@ impl<'a, T> Message<'a, T> {
 ///
 /// **Everything optional, and nothing required.** A destination and a payload are what a send
 /// cannot do without, so they are arguments; a topic, an idempotency key and the fork fan-out are
-/// choices, so they are here. That is the split [`step`](crate::step)/[`step_with`](crate::step_with),
+/// choices, so they are here. That is the split [`step`](crate::step())/[`step_with`](crate::step_with),
 /// `run`/[`run_with`](crate::WorkflowRef::run_with) and `fork`/[`fork_with`](crate::DBOS::fork_with)
 /// already make, and it is why the plain [`send`] is two arguments long.
 ///
@@ -761,7 +761,7 @@ pub struct SendOptions<'a> {
 /// batch would collide with itself and deliver one message instead of all of them.
 ///
 /// Python and Java draw the line in the same place: a list of `SendMessage` beside a batch-wide
-/// `send_to_forks` and a serialization strategy — which is what will land here next.
+/// `send_to_forks`.
 ///
 /// Built by functional update from [`Default`], as [`SendOptions`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

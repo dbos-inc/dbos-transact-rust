@@ -629,10 +629,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Forks workflows from a step this works out for each of them.
     ///
-    /// Named for what it does rather than what it was first for: Python, Java and TypeScript all
-    /// call this `fork_from_failure`, from when the failed step was the only place it could
-    /// start. Three of [`ForkPoint`]'s four cases have nothing to do with failure. Go reached the
-    /// same conclusion and calls it `ForkFrom`.
+    /// Named for what it does: Python, Java and TypeScript all call this `fork_from_failure`,
+    /// but three of [`ForkPoint`]'s four cases have nothing to do with failure. Go calls it
+    /// `ForkFrom` for the same reason.
     ///
     /// [`fork_workflows`](Self::fork_workflows) with the start step computed rather than given:
     /// the caller says *from the failure* or *from the step called `charge_card`*, and each
@@ -893,8 +892,8 @@ pub trait SystemDatabase: Send + Sync {
     /// The step's `completed_at` is stamped at the **wake time**, which is in the future when
     /// the row is written — so a timeline shows an hour's sleep as an hour rather than as an
     /// instant. Nothing in execution or recovery reads that column; it is for step aggregates,
-    /// metrics, and Conductor. **All four references do the same** — Go's `withCompletedAt`
-    /// (#442) was the last to arrive.
+    /// metrics, and Conductor. **All four references do the same**; Go's is `withCompletedAt`
+    /// (#442).
     ///
     /// The deadline [`get_event`](Self::get_event) registers is the same checkpoint with the
     /// opposite stamping, since a read that answers in milliseconds under a minute's timeout has
@@ -1414,12 +1413,9 @@ pub trait SystemDatabase: Send + Sync {
     /// so this is an identity read.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
-    /// write and its step checkpoint **commit together**, and a replay returns what the first run
-    /// decided rather than reading again. TypeScript and Python get that atomicity by passing a
-    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
-    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
-    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    /// read and its step checkpoint **commit together**, and a replay returns what the first run
+    /// saw rather than reading again — see [`create_schedule`](Self::create_schedule) for the
+    /// shape.
     ///
     /// A workflow that branches on a schedule must see the same schedule on replay, whatever an
     /// operator changed in between, which is why a read records a step at all.
@@ -1435,12 +1431,9 @@ pub trait SystemDatabase: Send + Sync {
     /// unclaimed rather than to every application's.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
-    /// write and its step checkpoint **commit together**, and a replay returns what the first run
-    /// decided rather than reading again. TypeScript and Python get that atomicity by passing a
-    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
-    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
-    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    /// read and its step checkpoint **commit together**, and a replay returns what the first run
+    /// saw rather than reading again — see [`create_schedule`](Self::create_schedule) for the
+    /// shape.
     async fn list_schedules(
         &self,
         filter: &ScheduleFilter<'_>,
@@ -1455,11 +1448,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
-    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
-    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
-    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
-    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    /// decided rather than doing it again — see [`create_schedule`](Self::create_schedule) for
+    /// the shape.
     async fn update_schedule(
         &self,
         name: &str,
@@ -1483,11 +1473,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
-    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
-    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
-    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
-    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    /// decided rather than doing it again — see [`create_schedule`](Self::create_schedule) for
+    /// the shape.
     ///
     /// Pausing and resuming record **different step names**, as they are different calls in the
     /// references, so a replay of one is never mistaken for the other.
@@ -1535,11 +1522,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
-    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
-    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts:359`); this layer names no driver type, so it takes the step instead and owns the
-    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
-    /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
+    /// decided rather than doing it again — see [`create_schedule`](Self::create_schedule) for
+    /// the shape.
     async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error>;
 
     /// Gives `new_name` ownership of the rows a [`RenameFrom`] selects.

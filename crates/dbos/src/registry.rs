@@ -358,7 +358,7 @@ mod tests {
         let one = dbos.register_workflow("takes_one", takes_one).unwrap();
         assert_eq!(nothing.name(), "takes_nothing");
         assert_eq!(one.name(), "takes_one");
-        // Closures too, which is what a macro will generate into.
+        // Closures too.
         dbos.register_workflow(
             "closure",
             |s: String| async move { Ok::<_, Error>(s.len()) },

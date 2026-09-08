@@ -46,11 +46,9 @@
 //! is the winner's **id** — the identity the handle carried anyway, and the same thing the
 //! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
 //!
-//! A position in the slice was the other candidate and is worse on every count that matters: it is
-//! the only positional return anywhere in this crate (`cancel_all` and its neighbours take ids and
-//! give back ids), it is meaningful only against the exact slice it came from and so can be
-//! misapplied to a drifted one with no error, and it is what would force a set with no repeats.
-//! The one thing it buys is skipping a
+//! A position in the slice would be the only positional return in this crate (`cancel_all` and
+//! its neighbours take ids and give back ids), is meaningful only against the exact slice it came
+//! from, and would force a set with no repeats — all to skip a
 //! [`position`](std::iter::Iterator::position) lookup in the drain loop above.
 //!
 //! `join_workflows` returns nothing for the same reason its references return their inputs
@@ -251,9 +249,9 @@ pub fn select_workflow<'a, E: crate::DurableError + 'a>(
 /// is [`Error::NotInWorkflow`], and [`DBOS::join_workflows`] is the call.
 ///
 /// **An empty set is a satisfied wait**, answered at once, where an empty
-/// [`select_workflow`](fn@select_workflow) is refused. That difference cost something when this
-/// took a step id — a set computed from state could be empty on one execution and not the next,
-/// shifting every later step — and costs nothing now that it takes none.
+/// [`select_workflow`](fn@select_workflow) is refused. Answering early is safe only because this
+/// takes no step id: a set computed from state could be empty on one execution and not the next,
+/// and a call that took an id in one and none in the other would shift every later step.
 ///
 /// **A replay asks the set again, rather than returning from anything it recorded.** That is the
 /// point of taking no step id, and it is what makes the members' *current* state the answer. The

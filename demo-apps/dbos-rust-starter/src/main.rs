@@ -1,4 +1,4 @@
-//! The DBOS Rust starter: the Workflows and Queues tabs of the starter app.
+//! The DBOS Rust starter: the Workflows, Queues, Events and Messages tabs of the starter app.
 //!
 //! **Workflows** is three steps, five seconds each, a progress event after each — and a crash
 //! button. Launch a workflow, crash the process, restart it, and watch execution resume at the
@@ -204,10 +204,9 @@ struct App {
     enqueued: WorkflowRef<(), String>,
     /// Handles for what this process has put on the queue, so the tab can report their statuses.
     ///
-    /// Kept rather than queried back: listing workflows by name and age belongs to the management
-    /// surface, which is a separate piece of work. A restart forgets them, which for a demo is the
-    /// right amount of memory — and the queue itself does not forget, because the rows are still
-    /// there and still get dequeued.
+    /// Kept rather than queried back, unlike the Messages tab: a restart forgets them, which for
+    /// this tab is the right amount of memory — the queue itself does not forget, because the rows
+    /// are still there and still get dequeued.
     ///
     /// A `tokio` mutex because the guard is held across `status().await`.
     queued: Arc<Mutex<Vec<WorkflowHandle<String>>>>,

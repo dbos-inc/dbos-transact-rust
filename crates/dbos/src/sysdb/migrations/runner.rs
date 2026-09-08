@@ -29,22 +29,17 @@ const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long to wait when an error does not look like a collision.
 ///
-/// Not zero, because the classification below is a heuristic and has been wrong twice: a brief
-/// pause lets an unrecognised collision resolve itself, while keeping a genuinely broken
-/// migration to a few seconds rather than the full peer timeout on every attempt.
+/// Not zero, because the classification below is a heuristic: a brief pause lets an
+/// unrecognised collision resolve itself, while keeping a genuinely broken migration to a few
+/// seconds rather than the full peer timeout on every attempt.
 const UNKNOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Whether an error is PostgreSQL objecting that something already exists.
-///
-/// **`CREATE ... IF NOT EXISTS` is not atomic.** Two connections can both find the object
-/// absent and both try to create it; one then fails on a catalog unique index. The
-/// postcondition still holds — the object exists — so these are success, not failure.
 /// PostgreSQL's "that object already exists" codes.
 ///
 /// Two migrators racing produce one of these on whichever loses: `CREATE ... IF NOT EXISTS` is
 /// not atomic, and `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS` on older servers at all. The
 /// list is the class-42 duplicate family plus the catalogue unique violation a schema race
-/// surfaces as.
+/// surfaces as. See [`is_already_exists`].
 const ALREADY_EXISTS: &[&str] = &[
     "23505", // unique_violation — the pg_namespace/pg_class catalogue race
     "42701", // duplicate_column
@@ -79,12 +74,11 @@ fn has_code(error: &sqlx::Error, codes: &[&str]) -> bool {
 ///
 /// Waiting only helps if someone else is going to finish the work. Broken SQL never becomes
 /// valid, so a syntax error or a missing function fails immediately rather than sitting out the
-/// peer timeout on every attempt — which turned a bad migration into a 30-second stall.
+/// peer timeout on every attempt — which would turn a bad migration into a 30-second stall.
 ///
 /// **The cost of being wrong is asymmetric, and not in the obvious direction.** Omitting a code
-/// that *is* a collision turns a routine race into a failed start, which is how `42701` was
-/// found. Including one that is not merely delays an error that was going to happen anyway. So
-/// this errs towards waiting.
+/// that *is* a collision turns a routine race into a failed start. Including one that is not
+/// merely delays an error that was going to happen anyway. So this errs towards waiting.
 fn is_possibly_concurrent(error: &sqlx::Error) -> bool {
     if has_code(error, ALREADY_EXISTS) || has_code(error, TRANSIENT) {
         return true;
@@ -346,7 +340,7 @@ pub async fn run(
 /// corpus defines is something some statement here names — `QUEUE_COLUMNS` selects
 /// `application_name` from migration 101 and the per-partition limits from 108 — so a database
 /// that stopped short of the ceiling is one this build cannot read, whatever it can parse. The
-/// distinction matters now that the shared series has a migration **Go** has not ported — Python
+/// distinction matters because the shared series has a migration **Go** has not ported — Python
 /// and TypeScript both define 108, Go's table stops at 107 — so a peer that migrated to 107 and
 /// stopped leaves a database that would pass any lower bar and then fail on the first queue read.
 pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {

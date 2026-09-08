@@ -1,6 +1,6 @@
 //! The macro forms of the two waits, against real databases.
 //!
-//! What these have to show is not that the wait works — [`waits.rs`](waits) covers that — but that
+//! What these have to show is not that the wait works — `waits.rs` covers that — but that
 //! wrapping it in a macro records nothing extra and awaits nothing extra. So every test here reads
 //! the parent's step rows back and asserts the whole sequence: the launches, the one wait, and
 //! exactly the `DBOS.getResult`s the shape calls for. A macro that quietly awaited a loser, or

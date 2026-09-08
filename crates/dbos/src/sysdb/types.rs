@@ -274,8 +274,8 @@ impl fmt::Display for WorkflowStatus {
 /// their nullability: `name` is `Option` because the column is. Identity concepts that group
 /// several columns — the `(name, class_name, config_name)` triple the registry keys on — are
 /// built from a record where they are needed, rather than being baked into it. Grouping them
-/// here meant claiming `name` was non-null and quietly substituting an empty string when it
-/// was not, which is the kind of loss this layer should report rather than absorb.
+/// here would mean claiming `name` is non-null and quietly substituting an empty string when it
+/// is not, which is the kind of loss this layer should report rather than absorb.
 ///
 /// Every payload field holds encoded text — see the module documentation.
 ///
@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(duration_from_secs(-1.0), None);
         assert_eq!(duration_from_secs(f64::NAN), None);
         assert_eq!(duration_from_secs(f64::INFINITY), None);
-        // Finite and non-negative, and still not a duration: the guard this replaced let it
+        // Finite and non-negative, and still not a duration: an `is_finite()` guard alone lets it
         // through to a panic, and the columns it reads are wide enough to hold it.
         assert_eq!(duration_from_secs(1e300), None);
     }
@@ -1992,12 +1992,12 @@ pub struct GetEventCaller<'a> {
 /// parent to record against.
 ///
 /// **Everything the parent contributes is here, including the id the child's own row carries.**
-/// It was on [`NewWorkflow`] as well to begin with, which is one fact spelled twice and two
-/// chances to disagree: nothing would have caught a caller naming one parent on the row and
-/// another on the step. Grouping it here makes the agreement structural rather than checked — a
-/// row gets a parent exactly when a start is recorded against that parent, because the same value
-/// writes both — and it is where [`NewWorkflow`]'s own rule puts it, that type holding the columns
-/// a caller may meaningfully set and leaving the ones a mechanism owns to the mechanism.
+/// A `parent_workflow_id` on [`NewWorkflow`] as well would be one fact spelled twice and two
+/// chances to disagree: nothing would catch a caller naming one parent on the row and another on
+/// the step. Grouping it here makes the agreement structural rather than checked — a row gets a
+/// parent exactly when a start is recorded against that parent, because the same value writes
+/// both — and it is where [`NewWorkflow`]'s own rule puts it, that type holding the columns a
+/// caller may meaningfully set and leaving the ones a mechanism owns to the mechanism.
 ///
 /// **Passing this is what makes the two writes one.** The child's row and the parent's record of
 /// having started it commit together, so no observer and no replay ever sees a child that exists
@@ -2024,8 +2024,8 @@ pub struct InitWorkflowCaller<'a> {
 ///
 /// What the blocking reads return: this layer moves payloads as opaque strings and never decodes
 /// one, so the format has to travel with the value for the caller to make sense of it.
-/// [`get_event`](crate::sysdb::SystemDatabase::get_event) returns this; `recv` and
-/// `read_stream_value` will return it too.
+/// [`get_event`](crate::sysdb::SystemDatabase::get_event) and `recv` return this, and
+/// [`StreamRead`] carries one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedValue {
     /// The payload, exactly as it was stored.
@@ -2294,9 +2294,9 @@ pub mod step_names {
     /// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
     ///
     /// A method apiece is why: the name comes from which one was called, so nothing has to infer
-    /// it. Inferring it from the batch size — as this once did — recorded a one-message bulk send
-    /// as `DBOS.send`, which is not the call the caller made. Python and Java pass the name down
-    /// from their two surfaces in exactly the same way.
+    /// it. Inferring it from the batch size would record a one-message bulk send as `DBOS.send`,
+    /// which is not the call the caller made. Python and Java pass the name down from their two
+    /// surfaces in exactly the same way.
     pub const SEND: &str = "DBOS.send";
     pub const SEND_BULK: &str = "DBOS.sendBulk";
 
@@ -2572,8 +2572,8 @@ pub struct NewSchedule<'a> {
     /// generates it. Java's DAO does, as this does. TypeScript and Python generate one layer
     /// higher, at every call site that registers a schedule, and hand this layer a value it must
     /// take. That is the same split `application_name` has, and it resolves the same way: the
-    /// fallback lives here because nothing sits above this layer yet, and becomes a second line
-    /// of defence rather than the only one once Phase 2's registration layer does.
+    /// fallback lives here so this layer stands on its own, and a registration layer above it
+    /// that supplies the id makes this a second line of defence rather than the only one.
     pub schedule_id: Option<&'a str>,
     /// See [`ScheduleRecord::schedule_name`].
     pub schedule_name: &'a str,

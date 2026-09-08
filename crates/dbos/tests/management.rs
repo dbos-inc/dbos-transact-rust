@@ -1858,8 +1858,7 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
         .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
         .unwrap();
 
-    // A write and a fork, which reach the guard by different routes: the methods hold it
-    // themselves, and `fork_batch` is a free function that had to be handed the instance.
+    // A write and a fork, so both kinds of call meet the guard in `StepPlacement::of`.
     let cancels_through_other = {
         let other = other.clone();
         owner
@@ -1995,7 +1994,7 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
         "a fork was written even though the call was refused",
     );
 
-    // And no step id was spent: the guard runs before `caller_for` allocates one.
+    // And no step id was spent: `StepPlacement::of` runs the guard before it allocates one.
     for caller in ["refused-cancel", "refused-fork-caller"] {
         assert!(
             reader
@@ -2101,10 +2100,10 @@ async fn an_empty_management_batch_inside_a_workflow_records_its_step() {
 
 /// **Management calls take their step ids where they are built, not where they are first polled.**
 ///
-/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
-/// branch before polling any and then first-polls them in source order, so a test that builds and
-/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
-/// handed to `join!` as `c, b, a`.
+/// The counterpart in `events.rs` makes the argument for the shape: `join!` builds every branch
+/// before polling any and then first-polls them in source order, so a test that builds and drives
+/// in the same order passes against poll-time ids too. These three are built `a, b, c` and handed
+/// to `join!` as `c, b, a`.
 #[tokio::test]
 async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
     let db = test_database().await;
@@ -2203,8 +2202,8 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
 /// The launch check comes first, then the call's own argument check, and only then the step id —
 /// so `fork_all` refusing a chosen id, and `fork_with` refusing a fork point that cannot name one,
 /// leave the step after them on the slot it would have had. The instance-level refusals are
-/// covered by `management_calls_through_another_instance_are_refused`; these are the ones the
-/// method itself raises.
+/// covered by `management_through_another_instance_from_inside_a_workflow_is_refused`; these are
+/// the ones the method itself raises.
 #[tokio::test]
 async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
     let db = test_database().await;

@@ -105,10 +105,10 @@ async fn a_message_from_outside_reaches_a_waiting_workflow() {
 
 /// **Messages take their step ids where they are built, not where they are first polled.**
 ///
-/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
-/// branch before polling any and then first-polls them in source order, so a test that builds and
-/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
-/// handed to `join!` as `c, b, a`.
+/// The counterpart in `events.rs` makes the argument for the shape: `join!` builds every branch
+/// before polling any and then first-polls them in source order, so a test that builds and drives
+/// in the same order passes against poll-time ids too. These three are built `a, b, c` and handed
+/// to `join!` as `c, b, a`.
 ///
 /// The receive is what this adds to that test: it is **two** steps, and its deadline's id has to
 /// come from the counter directly behind its own however the two are driven — a pair split by the

@@ -598,23 +598,16 @@ async fn dispatch_claimed(
 /// `start_dequeued_workflows` chose and the reason
 /// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
 ///
-/// **This lived in its own module until it stopped having two callers.** It was factored out of
-/// recovery so the queue runner could share it, and recovery became a re-enqueue in the same
-/// branch — one write, no rows read, no dispatch. It has been the dequeue loop's alone since it
-/// reached `main`, so it lives here now, next to the loop that calls it.
-///
 /// [`Submission::Dequeue`] claims a row another executor may hold and counts against the recovery
 /// budget — that is what [`Submission::claims_ownership`] is — so the cap below is not a
 /// parameter. [`Submission::Fresh`] does not belong here: a first attempt starts from arguments,
 /// not from a row, and has never been through this path.
 ///
-/// **The registry is consulted before the row is claimed, and for this caller that is harmless
-/// rather than load-bearing.** The order was recovery's: an `init_workflow` that succeeded and
-/// then found no registration would have burned an attempt and re-stamped the executor on a
-/// workflow this process cannot run. A dequeue has already paid both in its own claim, which
-/// flips the row to `PENDING`, counts the attempt, and stamps `executor_id` before this is
-/// reached. What the order does still mean here is that a row this process cannot run is never
-/// parked, however many attempts it accrues — the subject of the upstream note below.
+/// **The registry is consulted before the row is claimed, and that is harmless rather than
+/// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
+/// stamped `executor_id` before this is reached, so there is nothing for the order to save. What
+/// it does mean is that a row this process cannot run is never parked, however many attempts it
+/// accrues — the subject of the upstream note below.
 ///
 /// `slot` is this workflow's place in its queue's local running tally. It travels into the spawned
 /// execution so the tally is released when the workflow's task ends — and is dropped here,
@@ -710,9 +703,9 @@ async fn dispatch(
     // copy (`_core.py:1313`, `dbos-executor.ts:702`, `queue.go:798`, and Java's non-owner
     // rollback), which narrows the window rather than closing it; this narrows it further.
     //
-    // `should_execute` does not stand in for this, which is what it was doing before. It reports
-    // whether another owner holds the row *and this caller is not claiming it* — and a dequeue
-    // always claims, so it is `true` here whatever the row says.
+    // `should_execute` cannot stand in for this. It reports whether another owner holds the row
+    // *and this caller is not claiming it* — and a dequeue always claims, so it is `true` here
+    // whatever the row says.
     if initialized.status != WorkflowStatus::Pending {
         tracing::warn!(
             workflow_id,

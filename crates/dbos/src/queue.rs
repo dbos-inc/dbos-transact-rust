@@ -881,7 +881,7 @@ impl Connection {
         };
 
         // The row as written, so there is no read back to do: it left the transaction that wrote
-        // it, which is a stronger guarantee than re-reading afterwards ever was.
+        // it, which is a stronger guarantee than a re-read afterwards could give.
         let record = self
             .sysdb()
             .update_queue(name, &update, &validate)

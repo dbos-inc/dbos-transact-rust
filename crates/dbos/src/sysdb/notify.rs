@@ -30,8 +30,8 @@
 //! (`SplitN(payload, "::", 2)`), which is a thing this crate has no equivalent of: the poller was
 //! the only component that would ever have needed the halves back, and there is no poller.
 //!
-//! The consequence for whoever adds the listener: build the key by **concatenating** the prefix
-//! onto the payload exactly as it arrived. Never split it.
+//! So the listener builds the key by **concatenating** the prefix onto the payload exactly as it
+//! arrived, and never splits it.
 //!
 //! **Prefixing does not make keys injective, and that is fine.** The pairs `("a", "b::c")` and
 //! `("a::b", "c")` both render `m::a::b::c`, so a wake for one wakes the other. A wakeup is only
@@ -47,11 +47,11 @@ use super::NULL_TOPIC;
 
 /// The channel a message notification arrives on, published by migration 1's trigger.
 pub(crate) const NOTIFICATIONS_CHANNEL: &str = "dbos_notifications_channel";
-/// The channel an event notification arrives on. Migration 44 dropped the trigger that fed it;
-/// the writer-side push replaces it.
+/// The channel an event notification arrives on. No trigger feeds it (migration 44 removes the
+/// one there was); the writer pushes instead.
 pub(crate) const EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
-/// The channel a stream notification arrives on. Migration 43 dropped its trigger, as 44 did for
-/// events.
+/// The channel a stream notification arrives on. Fed by the writer, like events: migration 43
+/// removes its trigger.
 pub(crate) const STREAMS_CHANNEL: &str = "dbos_streams_channel";
 
 /// The prefixes, as constants rather than literals in three `format!`s.

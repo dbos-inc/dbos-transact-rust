@@ -1,7 +1,7 @@
 //! The workflow handle: three methods over a workflow id, in two flavours.
 //!
 //! Every reference agrees on the surface — the id, the result, the status — and every reference
-//! splits the implementation the same way (decision 10). A handle to a workflow running in *this*
+//! splits the implementation the same way. A handle to a workflow running in *this*
 //! process awaits the running task directly; a handle to one running elsewhere, or to one that
 //! finished before this process started, has nothing local to await and polls the database. The
 //! two are one public type, because a caller has no reason to care which it holds — and with a
@@ -191,8 +191,8 @@ where
     {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run. A refusal
-        // here is carried into the future by `placed`, so `handle.result().await?` reads as it
-        // always did and nothing was claimed on the way to it.
+        // here is carried into the future by `placed`, so `handle.result().await?` keeps its
+        // single `?` and nothing was claimed on the way to it.
         let built = ChildResultPlacement::of(&self.conn).map(|awaiting| {
             let placement = awaiting.placement().clone();
             (awaiting, placement)

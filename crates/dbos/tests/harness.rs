@@ -1,8 +1,8 @@
 //! Tests for the test harness itself.
 //!
-//! There is no library code to exercise yet, so what these assert is that the thing
-//! everything later depends on actually works: a real database on both v1 backends,
-//! containers shared rather than multiplied, and nothing left running afterwards.
+//! What these assert is that the thing every other test depends on actually works: a real
+//! database on both backends, containers shared rather than multiplied, and nothing left running
+//! afterwards.
 
 use std::sync::Arc;
 
@@ -11,8 +11,8 @@ use dbos_test_support::{Backend, SharedSlot, raw_database, test_database};
 
 /// The harness reaches a real server and can run SQL on a fresh database.
 ///
-/// Deliberately the raw lane: "no tables" is only true before migrations exist, so asserting
-/// it against the pooled lane would start failing the moment that lane means what it says.
+/// Deliberately the raw lane: a pooled database arrives migrated, so "no tables" is only true
+/// here.
 #[tokio::test]
 async fn connects_to_a_fresh_database() {
     let db = raw_database().await;

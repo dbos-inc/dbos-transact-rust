@@ -27,7 +27,7 @@ pub mod runner;
 ///
 /// Read from the file rather than from a list beside it. A migration is online exactly when it
 /// carries a `{{concurrently}}` placeholder — see [`Placeholders`] — so a list would be a second
-/// copy of a fact the file already states, and the two could disagree. They cannot now.
+/// copy of a fact the file already states, and the two could disagree.
 ///
 /// Never true on CockroachDB, which applies schema changes online regardless and does not take
 /// the keyword; the placeholder renders empty there.

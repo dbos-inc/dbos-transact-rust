@@ -31,13 +31,10 @@ pub const DATABASE_URL_ENV: &str = "DBOS_DATABASE_URL";
 /// which is why `#[non_exhaustive]` is here from the start: adding those variants is then
 /// source-compatible, because a downstream `match` already needs a wildcard arm.
 ///
-/// The part that needs care is the *trait*, not the enum. A serializer wants
-/// `fn serialize<T: Serialize>(&self, value: &T)`, and a trait with a generic method cannot be made
-/// into a `dyn` object at all — verified, not assumed: rustc rejects it with "because method
-/// `serialize` has generic type parameters". The way out is `erased-serde`, which is built for
-/// exactly this: the trait takes `&dyn erased_serde::Serialize` and hands back a
-/// `Box<dyn erased_serde::Deserializer>`, and the generic half lives in a free function the call
-/// site monomorphizes. The built-in two stay ordinary variants and pay none of it.
+/// The part that needs care is the *trait*, not the enum: a trait with a generic
+/// `fn serialize<T: Serialize>` is not object-safe, so the custom variant goes through
+/// `erased-serde`, with the generic half in a free function the call site monomorphizes. The
+/// built-in two stay ordinary variants and pay none of it.
 ///
 /// Two things here exist to keep that door open, and both would be breaking changes to add later:
 /// this is `Clone` and not `Copy`, because an `Arc` is not `Copy`; and [`name`](Self::name)
@@ -76,9 +73,6 @@ impl Serializer {
 /// from other crates entirely, functional update included, which is exactly the form above. Adding
 /// a field stays source-compatible for every caller who wrote `..Config::new(..)`, so the
 /// convention is documented rather than enforced.
-///
-/// The rest of the configuration surface — patching, the scheduler, Conductor — arrives with the
-/// phase that reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Names this application among those sharing the system database.

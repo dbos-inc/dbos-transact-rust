@@ -34,9 +34,8 @@
 //!
 //! # Why this is documented rather than fixed
 //!
-//! Both of the obvious repairs were tried on this branch and neither survives contact with the
-//! three kinds of durable call a branch can be, so the reasoning is kept here rather than
-//! rediscovered:
+//! Neither of the obvious repairs survives contact with the kinds of durable call a branch can
+//! be:
 //!
 //! - *Infer the winner from the branch that recorded.* A row does not mean a branch finished.
 //!   [`sleep`](crate::sleep) checkpoints the instant it will wake at and waits afterwards, so a
@@ -48,7 +47,7 @@
 //!   durable call's contract in service of one caller.
 //! - *Write both rows in one transaction.* There is no single write to join. An application step
 //!   records through `record_step`, a child's result through `record_child_result`, a sleep
-//!   through `checkpoint_sleep` before the wait it is checkpointing, and a child's start inside
+//!   through `record_sleep` before the wait it is checkpointing, and a child's start inside
 //!   the transaction that creates the child. The select would have to reach into all four.
 //!
 //! So the window stands, with its shape written down. If it is closed later, the bit on the call
@@ -320,12 +319,11 @@ pub fn control_error<T, E>(slot: &mut Option<Result<T, E>>) -> Option<Error<E>> 
 
 /// What a durable race is, and what writing one looks like.
 ///
-/// The split is worth stating once: everything above is the contract — the id this call claims,
-/// the position it records, the refusal a changed shape earns — and everything here drives it
-/// through [`select_step!`](crate::select_step), because there is nothing else to drive it with. A
-/// `Vec`-taking form existed on the reference branch purely as a test seam and was deleted when
-/// the macro landed; a race's branches disagree about what they return, which is the whole point,
-/// and a `Vec` cannot hold that.
+/// Everything above is the contract — the id this call claims, the position it records, the
+/// refusal a changed shape earns — and everything here drives it through
+/// [`select_step!`](crate::select_step), because there is nothing else to drive it with: a race's
+/// branches disagree about what they return, which is the whole point, and a `Vec` cannot hold
+/// that.
 ///
 /// **Every losing branch parks on [`std::future::pending`], never on a sleep.** Winning a race
 /// costs the winner a `check_step` and a `record_step` — two database round trips — and on a
@@ -345,8 +343,8 @@ mod tests {
     /// A launched instance and a workflow row for the race to record against.
     ///
     /// No `run` here on purpose: entering the same workflow id under two fresh contexts is
-    /// precisely what a replay is, and it is the only way to test one before recovery does it for
-    /// real.
+    /// precisely what a replay is, and it is the cheapest way to produce one without going through
+    /// recovery.
     async fn workflow(id: &str) -> (DBOS, dbos_test_support::TestDatabase) {
         let db = dbos_test_support::test_database().await;
         let dbos = DBOS::new(Config {
@@ -604,7 +602,7 @@ mod tests {
     /// **A losing sleep leaves a row**, which is the fact behind the module documentation's
     /// refusal to read branch rows as the race's answer.
     ///
-    /// `checkpoint_sleep` writes when the sleep is first polled and the wait comes after it, so
+    /// `record_sleep` writes when the sleep is first polled and the wait comes after it, so
     /// what this asserts is a row for a wait that was abandoned — beside the winner's, and
     /// indistinguishable from one.
     #[tokio::test]

@@ -159,9 +159,8 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
 /// call a transport failure permanent. See [`is_transport_failure`].
 ///
-/// Prefixes rather than exact codes, deliberately. The first version of the migration runner's
-/// classifier listed codes and was wrong twice; matching the class the standard defines is what
-/// stopped that.
+/// Prefixes rather than exact codes, deliberately: a list of codes misses the ones nobody has
+/// seen yet, and the class the standard defines covers them.
 ///
 /// TODO(dbos-team): UPSTREAM item 8. Classifying by class prefix means a *protocol* violation
 /// lands in whichever class it happens to carry rather than being called permanent, so some are
@@ -268,8 +267,8 @@ pub struct Settings<'a> {
     ///
     /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
     /// setting to. Longer trades wakeup latency for fewer notifying transactions;
-    /// `Some(Duration::ZERO)` turns coalescing off, which is a push per write — the behaviour the
-    /// database triggers had, and what migrations 43 and 44 dropped them to get away from.
+    /// `Some(Duration::ZERO)` turns coalescing off, which is a push per write — what a database
+    /// trigger costs, and why migrations 43 and 44 remove the events and streams triggers.
     ///
     /// Nothing here is load-bearing whatever it is set to: a wakeup only ever shortens a wait that
     /// re-queries on its own interval regardless.
@@ -333,7 +332,6 @@ impl<'a> Config<'a> {
     }
 }
 
-/// A system database backed by PostgreSQL or CockroachDB.
 /// The polling cap for a pool of `pool_size` connections.
 ///
 /// `configured` is the caller's choice: `None` takes the default, and `Some(0)` switches the cap
@@ -356,6 +354,7 @@ fn polling_limit(configured: Option<u32>, pool_size: u32) -> usize {
     }
 }
 
+/// A system database backed by PostgreSQL or CockroachDB.
 pub struct PostgresSystemDatabase {
     pool: PgPool,
     /// Schema-qualified, quoted table names, built once.
@@ -392,11 +391,10 @@ pub struct PostgresSystemDatabase {
     polling: tokio::sync::Semaphore,
     /// Who is waiting for what, so that something knowing a row was written can cut a wait short.
     ///
-    /// **Nothing wakes it yet**, and every blocking read here is correct anyway: the wait loop is
-    /// what delivers, and this only ever shortens an interval. It is subscribed to from the first
-    /// caller rather than added alongside the listener because the ordering is the part that cannot
-    /// be retrofitted — a caller must be registered *before* it looks, or it misses whatever lands
-    /// between the look and the wait.
+    /// Woken by the listener for other processes' writes and by the notifier for this one's, and
+    /// every blocking read here is correct with neither running: the wait loop is what delivers,
+    /// and this only ever shortens an interval. A caller must be registered *before* it looks, or
+    /// it misses whatever lands between the look and the wait.
     notify: Arc<Registry>,
     /// The listener, which is where a wait reads how long it may sleep.
     ///
@@ -777,7 +775,7 @@ impl PostgresSystemDatabase {
     /// **`started_at` is the caller's and the completion is this function's.** Every caller sits
     /// inside a [`with_retry`], so the start is read once outside it and the recorded duration
     /// spans every attempt, as [`crate::step()`] does for an ordinary step; the completion is read
-    /// here, once the work has actually finished. Taking a whole [`StepTiming`] invited the
+    /// here, once the work has actually finished. Taking a whole [`StepTiming`] would invite the
     /// caller to read the clock twice in a row and record a duration of nothing.
     ///
     /// [`StepTiming::completed_at`] is also the token that recognises a caller's own write after
@@ -1024,7 +1022,7 @@ impl PostgresSystemDatabase {
 
         // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's guard,
         // not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`, and with
-        // steps_table numbered from zero the latter drops step 0 from every fork that resumes at
+        // steps numbered from zero the latter drops step 0 from every fork that resumes at
         // step 1 — the fork then re-runs a step it was given the result of.
         let copies_anything = start_steps.iter().any(|&step| step > 0);
 
@@ -1115,8 +1113,8 @@ impl PostgresSystemDatabase {
         .await?;
 
         if copies_anything {
-            // The recorded steps_table, which are what the fork replays instead of running. The
-            // `CASE` rewrites recorded children when the caller is forking a whole tree;
+            // The recorded steps, which are what the fork replays instead of running. The
+            // `COALESCE` rewrites recorded children when the caller is forking a whole tree;
             // with no replacements it collapses to the original column.
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {steps_table} (workflow_uuid, function_id, output, error, \
@@ -1147,7 +1145,7 @@ impl PostgresSystemDatabase {
             .execute(&mut *tx)
             .await?;
 
-            // The per-step event history_table, bounded the same way.
+            // The per-step event history, bounded the same way.
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {history_table} (workflow_uuid, function_id, key, value, serialization) \
                  SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization \
@@ -1161,7 +1159,7 @@ impl PostgresSystemDatabase {
             .execute(&mut *tx)
             .await?;
 
-            // The current value of each key, rebuilt from the history_table rather than copied
+            // The current value of each key, rebuilt from the history rather than copied
             // from the source's `workflow_events`. The source's current value may have been
             // set *after* the fork point, and a fork must not see the future.
             sqlx::query(AssertSqlSafe(format!(
@@ -1600,7 +1598,6 @@ const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 /// same fan-out agree on who finished first.
 const UNSETTLED: &str = "'PENDING', 'ENQUEUED', 'DELAYED'";
 
-/// Every column `version_from_row` reads.
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
      rate_limit_period_sec, priority_enabled, partition_queue, partition_concurrency, \
@@ -1714,6 +1711,7 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
     })
 }
 
+/// Every column of `application_versions` [`version_from_row`] reads.
 const VERSION_COLUMNS: &str =
     "version_id, version_name, version_timestamp, created_at, application_name";
 
@@ -1729,22 +1727,11 @@ const VERSION_COLUMNS: &str =
 ///
 /// **A nameless writer is not thereby stopped from writing.** Leaving the owner intact means the
 /// *column*: the holder comes back, the write that follows is scoped to it, and so a handle with
-/// no application name of its own goes on to rewrite a row a named application holds. That is
-/// what a client with no configured name does by default, and all five implementations do it —
-/// see the item 26 note below before reading any surrounding doc as a guarantee.
+/// no application name of its own goes on to rewrite a row a named application holds. Item 26
+/// below.
 ///
 /// **Diagnostic, not a guard.** The writes it precedes match only a row that is unclaimed or
-/// already this application's, and that is what keeps a *named* peer's row safe. Inside a
-/// transaction it still races at READ COMMITTED, where every statement takes a fresh snapshot: a
-/// registrar claiming the row in between costs a following write that silently matches nothing.
-/// `SELECT … FOR UPDATE` would close that, and neither reference does it — both lock rows only on
-/// the dequeue path — so it is a change to raise with them rather than make alone.
-///
-/// **Exact only while a name is globally unique**, which migrations 9, 13 and 21 guarantee today.
-/// When the shared series drops 13's in favour of 106 and 107, a version name may exist once per
-/// application and this would return an arbitrary one, so it needs an `application_name` scope at
-/// that point — as do Python's and TypeScript's, which also read by name alone. Queue and
-/// schedule names have no such replacement.
+/// already this application's, and that is what keeps a *named* peer's row safe. Item 2 below.
 ///
 /// TODO(dbos-team): UPSTREAM item 9, per-application queue and schedule names. Their global
 /// uniqueness means two applications sharing a system database cannot both register `orders`, so
@@ -1761,10 +1748,12 @@ const VERSION_COLUMNS: &str =
 /// name alone too, so the drop migration wants an `application_name IS NOT DISTINCT FROM` scope on
 /// this read in all three, agreed before anyone writes the drop.
 ///
-/// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED a
-/// registrar can claim the row in between. The write is self-guarding, so it matches zero rows
-/// rather than landing on the wrong one — but the caller is told `Ok`, as it is for a version name
-/// that matches nothing at all.
+/// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED —
+/// where every statement takes a fresh snapshot, transaction or not — a registrar can claim the
+/// row in between. The write is self-guarding, so it matches zero rows rather than landing on the
+/// wrong one — but the caller is told `Ok`, as it is for a version name that matches nothing at
+/// all. `SELECT … FOR UPDATE` would close that, and neither reference does it — both lock rows
+/// only on the dequeue path — so it is a change to raise with them rather than make alone.
 ///
 /// TODO(dbos-team): UPSTREAM item 26. The nameless branch above is a shared gap rather than this
 /// port's choice — all five resolvers return the holder to a claimant that has no name, and their
@@ -2659,16 +2648,12 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "init_workflow", move || async move {
             // **A transaction, because the caller's record has to land with the row.**
             //
-            // This is the one thing the single `INSERT .. ON CONFLICT .. RETURNING` above could
-            // not do on its own, and it is worth being clear about what it costs: a creation with
-            // no caller — a root start, every enqueue, a dequeue's re-submission — pays a begin
-            // and a commit around what was one statement. Opened unconditionally even so, for two
-            // reasons. The paths would otherwise differ in what a failure part-way leaves behind,
-            // which is a seam nobody would remember when reading either. And it is where this
-            // method is going regardless: Python and TypeScript both write the payload to a
-            // separate `workflow_input` row — TypeScript's column comment already calls the
-            // `workflow_status` one legacy — so the day that split reaches here, every creation
-            // writes two rows and needs this.
+            // That is the one thing the `INSERT .. ON CONFLICT .. RETURNING` below cannot do on
+            // its own, and it costs something: a creation with no caller — a root start, every
+            // enqueue, a dequeue's re-submission — pays a begin and a commit around one statement.
+            // Opened unconditionally even so, because the two paths would otherwise differ in what
+            // a failure part-way leaves behind, which is a seam nobody would remember when reading
+            // either.
             let mut tx = pool.begin().await?;
 
             // The column list is Java's INSERT, in its order, plus Python's two debounce
@@ -2862,10 +2847,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // one error path that is itself a write: the workflow has to come out of this call
                 // `MAX_RECOVERY_ATTEMPTS_EXCEEDED` and stay there, or the next recovery attempt
                 // finds it `PENDING` and parks it again forever. Every other early return is a
-                // refusal that wrote nothing worth keeping, and rolls back — which is a change
-                // from the statement-per-call shape this had, where the upsert had already
-                // committed by the time a conflicting name was noticed and a rejected submission
-                // still bumped the row's recovery count.
+                // refusal that wrote nothing worth keeping, and rolls back — so a rejected
+                // submission does not bump the row's recovery count on its way out.
                 tx.commit().await?;
 
                 return Err(Error::MaxRecoveryAttemptsExceeded {
@@ -4347,9 +4330,9 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                 tx.commit().await?;
                 // Committed, so a reader woken by this finds the entry — including the sentinel a
-                // close writes, which is how a reader learns the stream has ended. Migration 43
-                // dropped the trigger that used to do it. The replay above returns before here on
-                // purpose: it wrote nothing, so there is nothing new to look at.
+                // close writes, which is how a reader learns the stream has ended. No trigger does
+                // this (migration 43 removes it), so the writer must. The replay above returns
+                // before here on purpose: it wrote nothing, so there is nothing new to look at.
                 self.notifier.signal(STREAMS_CHANNEL, workflow_id, key);
                 return Ok(());
             }
@@ -4608,8 +4591,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await?;
 
             tx.commit().await?;
-            // Committed, so a reader woken by this finds the row. Migration 44 dropped the trigger
-            // that used to do it from inside the transaction above.
+            // Committed, so a reader woken by this finds the row. No trigger does this (migration
+            // 44 removes it), so the writer must — and after the commit, not inside it.
             self.notifier.signal(EVENTS_CHANNEL, workflow_id, key);
             Ok(())
         })
@@ -4658,8 +4641,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // **Before the first look, never after.** A caller that looked first and registered second
         // would miss anything written in between and then wait out its whole timeout for a value
-        // already in the table. Nothing wakes this yet — the loop below delivers on its own — but
-        // the ordering is what makes a wakeup safe to add.
+        // already in the table. The loop below delivers on its own; a wakeup only shortens it.
         let mut subscription = self.notify.subscribe(event_key(workflow_id, key));
 
         // Recorded whether or not the value turns out to be there already, so which steps a run
@@ -5550,12 +5532,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             // `:3900`, python `_sys_db.py:4728`, whose comment says it outright: *"Count this
             // dispatch against the DLQ limit; no later insert does it."*
             //
-            // The `ENQUEUED` guard is what makes it correct rather than merely present: a peer
-            // that won the race has already moved the row, so a loser matches nothing and charges
-            // the workflow nothing.
-            //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
-            // already moved the row, and re-dispatching it would run the workflow twice.
+            // already moved the row, so a loser matches nothing, charges the workflow nothing, and
+            // does not run it a second time.
             // `COALESCE` claims an unclaimed row, which is what drains work a nameless client
             // enqueued; a nameless dequeuer leaves ownership untouched. `RETURNING` then reports
             // exactly the rows this statement flipped, so one a peer won is simply absent.
@@ -6509,7 +6488,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // An empty update still has to say whether the schedule exists, so it becomes
                     // a read rather than an early return: silence would report a typo as success.
                     let changed = if update.is_empty() {
-                        // include explict cast for CRDB compat
+                        // Cast explicitly: a bare `1` is `INT8` on CockroachDB and `INT4` on
+                        // PostgreSQL, and this decodes as one type.
                         sqlx::query_scalar::<_, i32>(AssertSqlSafe(format!(
                             "SELECT 1::int4 FROM {schedules_table} WHERE schedule_name = $1"
                         )))

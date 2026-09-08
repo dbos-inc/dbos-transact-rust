@@ -4,7 +4,7 @@
 //! gone goes back to `ENQUEUED`, and whichever executor next polls its queue runs it. This module
 //! is one write.
 //!
-//! Python, TypeScript and Go re-enqueue too — Go since #433 — and Java alone runs the recovered
+//! Python, TypeScript and Go re-enqueue too (Go's is #433); Java alone runs the recovered
 //! workflow in the process that found it.
 //!
 //! Three things the re-enqueue buys:

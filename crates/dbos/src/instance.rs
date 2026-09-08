@@ -195,11 +195,10 @@ impl Executor {
 
     /// Stops everything this executor started and closes the system database.
     ///
-    /// Here rather than in [`DBOS::shutdown`] because this is where the things being stopped live,
-    /// and there will be more of them: the task set holding running workflows, and the recovery
-    /// task. Teardown that grows a step at a time wants one place to grow, which is also how Java
-    /// draws it — `DBOS.shutdown()` calls `DBOSExecutor.close()` and knows nothing about what that
-    /// entails.
+    /// Here rather than in [`DBOS::shutdown`] because this is where the things being stopped live:
+    /// the task set holding running workflows and the dequeue loop, and the connection. Teardown
+    /// that grows a step at a time wants one place to grow, which is also how Java draws it —
+    /// `DBOS.shutdown()` calls `DBOSExecutor.close()` and knows nothing about what that entails.
     ///
     /// Takes `&self`, not `self`: the instance drops its handle here, but a workflow still running
     /// may hold another, and shutting down is precisely the moment when that is true.
@@ -344,9 +343,9 @@ impl DBOS {
         };
         let executor = Arc::new(executor);
         *self.write_executor() = Some(Arc::clone(&executor));
-        // Recovery already happened, inside `Executor::start`: it is one write now, and doing it
-        // before launch returns is what keeps it clear of workflows the application starts next.
-        // What is left is to start polling, which is also what will run the re-enqueued work.
+        // Recovery already happened, inside `Executor::start`: it is one write, and doing it before
+        // launch returns is what keeps it clear of workflows the application starts next. What is
+        // left is to start polling, which is also what will run the re-enqueued work.
         if !recovered.is_empty() {
             tracing::debug!(
                 workflows = recovered.len(),

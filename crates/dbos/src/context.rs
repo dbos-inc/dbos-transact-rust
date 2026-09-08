@@ -23,7 +23,7 @@ tokio::task_local! {
 
 /// What a running workflow knows about itself.
 ///
-/// Cheap to clone: two `Arc`s. Cloning it does not make a second workflow — the clone shares the
+/// Cheap to clone: a few `Arc`s. Cloning it does not make a second workflow — the clone shares the
 /// same step counter, which is the point, because a step allocated through either must not reuse
 /// an id allocated through the other.
 #[derive(Clone)]
@@ -141,7 +141,7 @@ impl Ctx {
     /// parameter to read it from by design.
     ///
     /// `None` is not an error. A step called outside a workflow runs plainly and undurably, which
-    /// is Python's behaviour and is what makes a `#[dbos::step]` function ordinarily testable.
+    /// is Python's behaviour and is what makes a function built from steps ordinarily testable.
     pub fn current() -> Option<Ctx> {
         CURRENT.try_with(Ctx::clone).ok()
     }
@@ -238,12 +238,11 @@ impl Ctx {
 
     /// Runs `body` under a context that is [`in_step`](Self::in_step).
     ///
-    /// **Nothing to unset afterwards**, which is what moving the answer off the shared state
-    /// bought: it lives on the `Ctx` bound for this body alone, so it goes out of scope with the
-    /// body however the body ends — an early return, an error, a panic — and no other call stack
-    /// ever saw it. The drop guard this used to need existed only because the flag was shared, and
-    /// a guard could not have fixed that: restoring rather than clearing still hands one step's
-    /// answer to another.
+    /// **Nothing to unset afterwards.** The marker lives on the `Ctx` bound for this body alone, so
+    /// it goes out of scope with the body however the body ends — an early return, an error, a
+    /// panic — and no other call stack ever saw it. A flag on the shared state would need a guard
+    /// to clear it, and a guard could not make it correct: restoring rather than clearing still
+    /// hands one step's answer to another.
     pub(crate) async fn in_step_scope<F: Future>(
         &self,
         cancellation: Option<CancellationToken>,
@@ -323,8 +322,8 @@ mod tests {
     #[test]
     fn step_ids_are_never_reused_across_threads() {
         // Two `Ctx` clones share one counter, so ids must be unique even when steps are allocated
-        // from different threads. Sequential *execution* is the v1 contract; a counter that could
-        // hand out a duplicate would be a replay bug rather than a policy question.
+        // from different threads. Steps may run concurrently, so a counter that could hand out a
+        // duplicate would be a replay bug rather than a policy question.
         let state = Arc::new(state());
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -429,10 +428,10 @@ mod tests {
 
     /// A sibling that has finished does not answer for a step still inside its own body.
     ///
-    /// One half of what a workflow-wide flag got wrong, and the half that corrupts a step that is
-    /// still *running*: whichever scope ended first cleared the answer for the other, so a body
-    /// still inside itself read as no longer in a step, and the next call it made allocated a step
-    /// id instead of being the plain call a nested one has to be.
+    /// One half of what a workflow-wide flag would get wrong, and the half that corrupts a step
+    /// that is still *running*: whichever scope ended first would clear the answer for the other,
+    /// so a body still inside itself would read as no longer in a step, and the next call it made
+    /// would allocate a step id instead of being the plain call a nested one has to be.
     #[tokio::test]
     async fn a_sibling_that_finishes_does_not_end_this_step() {
         let (ctx, dbos, _db) = ctx("wf-siblings", None).await;
@@ -464,10 +463,10 @@ mod tests {
 
     /// A step in flight does not make the workflow body around it look nested.
     ///
-    /// The other half of the same bug: with the answer shared, anything the workflow proper did
-    /// while a step was running took the plain path meant for a nested call, and so was never
+    /// The other half of the same hazard: with the answer shared, anything the workflow proper did
+    /// while a step was running would take the plain path meant for a nested call, and so never be
     /// checkpointed at all. `a_step_built_while_a_sibling_runs_is_still_checkpointed` in
-    /// [`step`](crate::step) is what that costs a caller.
+    /// [`step`](crate::step) is what that would cost a caller.
     #[tokio::test]
     async fn a_running_step_does_not_make_the_workflow_proper_look_nested() {
         let (ctx, dbos, _db) = ctx("wf-proper", None).await;

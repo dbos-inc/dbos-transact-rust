@@ -7,26 +7,22 @@
 //!
 //! # Status
 //!
-//! Under construction. The system database layer landed first and the execution engine is
-//! being built on it; the lifecycle, registration, workflows, steps, events, recovery, queues
-//! and the client are here, with the scheduler arriving next.
+//! Under construction. The system database layer, the lifecycle, registration, workflows,
+//! steps, events, messaging, recovery, queues and the client are here; the scheduler is not yet.
 //!
 //! # Cargo features
 //!
 //! - `engine` *(default)* — the durable execution engine: registry, contexts, workflows,
-//!   steps, queues, scheduler, messaging, and the client. Turning it off leaves the system
-//!   database and Conductor layers, which is the surface a future FFI host would consume.
+//!   steps, queues, messaging, and the client. Turning it off leaves the system database
+//!   layer, which is the surface a future FFI host would consume.
 //! - `macros` *(default)* — [`select_step!`], the durable race, which is a procedural macro and so
 //!   costs `syn` and `quote` at build time. Implies `engine`, because the expansion is engine
 //!   code; nothing it generates reaches the binary.
 
 #![forbid(unsafe_code)]
 
-// **What `$crate` would have been.** A `macro_rules!` names its own crate with `$crate` and so
-// works inside it; a procedural macro has no such token and must write an absolute path, which
-// this crate's own tests and doctests would otherwise fail to resolve. Renaming the dependency
-// (`dbos_sdk = { package = "dbos" }`) breaks the expansion for the same reason, which is a real
-// cost of the procedural form and the reason the path is `::dbos` rather than something shorter.
+// A procedural macro has no `$crate`, so `select_step!`'s expansion names `::dbos` absolutely;
+// this is what lets that path resolve inside this crate's own tests and doctests.
 extern crate self as dbos;
 
 pub mod sysdb;
@@ -146,10 +142,9 @@ pub use wait::{join_workflows, select_workflow};
 /// `dbos_sdk = { package = "dbos" }` puts only `dbos_sdk` in the extern prelude and the expansion
 /// resolves to nothing. Resolving the downstream name instead means `proc_macro_crate`, which
 /// reads the dependent's manifest and so brings a TOML parser into the build graph — against the
-/// whole point of the `macros` feature, which exists so that a build can decline `syn` and
-/// `quote`. `tokio` makes the same trade for `#[tokio::main]`. If a rename ever has to be
-/// supported, the cheap way is `tokio`'s: an optional `crate = path` at the head of the macro,
-/// which costs no dependency.
+/// point of the `macros` feature. `tokio` makes the same trade for `#[tokio::main]`. If a rename
+/// ever has to be supported, the cheap way is `tokio`'s: an optional `crate = path` at the head of
+/// the macro, which costs no dependency.
 ///
 /// # Arms, and the one place this is not `match`
 ///

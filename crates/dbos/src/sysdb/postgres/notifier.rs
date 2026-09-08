@@ -1,12 +1,11 @@
 //! The writer's half of the wakeup path: what this process wrote, told to everyone else.
 //!
-//! Migration 1 gave the notifications channel a trigger, and it is still there — a `send` needs
-//! nothing from this module. Migrations 43 and 44 dropped the equivalent triggers for streams and
-//! events, and **this is what replaces them.** The reason they went is that a trigger fires inside
-//! the writing transaction, so `NOTIFY` takes the async-notify queue lock before the commit and
-//! serialises every notifying commit in the database against every other. Pushing from the
-//! application instead moves that lock off the write path, and lets a batch of writes cost one
-//! notifying transaction instead of one each.
+//! The notifications channel is fed by migration 1's trigger, so a `send` needs nothing from this
+//! module. Events and streams have no trigger — migrations 43 and 44 remove them — and **this is
+//! what feeds their channels instead.** A trigger fires inside the writing transaction, so its
+//! `NOTIFY` takes the async-notify queue lock before the commit and serialises every notifying
+//! commit in the database against every other. Pushing from the application moves that lock off
+//! the write path, and lets a batch of writes cost one notifying transaction instead of one each.
 //!
 //! **Nothing here is load-bearing**, exactly as in [`listener`](super::listener): every wait
 //! re-queries on its own interval, so with this module deleted the same values are delivered, just
@@ -29,8 +28,8 @@ use crate::sysdb::notify::{Registry, key_for};
 
 /// How long a payload waits for company before it is pushed.
 ///
-/// **The whole point is that it is not zero.** A push per write would put this process back to one
-/// notifying transaction per write, which is what dropping the triggers was for; ten milliseconds
+/// **The whole point is that it is not zero.** A push per write would be one notifying transaction
+/// per write, which is exactly the cost a database trigger has; ten milliseconds
 /// of latency turns a burst of writes into one statement, and bounds the rate of notifying commits
 /// however fast the application writes. Ten is Go's `DefaultNotificationCoalesceInterval`,
 /// Python's `notification_coalesce_sec`, TypeScript's `DEFAULT_NOTIFICATION_COALESCE_MS` and

@@ -85,7 +85,7 @@
 //! one transaction, and it leaves one shape for the whole module rather than two.
 //!
 //! The recorded names are the cross-SDK spellings, in
-//! [`step_names`](crate::sysdb::types::step_names) beside every other name this crate records,
+//! [`step_names`] beside every other name this crate records,
 //! with what each one cost to settle. One call is one step, and the singular forms delegate to the
 //! bulk ones, so `cancel` and `cancel_all` spend the same one step id.
 //!
@@ -816,7 +816,7 @@ impl DBOS {
         workflow_id: &'a str,
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> PendingStep<'a, ()> {
-        // Encoded before the id is taken, as every other call in the crate now encodes before it
+        // Encoded before the id is taken, as every other call in the crate encodes before it
         // places: attributes that cannot be encoded are a call that never happens, and a call that
         // never happens must not move the workflow's counter.
         let built = crate::workflow::encode_attributes(attributes)
@@ -914,7 +914,7 @@ impl DBOS {
 /// Every method here is [`DBOS`]'s, and the differences are the two a client always has. **There is
 /// no launch check**, because a client is connected or it does not exist — `connect` hands back a
 /// usable client or an error, so none of these can fail with
-/// [`Error::NotLaunched`](crate::Error::NotLaunched). And **nothing is checkpointed**: called from
+/// [`Error::NotLaunched`]. And **nothing is checkpointed**: called from
 /// inside a workflow, a client's management call runs again on replay, where the same call on
 /// `DBOS` would replay its recorded step. A client has no step counter of its own to agree with the
 /// workflow's, and the ambient context belongs to an instance this client is not — the line
@@ -1156,7 +1156,7 @@ impl Connection {
     /// Puts workflows back on a queue, and hands back a handle to each.
     ///
     /// `self: &Arc<Self>` because the handles hold the connection they poll through, which is this
-    /// one — the same reason [`crate::workflow::start`] takes the executor by `Arc`.
+    /// one — the same reason `WorkflowHandle::polling` takes one by `Arc`.
     pub(crate) async fn resume_all<R, E>(
         self: &Arc<Self>,
         workflow_ids: &[&str],
@@ -1345,8 +1345,8 @@ impl Connection {
 /// (`system_database.go:2773`) has no id field and leaves `ForkedWorkflowIDs` unset; Java splits
 /// the options type outright, `ForkFromFailureOptions` carrying only the version, queue and
 /// partition key where its `ForkOptions` leads with `forkedWorkflowId`. Refusing is the merged
-/// shape's version of Java's missing field. It was silently dropped before, which is the one
-/// behaviour no reference has.
+/// shape's version of Java's missing field; silently dropping the id is the one behaviour no
+/// reference has.
 ///
 /// **Made by the surfaces rather than inside the connection**, because a refused call must not
 /// spend a step id and the connection is only reached once one has been taken. Both surfaces that

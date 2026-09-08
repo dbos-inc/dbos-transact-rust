@@ -300,7 +300,8 @@ pub struct StartOptions<'a> {
 /// **The queue-only options are nested here rather than sitting beside
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
 /// id, a priority, a partition key, a delay and a
-/// [`duplication_policy`](Self::duplication_policy) each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError` for
+/// [`duplication_policy`](Self::duplication_policy) each mean nothing without a queue: Go checks
+/// all five at start and returns `InvalidOptionError` for
 /// each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
 /// describing states its type system allowed it to build. Owning them from the queue makes the
 /// same five unrepresentable — there is no queue-less value here to hang them on. Three rules
@@ -450,8 +451,7 @@ pub enum DuplicationPolicy {
 }
 
 impl<'a> Enqueue<'a> {
-    /// A plain enqueue onto `name`, asking for nothing else — what `queue: Some(name)` meant
-    /// before the options existed.
+    /// A plain enqueue onto `name`, asking for nothing else.
     pub fn new(name: &'a str) -> Self {
         Self {
             name,
@@ -740,8 +740,8 @@ impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
 ///   `Timeout.Inherit`, `Timeout.None` and `Timeout.Explicit` (`workflow/Timeout.java`), resolved
 ///   at `DBOSContext.resolveTimeoutAndDeadline` — where the `None` case clears the propagated
 ///   deadline *and* the timeout, exactly as [`None`](Self::None) does here. This is the one place
-///   Java **is** the model, variant names included; decision 6's "Java is not a model" is about
-///   its user-facing `withDeadline` and the precedence that follows from it, which Rust lacks.
+///   Java **is** the model, variant names included; where it is not is its user-facing
+///   `withDeadline` and the precedence that follows from it, which Rust lacks.
 /// - **TypeScript** spells the three as `number | null | undefined` (`context.ts:31`) and branches
 ///   on the middle one under the comment *"Detach child deadline if a null timeout is configured"*
 ///   (`dbos.ts:1969`, and again at `enqueue_workflow.ts:92`).
@@ -943,7 +943,7 @@ where
     /// Returns as soon as the workflow is recorded and spawned. If the id is already owned —
     /// another process is running it, or a previous run finished it — the handle joins the
     /// existing run rather than this being an error: the id is an idempotency key, and honouring
-    /// it is the promise (decision 13).
+    /// it is the promise.
     ///
     /// **A start answers in the child's error channel by default**, though it can only fail in the
     /// engine's terms — there is no application error to report, since nothing the application
@@ -1008,7 +1008,7 @@ where
     ///
     /// **A `join!` over the starts — or over the awaits, or over whole
     /// [`run`](Self::run)s — is sound**, for the reason a `join!` over
-    /// [`step`](crate::step)s is: `join!` builds every branch before polling any, which is
+    /// [`step`](crate::step())s is: `join!` builds every branch before polling any, which is
     /// exactly the order the ids were claimed in. What is *not* sound is building a start in one
     /// workflow and polling it in another, or across a step-body boundary — an id is a claim on
     /// one position in one execution, and a start carried somewhere that cannot honour it is
@@ -1067,8 +1067,8 @@ where
     /// recorded, and that nothing is running until the process next launches. Detached, the drop
     /// takes the [`JoinHandle`](tokio::task::JoinHandle) and leaves the work: the child is
     /// created, its start is recorded, and it runs. What the caller loses by dropping is the
-    /// handle, which is [`select_workflow!`](crate::select_workflow)'s existing rule — a workflow
-    /// runs whether or not anything is watching it — rather than a new hazard of its own.
+    /// handle, which is [`select_workflow!`](macro@crate::select_workflow)'s existing rule — a
+    /// workflow runs whether or not anything is watching it — rather than a new hazard of its own.
     ///
     /// Spawned through [`spawn_tracked`], so shutdown reaches it — and what an abort leaves
     /// behind depends on where it lands. Before the transaction commits, it rolls back and the
@@ -1217,16 +1217,13 @@ async fn create<R, E>(
     // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
     // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
     // not another hour, and a crash loop cannot extend the budget indefinitely.
-    //
-    // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
-    // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
     let deadline = match (timeout, &parent) {
         // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
         // explicit timeout records the budget and leaves the deadline null for the claim
         // statement to fill in. The wait in the queue is not part of the budget — a workflow
         // given five minutes that sits queued for an hour still gets five minutes. Python and
-        // TypeScript both branch on the queue in exactly this spot; the claim statement this
-        // engine already ships does the other half.
+        // TypeScript both branch on the queue in exactly this spot; the claim statement does
+        // the other half.
         (Timeout::Explicit(_), _) if queue.is_some() => None,
         // **An explicit timeout replaces an inherited deadline**, which is Python's and
         // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
@@ -1396,8 +1393,7 @@ async fn create<R, E>(
 /// What [`run`](WorkflowRef::run) hands back as [`PendingRun`], and what a
 /// [`start`](WorkflowRef::start) is built on — [`PendingStart`] holds one of these and declares
 /// the channel it reports in. Awaiting either starts the workflow, so `child.start(x).await?` and
-/// `child.run(x).await?` read exactly as they did when both were `async fn`s, and not one call
-/// site had to change.
+/// `child.run(x).await?` read exactly as they would if both were `async fn`s.
 ///
 /// **A newtype over [`PendingStep`] rather than a `PendingStep`, because a durable race must not
 /// take one**, and the reason is not that dropping one leaves anything broken. It does not: dropped
@@ -1438,11 +1434,10 @@ pub struct PendingWorkflow<'a, T, E = crate::EngineOnly>(PendingStep<'a, T, E>);
 /// **Two error types, because a start deals in two.** `E` is the *child's* — it is what the handle
 /// will report when the child finishes, and none of it is in play yet. `C` is the channel this
 /// call itself answers in, and a start can only fail in the engine's terms: the child's body has
-/// not run, so there is no application error for it to have. Holding one parameter for both, as
-/// this type once did, forces a parent to fail the way its child does — and a parent whose error
-/// type differs from its child's then has no way to report a start failure at all, since `?`
-/// cannot convert between two application channels and [`Error::lift`] starts from
-/// [`EngineOnly`](crate::EngineOnly).
+/// not run, so there is no application error for it to have. One parameter for both would force a
+/// parent to fail the way its child does — and a parent whose error type differs from its child's
+/// would then have no way to report a start failure at all, since `?` cannot convert between two
+/// application channels and [`Error::lift`] starts from [`EngineOnly`](crate::EngineOnly).
 ///
 /// `C` **defaults to `E`**, which is the common case written without saying anything: a workflow
 /// starting a child that fails the way it does writes `child.start(x).await?` and nothing else.
@@ -1632,10 +1627,11 @@ impl Parent<'_> {
     /// Reads back a start recorded at this position, if this parent has run this far before.
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
-    /// [`Error::UnexpectedStep`] before this sees it. What is left to check is the child id: a row
-    /// under the right name carrying none was written by a plain step, which means the parent's
-    /// code changed — `step("charge")` became a child workflow named `charge` — and starting a
-    /// child now would give this position two meanings across two runs.
+    /// [`UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this sees it. What is left
+    /// to check is the child id: a row under the right name carrying none was written by a plain
+    /// step, which means the parent's code changed — `step("charge")` became a child workflow
+    /// named `charge` — and starting a child now would give this position two meanings across
+    /// two runs.
     ///
     /// **Stricter than the references here.** Python falls through to a fresh start when the
     /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
@@ -1666,11 +1662,11 @@ impl Parent<'_> {
     /// handing [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) a
     /// [`InitWorkflowCaller`]. This is the other arm, where the insert lost the deduplication key
     /// and there is no transaction of this call's to join: the holder's row belongs to whoever
-    /// created it, and all that is left to write is the mapping. Nothing was created here, so nothing is
-    /// left dangling if this write never happens — which is what makes a separate statement sound
-    /// in this arm and not in the other.
+    /// created it, and all that is left to write is the mapping. Nothing was created here, so
+    /// nothing is left dangling if this write never happens — which is what makes a separate
+    /// statement sound in this arm and not in the other.
     ///
-    /// The mapping only, never the holder's own `parent_workflow_id`: that column now travels on
+    /// The mapping only, never the holder's own `parent_workflow_id`: that column travels on
     /// [`InitWorkflowCaller`] and so cannot be reached from here at all, which is the asymmetry
     /// [`DuplicationPolicy::ReturnExisting`] describes, held by the shape rather than by care.
     ///

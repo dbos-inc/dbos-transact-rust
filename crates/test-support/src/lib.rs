@@ -1,8 +1,8 @@
 //! Test harness: a database server in a container, shared by every test that overlaps
 //! with it in time.
 //!
-//! Two things about it are load-bearing rather than incidental, and both should survive
-//! any rewrite:
+//! Several things about it are load-bearing rather than incidental, and should survive any
+//! rewrite:
 //!
 //! **Sharing is by reference count, not by parking the container in a `static`.**
 //! `testcontainers-rs` ties container removal to `Drop`, ships no Ryuk reaper, and leaves
@@ -146,8 +146,8 @@ fn has_code(error: &sqlx::Error, code: &str) -> bool {
 /// How a pooled database is built once one database has been migrated for real.
 ///
 /// **Replaying the corpus per pooled database is the thing this exists to avoid.** The corpus
-/// is a history, and a history does work it later undoes: it creates four indexes that a later
-/// migration drops, and rewrites `enqueue_workflow` three times. CockroachDB charges for every
+/// is a history, and a history does work it later undoes: it creates several indexes that later
+/// migrations drop, and rewrites `enqueue_workflow` three times. CockroachDB charges for every
 /// step of that as an online schema change — measured at 17s against 0.8s for the schema those
 /// steps arrive at, and 2.9s against 0.1s on PostgreSQL.
 ///
@@ -232,10 +232,9 @@ async fn dump_schema(pool: &sqlx::PgPool, schema: &str) -> String {
 /// **The split this exists to make is fixed cost against per-test cost.** Starting the container
 /// and migrating the baseline are paid once per test binary whatever the suite does; building a
 /// pooled database and resetting a leased one scale with the tests. Which of those dominates
-/// decides what is worth optimising, and reading it off total suite time is guesswork — the
-/// three suites that made the case for this all had between two and seven tests and finished
-/// within two seconds of each other, which says the fixed cost is large without saying which
-/// half of it is.
+/// decides what is worth optimising, and reading it off total suite time is guesswork: a suite
+/// of two tests and one of seven can finish within seconds of each other, which says the fixed
+/// cost is large without saying which half of it is.
 ///
 /// Every field is an atomic because these are written through `&TestServer`: the baseline is
 /// built inside a `OnceCell` initialiser taking `&self`, and pooled databases are built during a
@@ -355,8 +354,8 @@ pub const NO_BASELINE_CACHE_ENV: &str = "DBOS_TEST_NO_BASELINE_CACHE";
 /// key covers every migration's rendered SQL, so a migration that changes anything at all lands
 /// on a different key and nothing stale can be read. What a checked-in baseline would cost —
 /// something to regenerate, and a reviewer having to believe it matches — is exactly what
-/// deriving it avoids. `a_pooled_database_matches_one_the_migrations_built` still holds the
-/// whole arrangement honest, unchanged.
+/// deriving it avoids. `a_pooled_database_matches_one_the_migrations_built` holds the whole
+/// arrangement honest.
 mod baseline_cache {
     use std::path::{Path, PathBuf};
 
@@ -537,13 +536,11 @@ pub async fn shared_server() -> Arc<TestServer> {
 
 /// A database with the DBOS schema already applied — **the lane almost every test wants.**
 ///
-/// The contract is: you get a working, empty DBOS schema, and you do not care how. Today
-/// there are no migrations, so this hands out a fresh database and that is the whole story.
-/// Once migrations exist it becomes a lease from a pool of pre-migrated databases, reset and
-/// returned when the handle drops — because re-running the migrations per test costs tens of
-/// seconds on CockroachDB, where DDL is an online schema change.
+/// The contract is: you get a working, empty DBOS schema, and you do not care how. It is a lease
+/// from a pool of pre-migrated databases, reset on acquire and returned when the handle drops —
+/// because re-running the migrations per test costs tens of seconds on CockroachDB, where DDL
+/// is an online schema change.
 ///
-/// **The point of naming the lane now is that call sites will not change when that happens.**
 /// Reach for this unless you specifically need one of the things the pool takes away: an
 /// unmigrated database, or the freedom to run your own DDL. Those are [`raw_database`].
 pub async fn test_database() -> TestDatabase {
@@ -553,12 +550,11 @@ pub async fn test_database() -> TestDatabase {
 /// A fresh, unmigrated database of its own, never pooled and never reset.
 ///
 /// For tests that need the schema *absent* or that leave a database unfit to hand to anyone
-/// else: migration tests, and anything creating its own tables. This contract does not change
-/// when the pool arrives, so a test written against it stays correct.
+/// else: migration tests, and anything creating its own tables.
 ///
 /// It is not expensive — `CREATE DATABASE` is ~7 ms on Postgres and ~100 ms on CockroachDB,
 /// against seconds to start a container — so this shares the same container as everything
-/// else. What it costs, when there are migrations, is that the caller pays for them.
+/// else. What it costs is that the caller pays for any migrations it wants.
 pub async fn raw_database() -> TestDatabase {
     shared_server().await.create_database().await
 }
@@ -589,10 +585,8 @@ impl TestServer {
                     // An in-memory store, because nothing here outlives the container and
                     // CockroachDB's cost is dominated by DDL: the corpus is dozens of online
                     // schema changes, replayed in full to build a process's baseline and again
-                    // for every migration test. It was measured at 4m09s to 1m53s over the whole
-                    // CockroachDB leg — before pooled databases were cloned from that baseline,
-                    // so there is less replaying to save now — and it takes two seconds off
-                    // container startup besides.
+                    // for every migration test. Measured at roughly half the CockroachDB leg's
+                    // wall clock, and two seconds off container startup besides.
                     //
                     // The size is a ceiling rather than a reservation. The suite's data is a few
                     // thousand rows; the headroom is for CockroachDB's own system ranges and the
@@ -765,12 +759,11 @@ impl TestServer {
             .get_or_init(|| async {
                 let building = Instant::now();
                 // A dump outlives the server it came from, so a process that starts a second
-                // one does not migrate again. That is not hypothetical: the crate's own unit
-                // tests are the case it was written for. libtest orders by name, the only two
-                // modules wanting a database sort as `context::` and `step::`, and the ninety
-                // or so pure tests in between release the last handle — so the container is
-                // removed and restarted mid-binary. Measured in CI, the second corpus run cost
-                // 22s of the CockroachDB leg.
+                // one does not migrate again. The crate's own unit tests are the case: libtest
+                // orders by name, the modules wanting a database are spread through the run,
+                // and the pure tests between them release the last handle — so the container is
+                // removed and restarted mid-binary, and a second corpus run costs about 22s of
+                // the CockroachDB leg.
                 //
                 // Sound because the dump is portable SQL, derived from a database the real
                 // runner migrated in this same process: a fresh server replaying it lands on
