@@ -1117,16 +1117,26 @@ async fn create<R, E>(
 ) -> Result<WorkflowHandle<R, E>> {
     let placed = StartPlacement::of(executor, placement);
     let executor = &placed.executor;
-    let options = &request;
-    let owned_queue = request.queue.as_ref().map(OwnedEnqueue::as_enqueue);
+    // Taken apart rather than read through a borrow: the row below wants the payload and the
+    // attributes by reference and then hands the payload on to the run, so owning them here is
+    // what keeps a start from copying its own arguments.
+    let OwnedStart {
+        workflow_id: chosen_id,
+        timeout,
+        queue,
+        input,
+        attributes,
+        // The caller's reading, taken before this task existed: the step spans the start as the
+        // *caller* saw it, not the wait for a runtime thread to pick the task up.
+        started_at,
+    } = request;
+    let owned_queue = queue.as_ref().map(OwnedEnqueue::as_enqueue);
     let enqueue = owned_queue.as_ref();
     // **The ambient context is what makes this a child.** Every reference overloads the same
     // call rather than adding a `start_child`, so factoring a workflow body out into its own
     // workflow does not change how its call sites are written — and a workflow started from
     // outside one is unaffected by everything below.
     let parent = placed.parent();
-    let input = request.input.clone();
-    let attributes = request.attributes.clone();
 
     // The launch is recorded against the parent before anything is created, so a replay of
     // this position finds the child it already started instead of starting a second one.
@@ -1149,7 +1159,7 @@ async fn create<R, E>(
         ));
     }
 
-    let workflow_id = match (options.workflow_id.as_deref(), &parent) {
+    let workflow_id = match (chosen_id.as_deref(), &parent) {
         // An application-assigned id wins over the derivation, in every reference.
         (Some(id), _) => id.to_owned(),
         // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
@@ -1169,14 +1179,14 @@ async fn create<R, E>(
     //
     // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
     // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
-    let deadline = match (options.timeout, &parent) {
+    let deadline = match (timeout, &parent) {
         // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
         // explicit timeout records the budget and leaves the deadline null for the claim
         // statement to fill in. The wait in the queue is not part of the budget — a workflow
         // given five minutes that sits queued for an hour still gets five minutes. Python and
         // TypeScript both branch on the queue in exactly this spot; the claim statement this
         // engine already ships does the other half.
-        (Timeout::Explicit(_), _) if options.queue.is_some() => None,
+        (Timeout::Explicit(_), _) if queue.is_some() => None,
         // **An explicit timeout replaces an inherited deadline**, which is Python's and
         // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
         // use it over any propagated deadline"*. So a child given longer than its parent has
@@ -1205,9 +1215,6 @@ async fn create<R, E>(
         (Timeout::Inherit, None) => None,
     };
 
-    // The caller's reading, taken before this task existed: the step spans the start as the
-    // *caller* saw it, not the wait for a runtime thread to pick the task up.
-    let started_at = request.started_at;
     let new = NewWorkflow {
         name: Some(&key.name),
         class_name: key.class_name.as_deref(),
@@ -1221,7 +1228,7 @@ async fn create<R, E>(
         // budget behind it, and `Timeout::None` has neither. The column is what a
         // queue recomputes a deadline from on dequeue, so filling it in for either
         // would hand that path a budget nobody asked for.
-        timeout: options.timeout.budget(),
+        timeout: timeout.budget(),
         deadline,
         attributes: attributes.as_deref(),
         // The queue's five columns, and nothing below spawns the row they describe: a queue's
