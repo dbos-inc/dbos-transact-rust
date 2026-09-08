@@ -5,8 +5,13 @@
 //! replay reads the recorded answer instead of running it again. That is the boundary worth being
 //! precise about, because the step's checkpoint and the row a query writes land in **two separate
 //! transactions** — Rust has no transactional step yet. A crash in the window between them replays
-//! the step, so every write below is written to be safe to repeat, or is one whose repetition the
-//! workflow above it accounts for.
+//! the step, so a write below can be applied twice: the inventory decrement, its compensating
+//! increment and the order insert are each at-least-once, not exactly-once.
+//!
+//! That gap closes when Rust gains datasources and the transactional step built on them, which
+//! commit the application write and the step's checkpoint in a single transaction the way the
+//! other SDKs already do. Until then this demo leaves the window open rather than hiding it
+//! behind hand-rolled idempotency keys, because the mechanism it is here to show is recovery.
 
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -89,6 +94,14 @@ impl Store {
     /// tool, and a demo that runs on `cargo run` alone is worth more here than a rehearsal of one.
     /// The schema itself is copied from the other widget stores, column for column.
     pub async fn create_schema(&self) -> Result<(), sqlx::Error> {
+        // `sqlx::raw_sql` takes a `&'static str`, so the default below has to be a literal rather
+        // than the constant it has to agree with. This keeps the two from drifting: raise
+        // `DISPATCH_TICKS` without raising the default and orders would start at fewer ticks than
+        // the workflow sends, and never reach DISPATCHED.
+        const _: () = assert!(
+            DISPATCH_TICKS == 10,
+            "the orders DDL below hard-codes the default"
+        );
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS orders (
                  order_id SERIAL PRIMARY KEY,

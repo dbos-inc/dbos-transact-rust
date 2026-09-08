@@ -1,7 +1,8 @@
 # The widget store: an online storefront that survives being killed mid-checkout. The Rust port of
 # the demo that already exists in Python, TypeScript, Go and Java, against the same application
-# schema, so the four can be compared side by side — and so a checkout started by one of them is
-# a row this one would recover.
+# schema, so the five can be compared side by side. Only the application tables are shared: each
+# port recovers its own checkouts and no other's, because workflow names, app name, app version
+# and serializer all differ.
 [package]
 name = "dbos-rust-widget-store"
 description = "DBOS Rust widget store demo"
