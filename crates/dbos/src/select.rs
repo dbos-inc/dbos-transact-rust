@@ -390,6 +390,57 @@ mod tests {
         dbos.shutdown().await;
     }
 
+    /// **Branches that fail differently agree at the build, through `map_error`.**
+    ///
+    /// The channel is fixed by `push` before anything is awaited, so `map_err` in an arm's body is
+    /// too late — this is the conversion written where it still fits. What the loser's own row
+    /// would hold is untouched by it: the winner here records its error under its own id in the
+    /// channel it ran in, and only the arm sees the converted one.
+    #[tokio::test]
+    async fn branches_of_two_error_types_agree_through_map_error() {
+        #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+        #[error("the gateway refused")]
+        struct Refused;
+
+        #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+        #[error("charging failed: {0}")]
+        struct Charging(String);
+
+        let (dbos, _db) = workflow("wf-two-channels").await;
+
+        let answer: crate::Result<String, Charging> =
+            Ctx::scope(ctx(&dbos, "wf-two-channels"), async {
+                crate::select_step! {
+                    // Its own error type, converted while it is still a call — which is what lets
+                    // it stand beside a branch that fails as `Charging`.
+                    refused = step("refused", || async { Err::<u32, Error<Refused>>(Refused.into()) })
+                        .map_error(|refused: Refused| Charging(refused.to_string())) => {
+                        format!("refused: {}", refused.unwrap_err())
+                    }
+                    slow = step("slow", || async {
+                        std::future::pending::<()>().await;
+                        Err::<u32, Error<Charging>>(Charging("never".to_owned()).into())
+                    }) => format!("slow: {}", slow.unwrap_err())
+                }
+            })
+            .await;
+
+        assert_eq!(
+            answer.unwrap(),
+            "refused: charging failed: the gateway refused",
+            "the arm sees the branch's error converted into the channel the race agreed on"
+        );
+        // An application error is the branch's outcome, so it recorded one — and the race recorded
+        // it as the winner, which is the whole difference from a control signal.
+        assert_eq!(
+            steps(&dbos, "wf-two-channels").await,
+            [(0, "refused".to_owned()), (2, "DBOS.selectStep".to_owned())],
+            "the winner's row and the select's, with the loser's id spent and unrecorded"
+        );
+
+        dbos.shutdown().await;
+    }
+
     /// A replay takes the same arm, and the loser is not run for the first time on the way past.
     #[tokio::test]
     async fn a_replayed_race_takes_the_recorded_branch_and_polls_no_other() {

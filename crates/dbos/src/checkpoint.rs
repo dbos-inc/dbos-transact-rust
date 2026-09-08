@@ -270,6 +270,65 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     }
 }
 
+impl<'a, T, E> PendingStep<'a, T, E> {
+    /// Retargets this call's error channel through a conversion of the caller's.
+    ///
+    /// **For a race whose branches fail differently.** The branches of a
+    /// [`select_step!`](crate::select_step) must agree on how they fail *before* any of them is
+    /// awaited — [`Branches::push`](crate::__private::Branches::push) is what ties them together,
+    /// and it runs at the build — so `map_err` on an arm's body is too late. This converts the
+    /// call while it is still a value, which is early enough:
+    ///
+    /// ```ignore
+    /// dbos::select_step! {
+    ///     charged = billing.result().map_error(Mine::from) => charged?,
+    ///     expired = dbos::sleep(deadline) => expired?,
+    /// }
+    /// ```
+    ///
+    /// [`lift`](Self::lift) is this with the conversion the compiler can write itself, and is what
+    /// to reach for where the channel being left is the engine's. This is the other case: two
+    /// application error types, where only the caller knows what one means in terms of the other.
+    ///
+    /// **The engine's own variants are carried across unchanged** — the conversion sees the
+    /// application's error alone, which is the whole of `Error::map_application`'s job, so a
+    /// cancellation stays a cancellation and a race still reads it as a control signal rather than
+    /// as an outcome.
+    ///
+    /// **What is recorded is the error the call actually made.** This step writes its own row
+    /// before it returns, in its own channel, so the conversion changes what the *caller* sees and
+    /// not what the database holds — and a replay reads the original back and converts it again.
+    /// A conversion that is a pure function of its input therefore replays identically, which is
+    /// what `Fn + Copy` asks for and what a caller should keep to.
+    ///
+    /// The name and the placement are carried across unchanged, so this is the same call reported
+    /// differently: it claims no new id, and the per-poll check still holds it to the workflow it
+    /// was built in.
+    #[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that \
+                  id is spent; await it, or hand it to a combinator"]
+    pub fn map_error<F>(self, convert: impl Fn(E) -> F + Copy + Send + 'a) -> PendingStep<'a, T, F>
+    where
+        T: 'a,
+        E: 'a,
+        F: 'a,
+    {
+        let Self {
+            name,
+            placement,
+            running,
+        } = self;
+        PendingStep {
+            name,
+            placement,
+            running: Box::pin(async move {
+                running
+                    .await
+                    .map_err(|failed| failed.map_application(convert))
+            }),
+        }
+    }
+}
+
 impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
     /// Retargets an engine-channel call into the caller's own error channel.
     ///
@@ -296,16 +355,7 @@ impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
         T: 'a,
         F: 'a,
     {
-        let Self {
-            name,
-            placement,
-            running,
-        } = self;
-        PendingStep {
-            name,
-            placement,
-            running: Box::pin(async move { running.await.map_err(Error::lift) }),
-        }
+        self.map_error(|impossible| match impossible {})
     }
 }
 

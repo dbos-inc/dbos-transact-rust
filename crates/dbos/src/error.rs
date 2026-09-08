@@ -451,11 +451,12 @@ impl<E> Error<E> {
     /// Re-targets this error at another application error type.
     ///
     /// One match over the engine's variants, kept in a single place so [`lift`](Self::lift) and
-    /// any later conversion share the list rather than each carrying a copy of it.
+    /// [`PendingStep::map_error`](crate::PendingStep::map_error) share the list rather than each
+    /// carrying a copy of it.
     /// `Fn + Copy` rather than `FnOnce` because
     /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) nests errors and so recurses. Its
     /// one caller passes a non-capturing closure, so the tighter bound costs nothing.
-    fn map_application<E2>(self, f: impl Fn(E) -> E2 + Copy) -> Error<E2> {
+    pub(crate) fn map_application<E2>(self, f: impl Fn(E) -> E2 + Copy) -> Error<E2> {
         match self {
             Error::Application(error) => Error::Application(f(error)),
             Error::NotLaunched { operation } => Error::NotLaunched { operation },

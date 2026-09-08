@@ -182,6 +182,14 @@ pub use wait::{join_workflows, select_workflow};
 /// recovery to one that never ran its body. An application error is the branch's own recorded
 /// outcome, and winning with one is recorded and replayed like any other win.
 ///
+/// **Every branch fails the same way, and is made to say so before the race.** The branches are
+/// tied to one error type when they are pushed, which is at the build — so `map_err` on an arm's
+/// body is too late, and the conversion belongs on the call. A call in the engine's channel joins
+/// with [`lift`](PendingStep::lift), which the compiler writes itself because
+/// [`EngineOnly`] is uninhabited; a call with an application error type of its
+/// own joins with [`map_error`](PendingStep::map_error), which the caller writes because only the
+/// caller knows what one failure means in terms of the other.
+///
 /// # A branch is an expression, and exactly one call
 ///
 /// **An expression, where [`select_workflow!`](macro@crate::select_workflow) needs a variable.**
