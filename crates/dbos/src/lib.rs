@@ -54,6 +54,8 @@ mod recovery;
 #[cfg(feature = "engine")]
 mod registry;
 #[cfg(feature = "engine")]
+mod select;
+#[cfg(feature = "engine")]
 mod serialization;
 #[cfg(feature = "engine")]
 mod sleep;
@@ -108,3 +110,21 @@ pub use workflow::{
     DuplicationPolicy, Enqueue, PendingRun, PendingStart, PendingWorkflow, RunOptions,
     StartOptions, Timeout,
 };
+
+/// What [`select_step!`](crate::select_step) expands into, and **not public API**.
+///
+/// A procedural macro has no `$crate`, so its expansion has to name an absolute path that the
+/// calling crate can resolve — which means everything the expansion calls must be `pub`. This
+/// module is where that surface lives, so that being `pub` for the macro's sake is not the same as
+/// being part of the crate's API: nothing here is documented, nothing here is stable, and calling
+/// any of it by hand is writing an expansion by hand.
+///
+/// The durable race itself is documented on [`select_step!`](crate::select_step); the reasoning
+/// behind what it records is in `select.rs`.
+#[cfg(feature = "engine")]
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::select::{
+        Branches, Racing, Recording, check_select, control_error, record_select,
+    };
+}
