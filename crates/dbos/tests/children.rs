@@ -163,6 +163,12 @@ async fn a_start_dropped_after_it_begins_still_starts_the_child() {
                     // `Pin::new` rather than `pin!`, because a `PendingStep` is `Unpin` and says
                     // so — which is also what lets `start` be dropped outright below rather than
                     // held alive by a pin until the end of this body.
+                    // Deterministic, and it is the runtime that makes it so: `#[tokio::test]` is
+                    // current-thread, and the only await this poll can reach is the join onto the
+                    // task it has just spawned — which cannot have run, because nothing else runs
+                    // until this task yields. On a multi-threaded runtime the creation could
+                    // finish first and the poll return `Ready`, so a `flavor` here would have to
+                    // come with a gate holding the detached task open.
                     assert!(
                         matches!(
                             Pin::new(&mut start).poll(&mut Context::from_waker(Waker::noop())),

@@ -155,11 +155,17 @@ where
     /// case none of them can avoid: an id whose row this process has never seen, where "deleted"
     /// and "not yet" are the same observation.
     ///
-    /// **A wait that could go on forever is bounded by dropping it.** `tokio::time::timeout` around
-    /// this future, or dropping the future outright, ends the poll — so the hazard
-    /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) describes
-    /// costs a caller here what Go and TypeScript charge an argument for and Python and Java cannot
-    /// offer at all.
+    /// **A wait that could go on forever is bounded by dropping it, outside a workflow.**
+    /// `tokio::time::timeout` around this future, or dropping the future outright, ends the poll —
+    /// so the hazard [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result)
+    /// describes costs a caller here what Go and TypeScript charge an argument for and Python and
+    /// Java cannot offer at all. **Inside the workflow that started the child it is neither**, for
+    /// the reason [`PendingStep`] gives every durable call: the race decides which branch won and
+    /// records nothing, so a replay may decide it the other way. Bound the child where its bound
+    /// belongs — [`StartOptions::timeout`](crate::StartOptions::timeout), or the deadline it
+    /// inherits — and if a wait really has to be raced against something, race it inside a step,
+    /// whose own checkpoint stands for however it reached the answer.
+    ///
     /// **The id is claimed here, where the call is written, not where the wait is first polled.**
     /// So a `join!` over several handles' results is ordinary code — `join!` builds every branch
     /// before polling any, which is the order the ids were taken in and the order a replay takes

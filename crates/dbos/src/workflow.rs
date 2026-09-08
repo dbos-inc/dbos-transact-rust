@@ -1060,9 +1060,13 @@ where
     /// handle, which is [`select_workflow!`](crate::select_workflow)'s existing rule — a workflow
     /// runs whether or not anything is watching it — rather than a new hazard of its own.
     ///
-    /// Spawned through [`spawn_tracked`], so shutdown reaches it: aborted there, the transaction
-    /// rolls back and the start simply did not happen, which is what shutdown means everywhere
-    /// else in the crate.
+    /// Spawned through [`spawn_tracked`], so shutdown reaches it — and what an abort leaves
+    /// behind depends on where it lands. Before the transaction commits, it rolls back and the
+    /// start simply did not happen, which is what shutdown means everywhere else in the crate.
+    /// After it, the child exists and is recorded, and the caller is told it was
+    /// [`Interrupted`](Error::Interrupted) rather than told it never started; the arm below says
+    /// what that costs, which is nothing — the child is `PENDING` and recovers, and a replay of
+    /// this position joins it.
     ///
     /// Answers in the engine's channel and is lifted by its caller, because everything below can
     /// only fail in the engine's terms.
