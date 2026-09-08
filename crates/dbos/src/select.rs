@@ -35,9 +35,10 @@
 //! a management call. Every one of them **observes**: it claims one id, records one row, and a
 //! replay of it reads that row back rather than doing the thing again.
 //!
-//! A [`PendingWorkflow`](crate::PendingWorkflow) — a child's
-//! [`start`](crate::WorkflowRef::start) or [`run`](crate::WorkflowRef::run) — is **not** a
-//! `PendingStep`, so [`Branches::push`] cannot be handed one and a race cannot be built over one.
+//! A child's [`start`](crate::WorkflowRef::start) or [`run`](crate::WorkflowRef::run) — a
+//! [`PendingStart`](crate::PendingStart) and a [`PendingWorkflow`](crate::PendingWorkflow) — is
+//! **not** a `PendingStep`, so [`Branches::push`] cannot be handed one and a race cannot be built
+//! over one.
 //! That is the type doing what the prose alone could not: a start *creates* a workflow, only the
 //! winner is polled on a replay, and so whether a child exists at all would follow the timing of
 //! some other branch. Start outside the race and race what observes the result.
@@ -117,8 +118,8 @@ impl<E> Branches<E> {
     /// is free per call while `E` is fixed by the set.
     ///
     /// **A [`PendingStep`] and nothing else**, which is the refusal the module documentation
-    /// describes: a child's start and a whole run are
-    /// [`PendingWorkflow`](crate::PendingWorkflow)s, so this signature is what keeps them out of a
+    /// describes: a child's start is a [`PendingStart`](crate::PendingStart) and a whole run a
+    /// [`PendingWorkflow`](crate::PendingWorkflow), so this signature is what keeps them out of a
     /// race rather than a paragraph asking.
     pub fn push<T>(&mut self, branch: &PendingStep<'_, T, E>) {
         self.identities

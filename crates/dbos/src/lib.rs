@@ -161,8 +161,9 @@ pub use wait::{join_workflows, select_workflow};
 /// for a race whose branches are *not* all of one kind: a step against an await, a sleep against
 /// an event.
 ///
-/// **A [`start`](WorkflowRef::start) and a [`run`](WorkflowRef::run) are refused, by type.** Both
-/// hand back a [`PendingWorkflow`] rather than a `PendingStep`, and both *create* a workflow: only
+/// **A [`start`](WorkflowRef::start) and a [`run`](WorkflowRef::run) are refused, by type.** They
+/// hand back a [`PendingStart`] and a [`PendingWorkflow`] rather than a `PendingStep`, and both
+/// *create* a workflow: only
 /// the winner is polled on a replay, so whether a child exists at all would follow the timing of
 /// another branch, and a run additionally holds two ids and would leave a started, recorded child
 /// whose outcome the parent never learns. Start outside the race, and race the handle's
