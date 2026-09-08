@@ -186,10 +186,10 @@ async fn a_replayed_select_takes_the_same_arm() {
 
 /// Every result comes back, typed, in the order the handles were written.
 ///
-/// The step rows are the claim: one `DBOS.joinWorkflows` and then one `DBOS.getResult` per handle,
-/// in source order. Sequential reads are not a concession here — the set is already settled when
-/// the first one is read — and taking them in source order is what keeps each id where a replay
-/// expects it.
+/// The step rows are the claim: nothing for the wait itself, which records nowhere, and then one
+/// `DBOS.getResult` per handle in source order. Those reads are what carries the durability — each
+/// records the outcome the parent goes on to use — and sequential is not a concession, since the
+/// set is already settled by the time the first one is read.
 #[tokio::test]
 async fn join_workflows_returns_every_result_in_source_order() {
     let db = test_database().await;
@@ -237,11 +237,10 @@ async fn join_workflows_returns_every_result_in_source_order() {
         [
             (0, "counter".to_owned()),
             (1, "namer".to_owned()),
-            (2, "DBOS.joinWorkflows".to_owned()),
+            (2, "DBOS.getResult".to_owned()),
             (3, "DBOS.getResult".to_owned()),
-            (4, "DBOS.getResult".to_owned()),
         ],
-        "the two launches, the one wait, and a result read per handle in source order"
+        "the two launches and a result read per handle in source order, the wait recording nothing"
     );
 
     dbos.shutdown().await;

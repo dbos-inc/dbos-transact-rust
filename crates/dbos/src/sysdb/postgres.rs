@@ -83,10 +83,10 @@ use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
     DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead,
-    StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
+    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
+    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
+    StreamRead, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
     is_valid_application_name, validate_attributes,
 };
@@ -823,6 +823,74 @@ impl PostgresSystemDatabase {
         }
         tx.commit().await?;
         Ok(value)
+    }
+
+    /// Records that a step started a child workflow, against a caller's connection.
+    ///
+    /// Shared by [`record_child_workflow`](SystemDatabase::record_child_workflow), which runs it
+    /// on a pooled connection of its own, and [`init_workflow`](SystemDatabase::init_workflow),
+    /// which runs it on the transaction that creates the child — so the row and the record of it
+    /// commit together. What the two share is the whole of the statement; what differs is only
+    /// what it runs on.
+    async fn record_child_workflow_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        parent_workflow_id: &str,
+        child_workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        started_at: Option<Timestamp>,
+    ) -> Result<(), Error> {
+        // Python fails loudly here rather than "silently wedging the parent on recovery": a
+        // parent that replays and finds an empty child id has no workflow to attach to.
+        if child_workflow_id.is_empty() {
+            return Err(Error::InvalidInput {
+                field: "child_workflow_id".into(),
+                detail: "must not be empty".to_owned(),
+            });
+        }
+        let steps_table = self.tables.operation_outputs.as_str();
+        // Spans the launch only — the parent does not wait for the child here, so the step is
+        // complete as soon as the child exists. Stamped only when the caller offered a start,
+        // since half a pair measures nothing. Java passes both null here.
+        let completed_at = started_at.map(|_| Timestamp::now());
+        let application_name = self.application_name.as_deref();
+
+        // Same `DO UPDATE`-to-itself trick as `record_step`, but the returned value
+        // compared is the **child id**, not the completion time. A retry stamps a new clock
+        // reading and would fail a timestamp comparison, while the child id it is trying to
+        // record is by definition the same one. Python states the rule exactly: "Same child
+        // means an idempotent db_retry; a different child means nondeterminism."
+        let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, \
+             child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
+             application_name) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
+             SET child_workflow_id = {steps_table}.child_workflow_id \
+             RETURNING child_workflow_id"
+        )))
+        .bind(parent_workflow_id)
+        .bind(step_id)
+        .bind(step_name)
+        .bind(child_workflow_id)
+        .bind(started_at.map(Timestamp::as_epoch_ms))
+        .bind(completed_at.map(Timestamp::as_epoch_ms))
+        // The launch is the parent's step, so it is stamped with the parent's application —
+        // the child's own rows carry whatever application ends up running it.
+        .bind(application_name)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if let Some(stored) = stored
+            && stored.as_deref() != Some(child_workflow_id)
+        {
+            return Err(Error::StepAlreadyRecorded {
+                workflow_id: parent_workflow_id.to_owned(),
+                step_id,
+            });
+        }
+        Ok(())
     }
 
     /// Writes the checkpoint for a step that has just done its work.
@@ -2530,6 +2598,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
         submission: Submission,
+        caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
         let workflow_table = &self.tables.workflow_status;
@@ -2588,6 +2657,20 @@ impl SystemDatabase for PostgresSystemDatabase {
             (workflow_table.as_str(), &self.pool, owner_xid.as_str());
 
         with_retry(&self.retry, "init_workflow", move || async move {
+            // **A transaction, because the caller's record has to land with the row.**
+            //
+            // This is the one thing the single `INSERT .. ON CONFLICT .. RETURNING` above could
+            // not do on its own, and it is worth being clear about what it costs: a creation with
+            // no caller — a root start, every enqueue, a dequeue's re-submission — pays a begin
+            // and a commit around what was one statement. Opened unconditionally even so, for two
+            // reasons. The paths would otherwise differ in what a failure part-way leaves behind,
+            // which is a seam nobody would remember when reading either. And it is where this
+            // method is going regardless: Python and TypeScript both write the payload to a
+            // separate `workflow_input` row — TypeScript's column comment already calls the
+            // `workflow_status` one legacy — so the day that split reaches here, every creation
+            // writes two rows and needs this.
+            let mut tx = pool.begin().await?;
+
             // The column list is Java's INSERT, in its order, plus Python's two debounce
             // columns. Columns absent from it are absent deliberately: `output`, `error`,
             // `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited`
@@ -2670,7 +2753,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(initial_attempts)
             .bind(workflow.timeout.map(|d| d.as_millis() as i64))
             .bind(workflow.deadline.map(Timestamp::as_epoch_ms))
-            .bind(workflow.parent_workflow_id)
+            // The child's own back-pointer, from the caller that is also recording the start:
+            // one value, both rows, no way for them to name different parents.
+            .bind(caller.map(|caller| caller.parent_workflow_id))
             .bind(owner_xid)
             .bind(workflow.serialization)
             .bind(workflow.attributes)
@@ -2692,7 +2777,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .bind(increment)
             .bind(claiming)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             // A unique violation here can only be the partial index on
             // `(queue_name, deduplication_id)`: the primary-key conflict is absorbed by
@@ -2770,8 +2855,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                      WHERE workflow_uuid = $1 AND status = 'PENDING'"
                 )))
                 .bind(workflow.workflow_id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
+
+                // **Committed before the error, unlike every other failure here.** Parking is the
+                // one error path that is itself a write: the workflow has to come out of this call
+                // `MAX_RECOVERY_ATTEMPTS_EXCEEDED` and stay there, or the next recovery attempt
+                // finds it `PENDING` and parks it again forever. Every other early return is a
+                // refusal that wrote nothing worth keeping, and rolls back — which is a change
+                // from the statement-per-call shape this had, where the upsert had already
+                // committed by the time a conflicting name was noticed and a rejected submission
+                // still bumped the row's recovery count.
+                tx.commit().await?;
 
                 return Err(Error::MaxRecoveryAttemptsExceeded {
                     workflow_id: workflow.workflow_id.to_owned(),
@@ -2788,6 +2883,24 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "another owner holds this workflow; recorded but not claimed"
                 );
             }
+
+            // **The parent's record of the start, in the transaction that created the child.**
+            // Written for a row this call merely found as well as one it created: the parent
+            // started a child either way, and the id it needs to record is the same. A failure
+            // here takes the child's row down with it, so the caller's "the start failed" is true
+            // rather than a lie told over a workflow that exists.
+            if let Some(caller) = caller {
+                self.record_child_workflow_on(
+                    &mut tx,
+                    caller.parent_workflow_id,
+                    workflow.workflow_id,
+                    caller.step_id,
+                    caller.step_name,
+                    Some(caller.started_at),
+                )
+                .await?;
+            }
+            tx.commit().await?;
 
             Ok(WorkflowInitResult {
                 status,
@@ -3274,20 +3387,26 @@ impl SystemDatabase for PostgresSystemDatabase {
              WHERE workflow_uuid = ANY($1) AND status NOT IN ({UNSETTLED})"
         );
         let select = &select;
-        let mut outstanding: Vec<String> = workflow_ids.iter().map(|id| (*id).to_owned()).collect();
         // **Where the first-form's caller rejects duplicates, this one accepts them**, because
         // settling is a property of an id rather than a choice between ids — so a repeat is simply
-        // satisfied twice, and this is the wait that actually receives one.
+        // satisfied twice, and this is the wait that actually receives one. A set is what collapses
+        // them, and it collapses them on the way in rather than over the first pass or two.
         //
-        // Correctness never depended on the dedup: `retain` below drops *every* copy of an id that
-        // settles, so duplicates would fall out on their own the first pass one of them did. What
-        // it saves is the array bytes until then. The sort is not an ordering decision — `dedup`
-        // only removes *consecutive* duplicates, and that is the whole of what it is for.
-        outstanding.sort_unstable();
-        outstanding.dedup();
+        // **It is also what keeps the narrowing linear.** A pass removes every id it watched
+        // settle, and over a `Vec` each removal is a scan of the whole outstanding list — a fan-out
+        // of a few thousand pays that once per settled member per pass. TypeScript's
+        // `awaitWorkflowIds` carries its outstanding ids in a `Set` and deletes from it for the
+        // same reason; this is that, spelled in the type.
+        let mut outstanding: HashSet<String> =
+            workflow_ids.iter().map(|id| (*id).to_owned()).collect();
 
         while !outstanding.is_empty() {
-            let ids = &outstanding;
+            // The bind wants a slice, so each pass materialises the ids it is about to ask about.
+            // TypeScript spreads its set into an array in the same spot, for the same reason —
+            // borrowed rather than cloned, because the set outlives the pass and a long fan-out
+            // would otherwise copy every outstanding id once per interval.
+            let ids: Vec<&str> = outstanding.iter().map(String::as_str).collect();
+            let ids = &ids;
             let settled = with_retry(&self.retry, "await_workflow_ids", move || async move {
                 let _permit = polling
                     .acquire()
@@ -3302,9 +3421,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             for row in &settled {
                 let id: String = row.try_get("workflow_uuid")?;
-                // A linear scan of a list that is only ever shrinking, over a set small enough to
-                // name in one query — a hash set would cost more to build than it saves.
-                outstanding.retain(|outstanding| *outstanding != id);
+                outstanding.remove(&id);
             }
             if outstanding.is_empty() {
                 break;
@@ -3522,7 +3639,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         cancel_children: bool,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if workflow_ids.is_empty() {
+        // An empty batch still has to reach `run_transactional_step` when there is a caller: the
+        // step id was taken where the call was written, so returning here would leave a workflow
+        // holding an id nothing recorded, and a replay whose list is no longer empty would perform
+        // the operation instead of replaying the first run's answer. Which slot a call occupies —
+        // and whether it is recorded — must not depend on what it was passed, the rule the empty
+        // waits follow. Without a caller nothing is checked or written anyway, so the short circuit
+        // stands there and spares a client a transaction that would do nothing.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
         let started_at = Timestamp::now();
@@ -3591,7 +3715,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         queue_name: Option<&str>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if workflow_ids.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
         let workflow_table = self.tables.workflow_status.as_str();
@@ -3660,7 +3786,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         delete_children: bool,
         caller: Option<(&str, i32)>,
     ) -> Result<u64, Error> {
-        if workflow_ids.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(0);
         }
         // Descendants arrive owned from the database and are kept alive here; the roots stay
@@ -3751,7 +3879,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         options: &ForkOptions<'_>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if forks.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if forks.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
         options.validate()?;
@@ -3789,7 +3919,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         options: &ForkOptions<'_>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error> {
-        if workflow_ids.is_empty() {
+        // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
+        // `cancel_workflows` for why the caller decides this.
+        if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
 
@@ -3849,6 +3981,24 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await
     }
 
+    async fn send_message(
+        &self,
+        message: &Message<'_>,
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        send_to_forks: bool,
+    ) -> Result<(), Error> {
+        // One message is a batch of one everywhere below this line; only the recorded name differs.
+        self.deliver(
+            std::slice::from_ref(message),
+            serialization,
+            caller,
+            step_names::SEND,
+            send_to_forks,
+        )
+        .await
+    }
+
     async fn send_messages(
         &self,
         messages: &[Message<'_>],
@@ -3856,190 +4006,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
     ) -> Result<(), Error> {
-        // An empty batch still records its step. The workflow spent a step id on this call, and a
-        // step id that nothing occupies is a hole a replay has to guess about: the caller would
-        // re-run the send, and a message list that came out empty once and non-empty the next
-        // time would be delivered for real. Recording it makes the replay a replay.
-        //
-        // **The two batch implementations disagree.** Python guards only its insert with
-        // `if rows` and records the step regardless; Java returns early on an empty list and
-        // records nothing. Python's is the safer half of that split, for the reason above, and
-        // an empty send is cheap to record.
-        //
-        // With nothing to send *and* no step to record, there is genuinely nothing to do.
-        if messages.is_empty() && caller.is_none() {
-            return Ok(());
-        }
-        // Two messages under one key would give two rows the same primary key, so the second
-        // would be silently discarded as a duplicate of the first. A caller who did that does not
-        // know they have sent one message, and the database cannot tell them. Both
-        // implementations with a batch API reject this — Python raises, Java throws — and
-        // neither of the two without one can.
-        //
-        // The *empty* key is ours to decide, because they disagree: Python treats `""` as falsy
-        // and so as absent, giving the message a generated id; Java treats it as a real key, so
-        // one message keys on `"::destination"` and two collide. Refusing it picks neither
-        // reading of an input that means nothing, and matches how this layer treats every other
-        // empty string.
-        let mut keys = HashSet::with_capacity(messages.len());
-        for message in messages {
-            if let Some(key) = message.idempotency_key {
-                if key.is_empty() {
-                    return Err(Error::InvalidInput {
-                        field: "idempotency_key".into(),
-                        detail: "must be absent rather than empty".to_owned(),
-                    });
-                }
-                if !keys.insert(key) {
-                    return Err(Error::InvalidInput {
-                        field: "idempotency_key".into(),
-                        detail: format!("{key} is used by more than one message"),
-                    });
-                }
-            }
-        }
-
-        // Fixed before the retry, like every other step token: ids generated per attempt would
-        // make a retry after a lost commit acknowledgement deliver everything a second time.
-        let fallback_ids: Vec<String> = messages
-            .iter()
-            .map(|_| uuid::Uuid::new_v4().to_string())
-            .collect();
-        let timing = StepTiming {
-            started_at: Timestamp::now(),
-            completed_at: Timestamp::now(),
-        };
-
-        // Which API surface the caller reached for, inferred from the batch size.
-        let step_name = if messages.len() == 1 {
-            step_names::SEND
-        } else {
-            step_names::SEND_BULK
-        };
-
-        let notifications_table = self.tables.notifications.as_str();
-        let workflow_table = self.tables.workflow_status.as_str();
-        let pool = &self.pool;
-        let fallback_ids = &fallback_ids;
-
-        with_retry(&self.retry, "send_messages", move || async move {
-            let mut tx = pool.begin().await?;
-
-            // A replay must not send again — and must not be told it failed either.
-            if let Some((workflow_id, step_id)) = caller
-                && self
-                    .check_step_on(&mut tx, workflow_id, step_id, step_name)
-                    .await?
-                    .is_some()
-            {
-                tracing::debug!(
-                    workflow_id,
-                    step_id,
-                    count = messages.len(),
-                    "replaying send"
-                );
-                return Ok(());
-            }
-
-            // Inside the transaction, so the recipient set cannot go stale before the insert.
-            let forks_of = if send_to_forks {
-                let roots: Vec<&str> = messages.iter().map(|m| m.destination_id).collect();
-                Self::descendant_forks(&mut tx, workflow_table, &roots).await?
-            } else {
-                HashMap::new()
-            };
-
-            let mut destination_ids = Vec::new();
-            let mut topics = Vec::new();
-            let mut payloads = Vec::new();
-            let mut message_ids = Vec::new();
-            for (message, fallback) in messages.iter().zip(fallback_ids) {
-                let forks = forks_of
-                    .get(message.destination_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                for destination in
-                    std::iter::once(message.destination_id).chain(forks.iter().map(String::as_str))
-                {
-                    destination_ids.push(destination);
-                    topics.push(message.topic.unwrap_or(NULL_TOPIC));
-                    payloads.push(message.message);
-                    // The key is scoped per recipient, so one key can fan out to a whole fork
-                    // tree and still give each recipient a distinct, repeatable row — and so the
-                    // id a destination sees does not depend on whether the send fanned out.
-                    message_ids.push(match message.idempotency_key {
-                        Some(key) => format!("{key}::{destination}"),
-                        None => fallback.clone(),
-                    });
-                }
-            }
-
-            // Skipped when there is nothing to insert — an empty batch, which still has a step
-            // to record below.
-            let sent = if destination_ids.is_empty() {
-                Ok(Default::default())
-            } else {
-                sqlx::query(AssertSqlSafe(format!(
-                    "INSERT INTO {notifications_table} \
-                        (destination_uuid, topic, message, message_uuid, serialization) \
-                     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) \
-                        AS m(destination_uuid, topic, message, message_uuid), \
-                        (SELECT $5::text) AS s(serialization) \
-                     ON CONFLICT (message_uuid) DO NOTHING"
-                )))
-                .bind(&destination_ids)
-                .bind(&topics)
-                .bind(&payloads)
-                .bind(&message_ids)
-                .bind(serialization)
-                .execute(&mut *tx)
-                .await
-            };
-
-            match sent {
-                Ok(result) => {
-                    tracing::debug!(
-                        requested = messages.len(),
-                        delivered = result.rows_affected(),
-                        send_to_forks,
-                        "sent messages"
-                    );
-                }
-                // The foreign key is what catches an address that does not exist, so a message
-                // can never be left pointing at nothing.
-                Err(e) if is_foreign_key_violation(&e) => {
-                    let mut missing: Vec<String> = messages
-                        .iter()
-                        .map(|m| m.destination_id.to_owned())
-                        .collect();
-                    missing.sort();
-                    missing.dedup();
-                    return Err(Error::NonExistentWorkflow {
-                        workflow_ids: missing,
-                    });
-                }
-                Err(e) => return Err(e.into()),
-            }
-
-            // Recorded last and in the same transaction: a step committed without its messages
-            // would make a replay skip a send that never happened.
-            if let Some((workflow_id, step_id)) = caller {
-                self.record_step_on(
-                    &mut tx,
-                    workflow_id,
-                    step_id,
-                    step_name,
-                    Outcome::Output(None),
-                    None,
-                    Some(timing),
-                    None,
-                )
-                .await?;
-            }
-
-            tx.commit().await?;
-            Ok(())
-        })
+        self.deliver(
+            messages,
+            serialization,
+            caller,
+            step_names::SEND_BULK,
+            send_to_forks,
+        )
         .await
     }
 
@@ -6792,57 +6765,220 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_name: &str,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error> {
-        // Python fails loudly here rather than "silently wedging the parent on recovery": a
-        // parent that replays and finds an empty child id has no workflow to attach to.
-        if child_workflow_id.is_empty() {
-            return Err(Error::InvalidInput {
-                field: "child_workflow_id".into(),
-                detail: "must not be empty".to_owned(),
-            });
-        }
-        let steps_table = &self.tables.operation_outputs;
-        // Spans the launch only — the parent does not wait for the child here, so the step is
-        // complete as soon as the child exists. Stamped only when the caller offered a start,
-        // since half a pair measures nothing. Java passes both null here.
-        let completed_at = started_at.map(|_| Timestamp::now());
-        let (steps_table, pool) = (steps_table.as_str(), &self.pool);
-        let application_name = self.application_name.as_deref();
-
+        let pool = &self.pool;
         with_retry(&self.retry, "record_child_workflow", move || async move {
-            // Same `DO UPDATE`-to-itself trick as `record_step`, but the returned value
-            // compared is the **child id**, not the completion time. A retry stamps a new clock
-            // reading and would fail a timestamp comparison, while the child id it is trying to
-            // record is by definition the same one. Python states the rule exactly: "Same child
-            // means an idempotent db_retry; a different child means nondeterminism."
-            let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, \
-                 child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
-                 application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT (workflow_uuid, function_id) DO UPDATE \
-                 SET child_workflow_id = {steps_table}.child_workflow_id \
-                 RETURNING child_workflow_id"
-            )))
-            .bind(parent_workflow_id)
-            .bind(step_id)
-            .bind(step_name)
-            .bind(child_workflow_id)
-            .bind(started_at.map(Timestamp::as_epoch_ms))
-            .bind(completed_at.map(Timestamp::as_epoch_ms))
-            // The launch is the parent's step, so it is stamped with the parent's application —
-            // the child's own rows carry whatever application ends up running it.
-            .bind(application_name)
-            .fetch_optional(pool)
-            .await?;
+            let mut conn = pool.acquire().await?;
+            self.record_child_workflow_on(
+                &mut conn,
+                parent_workflow_id,
+                child_workflow_id,
+                step_id,
+                step_name,
+                started_at,
+            )
+            .await
+        })
+        .await
+    }
+}
 
-            if let Some(stored) = stored
-                && stored.as_deref() != Some(child_workflow_id)
-            {
-                return Err(Error::StepAlreadyRecorded {
-                    workflow_id: parent_workflow_id.to_owned(),
-                    step_id,
-                });
+impl PostgresSystemDatabase {
+    /// The delivery both send methods share, with the step name each records passed in.
+    ///
+    /// Everything about a send but its recorded name is the same for one message and for many —
+    /// the transaction, the fork fan-out, the replay skip, the duplicate-key check, the foreign
+    /// key — so the two trait methods are a name apiece over this. Splitting them up there rather
+    /// than inferring the name down here is what makes a one-message batch record `DBOS.sendBulk`.
+    async fn deliver(
+        &self,
+        messages: &[Message<'_>],
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        step_name: &'static str,
+        send_to_forks: bool,
+    ) -> Result<(), Error> {
+        // An empty batch still records its step. The workflow spent a step id on this call, and a
+        // step id that nothing occupies is a hole a replay has to guess about: the caller would
+        // re-run the send, and a message list that came out empty once and non-empty the next
+        // time would be delivered for real. Recording it makes the replay a replay.
+        //
+        // **The two batch implementations disagree.** Python guards only its insert with
+        // `if rows` and records the step regardless; Java returns early on an empty list and
+        // records nothing. Python's is the safer half of that split, for the reason above, and
+        // an empty send is cheap to record.
+        //
+        // With nothing to send *and* no step to record, there is genuinely nothing to do.
+        if messages.is_empty() && caller.is_none() {
+            return Ok(());
+        }
+        // Two messages under one key would give two rows the same primary key, so the second
+        // would be silently discarded as a duplicate of the first. A caller who did that does not
+        // know they have sent one message, and the database cannot tell them. Both
+        // implementations with a batch API reject this — Python raises, Java throws — and
+        // neither of the two without one can.
+        //
+        // The *empty* key is ours to decide, because they disagree: Python treats `""` as falsy
+        // and so as absent, giving the message a generated id; Java treats it as a real key, so
+        // one message keys on `"::destination"` and two collide. Refusing it picks neither
+        // reading of an input that means nothing, and matches how this layer treats every other
+        // empty string.
+        let mut keys = HashSet::with_capacity(messages.len());
+        for message in messages {
+            if let Some(key) = message.idempotency_key {
+                if key.is_empty() {
+                    return Err(Error::InvalidInput {
+                        field: "idempotency_key".into(),
+                        detail: "must be absent rather than empty".to_owned(),
+                    });
+                }
+                if !keys.insert(key) {
+                    return Err(Error::InvalidInput {
+                        field: "idempotency_key".into(),
+                        detail: format!("{key} is used by more than one message"),
+                    });
+                }
             }
+        }
+
+        // Fixed before the retry, like every other step token: ids generated per attempt would
+        // make a retry after a lost commit acknowledgement deliver everything a second time.
+        let fallback_ids: Vec<String> = messages
+            .iter()
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let timing = StepTiming {
+            started_at: Timestamp::now(),
+            completed_at: Timestamp::now(),
+        };
+
+        let notifications_table = self.tables.notifications.as_str();
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let fallback_ids = &fallback_ids;
+
+        with_retry(&self.retry, "send_messages", move || async move {
+            let mut tx = pool.begin().await?;
+
+            // A replay must not send again — and must not be told it failed either.
+            if let Some((workflow_id, step_id)) = caller
+                && self
+                    .check_step_on(&mut tx, workflow_id, step_id, step_name)
+                    .await?
+                    .is_some()
+            {
+                tracing::debug!(
+                    workflow_id,
+                    step_id,
+                    count = messages.len(),
+                    "replaying send"
+                );
+                return Ok(());
+            }
+
+            // Inside the transaction, so the recipient set cannot go stale before the insert.
+            let forks_of = if send_to_forks {
+                let roots: Vec<&str> = messages.iter().map(|m| m.destination_id).collect();
+                Self::descendant_forks(&mut tx, workflow_table, &roots).await?
+            } else {
+                HashMap::new()
+            };
+
+            let mut destination_ids = Vec::new();
+            let mut topics = Vec::new();
+            let mut payloads = Vec::new();
+            let mut message_ids = Vec::new();
+            for (message, fallback) in messages.iter().zip(fallback_ids) {
+                let forks = forks_of
+                    .get(message.destination_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for destination in
+                    std::iter::once(message.destination_id).chain(forks.iter().map(String::as_str))
+                {
+                    destination_ids.push(destination);
+                    topics.push(message.topic.unwrap_or(NULL_TOPIC));
+                    payloads.push(message.message);
+                    // Scoped per recipient, so one send can fan out to a whole fork tree and
+                    // still give each recipient a distinct, repeatable row — and so the id a
+                    // destination sees does not depend on whether the send fanned out.
+                    //
+                    // **Both branches have to be scoped, not just the keyed one.** The insert ends
+                    // `ON CONFLICT (message_uuid) DO NOTHING`, so an unscoped fallback shared by
+                    // the destination and its forks would collide with itself and deliver to the
+                    // destination alone — silently, since a discarded row is not an error. The
+                    // fallback stays fixed across retries because it is generated once, above the
+                    // retry, and suffixing it here does not change that.
+                    message_ids.push(match message.idempotency_key {
+                        Some(key) => format!("{key}::{destination}"),
+                        None => format!("{fallback}::{destination}"),
+                    });
+                }
+            }
+
+            // Skipped when there is nothing to insert — an empty batch, which still has a step
+            // to record below.
+            let sent = if destination_ids.is_empty() {
+                Ok(Default::default())
+            } else {
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {notifications_table} \
+                        (destination_uuid, topic, message, message_uuid, serialization) \
+                     SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) \
+                        AS m(destination_uuid, topic, message, message_uuid), \
+                        (SELECT $5::text) AS s(serialization) \
+                     ON CONFLICT (message_uuid) DO NOTHING"
+                )))
+                .bind(&destination_ids)
+                .bind(&topics)
+                .bind(&payloads)
+                .bind(&message_ids)
+                .bind(serialization)
+                .execute(&mut *tx)
+                .await
+            };
+
+            match sent {
+                Ok(result) => {
+                    tracing::debug!(
+                        requested = messages.len(),
+                        delivered = result.rows_affected(),
+                        send_to_forks,
+                        "sent messages"
+                    );
+                }
+                // The foreign key is what catches an address that does not exist, so a message
+                // can never be left pointing at nothing.
+                Err(e) if is_foreign_key_violation(&e) => {
+                    let mut missing: Vec<String> = messages
+                        .iter()
+                        .map(|m| m.destination_id.to_owned())
+                        .collect();
+                    missing.sort();
+                    missing.dedup();
+                    return Err(Error::NonExistentWorkflow {
+                        workflow_ids: missing,
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            // Recorded last and in the same transaction: a step committed without its messages
+            // would make a replay skip a send that never happened.
+            if let Some((workflow_id, step_id)) = caller {
+                self.record_step_on(
+                    &mut tx,
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    Outcome::Output(None),
+                    None,
+                    Some(timing),
+                    None,
+                )
+                .await?;
+            }
+
+            tx.commit().await?;
             Ok(())
         })
         .await

@@ -26,8 +26,8 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
-use crate::dbos::Executor;
 use crate::error::Error;
+use crate::instance::Executor;
 use crate::queue::DEFAULT_POLLING_INTERVAL;
 use crate::registry::WorkflowKey;
 use crate::sysdb;
@@ -682,6 +682,9 @@ async fn dispatch(
             },
             Some(MAX_RECOVERY_ATTEMPTS),
             submission,
+            // A dequeue starts nothing: the row exists and the workflow it belongs to was
+            // recorded against whatever started it, however long ago.
+            None,
         )
         .await
     {

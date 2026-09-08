@@ -8,8 +8,8 @@
 //!
 //! [`resume`](DBOS::resume) and [`fork`](DBOS::fork) each write an `ENQUEUED` row and leave it for
 //! whichever executor next polls that queue, which is what every reference does — so both hand back
-//! a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process is
-//! very probably not the one doing the work.
+//! a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process is very
+//! probably not the one doing the work.
 //!
 //! **The whole surface exists twice**, on [`DBOS`] for an application managing its own workflows
 //! and on [`Client`](crate::Client) for a process outside it — which, given the paragraph above, is
@@ -35,8 +35,8 @@
 //! form is a caller with one id. [`retrieve_workflow`](DBOS::retrieve_workflow),
 //! [`set_workflow_delay`](DBOS::set_workflow_delay) and
 //! [`update_workflow_attributes`](DBOS::update_workflow_attributes) have none, in this crate or in
-//! any reference: each addresses one row and none of them is worth a round trip to batch. The bulk
-//! form is the primitive: the system database cancels, deletes and forks in batches because a
+//! any reference: each addresses one row and none of them is worth a round trip to batch.
+//! The bulk form is the primitive: the system database cancels, deletes and forks in batches because a
 //! partially applied batch is worse than a slow one, and the singular methods are wrappers that
 //! pass a one-element slice.
 //!
@@ -46,24 +46,31 @@
 //!
 //! # Called from inside a workflow
 //!
-//! Every operation **on [`DBOS`]** is **checkpointed as a step of the workflow that calls it**, so
-//! a replay reads back what the first execution did instead of doing it again: a fork keeps the id
-//! it generated rather than writing a second one, a cancel or a delete is issued once, and a
-//! listing replays the rows it saw.
+//! Every operation **on [`DBOS`]** is **checkpointed as a step of the workflow that calls it**, so a
+//! replay reads back what the first execution did instead of doing it again: a fork keeps the id it
+//! generated rather than writing a second one, a cancel or a delete is issued once, and a listing
+//! replays the rows it saw.
 //!
-//! **The same call on a [`Client`](crate::Client) is not**, and cannot be. The step id would have
-//! to come from the ambient context, which belongs to a `DBOS` instance the client is not —
-//! possibly against another database entirely — so a client's management call runs again on replay.
-//! That is the line already drawn for a client's handle awaited inside a workflow
+//! **Each takes its step id where it is written, not where it is first polled**, which is why every
+//! one of them is a plain `fn` handing back a [`PendingStep`] rather than an `async fn` — see
+//! [`PendingStep`] for what that buys. A management call built beside a step and driven with it by
+//! `tokio::join!` therefore takes the same slot on every execution, and one that is refused before
+//! it reaches the counter — an unlaunched instance, another instance's handle, an argument the call
+//! cannot answer — moves no slot at all.
+//!
+//! **The same call on a [`Client`](crate::Client) is not**, and cannot be. The step id would have to
+//! come from the ambient context, which belongs to a `DBOS` instance the client is not — possibly
+//! against another database entirely — so a client's management call runs again on replay. That is
+//! the line already drawn for a client's handle awaited inside a workflow
 //! ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and for its
-//! [`get_event`](crate::Client::get_event): a client is a guest, and a guest does not write into
-//! its host's step sequence. No reference checkpoints a client's calls either — their wrappers all
-//! read an ambient context a client does not have.
+//! [`get_event`](crate::Client::get_event): a client is a guest, and a guest does not write into its
+//! host's step sequence. No reference checkpoints a client's calls either — their wrappers all read
+//! an ambient context a client does not have.
 //!
 //! **The checkpoint commits with the operation**, in one transaction, because the step id travels
 //! down into the system database rather than wrapping the call here — see
 //! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows), and
-//! [`caller_for`] for the two lines that spend the id. Nothing in this module records a step of
+//! [`DBOS::placed`] for the one line that spends the id. Nothing in this module records a step of
 //! its own, and there is no wrapper left to record one: the atomic version costs the same round
 //! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
 //! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
@@ -90,8 +97,8 @@
 //! what failed was the database being unreachable rather than the operation being wrong.
 //!
 //! [`retrieve_workflow`](DBOS::retrieve_workflow) is the one member of the `DBOS` surface with no
-//! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its
-//! equivalent as `DBOS.getStatus` because Python's reads the row.
+//! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its equivalent as
+//! `DBOS.getStatus` because Python's reads the row.
 //!
 //! # One thing this surface deliberately does not do
 //!
@@ -99,8 +106,8 @@
 //! and the running execution finds out by reading, not by being interrupted: a preemptible step
 //! polls the status and abandons its attempt, and any other step finishes before the workflow's own
 //! terminal write is refused by the status gate on `record_workflow_outcome`. That is what makes
-//! cancelling work at all across a fleet, where the executor running the workflow is usually not
-//! the one being asked to cancel it.
+//! cancelling work at all across a fleet, where the executor running the workflow is usually not the
+//! one being asked to cancel it.
 //!
 //! That also keeps this crate clear of go #426, where shutdown's context cancellation reached the
 //! *durable* cancel path and marked in-flight workflows `CANCELLED` instead of leaving them
@@ -111,14 +118,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
-use crate::context::Ctx;
-use crate::dbos::{DBOS, Executor};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
+use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
     Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord,
+    WorkflowRecord, step_names,
 };
 
 /// Whether an operation reaches a workflow's descendants.
@@ -178,12 +185,14 @@ pub enum ForkFrom<'a> {
 /// there — and because `resume_all(&ids, None)` says nothing at a call site about what was
 /// declined.
 ///
-/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has: resume takes a
-/// queue name and no partition key in all five, so resuming onto a partitioned queue either
-/// carries over a key belonging to whatever queue the workflow was on before, or writes the
-/// unkeyed row that [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not
-/// closed here alone — a field no reference has would put this crate's `resume` ahead of the
-/// contract.
+/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has. Resume takes a
+/// queue name and no partition key in all five, and the `UPDATE` behind it moves `queue_name`
+/// while leaving `queue_partition_key` untouched — so resuming onto a partitioned queue either
+/// carries over a key belonging to whatever queue the workflow was on before, or, for a workflow
+/// that never had one, writes the unkeyed row that
+/// [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not closed here alone:
+/// the gap is the contract's, and a field no reference has would put this crate's `resume` ahead
+/// of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
     /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
@@ -209,8 +218,8 @@ pub struct ForkOptions<'a> {
     ///
     /// **Only with a fork point that names its step** — [`ForkFrom::Beginning`] and
     /// [`ForkFrom::Step`]. The three searched points resolve the step inside the write and always
-    /// generate the id; naming one alongside them is an [`Error::Config`] rather than a value
-    /// quietly discarded.
+    /// generate the id; naming one alongside them is an [`Error::InvalidArgument`] rather than a
+    /// value quietly discarded.
     ///
     /// That line is every implementation's, drawn by having no parameter to pass an id through:
     /// Python's `fork_from_failure`, TypeScript's `forkFromFailure` and Go's `ForkFromDBInput`
@@ -249,8 +258,8 @@ pub struct ForkOptions<'a> {
 }
 
 impl DBOS {
-    /// This instance, refused if it is not the one running the calling workflow — and that
-    /// workflow, which the call is checkpointed against.
+    /// This instance, refused if it is not the one running the calling workflow — and where the
+    /// call stands in that workflow.
     ///
     /// Both halves come back together because the check is what relates them: a checkpointed
     /// management call takes its executor from `self` and its step id from the ambient context,
@@ -258,8 +267,8 @@ impl DBOS {
     /// `operation` names the call in either failure, so taking it once is also what keeps the two
     /// messages from drifting.
     ///
-    /// The context is `None` outside a workflow, where a management call is just a call — an
-    /// operator's tool, an admin endpoint, a test. `None` inside a *step* as well, by the leaf
+    /// The placement records nothing outside a workflow, where a management call is just a call —
+    /// an operator's tool, an admin endpoint, a test. Nothing inside a *step* either, by the leaf
     /// rule the rest of the crate follows: the step's own checkpoint stands for everything its
     /// body did, and allocating an id under it would shift every later step onto the wrong replay
     /// slot.
@@ -276,23 +285,17 @@ impl DBOS {
     /// instance serves it.
     ///
     /// **The launch check comes first**, as every method on this surface expects: an unlaunched
-    /// instance should say so whatever else is wrong with the call.
+    /// instance should say so whatever else is wrong with the call — and, coming before the
+    /// placement, it also means such a call moves no step counter.
     ///
-    /// The context is returned rather than the caller pair, and held in a local at each call
-    /// site, because [`caller_for`] borrows from it — and because allocating the step id is what
-    /// spends it, which must not happen before a call's own argument checks have passed.
-    fn checked_executor(&self, operation: &'static str) -> Result<(Arc<Executor>, Option<Ctx>)> {
-        let executor = self.executor(operation)?;
-        let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
-        if ctx
-            .as_ref()
-            .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
-        {
-            return Err(Error::WrongInstance {
-                operation: operation.into(),
-            });
-        }
-        Ok((executor, ctx))
+    /// **The id is spent here, at the call**, which is why every method below is a plain `fn`
+    /// handing back a [`PendingStep`] rather than an `async fn`: a management call built beside a
+    /// step and driven with it takes the same slot on every execution. A method with an argument
+    /// check of its own — [`fork_all`](Self::fork_all)'s refusal of a chosen id,
+    /// [`fork_with`](Self::fork_with)'s of a fork point that cannot name one — makes it between
+    /// the launch check and this, so a refused call spends nothing.
+    fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
+        StepPlacement::taken(self.executor(operation), operation)
     }
 
     /// A handle to a workflow this process did not start.
@@ -370,9 +373,18 @@ impl DBOS {
     /// dbos.cancel("runaway-workflow").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn cancel(&self, workflow_id: &str) -> Result<()> {
-        self.cancel_all(&[workflow_id], Children::Skip).await?;
-        Ok(())
+    pub fn cancel<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
+        PendingStep::placed(
+            step_names::CANCEL_WORKFLOW,
+            self.placed("cancel a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .cancel_all(&[workflow_id], Children::Skip, placement.step())
+                    .await?;
+                Ok(())
+            },
+        )
     }
 
     /// Cancels workflows, and optionally everything descended from them.
@@ -394,16 +406,21 @@ impl DBOS {
     /// dbos.cancel_all(&["fan-out-root"], dbos::Children::Include).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn cancel_all(
+    pub fn cancel_all<'a>(
         &self,
-        workflow_ids: &[&str],
+        workflow_ids: &'a [&'a str],
         children: Children,
-    ) -> Result<Vec<String>> {
-        let (executor, ctx) = self.checked_executor("cancel a workflow")?;
-        executor
-            .connection()
-            .cancel_all(workflow_ids, children, ctx.as_ref().map(caller_for))
-            .await
+    ) -> PendingStep<'a, Vec<String>> {
+        PendingStep::placed(
+            step_names::CANCEL_WORKFLOW,
+            self.placed("cancel a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .cancel_all(workflow_ids, children, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
@@ -449,9 +466,11 @@ impl DBOS {
     /// let handle = dbos.resume::<u32, dbos::EngineOnly>("stalled-workflow").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn resume<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
+    pub fn resume<'a, R: 'a, E: 'a>(
+        &self,
+        workflow_id: &'a str,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
         self.resume_with(workflow_id, ResumeOptions::default())
-            .await
     }
 
     /// Resumes a workflow onto a queue of the caller's choosing.
@@ -467,15 +486,25 @@ impl DBOS {
     /// ).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn resume_with<R, E>(
+    pub fn resume_with<'a, R: 'a, E: 'a>(
         &self,
-        workflow_id: &str,
-        options: ResumeOptions<'_>,
-    ) -> Result<WorkflowHandle<R, E>> {
-        self.resume_all(&[workflow_id], options)
-            .await?
-            .pop()
-            .ok_or_else(|| Error::Config(format!("resuming `{workflow_id}` produced no handle")))
+        workflow_id: &'a str,
+        options: ResumeOptions<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+        PendingStep::placed(
+            step_names::RESUME_WORKFLOW,
+            self.placed("resume a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .resume_all(&[workflow_id], options, placement.step())
+                    .await?
+                    .pop()
+                    .ok_or_else(|| {
+                        Error::Config(format!("resuming `{workflow_id}` produced no handle"))
+                    })
+            },
+        )
     }
 
     /// Resumes workflows, handing back one handle per id, in the order given.
@@ -489,28 +518,32 @@ impl DBOS {
     /// correctly. Python and Java draw the same line on the batch; **Go deliberately does not**,
     /// and says so — its `ResumeWorkflows` skips a missing id where its `ResumeWorkflow` refuses
     /// one. Following Python here keeps the batch and the single form answering the same way.
-    pub async fn resume_all<R, E>(
+    pub fn resume_all<'a, R: 'a, E: 'a>(
         &self,
-        workflow_ids: &[&str],
-        options: ResumeOptions<'_>,
-    ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        let (executor, ctx) = self.checked_executor("resume a workflow")?;
-        executor
-            .connection()
-            .resume_all(workflow_ids, options, ctx.as_ref().map(caller_for))
-            .await
+        workflow_ids: &'a [&'a str],
+        options: ResumeOptions<'a>,
+    ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
+        PendingStep::placed(
+            step_names::RESUME_WORKFLOW,
+            self.placed("resume a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .resume_all(workflow_ids, options, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Forks a workflow from `from`, enqueueing the fork and handing back a handle to it.
     ///
     /// [`fork_with`](Self::fork_with) for the options; this is the common case.
-    pub async fn fork<R, E>(
+    pub fn fork<'a, R: 'a, E: 'a>(
         &self,
-        workflow_id: &str,
-        from: ForkFrom<'_>,
-    ) -> Result<WorkflowHandle<R, E>> {
+        workflow_id: &'a str,
+        from: ForkFrom<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
         self.fork_with(workflow_id, from, ForkOptions::default())
-            .await
     }
 
     /// Forks a workflow, choosing what the fork inherits and where it runs.
@@ -544,25 +577,41 @@ impl DBOS {
     /// ).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn fork_with<R, E>(
+    pub fn fork_with<'a, R: 'a, E: 'a>(
         &self,
-        workflow_id: &str,
-        from: ForkFrom<'_>,
-        options: ForkOptions<'_>,
-    ) -> Result<WorkflowHandle<R, E>> {
-        let (executor, ctx) = self.checked_executor("fork a workflow")?;
-        executor
-            .connection()
-            .fork_all(
-                &[workflow_id],
-                from,
-                options.forked_id,
-                &options,
-                ctx.as_ref().map(caller_for),
-            )
-            .await?
-            .pop()
-            .ok_or_else(|| Error::Config(format!("forking `{workflow_id}` produced no workflow")))
+        workflow_id: &'a str,
+        from: ForkFrom<'a>,
+        options: ForkOptions<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+        // The argument check between the launch check and the placement, so a fork point that
+        // cannot name a chosen id refuses the call without moving the workflow's step counter.
+        let built = self.executor("fork a workflow").and_then(|executor| {
+            refuse_chosen_id_without_a_step(from, options.forked_id)?;
+            // The executor came from this handle rather than from the ambient context, so the two
+            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
+            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
+            Ok((executor, placement))
+        });
+        PendingStep::placed(
+            step_names::FORK_WORKFLOW,
+            built,
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .fork_all(
+                        &[workflow_id],
+                        from,
+                        options.forked_id,
+                        &options,
+                        placement.step(),
+                    )
+                    .await?
+                    .pop()
+                    .ok_or_else(|| {
+                        Error::Config(format!("forking `{workflow_id}` produced no workflow"))
+                    })
+            },
+        )
     }
 
     /// Forks workflows from the same point, handing back a handle to each fork in the order given.
@@ -582,27 +631,33 @@ impl DBOS {
     /// option applies to the whole batch, which is what makes
     /// [`app_version`](ForkOptions::app_version) useful — re-running a fan-out
     /// against the deployment that fixes it is the case this method exists for.
-    pub async fn fork_all<R, E>(
+    pub fn fork_all<'a, R: 'a, E: 'a>(
         &self,
-        workflow_ids: &[&str],
-        from: ForkFrom<'_>,
-        options: ForkOptions<'_>,
-    ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        // Which instance is serving this, and whether a workflow is asking — before the
-        // argument checks, as every other method on this surface does: an unlaunched instance,
-        // or one that is not the caller's, should say so whatever else is wrong with the call.
-        let (executor, ctx) = self.checked_executor("fork a workflow")?;
-        refuse_forked_id_in_bulk(&options)?;
-        executor
-            .connection()
-            .fork_all(
-                workflow_ids,
-                from,
-                None,
-                &options,
-                ctx.as_ref().map(caller_for),
-            )
-            .await
+        workflow_ids: &'a [&'a str],
+        from: ForkFrom<'a>,
+        options: ForkOptions<'a>,
+    ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
+        // Which instance is serving this first, as every other method on this surface does: an
+        // unlaunched instance should say so whatever else is wrong with the call. Then the
+        // argument check, and only then the step id — so a call refused for naming one id for
+        // many forks moves the workflow's counter no more than an unlaunched one does.
+        let built = self.executor("fork a workflow").and_then(|executor| {
+            refuse_forked_id_in_bulk(&options)?;
+            // The executor came from this handle rather than from the ambient context, so the two
+            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
+            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
+            Ok((executor, placement))
+        });
+        PendingStep::placed(
+            step_names::FORK_WORKFLOW,
+            built,
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .fork_all(workflow_ids, from, None, &options, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Removes a workflow and everything recorded against it.
@@ -617,8 +672,7 @@ impl DBOS {
     /// same statement reads "Delete all matching workflows regardless of their state".
     ///
     /// The executor running a deleted workflow finds its row gone at the next step boundary and
-    /// fails with `NonExistentWorkflow`, rather than stopping cleanly. Cancel first if that
-    /// matters.
+    /// fails with `NonExistentWorkflow`, rather than stopping cleanly. Cancel first if that matters.
     ///
     /// Deleting an id with no row is not an error, and children are left alone —
     /// [`delete_all`](Self::delete_all) with [`Children::Include`] is how a tree goes.
@@ -626,9 +680,18 @@ impl DBOS {
     /// **A workflow cannot delete itself.** Called from inside the workflow it names, this fails
     /// with [`Error::SystemDatabase`] carrying `InvalidInput` and nothing is deleted; see
     /// [`delete_all`](Self::delete_all) for why.
-    pub async fn delete(&self, workflow_id: &str) -> Result<()> {
-        self.delete_all(&[workflow_id], Children::Skip).await?;
-        Ok(())
+    pub fn delete<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
+        PendingStep::placed(
+            step_names::DELETE_WORKFLOW,
+            self.placed("delete a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .delete_all(&[workflow_id], Children::Skip, placement.step())
+                    .await?;
+                Ok(())
+            },
+        )
     }
 
     /// Deletes workflows, and optionally everything descended from them.
@@ -652,12 +715,21 @@ impl DBOS {
     /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is deleted. Deleting the
     /// caller's own tree from outside it, or deleting an unrelated tree from inside a workflow,
     /// is unaffected.
-    pub async fn delete_all(&self, workflow_ids: &[&str], children: Children) -> Result<u64> {
-        let (executor, ctx) = self.checked_executor("delete a workflow")?;
-        executor
-            .connection()
-            .delete_all(workflow_ids, children, ctx.as_ref().map(caller_for))
-            .await
+    pub fn delete_all<'a>(
+        &self,
+        workflow_ids: &'a [&'a str],
+        children: Children,
+    ) -> PendingStep<'a, u64> {
+        PendingStep::placed(
+            step_names::DELETE_WORKFLOW,
+            self.placed("delete a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .delete_all(workflow_ids, children, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Holds a queued workflow back, or lets it go sooner.
@@ -687,19 +759,24 @@ impl DBOS {
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// use std::time::Duration;
     /// // Not before the hour is up.
-    /// dbos.set_workflow_delay(
-    ///     "scheduled-report",
-    ///     dbos::WorkflowDelay::For(Duration::from_secs(3600)),
-    /// )
-    /// .await?;
+    /// dbos.set_workflow_delay("scheduled-report", dbos::WorkflowDelay::For(Duration::from_secs(3600))).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
-        let (executor, ctx) = self.checked_executor("delay a workflow")?;
-        executor
-            .connection()
-            .set_workflow_delay(workflow_id, delay, ctx.as_ref().map(caller_for))
-            .await
+    pub fn set_workflow_delay<'a>(
+        &self,
+        workflow_id: &'a str,
+        delay: WorkflowDelay,
+    ) -> PendingStep<'a, ()> {
+        PendingStep::placed(
+            step_names::SET_WORKFLOW_DELAY,
+            self.placed("delay a workflow"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .set_workflow_delay(workflow_id, delay, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Replaces a workflow's attributes, or clears them with `None`.
@@ -723,9 +800,9 @@ impl DBOS {
     ///
     /// **Named for what three of the four call it.** Python's is `update_workflow_attributes` and
     /// Java's `updateWorkflowAttributes`; TypeScript has no attributes method at all; and Go's
-    /// method is `SetWorkflowAttributes` while the step it records is
-    /// `DBOS.updateWorkflowAttributes` — so Go disagrees with itself, and the stored name is the
-    /// half that other implementations read.
+    /// method is `SetWorkflowAttributes` while the step it records is `DBOS.updateWorkflowAttributes`
+    /// — so Go disagrees with itself, and the stored name is the half that other implementations
+    /// read.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -734,16 +811,27 @@ impl DBOS {
     /// dbos.update_workflow_attributes("an-order", None).await?; // and cleared
     /// # Ok(()) }
     /// ```
-    pub async fn update_workflow_attributes(
+    pub fn update_workflow_attributes<'a>(
         &self,
-        workflow_id: &str,
+        workflow_id: &'a str,
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
-    ) -> Result<()> {
-        let (executor, ctx) = self.checked_executor("update a workflow's attributes")?;
-        executor
-            .connection()
-            .update_workflow_attributes(workflow_id, attributes, ctx.as_ref().map(caller_for))
-            .await
+    ) -> PendingStep<'a, ()> {
+        // Encoded before the id is taken, as every other call in the crate now encodes before it
+        // places: attributes that cannot be encoded are a call that never happens, and a call that
+        // never happens must not move the workflow's counter.
+        let built = crate::workflow::encode_attributes(attributes)
+            .and_then(|encoded| Ok((encoded, self.placed("update a workflow's attributes")?)))
+            .map(|(encoded, (executor, placement))| ((executor, encoded), placement));
+        PendingStep::placed(
+            step_names::UPDATE_WORKFLOW_ATTRIBUTES,
+            built,
+            move |(executor, encoded), placement| async move {
+                executor
+                    .connection()
+                    .update_workflow_attributes(workflow_id, encoded.as_deref(), placement.step())
+                    .await
+            },
+        )
     }
 
     /// Reads the workflows matching a filter, oldest first unless the filter says otherwise.
@@ -776,12 +864,20 @@ impl DBOS {
     /// }).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn list_workflows(&self, filter: &WorkflowFilter<'_>) -> Result<Vec<WorkflowRecord>> {
-        let (executor, ctx) = self.checked_executor("list workflows")?;
-        executor
-            .connection()
-            .list_workflows(filter, ctx.as_ref().map(caller_for))
-            .await
+    pub fn list_workflows<'a>(
+        &self,
+        filter: &'a WorkflowFilter<'a>,
+    ) -> PendingStep<'a, Vec<WorkflowRecord>> {
+        PendingStep::placed(
+            step_names::LIST_WORKFLOWS,
+            self.placed("list workflows"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .list_workflows(filter, placement.step())
+                    .await
+            },
+        )
     }
 
     /// Reads one workflow's steps, in execution order.
@@ -796,12 +892,20 @@ impl DBOS {
     ///
     /// An id with no row returns no steps rather than failing, the same as an id whose workflow
     /// has not reached its first step.
-    pub async fn list_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
-        let (executor, ctx) = self.checked_executor("list a workflow's steps")?;
-        executor
-            .connection()
-            .list_workflow_steps(workflow_id, ctx.as_ref().map(caller_for))
-            .await
+    pub fn list_workflow_steps<'a>(
+        &self,
+        workflow_id: &'a str,
+    ) -> PendingStep<'a, Vec<StepRecord>> {
+        PendingStep::placed(
+            step_names::LIST_WORKFLOW_STEPS,
+            self.placed("list a workflow's steps"),
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .list_workflow_steps(workflow_id, placement.step())
+                    .await
+            },
+        )
     }
 }
 
@@ -810,7 +914,7 @@ impl DBOS {
 /// Every method here is [`DBOS`]'s, and the differences are the two a client always has. **There is
 /// no launch check**, because a client is connected or it does not exist — `connect` hands back a
 /// usable client or an error, so none of these can fail with
-/// [`Error::NotLaunched`]. And **nothing is checkpointed**: called from
+/// [`Error::NotLaunched`](crate::Error::NotLaunched). And **nothing is checkpointed**: called from
 /// inside a workflow, a client's management call runs again on replay, where the same call on
 /// `DBOS` would replay its recorded step. A client has no step counter of its own to agree with the
 /// workflow's, and the ambient context belongs to an instance this client is not — the line
@@ -920,6 +1024,7 @@ impl crate::Client {
         from: ForkFrom<'_>,
         options: ForkOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
+        refuse_chosen_id_without_a_step(from, options.forked_id)?;
         self.connection()
             .fork_all(&[workflow_id], from, options.forked_id, &options, None)
             .await?
@@ -985,8 +1090,9 @@ impl crate::Client {
         workflow_id: &str,
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<()> {
+        let encoded = crate::workflow::encode_attributes(attributes)?;
         self.connection()
-            .update_workflow_attributes(workflow_id, attributes, None)
+            .update_workflow_attributes(workflow_id, encoded.as_deref(), None)
             .await
     }
 
@@ -1050,8 +1156,7 @@ impl Connection {
     /// Puts workflows back on a queue, and hands back a handle to each.
     ///
     /// `self: &Arc<Self>` because the handles hold the connection they poll through, which is this
-    /// one — the same reason [`spawn_execution`](crate::workflow::spawn_execution) takes the
-    /// executor by `Arc`.
+    /// one — the same reason [`crate::workflow::start`] takes the executor by `Arc`.
     pub(crate) async fn resume_all<R, E>(
         self: &Arc<Self>,
         workflow_ids: &[&str],
@@ -1094,24 +1199,6 @@ impl Connection {
             timeout: options.timeout,
             replacement_children: &[],
         };
-
-        // A chosen id belongs to the half of the surface that names its step. **Every reference
-        // draws the same line**, by giving the search half no parameter to pass one through:
-        // Python's `fork_from_failure` (`_sys_db.py:1680`) and TypeScript's `forkFromFailure`
-        // (`system_database.ts:2004`) generate a UUID per source and take no id; Go's
-        // `ForkFromDBInput` (`system_database.go:2773`) has no id field and leaves
-        // `ForkedWorkflowIDs` unset; Java splits the options type outright,
-        // `ForkFromFailureOptions` carrying only the version, queue and partition key where its
-        // `ForkOptions` leads with `forkedWorkflowId`. Refusing is the merged shape's version of
-        // Java's missing field. It was silently dropped before, which is the one behaviour no
-        // reference has.
-        if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
-            return Err(Error::Config(
-                "ForkOptions::forked_id needs a fork point that names its step: use ForkFrom::Step, \
-                 or ForkFrom::Beginning, and let the searched fork points generate the id"
-                    .to_owned(),
-            ));
-        }
 
         let forked = match from {
             ForkFrom::Beginning | ForkFrom::Step(_) => {
@@ -1203,18 +1290,19 @@ impl Connection {
     }
 
     /// Replaces a workflow's attributes, or clears them.
+    ///
+    /// `encoded` is plain JSON, never the configured [`Serializer`](crate::Serializer): the column
+    /// is read by `@>` containment and by every other implementation, so what a workflow chose for
+    /// its own payloads has no say in it. Encoded by the caller rather than here, because
+    /// [`DBOS::update_workflow_attributes`] has to encode before it takes its step id.
     pub(crate) async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
-        attributes: Option<&serde_json::Map<String, serde_json::Value>>,
+        encoded: Option<&str>,
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
-        // Plain JSON, never the configured [`Serializer`](crate::Serializer): the column is read by
-        // `@>` containment and by every other implementation, so what a workflow chose for its own
-        // payloads has no say in it. The same encoder an enqueue's attributes go through.
-        let encoded = crate::workflow::encode_attributes(attributes)?;
         self.sysdb()
-            .update_workflow_attributes(workflow_id, encoded.as_deref(), caller)
+            .update_workflow_attributes(workflow_id, encoded, caller)
             .await
             .map_err(Error::SystemDatabase)?;
         // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
@@ -1248,6 +1336,34 @@ impl Connection {
     }
 }
 
+/// Refuses a chosen fork id at a fork point that cannot name its step.
+///
+/// A chosen id belongs to the half of the surface that names its step. **Every reference draws the
+/// same line**, by giving the search half no parameter to pass one through: Python's
+/// `fork_from_failure` (`_sys_db.py:1680`) and TypeScript's `forkFromFailure`
+/// (`system_database.ts:2004`) generate a UUID per source and take no id; Go's `ForkFromDBInput`
+/// (`system_database.go:2773`) has no id field and leaves `ForkedWorkflowIDs` unset; Java splits
+/// the options type outright, `ForkFromFailureOptions` carrying only the version, queue and
+/// partition key where its `ForkOptions` leads with `forkedWorkflowId`. Refusing is the merged
+/// shape's version of Java's missing field. It was silently dropped before, which is the one
+/// behaviour no reference has.
+///
+/// **Made by the surfaces rather than inside the connection**, because a refused call must not
+/// spend a step id and the connection is only reached once one has been taken. Both surfaces that
+/// accept an id call it; the bulk forms pass `None` and have nothing to refuse here.
+fn refuse_chosen_id_without_a_step(from: ForkFrom<'_>, forked_id: Option<&str>) -> Result<()> {
+    if forked_id.is_some() && !matches!(from, ForkFrom::Beginning | ForkFrom::Step(_)) {
+        return Err(Error::InvalidArgument {
+            operation: "fork a workflow".into(),
+            detail: "ForkOptions::forked_id needs a fork point that names its step: use \
+                     ForkFrom::Step, or ForkFrom::Beginning, and let the searched fork points \
+                     generate the id"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Refuses a chosen fork id on a call that may produce many forks.
 ///
 /// One id cannot name several forks. Go carries its id per-source on `ForkWorkflowSpec` instead,
@@ -1255,19 +1371,11 @@ impl Connection {
 /// batch — and both surfaces here have to say so.
 fn refuse_forked_id_in_bulk(options: &ForkOptions<'_>) -> Result<()> {
     if options.forked_id.is_some() {
-        return Err(Error::Config(
-            "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
+        return Err(Error::InvalidArgument {
+            operation: "fork_all".into(),
+            detail: "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
                 .to_owned(),
-        ));
+        });
     }
     Ok(())
-}
-
-/// Where the caller stands, for `sysdb` to commit the checkpoint against.
-///
-/// **Allocates the step id, so it is called exactly once per management call.** Mapping it over
-/// an `Option<Ctx>` is what keeps that true: the id is spent only when there is a workflow to
-/// spend it in.
-fn caller_for(ctx: &Ctx) -> (&str, i32) {
-    (ctx.workflow_id(), ctx.next_step_id())
 }

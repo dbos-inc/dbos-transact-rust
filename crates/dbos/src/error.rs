@@ -86,7 +86,7 @@ pub type Result<T, E = EngineOnly> = std::result::Result<T, Error<E>>;
 
 /// Everything a durable function can fail with.
 ///
-/// `#[non_exhaustive]` because the twenty codes the other implementations share arrive with
+/// `#[non_exhaustive]` because the twenty codes the other implementations share (§4.6) arrive with
 /// the phases that raise them; matching callers need a wildcard arm from the start rather than a
 /// breaking change later.
 ///
@@ -169,8 +169,30 @@ pub enum Error<E = EngineOnly> {
     },
 
     /// The configuration could not be used.
+    ///
+    /// How the instance, the client or a queue was *set up* — a malformed database URL, an empty
+    /// schema, a queue whose limits contradict each other. Not what a call was passed at the point
+    /// it was made, which is [`InvalidArgument`](Self::InvalidArgument).
     #[error("invalid configuration: {0}")]
     Config(String),
+
+    /// A call was given an argument it cannot act on.
+    ///
+    /// The caller's mistake at one call site, rather than a setting that was wrong before anything
+    /// ran — waiting for the first of no workflows, or naming one forked id for a call that forks
+    /// many. Kept apart from [`Config`](Self::Config) because the two are fixed in different
+    /// places and by different people.
+    ///
+    /// **Deterministic, and recorded like any other failure** where the call took a step id: the
+    /// arguments are not checkpointed, so a replay reads the refusal back rather than deciding it
+    /// again against a set that may have changed.
+    #[error("invalid argument to {operation}: {detail}")]
+    InvalidArgument {
+        /// The call that was given it.
+        operation: Cow<'static, str>,
+        /// What was wrong with it.
+        detail: String,
+    },
 
     /// Two workflows were registered under one identity.
     ///
@@ -314,6 +336,59 @@ pub enum Error<E = EngineOnly> {
         message: String,
     },
 
+    /// A step was polled somewhere its step id cannot be honoured.
+    ///
+    /// A step takes its id from the workflow's counter **where it is built**, which is a claim on
+    /// one position in one workflow. So there are only four places a built step may be polled,
+    /// and **everything else is refused** rather than run under an id nothing there can honour:
+    ///
+    /// - at a step boundary of the workflow it was built in, which is the ordinary case and the
+    ///   only one that records anything;
+    /// - inside the very step body it was built in, where the leaf rule makes it a plain call;
+    /// - outside a workflow, if that is also where it was built, which is what makes a function
+    ///   built from steps ordinarily testable;
+    /// - anywhere at all, if it was reached through a [`Client`](crate::Client)'s connection: a
+    ///   client has no step counter anywhere to disagree with, so its calls are pinned to nothing.
+    ///
+    /// The refusals worth naming, because they are the ones code reaches by accident:
+    ///
+    /// - **Built outside a workflow, awaited inside one.** It took no id, so it would run
+    ///   unrecorded where the surrounding workflow plainly expects a checkpoint, and every replay
+    ///   would run it again. Easy to reach by accident — `Ctx::scope(ctx, step(..))` evaluates the
+    ///   step before the scope exists.
+    /// - **Built in one workflow, polled in another.** Its row would land under the wrong
+    ///   workflow's id.
+    /// - **Built inside a step body, awaited in the workflow proper**, or inside a *different*
+    ///   body. By the leaf rule it took no id inside the body it was built in, so it would run
+    ///   unrecorded where a checkpoint was expected.
+    /// - **Built in the workflow proper, carried into a step body.** Its checkpoint would sit
+    ///   beneath a step whose own row already stands for whatever its body did.
+    /// - **Polled where there is no context at all**, which in practice means
+    ///   `tokio::spawn(step(..))`. A spawned task inherits no workflow, so the step would run
+    ///   undurably wherever it was built — and a step built in the workflow proper has already
+    ///   spent an id that nothing will ever record against. Await the step in the workflow, or
+    ///   spawn work that is not a step.
+    ///
+    /// The first two were silent before ids were taken at the call; the next two are what the
+    /// per-call-stack step marker made distinguishable; the last ran plainly. `built` and `polled`
+    /// name the two places, so a refusal reads "built inside a step of workflow w but polled in
+    /// workflow w" rather than naming the same place twice.
+    ///
+    /// **Not a control signal.** It is a mistake in the code rather than a failure of the engine's
+    /// substrate, it is deterministic, and a replay reaches it again — so it is the workflow's
+    /// outcome like any other failure.
+    #[error(
+        "step {step} was built {built} but polled {polled}: a step takes its id where it is built"
+    )]
+    StepBuiltElsewhere {
+        /// The step's name, which is the only thing a caller can find it by.
+        step: String,
+        /// Where its id came from, or that it has none.
+        built: std::borrow::Cow<'static, str>,
+        /// Where it was polled instead.
+        polled: std::borrow::Cow<'static, str>,
+    },
+
     /// A step attempt ran past its timeout and was stopped.
     ///
     /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
@@ -337,14 +412,14 @@ pub enum Error<E = EngineOnly> {
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
-    /// not Java's — Java rethrows the final failure untyped, and is the outlier here. The first
-    /// failure is usually the informative one and the last is usually a timeout,
+    /// not Java's — Java rethrows the final failure untyped, and `sdk-parity.md` records it as the
+    /// outlier. The first failure is usually the informative one and the last is usually a timeout,
     /// so keeping only one loses the half that explains the other.
     ///
     /// Raised only where retries were actually asked for. A step left at the default
-    /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its
-    /// one attempt failed with, unwrapped: there is no retry policy to report on, and wrapping
-    /// would make every ordinary step failure arrive inside a collection of one.
+    /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its one
+    /// attempt failed with, unwrapped: there is no retry policy to report on, and wrapping would
+    /// make every ordinary step failure arrive inside a collection of one.
     #[error("the step {step} failed on all {attempts} attempts")]
     MaxStepRetriesExceeded {
         /// The step's name.
@@ -376,11 +451,12 @@ impl<E> Error<E> {
     /// Re-targets this error at another application error type.
     ///
     /// One match over the engine's variants, kept in a single place so [`lift`](Self::lift) and
-    /// any later conversion share the list rather than each carrying a copy of it.
+    /// [`PendingStep::map_error`](crate::PendingStep::map_error) share the list rather than each
+    /// carrying a copy of it.
     /// `Fn + Copy` rather than `FnOnce` because
     /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) nests errors and so recurses. Its
     /// one caller passes a non-capturing closure, so the tighter bound costs nothing.
-    fn map_application<E2>(self, f: impl Fn(E) -> E2 + Copy) -> Error<E2> {
+    pub(crate) fn map_application<E2>(self, f: impl Fn(E) -> E2 + Copy) -> Error<E2> {
         match self {
             Error::Application(error) => Error::Application(f(error)),
             Error::NotLaunched { operation } => Error::NotLaunched { operation },
@@ -389,6 +465,9 @@ impl<E> Error<E> {
             Error::InsideStep { operation } => Error::InsideStep { operation },
             Error::WrongInstance { operation } => Error::WrongInstance { operation },
             Error::Config(message) => Error::Config(message),
+            Error::InvalidArgument { operation, detail } => {
+                Error::InvalidArgument { operation, detail }
+            }
             Error::AlreadyRegistered { key } => Error::AlreadyRegistered { key },
             Error::Serialization {
                 what,
@@ -431,6 +510,15 @@ impl<E> Error<E> {
             },
             Error::StepFailed { step, message } => Error::StepFailed { step, message },
             Error::StepTimeout { step, timeout } => Error::StepTimeout { step, timeout },
+            Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            } => Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            },
             Error::MaxStepRetriesExceeded {
                 step,
                 attempts,
@@ -488,18 +576,27 @@ impl Error<EngineOnly> {
     /// needing a panic or a fallback for a case that cannot occur.
     ///
     /// Public because a workflow with its own error type sometimes holds an engine-channel
-    /// result — [`WorkflowRef::start`](crate::WorkflowRef::start) is one, and
-    /// [`DBOS::get_event`](crate::DBOS::get_event) called from inside a workflow another — and
+    /// result — the management calls are, and
+    /// [`DBOS::get_event`](crate::DBOS::get_event) called from inside a workflow is another — and
     /// `?` cannot lift `Error<EngineOnly>` into `Error<E>` on its own: the blanket conversion
     /// would wrap the whole error as the application's. This is the conversion written out:
     ///
     /// ```ignore
-    /// let child = checkout.start(order).await.map_err(Error::lift)?;
+    /// let status = child.status().await.map_err(Error::lift)?;
     /// ```
     ///
-    /// The workflow-facing calls do not need it: [`step`](crate::step()),
-    /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) are all generic over
-    /// the caller's channel, so `?` works on them directly.
+    /// The workflow's own calls do not need it: [`step`](crate::step),
+    /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) answer in the caller's
+    /// channel, so `?` works on them directly. A child's [`start`](crate::WorkflowRef::start),
+    /// [`run`](crate::WorkflowRef::run) and the await of its handle answer in the *child's*
+    /// channel, which is the same channel whenever parent and child fail the same way — the common
+    /// case, and the one those calls read as written for.
+    ///
+    /// Where the two differ, only the start is this conversion's business: it can fail in nothing
+    /// but the engine's terms, so [`PendingStart::lift`](crate::PendingStart::lift) re-declares
+    /// which channel it answers in, before the await rather than converting after it. A `run` or a
+    /// handle's await carries the child's own application failure, which no lift can reach: that
+    /// one is a real error of the child's type, and the parent writes out what it makes of it.
     pub fn lift<E>(self) -> Error<E> {
         self.map_application(|impossible| match impossible {})
     }

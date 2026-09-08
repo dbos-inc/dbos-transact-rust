@@ -59,11 +59,12 @@ use std::time::Duration;
 use types::step_names;
 use types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EncodedValue,
-    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, Message, NewQueue, NewSchedule,
-    NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord,
-    QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
+    NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite,
+    QueueRecord, QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord,
+    ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
+    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
+    WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -109,11 +110,34 @@ pub trait SystemDatabase: Send + Sync {
     /// passed in, and generated once per call — before any retry the implementation makes. A
     /// retry that generated a fresh identity after a lost commit acknowledgement would fail to
     /// recognise its own write and conclude another executor owned the row.
+    ///
+    /// **`caller` makes the child's row and the parent's record of it one write.** A start from
+    /// inside a workflow is a step of that workflow, and as two statements the pair has a gap: a
+    /// crash between them — or a dropped future, since a start is a future and any combinator that
+    /// races one may drop it — leaves a child workflow that exists, carries a
+    /// `parent_workflow_id`, and has nothing in the parent pointing at it.
+    ///
+    /// A replaying parent survives that, and it is worth being exact about why: the child's id is
+    /// derived from the parent's and this step's, so the replay re-derives it, finds the row owned,
+    /// and joins the child it already made rather than starting a second one. What does *not*
+    /// survive is the pair coming apart in the other direction. If the record fails permanently
+    /// where the row succeeded, the caller is told its start failed while the child exists and is
+    /// `PENDING` — a workflow that will run, reported as one that never began. And a parent that
+    /// never replays, because it finished or because the losing branch of a race dropped the start,
+    /// leaves that child unreferenced by anything but its own parent column.
+    ///
+    /// Passing the caller closes both: the two rows commit together or neither does. `None` is a
+    /// root start, which has no parent to record against.
+    ///
+    /// This is the shape [`fork_workflows`](Self::fork_workflows) and the management calls already
+    /// use — the checkpoint committing with the operation it records — reaching the one operation
+    /// that creates a workflow.
     async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
         submission: Submission,
+        caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.
@@ -325,10 +349,16 @@ pub trait SystemDatabase: Send + Sync {
     /// removes them either — [`join_workflows`](crate::DBOS::join_workflows) passes the caller's
     /// slice through as it was given — so an implementation must expect them.
     ///
+    /// **Nothing above checkpoints this wait**, where
+    /// [`await_first_workflow_id`](Self::await_first_workflow_id) is recorded when a workflow makes
+    /// it: an all-wait decides nothing, so a replay simply asks again and is answered by a set that
+    /// has already settled. TypeScript records its `waitAll` and this does not — the
+    /// free [`join_workflows`](crate::join_workflows()) sets out why.
+    ///
     /// Narrowing the array it sends is then an implementation's own business rather than a
-    /// contract: the Postgres one de-duplicates once before its first pass, which buys array bytes
-    /// and nothing else, since the narrowing above drops *every* copy of an id the moment one of
-    /// them settles.
+    /// contract: the Postgres one holds its outstanding ids in a `HashSet`, as TypeScript holds
+    /// its own in a `Set`, so a repeat collapses on the way in and each pass removes what it
+    /// watched settle without scanning what it did not.
     ///
     /// Empty input returns at once. Nothing to wait for is a satisfied wait, and TypeScript
     /// short-circuits an empty handle list the same way — where an empty *first*-wait has no
@@ -626,17 +656,34 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>, Error>;
 
-    /// Delivers messages to workflows, in one transaction.
+    /// Delivers one message to a workflow.
     ///
-    /// One method rather than the `send`/`send_bulk` pair the plan lists, because the batch form
-    /// is the primitive and the single form is a caller with one message. Python says so in its
-    /// own docstring — its `send_bulk` "is the single implementation underlying both `DBOS.send`
-    /// and `send_bulk`, inside and outside a workflow" — and Java exposes only `sendBulk` too.
+    /// Records the step as `"DBOS.send"`, which is what makes this a separate method from
+    /// [`send_messages`](Self::send_messages) rather than a caller with a one-element slice: the
+    /// step name is the API surface the caller reached for, and a batch of one is still a batch.
+    /// Python and Java pass their name down from the same two surfaces
+    /// (`function_name="DBOS.send"` versus `"DBOS.send_bulk"`; `"DBOS.send"` versus
+    /// `"DBOS.sendBulk"`), and neither infers it from a count.
     ///
-    /// `caller` is the sending workflow and the step id to record against. The step *name* is
-    /// derived from the batch size rather than passed in — `"DBOS.send"` for a single message,
-    /// `"DBOS.sendBulk"` for any other count — because that is what distinguishes the two API
-    /// surfaces the references record it under.
+    /// Everything else is [`send_messages`](Self::send_messages)'s, which this shares an
+    /// implementation with — the transaction, the fork fan-out, the replay skip, the two kinds of
+    /// idempotency, and the foreign key that refuses a destination that does not exist.
+    async fn send_message(
+        &self,
+        message: &Message<'_>,
+        serialization: Option<&str>,
+        caller: Option<(&str, i32)>,
+        send_to_forks: bool,
+    ) -> Result<(), Error>;
+
+    /// Delivers many messages to workflows, in one transaction.
+    ///
+    /// Records the step as `"DBOS.sendBulk"` however many messages it is given, one and none
+    /// included — see [`send_message`](Self::send_message) for why the name is the method rather
+    /// than the count. Python writes `DBOS.send_bulk` here and Java `DBOS.sendBulk`; Java's
+    /// spelling is taken because the rest of this constant family is camelCase already.
+    ///
+    /// `caller` is the sending workflow and the step id to record against.
     ///
     /// **Two independent kinds of idempotency, for two different callers.** `caller` makes a
     /// whole batch idempotent for a *workflow*: a replay finds the step recorded and sends

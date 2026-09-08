@@ -32,7 +32,7 @@ use crate::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 
 /// Returns this executor's abandoned workflows to their queues.
 ///
-/// Called by [`Executor::start`](crate::dbos::Executor) before `launch` returns, and reports what
+/// Called by [`Executor::start`](crate::instance::Executor) before `launch` returns, and reports what
 /// moved rather than handles: this process may run none of them.
 pub(crate) async fn reenqueue(
     sysdb: &dyn SystemDatabase,

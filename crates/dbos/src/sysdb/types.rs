@@ -20,10 +20,10 @@
 //! exactly rather than through someone's calendar, and `Duration` is in `std`. Callers wanting a
 //! calendar type convert at their own edge.
 //!
-//! One exception, and it is the schema's rather than a preference:
-//! `workflow_schedules.last_fired_at` holds ISO-8601 text, so a calendar is unavoidable for that
-//! column. `std` has none, so [`Timestamp::to_iso8601`] and [`Timestamp::parse_iso8601`] go through
-//! `time` — parsing and formatting only, with no timezone database, since the column is always UTC.
+//! One exception, and it is the schema's rather than a preference: `workflow_schedules.last_fired_at`
+//! holds ISO-8601 text, so a calendar is unavoidable for that column. `std` has none, so
+//! [`Timestamp::to_iso8601`] and [`Timestamp::parse_iso8601`] go through `time` — parsing and
+//! formatting only, with no timezone database, since the column is always UTC.
 
 use super::Error;
 use std::fmt;
@@ -152,11 +152,9 @@ impl Timestamp {
     /// Formats as ISO-8601 in UTC: `2026-08-12T14:30:00.123Z`, or `2026-08-12T14:30:00Z` on a
     /// whole second.
     ///
-    /// For [`workflow_schedules.last_fired_at`][lf], the one column in the schema holding a
-    /// formatted instant rather than epoch milliseconds. This is Go's and Java's spelling of the
-    /// four; every implementation's reader accepts it.
-    ///
-    /// [lf]: crate::sysdb::SystemDatabase::update_schedule_last_fired_at
+    /// For [`workflow_schedules.last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at),
+    /// the one column in the schema holding a formatted instant rather than epoch milliseconds.
+    /// This is Go's and Java's spelling of the four; every implementation's reader accepts it.
     ///
     /// Infallible in practice and `String` rather than `Result` because of it: the only way
     /// `time` refuses to format is a year outside its range, which is four orders of magnitude
@@ -451,6 +449,11 @@ pub struct WorkflowRecord {
 /// - `output`, `error`, `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and
 ///   `rate_limited` belong to execution, forking, and the rate limiter. A workflow that has
 ///   not started has no output to offer.
+/// - `parent_workflow_id` belongs to the child start, and travels on [`InitWorkflowCaller`] with
+///   the rest of what the parent contributes. A workflow has a parent exactly when its start was
+///   recorded against one — the two are one event, and one of them writing without the other is
+///   the state the pair exists to make unreachable, so there is no caller who can meaningfully
+///   set the column alone.
 ///
 /// Java draws the same line with `WorkflowStatusInternal`. Python and Go pass their full row
 /// type instead, but Go's is a package-internal call taking a transaction, and Python's carries
@@ -531,8 +534,6 @@ pub struct NewWorkflow<'a> {
     /// The role actually assumed.
     pub assumed_role: Option<&'a str>,
 
-    /// The workflow that started this one.
-    pub parent_workflow_id: Option<&'a str>,
     /// The schedule that triggered this workflow. Set only by the scheduler.
     pub schedule_name: Option<&'a str>,
     /// Caller-supplied JSON attributes, stored in a `jsonb` column.
@@ -1114,17 +1115,16 @@ impl<'a> Outcome<'a> {
 /// workflow rather than by it, so they are states no run ever reports — and it is precisely the
 /// caller waiting on a workflow it is not running that has to be told about them.
 ///
-/// **"Awaited" is the references' own word for that side of the relationship**, and it is
-/// load-bearing rather than decorative: Python raises `DBOSAwaitedWorkflowCancelledError`
-/// specifically so a cancelled *awaited* workflow is not mistaken for the *awaiting* one having
-/// been cancelled. The same distinction is why the variants below are values — see the second
-/// bullet.
+/// **"Awaited" is the references' own word for that side of the relationship**, and it is load-bearing
+/// rather than decorative: Python raises `DBOSAwaitedWorkflowCancelledError` specifically so a
+/// cancelled *awaited* workflow is not mistaken for the *awaiting* one having been cancelled. The
+/// same distinction is why the variants below are values — see the second bullet.
 ///
-/// Not named for terminality, because one variant is not terminal: [`WorkflowStatus::is_terminal`]
-/// is deliberately false for
+/// Not named for terminality, because one variant is not terminal:
+/// [`WorkflowStatus::is_terminal`] is deliberately false for
 /// [`MaxRecoveryAttemptsExceeded`](WorkflowStatus::MaxRecoveryAttemptsExceeded), which
-/// [`Parked`](Self::Parked) is. It ends a *wait* without ending the workflow, since the workflow
-/// can still be resumed.
+/// [`Parked`](Self::Parked) is. It ends a *wait* without ending the workflow, since the workflow can
+/// still be resumed.
 ///
 /// **All four come back as values, including the two that are failures.** Two reasons, and the
 /// second is the one that would be a bug:
@@ -1262,9 +1262,9 @@ impl WorkflowDelay {
 ///
 /// The references model this as two booleans, `is_recovery_request` and `is_dequeued_request`,
 /// but **no call site in any of them sets both** — Python's dispatchers pass exactly
-/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. That is a
-/// three-way choice, and naming it removes an unreadable pair of adjacent `bool` arguments that
-/// would compile just as happily swapped.
+/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. A
+/// three-way choice is what it has always been, and naming it removes an unreadable pair of
+/// adjacent `bool` arguments that would compile just as happily swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Submission {
     /// A first attempt, which does not claim a workflow another owner already holds.
@@ -1666,9 +1666,8 @@ impl DebounceRequest<'_> {
 /// What a debounce did, or why it could not.
 ///
 /// Recorded as a debounce step's output when one runs inside a workflow, so a replay reports what
-/// the first run did rather than bouncing again — see [`debounce_delayed_workflow`][d].
-///
-/// [d]: crate::sysdb::SystemDatabase::debounce_delayed_workflow
+/// the first run did rather than bouncing again — see
+/// [`SystemDatabase::debounce_delayed_workflow`](crate::sysdb::SystemDatabase::debounce_delayed_workflow).
 ///
 /// Three outcomes rather than the flat record the references return: their `DebounceResult`
 /// carries `bounced_workflow_id` alongside a run of `holder_*` fields, of which exactly one group
@@ -1818,7 +1817,7 @@ impl QueueRecord {
     /// **The deprecated flag re-scopes rather than adds.** Under `partition_queue`, `concurrency`,
     /// `worker_concurrency` and the rate limit all apply *per partition* — so they move into the
     /// partition fields and the queue-wide ones are dropped, leaving nothing enforced queue-wide.
-    /// That is what the flag means; Python spells it `_resolve_limits` and TypeScript
+    /// That is what the flag has always meant; Python spells it `_resolve_limits` and TypeScript
     /// `resolveQueueLimits`, both returning exactly this, and reading such a row any other way
     /// would either over-admit or strand a peer's backlog.
     ///
@@ -1983,6 +1982,44 @@ pub struct GetEventCaller<'a> {
     pub timeout_step_id: i32,
 }
 
+/// The workflow an [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) creates a child
+/// on behalf of, and the step the start is recorded under.
+///
+/// Named for its one method, as [`GetEventCaller`] is, and a struct for the same reason and then a
+/// second: this carries a step *name* as well as the two ids, and the name is the child workflow's
+/// own rather than a cross-SDK constant, so `Some(("wf", 4, "checkout"))` reads as three unrelated
+/// values. `None` is a root start — a workflow begun from outside any workflow, which has no
+/// parent to record against.
+///
+/// **Everything the parent contributes is here, including the id the child's own row carries.**
+/// It was on [`NewWorkflow`] as well to begin with, which is one fact spelled twice and two
+/// chances to disagree: nothing would have caught a caller naming one parent on the row and
+/// another on the step. Grouping it here makes the agreement structural rather than checked — a
+/// row gets a parent exactly when a start is recorded against that parent, because the same value
+/// writes both — and it is where [`NewWorkflow`]'s own rule puts it, that type holding the columns
+/// a caller may meaningfully set and leaving the ones a mechanism owns to the mechanism.
+///
+/// **Passing this is what makes the two writes one.** The child's row and the parent's record of
+/// having started it commit together, so no observer and no replay ever sees a child that exists
+/// with nothing pointing at it. The alternative — the caller writing the record itself, on the
+/// next round trip — leaves a window in which a crash, or merely a dropped future, produces
+/// exactly that: a workflow nothing started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitWorkflowCaller<'a> {
+    /// The workflow doing the starting: the record is written against it, and the child's row
+    /// points back at it.
+    pub parent_workflow_id: &'a str,
+    /// The step the start occupies in the parent, claimed before this call was made.
+    pub step_id: i32,
+    /// What the step is called, which is the child workflow's bare name — see
+    /// [`record_child_workflow`](crate::sysdb::SystemDatabase::record_child_workflow), whose
+    /// column this shares.
+    pub step_name: &'a str,
+    /// When the start began, for the row's `started_at`. The completion is stamped by the write
+    /// itself, since the step spans the launch alone.
+    pub started_at: Timestamp,
+}
+
 /// An encoded payload and the format it is encoded in.
 ///
 /// What the blocking reads return: this layer moves payloads as opaque strings and never decodes
@@ -2060,9 +2097,8 @@ pub struct Fork<'a> {
     pub source_id: &'a str,
     /// The id the fork gets, or `None` to have one generated.
     ///
-    /// Optional because Go and TypeScript both generate one when the caller does not care, and the
-    /// generated ids come back from
-    /// [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    /// Optional because Go and TypeScript both generate one when the caller does not care, and
+    /// the generated ids come back from [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
     pub forked_id: Option<&'a str>,
     /// The first step the fork will run.
     ///
@@ -2147,8 +2183,7 @@ pub struct ForkOptions<'a> {
     /// Forking onto a *new* version is the point of the parameter: a workflow that failed on a
     /// broken deployment is forked onto the fixed one.
     pub application_version: Option<&'a str>,
-    /// The queue the fork is enqueued on. `None` means
-    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    /// The queue the fork is enqueued on. `None` means [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
     ///
     /// A fork is always enqueued rather than started: it is created by whoever asked for the
     /// fork, and run by whichever executor picks it up.
@@ -2226,10 +2261,9 @@ impl ForkOptions<'_> {
 ///
 /// **Here rather than in a backend, because they are stored contract.** Each of these lands in
 /// `operation_outputs.function_name`, where a replay compares it, Conductor renders it, and another
-/// SDK's step listing has to agree with it — so they belong beside the row shapes rather than
-/// beside the SQL of whichever backend happens to write them. A second backend that redeclared them
-/// could drift from this one silently, and nothing would notice until a workflow crossed between
-/// the two.
+/// SDK's step listing has to agree with it — so they belong beside the row shapes rather than beside
+/// the SQL of whichever backend happens to write them. A second backend that redeclared them could
+/// drift from this one silently, and nothing would notice until a workflow crossed between the two.
 ///
 /// **Public because a caller may legitimately need to name one** — filtering a step listing to the
 /// engine's own operations, or grouping by them — and retyping a string the engine already owns is
@@ -2247,7 +2281,9 @@ pub mod step_names {
     /// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT`].
     pub const SLEEP: &str = "DBOS.sleep";
 
-    /// The step names `send_messages` records, chosen by how many messages it was given.
+    /// The step names the two send methods record, one each: `send_message` writes [`SEND`] and
+    /// `send_messages` writes [`SEND_BULK`]. The name is therefore the API surface the caller
+    /// reached for, never the batch's length — a batch of one is still a batch.
     ///
     /// `"DBOS.send"` is unanimous — all four implementations record exactly that for a single send,
     /// and a workflow replayed by another must find the name it expects or raise `UnexpectedStep`.
@@ -2257,13 +2293,10 @@ pub mod step_names {
     /// this constant family is camelCase already — `DBOS.setEvent`, `DBOS.getEvent` — so
     /// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
     ///
-    /// One system-database method serves both API surfaces, so the batch size stands in for which
-    /// one the caller reached for. A single send always carries exactly one message; anything else,
-    /// including an empty batch, came from the bulk API.
-    ///
-    /// A workflow whose message count changes between runs will flip names and be caught as
-    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep). That is nondeterminism in
-    /// the workflow, and catching it is the point of recording the name at all.
+    /// A method apiece is why: the name comes from which one was called, so nothing has to infer
+    /// it. Inferring it from the batch size — as this once did — recorded a one-message bulk send
+    /// as `DBOS.send`, which is not the call the caller made. Python and Java pass the name down
+    /// from their two surfaces in exactly the same way.
     pub const SEND: &str = "DBOS.send";
     pub const SEND_BULK: &str = "DBOS.sendBulk";
 
@@ -2293,48 +2326,60 @@ pub mod step_names {
     /// reason both of those exist rather than the caller passing a name.
     pub const GET_RESULT: &str = "DBOS.getResult";
 
-    /// The step names a wait over several workflow handles records.
+    /// The step name a wait for the *first* of several workflows records.
     ///
-    /// **The two exceptions in this table: named for the calls that write them rather than for a
-    /// reference.** Every other constant here is a string another implementation already writes,
-    /// so a step row a Python or TypeScript reader may see says what that reader calls the
-    /// operation. Python records `"DBOS.waitFirst"` (`_dbos.py:1634`) and TypeScript the same
-    /// string; TypeScript alone records `"DBOS.waitAll"`; Go and Java have neither call. This
-    /// crate names its calls [`select_workflow`](crate::select_workflow()) and
-    /// [`join_workflows`](crate::join_workflows()), after the concurrency shapes rather than the
-    /// wait, and a step listing should name the call the caller wrote — so these follow the calls.
+    /// **The one exception in this table: named for the call that writes it rather than for a
+    /// reference.** Every other constant here is a string some other implementation already writes,
+    /// because a step row a Python or TypeScript reader may see should say what that reader calls
+    /// the operation. This one does not follow that rule. Python records `"DBOS.waitFirst"`
+    /// (`_dbos.py:1634`) and TypeScript records the same string from `DBOS.waitFirst`; this crate
+    /// names the call [`select_workflow`](crate::select_workflow()), after the concurrency shape
+    /// rather than after the wait, and the step a caller reads in a listing is named for the call
+    /// they wrote — so this follows the call.
     ///
-    /// **The cost** is that a Rust workflow's wait steps do not line up with the same wait's in
-    /// Python or TypeScript: a cross-SDK reader such as Conductor's step listing sees two names for
-    /// one operation. Nothing breaks, because no implementation reads another's step *names* to
-    /// decide anything — the name is what a replay of this workflow checks against its own row.
-    /// The spelling keeps the table's convention, `DBOS.` and camelCase, so the divergence is the
-    /// word and not the shape.
+    /// **What that costs, stated plainly.** A Rust workflow's wait steps do not line up with the
+    /// same wait's steps in Python or TypeScript: a cross-SDK reader — Conductor's step listing, or
+    /// anything grouping steps by name across implementations — sees two names for one operation.
+    /// Nothing breaks, because no implementation reads another's step *names* to decide anything;
+    /// the name is what a replay of this workflow checks against its own row, and that stays
+    /// internally consistent. The spelling still follows the table's convention, `DBOS.` and
+    /// camelCase, so the divergence is the word and not the shape.
     ///
-    /// **What each one records is not the same shape.** A first-wait's answer is a *choice* — the
-    /// id that won — and a replay that made it again could pick a different winner and take a
-    /// different branch, so the winner is the step's output. An all-wait has no choice to make:
-    /// every id it was given has settled by the time it returns, in whatever order, and the
-    /// handles come back in the order the caller passed them. Its checkpoint therefore carries no
-    /// payload and exists only to skip the poll, which is exactly what TypeScript's records.
-    ///
-    /// Neither is a bulk/singular pair like [`CANCEL_WORKFLOW`] — these are two different
-    /// operations, and a workflow that switched between them between runs has changed what it waits
-    /// for, which is nondeterminism worth raising
-    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) over.
+    /// **There is no constant for the all-wait, because it records nothing.** TypeScript writes a
+    /// `"DBOS.waitAll"` row from the `runInternalStep` label in `DBOS.waitAll`, and Go, Java and
+    /// Python have the call nowhere. [`join_workflows`](crate::join_workflows()) is a plain wait
+    /// on every surface: it makes no choice a replay could make differently, and the
+    /// [`GET_RESULT`] steps it is written to precede already record the outcomes a replay reads.
+    /// The free [`join_workflows`](crate::join_workflows()) sets out the argument.
     pub const SELECT_WORKFLOW: &str = "DBOS.selectWorkflow";
-    pub const JOIN_WORKFLOWS: &str = "DBOS.joinWorkflows";
+
+    /// The step name a durable race over steps records.
+    ///
+    /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above
+    /// and for the same reason. Go's `Select` records `"DBOS.select"`
+    /// (`workflow.go:3082`); this crate's call is [`select_step!`](crate::select_step), because a
+    /// bare `select` in a Rust namespace reads as a future combinator where this one takes only
+    /// steps, and the recorded name follows the call a reader wrote. Python's `asyncio_wait`
+    /// records `"DBOS.asyncio_wait"` and could not have been borrowed at all.
+    ///
+    /// Affordable for the reason [`SELECT_WORKFLOW`] states in full: nothing reads a step name across
+    /// implementations, since a workflow only crosses one by enqueue and an enqueued workflow
+    /// starts from step zero. The divergence is the word and not the shape.
+    ///
+    /// **What it records is a position, not an outcome**: the index of the branch that won, among
+    /// the branches that race at this point in the code. The winner's own result is under the
+    /// winning step's own id, so recording it here too would keep one outcome in two places.
+    pub const SELECT_STEP: &str = "DBOS.selectStep";
 
     /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT`].
     pub const RECV: &str = "DBOS.recv";
 
     /// The step a debounce records when a workflow does the bouncing.
     ///
-    /// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations
-    /// disagree on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's,
-    /// which is the form DBOS's own type names take. Nothing reads a step name across languages,
-    /// since a workflow only crosses one by enqueue, so this is a convention rather than a wire
-    /// format.
+    /// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations disagree
+    /// on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's, which is the
+    /// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
+    /// only crosses one by enqueue, so this is a convention rather than a wire format.
     pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
 
     /// The step names the management surface records, which a replay compares against.
@@ -2347,12 +2392,11 @@ pub mod step_names {
     ///
     /// **The singular name covers the bulk form too.** Python, TypeScript and Java record the
     /// singular whatever the batch size; Go pluralizes, and inconsistently — `DBOS.cancelWorkflow`
-    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one. Three
-    /// of four decides it, and one name per operation is worth having on its own: the singular
-    /// forms here *are* the bulk ones with a single id, so a workflow that switches between
-    /// [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all) between runs
-    /// still replays instead of raising
-    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
+    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one.
+    /// Three of four decides it, and one name per operation is worth having on its own: the
+    /// singular forms here *are* the bulk ones with a single id, so a workflow that switches
+    /// between [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all)
+    /// between runs still replays instead of raising [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
     ///
     /// **[`LIST_WORKFLOW_STEPS`] follows the three, not Go**, which records
     /// `DBOS.getWorkflowSteps` where Python, TypeScript and Java all say `listWorkflowSteps`.
@@ -2390,13 +2434,13 @@ pub mod step_names {
 
     /// The step names the schedule methods record, which a replay compares against.
     ///
-    /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`.
-    /// Pause and resume are two names there because they are two API calls; they reach one method
-    /// here, so the name follows the status being set rather than the method being called.
+    /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause
+    /// and resume are two names there because they are two API calls; they reach one method here, so
+    /// the name follows the status being set rather than the method being called.
     ///
     /// **`DBOS.upsertSchedule` is the exception**: TypeScript has no such method — its upsert is
-    /// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is
-    /// this crate's, camelCased from Python's by analogy with the seven that are verbatim.
+    /// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is this
+    /// crate's, camelCased from Python's by analogy with the seven that are verbatim.
     pub const CREATE_SCHEDULE: &str = "DBOS.createSchedule";
     pub const UPSERT_SCHEDULE: &str = "DBOS.upsertSchedule";
     pub const GET_SCHEDULE: &str = "DBOS.getSchedule";
@@ -2504,16 +2548,13 @@ pub struct ScheduleRecord {
     /// Stored as ISO-8601 text rather than the epoch milliseconds every other time column holds,
     /// and read back through [`Timestamp::parse_iso8601`] so a caller gets an instant either way.
     /// The four implementations write four spellings of it — see
-    /// [`update_schedule_last_fired_at`][u].
-    ///
-    /// [u]: crate::sysdb::SystemDatabase::update_schedule_last_fired_at
+    /// [`SystemDatabase::update_schedule_last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at).
     pub last_fired_at: Option<Timestamp>,
     /// Whether missed firings are made up when a paused or stopped schedule resumes.
     pub automatic_backfill: bool,
     /// The timezone the cron expression is read in, or `None` for UTC.
     pub cron_timezone: Option<String>,
-    /// The queue firings are enqueued onto, or `None` for
-    /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    /// The queue firings are enqueued onto, or `None` for [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
     pub queue_name: Option<String>,
     /// The application that owns the schedule, or `None` if it is unclaimed.
     pub application_name: Option<String>,
@@ -2532,7 +2573,7 @@ pub struct NewSchedule<'a> {
     /// higher, at every call site that registers a schedule, and hand this layer a value it must
     /// take. That is the same split `application_name` has, and it resolves the same way: the
     /// fallback lives here because nothing sits above this layer yet, and becomes a second line
-    /// of defence rather than the only one once the scheduler's registration does.
+    /// of defence rather than the only one once Phase 2's registration layer does.
     pub schedule_id: Option<&'a str>,
     /// See [`ScheduleRecord::schedule_name`].
     pub schedule_name: &'a str,

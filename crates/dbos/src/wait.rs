@@ -41,10 +41,10 @@
 //!
 //! **They return handles; these return ids.** `DBOS.waitFirst` hands back the handle that won,
 //! which in a language without ownership costs nothing: the caller still holds the others. Handing
-//! back an owned [`WorkflowHandle`](crate::WorkflowHandle) here would mean taking the whole set by
-//! value and dropping every loser, which is precisely the wrong thing for the loop the call exists
-//! for. So the answer is the winner's **id** — the identity the handle carried anyway, and the same
-//! thing the checkpoint stores, so nothing is projected on the way out and re-derived on replay.
+//! back an owned [`WorkflowHandle`] here would mean taking the whole set by value and dropping
+//! every loser, which is precisely the wrong thing for the loop the call exists for. So the answer
+//! is the winner's **id** — the identity the handle carried anyway, and the same thing the
+//! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
 //!
 //! A position in the slice was the other candidate and is worse on every count that matters: it is
 //! the only positional return anywhere in this crate (`cancel_all` and its neighbours take ids and
@@ -76,42 +76,59 @@
 //! take, and a function and its macro that do the same thing under two different names is a seam to
 //! learn for nothing.
 //!
-//! **The recorded step names follow the calls**, which is the one place in
+//! **The recorded step name follows the call**, which is the one place in
 //! [`step_names`](crate::sysdb::types::step_names) that a reference's string is not taken:
-//! `DBOS.selectWorkflow` and `DBOS.joinWorkflows` where Python and TypeScript write
-//! `DBOS.waitFirst` and `DBOS.waitAll`. A step listing should name the call the caller wrote, and
-//! nothing across the SDKs reads another's step names to decide anything — a replay checks its own
-//! workflow's rows. The cost is that one operation has two names when steps are read across
-//! implementations, and the constants say so.
+//! `DBOS.selectWorkflow` where Python and TypeScript write `DBOS.waitFirst`. A step listing should
+//! name the call the caller wrote, and nothing across the SDKs reads another's step names to
+//! decide anything — a replay checks its own workflow's rows. The cost is that one operation has
+//! two names when steps are read across implementations, and the constant says so. The all-wait
+//! records no step at all, so it needs no name.
 //!
 //! # Called from inside a workflow
 //!
-//! Both are **checkpointed as a step of the calling workflow**, under
-//! [`SELECT_WORKFLOW`](crate::sysdb::types::step_names::SELECT_WORKFLOW) and
-//! [`JOIN_WORKFLOWS`](crate::sysdb::types::step_names::JOIN_WORKFLOWS). What that buys differs
-//! between them, and the difference is the whole reason `select_workflow` records a payload and
-//! `join_workflows` does not:
+//! **`select_workflow` is checkpointed as a step of the calling workflow**, under
+//! [`SELECT_WORKFLOW`](crate::sysdb::types::step_names::SELECT_WORKFLOW), because it records a
+//! *choice*. A replay that raced again could see a different member finish first and take a
+//! different branch, which would make the workflow nondeterministic in the one way a workflow may
+//! never be. So the winner's id is the step's output, and a replay hands back the same id without
+//! waiting.
 //!
-//! - **`select_workflow` records a choice.** A replay that raced again could see a different
-//!   member finish first and take a different branch, which would make the workflow
-//!   nondeterministic in the one way a workflow may never be. So the winner's id is the step's
-//!   output, and a replay hands back the same id without waiting.
-//! - **`join_workflows` records only that it happened.** Every member has settled by the time it
-//!   returns, in whatever order, so there is no choice to pin — the checkpoint exists to skip the
-//!   poll on replay, which is what TypeScript's checkpoint records too.
+//! **`join_workflows` is checkpointed nowhere, on any of its three surfaces.** It decides nothing:
+//! every member has settled by the time it returns, in whatever order, so there is no choice for a
+//! step to pin. TypeScript wraps its `waitAll` in a `runInternalStep` all the same, recording only
+//! that the wait happened, and that row is not worth a step id here — for a reason stronger than
+//! the row being cheap:
 //!
-//! **A replay checks what its payload lets it check, and no more.** `select_workflow` can ask
-//! whether the recorded winner is still in the set, because the winner is what it recorded anyway;
-//! the all-wait recorded no set and so cannot ask the same of one. A workflow resumed or forked
-//! with a member the first execution never waited on therefore skips the wait for it, exactly as a
-//! [`sleep`](crate::sleep) whose duration changed keeps the deadline it recorded. Step *inputs* are
-//! not checkpointed anywhere in DBOS — no implementation's step row has a column for them — so a
-//! replay whose arguments changed reads back the answer to the question it asked the first time.
-//! This is that rule rather than an exception to it.
+//! - **Whatever it could pin is already pinned harder by what comes after it.** An all-wait is
+//!   written to be followed by [`result`](crate::WorkflowHandle::result) on each handle, and each
+//!   of *those* is a step recording the outcome the workflow branches on. A replay reads those
+//!   rows back and never looks at the children at all, so a recorded wait in front of them is a
+//!   write no replay path reads.
+//! - **A wait whose results are never read has nothing worth pinning either.** The recorded fact
+//!   is "they had all settled", and the wait re-derives it by asking once — every member is
+//!   settled already, so the poll answers on its first pass.
+//! - **The step id is the expensive part, not the row.** An id is a position in this workflow's
+//!   counter, and every call that takes one has to be written the same way on every execution or
+//!   each later step lands on a slot it did not record. A call that pins no decision should not be
+//!   spending one.
 //!
-//! Outside a workflow neither is checkpointed and both are plain waits, which is the operator's
-//! and the client's case. Inside a *step* they are plain too, by the leaf rule every id-allocating
-//! call in this crate follows. [`Placement`] owns those rules and the argument for each.
+//! **What that costs is one narrow case, and it is the honest reading of the call.** A member
+//! *resumed* after it settled — a cancelled workflow put back on a queue — is waited for again by
+//! a replay, where a recorded step would have returned at once. The wait answers a question about
+//! the set *now*, and a `select_workflow` beside it still pins every choice made on the strength
+//! of one.
+//!
+//! **A replay of a first-wait checks what its payload lets it check, and no more.** It can ask
+//! whether the recorded winner is still in the set, because the winner is what it recorded anyway.
+//! Step *inputs* are not checkpointed anywhere in DBOS — no implementation's step row has a column
+//! for them — so a replay whose arguments changed reads back the answer to the question it asked
+//! the first time, exactly as a [`sleep`](crate::sleep) whose duration changed keeps the deadline
+//! it recorded.
+//!
+//! Outside a workflow the first-wait is not checkpointed either, which is the operator's and the
+//! client's case; inside a *step* it is plain too, by the leaf rule every id-allocating call in
+//! this crate follows. [`StepPlacement`] owns those rules and the argument for each. The all-wait
+//! is the same call in all four places.
 //!
 //! # Three surfaces, split by where the caller stands
 //!
@@ -164,11 +181,12 @@
 //! interval and nothing else — but where they would have to grow a parameter to bound the wait,
 //! the language already supplies it.
 
-use crate::checkpoint::Placement;
+use std::sync::Arc;
+
+use crate::checkpoint::{PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
-use crate::context::Ctx;
-use crate::dbos::DBOS;
 use crate::error::{Error, Result};
+use crate::instance::DBOS;
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 
@@ -180,9 +198,13 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// it is why [`get_event`](crate::get_event) is a free function too.
 ///
 /// The wait is checkpointed as a step, so a replay returns the same winner instead of racing
-/// again. The error is the *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no
-/// conversion. From inside a *step* it waits plainly with no checkpoint, the step's own checkpoint
-/// standing for everything its body did.
+/// again. **Its step id is taken here, at the call, not at the first poll** — see
+/// [`PendingStep`] — so a wait built beside a step and driven with it by `tokio::join!` takes the
+/// same slot on every execution, whatever it was passed: an empty set is placed like any other and
+/// its refusal recorded as the step's own outcome, so a replay refuses again. The error is
+/// the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion. From inside
+/// a *step* it waits plainly with no checkpoint, the step's own checkpoint standing for everything
+/// its body did.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -201,23 +223,48 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 ///
 /// Outside a workflow there is no context to read, so this is [`Error::NotInWorkflow`]. That is
 /// where [`DBOS::select_workflow`] is the call.
-pub async fn select_workflow<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<String, E> {
-    let Some(ctx) = Ctx::current() else {
-        return Err(Error::NotInWorkflow {
-            operation: "select_workflow".into(),
-        });
-    };
-    ctx.executor()
-        .connection()
-        .select_workflow(workflow_ids)
-        .await
-        .map_err(Error::lift)
+///
+/// **This rather than a [`select_step!`](crate::select_step) over the handles' awaits**, wherever
+/// the branches are all workflows. Both are durable — an await is a step like any other — but this
+/// settles the whole set with one query per poll interval, where N raced awaits are N pollers
+/// asking separately. `select_step!` is for a race whose branches are not all of one kind.
+pub fn select_workflow<'a, E: crate::DurableError + 'a>(
+    workflow_ids: &'a [&'a str],
+) -> PendingStep<'a, String, E> {
+    let built = StepPlacement::ambient_connection("select_workflow")
+        .and_then(|conn| Connection::placed(&conn, "select_workflow"));
+    Connection::pending_select_workflow(built, workflow_ids)
 }
 
 /// Waits until every one of these workflows has finished.
 ///
 /// The all-form of the free [`select_workflow`](fn@select_workflow), and the waiter a fan-out that
-/// needs every answer reaches for. Same context rules, same checkpoint, same error channel.
+/// needs every answer reaches for. Same context rules and same error channel — but **nothing is
+/// checkpointed and no step id is taken**, here or on any other surface, for the reasons the
+/// module doc gives: an all-wait decides nothing, and the
+/// [`result`](crate::WorkflowHandle::result) calls it exists to precede record the outcomes a
+/// replay actually reads.
+///
+/// So this is an ordinary `async fn` where the first-wait is a [`PendingStep`], and being inside a
+/// workflow is what it needs only to find an executor to wait through — which it looks for when
+/// the future is first polled, since it has nothing to claim before then. Outside a workflow that
+/// is [`Error::NotInWorkflow`], and [`DBOS::join_workflows`] is the call.
+///
+/// **An empty set is a satisfied wait**, answered at once, where an empty
+/// [`select_workflow`](fn@select_workflow) is refused. That difference cost something when this
+/// took a step id — a set computed from state could be empty on one execution and not the next,
+/// shifting every later step — and costs nothing now that it takes none.
+///
+/// **A replay asks the set again, rather than returning from anything it recorded.** That is the
+/// point of taking no step id, and it is what makes the members' *current* state the answer. The
+/// case where it shows is a member deleted between one execution and the next: it never settles, so
+/// the replayed join keeps waiting, where [`result`](crate::WorkflowHandle::result) on the same
+/// handle would have read the outcome back out of the parent's own row.
+///
+/// Neither is the defined behaviour of a deleted workflow. Removing one that a parent is still
+/// replaying through is collecting what is not garbage — the parent's recorded outcomes make some
+/// paths survive it, this one does not, and the difference is not a contract either way. A fan-out
+/// that must tolerate it should await its handles rather than join them first.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -234,15 +281,9 @@ pub async fn select_workflow<E: crate::DurableError>(workflow_ids: &[&str]) -> R
 /// }
 /// # Ok(total) }
 /// ```
-pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> Result<(), E> {
-    let Some(ctx) = Ctx::current() else {
-        return Err(Error::NotInWorkflow {
-            operation: "join_workflows".into(),
-        });
-    };
-    ctx.executor()
-        .connection()
-        .join_workflows(workflow_ids)
+pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> crate::Result<(), E> {
+    let conn = StepPlacement::ambient_connection("join_workflows").map_err(Error::lift)?;
+    Connection::join_workflows(&conn, workflow_ids)
         .await
         .map_err(Error::lift)
 }
@@ -315,8 +356,8 @@ pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> Re
 ///
 /// **A branch is a variable holding a handle, not an arbitrary expression.** The handle is named
 /// twice, once for its id and once to consume it, and an expression would be evaluated twice —
-/// which for `child.start(n).await?` would start the workflow twice. A workflow body starts its
-/// children one at a time anyway, so they are already bound.
+/// which for `child.start(n).await?` would start the workflow twice. A handle a body means to race
+/// has been bound to a name by the time it gets here in any case.
 ///
 /// **Two branches naming the same workflow are answered by the first**, in the order the arms are
 /// written. [`select_workflow`](fn@select_workflow) accepts a repeated id for the same reason: the
@@ -402,9 +443,10 @@ macro_rules! select_workflow {
 /// # Ok(format!("{name} counted to {count}")) }
 /// ```
 ///
-/// **Nothing new is recorded, and the awaits stay sequential.** The expansion is one
-/// [`join_workflows`](fn@join_workflows) and then [`result`](crate::WorkflowHandle::result) on each
-/// handle in source order. Sequential is not a concession here: the set is already settled by the
+/// **The results are what get recorded, and the awaits stay sequential.** The expansion is one
+/// [`join_workflows`](fn@join_workflows), which records nothing, and then
+/// [`result`](crate::WorkflowHandle::result) on each handle in source order — so the whole of what
+/// a replay reads back is the N `DBOS.getResult` rows. Sequential is not a concession here: the set is already settled by the
 /// time the first result is read, so every one of them is a row read that does not wait — and
 /// taking them in source order is what keeps each `DBOS.getResult` on the step id its replay
 /// expects.
@@ -536,9 +578,11 @@ impl DBOS {
     /// usable before every enqueue has committed — and what makes a mistyped id a wait that never
     /// ends. That is the trade every reference makes here, and the bound on it is dropping the
     /// future.
-    pub async fn select_workflow(&self, workflow_ids: &[&str]) -> Result<String> {
-        let executor = self.executor("select_workflow")?;
-        executor.connection().select_workflow(workflow_ids).await
+    pub fn select_workflow<'a>(&self, workflow_ids: &'a [&'a str]) -> PendingStep<'a, String> {
+        let built = self
+            .executor("select_workflow")
+            .and_then(|executor| Connection::placed(executor.connection(), "select_workflow"));
+        Connection::pending_select_workflow(built, workflow_ids)
     }
 
     /// Waits until every one of these workflows has finished.
@@ -563,9 +607,24 @@ impl DBOS {
     /// settling is a property of an id, so a repeated one is simply satisfied twice. **An empty
     /// slice returns at once** — nothing to wait for is a satisfied wait, where an empty first-wait
     /// has no answer and is refused.
+    ///
+    /// **Nothing is checkpointed**, unlike [`select_workflow`](Self::select_workflow) and unlike
+    /// every reference that has this call — the module doc argues it. Two consequences follow from
+    /// that and are worth stating. A member *resumed* after it settled, a cancelled workflow put
+    /// back on a queue, is waited for again by a replay where a recorded step would have returned
+    /// at once — that is the call answering the question it was asked, which is about the set now.
+    /// And a member *deleted* between one execution and the next never settles, so a replayed join
+    /// waits where awaiting each handle in turn would have read back the outcomes the parent
+    /// already recorded; the free [`join_workflows`](fn@join_workflows) sets out why, and what to
+    /// reach for instead.
+    ///
+    /// Called from inside a workflow it behaves exactly as it does outside one, so an instance
+    /// that is not the ambient workflow's is a plain wait here rather than
+    /// [`Error::WrongInstance`]: there is no step id for two counters to disagree about, which is
+    /// the only thing that error ever guarded.
     pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
         let executor = self.executor("join_workflows")?;
-        executor.connection().join_workflows(workflow_ids).await
+        Connection::join_workflows(executor.connection(), workflow_ids).await
     }
 }
 
@@ -588,14 +647,17 @@ impl crate::Client {
     /// See [`DBOS::select_workflow`]. Nothing is checkpointed, because a client has nothing to
     /// checkpoint against.
     pub async fn select_workflow(&self, workflow_ids: &[&str]) -> Result<String> {
-        self.connection().select_workflow(workflow_ids).await
+        let (conn, placement) = Connection::placed(self.connection(), "select_workflow")?;
+        Connection::select_workflow(&conn, placement, workflow_ids).await
     }
 
     /// Waits until every one of these workflows has finished.
     ///
-    /// See [`DBOS::join_workflows`]. Nothing is checkpointed, for the same reason.
+    /// See [`DBOS::join_workflows`], which a client reaches by the same body: an all-wait is
+    /// checkpointed nowhere, so this surface differs from that one only in where it finds a
+    /// connection.
     pub async fn join_workflows(&self, workflow_ids: &[&str]) -> Result<()> {
-        self.connection().join_workflows(workflow_ids).await
+        Connection::join_workflows(self.connection(), workflow_ids).await
     }
 }
 
@@ -618,29 +680,69 @@ fn summarize(workflow_ids: &[&str]) -> String {
 }
 
 impl Connection {
-    /// The first-wait itself, shared by both surfaces.
+    /// The connection the first-wait goes through, paired with where that wait stands.
+    ///
+    /// **The set is not looked at here**, which is the point rather than an omission: which slot a
+    /// wait occupies must depend on where it was written, never on what it was passed. A set
+    /// computed from state can be empty on one execution and not on the next, and a call that took
+    /// an id in one and none in the other shifts every later step of that workflow onto a slot it
+    /// did not record. So an empty set is placed like any other and refused by the run, with the
+    /// refusal recorded. TypeScript's `waitAll` returns early on an empty handle list, ahead of
+    /// `runInternalStep`, and carries that hazard; the all-wait here takes no id at all and so has
+    /// no slot to keep stable.
+    ///
+    /// A repeated id is not looked at either: the first-wait answers with the id itself, which
+    /// names one workflow however many entries pointed at it.
+    pub(crate) fn placed(
+        conn: &Arc<Self>,
+        operation: &'static str,
+    ) -> Result<(Arc<Self>, StepPlacement)> {
+        let placement = StepPlacement::of(conn, operation)?;
+        Ok((Arc::clone(conn), placement))
+    }
+
+    /// The first-wait as a [`PendingStep`], for the two surfaces that take a step id.
+    ///
+    /// The free [`select_workflow`](fn@crate::select_workflow) and [`DBOS::select_workflow`] differ
+    /// only in how they reach a connection and in which error channel they answer in, which is the
+    /// whole of what `built` carries; a [`Client`](crate::Client)'s stays a plain `async fn`,
+    /// because it takes no id and is legitimately driven from anywhere.
+    pub(crate) fn pending_select_workflow<'a, E: crate::DurableError + 'a>(
+        built: Result<(Arc<Self>, StepPlacement)>,
+        workflow_ids: &'a [&'a str],
+    ) -> PendingStep<'a, String, E> {
+        PendingStep::placed(
+            step_names::SELECT_WORKFLOW,
+            built,
+            move |conn, placement| async move {
+                Self::select_workflow(&conn, placement, workflow_ids)
+                    .await
+                    .map_err(Error::lift)
+            },
+        )
+    }
+
+    /// The first-wait itself, once its slot is decided.
     ///
     /// On the connection because that is what it needs — a poll interval, a serializer for the
-    /// recorded winner, and the database — which is what lets a client reach it. Named as its
-    /// surface is, like every other shared internal here.
+    /// recorded winner, and the database — which is what lets a client reach it, and what makes
+    /// this the one body all three surfaces run.
     pub(crate) async fn select_workflow(
-        self: &std::sync::Arc<Self>,
+        self: &Arc<Self>,
+        placement: StepPlacement,
         workflow_ids: &[&str],
     ) -> Result<String> {
-        // Before the placement, because a call that cannot be answered should not move the
-        // workflow's step counter: a workflow that fails here and is fixed to pass a non-empty set
-        // would otherwise replay onto a different slot than it recorded.
-        //
-        // The only thing refused. Nothing here cares whether an id repeats — the answer is the id
-        // itself, which names one workflow however many entries pointed at it.
-        if workflow_ids.is_empty() {
-            return Err(Error::Config(
-                "select_workflow was given no workflow ids to wait for".to_owned(),
-            ));
-        }
-
-        let placement = Placement::of(self, "select_workflow")?;
-        if let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await? {
+        // The ids first, so the refusal below has them: `check` answers `Some` only where the
+        // placement holds a step, so inside this arm they are known rather than defaulted.
+        if let Some((workflow_id, step_id)) = placement.step()
+            && let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await?
+        {
+            // A recorded failure replays as that failure. The only one this call records is the
+            // empty set below, and a replay of it must refuse again rather than look at the set it
+            // has now — the same rule that makes a recorded winner stand even when the set changed.
+            if let Some(error) = &recorded.error {
+                return Err(revive(error, step_names::SELECT_WORKFLOW));
+            }
             let winner: String = decode(
                 recorded.output.as_deref(),
                 "the id that won a select_workflow",
@@ -653,7 +755,7 @@ impl Connection {
             // not bookkeeping: a workflow that changed which ids it waits on has changed what this
             // position of its code means, and handing back a winner it no longer waits on would
             // have it act on an answer to a question it stopped asking. The same check
-            // `Awaiting::check` makes against a recorded child id, for the same reason.
+            // `ChildResultPlacement::check` makes against a recorded child id, for the same reason.
             //
             // **Both references make it too, without writing it down**, because returning a
             // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
@@ -664,10 +766,9 @@ impl Connection {
             // free there has to be spelled — which is the whole cost of it. It reads no extra
             // state: the winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
-                let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order
-                // `Awaiting::check` builds them in.
+                // `ChildResultPlacement::check` builds them in.
                 return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                     workflow_id: workflow_id.to_owned(),
                     step_id,
@@ -682,6 +783,28 @@ impl Connection {
         // instant the answer was written down — the placement every other recorded call in this
         // crate takes its `started_at` from.
         let started_at = Timestamp::now();
+
+        // **A first-wait over nothing has no answer it could ever give**, so it is refused rather
+        // than parked forever — and the refusal is *recorded*, because this call took a step id
+        // and a step that took one owes its slot an outcome. A replay then reads the refusal back
+        // instead of re-deciding it, which is what every other recorded failure does. Outside a
+        // workflow there is no slot, so `record` writes nothing and this is simply the error.
+        if workflow_ids.is_empty() {
+            let refused: Error = Error::InvalidArgument {
+                operation: "select_workflow".into(),
+                detail: "no workflow ids to wait for".to_owned(),
+            };
+            let encoded = encode(&refused, "select_workflow error")?;
+            placement
+                .record(
+                    self,
+                    step_names::SELECT_WORKFLOW,
+                    Outcome::Error(&encoded),
+                    started_at,
+                )
+                .await?;
+            return Err(refused);
+        }
         let winner = self
             .sysdb()
             .await_first_workflow_id(workflow_ids, self.outcome_poll_interval())
@@ -700,50 +823,19 @@ impl Connection {
         Ok(winner)
     }
 
-    /// The all-wait itself, shared by both surfaces.
-    pub(crate) async fn join_workflows(
-        self: &std::sync::Arc<Self>,
-        workflow_ids: &[&str],
-    ) -> Result<()> {
-        // Nothing to wait for is a satisfied wait — and, unlike the first-wait, one with an
-        // answer. Returned before the placement so an empty call spends no step id, which matches
-        // TypeScript short-circuiting its empty handle list before `runInternalStep`.
-        if workflow_ids.is_empty() {
-            return Ok(());
-        }
-
-        let placement = Placement::of(self, "join_workflows")?;
-        // The row is the whole of the answer, and there is nothing in it to check the current set
-        // against: an all-wait records no set, so a replay of one whose set has *grown* skips the
-        // wait for the member it never waited on. That is the ordinary reading of a step whose
-        // arguments changed — no implementation checkpoints step inputs — and the module doc says
-        // so where a caller will read it.
-        if placement
-            .check(self, step_names::JOIN_WORKFLOWS)
-            .await?
-            .is_some()
-        {
-            tracing::debug!("replaying join_workflows; every member had already settled");
-            return Ok(());
-        }
-
-        let started_at = Timestamp::now();
+    /// The all-wait itself — see [`select_workflow`](Self::select_workflow), of which this is the
+    /// other half, and which is the one of the two that records anything.
+    ///
+    /// **Takes no placement, because there is no slot to decide.** All three surfaces run this
+    /// same body, where the first-wait's has one shape inside a workflow and another outside it;
+    /// the module doc sets out why an all-wait pins nothing worth a step id.
+    ///
+    /// On the connection because that is what it needs — a poll interval and the database —
+    /// which is what lets a client reach it.
+    pub(crate) async fn join_workflows(self: &Arc<Self>, workflow_ids: &[&str]) -> Result<()> {
         self.sysdb()
             .await_workflow_ids(workflow_ids, self.outcome_poll_interval())
             .await
-            .map_err(Error::SystemDatabase)?;
-
-        // **No payload**, which is the shape of the thing rather than an economy: an all-wait
-        // decides nothing, so there is nothing a replay could take a different branch on. The row
-        // records that the wait happened, and that is all a replay needs to skip it — the same
-        // thing TypeScript's `runInternalStep` around `awaitWorkflowIds` writes.
-        placement
-            .record(
-                self,
-                step_names::JOIN_WORKFLOWS,
-                Outcome::Output(None),
-                started_at,
-            )
-            .await
+            .map_err(Error::SystemDatabase)
     }
 }

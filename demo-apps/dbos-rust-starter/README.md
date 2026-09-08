@@ -1,6 +1,6 @@
 # DBOS Rust Starter
 
-The Workflows and Queues tabs of the DBOS starter app.
+The Workflows, Queues, Events and Messages tabs of the DBOS starter app.
 
 **Workflows** is a three-step workflow that checkpoints each step to Postgres, a progress display,
 and a crash button. Launch a workflow, crash the app, restart it — execution resumes at the step
@@ -8,6 +8,13 @@ after the last one that finished, with no application code involved.
 
 **Queues** is a fan-out under a concurrency limit. Enqueue five workflows against a queue that
 allows three at a time, and watch three run while two wait.
+
+**Events** is a key/value a workflow publishes as it goes, readable by name from outside it. The
+Workflows tab already uses one event for its progress bar; this tab shows the half that bar cannot —
+a read that *waits*.
+
+**Messages** is a workflow that stops and waits to be told something. Approval requests park at
+`recv` until a message arrives, from this tab or from anywhere else sharing the database.
 
 ## Run it
 
@@ -39,6 +46,26 @@ Nothing is dequeued by the process that enqueued it just because it asked. Each 
 recorded `ENQUEUED` and claimed by whichever executor next polls the queue, which here happens to
 be the same one — run a second copy of the app against the same database and they will share the
 backlog.
+
+Then open the **Events** tab and start an order. It publishes three named keys — `accepted`,
+`charged`, `shipped` — three seconds apart. The button worth pressing is **Read** on `shipped`
+immediately after starting: the request blocks for about nine seconds and then returns the value,
+because `get_event` with a timeout waits for a key to appear rather than polling for it. Nothing is
+held open on the workflow's side, and the elapsed time is shown so you can see the wait was real.
+Read a key nothing ever publishes — the picker only offers three, but the API takes any name — and
+the same call returns "not published" at its deadline: absence is a value, not an error.
+
+The **Messages** tab is the one that shows a workflow *waiting*. Press "Request an approval" a few
+times; each starts a workflow that runs to `recv` and stops there, durably, with nothing of it in
+memory. Approve one and the row resolves. Approve them all and the difference is `send_bulk`: one
+transaction, so nobody is approved unless everybody is.
+
+The tab lists requests by querying the database for workflows named `ApprovalWorkflow` rather than
+remembering what this process started — which is what lets it survive the crash button. Start two
+requests, crash the app on the Workflows tab, restart, and both are still listed and still waiting.
+Approve them then: the messages arrive, the recovered workflows take them, and the decisions land.
+Their `recv` deadline was checkpointed, so a recovered request has whatever is left of its two
+minutes rather than a fresh two minutes.
 
 The server listens on loopback only, since the crash button exits the process. Ctrl-C is the
 other way out and takes the tidy path: it stops serving and calls `shutdown()`, which leaves any

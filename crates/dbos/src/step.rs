@@ -10,6 +10,7 @@ use tracing::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::checkpoint::{PendingStep, StepDurability, StepPlacement, revive};
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
@@ -87,9 +88,9 @@ pub struct StepOptions<E = EngineOnly> {
     /// system database.
     ///
     /// The cost is a periodic status read per running step, at
-    /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the
-    /// same polling-concurrency cap as every other database-backed wait. Python's `preemptible`
-    /// does the same and hardcodes its interval.
+    /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the same
+    /// polling-concurrency cap as every other database-backed wait. Python's `preemptible` does
+    /// the same and hardcodes its interval.
     ///
     /// **A preempted step records nothing** and runs again on resume, because a cancellation is a
     /// control signal rather than the step's result — the step did not fail, it was interrupted.
@@ -227,21 +228,60 @@ impl<E> StepOptions<E> {
 /// ordinarily callable and ordinarily testable, and it is what Python does. Inside another step the
 /// same applies: a step is a leaf, so a nested one is a plain call rather than a second checkpoint.
 ///
-/// **A workflow body must await each step before starting the next.** The flag that makes a step a
-/// leaf lives on the workflow rather than on the call stack, so two steps in flight at once — under
-/// `tokio::join!`, `select!`, or any other concurrent combinator — see each other's. Two ways that
-/// goes wrong, and both are silent: a step that starts while another's body is running takes the
-/// plain path above and is *not* checkpointed, so a replay runs it again; and a sibling finishing
-/// clears the flag for a step still inside its body, so a step nested in that one allocates an id
-/// after all. Step ids then fall out of poll order, and a replay that interleaves differently meets
-/// a recorded step under the wrong name — which is a system-database error, so the workflow records
-/// nothing, stays `PENDING`, and is recovered until it parks.
+/// **Steps may run concurrently, and the id is what makes that sound.** This call takes the id
+/// from the workflow's counter *here*, in the caller's own sequential order, and hands back a
+/// [`PendingStep`] that has not run — so a set of steps built and then driven together gets the same
+/// slots on a replay however their bodies interleave. `tokio::join!` over steps is therefore
+/// ordinary code: it builds every branch before polling any, which is exactly the order the ids
+/// were taken in. An id allocated at the first poll would instead depend on which future reached
+/// the counter first, which is not something a replay reproduces.
 ///
-/// That is a known gap rather than a rule with a workaround. Concurrent steps are a later change:
-/// the flag has to become per-call-stack — a nested [`Ctx`] scope around the body, so
-/// that nesting is exact and siblings cannot see each other — and wants a count of live steps, so
-/// that genuine concurrency is refused loudly rather than degrading to a plain call. Until then,
-/// sequential is the contract.
+/// **That is now a promise about every durable call in the crate.** `sleep`, the events, the
+/// messages, the waits and every checkpointed management call on [`DBOS`](crate::DBOS) take their
+/// ids at the call, and so do a child's [`start`](crate::WorkflowRef::start), the await of its
+/// handle ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and the
+/// [`run`](crate::WorkflowRef::run) that is the two of them in sequence. Any of them may be built
+/// first and driven together with steps and with each other; `join!` over a mixture of them is
+/// ordinary code. The caveat that used to stand here — await these one at a time, because their
+/// ids land wherever they are first polled — is gone, and with it the failure it warned about: a
+/// replay that interleaved differently met a recorded step under the wrong name, which records
+/// nothing, leaves the workflow `PENDING`, and has it recovered until it parks.
+///
+/// **`join!` needs nothing of a race; a race needs its winner recorded.** An all-wait decides
+/// nothing, so a replay has nothing to get differently and `join!` over durable calls is ordinary
+/// code. A race decides something — which branch won — and that decision has to survive to the
+/// replay like any other, or the replay is free to decide it the other way and continue from a
+/// branch this execution abandoned. So what a workflow body has no use for is the *unrecorded*
+/// race: a bare `tokio::select!` over durable calls, and `tokio::time::timeout`, which is that
+/// same race against a clock no replay reproduces.
+///
+/// Recorded races are the supported ones, and there are three of them.
+/// [`select_step!`](crate::select_step) is the general one: it checkpoints *which branch* won, and
+/// a replay polls that branch alone — which is `tokio::select!`'s shape with the decision written
+/// down. [`select_workflow!`](macro@crate::select_workflow) is the specialised one, for a race
+/// whose branches are all workflows: it checkpoints which handle won and settles the whole set
+/// with one wait rather than one per handle. A call that carries its own deadline is the third —
+/// there the bound is part of what gets recorded rather than a second branch. And a race over
+/// futures this crate knows nothing about can still go *inside a step*, whose checkpoint stands
+/// for however its body reached the answer. [`PendingStep`] says all of this for every durable
+/// call, not only steps, and ids taken at the call are what let a race be recorded at all: a
+/// losing branch has already spent its id, and spends the same one on the replay, whether or not
+/// it is ever polled.
+///
+/// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
+/// body runs under is rebound for that body alone, so a step built in the workflow proper while a
+/// sibling's body is in flight still takes an id and checkpoints.
+///
+/// **A step built and dropped has still spent its id**, which is why [`PendingStep`] is `#[must_use]`.
+/// It is deterministic — the same construction sequence burns the same ids on a replay — but it is
+/// no longer the no-op it was when the id was taken at the first poll.
+///
+/// **A step is polled where it was built.** The id is a claim on one position in one workflow, so
+/// a step built outside a workflow and awaited inside one, carried into a second workflow, or
+/// carried across a step-body boundary in either direction is refused as
+/// [`Error::StepBuiltElsewhere`](crate::Error::StepBuiltElsewhere) rather than run under an id
+/// nothing there can honour. The everyday way to trip it is evaluating the step before the context
+/// exists: `Ctx::scope(ctx, step(..))` builds it outside and polls it inside.
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.
@@ -252,14 +292,14 @@ impl<E> StepOptions<E> {
 /// `FnMut` unless it moves a captured value out — and a body that genuinely consumes what it
 /// captured fails to compile here rather than at its second attempt, which is where the mistake
 /// should be reported.
-pub async fn step<T, E, F, Fut>(name: &str, body: F) -> Result<T, E>
+pub fn step<'a, T, E, F, Fut>(name: &str, body: F) -> PendingStep<'a, T, E>
 where
-    T: Serialize + DeserializeOwned,
-    E: DurableError,
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
+    T: Serialize + DeserializeOwned + Send + 'a,
+    E: DurableError + Send,
+    F: FnMut() -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T, E>> + Send + 'a,
 {
-    step_with(name, StepOptions::default(), body).await
+    step_with(name, StepOptions::default(), body)
 }
 
 /// Runs `body` as a step, retrying it as `options` allows.
@@ -290,30 +330,74 @@ where
 ///
 /// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
 /// to after the final attempt, rather than the last attempt alone. Python takes its
-/// `step_start_time` in the same place, and Go does too since #442.
-pub async fn step_with<T, E, F, Fut>(name: &str, options: StepOptions<E>, body: F) -> Result<T, E>
+/// `step_start_time` in the same place, and Go moved to it in #442.
+pub fn step_with<'a, T, E, F, Fut>(
+    name: &str,
+    options: StepOptions<E>,
+    body: F,
+) -> PendingStep<'a, T, E>
+where
+    T: Serialize + DeserializeOwned + Send + 'a,
+    E: DurableError + Send,
+    F: FnMut() -> Fut + Send + 'a,
+    Fut: Future<Output = Result<T, E>> + Send + 'a,
+{
+    // **The whole of what happens at the call**: read where we are, and take the id if this is a
+    // place that checkpoints. Everything below is deferred into the run, which does not begin
+    // until something polls it.
+    let placement = StepPlacement::here();
+    let name: Arc<str> = Arc::from(name);
+    // The placement is held by both halves: the run needs the answer it gives, and the
+    // `PendingStep` needs to ask it again on every poll. Cloning it is a couple of `Arc` bumps.
+    PendingStep::new(
+        Arc::clone(&name),
+        placement.clone(),
+        run(placement, name, options, body),
+    )
+}
+
+/// The step itself, once something polls it.
+///
+/// **The first thing it does is check that it is where it was built**, because the id it carries is
+/// a claim on one position in one workflow and nothing else can honour it. That check is
+/// [`StepPlacement::check_here`] rather than anything written here: the rule belongs to the id, so
+/// every call that takes one asks the same question of the same code.
+async fn run<T, E, F, Fut>(
+    placement: StepPlacement,
+    name: Arc<str>,
+    options: StepOptions<E>,
+    mut body: F,
+) -> Result<T, E>
 where
     T: Serialize + DeserializeOwned,
     E: DurableError,
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    let mut body = body;
-    let Some(ctx) = Ctx::current().filter(|ctx| !ctx.in_step()) else {
-        tracing::debug!(
-            step_name = name,
-            "the step body runs plainly, not as a checkpoint: it is outside a workflow, or \
-             inside another step"
-        );
-        return body().await;
+    let name = &*name;
+    // Borrowed, not cloned: the answer is about where this stands, and `StepDurability` borrows
+    // the placement rather than the ambient context, so nothing here needs to own one.
+    let (ctx, step_id) = match Ctx::with_current(|here| placement.check_here(name, here))? {
+        StepDurability::Recorded { ctx, step_id } => (ctx, step_id),
+        // Outside a workflow, inside another step's body, or on a client's connection. The step
+        // claimed no id in any of them, so there is nothing to check against and nothing to
+        // record; `built` names which, rather than this deciding again.
+        StepDurability::Plain => {
+            tracing::debug!(
+                step_name = name,
+                built = %placement.whereabouts(),
+                "the step body runs plainly"
+            );
+            return body().await;
+        }
     };
 
-    let step_id = ctx.next_step_id();
     let executor = ctx.executor();
     let workflow_id = ctx.workflow_id();
 
     // Before the check, not after it: the recorded duration covers the whole step, including the
-    // round trip that asks whether it has already run.
+    // round trip that asks whether it has already run. Go moved to this in #442 and Python has
+    // always taken `step_start_time` here.
     let started_at = Timestamp::now();
 
     let recorded = executor
@@ -340,7 +424,15 @@ where
         let attempt = failures.len() as u32 + 1;
         // The span nests inside the workflow's, so anything the body logs carries both ids.
         let span = tracing::info_span!("step", step_id, step_name = name, attempt);
-        match supervise(&ctx, name, &options, body(), span).await {
+        // **The closure is called inside the step's scope, not beside it.** An `async` block
+        // does nothing until it is polled, and `in_step_scope` is what polls this one, so a body
+        // that *builds* a durable call as its first act — `|| step("inner", ..)`, or a helper
+        // that hands one back — makes that call with this attempt's marker in scope and is a
+        // plain nested call by the leaf rule. Passing `body()` here instead would run the closure
+        // on the workflow's own call stack, where it takes a step id from the counter, and the
+        // call would then be refused by its own run for being polled inside a step body. Every
+        // attempt would spend another id on the way.
+        match supervise(ctx, name, &options, async { body().await }, span).await {
             Ok(value) => break Ok(value),
             // Not the step's result and not retryable: a cancelled workflow, a shutdown, or a
             // database that is down says nothing about whether the body would succeed. Returning
@@ -497,15 +589,48 @@ where
     E: DurableError,
     Fut: Future<Output = Result<T, E>>,
 {
-    if options.timeout.is_none() && !options.preemptible {
-        return ctx.in_step_scope(None, body).instrument(span).await;
-    }
-
+    // **Every attempt gets a token, and it fires wherever the attempt is abandoned.** The guard
+    // cancels it if this future is dropped — a caller dropping the step, a combinator dropping it
+    // as a losing branch, the `select!` below losing the attempt to a watchdog — so work the
+    // runtime cannot stop by dropping, a `spawn_blocking` thread watching `ctx.cancellation()`,
+    // learns that its step is over in every one of those cases and not only the two this function
+    // races itself.
+    //
+    // **An attempt that returns disarms it**, which is what keeps the token a signal that the
+    // step was abandoned rather than a step-is-over broadcast: the body reached an outcome and
+    // had its chance to clean up, and work it deliberately left running is not this function's to
+    // stop. The two watchdog arms still cancel explicitly, before the losing future is dropped at
+    // the end of the `select!`, because a body that could only learn from the token should learn
+    // before its destructors run.
     let token = CancellationToken::new();
+    let cancel_on_drop = token.clone().drop_guard();
     let attempt = ctx
         .in_step_scope(Some(token.clone()), body)
         .instrument(span);
 
+    let outcome = if options.timeout.is_none() && !options.preemptible {
+        attempt.await
+    } else {
+        supervised(ctx, name, options, attempt, token).await
+    };
+    cancel_on_drop.disarm();
+    outcome
+}
+
+/// The watchdog half of [`supervise`], for an attempt that has a timeout or is preemptible.
+///
+/// Split out so the common case — neither watchdog — is an `await` on the attempt and nothing
+/// else, and so the token's disarm has one home rather than one per return path.
+async fn supervised<T, E>(
+    ctx: &Ctx,
+    name: &str,
+    options: &StepOptions<E>,
+    attempt: impl Future<Output = Result<T, E>>,
+    token: CancellationToken,
+) -> Result<T, E>
+where
+    E: DurableError,
+{
     // A deadline that never arrives, so the arm can be unconditional rather than duplicating the
     // whole `select!` for each combination of watchdogs.
     let deadline = async {
@@ -566,6 +691,11 @@ where
 /// between polls, and already runs under the polling-concurrency cap that stops a fan-out of
 /// waiters from starving the control plane. Python's poller is the same loop over
 /// `get_workflow_status`, with an interval it hardcodes and this one takes from config.
+///
+/// A terminal outcome that is *not* a cancellation means another executor wrote this workflow's
+/// result while this process was still running it. There is nothing to preempt for — the step's
+/// own outcome is no longer wanted either way — so this parks rather than reporting a cancellation
+/// that did not happen, and lets the attempt finish on its own terms.
 async fn observe_cancellation(ctx: &Ctx) {
     let executor = ctx.executor();
     let interval = executor.outcome_poll_interval();
@@ -599,22 +729,6 @@ async fn observe_cancellation(ctx: &Ctx) {
             std::future::pending().await
         }
     }
-}
-
-/// Rebuilds the error a recorded step failed with.
-///
-/// The same error, not a description of it: an application failure comes back as its own variant
-/// with its own fields, and an engine failure as the variant it was. The only payloads that do not
-/// survive are the `serde_json::Error` sources, which arrive absent rather than different.
-///
-/// Falls back to a plain message when the column does not hold one of ours, which is what a row
-/// written by another SDK looks like — its serializer chose its own shape, and the `serialization`
-/// column says so. A readable message beats a decode failure standing in for somebody else's error.
-fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
-    serde_json::from_str(recorded).unwrap_or_else(|_| Error::StepFailed {
-        step: step.to_owned(),
-        message: recorded.to_owned(),
-    })
 }
 
 #[cfg(test)]
@@ -682,7 +796,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::sysdb::types::{NewWorkflow, Submission};
+    use crate::sysdb::types::{NewWorkflow, StepRecord, Submission};
     use crate::{Config, DBOS};
 
     /// A launched instance and a workflow row to hang steps off.
@@ -701,7 +815,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh)
+            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
             .await
             .expect("could not create the workflow row");
         (dbos, db)
@@ -709,6 +823,28 @@ mod tests {
 
     fn ctx(dbos: &DBOS, id: &str) -> Ctx {
         Ctx::new(dbos.executor("test").expect("launched"), id, None)
+    }
+
+    /// The step rows a workflow recorded, in id order.
+    async fn steps(dbos: &DBOS, id: &str) -> Vec<StepRecord> {
+        dbos.executor("test")
+            .expect("launched")
+            .sysdb()
+            .list_workflow_steps(id, true, None, None, None)
+            .await
+            .expect("read failed")
+    }
+
+    /// What most of these tests actually assert on: which ids were claimed, and by what.
+    ///
+    /// Split from [`steps`] rather than folded into it because a test that also reads a row's
+    /// output needs the rows themselves, and reading them twice to see both halves is worse than
+    /// projecting once here.
+    fn ids(steps: &[StepRecord]) -> Vec<(i32, &str)> {
+        steps
+            .iter()
+            .map(|step| (step.step_id, step.step_name.as_str()))
+            .collect()
     }
 
     #[tokio::test]
@@ -722,12 +858,18 @@ mod tests {
         };
 
         // First run: the body executes and the result is recorded.
-        let first = Ctx::scope(ctx(&dbos, "wf-replay"), step("compute", body)).await;
+        let first = Ctx::scope(ctx(&dbos, "wf-replay"), async {
+            step("compute", body).await
+        })
+        .await;
         assert_eq!(first.unwrap(), 7);
         assert_eq!(entered.load(Ordering::SeqCst), 1);
 
         // Replay: a fresh context over the same workflow id, step ids starting again from zero.
-        let again = Ctx::scope(ctx(&dbos, "wf-replay"), step("compute", body)).await;
+        let again = Ctx::scope(ctx(&dbos, "wf-replay"), async {
+            step("compute", body).await
+        })
+        .await;
         assert_eq!(again.unwrap(), 7, "the recorded result");
         assert_eq!(
             entered.load(Ordering::SeqCst),
@@ -750,7 +892,10 @@ mod tests {
 
         let failing = || async { Err::<(), _>(CardDeclined { attempts: 3 }.into()) };
 
-        let first = Ctx::scope(ctx(&dbos, "wf-failed-step"), step("boom", failing)).await;
+        let first = Ctx::scope(ctx(&dbos, "wf-failed-step"), async {
+            step("boom", failing).await
+        })
+        .await;
         let first = first.unwrap_err();
         let Error::Application(error) = &first else {
             panic!("expected an application error, got {first}")
@@ -759,7 +904,10 @@ mod tests {
 
         // Replay gives back the *same error*, decoded, rather than a sentence about it — the same
         // fidelity a successful step's output gets, fields and all.
-        let again = Ctx::scope(ctx(&dbos, "wf-failed-step"), step("boom", failing)).await;
+        let again = Ctx::scope(ctx(&dbos, "wf-failed-step"), async {
+            step("boom", failing).await
+        })
+        .await;
         let again = again.unwrap_err();
         let Error::Application(replayed) = &again else {
             panic!("expected an application error, got {again}")
@@ -780,8 +928,7 @@ mod tests {
 
         let (dbos, _db) = workflow("wf-blip").await;
 
-        let failed = Ctx::scope(
-            ctx(&dbos, "wf-blip"),
+        let failed = Ctx::scope(ctx(&dbos, "wf-blip"), async {
             step("charge", || async {
                 Err::<(), crate::Error>(Error::SystemDatabase(crate::sysdb::Error::Backend(
                     BackendError {
@@ -790,19 +937,14 @@ mod tests {
                         kind: BackendErrorKind::Connection,
                     },
                 )))
-            }),
-        )
+            })
+            .await
+        })
         .await
         .unwrap_err();
         assert!(matches!(failed, Error::SystemDatabase(_)), "{failed}");
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-blip", true, None, None, None)
-            .await
-            .expect("read failed");
+        let steps = steps(&dbos, "wf-blip").await;
         assert!(
             steps.is_empty(),
             "a database failure must not be checkpointed as the step's outcome: {steps:?}"
@@ -835,12 +977,12 @@ mod tests {
             .await
             .expect("could not record the step");
 
-        let replayed = Ctx::scope(
-            ctx(&dbos, "wf-foreign"),
+        let replayed = Ctx::scope(ctx(&dbos, "wf-foreign"), async {
             step("charge", || async {
                 Err::<(), _>(CardDeclined { attempts: 1 }.into())
-            }),
-        )
+            })
+            .await
+        })
         .await
         .unwrap_err();
 
@@ -866,10 +1008,16 @@ mod tests {
                 key: "checkout/Checkout/eu".to_owned(),
             })
         };
-        let first = Ctx::scope(ctx(&dbos, "wf-variant"), step("boom", failing)).await;
+        let first = Ctx::scope(ctx(&dbos, "wf-variant"), async {
+            step("boom", failing).await
+        })
+        .await;
         let first = first.unwrap_err();
 
-        let again = Ctx::scope(ctx(&dbos, "wf-variant"), step("boom", failing)).await;
+        let again = Ctx::scope(ctx(&dbos, "wf-variant"), async {
+            step("boom", failing).await
+        })
+        .await;
         let again = again.unwrap_err();
 
         match &again {
@@ -885,18 +1033,16 @@ mod tests {
     async fn a_step_whose_name_changed_is_reported_rather_than_silently_matched() {
         let (dbos, _db) = workflow("wf-renamed").await;
 
-        let first = Ctx::scope(
-            ctx(&dbos, "wf-renamed"),
-            step("old_name", || async { Ok::<_, crate::Error>(1u32) }),
-        )
+        let first = Ctx::scope(ctx(&dbos, "wf-renamed"), async {
+            step("old_name", || async { Ok::<_, crate::Error>(1u32) }).await
+        })
         .await;
         assert_eq!(first.unwrap(), 1);
 
         // Step 0 is recorded under a different name, so its result is not this step's result.
-        let renamed = Ctx::scope(
-            ctx(&dbos, "wf-renamed"),
-            step("new_name", || async { Ok::<_, crate::Error>(1u32) }),
-        )
+        let renamed = Ctx::scope(ctx(&dbos, "wf-renamed"), async {
+            step("new_name", || async { Ok::<_, crate::Error>(1u32) }).await
+        })
         .await;
         assert!(
             renamed.is_err(),
@@ -923,18 +1069,8 @@ mod tests {
         })
         .await;
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-order", true, None, None, None)
-            .await
-            .expect("read failed");
-        let seen: Vec<(i32, &str)> = steps
-            .iter()
-            .map(|s| (s.step_id, s.step_name.as_str()))
-            .collect();
-        assert_eq!(seen, [(0, "one"), (1, "two"), (2, "three")]);
+        let steps = steps(&dbos, "wf-order").await;
+        assert_eq!(ids(&steps), [(0, "one"), (1, "two"), (2, "three")]);
         assert_eq!(steps[2].output.as_deref(), Some("3"));
 
         dbos.shutdown().await;
@@ -961,22 +1097,355 @@ mod tests {
         })
         .await;
 
-        let steps = dbos
-            .executor("test")
-            .unwrap()
-            .sysdb()
-            .list_workflow_steps("wf-nested", true, None, None, None)
-            .await
-            .expect("read failed");
-        let seen: Vec<(i32, &str)> = steps
-            .iter()
-            .map(|s| (s.step_id, s.step_name.as_str()))
-            .collect();
         assert_eq!(
-            seen,
+            ids(&steps(&dbos, "wf-nested").await),
             [(0, "outer"), (1, "after")],
             "`inner` is not a checkpoint"
         );
+
+        dbos.shutdown().await;
+    }
+
+    /// One poll in the right place does not buy a second somewhere else.
+    ///
+    /// The run checks its placement as its first act and is then past that check, so a step that
+    /// is polled once where it belongs and *then* moved would go on running under the context it
+    /// captured — recording beneath a step whose own row already covers whatever its body did,
+    /// which is the case `StepBuiltElsewhere` exists to refuse. `PendingStep` is `Send` and
+    /// `Unpin`, so nothing but the poll can catch that, and it has to catch it every time.
+    ///
+    /// The first poll is driven by hand because that is the only way to leave a step started and
+    /// still holdable; ordinary `await` runs it to completion where it stands.
+    #[tokio::test]
+    async fn a_step_polled_once_is_refused_when_it_moves() {
+        let (dbos, _db) = workflow("wf-relocated").await;
+        let c = ctx(&dbos, "wf-relocated");
+
+        let outcome = Ctx::scope(c.clone(), async {
+            // The body never finishes, so it does not matter how far one poll gets: whether it
+            // suspends in the round trip that asks whether this step has already run or in the
+            // body itself, nothing has been written when the step is moved. A body that returns
+            // immediately leaves that to scheduling — one poll runs until the first suspension,
+            // and on a loaded machine the reply to that round trip can already be waiting, which
+            // carries the poll through the body and into the checkpoint's own write. The
+            // assertion below would then be about which read happened to be ready rather than
+            // about the rule, and it has failed in CI for exactly that.
+            let mut built = step("moved", || async {
+                std::future::pending::<()>().await;
+                Ok::<_, crate::Error>(1u32)
+            });
+            let started = std::pin::Pin::new(&mut built)
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+            assert!(
+                started.is_pending(),
+                "the first poll should suspend, leaving the run started"
+            );
+            // Now somewhere its id cannot be honoured: a step body, whose own checkpoint already
+            // stands for everything it does.
+            c.in_step_scope(None, built).await
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, Err(Error::StepBuiltElsewhere { .. })),
+            "a started step is still refused where it moves: {outcome:?}"
+        );
+        assert!(
+            steps(&dbos, "wf-relocated").await.is_empty(),
+            "and it records nothing under the workflow it was built in"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// The leaf rule again, for a body that *builds* its inner step rather than awaiting one it
+    /// wrote inline.
+    ///
+    /// `|| step("inner", ..)` hands the inner step back as the attempt's whole future, so the
+    /// closure does its work where it is *called* rather than where that future is polled. Called
+    /// outside the step's scope it would take an id from the workflow's counter, be refused for
+    /// then being polled inside a step body, and spend another id on every retry — so this is the
+    /// one shape that says the closure runs where the attempt does.
+    #[tokio::test]
+    async fn a_body_that_builds_its_step_builds_it_inside_the_attempt() {
+        let (dbos, _db) = workflow("wf-built-in-body").await;
+
+        let outer = Ctx::scope(ctx(&dbos, "wf-built-in-body"), async {
+            let outer = step("outer", || {
+                step("inner", || async { Ok::<_, crate::Error>(1u32) })
+            })
+            .await;
+            step("after", || async { Ok::<_, crate::Error>(9u32) })
+                .await
+                .unwrap();
+            outer
+        })
+        .await;
+
+        assert_eq!(outer.unwrap(), 1);
+        assert_eq!(
+            ids(&steps(&dbos, "wf-built-in-body").await),
+            [(0, "outer"), (1, "after")],
+            "`inner` is a plain call, so it takes no id and `after` keeps the next one"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// A step built in the workflow proper while a sibling's body is in flight is still a step.
+    ///
+    /// What the per-call-stack marker buys, at the only altitude that shows it: with the answer on
+    /// the shared workflow state, `held` being mid-body made `beside` read *itself* as nested, so
+    /// `beside` ran plainly and wrote no row — and every replay of this workflow ran it again.
+    ///
+    /// The two notifies are the whole of the interleaving, and there is no sleep in it: `beside` is
+    /// built only once `held` says it is inside its body, and `held` returns only once `beside` has
+    /// been awaited.
+    #[tokio::test]
+    async fn a_step_built_while_a_sibling_runs_is_still_checkpointed() {
+        let (dbos, _db) = workflow("wf-concurrent").await;
+        let inside = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        Ctx::scope(ctx(&dbos, "wf-concurrent"), async {
+            let held = step("held", {
+                let inside = Arc::clone(&inside);
+                let release = Arc::clone(&release);
+                move || {
+                    let inside = Arc::clone(&inside);
+                    let release = Arc::clone(&release);
+                    async move {
+                        inside.notify_one();
+                        release.notified().await;
+                        Ok::<_, crate::Error>(1u32)
+                    }
+                }
+            });
+            let beside = async {
+                inside.notified().await;
+                let value = step("beside", || async { Ok::<_, crate::Error>(2u32) }).await;
+                release.notify_one();
+                value
+            };
+
+            let (held, beside) = tokio::join!(held, beside);
+            assert_eq!(held.unwrap(), 1);
+            assert_eq!(beside.unwrap(), 2);
+        })
+        .await;
+
+        assert_eq!(
+            ids(&steps(&dbos, "wf-concurrent").await),
+            [(0, "held"), (1, "beside")],
+            "`beside` is the workflow's own step, not something inside `held`"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// A built step says what it is before it has run, because the run cannot be asked.
+    #[tokio::test]
+    async fn a_built_step_carries_its_name_and_id() {
+        let (dbos, _db) = workflow("wf-identity").await;
+
+        Ctx::scope(ctx(&dbos, "wf-identity"), async {
+            let first = step("first", || async { Ok::<_, crate::Error>(1u32) });
+            let second = step("second", || async { Ok::<_, crate::Error>(2u32) });
+            assert_eq!((first.name(), first.step_id()), ("first", Some(0)));
+            assert_eq!((second.name(), second.step_id()), ("second", Some(1)));
+            // Awaiting them is not what numbered them, which is the point.
+            assert_eq!(second.await.unwrap(), 2);
+            assert_eq!(first.await.unwrap(), 1);
+        })
+        .await;
+
+        dbos.shutdown().await;
+    }
+
+    /// Steps driven concurrently take the ids they were **built** with, not the ones they are
+    /// polled in.
+    ///
+    /// The branches are built `a, b, c` and handed to `join!` as `c, b, a`, so the two orders
+    /// disagree. Driving them out of build order is the whole assertion: `join!` first-polls its
+    /// branches in source order, so an id taken at the first poll would still have numbered them
+    /// 0, 1, 2 had they been listed in the order they were built, and this test would have passed
+    /// against the bug it exists to catch.
+    #[tokio::test]
+    async fn steps_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
+        let (dbos, _db) = workflow("wf-out-of-order").await;
+
+        Ctx::scope(ctx(&dbos, "wf-out-of-order"), async {
+            let a = step("a", || async { Ok::<_, crate::Error>(1u32) });
+            let b = step("b", || async { Ok::<_, crate::Error>(2u32) });
+            let c = step("c", || async { Ok::<_, crate::Error>(3u32) });
+            let (c, b, a) = tokio::join!(c, b, a);
+            assert_eq!((a.unwrap(), b.unwrap(), c.unwrap()), (1, 2, 3));
+        })
+        .await;
+
+        assert_eq!(
+            ids(&steps(&dbos, "wf-out-of-order").await),
+            [(0, "a"), (1, "b"), (2, "c")],
+            "the ids follow source order, which is what a replay builds again"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// Built before the context existed, awaited inside it.
+    ///
+    /// `Ctx::scope(ctx, step(..))` is how this happens by accident: the argument is evaluated
+    /// first, so the step takes no id and would then run unrecorded where the workflow around it
+    /// plainly expects a checkpoint.
+    #[tokio::test]
+    async fn a_step_built_outside_and_polled_inside_is_refused() {
+        let (dbos, _db) = workflow("wf-outside-in").await;
+
+        let smuggled = step("early", || async { Ok::<_, crate::Error>(1u32) });
+        assert_eq!(
+            smuggled.step_id(),
+            None,
+            "there was no counter to draw from"
+        );
+
+        match Ctx::scope(ctx(&dbos, "wf-outside-in"), smuggled).await {
+            Err(Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!((step.as_str(), &*built), ("early", "outside a workflow"));
+                assert_eq!(&*polled, "in workflow wf-outside-in");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
+
+        dbos.shutdown().await;
+    }
+
+    /// Built in one workflow, polled in another: the id names a position in the first.
+    #[tokio::test]
+    async fn a_step_built_in_another_workflow_is_refused() {
+        let (dbos, _db) = workflow("wf-donor").await;
+        dbos.executor("test")
+            .expect("launched")
+            .sysdb()
+            .init_workflow(&NewWorkflow::new("wf-thief"), None, Submission::Fresh, None)
+            .await
+            .expect("could not create the second workflow row");
+
+        // Built in the donor and never awaited there, which is what makes its id a claim nobody
+        // honours. Yielding the un-awaited step out of the scope is the smuggling under test, so
+        // the lint against it is the thing being demonstrated.
+        #[allow(clippy::async_yields_async)]
+        let smuggled = Ctx::scope(ctx(&dbos, "wf-donor"), async {
+            step("borrowed", || async { Ok::<_, crate::Error>(7u32) })
+        })
+        .await;
+        assert_eq!(smuggled.step_id(), Some(0));
+
+        match Ctx::scope(ctx(&dbos, "wf-thief"), smuggled).await {
+            Err(Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!(
+                    (step.as_str(), &*built),
+                    ("borrowed", "in workflow wf-donor")
+                );
+                assert_eq!(&*polled, "in workflow wf-thief");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
+
+        dbos.shutdown().await;
+    }
+
+    /// Built inside a step body, carried out, and awaited in the workflow proper.
+    ///
+    /// By the leaf rule it took no id inside that body, so awaiting it outside would run it
+    /// unrecorded at a position the workflow expects to be a checkpoint. Both places share a
+    /// workflow id, so only the step marker tells them apart. It is smuggled out through a slot the
+    /// body can reach, since a step's output has to serialize and a `PendingStep` does not.
+    #[tokio::test]
+    async fn a_step_built_inside_a_step_and_awaited_outside_it_is_refused() {
+        let (dbos, _db) = workflow("wf-carried-out").await;
+
+        let (out, smuggled) = tokio::sync::oneshot::channel();
+        let refused = Ctx::scope(ctx(&dbos, "wf-carried-out"), async {
+            // Taken in the closure rather than the async block: the body is `FnMut`, so nothing it
+            // captures may escape into a future the closure hands back.
+            let mut out = Some(out);
+            step("outer", move || {
+                let out = out.take();
+                async move {
+                    if let Some(out) = out {
+                        let _ = out.send(step("inner", || async { Ok::<_, crate::Error>(1u32) }));
+                    }
+                    Ok::<_, crate::Error>(0u32)
+                }
+            })
+            .await
+            .expect("the outer step failed");
+            smuggled.await.expect("the body sent one out").await
+        })
+        .await;
+
+        match refused {
+            Err(Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!(step, "inner");
+                assert_eq!(&*built, "inside a step of workflow wf-carried-out");
+                assert_eq!(&*polled, "in workflow wf-carried-out");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
+
+        dbos.shutdown().await;
+    }
+
+    /// The same rule the other way: built in the workflow proper, carried *into* a step body.
+    ///
+    /// Its checkpoint would sit beneath a step whose own row already stands for whatever its body
+    /// did, which is the leaf rule read from the other side.
+    #[tokio::test]
+    async fn a_step_carried_into_a_step_body_is_refused() {
+        let (dbos, _db) = workflow("wf-carried-in").await;
+
+        let refused = Ctx::scope(ctx(&dbos, "wf-carried-in"), async {
+            let claimed = step("claimed", || async { Ok::<_, crate::Error>(1u32) });
+            assert_eq!(claimed.step_id(), Some(0), "claimed at a step boundary");
+
+            let mut carried = Some(claimed);
+            step("outer", move || {
+                let taken = carried.take();
+                async move {
+                    match taken {
+                        Some(inner) => inner.await,
+                        None => Ok(0u32),
+                    }
+                }
+            })
+            .await
+        })
+        .await;
+
+        match refused {
+            Err(Error::StepBuiltElsewhere {
+                step,
+                built,
+                polled,
+            }) => {
+                assert_eq!(step, "claimed");
+                assert_eq!(&*built, "in workflow wf-carried-in");
+                assert_eq!(&*polled, "inside a step of workflow wf-carried-in");
+            }
+            other => panic!("expected a built-elsewhere refusal, got {other:?}"),
+        }
 
         dbos.shutdown().await;
     }

@@ -26,11 +26,12 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
+use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{decode, encode};
-use crate::sysdb::types::GetEventCaller;
+use crate::sysdb::types::{GetEventCaller, step_names};
 
 /// Publishes a key/value on the current workflow, for anyone to read.
 ///
@@ -46,11 +47,51 @@ use crate::sysdb::types::GetEventCaller;
 /// sequence to checkpoint against, and unlike a step there is no plain version of a durable write
 /// to degrade to; inside a step, allocating an id would shift every later step onto the wrong
 /// replay slot.
-pub async fn set_event<T, E>(key: &str, value: &T) -> Result<(), E>
+///
+/// **The step id is taken at the call, not at the first poll** — see [`PendingStep`] — so a set
+/// built beside a [`get_event`] and driven with it by `tokio::join!` takes the same slot on every
+/// execution. **The value is encoded first**, ahead of the id: a payload that cannot be encoded is
+/// a call that never happens, and a call that never happens must not move the counter, or a
+/// workflow fixed to encode cleanly would replay onto slots one short of the ones it recorded.
+pub fn set_event<'a, T, E>(key: &'a str, value: &T) -> PendingStep<'a, (), E>
 where
     T: Serialize,
-    E: DurableError,
+    E: DurableError + 'a,
 {
+    let built = place_set_event(value);
+    PendingStep::placed(
+        step_names::SET_EVENT,
+        built,
+        move |(executor, encoded), placement| async move {
+            // `set_event` is refused anywhere that records nothing, so the placement is always
+            // `Recorded` here — the `else` is unreachable and says so rather than inventing a
+            // second meaning for a write with no id.
+            let Some((workflow_id, step_id)) = placement.step() else {
+                unreachable!("set_event is refused outside a workflow and inside a step")
+            };
+            executor
+                .sysdb()
+                .set_event(
+                    workflow_id,
+                    step_id,
+                    key,
+                    &encoded,
+                    Some(executor.serializer().name()),
+                )
+                .await
+                .map_err(Error::SystemDatabase)?;
+            Ok(())
+        },
+    )
+}
+
+/// Everything [`set_event`] does before it has run anything: the two refusals, the encoding, and
+/// then the id.
+///
+/// Split out because the order is the contract and a function is what keeps it readable: refuse,
+/// encode, *then* place. Written inline the `?`s would need the call's error channel, where here
+/// they are the engine's and [`PendingStep::placed`] lifts them at the poll.
+fn place_set_event<T: Serialize>(value: &T) -> Built<(Arc<crate::Executor>, String)> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {
             operation: "set_event".into(),
@@ -61,22 +102,13 @@ where
             operation: "set_event".into(),
         });
     }
-
     let encoded = encode(value, "event value")?;
-    let step_id = ctx.next_step_id();
-    let executor = ctx.executor();
-    executor
-        .sysdb()
-        .set_event(
-            ctx.workflow_id(),
-            step_id,
-            key,
-            &encoded,
-            Some(executor.serializer().name()),
-        )
-        .await
-        .map_err(Error::SystemDatabase)?;
-    Ok(())
+    // The refusals above already settled that this stands at a step boundary of its own workflow,
+    // served by its own executor, so the placement has no second connection to disagree with and
+    // cannot fail. It takes the context those refusals read rather than reading it again, so the
+    // one that refused and the one that places are the same value.
+    let executor = Arc::clone(ctx.executor());
+    Ok(((executor, encoded), StepPlacement::at(ctx)))
 }
 
 /// Reads a key a workflow published, waiting up to `timeout` for it to appear.
@@ -97,25 +129,32 @@ where
 ///
 /// Outside a workflow there is no context to read, so this is [`Error::NotInWorkflow`]. That is
 /// where [`DBOS::get_event`] is the call.
-pub async fn get_event<T, E>(
-    workflow_id: &str,
-    key: &str,
+pub fn get_event<'a, T, E>(
+    workflow_id: &'a str,
+    key: &'a str,
     timeout: Duration,
-) -> Result<Option<T>, E>
+) -> PendingStep<'a, Option<T>, E>
 where
-    T: DeserializeOwned,
-    E: DurableError,
+    T: DeserializeOwned + 'a,
+    E: DurableError + 'a,
 {
-    let Some(ctx) = Ctx::current() else {
-        return Err(Error::NotInWorkflow {
+    let built = Ctx::current()
+        .ok_or(Error::NotInWorkflow {
             operation: "get_event".into(),
+        })
+        .map(|ctx| {
+            // Served by the ambient workflow's own executor, so there is no second connection for
+            // the placement to disagree with and nothing here can fail. Inside a step it answers
+            // `InsideStep`, which takes no id and is what makes the read plain there. The context
+            // is handed over rather than read a second time, so this is one read in total.
+            let executor = Arc::clone(ctx.executor());
+            let placement = StepPlacement::at(ctx);
+            // Field order is the contract: the read's id first, the deadline's second, matching
+            // what every SDK records and what a replay looks up.
+            let timeout_step_id = placement.next_step_id();
+            ((executor, timeout_step_id), placement)
         });
-    };
-    let caller = (!ctx.in_step()).then(|| caller_for(&ctx));
-    ctx.executor()
-        .connection()
-        .get_event(workflow_id, key, timeout, caller)
-        .await
+    pending_get_event(built, workflow_id, key, timeout)
 }
 
 impl DBOS {
@@ -138,31 +177,24 @@ impl DBOS {
     /// With one exception it cannot share: this takes its executor from `self` and its step ids
     /// from the ambient context, so a handle to some *other* instance would split the two. That is
     /// [`Error::WrongInstance`] rather than a silent write into the wrong database.
-    pub async fn get_event<T: DeserializeOwned>(
+    pub fn get_event<'a, T: DeserializeOwned + 'a>(
         &self,
-        workflow_id: &str,
-        key: &str,
+        workflow_id: &'a str,
+        key: &'a str,
         timeout: Duration,
-    ) -> Result<Option<T>> {
-        let executor = self.executor("get_event")?;
-        let ctx = Ctx::current().filter(|ctx| !ctx.in_step());
-        // Exactly where the two halves would be combined: a caller is about to be built from the
-        // ambient context and handed to `self`'s executor. Inside a step `ctx` is already `None`,
-        // so nothing is checkpointed and there is nothing to disagree about — that read is plain
-        // whichever instance serves it.
-        if ctx
-            .as_ref()
-            .is_some_and(|ctx| !Arc::ptr_eq(ctx.executor(), &executor))
-        {
-            return Err(Error::WrongInstance {
-                operation: "get_event".into(),
-            });
-        }
-        let caller = ctx.as_ref().map(caller_for);
-        executor
-            .connection()
-            .get_event(workflow_id, key, timeout, caller)
-            .await
+    ) -> PendingStep<'a, Option<T>> {
+        // `taken` is where the two halves would be combined, and where they are reconciled: a
+        // caller is about to be built from the ambient context and handed to `self`'s executor,
+        // so a context belonging to another instance is `Error::WrongInstance` rather than a
+        // silent read from the wrong database. Inside a step the placement records nothing, so
+        // there is nothing to disagree about — that read is plain whichever instance serves it.
+        let built = StepPlacement::taken(self.executor("get_event"), "get_event").map(
+            |(executor, placement)| {
+                let timeout_step_id = placement.next_step_id();
+                ((executor, timeout_step_id), placement)
+            },
+        );
+        pending_get_event(built, workflow_id, key, timeout)
     }
 }
 
@@ -195,16 +227,43 @@ impl crate::Client {
     }
 }
 
-/// Where the caller stands, for `sysdb` to checkpoint the read against.
+/// An event read as a [`PendingStep`], for the two surfaces that take a step id.
 ///
-/// Field order is the contract: the read's id first, the deadline's second, matching what every
-/// SDK records and what a replay looks up.
-fn caller_for(ctx: &Ctx) -> GetEventCaller<'_> {
-    GetEventCaller {
-        workflow_id: ctx.workflow_id(),
-        step_id: ctx.next_step_id(),
-        timeout_step_id: ctx.next_step_id(),
-    }
+/// They differ only in how they reach an executor and in which error channel they answer in —
+/// which is the whole of what `built` carries — so everything after the placement is written once.
+fn pending_get_event<'a, T, E>(
+    built: Built<(Arc<crate::Executor>, Option<i32>)>,
+    workflow_id: &'a str,
+    key: &'a str,
+    timeout: Duration,
+) -> PendingStep<'a, Option<T>, E>
+where
+    T: DeserializeOwned + 'a,
+    E: DurableError + 'a,
+{
+    PendingStep::placed(
+        step_names::GET_EVENT,
+        built,
+        move |(executor, timeout_step_id), placement| async move {
+            // Both ids or neither: `timeout_step_id` was taken exactly where the placement took
+            // the read's own, so a placement that recorded nothing has no deadline id either and
+            // the read runs plainly.
+            // `caller_id` is the workflow *making* the read, which is what the checkpoint hangs
+            // off; `workflow_id` above is the one being read from, and the two are rarely the
+            // same.
+            let caller = placement.step().zip(timeout_step_id).map(
+                |((caller_id, step_id), timeout_step_id)| GetEventCaller {
+                    workflow_id: caller_id,
+                    step_id,
+                    timeout_step_id,
+                },
+            );
+            executor
+                .connection()
+                .get_event(workflow_id, key, timeout, caller)
+                .await
+        },
+    )
 }
 
 impl Connection {

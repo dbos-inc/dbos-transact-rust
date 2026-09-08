@@ -12,7 +12,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Client, ClientConfig, Config, DBOS, Error, StartOptions};
+use dbos::{Client, ClientConfig, Config, DBOS, Error, ForkFrom, StartOptions, WorkflowHandle};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -309,8 +309,183 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
         .select_workflow(&[])
         .await
         .expect_err("an empty select_workflow should be refused");
-    assert!(matches!(err, Error::Config(_)), "{err}");
+    assert!(matches!(err, Error::InvalidArgument { .. }), "{err}");
     assert!(err.to_string().contains("no workflow ids"), "{err}");
+
+    dbos.shutdown().await;
+}
+
+/// **A wait takes its step id where it is built, not where it is first polled.**
+///
+/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
+/// branch before polling any and then first-polls them in source order, so a test that builds and
+/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
+/// handed to `join!` as `c, b, a`.
+///
+/// **Only two of the three have an id to keep.** `join_workflows` is a plain wait that takes none,
+/// which is why it can sit anywhere in a `join!` without moving what the others got — the
+/// strongest form of the property this test is about. The first-wait is over a workflow that has
+/// already settled, so nothing here blocks and the only thing separating a build-time id from a
+/// poll-time one is the order they were written in.
+#[tokio::test]
+async fn waits_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-join-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async { Ok::<u32, Error>(1) })
+        .unwrap();
+    let waiter = dbos
+        .register_workflow("waiter", |settled: String| async move {
+            // Built a, b, c — the order their ids come from the counter in, and the order a
+            // replay will build them in again.
+            let ids = [settled.as_str()];
+            let a = dbos::join_workflows(&ids);
+            let b = dbos::select_workflow(&ids);
+            let c = dbos::step("after", || async { Ok::<u32, Error>(1) });
+            assert_eq!(
+                (b.step_id(), c.step_id()),
+                (Some(0), Some(1)),
+                "the ids were taken at the call, in source order, before anything was polled — \
+                 and the all-wait between them took none"
+            );
+            // ...and driven c, b, a.
+            let (c, b, a) = tokio::join!(c, b, a);
+            a?;
+            assert_eq!(b?, settled, "the only member of the set did not win it");
+            c?;
+            Ok::<u32, Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let settled = target.start(()).await.expect("start failed");
+    let settled_id = settled.workflow_id().to_owned();
+    assert_eq!(settled.result().await.expect("the target failed"), 1);
+
+    let workflow_id = "waits-out-of-order";
+    waiter
+        .run_with(
+            settled_id,
+            dbos::RunOptions {
+                workflow_id: Some(workflow_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(workflow_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "DBOS.selectWorkflow"), (1, "after")],
+        "the ids follow the order the calls were built in, not the order they were polled in",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// An all-wait inside a workflow takes no step id, whatever it was passed.
+///
+/// **Which slot a call takes must depend on where it was written, never on what it was passed** —
+/// a set computed from state can be empty on one execution and not on the next, so a wait that
+/// took an id in one and none in the other would shift every later step of that workflow onto a
+/// slot it did not record. `join_workflows` satisfies that the other way round: it takes no id on
+/// any execution, so an empty set and a full one leave the following step on the same slot for the
+/// same reason. The empty case is the one worth a test, because it is where a wait that *did*
+/// place itself would have been tempted to return early.
+#[tokio::test]
+async fn an_empty_wait_inside_a_workflow_takes_no_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-empty-id-app", &db));
+    let wf = dbos
+        .register_workflow("wf", |()| async {
+            let empty: Vec<&str> = Vec::new();
+            dbos::join_workflows(&empty).await?;
+            dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+            Ok::<u32, Error>(1)
+        })
+        .expect("registration failed");
+    dbos.launch().await.expect("launch failed");
+
+    let handle = wf.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    assert_eq!(handle.result().await.expect("the workflow failed"), 1);
+
+    let steps = dbos
+        .list_workflow_steps(&id)
+        .await
+        .expect("could not read the steps");
+    let seen: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|step| (step.step_id, step.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [(0, "after")],
+        "the all-wait recorded nothing, so `after` holds the workflow's first step id"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// An empty first-wait inside a workflow records its refusal as the step's outcome.
+///
+/// It took a step id, and a step that took one owes its slot an outcome — so the refusal is
+/// written to the row rather than happening instead of a step. A replay then reads it back
+/// instead of deciding it again, which is what makes it safe for the set to have changed since:
+/// step arguments are not checkpointed anywhere in DBOS.
+#[tokio::test]
+async fn an_empty_first_wait_records_its_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-empty-refusal-app", &db));
+    let wf = dbos
+        .register_workflow("wf", |()| async {
+            let none: [&str; 0] = [];
+            let refused: dbos::Result<String> = dbos::select_workflow(&none).await;
+            let message = match refused {
+                Err(error) => format!("{error}"),
+                Ok(id) => panic!("an empty first-wait answered with {id}"),
+            };
+            dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+            Ok::<String, Error>(message)
+        })
+        .expect("registration failed");
+    dbos.launch().await.expect("launch failed");
+
+    let handle = wf.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let message = handle.result().await.expect("the workflow failed");
+    assert!(
+        message.contains("no workflow ids") && message.contains("invalid argument"),
+        "{message}"
+    );
+
+    let steps = dbos
+        .list_workflow_steps(&id)
+        .await
+        .expect("could not read the steps");
+    let seen: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|step| (step.step_id, step.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [(0, "DBOS.selectWorkflow"), (1, "after")],
+        "the refusal occupies its own slot, leaving `after` where it would have been anyway"
+    );
+    let refusal = &steps[0];
+    assert!(
+        refusal.error.is_some() && refusal.output.is_none(),
+        "the refusal is the step's recorded outcome: {refusal:?}"
+    );
 
     dbos.shutdown().await;
 }
@@ -349,14 +524,15 @@ async fn a_repeated_id_is_accepted_by_both_waits() {
     dbos.shutdown().await;
 }
 
-/// Called from inside a workflow, both waits are checkpointed under their cross-SDK step names —
-/// and `select_workflow` records the winner while `join_workflows` records no payload.
+/// Called from inside a workflow, `select_workflow` is a checkpointed step and `join_workflows` is
+/// not.
 ///
 /// The recorded winner is what makes the choice survive a replay: a second execution reads the id
 /// back rather than racing again, so a workflow that branches on which member won cannot take a
-/// different branch the second time.
+/// different branch the second time. The all-wait after it decides nothing, so it writes no row at
+/// all and leaves the step ids to the calls that do.
 #[tokio::test]
-async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
+async fn a_first_wait_inside_a_workflow_is_a_checkpointed_step_and_an_all_wait_is_not() {
     let db = test_database().await;
     let dbos = DBOS::new(config("wait-step-app", &db));
     let reader = reader(&db).await;
@@ -370,8 +546,9 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
             move |()| {
                 let quick = quick.clone();
                 async move {
-                    // Launched one at a time, as a parent must: every call takes a step id from
-                    // the parent's counter.
+                    // A loop rather than a `join!` because that is the plainest way to write it
+                    // — each start takes its step id where it is written, so driving them
+                    // together would number them the same way.
                     let mut children = Vec::new();
                     for which in 0..2u32 {
                         children.push(quick.start(which).await?);
@@ -405,13 +582,8 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
         .collect();
     assert_eq!(
         seen,
-        [
-            (0, "quick"),
-            (1, "quick"),
-            (2, "DBOS.selectWorkflow"),
-            (3, "DBOS.joinWorkflows"),
-        ],
-        "the two launches and the two waits, in order"
+        [(0, "quick"), (1, "quick"), (2, "DBOS.selectWorkflow")],
+        "the two launches and the one wait that records, in order"
     );
 
     // The winner is the payload, and it is exactly what the parent returned — no projection on
@@ -434,11 +606,121 @@ async fn a_wait_inside_a_workflow_is_a_checkpointed_step() {
         "the winner {winner} is not one of the children {children:?}"
     );
 
-    // An all-wait decides nothing, so there is nothing for a replay to branch on.
-    assert_eq!(steps[3].output, None, "joinWorkflows recorded a payload");
-    assert_eq!(steps[3].error, None);
+    dbos.shutdown().await;
+}
+
+/// A recorded refusal replays as that refusal, against whatever set the second execution has.
+///
+/// **Step arguments are not checkpointed anywhere in DBOS**, so a replay answers the question the
+/// first run asked rather than the one it is holding now. That is what makes recording the empty
+/// first-wait's refusal the right thing rather than merely a tidy one: the second execution here
+/// carries a set with a settled workflow in it, which would have a winner to report — and reports
+/// the refusal instead, because that is what this position of the code decided.
+///
+/// The second execution is a fork from step 1, which carries step 0's row across and re-runs from
+/// there, so the wait at position zero meets its own recorded outcome.
+#[tokio::test]
+async fn a_recorded_refusal_replays_rather_than_being_decided_again() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("wait-replay-app", &db));
+
+    let quick = dbos
+        .register_workflow("quick", |()| async { Ok::<u32, Error>(1) })
+        .unwrap();
+    // Empty on the first execution and not on the second, which is the whole point: a set built
+    // from state is exactly what changes between a run and its replay.
+    let settled: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let executions = Arc::new(AtomicU32::new(0));
+    let parent = dbos
+        .register_workflow("parent", {
+            let (settled, executions) = (Arc::clone(&settled), Arc::clone(&executions));
+            move |()| {
+                let (settled, executions) = (Arc::clone(&settled), Arc::clone(&executions));
+                async move {
+                    let ids: Vec<String> = if executions.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Vec::new()
+                    } else {
+                        settled.lock().unwrap().clone()
+                    };
+                    let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+                    let outcome: dbos::Result<String> = dbos::select_workflow(&borrowed).await;
+                    let described = match outcome {
+                        Err(error) => format!("{error}"),
+                        Ok(winner) => format!("won by {winner}"),
+                    };
+                    dbos::step("after", || async { Ok::<u32, Error>(1) }).await?;
+                    Ok::<String, Error>(described)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // A workflow that has already settled, so a second execution that *did* race would have a
+    // winner to report rather than hanging — which is what makes the assertion below sharp.
+    let done = quick.start(()).await.expect("start failed");
+    let done_id = done.workflow_id().to_owned();
+    done.result().await.expect("quick failed");
+    settled.lock().unwrap().push(done_id.clone());
+
+    let first = parent.start(()).await.expect("start failed");
+    let parent_id = first.workflow_id().to_owned();
+    let described = tokio::time::timeout(DEADLINE, first.result())
+        .await
+        .expect("the parent never finished")
+        .expect("the parent failed");
+    assert!(described.contains("no workflow ids"), "{described}");
+
+    let forked: WorkflowHandle<String, Error> = dbos
+        .fork(&parent_id, ForkFrom::Step(1))
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(DEADLINE, forked.result())
+        .await
+        .expect("the fork never finished")
+        .expect("the fork failed");
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        2,
+        "the fork should have run the body a second time"
+    );
+    assert_eq!(
+        replayed, described,
+        "the replay reported {replayed} against a set holding {done_id}, instead of reading back \
+         the refusal it recorded"
+    );
 
     dbos.shutdown().await;
+}
+
+/// A client's waits answer an empty set the same way, having no workflow to record against.
+///
+/// The refusal and the satisfaction are properties of the call rather than of the checkpoint, so
+/// they read the same from a surface that never takes a step id.
+#[tokio::test]
+async fn a_clients_empty_waits_answer_without_a_slot() {
+    let db = test_database().await;
+    let client = Client::connect(ClientConfig {
+        app_name: Some("wait-client-empty-app".to_owned()),
+        outcome_poll_interval: Some(Duration::from_millis(50)),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+
+    client
+        .join_workflows(&[])
+        .await
+        .expect("an empty all-wait is satisfied for a client too");
+
+    let error = client
+        .select_workflow(&[])
+        .await
+        .expect_err("an empty first-wait is refused for a client too");
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
+    assert!(error.to_string().contains("no workflow ids"), "{error}");
+
+    client.close().await;
 }
 
 /// The same two waits from a client, which has no workflow to checkpoint against.

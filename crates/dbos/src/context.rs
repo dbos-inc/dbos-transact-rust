@@ -9,11 +9,11 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::dbos::Executor;
+use crate::instance::Executor;
 use crate::sysdb::types::Timestamp;
 
 tokio::task_local! {
@@ -37,11 +37,49 @@ pub struct Ctx {
     /// carry it — a token cancelled by attempt one would arrive already-cancelled at attempt two.
     /// [`in_step_scope`](Self::in_step_scope) rebinds the task-local with a `Ctx` holding the
     /// attempt's token, which works because cloning a `Ctx` shares the workflow state that has to
-    /// be shared and copies only this.
+    /// be shared and copies only what belongs to the attempt.
     ///
     /// `None` outside a step, and outside a step there is nothing to cancel.
     step_cancellation: Option<CancellationToken>,
+    /// Which step body this context is inside, or `None` in the workflow proper.
+    ///
+    /// A step is a leaf: the checkpoint it writes stands for everything the body did, so a step
+    /// inside a step is a plain call. Without this the inner call would allocate a step id of its
+    /// own and every step after it would replay against the wrong slot — a correctness trap rather
+    /// than a policy question, and Go #420 draws the same line.
+    ///
+    /// **Here rather than on [`WorkflowState`], because the question is about one call stack and
+    /// not about the workflow.** [`in_step_scope`](Self::in_step_scope) binds it on the context it
+    /// rebinds the task-local with, so it is in scope only while that body is being polled: two
+    /// steps in flight cannot see each other's, and one that finishes cannot answer for another
+    /// still inside its own. A *count* of live steps would belong on the shared state instead,
+    /// since refusing concurrency outright is a question about the workflow.
+    step_marker: Option<StepMarker>,
 }
+
+/// Which step body a context is inside.
+///
+/// **A newtype rather than a bare integer**, because the only other integer in reach is a step id
+/// and the two mean nothing alike: a step id is an ordinal position, restarts from zero on every
+/// replay, and is half the primary key of a checkpoint row, where a marker is opaque, never
+/// persisted, and never compared across runs. Distinct types are what keep a later edit from
+/// passing one where the other belongs.
+///
+/// **One per attempt, not one per step.** [`Ctx::in_step_scope`] is entered again for every retry,
+/// and each entry is a body of its own — work the first attempt handed out is not inside the
+/// second.
+///
+/// Named `marker` rather than `body` because in [`step`](crate::step) a step's *body* is already
+/// its closure, and the field would shadow it wherever both are in scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepMarker(u64);
+
+/// Hands out a fresh [`StepMarker`] for each step body.
+///
+/// Process-wide rather than per-workflow, because a marker is only ever compared for equality and
+/// a value distinct across the process is distinct within any one workflow. `Relaxed` is enough:
+/// the counter orders nothing, it only has to stop handing out the same value twice.
+static NEXT_STEP_MARKER: AtomicU64 = AtomicU64::new(0);
 
 /// The parts of a workflow that outlive any one call within it.
 struct WorkflowState {
@@ -60,28 +98,15 @@ struct WorkflowState {
     deadline: Option<Timestamp>,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
-    /// **Zero-based, matching Go, TypeScript and Java.** Python is the outlier at one-based. The
-    /// id addresses a fork point and labels a row in a step listing, so it is a number that leaves
-    /// its own SDK: three of four is what a fourth has to match.
+    /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
+    /// pre-increments (`stepID: -1, // Steps are 0-indexed`), while TypeScript and Java start at 0
+    /// and post-increment. Python is the outlier at one-based, and that is an upstream
+    /// inconsistency rather than a choice open to this port: the step id addresses a fork point
+    /// and labels a row in a step listing, so it is a number Conductor renders and a user passes
+    /// to `fork`. Three of four is what a fourth implementation has to match.
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
-    /// Whether a step is on the stack right now.
-    ///
-    /// A step is a leaf: the checkpoint it writes stands for everything the body did, so a step
-    /// inside a step is a plain call. Without this the inner call would allocate a step id of its
-    /// own and every step after it would replay against the wrong slot — a correctness trap rather
-    /// than a policy question, and Go #420 draws the same line.
-    ///
-    /// **Here, and so per-workflow, which is only right while steps run one at a time.** The
-    /// question is really per-call-stack, so two steps in flight at once share an answer meant for
-    /// one — silently, and in both directions; [`step`](crate::step()) documents what that costs a
-    /// caller and why sequential is the contract for now. Supporting concurrency starts by moving
-    /// this out of here: the flag belongs to the [`Ctx`] that [`Ctx::in_step_scope`] wraps the body
-    /// with, rather than to the state every clone shares, and then `WorkflowState` holds only what
-    /// genuinely belongs to the whole workflow — the id and the step counter. A count of live steps
-    /// would stay here, since refusing concurrency is a question about the workflow.
-    in_step: AtomicBool,
 }
 
 impl WorkflowState {
@@ -103,9 +128,9 @@ impl Ctx {
                 workflow_id: workflow_id.into(),
                 deadline,
                 next_step_id: AtomicI32::new(0),
-                in_step: AtomicBool::new(false),
             }),
             step_cancellation: None,
+            step_marker: None,
         }
     }
 
@@ -121,9 +146,46 @@ impl Ctx {
         CURRENT.try_with(Ctx::clone).ok()
     }
 
+    /// [`current`](Self::current) without the clone: runs `f` on the ambient context, or on
+    /// `None`.
+    ///
+    /// **For callers that only want to look.** `current` hands back an owned `Ctx`, which costs
+    /// three atomic increments and three decrements — the executor, the workflow state, and the
+    /// attempt's cancellation token are each behind an `Arc`. Those refcounts are shared by every
+    /// concurrent step of the workflow, so they are exactly the words under contention when steps
+    /// run together, and paying for them to answer a question that borrows is waste. A step's
+    /// `poll` asks where it stands on every poll, which is what makes that waste worth a second
+    /// accessor.
+    pub(crate) fn with_current<R>(f: impl FnOnce(Option<&Ctx>) -> R) -> R {
+        // The `Option` is what lets one `FnOnce` serve both arms: `try_with` runs the closure
+        // exactly when it returns `Ok`, so precisely one of these two takes finds a value.
+        let mut f = Some(f);
+        match CURRENT.try_with(|ctx| f.take().expect("the closure runs once")(Some(ctx))) {
+            Ok(answer) => answer,
+            Err(_) => f.take().expect("the closure runs once")(None),
+        }
+    }
+
     /// The id of the workflow this context belongs to.
     pub fn workflow_id(&self) -> &str {
         &self.workflow.workflow_id
+    }
+
+    /// Whether this and `other` are the same *execution* of the same workflow.
+    ///
+    /// **Identity, not equality of ids.** A workflow id names a row; this asks whether the two
+    /// contexts share one [`WorkflowState`], and therefore one step counter. Two things a matching
+    /// id would wave through do not share one: a second `DBOS` in the process serving the same id,
+    /// which is what [`Error::WrongInstance`](crate::Error::WrongInstance) exists to catch, and a
+    /// second *execution* of one id — a recovery re-run — whose counter restarts from zero. A
+    /// step id means nothing across either, so anything holding one has to ask this rather than
+    /// compare strings.
+    ///
+    /// Cheap: one pointer comparison. Clones of a `Ctx` share the state, so the ordinary case —
+    /// a step built and polled inside one workflow body — answers true without touching memory
+    /// the caller did not already have.
+    pub(crate) fn is_same_execution(&self, other: &Ctx) -> bool {
+        Arc::ptr_eq(&self.workflow, &other.workflow)
     }
 
     /// When this workflow must stop, if it has a deadline at all.
@@ -154,38 +216,46 @@ impl Ctx {
         &self.executor
     }
 
-    /// Whether a step is already running in this workflow.
+    /// Whether this call is inside a step body.
+    ///
+    /// **Per call stack, not per workflow**: it reads the [`StepMarker`] that
+    /// [`in_step_scope`](Self::in_step_scope) binds on the context it rebinds for the body, so a
+    /// sibling step running concurrently has no bearing on the answer, and neither has one that
+    /// has just finished.
     pub(crate) fn in_step(&self) -> bool {
-        self.workflow.in_step.load(Ordering::Relaxed)
+        self.step_marker.is_some()
     }
 
-    /// Runs `body` with [`in_step`](Self::in_step) set, clearing it afterwards.
+    /// Which step body this context is inside, if any.
     ///
-    /// A guard rather than a plain pair of writes, so the flag is cleared even when the body
-    /// returns early or panics — a step that failed must not leave the workflow believing it is
-    /// still inside one.
+    /// [`in_step`](Self::in_step) asks whether there is one; this asks *which*, and the difference
+    /// is what lets a durable call built inside a step body be refused when it is polled somewhere
+    /// else. Both places have the same workflow id, so comparing workflow identity cannot tell them
+    /// apart. See [`StepMarker`].
+    pub(crate) fn step_marker(&self) -> Option<StepMarker> {
+        self.step_marker
+    }
+
+    /// Runs `body` under a context that is [`in_step`](Self::in_step).
     ///
-    /// **Clearing, not restoring**, and along this call stack the two are the same thing: [`step`]
-    /// only reaches here when no step was on the stack, so the flag was false on the way in. They
-    /// come apart only between *concurrent* steps, where one finishing clears the flag for another
-    /// still running — which is the gap [`in_step`](Self::in_step) describes, and is not something
-    /// restoring here would fix, because the flag is shared rather than per-stack in the first
-    /// place.
-    ///
-    /// [`step`]: crate::step()
+    /// **Nothing to unset afterwards**, which is what moving the answer off the shared state
+    /// bought: it lives on the `Ctx` bound for this body alone, so it goes out of scope with the
+    /// body however the body ends — an early return, an error, a panic — and no other call stack
+    /// ever saw it. The drop guard this used to need existed only because the flag was shared, and
+    /// a guard could not have fixed that: restoring rather than clearing still hands one step's
+    /// answer to another.
     pub(crate) async fn in_step_scope<F: Future>(
         &self,
         cancellation: Option<CancellationToken>,
         body: F,
     ) -> F::Output {
-        let _guard = InStep(Arc::clone(&self.workflow));
-        self.workflow.in_step.store(true, Ordering::Relaxed);
-        // Rebinding rather than mutating: the body must see this attempt's token, and the `Ctx`
-        // the workflow body holds must not acquire one that outlives the step.
+        // Rebinding rather than mutating: the body must see this attempt's token and its own
+        // marker, and the `Ctx` the workflow body holds must acquire neither.
         let scoped = Ctx {
             executor: Arc::clone(&self.executor),
             workflow: Arc::clone(&self.workflow),
             step_cancellation: cancellation,
+            step_marker: Some(StepMarker(NEXT_STEP_MARKER.fetch_add(1, Ordering::Relaxed))),
         };
         CURRENT.scope(scoped, body).await
     }
@@ -193,12 +263,15 @@ impl Ctx {
     /// Fires when the running step should stop.
     ///
     /// Observe it from work the runtime cannot stop by dropping this future — a `spawn_blocking`
-    /// thread, or a client that holds its own cancel handle. **Ordinary `async` code needs
-    /// nothing**: a step that times out has its future dropped, which stops it at its next
-    /// suspension point and runs its destructors on the way out, so a connection is returned and a
-    /// guard released without the body containing a line about it. That is what TypeScript's
-    /// `stepStatus.timeoutSignal` is for, and Rust gets the common case for free where TypeScript
-    /// has to abandon the attempt and discard its eventual settlement.
+    /// thread, or a client that holds its own cancel handle. It fires whenever the attempt ends
+    /// **without completing**: a timeout, a cancelled workflow, or anything else that drops the
+    /// step's future. An attempt that reaches an outcome does *not* fire it, because the body has
+    /// had its chance to clean up and work it deliberately left running is not the engine's to
+    /// stop. **Ordinary `async` code needs nothing**: a step that times out has its future dropped,
+    /// which stops it at its next suspension point and runs its destructors on the way out, so a
+    /// connection is returned and a guard released without the body containing a line about it.
+    /// That is what TypeScript's `stepStatus.timeoutSignal` is for, and Rust gets the common case
+    /// for free where TypeScript has to abandon the attempt and discard its eventual settlement.
     ///
     /// Returns a token that is never cancelled when there is no step running, so a body that is
     /// also called outside a workflow needs no second path.
@@ -215,16 +288,8 @@ impl std::fmt::Debug for Ctx {
                 "steps_taken",
                 &self.workflow.next_step_id.load(Ordering::Relaxed),
             )
+            .field("step_marker", &self.step_marker)
             .finish_non_exhaustive()
-    }
-}
-
-/// Clears the in-step flag however the step ends.
-struct InStep(Arc<WorkflowState>);
-
-impl Drop for InStep {
-    fn drop(&mut self) {
-        self.0.in_step.store(false, Ordering::Relaxed);
     }
 }
 
@@ -240,7 +305,6 @@ mod tests {
             workflow_id: "wf-1".to_owned(),
             deadline: None,
             next_step_id: AtomicI32::new(0),
-            in_step: AtomicBool::new(false),
         }
     }
 
@@ -357,6 +421,79 @@ mod tests {
                     );
                 })
                 .await;
+        })
+        .await;
+
+        dbos.shutdown().await;
+    }
+
+    /// A sibling that has finished does not answer for a step still inside its own body.
+    ///
+    /// One half of what a workflow-wide flag got wrong, and the half that corrupts a step that is
+    /// still *running*: whichever scope ended first cleared the answer for the other, so a body
+    /// still inside itself read as no longer in a step, and the next call it made allocated a step
+    /// id instead of being the plain call a nested one has to be.
+    #[tokio::test]
+    async fn a_sibling_that_finishes_does_not_end_this_step() {
+        let (ctx, dbos, _db) = ctx("wf-siblings", None).await;
+        let (inside, wait_for_inside) = tokio::sync::oneshot::channel();
+        let (done, wait_for_done) = tokio::sync::oneshot::channel();
+
+        let long = ctx.in_step_scope(None, async move {
+            inside.send(()).expect("the sibling is waiting on this");
+            wait_for_done.await.expect("the sibling ran to completion");
+            Ctx::current().expect("inside a step").in_step()
+        });
+        let short = async {
+            wait_for_inside
+                .await
+                .expect("the long step reached its body");
+            // A whole step scope opens and closes while the other one is suspended inside its own.
+            ctx.in_step_scope(None, std::future::ready(())).await;
+            done.send(()).expect("the long step is waiting on this");
+        };
+
+        let (still_inside, ()) = tokio::join!(long, short);
+        assert!(
+            still_inside,
+            "a sibling finishing must not tell a step it has left its own body"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// A step in flight does not make the workflow body around it look nested.
+    ///
+    /// The other half of the same bug: with the answer shared, anything the workflow proper did
+    /// while a step was running took the plain path meant for a nested call, and so was never
+    /// checkpointed at all. `a_step_built_while_a_sibling_runs_is_still_checkpointed` in
+    /// [`step`](crate::step) is what that costs a caller.
+    #[tokio::test]
+    async fn a_running_step_does_not_make_the_workflow_proper_look_nested() {
+        let (ctx, dbos, _db) = ctx("wf-proper", None).await;
+        let (inside, wait_for_inside) = tokio::sync::oneshot::channel();
+        let (looked, wait_for_look) = tokio::sync::oneshot::channel();
+
+        let stepping = ctx.clone();
+        Ctx::scope(ctx, async move {
+            let held = stepping.in_step_scope(None, async move {
+                inside
+                    .send(())
+                    .expect("the workflow body is waiting on this");
+                wait_for_look.await.expect("the workflow body looked");
+            });
+            let proper = async {
+                wait_for_inside.await.expect("the step reached its body");
+                let seen = Ctx::current().expect("inside the workflow").in_step();
+                looked.send(()).expect("the step is waiting on this");
+                seen
+            };
+
+            let ((), seen) = tokio::join!(held, proper);
+            assert!(
+                !seen,
+                "the workflow body is not inside the step it is waiting on"
+            );
         })
         .await;
 

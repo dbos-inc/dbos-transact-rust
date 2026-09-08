@@ -19,7 +19,7 @@
 //! calls it with no executor in sight.
 //!
 //! The type system then makes the boundary concrete twice over. Nothing on this type can fail with
-//! [`Error::NotLaunched`], because **a client is always connected** —
+//! [`Error::NotLaunched`](crate::Error::NotLaunched), because **a client is always connected** —
 //! [`connect`](Client::connect) hands back a usable client or an error, with no second state to
 //! check afterwards. And nothing on it can run a workflow, because it holds nothing that could.
 //!
@@ -70,9 +70,7 @@ use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::serialization::encode;
 use crate::sysdb::DEFAULT_SCHEMA;
-use crate::sysdb::types::{
-    Message as EncodedMessage, NewWorkflow, Timestamp, VersionInfo, WorkflowStatus,
-};
+use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
@@ -149,8 +147,8 @@ pub struct ClientConfig {
     /// On, so [`get_event`](crate::Client::get_event) is woken rather than polling. That is the one
     /// wait it serves here: a workflow's *outcome* is announced on no channel, in this
     /// implementation or any other — Python's `await_workflow_result` polls too — so a result wait
-    /// looks again every [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this
-    /// is set to.
+    /// looks again every [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this is
+    /// set to.
     ///
     /// Go's client starts its listener for the same reason. Python defaults its client's off — a
     /// client there is often a short-lived script, and the listener is a thread and a held
@@ -279,8 +277,8 @@ impl ClientConfig {
 /// teardown, which closes the connections but says nothing about when. That is a safety net —
 /// without it the listener would hold a `LISTEN` connection for the life of the process — and not a
 /// shutdown: nothing waits for either task, and whatever the notifier had inside its coalescing
-/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client
-/// is put away deliberately, and is what a process that connects repeatedly wants.
+/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client is
+/// put away deliberately, and is what a process that connects repeatedly wants.
 #[derive(Clone, Debug)]
 pub struct Client(Arc<Connection>);
 
@@ -425,7 +423,9 @@ impl Client {
             ..new_row(workflow_id, Some(&options.queue))
         };
 
-        match init_or_join(&self.0, &new, options.queue.duplication_policy).await? {
+        // A client has no step counter of its own, so an enqueue it makes records against no
+        // parent — the line drawn for every other call a client makes.
+        match init_or_join(&self.0, &new, options.queue.duplication_policy, None).await? {
             Submitted::Created(_) => {
                 tracing::debug!(
                     workflow_id,
@@ -488,87 +488,14 @@ impl Client {
             .map(|row| row.status))
     }
 
-    /// Sends a message to a workflow, for it to [`recv`] when it is ready.
-    ///
-    /// [`recv`]: crate::sysdb::SystemDatabase::recv
-    ///
-    /// The message waits in the database until the destination reads it, so sending to a workflow
-    /// that has not reached its receive — or is not running at all — is normal rather than an
-    /// error. Sending to a workflow that *does not exist* is [`Error::SystemDatabase`] carrying the
-    /// system database's non-existent-workflow error: the foreign key catches it, so a message is
-    /// never left addressed to nothing.
-    ///
-    /// **A client's send is not a step**, and that is the difference from the send a workflow body
-    /// will make. A workflow's send is checkpointed, so a replay does not send twice; a client has
-    /// no replay and no step sequence, and [`Message::idempotency_key`] is the mechanism it has
-    /// instead — the key becomes the row's identity, so a retried request delivers one message.
-    pub async fn send<T: Serialize>(&self, message: Message<'_, T>) -> Result<()> {
-        self.send_with(message, Forks::Skip).await
-    }
-
-    /// [`send`](Self::send), saying whether the message also reaches the destination's forks.
-    pub async fn send_with<T: Serialize>(
-        &self,
-        message: Message<'_, T>,
-        forks: Forks,
-    ) -> Result<()> {
-        self.send_all(std::slice::from_ref(&message), forks).await
-    }
-
-    /// Sends many messages in one transaction.
-    ///
-    /// **All or none**, which is the reason to prefer this over a loop of [`send`](Self::send):
-    /// the batch is one insert, so a failure halfway through delivers nothing rather than a prefix.
-    /// Python and Java expose the same as `send_bulk`; TypeScript and Go have no equivalent, and a
-    /// caller there writes the loop and lives with the prefix.
-    ///
-    /// One payload type for the whole batch, which is what typing it costs. A batch of genuinely
-    /// different shapes is a batch of `serde_json::Value`, or two calls.
-    pub async fn send_all<T: Serialize>(
-        &self,
-        messages: &[Message<'_, T>],
-        forks: Forks,
-    ) -> Result<()> {
-        // Encoded up front so that nothing is sent when one payload cannot be: the whole batch is
-        // one transaction, and failing halfway through the encoding would be the prefix this
-        // method exists to avoid.
-        let encoded = messages
-            .iter()
-            .map(|message| encode(message.message, "message"))
-            .collect::<Result<Vec<_>>>()?;
-        let messages: Vec<EncodedMessage<'_>> = messages
-            .iter()
-            .zip(&encoded)
-            .map(|(message, encoded)| EncodedMessage {
-                destination_id: message.destination_id,
-                topic: message.topic,
-                message: encoded,
-                idempotency_key: message.idempotency_key,
-            })
-            .collect();
-
-        self.0
-            .sysdb()
-            .send_messages(
-                &messages,
-                Some(self.0.serializer().name()),
-                // No caller: a client is never inside a workflow, so there is no step to record
-                // the batch against and nothing to replay it for.
-                None,
-                forks == Forks::Include,
-            )
-            .await
-            .map_err(Error::SystemDatabase)
-    }
-
     /// Registers a queue, or reports the one already registered under this name.
     ///
     /// The same operation [`DBOS::register_queue`](crate::DBOS::register_queue) performs, and the
     /// reason a client has it is that a queue is a row: a fleet may be configured by the tool that
     /// deploys it rather than by the code that drains it.
     ///
-    /// The limits and the policy are the same [`QueueOptions`] and
-    /// [`QueueConflict`] an application states — but
+    /// The limits and the policy are the same [`QueueOptions`](crate::QueueOptions) and
+    /// [`QueueConflict`](crate::QueueConflict) an application states — but
     /// [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
     /// [`Error::Config`] here rather than a registration: a client runs none of the application's
     /// code, so there is no version of it to be the latest of. Ask for
@@ -581,7 +508,7 @@ impl Client {
     /// being refused**, replacing its stored limits — the ownership check every implementation
     /// shares lets a nameless writer through. Give the client an
     /// [`app_name`](ClientConfig::app_name) to get the refusal
-    /// [`QueueConflict`] describes. UPSTREAM item 26.
+    /// [`QueueConflict`](crate::QueueConflict) describes. UPSTREAM item 26.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
@@ -882,65 +809,6 @@ impl<'a> From<Enqueue<'a>> for EnqueueOptions<'a> {
     }
 }
 
-/// A message for a workflow, and how to address it.
-///
-/// [`Message::new`] plus functional update, like everything else that takes options here:
-///
-/// ```no_run
-/// # use dbos::Message;
-/// let message = Message {
-///     topic: Some("approvals"),
-///     ..Message::new("order-42", &"approved")
-/// };
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Message<'a, T> {
-    /// The workflow it is for.
-    pub destination_id: &'a str,
-    /// The payload, encoded by this client's serializer on the way in.
-    pub message: &'a T,
-    /// The topic it is filed under, or `None` for the default one.
-    ///
-    /// A receiver selects on the topic, so a message sent under one nobody is receiving on waits
-    /// forever rather than being delivered to a different receive.
-    pub topic: Option<&'a str>,
-    /// A key that makes re-sending this message a no-op.
-    ///
-    /// It becomes the row's identity, so a second send under the same key is discarded by the
-    /// database rather than delivered twice. **This is a client's only idempotency**: a workflow's
-    /// send is a checkpointed step, and a client has no step to be checkpointed.
-    pub idempotency_key: Option<&'a str>,
-}
-
-impl<'a, T> Message<'a, T> {
-    /// A message for `destination_id`, on the default topic.
-    pub fn new(destination_id: &'a str, message: &'a T) -> Self {
-        Self {
-            destination_id,
-            message,
-            topic: None,
-            idempotency_key: None,
-        }
-    }
-}
-
-/// Whether a message also reaches the workflows forked from its destination.
-///
-/// A fork is a new workflow replaying an old one's steps, so a message the original was waiting for
-/// is one the fork will wait for too — and it was consumed by the original. Including the forks is
-/// how a send reaches both.
-///
-/// The fork set is resolved inside the sending transaction, so a fork created while the send is in
-/// flight cannot make it stale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Forks {
-    /// The destination named, and nothing else.
-    #[default]
-    Skip,
-    /// The destination, and everything recursively forked from it.
-    Include,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,18 +889,6 @@ mod tests {
         assert_eq!(options.queue.name, "billing");
         assert_eq!(options.workflow_id, Some("order-42"));
         assert_eq!(EnqueueOptions::from(queue.clone()).queue, queue);
-    }
-
-    #[test]
-    fn a_message_is_untopicked_and_sent_once_per_call() {
-        let message = Message::new("workflow-1", &"payload");
-        assert_eq!(message.destination_id, "workflow-1");
-        assert_eq!(message.topic, None);
-        assert_eq!(
-            message.idempotency_key, None,
-            "each send is a distinct message unless a key says otherwise"
-        );
-        assert_eq!(Forks::default(), Forks::Skip);
     }
 
     /// A client is meant to be cloned into whatever holds application state, and used from
