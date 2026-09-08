@@ -356,9 +356,9 @@ pub trait SystemDatabase: Send + Sync {
     /// free [`join_workflows`](crate::join_workflows()) sets out why.
     ///
     /// Narrowing the array it sends is then an implementation's own business rather than a
-    /// contract: the Postgres one de-duplicates once before its first pass, which buys array bytes
-    /// and nothing else, since the narrowing above drops *every* copy of an id the moment one of
-    /// them settles.
+    /// contract: the Postgres one holds its outstanding ids in a `HashSet`, as TypeScript holds
+    /// its own in a `Set`, so a repeat collapses on the way in and each pass removes what it
+    /// watched settle without scanning what it did not.
     ///
     /// Empty input returns at once. Nothing to wait for is a satisfied wait, and TypeScript
     /// short-circuits an empty handle list the same way — where an empty *first*-wait has no
