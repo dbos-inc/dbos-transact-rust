@@ -1951,3 +1951,219 @@ async fn a_child_that_fails_differently_is_started_through_lift() {
 
     dbos.shutdown().await;
 }
+
+/// **A race across a step and the await of a child**, which is the pairing `select_step!` exists
+/// for: the child is started outside the race, and what races is the handle's `result` — a call
+/// that *observes* rather than one that creates.
+///
+/// The await wins here, the losing step records nothing, and the race records the winner's
+/// position. The ids show the whole shape: the start keeps its build-order id, the loser spends
+/// one and writes nothing, and the select's own id follows its branches.
+#[tokio::test]
+async fn a_select_step_races_a_step_against_a_childs_result() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("race-child-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                let started = child.start(()).await?;
+                let outcome: u32 = dbos::select_step! {
+                    // Never finishes, so the await wins however long the child's row takes to
+                    // settle: a loser that merely slept would be racing a wall clock against the
+                    // winner's database round trips.
+                    slow = dbos::step("slow", || async {
+                        std::future::pending::<()>().await;
+                        Ok::<u32, Error>(0)
+                    }) => slow?,
+                    finished = started.result() => finished?
+                }?;
+                Ok::<u32, Error>(outcome)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let outcome = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("raced"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(
+        outcome, 7,
+        "the await won and its arm produced the child's answer"
+    );
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("raced", false, None, None, None)
+        .await
+        .expect("read failed");
+    let positions: Vec<_> = steps
+        .iter()
+        .map(|step| {
+            (
+                step.step_id,
+                step.step_name.as_str(),
+                step.child_workflow_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        [
+            (0, "child", Some("raced-0")),
+            // Id 1 is the losing step, built and dropped without a row.
+            (2, "DBOS.getResult", Some("raced-0")),
+            (3, "DBOS.selectStep", None),
+        ],
+        "the await keeps its build-order id and the race records the winner behind it"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A control signal winning a race is not the race's decision.** A step that ends in a
+/// cancellation, an interruption or a database failure records nothing, so the workflow stays
+/// pending and is recovered — and the race it won has to do the same. Recording the branch as the
+/// winner would pin every recovery to a branch that never ran its body, and never race the other
+/// again.
+#[tokio::test]
+async fn a_control_signal_winning_a_select_step_records_no_winner() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("control-race-app", &db));
+    let raced = Arc::new(tokio::sync::Notify::new());
+    let parent = {
+        let raced = Arc::clone(&raced);
+        dbos.register_workflow("parent", move |()| {
+            let raced = Arc::clone(&raced);
+            async move {
+                // The arms hand the branch's own result out rather than `?`-ing it, so the
+                // workflow reaches the notify whichever way the race went.
+                let outcome: Result<Result<u32, Error>, Error> = dbos::select_step! {
+                    // The shape a cancelled or interrupted body reports in: a control signal,
+                    // which the step returns without checkpointing.
+                    interrupted = dbos::step("interrupted", || async {
+                        Err::<u32, Error>(Error::Interrupted {
+                            workflow_id: "raced".to_owned(),
+                        })
+                    }) => interrupted,
+                    // Never finishes, so the interrupted branch wins whatever its own round trip
+                    // costs.
+                    slow = dbos::step("slow", || async {
+                        std::future::pending::<()>().await;
+                        Ok::<u32, Error>(1)
+                    }) => slow,
+                };
+                raced.notify_one();
+                outcome.and_then(|won| won)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("raced"),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed to start");
+    tokio::time::timeout(Duration::from_secs(5), raced.notified())
+        .await
+        .expect("the race did not finish");
+
+    let steps: Vec<_> = reader(&db)
+        .await
+        .list_workflow_steps("raced", false, None, None, None)
+        .await
+        .expect("read failed")
+        .iter()
+        .map(|step| (step.step_id, step.step_name.clone()))
+        .collect();
+    assert_eq!(
+        steps,
+        [],
+        "neither the interrupted step nor the race it won left a row"
+    );
+    drop(handle);
+
+    dbos.shutdown().await;
+}
+
+/// **A losing step's cancellation token fires**, as it does for a timeout, so work the runtime
+/// cannot stop by dropping the future — a blocking thread, a task the body spawned — learns that
+/// its step is over.
+///
+/// The winner waits for the loser to say it has registered a watcher rather than for a sleep to
+/// expire, which is what makes the ordering a fact rather than a race against the database.
+#[tokio::test]
+async fn a_losing_step_has_its_cancellation_token_fired() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("loser-cancelled-app", &db));
+    let released = Arc::new(tokio::sync::Notify::new());
+    let workflow = {
+        let released = Arc::clone(&released);
+        dbos.register_workflow("workflow", move |()| {
+            let released = Arc::clone(&released);
+            async move {
+                let (watching, watching_rx) = tokio::sync::oneshot::channel::<()>();
+                let mut watching = Some(watching);
+                let mut watching_rx_slot = Some(watching_rx);
+                let outcome: u32 = dbos::select_step! {
+                    fast = dbos::step("fast", move || {
+                        // Taken by the first attempt; a step is built once and run once here.
+                        let watching_rx = watching_rx_slot.take();
+                        async move {
+                            if let Some(watching_rx) = watching_rx {
+                                let _ = watching_rx.await;
+                            }
+                            Ok::<u32, Error>(1)
+                        }
+                    }) => fast?,
+                    slow = dbos::step("slow", move || {
+                        let released = Arc::clone(&released);
+                        let watching = watching.take();
+                        async move {
+                            let token = dbos::Ctx::current().expect("in a step").cancellation();
+                            tokio::spawn(async move {
+                                token.cancelled().await;
+                                released.notify_one();
+                            });
+                            // Said only once the watcher is registered, and never withdrawn: from
+                            // here the loser can be dropped and still be heard.
+                            if let Some(watching) = watching {
+                                let _ = watching.send(());
+                            }
+                            std::future::pending::<()>().await;
+                            Ok::<u32, Error>(2)
+                        }
+                    }) => slow?,
+                }?;
+                Ok::<u32, Error>(outcome)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let outcome = workflow.run(()).await.expect("the workflow failed");
+    assert_eq!(outcome, 1, "the fast step won");
+    tokio::time::timeout(Duration::from_secs(5), released.notified())
+        .await
+        .expect("the losing step's token never fired");
+
+    dbos.shutdown().await;
+}

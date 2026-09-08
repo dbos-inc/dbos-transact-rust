@@ -261,6 +261,45 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     }
 }
 
+impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
+    /// Retargets an engine-channel call into the caller's own error channel.
+    ///
+    /// **For a race that mixes channels.** The branches of a
+    /// [`select_step!`](crate::select_step) must agree on how they fail before any of them is
+    /// awaited, so `map_err(Error::lift)` in an arm is too late: it converts the branch's
+    /// *output*, where what has to change is its declared type. This converts the call itself,
+    /// while it is still a value, which is early enough. The management surface is where it comes
+    /// up — those calls answer in the engine's channel and a workflow body rarely does.
+    ///
+    /// Only from the engine's channel, which is not so much a restriction as the whole reason it
+    /// is sound: [`EngineOnly`](crate::EngineOnly) is uninhabited, so there is no application
+    /// error to translate and nothing can be lost. Two *different* application error types have no
+    /// such conversion, and a race across them is refused — rightly, since it would have no honest
+    /// answer for what it returns.
+    ///
+    /// The name and the placement are carried across unchanged, so this is the same call reported
+    /// differently: it claims no new id, and the per-poll check still holds it to the workflow it
+    /// was built in.
+    #[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that \
+                  id is spent; await it, or hand it to a combinator"]
+    pub fn lift<F>(self) -> PendingStep<'a, T, F>
+    where
+        T: 'a,
+        F: 'a,
+    {
+        let Self {
+            name,
+            placement,
+            running,
+        } = self;
+        PendingStep {
+            name,
+            placement,
+            running: Box::pin(async move { running.await.map_err(Error::lift) }),
+        }
+    }
+}
+
 impl<T, E> Future for PendingStep<'_, T, E> {
     type Output = crate::Result<T, E>;
 

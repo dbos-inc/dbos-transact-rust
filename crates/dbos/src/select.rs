@@ -274,3 +274,369 @@ pub fn control_error<T, E>(slot: &mut Option<Result<T, E>>) -> Option<Error<E>> 
         _ => None,
     }
 }
+
+/// What a durable race is, and what writing one looks like.
+///
+/// The split is worth stating once: everything above is the contract — the id this call claims,
+/// the position it records, the refusal a changed shape earns — and everything here drives it
+/// through [`select_step!`](crate::select_step), because there is nothing else to drive it with. A
+/// `Vec`-taking form existed on the reference branch purely as a test seam and was deleted when
+/// the macro landed; a race's branches disagree about what they return, which is the whole point,
+/// and a `Vec` cannot hold that.
+///
+/// **Every losing branch parks on [`std::future::pending`], never on a sleep.** Winning a race
+/// costs the winner a `check_step` and a `record_step` — two database round trips — and on a
+/// loaded runner those outlast any sleep short enough to keep a test quick, so a sleeping loser
+/// wins and the test fails for a reason that has nothing to do with what it asserts.
+#[cfg(all(test, feature = "macros"))]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+    use crate::context::Ctx;
+    use crate::step::step;
+    use crate::sysdb::types::{NewWorkflow, Submission};
+    use crate::{Config, DBOS};
+
+    /// A launched instance and a workflow row for the race to record against.
+    ///
+    /// No `run` here on purpose: entering the same workflow id under two fresh contexts is
+    /// precisely what a replay is, and it is the only way to test one before recovery does it for
+    /// real.
+    async fn workflow(id: &str) -> (DBOS, dbos_test_support::TestDatabase) {
+        let db = dbos_test_support::test_database().await;
+        let dbos = DBOS::new(Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..Config::new("select-test", db.url())
+        });
+        dbos.launch().await.expect("launch failed");
+        dbos.executor("test")
+            .expect("launched")
+            .sysdb()
+            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
+            .await
+            .expect("could not create the workflow row");
+        (dbos, db)
+    }
+
+    fn ctx(dbos: &DBOS, id: &str) -> Ctx {
+        Ctx::new(dbos.executor("test").expect("launched"), id, None)
+    }
+
+    /// The ids a workflow's steps were recorded under, and what recorded them.
+    async fn steps(dbos: &DBOS, id: &str) -> Vec<(i32, String)> {
+        dbos.executor("test")
+            .expect("launched")
+            .sysdb()
+            .list_workflow_steps(id, true, None, None, None)
+            .await
+            .expect("read failed")
+            .into_iter()
+            .map(|step| (step.step_id, step.step_name))
+            .collect()
+    }
+
+    /// A branch that never answers, which is how every loser in this module loses.
+    fn never(name: &'static str) -> PendingStep<'static, u32> {
+        step(name, || async {
+            std::future::pending::<()>().await;
+            Ok::<_, crate::Error>(0u32)
+        })
+    }
+
+    /// The macro over the core: heterogeneous branches, typed arms, one arm run.
+    ///
+    /// The branches return a `u32` and a `String`, which is the thing a `Vec`-taking core cannot
+    /// express and the whole reason this is a macro.
+    #[tokio::test]
+    async fn a_race_runs_one_arm_and_the_loser_records_nothing() {
+        let (dbos, _db) = workflow("wf-macro").await;
+        let loser_ran = Arc::new(AtomicU32::new(0));
+
+        let answer: crate::Result<String> = Ctx::scope(ctx(&dbos, "wf-macro"), {
+            let loser_ran = Arc::clone(&loser_ran);
+            async move {
+                crate::select_step! {
+                    slow = step("slow", {
+                        let loser_ran = Arc::clone(&loser_ran);
+                        move || {
+                            let loser_ran = Arc::clone(&loser_ran);
+                            async move {
+                                loser_ran.fetch_add(1, Ordering::SeqCst);
+                                std::future::pending::<()>().await;
+                                Ok::<_, crate::Error>(1u32)
+                            }
+                        }
+                    }) => format!("the counter won with {}", slow?),
+                    quick = step("quick", || async {
+                        Ok::<_, crate::Error>("hello".to_owned())
+                    }) => format!("the namer won with {}", quick?)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(answer.unwrap(), "the namer won with hello");
+        // The loser was *built*, so it spent id 0, and dropped without recording — which is what
+        // keeps the numbering stable across a replay that never runs it.
+        assert_eq!(
+            steps(&dbos, "wf-macro").await,
+            [(1, "quick".to_owned()), (2, "DBOS.selectStep".to_owned())],
+            "the winner keeps its build-order id, the loser records nothing"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// A replay takes the same arm, and the loser is not run for the first time on the way past.
+    #[tokio::test]
+    async fn a_replayed_race_takes_the_recorded_branch_and_polls_no_other() {
+        let (dbos, _db) = workflow("wf-macro-replay").await;
+        let loser_ran = Arc::new(AtomicU32::new(0));
+
+        let race = |loser_ran: Arc<AtomicU32>| async move {
+            crate::select_step! {
+                quick = step("quick", || async { Ok::<_, crate::Error>(7u32) }) => {
+                    format!("quick: {}", quick?)
+                }
+                slow = step("slow", {
+                    let loser_ran = Arc::clone(&loser_ran);
+                    move || {
+                        let loser_ran = Arc::clone(&loser_ran);
+                        async move {
+                            loser_ran.fetch_add(1, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                            Ok::<_, crate::Error>("slow".to_owned())
+                        }
+                    }
+                }) => format!("slow: {}", slow?)
+            }
+        };
+
+        let first: crate::Result<String> =
+            Ctx::scope(ctx(&dbos, "wf-macro-replay"), race(Arc::clone(&loser_ran))).await;
+        assert_eq!(first.unwrap(), "quick: 7");
+        let started_once = loser_ran.load(Ordering::SeqCst);
+
+        let again: crate::Result<String> =
+            Ctx::scope(ctx(&dbos, "wf-macro-replay"), race(Arc::clone(&loser_ran))).await;
+        assert_eq!(again.unwrap(), "quick: 7", "the replay takes the same arm");
+        assert_eq!(
+            loser_ran.load(Ordering::SeqCst),
+            started_once,
+            "the loser recorded nothing the first time, so a replay must not run it now"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// A recorded winner that no longer exists is a changed shape, not a branch to take.
+    ///
+    /// The select has to land on the same step id both times, so the same three calls are built —
+    /// only two of them are raced the second time.
+    #[tokio::test]
+    async fn a_recorded_winner_outside_the_current_set_is_reported() {
+        let (dbos, _db) = workflow("wf-shrunk").await;
+
+        let first: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
+            crate::select_step! {
+                b = never("b") => b?,
+                c = never("c") => c?,
+                a = step("a", || async { Ok::<_, crate::Error>(1u32) }) => a?
+            }
+        })
+        .await;
+        assert_eq!(first.unwrap(), 1, "the branch built third finished first");
+
+        let shrunk: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-shrunk"), async {
+            // Built and dropped, so the select still lands on step 3 and the refusal is about the
+            // race's shape rather than about which slot it read.
+            let _third = step("a", || async { Ok::<_, crate::Error>(1u32) });
+            crate::select_step! {
+                b = step("b", || async { Ok::<_, crate::Error>(2u32) }) => b?,
+                c = step("c", || async { Ok::<_, crate::Error>(3u32) }) => c?
+            }
+        })
+        .await;
+
+        match shrunk {
+            Err(crate::Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+                expected,
+                recorded,
+                ..
+            })) => {
+                assert!(recorded.contains("branch 2"), "{recorded}");
+                // The branches this run built, named — "branch 2" alone says nothing about what
+                // the code in front of the reader does now.
+                assert!(
+                    expected.contains("0: b (step 1), 1: c (step 2)"),
+                    "{expected}"
+                );
+            }
+            other => panic!("a stale winner must be reported, got {other:?}"),
+        }
+
+        dbos.shutdown().await;
+    }
+
+    /// Outside a workflow the branches run plainly and nothing is recorded — which is what keeps a
+    /// function built from steps ordinarily callable and ordinarily testable.
+    #[tokio::test]
+    async fn outside_a_workflow_the_race_is_plain() {
+        let answer: crate::Result<u32> = async {
+            crate::select_step! {
+                quick = step("quick", || async { Ok::<_, crate::Error>(1u32) }) => quick?,
+                slow = never("slow") => slow?
+            }
+        }
+        .await;
+        assert_eq!(answer.unwrap(), 1);
+    }
+
+    /// Inside a step body it is plain too, by the leaf rule the whole crate follows: the step's
+    /// own checkpoint stands for everything its body did.
+    ///
+    /// This is the case the module documentation blesses — *put the race inside a step* — so it is
+    /// worth pinning that it records nothing of its own rather than a second row under the step.
+    #[tokio::test]
+    async fn inside_a_step_body_the_race_is_plain() {
+        let (dbos, _db) = workflow("wf-in-step").await;
+
+        let answer: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-in-step"), async {
+            step("outer", || async {
+                crate::select_step! {
+                    quick = step("inner-quick", || async { Ok::<_, crate::Error>(5u32) }) => quick?,
+                    slow = never("inner-slow") => slow?
+                }
+            })
+            .await
+        })
+        .await;
+
+        assert_eq!(answer.unwrap(), 5);
+        assert_eq!(
+            steps(&dbos, "wf-in-step").await,
+            [(0, "outer".to_owned())],
+            "the step's own row stands for the race inside it"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// **No arity to run out of.** Ten branches, where a declarative form would stop at the last
+    /// sum type somebody wrote.
+    #[tokio::test]
+    async fn a_race_wider_than_any_hand_written_arity() {
+        let (dbos, _db) = workflow("wf-macro-wide").await;
+
+        let answer: crate::Result<u32> = Ctx::scope(ctx(&dbos, "wf-macro-wide"), async {
+            crate::select_step! {
+                a = never("a") => a?,
+                b = never("b") => b?,
+                c = never("c") => c?,
+                d = never("d") => d?,
+                e = never("e") => e?,
+                f = never("f") => f?,
+                g = never("g") => g?,
+                h = never("h") => h?,
+                i = never("i") => i?,
+                j = step("j", || async { Ok::<_, crate::Error>(10u32) }) => j?,
+            }
+        })
+        .await;
+
+        assert_eq!(answer.unwrap(), 10, "the tenth branch finished first");
+        assert_eq!(
+            steps(&dbos, "wf-macro-wide").await,
+            [(9, "j".to_owned()), (10, "DBOS.selectStep".to_owned())],
+            "nine losers spend their ids and record nothing"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// The comma rule is `match`'s: a block body ends its own arm, including mid-list.
+    ///
+    /// Outside a workflow, because what is under test is the grammar rather than the checkpoint —
+    /// this compiling at all is most of the assertion.
+    #[tokio::test]
+    async fn a_block_arm_ends_itself_like_a_match_arm() {
+        let answer: crate::Result<u32> = async {
+            crate::select_step! {
+                quick = step("quick", || async { Ok::<_, crate::Error>(1u32) }) => {
+                    let won = quick?;
+                    won + 10
+                }
+                slow = never("slow") => match slow {
+                    Ok(value) => value + 1,
+                    Err(_) => 0,
+                }
+            }
+        }
+        .await;
+        assert_eq!(answer.unwrap(), 11);
+    }
+
+    /// **An engine-channel call joins a race in the application's own channel**, which is what
+    /// [`PendingStep::lift`] is for.
+    ///
+    /// The management surface answers in the engine's channel, a workflow body usually does not,
+    /// and the branches have to agree on how they fail *before* any of them is awaited — so
+    /// `map_err(Error::lift)` inside an arm is too late, converting the branch's output where what
+    /// has to change is its type. This compiling is most of the assertion.
+    #[tokio::test]
+    async fn an_engine_channel_call_joins_a_race_in_the_applications_channel() {
+        #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+        #[error("the application failed")]
+        struct AppError;
+
+        let (dbos, _db) = workflow("wf-lifted").await;
+        let filter = crate::sysdb::types::WorkflowFilter::default();
+
+        let listed: crate::Result<bool, AppError> = Ctx::scope(ctx(&dbos, "wf-lifted"), async {
+            crate::select_step! {
+                never = crate::step("never", || async {
+                    std::future::pending::<()>().await;
+                    Ok::<bool, crate::Error<AppError>>(false)
+                }) => never?,
+                rows = dbos.list_workflows(&filter).lift() => !rows?.is_empty()
+            }
+        })
+        .await;
+
+        assert!(
+            listed.unwrap(),
+            "the listing won and saw this workflow's row"
+        );
+
+        dbos.shutdown().await;
+    }
+
+    /// **The race's error type comes from its branches, with nothing written down.**
+    ///
+    /// [`Branches`] is what carries it: the branches disagree about `T` — that is the point of a
+    /// race — and agree about `E`, and pushing each one is what states the agreement. Without it
+    /// the only thing tying the expansion's error type to the branches' would be a `?` inside an
+    /// arm, so a race whose arms handle their own failures would need an annotation. No annotation
+    /// here is the whole test.
+    #[tokio::test]
+    async fn the_error_type_is_inferred_from_the_branches() {
+        let (dbos, _db) = workflow("wf-macro-inferred").await;
+
+        let answer = Ctx::scope(ctx(&dbos, "wf-macro-inferred"), async {
+            crate::select_step! {
+                counted = never("counted") => counted.is_ok(),
+                named = step("named", || async {
+                    Ok::<_, crate::Error>("hello".to_owned())
+                }) => named.is_ok(),
+            }
+        })
+        .await;
+
+        assert!(answer.unwrap(), "the branch that finished first succeeded");
+
+        dbos.shutdown().await;
+    }
+}
