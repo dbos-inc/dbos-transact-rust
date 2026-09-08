@@ -172,9 +172,11 @@ where
     /// so a replay is free to decide it the other way and continue from a wait this execution
     /// abandoned. What is wrong there is the *unrecorded* decision and not the racing — bound the
     /// child where its bound belongs, with [`StartOptions::timeout`](crate::StartOptions::timeout)
-    /// or the deadline it inherits, and race this wait against other waits with
-    /// [`select_workflow!`](macro@crate::select_workflow), which checkpoints the winner and then
-    /// awaits that handle alone, on the run and on the replay both.
+    /// or the deadline it inherits, and race this wait with the macro built for the shape:
+    /// [`select_workflow!`](macro@crate::select_workflow) against other waits, which checkpoints
+    /// the winner and then awaits that handle alone on the run and on the replay both, or
+    /// [`select_step!`](crate::select_step) against a call of another kind — a step, a sleep, an
+    /// event — since this wait is a [`PendingStep`] and so may be one of its branches.
     ///
     /// **The id is claimed here, where the call is written, not where the wait is first polled.**
     /// So a `join!` over several handles' results is ordinary code — `join!` builds every branch

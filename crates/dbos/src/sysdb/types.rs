@@ -2353,6 +2353,24 @@ pub mod step_names {
     /// The free [`join_workflows`](crate::join_workflows()) sets out the argument.
     pub const SELECT_WORKFLOW: &str = "DBOS.selectWorkflow";
 
+    /// The step name a durable race over steps records.
+    ///
+    /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above
+    /// and for the same reason. Go's `Select` records `"DBOS.select"`
+    /// (`workflow.go:3082`); this crate's call is [`select_step!`](crate::select_step), because a
+    /// bare `select` in a Rust namespace reads as a future combinator where this one takes only
+    /// steps, and the recorded name follows the call a reader wrote. Python's `asyncio_wait`
+    /// records `"DBOS.asyncio_wait"` and could not have been borrowed at all.
+    ///
+    /// Affordable for the reason [`SELECT_WORKFLOW`] states in full: nothing reads a step name across
+    /// implementations, since a workflow only crosses one by enqueue and an enqueued workflow
+    /// starts from step zero. The divergence is the word and not the shape.
+    ///
+    /// **What it records is a position, not an outcome**: the index of the branch that won, among
+    /// the branches that race at this point in the code. The winner's own result is under the
+    /// winning step's own id, so recording it here too would keep one outcome in two places.
+    pub const SELECT_STEP: &str = "DBOS.selectStep";
+
     /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT`].
     pub const RECV: &str = "DBOS.recv";
 

@@ -65,15 +65,21 @@
 //!
 //! What to reach for instead, inside a workflow body:
 //!
+//! - **Racing durable calls**: [`select_step!`](crate::select_step), which is `tokio::select!`'s
+//!   answer here — it records *which branch won* and a replay polls only that one, so the choice
+//!   is replayed rather than made again.
 //! - **Racing workflows**: [`select_workflow!`](macro@crate::select_workflow), which records the
-//!   winner and awaits only it.
+//!   winner and awaits only it. Where every branch is a workflow's outcome this is the call to
+//!   reach for rather than `select_step!` over the handles' awaits: it settles the whole set with
+//!   one query per poll interval, where N racing awaits poll N times.
 //! - **Bounding how long something may take**: the call's own deadline —
 //!   [`get_event`](crate::get_event) and [`recv`](crate::recv) take one, a step carries its
 //!   timeout, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout).
 //!   Each of those is recorded; a `timeout` around the future is not.
-//! - **Racing anything else**: put the race *inside a step*. A step is a leaf whose checkpoint
-//!   stands for everything its body did, so a `select!` or a `timeout` in there is replayed as the
-//!   one answer the step recorded, and nothing about how it was reached has to be reproduced.
+//! - **Racing anything else** — a future this crate knows nothing about, or a wall clock: put the
+//!   race *inside a step*. A step is a leaf whose checkpoint stands for everything its body did,
+//!   so a `select!` or a `timeout` in there is replayed as the one answer the step recorded, and
+//!   nothing about how it was reached has to be reproduced.
 //!
 //! That last line is the general rule and the reason the others are narrow: **the ban is on racing
 //! in a workflow body, not on racing.** Inside a step body, or outside a workflow entirely, the
@@ -83,10 +89,11 @@
 //! above: [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a
 //! workflow, and a race polls in source order and stops at the first branch that is ready — so
 //! whether the child exists at all would follow the timing of some other branch. Start outside the
-//! race; race what observes the result. Being their own types keeps them out of everything here
-//! that is typed on a [`PendingStep`], but a race is not one of those: `select!` takes any future,
-//! so this paragraph is what stands between a body and that mistake, exactly as it does for every
-//! other call above.
+//! race; race what observes the result. Being their own types is what keeps them out of a durable
+//! race in particular: [`select_step!`](crate::select_step) pushes each branch onto a set that
+//! takes a [`PendingStep`], so a start handed to one is a type error rather than a paragraph
+//! ignored. What no type stops is `tokio::select!`, which takes any future — there this paragraph
+//! is what stands between a body and the mistake, exactly as it does for every other call above.
 //!
 
 use std::future::Future;
@@ -142,8 +149,10 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// first execution never took. A `timeout` is that same race against a clock, and the clock is not
 /// replayed either. An all-wait decides nothing, which is why `join!` needs no help.
 ///
-/// Inside a workflow body, reach for these instead: race workflows with
-/// [`select_workflow!`](macro@crate::select_workflow), which records its winner; bound a call with
+/// Inside a workflow body, reach for these instead: race durable calls with
+/// [`select_step!`](crate::select_step), which records which branch won and replays only that one;
+/// race workflows with [`select_workflow!`](macro@crate::select_workflow), which records its
+/// winner and is the cheaper call where every branch is a workflow's outcome; bound a call with
 /// the deadline it already takes — [`get_event`](crate::get_event) and [`recv`](crate::recv) take
 /// one, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout); and put
 /// any other race **inside a step**, whose checkpoint stands for however its body reached the
@@ -258,6 +267,95 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     #[must_use]
     pub fn step_id(&self) -> Option<i32> {
         self.placement.as_ref().and_then(StepPlacement::step_id)
+    }
+}
+
+impl<'a, T, E> PendingStep<'a, T, E> {
+    /// Retargets this call's error channel through a conversion of the caller's.
+    ///
+    /// **For a race whose branches fail differently.** The branches of a
+    /// [`select_step!`](crate::select_step) must agree on how they fail *before* any of them is
+    /// awaited — [`Branches::push`](crate::__private::Branches::push) is what ties them together,
+    /// and it runs at the build — so `map_err` on an arm's body is too late. This converts the
+    /// call while it is still a value, which is early enough:
+    ///
+    /// ```ignore
+    /// dbos::select_step! {
+    ///     charged = billing.result().map_error(Mine::from) => charged?,
+    ///     expired = dbos::sleep(deadline) => expired?,
+    /// }
+    /// ```
+    ///
+    /// [`lift`](Self::lift) is this with the conversion the compiler can write itself, and is what
+    /// to reach for where the channel being left is the engine's. This is the other case: two
+    /// application error types, where only the caller knows what one means in terms of the other.
+    ///
+    /// **The engine's own variants are carried across unchanged** — the conversion sees the
+    /// application's error alone, which is the whole of `Error::map_application`'s job, so a
+    /// cancellation stays a cancellation and a race still reads it as a control signal rather than
+    /// as an outcome.
+    ///
+    /// **What is recorded is the error the call actually made.** This step writes its own row
+    /// before it returns, in its own channel, so the conversion changes what the *caller* sees and
+    /// not what the database holds — and a replay reads the original back and converts it again.
+    /// A conversion that is a pure function of its input therefore replays identically, which is
+    /// what `Fn + Copy` asks for and what a caller should keep to.
+    ///
+    /// The name and the placement are carried across unchanged, so this is the same call reported
+    /// differently: it claims no new id, and the per-poll check still holds it to the workflow it
+    /// was built in.
+    #[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that \
+                  id is spent; await it, or hand it to a combinator"]
+    pub fn map_error<F>(self, convert: impl Fn(E) -> F + Copy + Send + 'a) -> PendingStep<'a, T, F>
+    where
+        T: 'a,
+        E: 'a,
+        F: 'a,
+    {
+        let Self {
+            name,
+            placement,
+            running,
+        } = self;
+        PendingStep {
+            name,
+            placement,
+            running: Box::pin(async move {
+                running
+                    .await
+                    .map_err(|failed| failed.map_application(convert))
+            }),
+        }
+    }
+}
+
+impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
+    /// Retargets an engine-channel call into the caller's own error channel.
+    ///
+    /// **For a race that mixes channels.** The branches of a
+    /// [`select_step!`](crate::select_step) must agree on how they fail before any of them is
+    /// awaited, so `map_err(Error::lift)` in an arm is too late: it converts the branch's
+    /// *output*, where what has to change is its declared type. This converts the call itself,
+    /// while it is still a value, which is early enough. The management surface is where it comes
+    /// up — those calls answer in the engine's channel and a workflow body rarely does.
+    ///
+    /// Only from the engine's channel, which is not so much a restriction as the whole reason it
+    /// is sound: [`EngineOnly`](crate::EngineOnly) is uninhabited, so there is no application
+    /// error to translate and nothing can be lost. Two *different* application error types have no
+    /// such conversion, and a race across them is refused — rightly, since it would have no honest
+    /// answer for what it returns.
+    ///
+    /// The name and the placement are carried across unchanged, so this is the same call reported
+    /// differently: it claims no new id, and the per-poll check still holds it to the workflow it
+    /// was built in.
+    #[must_use = "a durable call that is not awaited never runs, and if it claimed a step id that \
+                  id is spent; await it, or hand it to a combinator"]
+    pub fn lift<F>(self) -> PendingStep<'a, T, F>
+    where
+        T: 'a,
+        F: 'a,
+    {
+        self.map_error(|impossible| match impossible {})
     }
 }
 

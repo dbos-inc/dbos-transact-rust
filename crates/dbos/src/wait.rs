@@ -223,6 +223,11 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 ///
 /// Outside a workflow there is no context to read, so this is [`Error::NotInWorkflow`]. That is
 /// where [`DBOS::select_workflow`] is the call.
+///
+/// **This rather than a [`select_step!`](crate::select_step) over the handles' awaits**, wherever
+/// the branches are all workflows. Both are durable — an await is a step like any other — but this
+/// settles the whole set with one query per poll interval, where N raced awaits are N pollers
+/// asking separately. `select_step!` is for a race whose branches are not all of one kind.
 pub fn select_workflow<'a, E: crate::DurableError + 'a>(
     workflow_ids: &'a [&'a str],
 ) -> PendingStep<'a, String, E> {
