@@ -207,10 +207,17 @@ The dry run does the local half for real — steps 1, 2 and 4, the bump, its com
 and undoes all of it before returning. Only the two steps that leave your machine, the publish and
 the push, are simulated. It works that way for the same reason step 1 does: a dry run that left
 the manifests alone would report the unsatisfiable `-dev` pin and package crates still carrying
-the `-dev` version, so it would never once look at the artifacts a release would upload. The
-scratch commit stays in the reflog, the tag is deleted by name only if the dry run cut it, and the
-reset is exact because the tree was verified clean before anything started — which is also why the
-dry run refuses to start on a dirty tree.
+the `-dev` version, so it would never once look at the artifacts a release would upload. The tag
+is cut for a similar reason: `cargo release push` refuses to run without it, and a tag name
+already taken is exactly what a dry run is for — a real release only reaches its tag step after
+the publish, which cannot be taken back.
+
+All of that happens on a **detached HEAD**, so `main` itself never moves. An interrupted dry run
+cannot leave a release commit sitting on a branch for someone to push later; the most it leaves is
+a detached HEAD and a local tag, and `git checkout main` plus a `git tag -d v0.5.0` clears both.
+On a normal exit the tag is deleted, the commit is reset away — it stays in the reflog — and the
+branch is checked out again. The reset is exact because the tree was verified clean before
+anything started, which is also why the dry run refuses to start on a dirty tree.
 
 ### Release candidates
 
