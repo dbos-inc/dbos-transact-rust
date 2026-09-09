@@ -162,7 +162,7 @@ impl<E> Clone for StepOptions<E> {
 impl<E> StepOptions<E> {
     /// Sets [`should_retry`](Self::should_retry), wrapping the closure.
     ///
-    /// A method beside the struct literal rather than instead of it: the other four fields are
+    /// A method beside the struct literal rather than instead of it: the other fields are
     /// plain values and read better set directly, while this one would otherwise make every call
     /// site spell `Some(Arc::new(..))` around a one-line match.
     ///
@@ -238,16 +238,13 @@ impl<E> StepOptions<E> {
 /// were taken in. An id allocated at the first poll would instead depend on which future reached
 /// the counter first, which is not something a replay reproduces.
 ///
-/// **That is now a promise about every durable call in the crate.** `sleep`, the events, the
+/// **That is a promise about every durable call in the crate.** `sleep`, the events, the
 /// messages, the waits and every checkpointed management call on [`DBOS`](crate::DBOS) take their
 /// ids at the call, and so do a child's [`start`](crate::WorkflowRef::start), the await of its
 /// handle ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and the
 /// [`run`](crate::WorkflowRef::run) that is the two of them in sequence. Any of them may be built
 /// first and driven together with steps and with each other; `join!` over a mixture of them is
-/// ordinary code. The caveat that used to stand here — await these one at a time, because their
-/// ids land wherever they are first polled — is gone, and with it the failure it warned about: a
-/// replay that interleaved differently met a recorded step under the wrong name, which records
-/// nothing, leaves the workflow `PENDING`, and has it recovered until it parks.
+/// ordinary code.
 ///
 /// **`join!` needs nothing of a race; a race needs its winner recorded.** An all-wait decides
 /// nothing, so a replay has nothing to get differently and `join!` over durable calls is ordinary
@@ -257,18 +254,16 @@ impl<E> StepOptions<E> {
 /// race: a bare `tokio::select!` over durable calls, and `tokio::time::timeout`, which is that
 /// same race against a clock no replay reproduces.
 ///
-/// Recorded races are the supported ones, and there are three of them.
-/// [`select_step!`](crate::select_step) is the general one: it checkpoints *which branch* won, and
-/// a replay polls that branch alone — which is `tokio::select!`'s shape with the decision written
-/// down. [`select_workflow!`](macro@crate::select_workflow) is the specialised one, for a race
-/// whose branches are all workflows: it checkpoints which handle won and settles the whole set
-/// with one wait rather than one per handle. A call that carries its own deadline is the third —
-/// there the bound is part of what gets recorded rather than a second branch. And a race over
-/// futures this crate knows nothing about can still go *inside a step*, whose checkpoint stands
-/// for however its body reached the answer. [`PendingStep`] says all of this for every durable
-/// call, not only steps, and ids taken at the call are what let a race be recorded at all: a
-/// losing branch has already spent its id, and spends the same one on the replay, whether or not
-/// it is ever polled.
+/// Recorded races are the supported ones. [`select_step!`](crate::select_step) is the general one:
+/// it checkpoints *which branch* won, and a replay polls that branch alone.
+/// [`select_workflow!`](macro@crate::select_workflow) is the specialised one, for a race whose
+/// branches are all workflows: it checkpoints which handle won and settles the whole set with one
+/// wait. A call that carries its own deadline is the third — there the bound is part of what gets
+/// recorded. And a race over futures this crate knows nothing about can still go *inside a step*,
+/// whose checkpoint stands for however its body reached the answer. [`PendingStep`] says all of
+/// this for every durable call, not only steps; ids taken at the call are what let a race be
+/// recorded at all, since a losing branch spends the same id on the replay whether or not it is
+/// ever polled.
 ///
 /// **Whether a step is nested is decided per call stack, not per workflow.** The context a step
 /// body runs under is rebound for that body alone, so a step built in the workflow proper while a
@@ -276,14 +271,14 @@ impl<E> StepOptions<E> {
 ///
 /// **A step built and dropped has still spent its id**, which is why [`PendingStep`] is `#[must_use]`.
 /// It is deterministic — the same construction sequence burns the same ids on a replay — but it is
-/// no longer the no-op it was when the id was taken at the first poll.
+/// not a no-op.
 ///
-/// **A step is polled where it was built.** The id is a claim on one position in one workflow, so
-/// a step built outside a workflow and awaited inside one, carried into a second workflow, or
-/// carried across a step-body boundary in either direction is refused as
-/// [`Error::StepBuiltElsewhere`](crate::Error::StepBuiltElsewhere) rather than run under an id
-/// nothing there can honour. The everyday way to trip it is evaluating the step before the context
-/// exists: `Ctx::scope(ctx, step(..))` builds it outside and polls it inside.
+/// **A step is polled where it was built.** The id is a claim on one position in one workflow, so a
+/// step built outside a workflow and awaited inside one, carried into a second workflow, or carried
+/// across a step-body boundary in either direction is refused as [`Error::StepBuiltElsewhere`]
+/// rather than run under an id nothing there can honour. The everyday way to trip it is building
+/// the step before the workflow runs — in the handler that then starts it, say — and awaiting it
+/// inside.
 ///
 /// The name is explicit and it matters: it is checked on replay, so a step whose name changed is
 /// reported rather than silently matched against the recorded result of whatever used to be there.
@@ -332,7 +327,7 @@ where
 ///
 /// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
 /// to after the final attempt, rather than the last attempt alone. Python takes its
-/// `step_start_time` in the same place, and Go moved to it in #442.
+/// `step_start_time` in the same place, and so does Go (#442).
 pub fn step_with<'a, T, E, F, Fut>(
     name: &str,
     options: StepOptions<E>,
@@ -398,8 +393,8 @@ where
     let workflow_id = ctx.workflow_id();
 
     // Before the check, not after it: the recorded duration covers the whole step, including the
-    // round trip that asks whether it has already run. Go moved to this in #442 and Python has
-    // always taken `step_start_time` here.
+    // round trip that asks whether it has already run. Python takes `step_start_time` here, and
+    // so does Go (#442).
     let started_at = Timestamp::now();
 
     let recorded = executor
@@ -574,9 +569,9 @@ where
 
 /// Runs one attempt under the watchdogs its options ask for.
 ///
-/// One place decides whether the attempt completed or blew its deadline, which is the shape
-/// py #826 arrived at when it merged Python's preemption poller and its new step timeout into a
-/// single `_supervise_step`. Preemption joins here rather than beside it.
+/// One place decides whether the attempt completed or blew its deadline, which is the shape of
+/// Python's `_supervise_step` (py #826), where the preemption poller and the step timeout share
+/// one loop. Preemption joins here rather than beside it.
 ///
 /// **Without a timeout this is the body and nothing else** — no timer, no token, no `select!` —
 /// so a step that does not ask for one pays nothing for the option existing.
@@ -602,7 +597,7 @@ where
     // **Every attempt gets a token, and it fires wherever the attempt is abandoned.** The guard
     // cancels it if this future is dropped — a caller dropping the step, a combinator dropping it
     // as a losing branch, the `select!` below losing the attempt to a watchdog — so work the
-    // runtime cannot stop by dropping, a `spawn_blocking` thread watching `ctx.cancellation()`,
+    // runtime cannot stop by dropping, a `spawn_blocking` thread watching `cancellation_token()`,
     // learns that its step is over in every one of those cases and not only the two this function
     // races itself.
     //
@@ -813,7 +808,7 @@ mod tests {
     ///
     /// The row has to exist because a step re-stamps its workflow's executor id, and there is no
     /// `run` here on purpose: entering the same workflow id under two contexts is precisely what a
-    /// replay is, and it is the only way to test one before recovery exists to do it for real.
+    /// replay is, and it is the cheapest way to produce one without going through recovery.
     async fn workflow(id: &str) -> (DBOS, dbos_test_support::TestDatabase) {
         let db = dbos_test_support::test_database().await;
         let dbos = DBOS::new(Config {
@@ -1092,8 +1087,8 @@ mod tests {
 
         Ctx::scope(ctx(&dbos, "wf-nested"), async {
             step("outer", || async {
-                // Go #420's rule: a step is a leaf. Were this to allocate an id, every step after
-                // it would replay against the wrong slot.
+                // A step is a leaf (Go draws the same line in #420). Were this to allocate an id,
+                // every step after it would replay against the wrong slot.
                 let inner = step("inner", || async { Ok::<_, crate::Error>(1u32) })
                     .await
                     .unwrap();
@@ -1139,7 +1134,7 @@ mod tests {
             // and on a loaded machine the reply to that round trip can already be waiting, which
             // carries the poll through the body and into the checkpoint's own write. The
             // assertion below would then be about which read happened to be ready rather than
-            // about the rule, and it has failed in CI for exactly that.
+            // about the rule.
             let mut built = step("moved", || async {
                 std::future::pending::<()>().await;
                 Ok::<_, crate::Error>(1u32)
@@ -1205,9 +1200,10 @@ mod tests {
 
     /// A step built in the workflow proper while a sibling's body is in flight is still a step.
     ///
-    /// What the per-call-stack marker buys, at the only altitude that shows it: with the answer on
-    /// the shared workflow state, `held` being mid-body made `beside` read *itself* as nested, so
-    /// `beside` ran plainly and wrote no row — and every replay of this workflow ran it again.
+    /// What the per-call-stack marker buys, at the only altitude that shows it: were the answer
+    /// kept on the shared workflow state, `held` being mid-body would make `beside` read *itself*
+    /// as nested, so `beside` would run plainly and write no row — and every replay of this
+    /// workflow would run it again.
     ///
     /// The two notifies are the whole of the interleaving, and there is no sleep in it: `beside` is
     /// built only once `held` says it is inside its body, and `held` returns only once `beside` has

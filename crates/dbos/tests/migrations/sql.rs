@@ -1,11 +1,10 @@
 //! Applies the migration corpus to a real database.
 //!
 //! Everything else about the corpus is checked by reading it — file counts, slot arithmetic,
-//! header numbering. Those tests are cheap and they caught real problems, but they share a
-//! blind spot: they assert things *about* SQL without ever asking a database whether it is
-//! valid. A `%s` bound to the wrong value, a variant selected for the wrong dialect, or a
-//! statement that parses everywhere but only executes on one backend all pass a static check
-//! and fail here.
+//! header numbering. Those tests are cheap, but they share a blind spot: they assert things
+//! *about* SQL without ever asking a database whether it is valid. A `%s` bound to the wrong
+//! value, a variant selected for the wrong dialect, or a statement that parses everywhere but
+//! only executes on one backend all pass a static check and fail here.
 //!
 //! These run on the raw lane, because the migrations are the thing under test.
 
@@ -347,8 +346,8 @@ async fn only_the_notifications_trigger_survives() {
 /// Migration 10 is skipped, because migration 1 already created the primary key.
 ///
 /// Its guard is the only conditional in the corpus, and the branch it protects is one this
-/// implementation should never take — migration 1 has created `message_uuid ... PRIMARY KEY`
-/// inline all along. If this ever fails, either migration 1 changed or the guard is wrong.
+/// implementation should never take — migration 1 creates `message_uuid ... PRIMARY KEY`
+/// inline. If this ever fails, either migration 1 changed or the guard is wrong.
 #[tokio::test]
 async fn migration_ten_is_a_no_op_on_a_schema_we_created() {
     let db = raw_database().await;

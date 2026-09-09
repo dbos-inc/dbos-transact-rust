@@ -86,9 +86,9 @@ pub type Result<T, E = EngineOnly> = std::result::Result<T, Error<E>>;
 
 /// Everything a durable function can fail with.
 ///
-/// `#[non_exhaustive]` because the twenty codes the other implementations share (§4.6) arrive with
-/// the phases that raise them; matching callers need a wildcard arm from the start rather than a
-/// breaking change later.
+/// `#[non_exhaustive]` because more of the error codes the other implementations share arrive
+/// with the phases that raise them; matching callers need a wildcard arm from the start rather
+/// than a breaking change later.
 ///
 /// **Serializable, and that is load-bearing.** A failed workflow or step records the error it
 /// failed with, and a replay has to give back *that error* rather than a description of it — the
@@ -128,7 +128,7 @@ pub enum Error<E = EngineOnly> {
 
     /// An operation that only makes sense inside a workflow was called outside one.
     ///
-    /// [`set_event`](crate::set_event) is the first: it checkpoints its write under a step id,
+    /// [`set_event`](crate::set_event) is the archetype: it checkpoints its write under a step id,
     /// and outside a workflow there is no step-id sequence to record against — unlike a step,
     /// whose body can simply run plainly.
     #[error("{operation} must be called from within a workflow")]
@@ -354,8 +354,8 @@ pub enum Error<E = EngineOnly> {
     ///
     /// - **Built outside a workflow, awaited inside one.** It took no id, so it would run
     ///   unrecorded where the surrounding workflow plainly expects a checkpoint, and every replay
-    ///   would run it again. Easy to reach by accident — `Ctx::scope(ctx, step(..))` evaluates the
-    ///   step before the scope exists.
+    ///   would run it again. Easy to reach by accident: a step built in the handler that then
+    ///   starts the workflow, and awaited from the workflow body.
     /// - **Built in one workflow, polled in another.** Its row would land under the wrong
     ///   workflow's id.
     /// - **Built inside a step body, awaited in the workflow proper**, or inside a *different*
@@ -369,10 +369,8 @@ pub enum Error<E = EngineOnly> {
     ///   spent an id that nothing will ever record against. Await the step in the workflow, or
     ///   spawn work that is not a step.
     ///
-    /// The first two were silent before ids were taken at the call; the next two are what the
-    /// per-call-stack step marker made distinguishable; the last ran plainly. `built` and `polled`
-    /// name the two places, so a refusal reads "built inside a step of workflow w but polled in
-    /// workflow w" rather than naming the same place twice.
+    /// `built` and `polled` name the two places, so a refusal reads "built inside a step of
+    /// workflow w but polled in workflow w" rather than naming the same place twice.
     ///
     /// **Not a control signal.** It is a mistake in the code rather than a failure of the engine's
     /// substrate, it is deterministic, and a replay reaches it again — so it is the workflow's
@@ -412,9 +410,9 @@ pub enum Error<E = EngineOnly> {
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
-    /// not Java's — Java rethrows the final failure untyped, and `sdk-parity.md` records it as the
-    /// outlier. The first failure is usually the informative one and the last is usually a timeout,
-    /// so keeping only one loses the half that explains the other.
+    /// not Java's, which rethrows the final failure untyped. The first failure is usually the
+    /// informative one and the last is usually a timeout, so keeping only one loses the half that
+    /// explains the other.
     ///
     /// Raised only where retries were actually asked for. A step left at the default
     /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its one
@@ -454,8 +452,8 @@ impl<E> Error<E> {
     /// [`PendingStep::map_error`](crate::PendingStep::map_error) share the list rather than each
     /// carrying a copy of it.
     /// `Fn + Copy` rather than `FnOnce` because
-    /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) nests errors and so recurses. Its
-    /// one caller passes a non-capturing closure, so the tighter bound costs nothing.
+    /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) nests errors and so recurses; the
+    /// closures handed to it are trivially `Copy`, so the tighter bound costs nothing.
     pub(crate) fn map_application<E2>(self, f: impl Fn(E) -> E2 + Copy) -> Error<E2> {
         match self {
             Error::Application(error) => Error::Application(f(error)),
@@ -585,7 +583,7 @@ impl Error<EngineOnly> {
     /// let status = child.status().await.map_err(Error::lift)?;
     /// ```
     ///
-    /// The workflow's own calls do not need it: [`step`](crate::step),
+    /// The workflow's own calls do not need it: [`step`](crate::step()),
     /// [`set_event`](crate::set_event) and [`get_event`](crate::get_event) answer in the caller's
     /// channel, so `?` works on them directly. A child's [`start`](crate::WorkflowRef::start),
     /// [`run`](crate::WorkflowRef::run) and the await of its handle answer in the *child's*

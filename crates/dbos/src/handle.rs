@@ -1,7 +1,7 @@
 //! The workflow handle: three methods over a workflow id, in two flavours.
 //!
 //! Every reference agrees on the surface — the id, the result, the status — and every reference
-//! splits the implementation the same way (decision 10). A handle to a workflow running in *this*
+//! splits the implementation the same way. A handle to a workflow running in *this*
 //! process awaits the running task directly; a handle to one running elsewhere, or to one that
 //! finished before this process started, has nothing local to await and polls the database. The
 //! two are one public type, because a caller has no reason to care which it holds — and with a
@@ -191,8 +191,8 @@ where
     {
         // Allocated before anything can fail, and before the check it gates: the position of this
         // await in the parent has to be the same on the replay as it was on the run. A refusal
-        // here is carried into the future by `placed`, so `handle.result().await?` reads as it
-        // always did and nothing was claimed on the way to it.
+        // here is carried into the future by `placed`, so `handle.result().await?` keeps its
+        // single `?` and nothing was claimed on the way to it.
         let built = ChildResultPlacement::of(&self.conn).map(|awaiting| {
             let placement = awaiting.placement().clone();
             (awaiting, placement)
@@ -356,13 +356,13 @@ impl ChildResultPlacement {
             return Ok(None);
         };
         // The mirror of the launch's own check, and the second half of one rule.
-        // `check_child_result` compares the step *name*, which leaves the question of whose
-        // outcome this is. For a child it cannot differ — the handle's id was read out of the
-        // launch row moments earlier — but a workflow may also await a handle it did not start,
-        // and there the recorded row is the only thing that knows which workflow answered.
-        // Adopting some other workflow's outcome as this one's is what this refuses, and every
-        // implementation writes the id needed to refuse it (Python's `record_get_result` stores
-        // the awaited id as `child_workflow_id` too, `_sys_db.py:2851`).
+        // `check_child_result` compares the step *name*, which leaves the question of whose outcome
+        // this is. For a child it cannot differ — the handle's id was read out of the launch row
+        // moments earlier — but a workflow may also await a handle it did not start, and there the
+        // recorded row is the only thing that knows which workflow answered. Adopting some other
+        // workflow's outcome as this one's is what this refuses, and every implementation writes
+        // the id needed to refuse it (Python's `record_get_result` stores the awaited id as
+        // `child_workflow_id` too, `_sys_db.py`).
         if recorded.child_workflow_id.as_deref() != Some(awaited_workflow_id) {
             return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                 workflow_id: workflow_id.to_owned(),
@@ -401,9 +401,9 @@ impl ChildResultPlacement {
     ///
     /// **Rust follows Go here, against the other three.** Go filters this case out of its await
     /// checkpoint deliberately and says so — *"either the workflow result proper (no dlq, no raw
-    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go:419`). Python,
-    /// TypeScript and Java all record it, because in all three the await runs inside the generic
-    /// step wrapper and that wrapper checkpoints whatever exception it caught.
+    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go`). Python, TypeScript
+    /// and Java all record it, because in all three the await runs inside the generic step wrapper
+    /// and that wrapper checkpoints whatever exception it caught.
     ///
     /// TODO(dbos-team): UPSTREAM item 20. Two implementations pin a parked child's verdict into
     /// the parent's replay and two do not, and none of the four argues for its side — the split

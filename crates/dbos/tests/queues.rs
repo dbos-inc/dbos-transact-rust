@@ -1,7 +1,9 @@
-//! Queue registration and enqueueing, against real databases.
+//! Queue registration, enqueueing and dequeueing, against real databases.
 //!
-//! Nothing here dequeues — the runner arrives with the next commit — so these assert the row and
-//! the handle, which is exactly what a workflow left on a queue *is* until someone polls for it.
+//! Registration and enqueue are asserted on the row and the handle — which is exactly what a
+//! workflow left on a queue *is* until someone polls for it — and the dequeue tests then run the
+//! supervisor and its workers for real, so a limit is asserted by what actually runs at once
+//! rather than by what the row says.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -302,7 +304,7 @@ async fn registering_before_launch_is_refused() {
     );
 }
 
-/// **The starter app's Queues tab, which is this slice's acceptance test.**
+/// **The starter app's Queues tab, which is the runner's acceptance test.**
 ///
 /// Register a queue with `worker_concurrency: 3`, enqueue five workflows that each hold for a
 /// moment, and watch three run while two wait. The Go starter's tab says exactly this, and it is
@@ -1082,10 +1084,9 @@ async fn another_applications_queue_is_not_dequeued_from() {
 ///
 /// The claim statement carries
 /// `workflow_deadline_epoch_ms = CASE WHEN workflow_timeout_ms IS NOT NULL AND
-/// workflow_deadline_epoch_ms IS NULL THEN now + workflow_timeout_ms ELSE ... END`, which is the
-/// arm the queued branch of the deadline rule reserved and had nothing to exercise it until a
-/// runner existed. A budget survives the queue wait intact and becomes an instant when the
-/// workflow is actually picked up.
+/// workflow_deadline_epoch_ms IS NULL THEN now + workflow_timeout_ms ELSE ... END`, the arm the
+/// queued branch of the deadline rule leaves for it. A budget survives the queue wait intact and
+/// becomes an instant when the workflow is actually picked up.
 #[tokio::test]
 async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
     let db = test_database().await;
@@ -1216,9 +1217,9 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 /// **The four queue-only options are refused only where nesting could not rule them out.**
 ///
 /// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
-/// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less
-/// value to hang them on. Go returns `InvalidOptionError` for each of those four
-/// (`workflow.go:1178`–`1199`). What is left is the pair no shape can express.
+/// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less value
+/// to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`). What is
+/// left is the pair no shape can express.
 #[tokio::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;
@@ -1462,7 +1463,8 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
     dbos.shutdown().await;
 }
 
-/// `DuplicationPolicy::ReturnExisting` joins the holder instead of refusing, and the join is idempotent.
+/// `DuplicationPolicy::ReturnExisting` joins the holder instead of refusing, and the join is
+/// idempotent.
 ///
 /// The enqueue that loses the key does not write a row at all: it takes a handle to the workflow
 /// that holds it, so a retried request waits on the first caller's workflow rather than being told
@@ -1541,7 +1543,8 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
         );
     }
 
-    // The holder has finished, so the key is free and the same policy claims it rather than joining.
+    // The holder has finished, so the key is free and the same policy claims it rather than
+    // joining.
     let third = workflow
         .start_with(
             (),
@@ -1590,12 +1593,12 @@ async fn priority_orders_the_backlog_lower_first() {
     // polling `demo-queue` and the four rows accumulate untouched — otherwise the first one
     // enqueued is simply the first one available, whatever its priority.
     //
-    // A delay on each enqueue was the previous way of arranging this, and it does not hold: the
-    // delay is relative to its own enqueue, so four sequential enqueues get four deadlines
-    // staggered by a round trip apiece, and the release sweep runs on its own second-granularity
-    // tick. A tick landing inside that stagger releases the earliest-enqueued row on its own,
-    // which then runs first however low its priority — reliably enough to fail on CockroachDB,
-    // where the round trips are slow enough to widen the window.
+    // A delay on each enqueue would not hold the backlog: the delay is relative to its own
+    // enqueue, so four sequential enqueues get four deadlines staggered by a round trip apiece,
+    // and the release sweep runs on its own second-granularity tick. A tick landing inside that
+    // stagger releases the earliest-enqueued row on its own, which then runs first however low
+    // its priority — reliably enough to fail on CockroachDB, where the round trips are slow
+    // enough to widen the window.
     let submitted = [
         ("low", Some(9)),
         ("high", Some(1)),
@@ -1749,8 +1752,8 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
 }
 /// A rate limit and priority ordering are stored, reported, and changeable at runtime.
 ///
-/// The dequeue already honoured both — `start_queued_workflows` counts a window's starts and
-/// orders by priority — so what was missing was only the way to ask for them.
+/// The dequeue honours both — `start_queued_workflows` counts a window's starts and orders by
+/// priority — so what this pins is the way to ask for them.
 #[tokio::test]
 async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
     let db = test_database().await;

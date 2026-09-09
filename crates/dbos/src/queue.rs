@@ -14,8 +14,8 @@
 //! refers to. It also removes the branch every reference runner carries, where a queue's
 //! configuration is re-read per iteration only if it came from the database.
 //!
-//! The one queue with no row is [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE), which is the
-//! engine's own: `resume` and `fork` put work there, and it is not a queue anybody registers.
+//! The one queue with no row is [`INTERNAL_QUEUE`], which is the engine's own: `resume` and `fork`
+//! put work there, and it is not a queue anybody registers.
 
 use std::borrow::Cow;
 use std::result::Result as StdResult;
@@ -46,11 +46,11 @@ pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// **Its own fields rather than a wrapped [`QueueRecord`]**, which is what Go's `queueFromConfig`,
 /// TypeScript's `WorkflowQueue._fromRecord` and Python's `ResolvedQueueLimits` each build too. Two
-/// reasons, and the second is why it is worth the mapping: the engine names a limit for the scope
-/// it applies at while the row names it for its column — [`concurrency`](Self::concurrency)
-/// against `concurrency` — and derived equality over a wrapped row would compare
-/// [`application_name`](QueueRecord::application_name), which this type deliberately does not
-/// report, so two queues identical through every accessor here could still differ.
+/// reasons: this reports every limit at the scope it is enforced at, where the row spells them as
+/// the columns a deprecated `partition_queue` flag re-scopes; and derived equality over a wrapped
+/// row would compare [`application_name`](QueueRecord::application_name) and `partition_queue`,
+/// neither of which this type reports, so two queues identical through every accessor here could
+/// still differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queue {
     name: String,
@@ -71,8 +71,7 @@ impl Queue {
     /// registered the two are the same. For one a peer wrote with the deprecated `partition_queue`
     /// flag they are not: that flag means every queue-wide limit applies per partition, so
     /// [`QueueRecord::resolved_limits`] moves them into the partition fields and the receipt says
-    /// what the queue
-    /// actually does rather than which columns happen to hold it.
+    /// what the queue actually does rather than which columns happen to hold it.
     fn from_record(record: QueueRecord) -> Self {
         let name = record.name.clone();
         let polling_interval = record.polling_interval;
@@ -155,10 +154,10 @@ impl Queue {
 /// They are one idea crossed two ways — over **scope**, the whole queue or one partition key, and
 /// over **reach**, the whole fleet or this process alone:
 ///
-/// |                       | whole queue                       | one partition                               |
-/// |-----------------------|-----------------------------------|---------------------------------------------|
-/// | **every executor**    | [`concurrency`][g]         | [`partition_concurrency`][p]                |
-/// | **this process only** | [`worker_concurrency`][w]         | [`partition_worker_concurrency`][pw]        |
+/// |                       | whole queue                | one partition                          |
+/// |-----------------------|----------------------------|----------------------------------------|
+/// | **every executor**    | [`concurrency`][g]         | [`partition_concurrency`][p]           |
+/// | **this process only** | [`worker_concurrency`][w]  | [`partition_worker_concurrency`][pw]   |
 ///
 /// [g]: Self::concurrency
 /// [p]: Self::partition_concurrency
@@ -340,10 +339,9 @@ pub struct QueueChange {
 /// is refused when it does.
 ///
 /// **Named at the call, never defaulted.** Python and TypeScript default it per surface — to
-/// `update_if_latest_version` for an application (`_dbos.py:981`, `dbos.ts:2745`) and to
-/// `always_update` for a client (`_client.py:382`, `client.ts:559`) — which one Rust type cannot
-/// express, a default being a property of the type rather than of the caller. So a registration
-/// says which it means.
+/// `update_if_latest_version` for an application (`_dbos.py`, `dbos.ts`) and to `always_update` for
+/// a client (`_client.py`, `client.ts`) — which one Rust type cannot express, a default being a
+/// property of the type rather than of the caller. So a registration says which it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueConflict {
     /// Overwrite only if this process is running the **latest registered application version**.
@@ -356,8 +354,7 @@ pub enum QueueConflict {
     ///
     /// **A [`Client`](crate::Client) is refused this**, having no version to be the latest of:
     /// [`Client::register_queue`](crate::Client::register_queue) returns [`Error::Config`], which
-    /// is where Python and TypeScript raise on the same combination (`_client.py:455`,
-    /// `client.ts:561`).
+    /// is where Python and TypeScript raise on the same combination (`_client.py`, `client.ts`).
     UpdateIfLatestVersion,
     /// Always overwrite the stored limits.
     ///
@@ -383,9 +380,10 @@ pub enum QueueConflict {
 ///   because the dequeue clamps its budgets with `.max(0)`: a `Some(0)` reaches the database, is
 ///   read back as a limit of nothing, and leaves a queue that silently never dequeues, with no
 ///   error and nothing in the log to explain it.
-/// - **A fleet-wide limit cannot be below a per-process one**, which Python, TypeScript and Go all
-///   check and Java does not. The pair is incoherent rather than merely useless: the smaller number
-///   wins in the dequeue, so the configuration does not say what it appears to say.
+/// - **A fleet-wide limit cannot be below a per-process one**, which all four references check —
+///   Java's is in `QueueRegistry.register`. The pair is incoherent rather than merely
+///   useless: the smaller number wins in the dequeue, so the configuration does not say what it
+///   appears to say.
 fn validate(name: &str, options: &QueueOptions) -> Result<()> {
     validate_fields(options)
         .map_err(|(_, detail)| Error::Config(format!("queue `{name}`: {detail}")))
@@ -711,8 +709,8 @@ impl Connection {
                 // **A handle with no application version cannot answer this question**, which is
                 // the case a [`Client`](crate::Client) is: it runs none of the application's code,
                 // so there is no version of it to weigh against the registered ones. Python and
-                // TypeScript refuse the same combination on the same grounds (`_client.py:455`,
-                // `client.ts:561`). Only a client reaches it: `DBOS::register_queue` passes the
+                // TypeScript refuse the same combination on the same grounds (`_client.py`,
+                // `client.ts`). Only a client reaches it: `DBOS::register_queue` passes the
                 // executor's version, which a launched instance always has.
                 let Some(version) = app_version else {
                     return Err(Error::Config(format!(
@@ -882,7 +880,7 @@ impl Connection {
         };
 
         // The row as written, so there is no read back to do: it left the transaction that wrote
-        // it, which is a stronger guarantee than re-reading afterwards ever was.
+        // it, which is a stronger guarantee than a re-read afterwards could give.
         let record = self
             .sysdb()
             .update_queue(name, &update, &validate)

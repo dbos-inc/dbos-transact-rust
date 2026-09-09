@@ -8,8 +8,9 @@ use std::borrow::Cow;
 
 /// What went wrong talking to the system database.
 ///
-/// Deliberately not `sqlx::Error`: that type names a specific driver, and this trait has to be
-/// implementable by a backend that does not use one.
+/// Deliberately not `sqlx::Error`: that type names a specific driver, and
+/// [`SystemDatabase`](super::SystemDatabase) has to be implementable by a backend that does not
+/// use one.
 ///
 /// Serializable, because the engine records a failed step's error and has to give back *that
 /// error* on replay rather than a description of it. Nothing here names a driver type, so this
@@ -44,7 +45,7 @@ pub enum Error {
     /// one says the workflow already exists, and here it existing is the premise.
     ///
     /// **In-process only.** Two receivers in different processes never meet, and are arbitrated at
-    /// the database instead; see `consume_message`.
+    /// the database instead, by the consuming `UPDATE` in `recv`.
     ConcurrentRecv {
         /// The workflow being received on, which is also the workflow calling.
         workflow_id: String,
@@ -303,8 +304,8 @@ impl std::fmt::Display for BackendError {
 pub enum BackendErrorKind {
     /// The connection failed, or the server cannot serve requests right now.
     ///
-    /// Retried by default, and the one class [`super::retry::RetryPolicy`] can be told to give up on:
-    /// a caller that would rather see the failure than block can opt out.
+    /// Retried by default, and the one class [`super::retry::RetryPolicy`] can be told to give up
+    /// on: a caller that would rather see the failure than block can opt out.
     Connection,
     /// Contention — a serialization failure or a deadlock.
     ///

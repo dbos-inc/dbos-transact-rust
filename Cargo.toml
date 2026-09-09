@@ -1,12 +1,10 @@
 [workspace]
 resolver = "3"
-# Each crate is created by the work that first ships code into it, rather than scaffolded up
-# front: `dbos-macros` arrives with the attribute macros. Two crates are published, `dbos` and
-# `dbos-macros`, and the `dbos-transact` name — held on crates.io at an 0.1.1 placeholder — stays
-# a placeholder: a signpost crate was considered and dropped, since `dbos` is the name users are
-# pointed at everywhere. `test-support` is unpublished and exists so that tests needing a real
-# database can live beside the code they test, rather than only under `tests/`. `xtask` is
-# unpublished too and holds this repository's automation, reached as `cargo xtask`.
+# Two crates are published, `dbos` and `dbos-macros`. The `dbos-transact` name — held on
+# crates.io at an 0.1.1 placeholder — stays a placeholder: `dbos` is the name users are pointed
+# at everywhere. `test-support` is unpublished and exists so that tests needing a real database
+# can live beside the code they test, rather than only under `tests/`. `xtask` is unpublished
+# too and holds this repository's automation, reached as `cargo xtask`.
 members = [
     "crates/dbos",
     "crates/dbos-macros",

@@ -173,7 +173,7 @@ async fn the_initial_status_is_derived_from_the_queue_and_delay() {
         ),
     ];
     for (index, (queue, delay, expected)) in cases.into_iter().enumerate() {
-        // The id has to outlive the borrow now that `NewWorkflow` holds `&str`.
+        // The id has to outlive the borrow: `NewWorkflow` holds `&str`.
         let id = format!("wf-status-{index}");
         let wf = NewWorkflow {
             queue_name: queue,
@@ -255,7 +255,7 @@ async fn exceeding_the_recovery_limit_parks_the_workflow() {
 /// **The dequeue claim is what counts against the recovery budget.**
 ///
 /// Recovery re-enqueues rather than re-invoking, so this transition is the one every recovered
-/// workflow makes — and until the claim counted it, `recovery_attempts` never moved for a queued
+/// workflow makes; if the claim did not count, `recovery_attempts` would never move for a queued
 /// workflow at all. Python, TypeScript and Go all count in their claim; Python's says so outright:
 /// *"Count this dispatch against the DLQ limit; no later insert does it."*
 #[tokio::test]
@@ -335,7 +335,7 @@ async fn a_claim_that_wins_nothing_counts_nothing() {
     );
 }
 
-/// Re-enqueue and re-dequeue is what recovery now looks like, and enough of it parks the workflow.
+/// Re-enqueue and re-dequeue is what recovery looks like, and enough of it parks the workflow.
 ///
 /// The end of the path this counting exists for: without it the loop below runs forever with
 /// `recovery_attempts` stuck at zero, and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` is unreachable.
@@ -474,8 +474,7 @@ async fn an_owner_is_generated_when_none_is_supplied() {
 /// Every field a caller can set is written, and comes back on the row.
 ///
 /// [`NewWorkflow`] has 24 fields and most tests set a handful. Without this, a field could be
-/// dropped from the `INSERT` and nothing would notice — which is exactly what happened while
-/// this test was being written.
+/// dropped from the `INSERT` and nothing would notice.
 #[tokio::test]
 async fn every_settable_field_round_trips() {
     let (sys, _db) = sysdb().await;
@@ -753,10 +752,10 @@ async fn an_await_waits_for_a_workflow_that_has_not_finished() {
 /// the only permit for the life of the process, and every other waiter would block behind it — not
 /// slowly, but forever.
 ///
-/// The never-finishing waiter is the point. An earlier version of this test finished every
-/// workflow, which a permit held across the wait survives comfortably: the waiters merely serialise,
-/// each releasing as its own answer arrives. Verified by mutation — hoisting the permit out of the
-/// retried region must fail this test, and against that earlier version it did not.
+/// The never-finishing waiter is the point, and it is what makes this a mutation test: hoisting
+/// the permit out of the retried region must fail here. A variant where every workflow finishes
+/// would not catch it — a permit held across the wait survives that comfortably, the waiters
+/// merely serialising as each answer arrives.
 #[tokio::test]
 async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     let db = test_database().await;
@@ -825,10 +824,9 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
 
 /// A wait on a closed handle reports rather than hanging, including one parked on a polling permit.
 ///
-/// Run at a cap of one with the permit held by the waiter itself, so this covers the case that once
-/// argued for closing the limiter alongside the pool: closing the pool is enough on its own, since
-/// every in-flight poll then fails permanently and releases its permit. Verified by mutation — the
-/// limiter close was deleted and no test failed, which is why it is not there.
+/// Run at a cap of one with the permit held by the waiter itself. Closing the pool is enough on its
+/// own: every in-flight poll then fails permanently and releases its permit, so the limiter needs
+/// no close of its own.
 #[tokio::test]
 async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
     let db = test_database().await;
@@ -1173,7 +1171,7 @@ async fn the_opt_out_surfaces_a_killed_connection() {
 /// Five workflows chosen so that every filter has both a match and a non-match. Some columns are
 /// then set with raw SQL: `forked_from`, `was_forked_from`, `completed_at`, and
 /// `started_at_epoch_ms` are not settable at creation in any implementation, but the filters on
-/// them are real and are worth proving before fork and execution land.
+/// them are real.
 async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
     let (sys, db) = sysdb().await;
 
@@ -1599,8 +1597,8 @@ async fn payloads_can_be_left_unloaded() {
     use dbos::sysdb::types::WorkflowFilter as F;
     // `_db` rather than `db`: the lease has to outlive every query below. Dropping it early
     // returns the database to the pool while this test is still reading, so another test leases it
-    // and `reset()`s it — deleting these rows underneath the assertions. That is what this test did
-    // until 2026-08-18, and it hung CI for six hours.
+    // and `reset()`s it — deleting these rows underneath the assertions, which hangs the test
+    // rather than failing it.
     let (sys, _db) = sysdb().await;
     let wf = NewWorkflow {
         input: Some(r#"{"positionalArgs":[1]}"#),
@@ -2178,7 +2176,7 @@ async fn steps_are_listed_in_execution_order() {
         .unwrap();
     // Recorded out of order, to prove the ordering comes from `step_id` and not insertion.
     for id in [2, 0, 1] {
-        // Both have to outlive the borrow now that `Outcome` holds `&str`.
+        // Both have to outlive the borrow: `Outcome` holds `&str`.
         let (name, output) = (format!("step-{id}"), format!("out-{id}"));
         sys.record_step(
             "wf-list",
@@ -2219,11 +2217,11 @@ async fn steps_are_listed_in_execution_order() {
 
 /// A child's row and the parent's record of starting it are written together, or not at all.
 ///
-/// **The pair is one durable act.** Written as two statements it had a window between them, and a
-/// crash or a dropped future landing in it left a child workflow that existed with nothing in its
-/// parent pointing at it — and, worse, a permanent failure of the second write reported "the start
-/// failed" over a child that was already `PENDING` and would run. `init_workflow` takes the caller
-/// so both rows share a transaction.
+/// **The pair is one durable act.** Written as two statements there would be a window between
+/// them, and a crash or a dropped future landing in it would leave a child workflow that existed
+/// with nothing in its parent pointing at it — and, worse, a permanent failure of the second write
+/// would report "the start failed" over a child that was already `PENDING` and would run.
+/// `init_workflow` takes the caller so both rows share a transaction.
 #[tokio::test]
 async fn a_child_and_its_start_record_are_one_write() {
     let (sys, _db) = sysdb().await;
@@ -2495,7 +2493,7 @@ async fn an_untimed_step_cannot_detect_a_rival() {
 
 /// A step that raised is recorded as an error, and a void one as an empty success.
 ///
-/// The two are different `StepOutcome` variants and land in different columns, so a replay can
+/// The two are different `Outcome` variants and land in different columns, so a replay can
 /// tell "returned nothing" from "threw" — which a single nullable payload could not.
 #[tokio::test]
 async fn a_step_records_either_an_output_or_an_error() {
@@ -2852,8 +2850,8 @@ async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
     );
 }
 
-/// Scoped like the sweep it replaces: another executor's, another version's, and finished work
-/// are all left alone.
+/// Scoped by executor and version: another executor's, another version's, and finished work are all
+/// left alone.
 #[tokio::test]
 async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
     let (sys, _db) = sysdb().await;
@@ -3036,9 +3034,9 @@ async fn a_queued_workflow_can_be_returned_to_its_queue() {
         .await
         .unwrap();
 
-    // Claim it as a dequeue would. Done in SQL because the ENQUEUED -> PENDING transition
-    // belongs to `start_queued_workflows`, which is task 3.6 and does not exist yet —
-    // `init_workflow` derives the status from the queue and so leaves it ENQUEUED.
+    // Claim it as a dequeue would. Done in SQL rather than through `start_queued_workflows`, so
+    // this row is claimed without a dequeue pass choosing which row to take — `init_workflow`
+    // derives the status from the queue and so leaves it ENQUEUED.
     let mut conn = db.admin_connection().await;
     sqlx::query(sqlx::AssertSqlSafe(
         "UPDATE dbos.workflow_status SET status = 'PENDING', started_at_epoch_ms = 1000 \
@@ -3356,9 +3354,9 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
 
 /// The bulk readers report everything a workflow was sent, published, and streamed.
 ///
-/// Written with raw SQL because nothing yet *writes* these tables — `send`, `set_event`, and
-/// `write_stream` are the rest of 3.5 — so this pins the read shape ahead of them rather than
-/// waiting.
+/// Written with raw SQL rather than through the writers, so the read shape is pinned on its own:
+/// the rows go in out of order, with mixed topics and formats, and the readers must sort and
+/// report them regardless of who wrote them.
 #[tokio::test]
 async fn the_bulk_readers_return_notifications_events_and_streams() {
     let (sys, db) = sysdb().await;
@@ -3526,8 +3524,8 @@ async fn replaying_set_event_does_not_republish() {
     assert_eq!(rows.0, 1, "the replay added no history row either");
 }
 
-/// How long the blocking reads wait between looks. Nothing pushes yet, so it is also how long a
-/// value takes to arrive.
+/// How long the blocking reads wait between looks, and so how long a value takes to arrive when
+/// nothing wakes the reader.
 const RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Publisher and reader, both initialised, sharing one handle.
@@ -3573,10 +3571,16 @@ async fn an_event_already_published_returns_at_once() {
 
 /// A value published *after* the wait began still arrives — which is the whole feature.
 ///
-/// **Nothing pushes.** No listener exists yet and no trigger fires into this process, so what
-/// delivers here is the re-query, exactly as it does on CockroachDB in every SDK. If this passes
-/// only once a notification transport lands, the transport has become load-bearing and the design
-/// has gone wrong.
+/// **Nothing wakes the reader.** The publisher writes through a handle of its own, so the
+/// registry it signals on the way out is not the one the reader subscribed to; no listener is
+/// running and no trigger fires into this process. What delivers is the re-query, exactly as it
+/// does on CockroachDB in every SDK. If this passed only with the listener running, the transport
+/// would have become load-bearing and the design gone wrong.
+///
+/// The shared-handle case has its own test,
+/// `a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing`. Publishing through `sys` here
+/// would quietly retest that one instead, and a re-query loop that had stopped working would
+/// still pass.
 #[tokio::test]
 async fn a_value_published_during_the_wait_still_arrives() {
     let db = test_database().await;
@@ -3584,43 +3588,74 @@ async fn a_value_published_during_the_wait_still_arrives() {
         db.pool().await,
         &Settings::default(),
     ));
+    // Two handles over one database, each with its own pool: separate registries, so the wake
+    // `set_event` does on its way out lands where the reader is not subscribed and only the row
+    // itself crosses between them.
+    let publisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
 
-    let publishing = {
-        let sys = std::sync::Arc::clone(&sys);
-        tokio::spawn(async move {
-            // Long enough that the reader's first look has already found nothing, so the value can
-            // only be delivered by a later pass of the loop.
-            tokio::time::sleep(BRIEFLY).await;
-            sys.set_event(
-                "wf-publisher",
-                0,
-                "progress",
-                "\"done\"",
-                Some("portable_json"),
-            )
-            .await
-            .unwrap();
-        })
-    };
+    // **The read is driven here rather than raced against a sleeping publisher**, because a sleep
+    // does not order the two. A spawned publisher can be scheduled, sleep out its whole delay and
+    // write before the reader has been polled once — and a value already in the table is answered
+    // by the *first* look, so the test would pass with the re-query loop deleted. Pinned here, the
+    // read is polled throughout the gate below and is known not to have answered when it lifts.
+    //
+    // What the gate establishes directly is that the read did not *answer* in two whole intervals,
+    // which is not quite the same as having taken a look. The step from one to the other is that
+    // the pool is already warm — `publisher_and_reader` above ran its inserts through this very
+    // handle — so the first look is a round trip on a live connection, issued microseconds into
+    // the gate rather than after it. A read still pending two intervals later has therefore
+    // looked, missed, and gone back round the loop at least once.
+    let read = sys.get_event("wf-publisher", "progress", RECHECK * 600, None);
+    let mut read = std::pin::pin!(read);
+    tokio::select! {
+        answered = &mut read => {
+            panic!("the read answered before anything was published: {answered:?}")
+        }
+        () = tokio::time::sleep(RECHECK * 2) => {}
+    }
+
+    // The other half of the ordering, and this one is checked rather than assumed: the key is
+    // absent at this instant, so every look the read has taken has looked at a table without it.
+    let mut probe = db.admin_connection().await;
+    let present: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(
+        "SELECT count(*) FROM dbos.workflow_events \
+         WHERE workflow_uuid = 'wf-publisher' AND key = 'progress'",
+    ))
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(
+        present.0, 0,
+        "the value was already published, so the first look could have answered the read",
+    );
+
+    // Timed from here, so what the bound below measures is the publish reaching the reader rather
+    // than anything the gate above spent.
+    let began = Timestamp::now();
+    publisher
+        .set_event(
+            "wf-publisher",
+            0,
+            "progress",
+            "\"done\"",
+            Some("portable_json"),
+        )
+        .await
+        .unwrap();
 
     // The read is given ten minutes, so its deadline cannot be what ends the wait — only the loop
-    // finding the value can be. Bounded at ten intervals: an interval sized for a transport that
-    // does not exist yet would still deliver, eventually, and "eventually" is the regression.
-    let began = Timestamp::now();
-    let found = tokio::time::timeout(
-        RECHECK * 10,
-        sys.get_event("wf-publisher", "progress", RECHECK * 600, None),
-    )
-    .await
-    .expect("the wait loop never delivered a value that was published during it")
-    .unwrap();
+    // finding the value can be. Bounded at ten intervals so that a loop which has slowed to some
+    // longer period fails here rather than passing: "eventually" is the regression.
+    let found = tokio::time::timeout(RECHECK * 10, read)
+        .await
+        .expect("the wait loop never delivered a value that was published during it")
+        .unwrap();
     assert!(
         Timestamp::now().duration_since(began).unwrap() < RECHECK * 5,
         "delivered, but far slower than the interval it is supposed to run at",
     );
 
-    publishing.await.unwrap();
     assert_eq!(
         found,
         Some(EncodedValue {
@@ -3886,7 +3921,7 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
 ///
 /// A read that answers in milliseconds under a long timeout must not be recorded as having taken
 /// the whole timeout, or every step aggregate and every Conductor timeline reports it that way.
-/// The sleep tests above cover the other stamping, which is what a real sleep gets.
+/// The sleep tests cover the other stamping, which is what a real sleep gets.
 #[tokio::test]
 async fn a_read_records_a_deadline_it_may_abandon_rather_than_a_sleep() {
     let (sys, _db) = sysdb().await;
@@ -4415,9 +4450,9 @@ async fn a_second_receiver_on_one_topic_is_refused() {
 /// on to the consuming `UPDATE`, and its own step write conflicts — `StepAlreadyRecorded`, with
 /// the consumption rolled back alongside it. `recv` reports that conflict rather than adopting,
 /// deliberately and for the reasons written where it is raised, so both outcomes are accepted
-/// here. Requiring the first was this test's flake: it held on an idle machine and failed on a
-/// loaded one, which is where CI runs. Nothing is lost by accepting both, because the adopting
-/// path has a test of its own that pins it without a race —
+/// here. Requiring the first would hold on an idle machine and fail on a loaded one, which is
+/// where CI runs. Nothing is lost by accepting both, because the adopting path has a test of its
+/// own that pins it without a race —
 /// `a_recv_defers_to_a_rival_that_recorded_first`, which records the rival's step during the wait
 /// rather than hoping the scheduler lands it there.
 ///
@@ -4425,7 +4460,7 @@ async fn a_second_receiver_on_one_topic_is_refused() {
 /// consumed between the two, and one answer, whether it was delivered once or twice.
 ///
 /// **What this does not pin:** the `consumed = FALSE` predicate itself. Removing it and re-running
-/// this test passes, because the transaction covers the same case — verified by mutation. The
+/// this test still passes, because the transaction covers the same case. The
 /// predicate stays for the reasons given where it is written, but no test here can tell it apart,
 /// and claiming otherwise would be worse than saying so.
 #[tokio::test]
@@ -4641,9 +4676,9 @@ async fn listening(pool: sqlx::PgPool) -> PostgresSystemDatabase {
 /// milliseconds can only have come from a notification. Run it with the listener off and the same
 /// call takes up to a second; run it with the interval switch broken and it takes up to a minute.
 ///
-/// It is `recv` rather than `get_event` because migration 1's trigger is the only one left: 43 and
-/// 44 dropped the events and streams triggers, and the writer-side push that replaces them is a
-/// separate change.
+/// It is `recv` rather than `get_event` because migration 1's notifications trigger is the only
+/// one the corpus leaves in place — 43 and 44 drop the events and streams triggers — and the
+/// writer-side push that replaces them has tests of its own below.
 #[tokio::test]
 async fn a_listener_delivers_a_message_sooner_than_the_interval_allows() {
     let db = test_database().await;
@@ -4689,12 +4724,11 @@ async fn a_listener_delivers_a_message_sooner_than_the_interval_allows() {
 /// past its own timeout. Waking every waiter on connect is what covers that. Go and Java both do
 /// it; Python and TypeScript do not, and rely on the fallback catching it.
 ///
-/// **The gap is manufactured rather than raced for.** An earlier version of this test killed the
-/// listener's connection and sent a message, which proved nothing: `PgListener` reconnects in
-/// milliseconds, so the notification was delivered normally and the test passed with the wake
-/// removed — verified by mutation. Here the row is inserted with triggers off, so no notification
-/// is ever sent for it, and only then is the connection killed. Nothing but the wake on reconnect
-/// can end the wait inside a minute.
+/// **The gap is manufactured rather than raced for.** Killing the listener's connection and then
+/// sending a message would prove nothing: `PgListener` reconnects in milliseconds, so the
+/// notification arrives normally and the test passes even with the wake removed. Here the row is
+/// inserted with triggers off, so no notification is ever sent for it, and only then is the
+/// connection killed. Nothing but the wake on reconnect can end the wait inside a minute.
 #[tokio::test]
 async fn a_message_that_notified_nobody_is_found_on_reconnect() {
     const TAG: &str = "listener-outage";
@@ -4811,9 +4845,9 @@ async fn cockroach_gets_no_listener_and_reports_it() {
 
 /// An event set in another process reaches a reader far sooner than its interval allows.
 ///
-/// **The events counterpart of the message test above, and what migration 44 took away.** That one
-/// rides migration 1's surviving trigger; here the trigger is gone and the writer's own push is the
-/// only thing that can put a notification on the wire. The reader is delivering, so its next look
+/// **The events counterpart of the message test above.** That one rides migration 1's surviving
+/// trigger; here migration 44 has dropped the trigger, and the writer's own push is the only thing
+/// that can put a notification on the wire. The reader is delivering, so its next look
 /// is a minute away — arriving in milliseconds can only be the push.
 ///
 /// Two handles over one database, each with its own pool and its own registry, which is what two
@@ -4868,13 +4902,12 @@ async fn an_event_set_elsewhere_arrives_sooner_than_the_interval_allows() {
     );
 }
 
-/// A stream write puts a notification where migration 43's trigger used to put one.
+/// A stream write puts a notification on the channel migration 43's dropped trigger published to.
 ///
 /// **Read off the wire rather than through a waiter**, because there is no waiter to use: nothing
-/// in this crate waits on a stream — the loop that would is the engine's, and decision 9 keeps it
-/// there. So the test listens on the channel itself and asserts the payload, which is the contract
-/// a reader in another process depends on: `id::key`, unescaped, exactly as the dropped trigger
-/// wrote it.
+/// in this crate waits on a stream — the loop that would is the engine's. So the test listens on
+/// the channel itself and asserts the payload, which is the contract a reader in another process
+/// depends on: `id::key`, unescaped, exactly as the trigger wrote it.
 #[tokio::test]
 async fn a_stream_write_is_pushed_where_the_trigger_used_to_publish() {
     let db = test_database().await;
@@ -6251,9 +6284,7 @@ async fn a_message_can_follow_a_workflow_to_its_forks() {
     // derived per recipient on both branches, and it has to be: the insert ends
     // `ON CONFLICT (message_uuid) DO NOTHING`, so one id shared by the destination and its forks
     // would collide with itself and deliver to the destination alone — silently, because a
-    // discarded row is not an error. That was the behaviour until the fallback was scoped the way
-    // the keyed branch already was, and every assertion above passed throughout, because every
-    // send above names a key.
+    // discarded row is not an error. Every send above names a key, so this one must not.
     sys.send_message(
         &Message {
             destination_id: "wf-root",
@@ -6355,7 +6386,7 @@ async fn the_recorded_step_name_follows_the_surface_not_the_size() {
     sys.send_message(&to("wf-a"), None, Some(("wf-namer", 0)), false)
         .await
         .unwrap();
-    // The case the size rule got wrong: one message, but reached through the batch API.
+    // One message, but reached through the batch API.
     sys.send_messages(&[to("wf-b")], None, Some(("wf-namer", 1)), false)
         .await
         .unwrap();
@@ -6421,11 +6452,10 @@ async fn an_unprotected_send_outside_a_workflow_delivers_every_time() {
 /// and being told about it is better than the alternative — a replay that silently delivers again
 /// because it looked like a different step.
 ///
-/// **A changed batch *size* is no longer caught, and that is deliberate.** It was, back when the
-/// name was inferred from the count — which gave sends an argument-level determinism check no other
-/// step in the crate has, as an accident of the inference rather than a feature. A replay whose
-/// batch grew now finds its recorded step and delivers nothing, exactly as a step whose arguments
-/// changed does everywhere else.
+/// **A changed batch *size* is not caught, and that is deliberate.** Inferring the name from the
+/// count would give sends an argument-level determinism check no other step in the crate has. A
+/// replay whose batch grew finds its recorded step and delivers nothing, exactly as a step whose
+/// arguments changed does everywhere else.
 #[tokio::test]
 async fn a_replay_that_changed_its_send_surface_is_refused() {
     let (sys, _db) = sysdb().await;
@@ -6595,7 +6625,7 @@ async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
 
 /// A reader draining a stream sees every offset in order, and stops at the first empty one.
 ///
-/// This is the loop the engine will own, written out by hand — the point being that everything it
+/// This is the engine's loop, written out by hand — the point being that everything it
 /// needs comes from this one call: the value, whether there is one, and whether the producer is
 /// still going.
 #[tokio::test]
@@ -7653,7 +7683,7 @@ async fn two_applications_cannot_both_claim_one_version() {
     );
 }
 
-/// Inserts a queue and a schedule directly, since 3.6 has not built their methods yet.
+/// Inserts a queue and a schedule directly, so the owner can be any value rather than a handle's.
 async fn register_queue_and_schedule(pool: &sqlx::PgPool, suffix: &str, owner: Option<&str>) {
     sqlx::query(r#"INSERT INTO "dbos"."queues" ("name", "application_name") VALUES ($1, $2)"#)
         .bind(format!("queue-{suffix}"))
@@ -8154,7 +8184,7 @@ async fn listing_queues_scopes_but_reading_one_does_not() {
 /// The two columns are only meaningful together and no SDK can write one alone, so reaching this
 /// state takes direct SQL. Matching TypeScript matters more than reporting it: a peer reading the
 /// same row must not see a different queue. The safety cost — an unthrottled queue that says
-/// nothing — is recorded as a `TODO` on the reader.
+/// nothing — is recorded as a `TODO(dbos-team)` on the reader.
 #[tokio::test]
 async fn half_a_rate_limit_reads_as_none() {
     let (sys, db) = sysdb().await;
@@ -8178,17 +8208,16 @@ async fn half_a_rate_limit_reads_as_none() {
 /// waits for the next poll — 11 of 15 rounds in a stress run. Nothing in the test can prevent it:
 /// a row is readable while still being skippable, so reading it first only narrows the window.
 ///
-/// Skipped rather than loosened, because the assertion is the point: these tests are what caught
-/// the behaviour, and Java's equivalent tests miss it precisely because they assert a limit being
-/// enforced rather than a count being complete. Weakening ours the same way would lose the only
-/// coverage anyone has.
+/// Skipped rather than loosened, because the assertion is the point: Java's equivalent tests miss
+/// the behaviour precisely because they assert a limit being enforced rather than a count being
+/// complete. Weakening ours the same way would lose the only coverage anyone has.
 ///
-/// Remove this once the lock mode is settled — see the `TODO` on `start_queued_workflows` and
-/// `UPSTREAM.md`.
+/// Remove this once the lock mode is settled — see the `TODO(dbos-team)` on
+/// `start_queued_workflows`, UPSTREAM item 7.
 fn skip_dequeue_completeness(db: &support::TestDatabase) -> bool {
     let skipping = matches!(db.backend(), Backend::Cockroach);
     if skipping {
-        eprintln!("skipped on CockroachDB: SKIP LOCKED may under-deliver; see UPSTREAM.md item 7");
+        eprintln!("skipped on CockroachDB: SKIP LOCKED may under-deliver; see UPSTREAM item 7");
     }
     skipping
 }
@@ -8483,8 +8512,8 @@ async fn a_partition_rate_limit_bounds_each_key_separately() {
 
 /// A dequeue takes only this application's workflows, and claims the unclaimed ones.
 ///
-/// This is 5.2: the claim rides on the same statement that starts the workflow, so an unclaimed
-/// workflow belongs to whichever application dequeued it and nothing can take it back.
+/// The claim rides on the same statement that starts the workflow, so an unclaimed workflow
+/// belongs to whichever application dequeued it and nothing can take it back.
 #[tokio::test]
 async fn a_dequeue_claims_what_it_starts() {
     let db = test_database().await;
@@ -8619,8 +8648,8 @@ async fn an_empty_partition_key_is_refused() {
 /// A period too large for a `Duration` is reported, not a panic.
 ///
 /// `rate_limit_period_sec` and `polling_interval_sec` are `DOUBLE PRECISION`, so a row can hold a
-/// value no `Duration` can represent. Reading one used to panic inside `Duration::from_secs_f64`,
-/// which a library must never do on stored data.
+/// value no `Duration` can represent. `Duration::from_secs_f64` panics on one, which a library
+/// must never do on stored data.
 #[tokio::test]
 async fn an_unrepresentable_period_is_malformed() {
     let (sys, db) = sysdb().await;
@@ -9305,9 +9334,9 @@ async fn the_deduplication_key_holder_is_read_by_queue_and_key() {
 
 /// Finishing releases the key, so the next submission under it succeeds.
 ///
-/// Reaching a terminal status means going through `PENDING`, and the only route there is a dequeue —
-/// `init_workflow`'s conflict path does not touch `status`, and `resume` enqueues rather than starts.
-/// So this inherits the dequeue's CockroachDB caveat despite being a test about neither.
+/// Reaching a terminal status means going through `PENDING`, and the only route there is a dequeue
+/// — `init_workflow`'s conflict path does not touch `status`, and `resume` enqueues rather than
+/// starts. So this inherits the dequeue's CockroachDB caveat despite being a test about neither.
 #[tokio::test]
 async fn finishing_releases_the_deduplication_key() {
     let (sys, db) = sysdb().await;

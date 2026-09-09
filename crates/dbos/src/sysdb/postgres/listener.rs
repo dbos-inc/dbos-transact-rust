@@ -11,8 +11,7 @@
 //! to a query a minute. See [`SHORT_INTERVAL`] and [`LONG_INTERVAL`].
 //!
 //! **The listener never parses a payload.** It prepends its channel's prefix and looks the whole
-//! string up; see [`key_for`](crate::sysdb::notify::key_for) for why splitting is not merely unnecessary
-//! but wrong.
+//! string up; see [`key_for`] for why splitting is not merely unnecessary but wrong.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,8 +29,8 @@ use crate::sysdb::notify::{
 /// **It is a delivery latency, not a fallback**: with nothing pushing, this is how long a `recv`
 /// takes to see a message another process has already committed. One second is Java's constant, and
 /// Python's whenever no listener is running. TypeScript's 10s is not a counterexample — it is a
-/// fallback beneath a listener that does the delivering, and taking that number without the listener
-/// would be a tenfold regression against every other implementation's no-push behaviour.
+/// fallback beneath a listener that does the delivering, and taking that number without the
+/// listener would be a tenfold regression against every other implementation's no-push behaviour.
 ///
 /// **A stream read gets this whatever the listener is doing.** A stream reader waits on two things:
 /// a value arriving, which is pushed, and the producer *terminating*, which nothing pushes in any
@@ -110,8 +109,8 @@ impl Listener {
     /// absent listeners, so everything sent while this process had no connection is simply gone.
     /// Waking every waiter after each connect turns that hole into one extra look each — which is
     /// all a wakeup ever was — instead of a stall until each caller's own interval comes round, and
-    /// with the long interval that stall can outlast the caller's timeout entirely. Go and Java both
-    /// do this; Python and TypeScript do not, and rely on the fallback catching it.
+    /// with the long interval that stall can outlast the caller's timeout entirely. Go and Java
+    /// both do this; Python and TypeScript do not, and rely on the fallback catching it.
     ///
     /// Waking on the *first* connect too, not only on reconnects: before it there was no listener
     /// either, so the same hole is there.
@@ -142,9 +141,9 @@ impl Listener {
 
     /// Subscribes, then proves the subscription actually delivers.
     ///
-    /// **`LISTEN` returning without error does not mean a notification will ever arrive.** Through a
-    /// transaction-mode pooler — PgBouncer with `pool_mode=transaction`, and anything like it — the
-    /// statement succeeds and the subscription is dropped the moment the backend is handed to
+    /// **`LISTEN` returning without error does not mean a notification will ever arrive.** Through
+    /// a transaction-mode pooler — PgBouncer with `pool_mode=transaction`, and anything like it —
+    /// the statement succeeds and the subscription is dropped the moment the backend is handed to
     /// someone else. So this sends itself one notification and waits for it.
     ///
     /// TypeScript does the same test and only warns, which it can afford because its interval is a
@@ -185,8 +184,8 @@ impl Listener {
     /// simply does not arrive is `Ok(false)`, because that is the answer it exists to give.
     async fn self_test(&self, listener: &mut PgListener) -> Result<bool, sqlx::Error> {
         // From the pool rather than the listening connection: a backend does not receive its own
-        // `NOTIFY` any differently, but sending from elsewhere is what a real writer does, and it is
-        // the path a pooler breaks.
+        // `NOTIFY` any differently, but sending from elsewhere is what a real writer does, and it
+        // is the path a pooler breaks.
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(NOTIFICATIONS_CHANNEL)
             .bind(SELF_TEST_PAYLOAD)

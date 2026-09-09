@@ -274,8 +274,8 @@ impl fmt::Display for WorkflowStatus {
 /// their nullability: `name` is `Option` because the column is. Identity concepts that group
 /// several columns — the `(name, class_name, config_name)` triple the registry keys on — are
 /// built from a record where they are needed, rather than being baked into it. Grouping them
-/// here meant claiming `name` was non-null and quietly substituting an empty string when it
-/// was not, which is the kind of loss this layer should report rather than absorb.
+/// here would mean claiming `name` is non-null and quietly substituting an empty string when it
+/// is not, which is the kind of loss this layer should report rather than absorb.
 ///
 /// Every payload field holds encoded text — see the module documentation.
 ///
@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(duration_from_secs(-1.0), None);
         assert_eq!(duration_from_secs(f64::NAN), None);
         assert_eq!(duration_from_secs(f64::INFINITY), None);
-        // Finite and non-negative, and still not a duration: the guard this replaced let it
+        // Finite and non-negative, and still not a duration: an `is_finite()` guard alone lets it
         // through to a panic, and the columns it reads are wide enough to hold it.
         assert_eq!(duration_from_secs(1e300), None);
     }
@@ -869,9 +869,9 @@ pub enum Applications<'a> {
 /// [`applications`](Self::applications) is the exception, and deliberately so: its default scopes
 /// to the caller's own application rather than to everything.
 ///
-/// The set is the union of all four implementations, which do not agree on it. Go has 28
-/// filters, Python 26, Java adds two Go lacks. Where they diverge it is noted on the field, so a
-/// missing filter reads as a decision rather than an oversight.
+/// The set is the union of all four implementations, which do not agree on it: each carries a
+/// couple the others lack. Where they diverge it is noted on the field, so a missing filter
+/// reads as a decision rather than an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
@@ -1260,11 +1260,10 @@ impl WorkflowDelay {
 
 /// Why a workflow is being submitted, which decides whether it may claim a row someone holds.
 ///
-/// The references model this as two booleans, `is_recovery_request` and `is_dequeued_request`,
-/// but **no call site in any of them sets both** — Python's dispatchers pass exactly
-/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. A
-/// three-way choice is what it has always been, and naming it removes an unreadable pair of
-/// adjacent `bool` arguments that would compile just as happily swapped.
+/// Java models this as two booleans, `isRecoveryRequest` and `isDequeuedRequest`, but **no call
+/// site sets both** — its dispatcher branches on one or the other, never the pair. A three-way
+/// choice is what it has always been, and naming it removes an unreadable pair of adjacent
+/// `bool` arguments that would compile just as happily swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Submission {
     /// A first attempt, which does not claim a workflow another owner already holds.
@@ -1992,12 +1991,12 @@ pub struct GetEventCaller<'a> {
 /// parent to record against.
 ///
 /// **Everything the parent contributes is here, including the id the child's own row carries.**
-/// It was on [`NewWorkflow`] as well to begin with, which is one fact spelled twice and two
-/// chances to disagree: nothing would have caught a caller naming one parent on the row and
-/// another on the step. Grouping it here makes the agreement structural rather than checked — a
-/// row gets a parent exactly when a start is recorded against that parent, because the same value
-/// writes both — and it is where [`NewWorkflow`]'s own rule puts it, that type holding the columns
-/// a caller may meaningfully set and leaving the ones a mechanism owns to the mechanism.
+/// A `parent_workflow_id` on [`NewWorkflow`] as well would be one fact spelled twice and two
+/// chances to disagree: nothing would catch a caller naming one parent on the row and another on
+/// the step. Grouping it here makes the agreement structural rather than checked — a row gets a
+/// parent exactly when a start is recorded against that parent, because the same value writes
+/// both — and it is where [`NewWorkflow`]'s own rule puts it, that type holding the columns a
+/// caller may meaningfully set and leaving the ones a mechanism owns to the mechanism.
 ///
 /// **Passing this is what makes the two writes one.** The child's row and the parent's record of
 /// having started it commit together, so no observer and no replay ever sees a child that exists
@@ -2024,8 +2023,8 @@ pub struct InitWorkflowCaller<'a> {
 ///
 /// What the blocking reads return: this layer moves payloads as opaque strings and never decodes
 /// one, so the format has to travel with the value for the caller to make sense of it.
-/// [`get_event`](crate::sysdb::SystemDatabase::get_event) returns this; `recv` and
-/// `read_stream_value` will return it too.
+/// [`get_event`](crate::sysdb::SystemDatabase::get_event) and `recv` return this, and
+/// [`StreamRead`] carries one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedValue {
     /// The payload, exactly as it was stored.
@@ -2192,14 +2191,14 @@ pub struct ForkOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run before it is cancelled.
     ///
-    /// Java and TypeScript both carry this on their fork options; Python and Go do not.
+    /// All four references carry this on their fork options.
     pub timeout: Option<Duration>,
     /// Child workflow ids to rewrite as the fork's steps are copied.
     ///
     /// When a tree of workflows is forked together, the parent's recorded children are the
     /// *original* children — replaying them would make the fork adopt the originals rather than
-    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy. Python
-    /// and TypeScript both take this map; Go and Java do not.
+    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy. Python,
+    /// TypeScript and Go all take this map; Java does not.
     pub replacement_children: &'a [(&'a str, &'a str)],
 }
 
@@ -2294,9 +2293,9 @@ pub mod step_names {
     /// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
     ///
     /// A method apiece is why: the name comes from which one was called, so nothing has to infer
-    /// it. Inferring it from the batch size — as this once did — recorded a one-message bulk send
-    /// as `DBOS.send`, which is not the call the caller made. Python and Java pass the name down
-    /// from their two surfaces in exactly the same way.
+    /// it. Inferring it from the batch size would record a one-message bulk send as `DBOS.send`,
+    /// which is not the call the caller made. Python and Java pass the name down from their two
+    /// surfaces in exactly the same way.
     pub const SEND: &str = "DBOS.send";
     pub const SEND_BULK: &str = "DBOS.sendBulk";
 
@@ -2332,10 +2331,10 @@ pub mod step_names {
     /// reference.** Every other constant here is a string some other implementation already writes,
     /// because a step row a Python or TypeScript reader may see should say what that reader calls
     /// the operation. This one does not follow that rule. Python records `"DBOS.waitFirst"`
-    /// (`_dbos.py:1634`) and TypeScript records the same string from `DBOS.waitFirst`; this crate
-    /// names the call [`select_workflow`](crate::select_workflow()), after the concurrency shape
-    /// rather than after the wait, and the step a caller reads in a listing is named for the call
-    /// they wrote — so this follows the call.
+    /// (`_dbos.py`) and TypeScript records the same string from `DBOS.waitFirst`; this crate names
+    /// the call [`select_workflow`](crate::select_workflow()), after the concurrency shape rather
+    /// than after the wait, and the step a caller reads in a listing is named for the call they
+    /// wrote — so this follows the call.
     ///
     /// **What that costs, stated plainly.** A Rust workflow's wait steps do not line up with the
     /// same wait's steps in Python or TypeScript: a cross-SDK reader — Conductor's step listing, or
@@ -2355,12 +2354,12 @@ pub mod step_names {
 
     /// The step name a durable race over steps records.
     ///
-    /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above
-    /// and for the same reason. Go's `Select` records `"DBOS.select"`
-    /// (`workflow.go:3082`); this crate's call is [`select_step!`](crate::select_step), because a
-    /// bare `select` in a Rust namespace reads as a future combinator where this one takes only
-    /// steps, and the recorded name follows the call a reader wrote. Python's `asyncio_wait`
-    /// records `"DBOS.asyncio_wait"` and could not have been borrowed at all.
+    /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above and
+    /// for the same reason. Go's `Select` records `"DBOS.select"` (`workflow.go`); this crate's
+    /// call is [`select_step!`](crate::select_step), because a bare `select` in a Rust namespace
+    /// reads as a future combinator where this one takes only steps, and the recorded name follows
+    /// the call a reader wrote. Python's `asyncio_wait` records `"DBOS.asyncio_wait"` and could not
+    /// have been borrowed at all.
     ///
     /// Affordable for the reason [`SELECT_WORKFLOW`] states in full: nothing reads a step name across
     /// implementations, since a workflow only crosses one by enqueue and an enqueued workflow
@@ -2572,8 +2571,8 @@ pub struct NewSchedule<'a> {
     /// generates it. Java's DAO does, as this does. TypeScript and Python generate one layer
     /// higher, at every call site that registers a schedule, and hand this layer a value it must
     /// take. That is the same split `application_name` has, and it resolves the same way: the
-    /// fallback lives here because nothing sits above this layer yet, and becomes a second line
-    /// of defence rather than the only one once Phase 2's registration layer does.
+    /// fallback lives here so this layer stands on its own, and a registration layer above it
+    /// that supplies the id makes this a second line of defence rather than the only one.
     pub schedule_id: Option<&'a str>,
     /// See [`ScheduleRecord::schedule_name`].
     pub schedule_name: &'a str,

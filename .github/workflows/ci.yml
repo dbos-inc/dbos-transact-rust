@@ -94,8 +94,7 @@ jobs:
     # Both legs run in well under ten minutes, so this is a hang guard rather than a budget.
     # Without it a single stuck test burns GitHub's six-hour default before saying anything:
     # `with_retry` has no attempt limit by design, so any error it classes as transient or
-    # connection-related retries forever, and a test that trips one waits out the job. That
-    # happened on 2026-08-18 and cost six hours to learn one test name.
+    # connection-related retries forever, and a test that trips one waits out the job.
     timeout-minutes: 25
     # Both v1 backends are required, not advisory. The Cockroach leg has already caught
     # two integer-width divergences that no amount of reading the SQL would have surfaced.

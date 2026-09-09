@@ -86,7 +86,7 @@ impl Executor {
             executor_id,
             app_version,
             app_id,
-            // Decision 20: the runtime is the executor's, taken here. `start` is `async`, so a
+            // The runtime is the executor's, taken here. `start` is `async`, so a
             // runtime is necessarily current.
             runtime: tokio::runtime::Handle::current(),
             workflows,
@@ -118,14 +118,13 @@ impl Executor {
 
     /// Names the application whose rows this executor owns.
     ///
-    /// **Its own, and not an [`Option`].** The connection reports a name that may be absent, because
-    /// the one a [`Client`](crate::Client) opens may speak for every application at once. An
-    /// executor may not: the identity is resolved and validated at launch, before anything
-    /// connects, and the name that wins — on DBOS Cloud the deployment's
-    /// `DBOS_APP_NAME` rather than [`Config::app_name`](crate::Config::app_name) — is the
-    /// ownership key on every row this process writes. Holding it here rather than unwrapping the
-    /// database's is what keeps that a fact of the type instead of an invariant each caller has to
-    /// remember.
+    /// **Its own, and not an [`Option`].** The connection reports a name that may be absent,
+    /// because the one a [`Client`](crate::Client) opens may speak for every application at once.
+    /// An executor may not: the identity is resolved and validated at launch, before anything
+    /// connects, and the name that wins — on DBOS Cloud the deployment's `DBOS_APP_NAME` rather
+    /// than [`Config::app_name`](crate::Config::app_name) — is the ownership key on every row this
+    /// process writes. Holding it here rather than unwrapping the database's is what keeps that a
+    /// fact of the type instead of an invariant each caller has to remember.
     pub fn app_name(&self) -> &str {
         &self.app_name
     }
@@ -154,9 +153,10 @@ impl Executor {
     /// engine names the pair [`app_name`](Self::app_name) and `app_version`, matching
     /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV) and the `DBOS__APPVERSION` every
     /// implementation reads, while `sysdb` spells them `application_name` and
-    /// `application_version` because those are the columns' own names. The conversion happens where a value crosses into a `sysdb` type —
-    /// `NewWorkflow { application_version: Some(executor.app_version()), .. }` — which is the
-    /// same boundary every other schema word stops at.
+    /// `application_version` because those are the columns' own names. The conversion happens
+    /// where a value crosses into a `sysdb` type — `NewWorkflow { application_version:
+    /// Some(executor.app_version()), .. }` — which is the same boundary every other schema word
+    /// stops at.
     pub fn app_version(&self) -> &str {
         &self.app_version
     }
@@ -195,11 +195,10 @@ impl Executor {
 
     /// Stops everything this executor started and closes the system database.
     ///
-    /// Here rather than in [`DBOS::shutdown`] because this is where the things being stopped live,
-    /// and there will be more of them: the task set holding running workflows, and the recovery
-    /// task. Teardown that grows a step at a time wants one place to grow, which is also how Java
-    /// draws it — `DBOS.shutdown()` calls `DBOSExecutor.close()` and knows nothing about what that
-    /// entails.
+    /// Here rather than in [`DBOS::shutdown`] because this is where the things being stopped live:
+    /// the task set holding running workflows and the dequeue loop, and the connection. Teardown
+    /// that grows a step at a time wants one place to grow, which is also how Java draws it —
+    /// `DBOS.shutdown()` calls `DBOSExecutor.close()` and knows nothing about what that entails.
     ///
     /// Takes `&self`, not `self`: the instance drops its handle here, but a workflow still running
     /// may hold another, and shutting down is precisely the moment when that is true.
@@ -242,11 +241,12 @@ impl std::fmt::Debug for Executor {
 /// Cheap to clone — it is an `Arc` internally, so a clone is another handle to the same instance
 /// rather than another instance. Clone it into whatever holds application state.
 ///
-/// The instance owns configuration and, from the next commit, the workflow registry; it holds them
-/// for the life of the application. [`launch`](Self::launch) constructs an [`Executor`] and
-/// [`shutdown`](Self::shutdown) drops it, so relaunching in one process is supported — which is why
-/// this is an instance whose state changes rather than a builder that becomes a handle. A type-state
-/// would make "not launched" a compile error and would also make relaunching inexpressible.
+/// The instance owns the configuration and the workflow registry, holding them for the life of the
+/// application. [`launch`](Self::launch) constructs an [`Executor`] and
+/// [`shutdown`](Self::shutdown) drops it, so relaunching in one process is supported — which is
+/// why this is an instance whose state changes rather than a builder that becomes a handle. A
+/// type-state would make "not launched" a compile error and would also make relaunching
+/// inexpressible.
 #[derive(Clone)]
 pub struct DBOS(Arc<Inner>);
 
@@ -343,9 +343,9 @@ impl DBOS {
         };
         let executor = Arc::new(executor);
         *self.write_executor() = Some(Arc::clone(&executor));
-        // Recovery already happened, inside `Executor::start`: it is one write now, and doing it
-        // before launch returns is what keeps it clear of workflows the application starts next.
-        // What is left is to start polling, which is also what will run the re-enqueued work.
+        // Recovery already happened, inside `Executor::start`: it is one write, and doing it before
+        // launch returns is what keeps it clear of workflows the application starts next. What is
+        // left is to start polling, which is also what will run the re-enqueued work.
         if !recovered.is_empty() {
             tracing::debug!(
                 workflows = recovered.len(),
@@ -354,9 +354,9 @@ impl DBOS {
         }
         // The dequeue loop starts unconditionally, because a queue this process never registered
         // is still one it should dequeue from: the worker set is rebuilt from the `queues` table
-        // on every supervisor sweep, not from this instance's `register_queue` calls. A queue another
-        // *process of this application* registered is therefore picked up, as is one registered
-        // against this instance after launch, without a restart.
+        // on every supervisor sweep, not from this instance's `register_queue` calls. A queue
+        // another *process of this application* registered is therefore picked up, as is one
+        // registered against this instance after launch, without a restart.
         //
         // Another *application's* queue is not, and that is the boundary: the search scopes to
         // this application's rows plus the unclaimed ones, so a peer application's backlog is

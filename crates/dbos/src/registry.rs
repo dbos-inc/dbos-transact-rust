@@ -23,7 +23,7 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A registered workflow with its types erased: encoded argument in, encoded outcome out.
 ///
-/// That *is* an FFI shape, and deliberately so (§9.2) — a host language marshals strings and never
+/// That *is* an FFI shape, and deliberately so — a host language marshals strings and never
 /// a Rust type. No context parameter appears in it, because the context is ambient. The error is
 /// erased along with the value, which is what lets a caller keep a typed error while recovery,
 /// holding only a row, keeps none.
@@ -70,8 +70,8 @@ impl WorkflowKey {
     ///
     /// Both spellings are in the wild, and Java's own code is the evidence rather than an
     /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
-    /// compares an init against an existing row (`WorkflowDAO.java:120`), which is a defence
-    /// nobody writes against a distinction that cannot occur.
+    /// compares an init against an existing row (`WorkflowDAO.java`), which is a defence nobody
+    /// writes against a distinction that cannot occur.
     pub(crate) fn from_row(
         name: impl Into<String>,
         class_name: Option<&str>,
@@ -262,7 +262,7 @@ impl DBOS {
     /// **Do not capture the [`DBOS`] instance in `workflow`.** The registry lives on the instance,
     /// so the closure is stored inside the very `Arc` a captured handle points at — a cycle, and
     /// the instance, its executor and its connection pool are then never freed. Nothing a workflow
-    /// body needs requires one: [`step`](crate::step), [`set_event`](crate::set_event) and
+    /// body needs requires one: [`step`](crate::step()), [`set_event`](crate::set_event) and
     /// [`get_event`](crate::get_event) all read the ambient context.
     ///
     /// A [`WorkflowRef`] holds an instance too, so capturing one — to start a child workflow —
@@ -358,7 +358,7 @@ mod tests {
         let one = dbos.register_workflow("takes_one", takes_one).unwrap();
         assert_eq!(nothing.name(), "takes_nothing");
         assert_eq!(one.name(), "takes_one");
-        // Closures too, which is what a macro will generate into.
+        // Closures too.
         dbos.register_workflow(
             "closure",
             |s: String| async move { Ok::<_, Error>(s.len()) },
@@ -472,7 +472,8 @@ mod tests {
 
     #[test]
     fn a_row_written_with_empty_strings_resolves_to_the_same_key_as_one_written_with_nulls() {
-        // Java writes `""` where Python writes NULL, and both must find this registration.
+        // Some SDKs spell absence `""` where Python writes NULL, and both must find this
+        // registration.
         let free = WorkflowKey::new("checkout");
         assert_eq!(WorkflowKey::from_row("checkout", None, None), free);
         assert_eq!(WorkflowKey::from_row("checkout", Some(""), Some("")), free);

@@ -4,19 +4,19 @@
 //! waiting on a set of handles, reading an event. Each is a single durable act that a replay must
 //! not perform twice, so each takes a step id from the ambient workflow and records its answer
 //! under it — which is exactly what makes it a step, and what puts it here beside the ones
-//! [`step`](crate::step) builds. What none of them is is a `step` *call*: there is no user body,
+//! [`step`](crate::step()) builds. What none of them is is a `step` *call*: there is no user body,
 //! no retry policy and no timeout, so none of them goes through `step_with`.
 //!
-//! **Being a step and being a [`PendingStep`] are the same thing now.** `step` and `step_with`
-//! take their id through [`StepPlacement::here`] at the call; a child's
+//! **Being a step and being a [`PendingStep`] are the same thing.** `step` and `step_with` take
+//! their id through [`StepPlacement::here`] at the call; a child's
 //! [`start`](crate::WorkflowRef::start) and the await of a handle
 //! ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) take theirs through
-//! [`StepPlacement::of`] — which is also why [`run`](crate::WorkflowRef::run), being the two of
-//! them in sequence, claims two ids where it is written rather than two wherever it happens to be
-//! driven; and `sleep`, the events, the messages, the waits and every checkpointed management call
-//! take theirs through [`StepPlacement::of`] at the call and hand it to [`PendingStep::placed`].
-//! Nothing is left that allocates inside its own `async fn`, so any of these may be built first
-//! and driven concurrently, with steps and with each other.
+//! [`StepPlacement::of`] — which is why [`run`](crate::WorkflowRef::run), being the two of them in
+//! sequence, claims two ids where it is written rather than wherever it happens to be driven; and
+//! `sleep`, the events, the messages, the waits and every checkpointed management call take theirs
+//! through [`StepPlacement::of`] at the call and hand it to [`PendingStep::placed`]. Nothing
+//! allocates inside its own `async fn`, so any of these may be built first and driven
+//! concurrently, with steps and with each other.
 //!
 //! What they share is not the recording but the **decision of whether to record at all**, and that
 //! decision is subtle enough to be worth having in one place:
@@ -31,10 +31,9 @@
 //!   on *whose* connection it is — a [`Client`](crate::Client)'s degrades to the plain call, a
 //!   second application instance's is [`Error::WrongInstance`].
 //!
-//! Those four cases and the argument for each were written once, for
-//! [`WorkflowHandle::result`](crate::WorkflowHandle::result), and are now shared by every caller
-//! that has the same question. The references keep the same logic in one place for the same
-//! reason: Python's `call_function_as_step`, TypeScript's `runInternalStep` and Java's
+//! Those four cases and the argument for each are written once and shared by every caller that
+//! has the same question. The references keep the same logic in one place for the same reason:
+//! Python's `call_function_as_step`, TypeScript's `runInternalStep` and Java's
 //! `runDbosFunctionAsStep` are each one wrapper that every library step goes through.
 //!
 //! **What is *not* shared is the write**, and deliberately. A child await records the awaited id
@@ -51,50 +50,19 @@
 //!
 //! # Racing, and what a workflow body may not use
 //!
-//! **`tokio::join!` over durable calls is ordinary code; `tokio::select!` is not, and neither is
-//! `tokio::time::timeout`.** The difference is not the ids — those are taken where each call is
-//! written and a replay rebuilds the same ones in the same order, which is what this module is
-//! for. It is that a race **decides something**, and nothing records what it decided. A replay
-//! that races again may see the other branch answer first and take a path the first execution
-//! never took, which is the one thing a workflow may never do; a `timeout` is the same race
-//! against the wall clock, and the clock is not replayed either.
+//! `tokio::join!` over durable calls is ordinary code; `tokio::select!` and `tokio::time::timeout`
+//! are not, because a race *decides* something and nothing records what it decided. [`PendingStep`]
+//! sets out the rule and what to reach for instead.
 //!
-//! An all-wait decides nothing, which is why `join!` needs no help: every branch runs, and the
-//! only question a replay could get differently — which id each call holds — was settled at the
-//! call.
-//!
-//! What to reach for instead, inside a workflow body:
-//!
-//! - **Racing durable calls**: [`select_step!`](crate::select_step), which is `tokio::select!`'s
-//!   answer here — it records *which branch won* and a replay polls only that one, so the choice
-//!   is replayed rather than made again.
-//! - **Racing workflows**: [`select_workflow!`](macro@crate::select_workflow), which records the
-//!   winner and awaits only it. Where every branch is a workflow's outcome this is the call to
-//!   reach for rather than `select_step!` over the handles' awaits: it settles the whole set with
-//!   one query per poll interval, where N racing awaits poll N times.
-//! - **Bounding how long something may take**: the call's own deadline —
-//!   [`get_event`](crate::get_event) and [`recv`](crate::recv) take one, a step carries its
-//!   timeout, and a whole workflow's is [`StartOptions::timeout`](crate::StartOptions::timeout).
-//!   Each of those is recorded; a `timeout` around the future is not.
-//! - **Racing anything else** — a future this crate knows nothing about, or a wall clock: put the
-//!   race *inside a step*. A step is a leaf whose checkpoint stands for everything its body did,
-//!   so a `select!` or a `timeout` in there is replayed as the one answer the step recorded, and
-//!   nothing about how it was reached has to be reproduced.
-//!
-//! That last line is the general rule and the reason the others are narrow: **the ban is on racing
-//! in a workflow body, not on racing.** Inside a step body, or outside a workflow entirely, the
-//! whole of tokio is available.
-//!
-//! Two calls are named for this rule by their own types, and for a different reason than the one
-//! above: [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a
-//! workflow, and a race polls in source order and stops at the first branch that is ready — so
-//! whether the child exists at all would follow the timing of some other branch. Start outside the
-//! race; race what observes the result. Being their own types is what keeps them out of a durable
-//! race in particular: [`select_step!`](crate::select_step) pushes each branch onto a set that
-//! takes a [`PendingStep`], so a start handed to one is a type error rather than a paragraph
-//! ignored. What no type stops is `tokio::select!`, which takes any future — there this paragraph
-//! is what stands between a body and the mistake, exactly as it does for every other call above.
-//!
+//! Two calls are kept out of a durable race by their own types:
+//! [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a workflow,
+//! and a race polls in source order and stops at the first branch that is ready — so whether the
+//! child exists at all would follow the timing of some other branch. Start outside the race; race
+//! what observes the result.
+//! [`select_step!`](crate::select_step) pushes each branch onto a set that takes a [`PendingStep`],
+//! so a start handed to one is a type error rather than a paragraph ignored. What no type stops is
+//! `tokio::select!`, which takes any future — there the prose is what stands between a body and
+//! the mistake.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -126,12 +94,12 @@ pub(crate) type Built<C> = Result<(C, StepPlacement), Error>;
 /// however the bodies then interleave. An id allocated at the first poll would instead depend on
 /// which future reached the counter first, and a replay does not reproduce that.
 ///
-/// Awaiting one runs it. This is a [`Future`], so `step(..).await?` reads exactly as it did when
-/// [`step`](crate::step) was an `async fn`, and not one call site had to change.
+/// Awaiting one runs it: this is a [`Future`], so `step(..).await?` reads as an `async fn` call
+/// would.
 ///
 /// **Built and dropped, it has still spent the id**, which is why this is `#[must_use]`. That is
-/// deterministic — the same construction sequence burns the same ids on the replay — but it is no
-/// longer the no-op it was when the id was taken at the first poll.
+/// deterministic — the same construction sequence burns the same ids on the replay — but it is
+/// not a no-op.
 ///
 /// **Polled where it was built, and asked again on every poll.** The id is a claim on one position
 /// in one workflow, so a call carried into another workflow, or built outside one and polled
@@ -435,7 +403,7 @@ pub(crate) fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
 
 /// Where a durable call stands: which of the workflow's step ids it occupies, if any.
 ///
-/// **One type for both kinds of step.** A *user step* is what [`step`](crate::step) and
+/// **One type for both kinds of step.** A *user step* is what [`step`](crate::step()) and
 /// [`step_with`](crate::step_with) build: a body the caller wrote, a retry policy, a timeout. A
 /// *library step* is one this crate writes on the caller's behalf — awaiting a workflow's result,
 /// waiting on a set of handles, reading or setting an event, a checkpointed management call. They
@@ -479,7 +447,7 @@ pub(crate) enum StepPlacement {
     /// **A variant of its own rather than sharing an uncheckpointed one with
     /// [`InsideStep`](Self::InsideStep)**, because the two want opposite treatment. A client's
     /// call is legitimately driven from anywhere and nothing pins it; an in-step call has to be
-    /// held to the body it was built in. Conflating them is how the second went unchecked.
+    /// held to the body it was built in.
     ClientConnection,
     /// Inside a workflow at a step boundary: this call is a step of that workflow.
     ///
@@ -567,9 +535,9 @@ impl StepPlacement {
     /// [`DBOS`](crate::DBOS) form for everyone else, and why
     /// [`get_event`](crate::get_event)'s free form follows the same rule.
     ///
-    /// Here rather than in each of those modules because it is one function, and it was two
-    /// copies under two names before: the question of how a call reaches the executor that will
-    /// serve it belongs beside [`taken`](Self::taken), which asks the other half of it.
+    /// Here rather than in each of those modules because it is one function: the question of how
+    /// a call reaches the executor that will serve it belongs beside [`taken`](Self::taken), which
+    /// asks the other half of it.
     ///
     /// `operation` names the caller for the error, which is the only thing that differs between
     /// them.
@@ -584,10 +552,9 @@ impl StepPlacement {
     /// Where a call served by the ambient workflow's own executor stands.
     ///
     /// [`of`](Self::of) with no second connection to disagree with, which is every *user* step:
-    /// [`step`](crate::step) is always served by the workflow it is written in, so
-    /// [`ClientConnection`](Self::ClientConnection) is unreachable and
-    /// [`Error::WrongInstance`] cannot arise. That is the whole of why this cannot fail where
-    /// `of` can.
+    /// [`step`](crate::step()) is always served by the workflow it is written in, so
+    /// [`ClientConnection`](Self::ClientConnection) is unreachable and [`Error::WrongInstance`]
+    /// cannot arise. That is the whole of why this cannot fail where `of` can.
     ///
     /// Allocating is the point, and it happens here rather than at the poll: the position of this
     /// call has to be the same on the replay as it was on the run, and building is what fixes it.
@@ -671,8 +638,8 @@ impl StepPlacement {
     /// it.** An id is a claim on one position in one workflow, so a call carried somewhere that
     /// cannot honour it is refused rather than run: the alternatives are recording it under the
     /// wrong workflow's id, or running it unrecorded where the surrounding workflow expects a
-    /// checkpoint and every replay would run it again. [`step`](crate::step) asks this, and so
-    /// will each library step as it moves its allocation to the call.
+    /// checkpoint and every replay would run it again. [`step`](crate::step()) asks this at the
+    /// run, and [`PendingStep`]'s poll asks it for every placed call.
     ///
     /// `step` names the call for [`Error::StepBuiltElsewhere`].
     pub(crate) fn check_here<E>(
@@ -702,7 +669,7 @@ impl StepPlacement {
             // Took no id, and is polled in the same step body it was built in. Compared by marker
             // alone: it is process-unique, so equal markers are the same body and therefore the
             // same workflow. The `is_some` is what keeps that true — two absent markers are not a
-            // match, they are the workflow proper twice — and it holds by construction today.
+            // match, they are the workflow proper twice — and it holds by construction.
             (Self::InsideStep { ctx }, Some(here))
                 if ctx.step_marker().is_some() && here.step_marker() == ctx.step_marker() =>
             {

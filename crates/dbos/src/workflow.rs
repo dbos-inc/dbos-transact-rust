@@ -299,29 +299,29 @@ pub struct StartOptions<'a> {
 ///
 /// **The queue-only options are nested here rather than sitting beside
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
-/// id, a priority, a partition key, a delay and a
-/// [`duplication_policy`](Self::duplication_policy) each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError` for
-/// each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
-/// describing states its type system allowed it to build. Owning them from the queue makes the
-/// same five unrepresentable — there is no queue-less value here to hang them on. Three rules
-/// survive as refusals at start, because no shape can take them:
+/// id, a priority, a partition key, a delay and a [`duplication_policy`](Self::duplication_policy)
+/// each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError`
+/// for each, including the policy (`workflow.go`), which is five runtime errors describing states
+/// its type system allowed it to build. Owning them from the queue makes the same five
+/// unrepresentable — there is no queue-less value here to hang them on. Three rules survive as
+/// refusals at start, because no shape can take them:
 ///
 /// - **A [`deduplication_id`](Self::deduplication_id) and a [`partition_key`](Self::partition_key)
-///   cannot both be set.** Go refuses the same pair (`workflow.go:1201`), and it is not a policy
-///   choice: a partitioned queue's sweep claims one head-of-line workflow per partition and leans
-///   on the `PENDING` gate to hold concurrency at one, while a deduplication key is enforced by a
-///   partial unique index over `(queue_name, deduplication_id)` that knows nothing about
-///   partitions.
+///   cannot both be set.** Go refuses the same pair (`workflow.go`), and it is not a policy choice:
+///   a partitioned queue's sweep claims one head-of-line workflow per partition and leans on the
+///   `PENDING` gate to hold concurrency at one, while a deduplication key is enforced by a partial
+///   unique index over `(queue_name, deduplication_id)` that knows nothing about partitions.
 /// - **A [`priority`](Self::priority) must be between 1 and [`i32::MAX`].** `0` is the stored
 ///   sentinel for unprioritised, so accepting it would give that state a second spelling that
 ///   reads like a real priority.
-/// - **[`DuplicationPolicy::ReturnExisting`] needs a [`deduplication_id`](Self::deduplication_id)**,
-///   because a policy for resolving a collision is meaningless where nothing can collide. Python
-///   and Go refuse the same pair (`_enqueue_options.py:82`, `workflow.go:1177`), and keeping the
-///   two apart is what makes the ordinary enqueue — a key, no policy — the short one to write.
+/// - **[`DuplicationPolicy::ReturnExisting`] needs a
+///   [`deduplication_id`](Self::deduplication_id)**, because a policy for resolving a collision is
+///   meaningless where nothing can collide. Python and Go refuse the same pair
+///   (`_enqueue_options.py`, `workflow.go`), and keeping the two apart is what makes the ordinary
+///   enqueue — a key, no policy — the short one to write.
 ///
-/// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts:324`), which
-/// is the nearest precedent; Go and Python keep them flat on their options struct.
+/// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts`), which is
+/// the nearest precedent; Go and Python keep them flat on their options struct.
 ///
 /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
 /// and a queue registered by a peer is as valid a destination as one registered here.
@@ -420,19 +420,19 @@ pub enum DuplicationPolicy {
     /// **Idempotent enqueue**: the first caller's workflow is the one that runs, and every later
     /// caller waits on it instead of being told no — so this caller's arguments are discarded,
     /// which is the half worth knowing. Three implementations offer the choice — TypeScript's
-    /// `duplicationPolicy` (`dbos.ts:178`), Python's `duplication_policy` (`_context.py:794`) and
-    /// Go's `DeduplicationPolicy` (`workflow.go:888`) — and all three require a key, as this does.
-    /// Java is the one that always rejects, though it has the same lookup underneath: its
-    /// `DebouncerClient` hand-rolls the join with `findDeduplicationHolder`. All three document it
-    /// as how a *singleton workflow* is written.
+    /// `duplicationPolicy` (`dbos.ts`), Python's `duplication_policy` (`_context.py`) and Go's
+    /// `DeduplicationPolicy` (`workflow.go`) — and all three require a key, as this does. Java is
+    /// the one that always rejects, though it has the same lookup underneath: its `DebouncerClient`
+    /// hand-rolls the join with `findDeduplicationHolder`. All three document it as how a
+    /// *singleton workflow* is written.
     ///
     /// The key is held only while the holder is *waiting*, so this joins a backlog, not a history:
     /// once the holder has finished, the same key enqueues a new workflow.
     ///
-    /// **Started from inside a workflow, the parent's launch record points at the workflow that
-    /// was joined**, not at the id this call derived — so a replay resolves to the same workflow
-    /// rather than trying to start the child again. Go records the same mapping at the same
-    /// reserved step id, for the same stated reason (`workflow.go:1465`).
+    /// **Started from inside a workflow, the parent's launch record points at the workflow that was
+    /// joined**, not at the id this call derived — so a replay resolves to the same workflow rather
+    /// than trying to start the child again. Go records the same mapping at the same reserved step
+    /// id, for the same stated reason (`workflow.go`).
     ///
     /// **A joined workflow is a child by one measure and not by the other, deliberately.** The
     /// relationship is stored twice: `operation_outputs.child_workflow_id` at the parent's step,
@@ -450,8 +450,7 @@ pub enum DuplicationPolicy {
 }
 
 impl<'a> Enqueue<'a> {
-    /// A plain enqueue onto `name`, asking for nothing else — what `queue: Some(name)` meant
-    /// before the options existed.
+    /// A plain enqueue onto `name`, asking for nothing else.
     pub fn new(name: &'a str) -> Self {
         Self {
             name,
@@ -472,11 +471,11 @@ impl<'a> Enqueue<'a> {
     /// pair of rules that are about the options themselves:
     ///
     /// - **A deduplication id and a partition key cannot both be set.** Go refuses the same pair
-    ///   (`workflow.go:1201`) and it is not a policy choice: the two ask the dequeue for
-    ///   incompatible things. A partitioned queue's sweep claims one head-of-line workflow per
-    ///   partition and relies on the `PENDING` gate to hold concurrency at one, while a
-    ///   deduplication key is enforced by a partial unique index over `(queue_name,
-    ///   deduplication_id)` that knows nothing about partitions.
+    ///   (`workflow.go`) and it is not a policy choice: the two ask the dequeue for incompatible
+    ///   things. A partitioned queue's sweep claims one head-of-line workflow per partition and
+    ///   relies on the `PENDING` gate to hold concurrency at one, while a deduplication key is
+    ///   enforced by a partial unique index over `(queue_name, deduplication_id)` that knows
+    ///   nothing about partitions.
     /// - **A priority must be at least 1.** `0` is the stored sentinel for unprioritised, so
     ///   accepting it would give that state a second spelling that reads like a real priority;
     ///   the references' documented range starts at 1 for the same reason. The ceiling is
@@ -740,13 +739,13 @@ impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
 ///   `Timeout.Inherit`, `Timeout.None` and `Timeout.Explicit` (`workflow/Timeout.java`), resolved
 ///   at `DBOSContext.resolveTimeoutAndDeadline` — where the `None` case clears the propagated
 ///   deadline *and* the timeout, exactly as [`None`](Self::None) does here. This is the one place
-///   Java **is** the model, variant names included; decision 6's "Java is not a model" is about
-///   its user-facing `withDeadline` and the precedence that follows from it, which Rust lacks.
-/// - **TypeScript** spells the three as `number | null | undefined` (`context.ts:31`) and branches
+///   Java **is** the model, variant names included; where it is not is its user-facing
+///   `withDeadline` and the precedence that follows from it, which Rust lacks.
+/// - **TypeScript** spells the three as `number | null | undefined` (`context.ts`) and branches
 ///   on the middle one under the comment *"Detach child deadline if a null timeout is configured"*
-///   (`dbos.ts:1969`, and again at `enqueue_workflow.ts:92`).
+///   (`dbos.ts`, and again at `enqueue_workflow.ts`).
 /// - **Python** reaches them through `SetWorkflowTimeout(None)`, whose `__enter__` clears the
-///   propagated deadline as well as the timeout (`_context.py:568`).
+///   propagated deadline as well as the timeout (`_context.py`).
 /// - **Go** gets all three for free, because its deadline rides on a `context` a caller may
 ///   decline to pass on.
 ///
@@ -943,7 +942,7 @@ where
     /// Returns as soon as the workflow is recorded and spawned. If the id is already owned —
     /// another process is running it, or a previous run finished it — the handle joins the
     /// existing run rather than this being an error: the id is an idempotency key, and honouring
-    /// it is the promise (decision 13).
+    /// it is the promise.
     ///
     /// **A start answers in the child's error channel by default**, though it can only fail in the
     /// engine's terms — there is no application error to report, since nothing the application
@@ -1008,7 +1007,7 @@ where
     ///
     /// **A `join!` over the starts — or over the awaits, or over whole
     /// [`run`](Self::run)s — is sound**, for the reason a `join!` over
-    /// [`step`](crate::step)s is: `join!` builds every branch before polling any, which is
+    /// [`step`](crate::step())s is: `join!` builds every branch before polling any, which is
     /// exactly the order the ids were claimed in. What is *not* sound is building a start in one
     /// workflow and polling it in another, or across a step-body boundary — an id is a claim on
     /// one position in one execution, and a start carried somewhere that cannot honour it is
@@ -1067,8 +1066,8 @@ where
     /// recorded, and that nothing is running until the process next launches. Detached, the drop
     /// takes the [`JoinHandle`](tokio::task::JoinHandle) and leaves the work: the child is
     /// created, its start is recorded, and it runs. What the caller loses by dropping is the
-    /// handle, which is [`select_workflow!`](crate::select_workflow)'s existing rule — a workflow
-    /// runs whether or not anything is watching it — rather than a new hazard of its own.
+    /// handle, which is [`select_workflow!`](macro@crate::select_workflow)'s existing rule — a
+    /// workflow runs whether or not anything is watching it — rather than a new hazard of its own.
     ///
     /// Spawned through [`spawn_tracked`], so shutdown reaches it — and what an abort leaves
     /// behind depends on where it lands. Before the transaction commits, it rolls back and the
@@ -1217,16 +1216,13 @@ async fn create<R, E>(
     // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
     // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
     // not another hour, and a crash loop cannot extend the budget indefinitely.
-    //
-    // A *queued* workflow is assigned its deadline on dequeue instead, because the wait in the
-    // queue is not part of the budget. That path arrives with queues; nothing here enqueues.
     let deadline = match (timeout, &parent) {
         // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
         // explicit timeout records the budget and leaves the deadline null for the claim
         // statement to fill in. The wait in the queue is not part of the budget — a workflow
         // given five minutes that sits queued for an hour still gets five minutes. Python and
-        // TypeScript both branch on the queue in exactly this spot; the claim statement this
-        // engine already ships does the other half.
+        // TypeScript both branch on the queue in exactly this spot; the claim statement does
+        // the other half.
         (Timeout::Explicit(_), _) if queue.is_some() => None,
         // **An explicit timeout replaces an inherited deadline**, which is Python's and
         // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
@@ -1361,10 +1357,10 @@ async fn create<R, E>(
             workflow_id,
             "the workflow is already owned; the handle joins the existing run"
         );
-        // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read
-        // this row, and it is the case the references pass their own flag on — Python parks
-        // its unowned dispatch with `fail_if_missing=True` (`_core.py:1100`) and Go its lost
-        // start race (`workflow.go:1584`).
+        // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read this
+        // row, and it is the case the references pass their own flag on — Python parks its unowned
+        // dispatch with `fail_if_missing=True` (`_core.py`) and Go its lost start race
+        // (`workflow.go`).
         return Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             workflow_id,
@@ -1396,8 +1392,7 @@ async fn create<R, E>(
 /// What [`run`](WorkflowRef::run) hands back as [`PendingRun`], and what a
 /// [`start`](WorkflowRef::start) is built on — [`PendingStart`] holds one of these and declares
 /// the channel it reports in. Awaiting either starts the workflow, so `child.start(x).await?` and
-/// `child.run(x).await?` read exactly as they did when both were `async fn`s, and not one call
-/// site had to change.
+/// `child.run(x).await?` read exactly as they would if both were `async fn`s.
 ///
 /// **A newtype over [`PendingStep`] rather than a `PendingStep`, because a durable race must not
 /// take one**, and the reason is not that dropping one leaves anything broken. It does not: dropped
@@ -1438,11 +1433,10 @@ pub struct PendingWorkflow<'a, T, E = crate::EngineOnly>(PendingStep<'a, T, E>);
 /// **Two error types, because a start deals in two.** `E` is the *child's* — it is what the handle
 /// will report when the child finishes, and none of it is in play yet. `C` is the channel this
 /// call itself answers in, and a start can only fail in the engine's terms: the child's body has
-/// not run, so there is no application error for it to have. Holding one parameter for both, as
-/// this type once did, forces a parent to fail the way its child does — and a parent whose error
-/// type differs from its child's then has no way to report a start failure at all, since `?`
-/// cannot convert between two application channels and [`Error::lift`] starts from
-/// [`EngineOnly`](crate::EngineOnly).
+/// not run, so there is no application error for it to have. One parameter for both would force a
+/// parent to fail the way its child does — and a parent whose error type differs from its child's
+/// would then have no way to report a start failure at all, since `?` cannot convert between two
+/// application channels and [`Error::lift`] starts from [`EngineOnly`](crate::EngineOnly).
 ///
 /// `C` **defaults to `E`**, which is the common case written without saying anything: a workflow
 /// starting a child that fails the way it does writes `child.start(x).await?` and nothing else.
@@ -1632,10 +1626,11 @@ impl Parent<'_> {
     /// Reads back a start recorded at this position, if this parent has run this far before.
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
-    /// [`Error::UnexpectedStep`] before this sees it. What is left to check is the child id: a row
-    /// under the right name carrying none was written by a plain step, which means the parent's
-    /// code changed — `step("charge")` became a child workflow named `charge` — and starting a
-    /// child now would give this position two meanings across two runs.
+    /// [`UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this sees it. What is left
+    /// to check is the child id: a row under the right name carrying none was written by a plain
+    /// step, which means the parent's code changed — `step("charge")` became a child workflow
+    /// named `charge` — and starting a child now would give this position two meanings across
+    /// two runs.
     ///
     /// **Stricter than the references here.** Python falls through to a fresh start when the
     /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
@@ -1666,22 +1661,22 @@ impl Parent<'_> {
     /// handing [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) a
     /// [`InitWorkflowCaller`]. This is the other arm, where the insert lost the deduplication key
     /// and there is no transaction of this call's to join: the holder's row belongs to whoever
-    /// created it, and all that is left to write is the mapping. Nothing was created here, so nothing is
-    /// left dangling if this write never happens — which is what makes a separate statement sound
-    /// in this arm and not in the other.
+    /// created it, and all that is left to write is the mapping. Nothing was created here, so
+    /// nothing is left dangling if this write never happens — which is what makes a separate
+    /// statement sound in this arm and not in the other.
     ///
-    /// The mapping only, never the holder's own `parent_workflow_id`: that column now travels on
+    /// The mapping only, never the holder's own `parent_workflow_id`: that column travels on
     /// [`InitWorkflowCaller`] and so cannot be reached from here at all, which is the asymmetry
     /// [`DuplicationPolicy::ReturnExisting`] describes, held by the shape rather than by care.
     ///
     /// **The step name is the workflow's bare name**, not the `name`/`class_name`/`config_name`
-    /// triple that identifies it — and that is four of four rather than a narrowing, including
-    /// both references that also carry a class and a config. Python records
-    /// `get_dbos_func_name(func)` and hands the other two to `_init_workflow` separately
-    /// (`_core.py:1428`); Java records `workflowName` beside a `className` on the status row
-    /// (`DBOSExecutor.java:2035`); Go has one name to record. The qualification belongs to the
-    /// child's own row, which the `init_workflow` call above fills in — this column is the
-    /// *parent's* step listing, where the name is what a reader is looking for.
+    /// triple that identifies it — and that is four of four rather than a narrowing, including both
+    /// references that also carry a class and a config. Python records `get_dbos_func_name(func)`
+    /// and hands the other two to `_init_workflow` separately (`_core.py`); Java records
+    /// `workflowName` beside a `className` on the status row (`DBOSExecutor.java`); Go has one name
+    /// to record. The qualification belongs to the child's own row, which the `init_workflow` call
+    /// above fills in — this column is the *parent's* step listing, where the name is what a reader
+    /// is looking for.
     async fn record_child(
         &self,
         executor: &Executor,

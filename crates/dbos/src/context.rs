@@ -23,16 +23,14 @@ tokio::task_local! {
 
 /// What a running workflow knows about itself.
 ///
-/// Cheap to clone: two `Arc`s. Cloning it does not make a second workflow — the clone shares the
+/// Cheap to clone: a few `Arc`s. Cloning it does not make a second workflow — the clone shares the
 /// same step counter, which is the point, because a step allocated through either must not reuse
 /// an id allocated through the other.
 ///
-/// **Internal.** Everything a workflow may ask about itself is a free function —
-/// [`workflow_id`](crate::workflow_id), [`step_id`](crate::step_id) and
-/// [`cancellation_token`](crate::cancellation_token) — so user code never names this type or
+/// **Internal.** Everything a workflow may ask about itself is a free function — [`workflow_id`],
+/// [`step_id`], [`step_status`] and [`cancellation_token`] — so user code never names this type or
 /// reaches through it. That keeps the ambient context an implementation detail: the questions are
-/// stable API, the
-/// thing that answers them is not.
+/// stable API, the thing that answers them is not.
 #[derive(Clone)]
 pub(crate) struct Ctx {
     executor: Arc<Executor>,
@@ -67,7 +65,7 @@ pub(crate) struct Ctx {
 pub(crate) struct StepScope {
     /// Which body, for the leaf rule. Opaque, and never compared across runs.
     marker: StepMarker,
-    /// What [`step_status`](crate::step_status) reports.
+    /// What [`step_status`] reports.
     ///
     /// **The id inside it is per step, where the marker is per attempt.** A retry enters a new
     /// scope with a fresh marker and the *same* id: the attempts are different bodies, and they are
@@ -86,18 +84,17 @@ pub(crate) struct StepScope {
     ///
     /// **This is the receiving end, and only that.** The engine raises a cancellation on the token
     /// it holds itself; what lands here is a clone, handed to the body so it can watch — see
-    /// [`cancellation_token`](crate::cancellation_token). Nothing a body does with this cancels
-    /// anything.
+    /// [`cancellation_token`]. Nothing a body does with this cancels anything.
     cancellation: CancellationToken,
 }
 
 /// What a step body can learn about the attempt it is running as.
 ///
-/// Read with [`step_status`](crate::step_status). The equivalent is `DBOS.step_status` in Python
+/// Read with [`step_status`]. The equivalent is `DBOS.step_status` in Python
 /// and `DBOS.stepStatus` in TypeScript; Go and Java expose nothing like it.
 ///
 /// TypeScript's carries a fourth field, `timeoutSignal`, which here is
-/// [`cancellation_token`](crate::cancellation_token) — a free function rather than a field, because
+/// [`cancellation_token`] — a free function rather than a field, because
 /// it is useful to a body that has no interest in which attempt it is.
 ///
 /// **A read-only snapshot, and read-only by construction.** The fields are behind accessors rather
@@ -109,7 +106,7 @@ pub(crate) struct StepScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepStatus {
     /// The step's ordinal position in its workflow, counting from zero — the same number
-    /// [`step_id`](crate::step_id) reports, and half a checkpoint row's key.
+    /// [`step_id`] reports, and half a checkpoint row's key.
     pub(crate) step_id: i32,
     /// Which attempt is running, counting from **one**.
     ///
@@ -176,7 +173,7 @@ impl StepStatus {
 /// and each entry is a body of its own — work the first attempt handed out is not inside the
 /// second.
 ///
-/// Named `marker` rather than `body` because in [`step`](crate::step) a step's *body* is already
+/// Named `marker` rather than `body` because in [`step`](crate::step()) a step's *body* is already
 /// its closure, and the field would shadow it wherever both are in scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StepMarker(u64);
@@ -246,7 +243,7 @@ impl Ctx {
     /// that wrap this, which is what keeps the context itself off the public surface.
     ///
     /// `None` is not an error. A step called outside a workflow runs plainly and undurably, which
-    /// is Python's behaviour and is what makes a `#[dbos::step]` function ordinarily testable.
+    /// is Python's behaviour and is what makes a function built from steps ordinarily testable.
     pub(crate) fn current() -> Option<Ctx> {
         CURRENT.try_with(Ctx::clone).ok()
     }
@@ -353,12 +350,11 @@ impl Ctx {
 
     /// Runs `body` under a context that is [`in_step`](Self::in_step).
     ///
-    /// **Nothing to unset afterwards**, which is what moving the answer off the shared state
-    /// bought: it lives on the `Ctx` bound for this body alone, so it goes out of scope with the
-    /// body however the body ends — an early return, an error, a panic — and no other call stack
-    /// ever saw it. The drop guard this used to need existed only because the flag was shared, and
-    /// a guard could not have fixed that: restoring rather than clearing still hands one step's
-    /// answer to another.
+    /// **Nothing to unset afterwards.** The marker lives on the `Ctx` bound for this body alone, so
+    /// it goes out of scope with the body however the body ends — an early return, an error, a
+    /// panic — and no other call stack ever saw it. A flag on the shared state would need a guard
+    /// to clear it, and a guard could not make it correct: restoring rather than clearing still
+    /// hands one step's answer to another.
     pub(crate) async fn in_step_scope<F: Future>(
         &self,
         cancellation: CancellationToken,
@@ -379,24 +375,14 @@ impl Ctx {
         CURRENT.scope(scoped, body).await
     }
 
-    /// Fires when the running step should stop.
+    /// Fires when the running step should stop: the attempt's token, or one that never fires when
+    /// there is no step running.
     ///
-    /// Observe it from work the runtime cannot stop by dropping this future — a `spawn_blocking`
-    /// thread, or a client that holds its own cancel handle. It fires whenever the attempt ends
-    /// **without completing**: a timeout, a cancelled workflow, or anything else that drops the
-    /// step's future. An attempt that reaches an outcome does *not* fire it, because the body has
-    /// had its chance to clean up and work it deliberately left running is not the engine's to
-    /// stop. **Ordinary `async` code needs nothing**: a step that times out has its future dropped,
-    /// which stops it at its next suspension point and runs its destructors on the way out, so a
-    /// connection is returned and a guard released without the body containing a line about it.
-    /// That is what TypeScript's `stepStatus.timeoutSignal` is for, and Rust gets the common case
-    /// for free where TypeScript has to abandon the attempt and discard its eventual settlement.
-    ///
-    /// Returns a token that is never cancelled when there is no step running, so a body that is
-    /// also called outside a workflow needs no second path.
+    /// What [`cancellation_token`] hands out; its documentation says
+    /// when the token fires and who should watch it.
     pub(crate) fn cancellation(&self) -> CancellationToken {
-        // `unwrap_or_default` means exactly one thing now: there is no step here, and a token
-        // that never fires is the honest answer.
+        // `unwrap_or_default` means exactly one thing: there is no step here, and a token that
+        // never fires is the honest answer.
         self.step
             .as_ref()
             .map(|step| step.cancellation.clone())
@@ -417,7 +403,7 @@ impl Ctx {
 ///
 /// Answers from inside a step as well as from the workflow body — a step is part of its workflow,
 /// and asking which workflow it belongs to is not the same question as
-/// [`step_id`](crate::step_id).
+/// [`step_id`].
 ///
 /// ```no_run
 /// # async fn f() -> dbos::Result<()> {
@@ -469,20 +455,20 @@ pub fn step_id() -> Option<i32> {
 
 /// What the step this code is running inside knows about its own attempt, or `None` outside one.
 ///
-/// [`step_id`](crate::step_id) is the common case and stays its own function; this is the rest of
-/// what a body may ask — chiefly **which attempt it is**, so a step can behave differently on its
-/// last one: log the failure loudly, fall back to a cheaper path, or stop paying for a cache it is
-/// about to give up on.
+/// [`step_id`] is the common case and stays its own function; this is the rest of what a body may
+/// ask — chiefly **which attempt it is**, so a step can behave differently on its last one: log the
+/// failure loudly, fall back to a cheaper path, or stop paying for a cache it is about to give up
+/// on.
 ///
 /// `None` in the workflow body proper and outside a workflow, exactly as
-/// [`step_id`](crate::step_id) is — a status belongs to a step, and between two steps a workflow is
+/// [`step_id`] is — a status belongs to a step, and between two steps a workflow is
 /// inside neither.
 ///
 /// **Inside a step called from another step, this describes the enclosing step** — its id, its
-/// attempt, its cap — for the reason [`step_id`](crate::step_id) gives: the nested call is part of
-/// that step and has no attempt of its own. Worth knowing before a shared helper branches on it,
-/// since "the last attempt" it reads is its caller's, and can be the last attempt of a step the
-/// helper itself has never failed.
+/// attempt, its cap — for the reason [`step_id`] gives: the nested call is part of that step and
+/// has no attempt of its own. Worth knowing before a shared helper branches on it, since "the last
+/// attempt" it reads is its caller's, and can be the last attempt of a step the helper itself has
+/// never failed.
 ///
 /// ```no_run
 /// # #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
@@ -514,16 +500,15 @@ pub fn step_status() -> Option<StepStatus> {
 /// and on any other path that abandons an attempt. What this hands back is a clone to watch.
 ///
 /// **A clone is not a read-only handle, and cancelling one reaches no further than the body's own
-/// watchers.** `cancel()` and `drop_guard()` are public on
-/// [`CancellationToken`](tokio_util::sync::CancellationToken), so a body *can* fire the token it
-/// was handed, and every other clone of it — including ones the body passed to its own detached
-/// work — will see cancelled. Nothing else changes: the engine never waits on this token, it only
-/// fires it, so a body cannot end its own attempt, fail its step or cancel its workflow this way.
-/// A step ends by returning, and a workflow is cancelled through
-/// [`DBOS::cancel`](crate::DBOS::cancel). Firing it yourself only tells your own
-/// watchers that an attempt was abandoned when it was not, which is a lie worth not telling; the
-/// type stays `CancellationToken` rather than a wrapper because hiding `cancel()` would mean
-/// reimplementing the half of it a body actually waits on.
+/// watchers.** `cancel()` and `drop_guard()` are public on [`CancellationToken`], so a body *can*
+/// fire the token it was handed, and every other clone of it — including ones the body passed to
+/// its own detached work — will see cancelled. Nothing else changes: the engine never waits on this
+/// token, it only fires it, so a body cannot end its own attempt, fail its step or cancel its
+/// workflow this way. A step ends by returning, and a workflow is cancelled through
+/// [`DBOS::cancel`](crate::DBOS::cancel). Firing it yourself only tells your own watchers that an
+/// attempt was abandoned when it was not, which is a lie worth not telling; the type stays
+/// `CancellationToken` rather than a wrapper because hiding `cancel()` would mean reimplementing
+/// the half of it a body actually waits on.
 ///
 /// Watch it from work the runtime cannot stop by dropping the step's future — a
 /// [`spawn_blocking`](tokio::task::spawn_blocking) thread, or a client holding its own cancel
@@ -612,8 +597,8 @@ mod tests {
     #[test]
     fn step_ids_are_never_reused_across_threads() {
         // Two `Ctx` clones share one counter, so ids must be unique even when steps are allocated
-        // from different threads. Sequential *execution* is the v1 contract; a counter that could
-        // hand out a duplicate would be a replay bug rather than a policy question.
+        // from different threads. Steps may run concurrently, so a counter that could hand out a
+        // duplicate would be a replay bug rather than a policy question.
         let state = Arc::new(state());
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -718,10 +703,10 @@ mod tests {
 
     /// A sibling that has finished does not answer for a step still inside its own body.
     ///
-    /// One half of what a workflow-wide flag got wrong, and the half that corrupts a step that is
-    /// still *running*: whichever scope ended first cleared the answer for the other, so a body
-    /// still inside itself read as no longer in a step, and the next call it made allocated a step
-    /// id instead of being the plain call a nested one has to be.
+    /// One half of what a workflow-wide flag would get wrong, and the half that corrupts a step
+    /// that is still *running*: whichever scope ended first would clear the answer for the other,
+    /// so a body still inside itself would read as no longer in a step, and the next call it made
+    /// would allocate a step id instead of being the plain call a nested one has to be.
     #[tokio::test]
     async fn a_sibling_that_finishes_does_not_end_this_step() {
         let (ctx, dbos, _db) = ctx("wf-siblings", None).await;
@@ -758,10 +743,10 @@ mod tests {
 
     /// A step in flight does not make the workflow body around it look nested.
     ///
-    /// The other half of the same bug: with the answer shared, anything the workflow proper did
-    /// while a step was running took the plain path meant for a nested call, and so was never
+    /// The other half of the same hazard: with the answer shared, anything the workflow proper did
+    /// while a step was running would take the plain path meant for a nested call, and so never be
     /// checkpointed at all. `a_step_built_while_a_sibling_runs_is_still_checkpointed` in
-    /// [`step`](crate::step) is what that costs a caller.
+    /// [`step`](crate::step()) is what that would cost a caller.
     #[tokio::test]
     async fn a_running_step_does_not_make_the_workflow_proper_look_nested() {
         let (ctx, dbos, _db) = ctx("wf-proper", None).await;

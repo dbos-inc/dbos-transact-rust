@@ -18,7 +18,7 @@ use dbos_test_support::{TestDatabase, test_database};
 ///
 /// DBOS computes none, so a launch without one fails, and it has to be stable across a relaunch of
 /// the same application or the relaunch would recover nothing. It cannot simply be a shared
-/// constant, though: `application_versions` still carries a global `UNIQUE (version_name)`, so two
+/// constant, though: `application_versions` carries a global `UNIQUE (version_name)`, so two
 /// differently-named applications sharing one database cannot both register `1.0.0` — see the
 /// UPSTREAM notes on `resolve_owning_application`, and
 /// `lifecycle::a_launch_that_fails_after_connecting_closes_the_database`, which contests a version
@@ -120,9 +120,9 @@ async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
 ///
 /// **A start creates a durable object part-way through its own future, and dropping a future does
 /// not undo a committed row.** Anything that abandons a branch — a `select!`, a `timeout` — can
-/// therefore drop a start after it has written, which before left a child that existed with
-/// nothing in its parent pointing at it and nothing running it. The writing half runs in a task of
-/// its own, so the drop takes the handle and leaves the work.
+/// therefore drop a start after it has written. The writing half runs in a task of its own, so the
+/// drop takes the handle and leaves the work, rather than leaving a child with nothing in its
+/// parent pointing at it and nothing running it.
 ///
 /// **Polled exactly once and then dropped**, which is what makes this a test rather than a race:
 /// one poll is enough to reach the spawn and no further, since everything after it is behind an
@@ -257,7 +257,7 @@ async fn a_start_dropped_after_it_begins_still_starts_the_child() {
 /// names no row, because the insert lost the key and nothing was written under it. What the parent
 /// records at that step is the *holder's* id, so a replay of this position resolves to the same
 /// workflow instead of trying to start a child that never existed. Go records the same mapping at
-/// the same reserved step id, for the reason it states at `workflow.go:1465`.
+/// the same reserved step id, for the reason it states at `workflow.go`.
 #[tokio::test]
 async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
     let db = test_database().await;
@@ -557,9 +557,9 @@ async fn a_recovered_parent_adopts_the_children_it_already_started() {
 /// the wrong slots. It costs nothing in wall-clock: three children that each sleep are all in
 /// flight together, so the parent takes about as long as the slowest rather than the sum.
 ///
-/// A `join!` over the child starts — or over the awaits, or over whole `run`s — is sound now
-/// that a start takes its id where it is *built*, the same as a step: `join!` builds every branch
-/// before polling any, which is exactly the order the ids were claimed in. The loop stays here
+/// A `join!` over the child starts — or over the awaits, or over whole `run`s — is sound, because
+/// a start takes its id where it is *built*, the same as a step: `join!` builds every branch
+/// before polling any, which is exactly the order the ids were claimed in. The loop is here
 /// because it is the plainest way to write a fan-out, not because it is the only sound one; the
 /// tests below drive the concurrent forms out of build order on purpose.
 #[tokio::test]
@@ -1461,9 +1461,9 @@ async fn a_child_can_decline_the_inherited_deadline() {
 /// inherited its deadline are cancelled at the same instant, independently.
 ///
 /// Nothing signals the child. It holds the same instant, its own `select!` fires on it, and it
-/// writes its own `CANCELLED`. That is why this slice adds no cancellation cascade: for deadlines
-/// there is nothing left for one to do. (An explicit `cancel` with children is a different
-/// question, and belongs with the management surface.)
+/// writes its own `CANCELLED`. That is why deadlines need no cancellation cascade: there is
+/// nothing left for one to do. (An explicit `cancel` with children is a different question, and
+/// belongs to the management surface.)
 #[tokio::test]
 async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
     let db = test_database().await;
@@ -1632,8 +1632,7 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
 /// The second place [`Error::WrongInstance`] is reachable from, and the reason it exists: the step
 /// id would come from this workflow's counter while the start record went through the other
 /// instance's system database, landing where the workflow that allocated it cannot see it.
-/// `DBOS::get_event` refuses the same combination for the same reason, and is where the variant
-/// was first raised.
+/// `DBOS::get_event` refuses the same combination for the same reason.
 #[tokio::test]
 async fn a_child_started_through_another_instance_is_refused() {
     let db = test_database().await;

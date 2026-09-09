@@ -200,7 +200,7 @@ async fn checkout_endpoint(
 ///
 /// The checkout is not running when this arrives — it is parked at its `recv` with nothing of it in
 /// memory — and it is the row this writes that wakes it. Which is why the same call would work from
-/// another process, or from one of the widget stores written in another language.
+/// another process.
 async fn payment_endpoint(
     State(app): State<App>,
     Path((payment_id, payment_status)): Path<(String, String)>,

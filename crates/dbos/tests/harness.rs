@@ -1,8 +1,8 @@
 //! Tests for the test harness itself.
 //!
-//! There is no library code to exercise yet, so what these assert is that the thing
-//! everything later depends on actually works: a real database on both v1 backends,
-//! containers shared rather than multiplied, and nothing left running afterwards.
+//! What these assert is that the thing every other test depends on actually works: a real
+//! database on both backends, containers shared rather than multiplied, and nothing left running
+//! afterwards.
 
 use std::sync::Arc;
 
@@ -11,8 +11,8 @@ use dbos_test_support::{Backend, SharedSlot, raw_database, test_database};
 
 /// The harness reaches a real server and can run SQL on a fresh database.
 ///
-/// Deliberately the raw lane: "no tables" is only true before migrations exist, so asserting
-/// it against the pooled lane would start failing the moment that lane means what it says.
+/// Deliberately the raw lane: a pooled database arrives migrated, so "no tables" is only true
+/// here.
 #[tokio::test]
 async fn connects_to_a_fresh_database() {
     let db = raw_database().await;
@@ -113,8 +113,8 @@ async fn recorded_version(pool: &sqlx::PgPool) -> i64 {
 /// introducing an object the dump does not emit — all look like passing tests running against
 /// the wrong schema rather than like failures.
 ///
-/// It costs one full corpus run on top of the one the pool already makes. That is the price of
-/// the other several this file's binary no longer pays.
+/// It costs one full corpus run on top of the one the pool already makes, which is the price of
+/// the several the baseline spares every other test in this binary.
 #[tokio::test]
 async fn a_pooled_database_matches_one_the_migrations_built() {
     let migrated = raw_database().await;
@@ -244,11 +244,10 @@ async fn shared_slot_releases_once_nobody_holds_it() {
 /// `SERIAL` is not the same type on both backends: `INT4` on Postgres, `INT8` on
 /// CockroachDB.
 ///
-/// This divergence was caught by the first CockroachDB CI run before the 2026-08-04 repo
-/// reset, and no amount of reading the migrations would have surfaced it. It is recorded
-/// here as an executable note, and it is why the DBOS schema uses explicit `BIGINT`
-/// rather than `SERIAL`. It also proves the backend switch actually reaches
-/// a different engine, which a `SELECT 1` cannot.
+/// Nothing in the migrations' text surfaces this; only running against CockroachDB does. It is
+/// recorded here as an executable note, and it is why the DBOS schema uses explicit `BIGINT`
+/// rather than `SERIAL`. It also proves the backend switch actually reaches a different engine,
+/// which a `SELECT 1` cannot.
 #[tokio::test]
 async fn serial_width_diverges_between_backends() {
     // Raw lane: this creates a table, and a pooled database must not be handed on dirty.

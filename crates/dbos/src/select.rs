@@ -1,10 +1,10 @@
 //! The durable race over steps: what it records, and the pair the macro's expansion calls.
 //!
 //! A workflow that races two steps has made a **choice**, and a choice a workflow makes has to be
-//! recorded — a replay that raced again could see the other branch finish first and take a path
-//! the first execution never took, which is the one thing a workflow may never do. That is the
-//! whole reason this module exists where a `tokio::join!` over [steps](crate::step) needs nothing:
-//! an all-wait decides nothing, so there is nothing for a replay to get differently.
+//! recorded — a replay that raced again could see the other branch finish first and take a path the
+//! first execution never took, which is the one thing a workflow may never do. That is the whole
+//! reason this module exists where a `tokio::join!` over [steps](crate::step()) needs nothing: an
+//! all-wait decides nothing, so there is nothing for a replay to get differently.
 //!
 //! **A plain `tokio::select!` over steps is the trap this replaces.** Since a step takes its id
 //! when it is built rather than at its first poll, the ids under a `select!` are already
@@ -34,21 +34,20 @@
 //!
 //! # Why this is documented rather than fixed
 //!
-//! Both of the obvious repairs were tried on this branch and neither survives contact with the
-//! three kinds of durable call a branch can be, so the reasoning is kept here rather than
-//! rediscovered:
+//! Neither of the obvious repairs survives contact with the kinds of durable call a branch can
+//! be:
 //!
 //! - *Infer the winner from the branch that recorded.* A row does not mean a branch finished.
-//!   [`sleep`](crate::sleep) checkpoints the instant it will wake at and waits afterwards, so a
+//!   [`sleep`](crate::sleep()) checkpoints the instant it will wake at and waits afterwards, so a
 //!   **losing** sleep leaves a row that is, in the row, indistinguishable from a winner's — and a
-//!   losing sleep is what a timeout race has. Nothing in the row separates them: a durable sleep
-//!   is stamped complete at its wake time, which a later recovery reads as long past, and a
-//!   deadline is stamped complete the moment it is written. Making this sound needs a bit on the
-//!   call itself, saying whether its row would mean it finished, which is a change to every
-//!   durable call's contract in service of one caller.
+//!   losing sleep is what a timeout race has. Nothing in the row separates them: a durable sleep is
+//!   stamped complete at its wake time, which a later recovery reads as long past, and a deadline
+//!   is stamped complete the moment it is written. Making this sound needs a bit on the call
+//!   itself, saying whether its row would mean it finished, which is a change to every durable
+//!   call's contract in service of one caller.
 //! - *Write both rows in one transaction.* There is no single write to join. An application step
 //!   records through `record_step`, a child's result through `record_child_result`, a sleep
-//!   through `checkpoint_sleep` before the wait it is checkpointing, and a child's start inside
+//!   through `record_sleep` before the wait it is checkpointing, and a child's start inside
 //!   the transaction that creates the child. The select would have to reach into all four.
 //!
 //! So the window stands, with its shape written down. If it is closed later, the bit on the call
@@ -72,10 +71,10 @@
 //!
 //! # What may be a branch
 //!
-//! A [`PendingStep`] — a [`step`](crate::step), a
-//! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep), an event, a wait,
-//! a management call. Every one of them **observes**: it claims one id, records one row, and a
-//! replay of it reads that row back rather than doing the thing again.
+//! A [`PendingStep`] — a [`step`](crate::step()), a
+//! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep()), an event, a
+//! wait, a management call. Every one of them **observes**: it claims one id, records one row, and
+//! a replay of it reads that row back rather than doing the thing again.
 //!
 //! A child's [`start`](crate::WorkflowRef::start) or [`run`](crate::WorkflowRef::run) — a
 //! [`PendingStart`](crate::PendingStart) and a [`PendingWorkflow`](crate::PendingWorkflow) — is
@@ -300,12 +299,11 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
 /// Takes a control signal out of the winning branch's slot, if that is what it holds.
 ///
 /// **A control signal is not the race's decision.** A step that ends in a cancellation, an
-/// interruption or a database failure records nothing — [`step`](crate::step) hands it back with
+/// interruption or a database failure records nothing — [`step`](crate::step()) hands it back with
 /// the row untouched, so the workflow stays pending and is recovered — and the race it won has to
-/// do the same. Recording that branch as the winner would pin every recovery to a branch that
-/// never ran its body and never race the others again; and a control signal tends to arrive
-/// *fast*, one failed round trip ahead of any branch doing real work, so it would win exactly when
-/// it matters.
+/// do the same. Recording that branch as the winner would pin every recovery to a branch that never
+/// ran its body and never race the others again; and a control signal tends to arrive *fast*, one
+/// failed round trip ahead of any branch doing real work, so it would win exactly when it matters.
 ///
 /// An application error is different and is left where it is: the branch recorded it under its own
 /// id, so recording it as the winner is a faithful account and a replay reproduces it.
@@ -320,12 +318,11 @@ pub fn control_error<T, E>(slot: &mut Option<Result<T, E>>) -> Option<Error<E>> 
 
 /// What a durable race is, and what writing one looks like.
 ///
-/// The split is worth stating once: everything above is the contract — the id this call claims,
-/// the position it records, the refusal a changed shape earns — and everything here drives it
-/// through [`select_step!`](crate::select_step), because there is nothing else to drive it with. A
-/// `Vec`-taking form existed on the reference branch purely as a test seam and was deleted when
-/// the macro landed; a race's branches disagree about what they return, which is the whole point,
-/// and a `Vec` cannot hold that.
+/// Everything above is the contract — the id this call claims, the position it records, the
+/// refusal a changed shape earns — and everything here drives it through
+/// [`select_step!`](crate::select_step), because there is nothing else to drive it with: a race's
+/// branches disagree about what they return, which is the whole point, and a `Vec` cannot hold
+/// that.
 ///
 /// **Every losing branch parks on [`std::future::pending`], never on a sleep.** Winning a race
 /// costs the winner a `check_step` and a `record_step` — two database round trips — and on a
@@ -345,8 +342,8 @@ mod tests {
     /// A launched instance and a workflow row for the race to record against.
     ///
     /// No `run` here on purpose: entering the same workflow id under two fresh contexts is
-    /// precisely what a replay is, and it is the only way to test one before recovery does it for
-    /// real.
+    /// precisely what a replay is, and it is the cheapest way to produce one without going through
+    /// recovery.
     async fn workflow(id: &str) -> (DBOS, dbos_test_support::TestDatabase) {
         let db = dbos_test_support::test_database().await;
         let dbos = DBOS::new(Config {
@@ -604,7 +601,7 @@ mod tests {
     /// **A losing sleep leaves a row**, which is the fact behind the module documentation's
     /// refusal to read branch rows as the race's answer.
     ///
-    /// `checkpoint_sleep` writes when the sleep is first polled and the wait comes after it, so
+    /// `record_sleep` writes when the sleep is first polled and the wait comes after it, so
     /// what this asserts is a row for a wait that was abandoned — beside the winner's, and
     /// indistinguishable from one.
     #[tokio::test]

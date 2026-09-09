@@ -19,9 +19,9 @@
 //! calls it with no executor in sight.
 //!
 //! The type system then makes the boundary concrete twice over. Nothing on this type can fail with
-//! [`Error::NotLaunched`](crate::Error::NotLaunched), because **a client is always connected** —
-//! [`connect`](Client::connect) hands back a usable client or an error, with no second state to
-//! check afterwards. And nothing on it can run a workflow, because it holds nothing that could.
+//! [`Error::NotLaunched`], because **a client is always connected** — [`connect`](Client::connect)
+//! hands back a usable client or an error, with no second state to check afterwards. And nothing on
+//! it can run a workflow, because it holds nothing that could.
 //!
 //! # What a client is not
 //!
@@ -50,13 +50,11 @@
 //! **It has no application version of its own**, so it stamps none unless an enqueue names one.
 //! A client's binary is not the application's.
 //!
-//! # What is not here yet
-//!
-//! The workflow-management surface — cancelling, resuming, forking, deleting, listing — is
-//! arriving separately and lands on both surfaces at once. Schedules, durable streams and the
-//! debouncer are each their own feature and reach the client when they reach the crate. What this
-//! module has is the part that is a client's alone: connecting without an executor, and enqueueing
-//! a workflow by name.
+//! What this module holds is the part that is a client's alone: connecting without an executor,
+//! and enqueueing a workflow by name. The surfaces a client shares with an application live with
+//! their types — the queue operations in [`queue`](crate::queue), messages in
+//! [`message`](crate::message), events in [`event`](crate::event), and workflow management in
+//! [`management`](crate::management).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -115,7 +113,7 @@ pub struct ClientConfig {
     /// Set it whenever several applications share a system database. Leave it unset for a tool
     /// whose job is to look at all of them.
     ///
-    /// Held to the same rule a launched application's name is: three to thirty characters of
+    /// Held to the same rule a launched application's name is: three to 256 characters of
     /// lowercase letters, digits, dashes and underscores.
     pub app_name: Option<String>,
 
@@ -463,11 +461,11 @@ impl Client {
     ///
     /// **Java's client is the other unchecked one**, and its javadoc sends users to that same pair:
     /// *"This call does not ensure that the workflow exists; use the returned handle's
-    /// `getStatus()`"* (`DBOSClient.java:1157`). Python's and Go's spend a round trip instead and
-    /// refuse an id that names nothing (`_client.py:570`, `workflow.go:4433`) — which is what a
-    /// caller who wants it writes here as [`workflow_status`](Self::workflow_status) before taking
-    /// the handle — or bounds the wait instead, since dropping the future ends it and
-    /// `tokio::time::timeout` is the whole of what Go's `WithHandleTimeout` exists to provide.
+    /// `getStatus()`"* (`DBOSClient.java`). Python's and Go's spend a round trip instead and refuse
+    /// an id that names nothing (`_client.py`, `workflow.go`) — which is what a caller who wants it
+    /// writes here as [`workflow_status`](Self::workflow_status) before taking the handle — or
+    /// bounds the wait instead, since dropping the future ends it and `tokio::time::timeout` is the
+    /// whole of what Go's `WithHandleTimeout` exists to provide.
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> WorkflowHandle<R, E> {
         WorkflowHandle::polling(Arc::clone(&self.0), workflow_id.to_owned(), false)
     }
@@ -494,21 +492,19 @@ impl Client {
     /// reason a client has it is that a queue is a row: a fleet may be configured by the tool that
     /// deploys it rather than by the code that drains it.
     ///
-    /// The limits and the policy are the same [`QueueOptions`](crate::QueueOptions) and
-    /// [`QueueConflict`](crate::QueueConflict) an application states — but
-    /// [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
+    /// The limits and the policy are the same [`QueueOptions`] and [`QueueConflict`] an application
+    /// states — but [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
     /// [`Error::Config`] here rather than a registration: a client runs none of the application's
     /// code, so there is no version of it to be the latest of. Ask for
     /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate), which is what Python's and
-    /// TypeScript's clients default to, or
-    /// [`NeverUpdate`](crate::QueueConflict::NeverUpdate). They refuse the same combination
-    /// (`_client.py:455`, `client.ts:561`).
+    /// TypeScript's clients default to, or [`NeverUpdate`](crate::QueueConflict::NeverUpdate). They
+    /// refuse the same combination (`_client.py`, `client.ts`).
     ///
     /// **A client with no application name of its own registers over a peer's queue rather than
     /// being refused**, replacing its stored limits — the ownership check every implementation
     /// shares lets a nameless writer through. Give the client an
     /// [`app_name`](ClientConfig::app_name) to get the refusal
-    /// [`QueueConflict`](crate::QueueConflict) describes. UPSTREAM item 26.
+    /// [`QueueConflict`] describes. UPSTREAM item 26.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {

@@ -280,7 +280,7 @@ async fn join_workflows_returns_when_the_last_one_settles() {
         .expect("the waiting task panicked")
         .expect("join_workflows failed");
 
-    // What the wait bought: every handle now has its answer in hand.
+    // Every handle has its answer in hand, without waiting.
     for (which, handle) in handles.into_iter().enumerate() {
         assert_eq!(
             handle.result().await.expect("the workflow failed"),
@@ -317,10 +317,10 @@ async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
 
 /// **A wait takes its step id where it is built, not where it is first polled.**
 ///
-/// [`events.rs`'s counterpart](../events.rs) makes the argument for the shape: `join!` builds every
-/// branch before polling any and then first-polls them in source order, so a test that builds and
-/// drives in the same order passes against poll-time ids too. These three are built `a, b, c` and
-/// handed to `join!` as `c, b, a`.
+/// The counterpart in `events.rs` makes the argument for the shape: `join!` builds every branch
+/// before polling any and then first-polls them in source order, so a test that builds and drives
+/// in the same order passes against poll-time ids too. These three are built `a, b, c` and handed
+/// to `join!` as `c, b, a`.
 ///
 /// **Only two of the three have an id to keep.** `join_workflows` is a plain wait that takes none,
 /// which is why it can sit anywhere in a `join!` without moving what the others got — the

@@ -41,16 +41,14 @@
 //!
 //! **They return handles; these return ids.** `DBOS.waitFirst` hands back the handle that won,
 //! which in a language without ownership costs nothing: the caller still holds the others. Handing
-//! back an owned [`WorkflowHandle`] here would mean taking the whole set by value and dropping
-//! every loser, which is precisely the wrong thing for the loop the call exists for. So the answer
-//! is the winner's **id** — the identity the handle carried anyway, and the same thing the
-//! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
+//! back an owned [`WorkflowHandle`](crate::WorkflowHandle) here would mean taking the whole set by
+//! value and dropping every loser, which is precisely the wrong thing for the loop the call exists
+//! for. So the answer is the winner's **id** — the identity the handle carried anyway, and the same
+//! thing the checkpoint stores, so nothing is projected on the way out and re-derived on replay.
 //!
-//! A position in the slice was the other candidate and is worse on every count that matters: it is
-//! the only positional return anywhere in this crate (`cancel_all` and its neighbours take ids and
-//! give back ids), it is meaningful only against the exact slice it came from and so can be
-//! misapplied to a drifted one with no error, and it is what would force a set with no repeats.
-//! The one thing it buys is skipping a
+//! A position in the slice would be the only positional return in this crate (`cancel_all` and
+//! its neighbours take ids and give back ids), is meaningful only against the exact slice it came
+//! from, and would force a set with no repeats — all to skip a
 //! [`position`](std::iter::Iterator::position) lookup in the drain loop above.
 //!
 //! `join_workflows` returns nothing for the same reason its references return their inputs
@@ -76,13 +74,12 @@
 //! take, and a function and its macro that do the same thing under two different names is a seam to
 //! learn for nothing.
 //!
-//! **The recorded step name follows the call**, which is the one place in
-//! [`step_names`](crate::sysdb::types::step_names) that a reference's string is not taken:
-//! `DBOS.selectWorkflow` where Python and TypeScript write `DBOS.waitFirst`. A step listing should
-//! name the call the caller wrote, and nothing across the SDKs reads another's step names to
-//! decide anything — a replay checks its own workflow's rows. The cost is that one operation has
-//! two names when steps are read across implementations, and the constant says so. The all-wait
-//! records no step at all, so it needs no name.
+//! **The recorded step name follows the call**, which is the one place in [`step_names`] that a
+//! reference's string is not taken: `DBOS.selectWorkflow` where Python and TypeScript write
+//! `DBOS.waitFirst`. A step listing should name the call the caller wrote, and nothing across the
+//! SDKs reads another's step names to decide anything — a replay checks its own workflow's rows.
+//! The cost is that one operation has two names when steps are read across implementations, and the
+//! constant says so. The all-wait records no step at all, so it needs no name.
 //!
 //! # Called from inside a workflow
 //!
@@ -122,7 +119,7 @@
 //! whether the recorded winner is still in the set, because the winner is what it recorded anyway.
 //! Step *inputs* are not checkpointed anywhere in DBOS — no implementation's step row has a column
 //! for them — so a replay whose arguments changed reads back the answer to the question it asked
-//! the first time, exactly as a [`sleep`](crate::sleep) whose duration changed keeps the deadline
+//! the first time, exactly as a [`sleep`](crate::sleep()) whose duration changed keeps the deadline
 //! it recorded.
 //!
 //! Outside a workflow the first-wait is not checkpointed either, which is the operator's and the
@@ -197,14 +194,14 @@ use crate::sysdb::types::{Outcome, Timestamp, step_names};
 /// That is what keeps the registry free of strong references back to the instance holding it, and
 /// it is why [`get_event`](crate::get_event) is a free function too.
 ///
-/// The wait is checkpointed as a step, so a replay returns the same winner instead of racing
-/// again. **Its step id is taken here, at the call, not at the first poll** — see
-/// [`PendingStep`] — so a wait built beside a step and driven with it by `tokio::join!` takes the
-/// same slot on every execution, whatever it was passed: an empty set is placed like any other and
-/// its refusal recorded as the step's own outcome, so a replay refuses again. The error is
-/// the *workflow's* channel, like [`step`](crate::step)'s, so `?` needs no conversion. From inside
-/// a *step* it waits plainly with no checkpoint, the step's own checkpoint standing for everything
-/// its body did.
+/// The wait is checkpointed as a step, so a replay returns the same winner instead of racing again.
+/// **Its step id is taken here, at the call, not at the first poll** — see [`PendingStep`] — so a
+/// wait built beside a step and driven with it by `tokio::join!` takes the same slot on every
+/// execution, whatever it was passed: an empty set is placed like any other and its refusal
+/// recorded as the step's own outcome, so a replay refuses again. The error is the *workflow's*
+/// channel, like [`step`](crate::step())'s, so `?` needs no conversion. From inside a *step* it
+/// waits plainly with no checkpoint, the step's own checkpoint standing for everything its body
+/// did.
 ///
 /// ```no_run
 /// # async fn fan_out(child: dbos::WorkflowRef<u32, u32>) -> dbos::Result<u32> {
@@ -251,9 +248,9 @@ pub fn select_workflow<'a, E: crate::DurableError + 'a>(
 /// is [`Error::NotInWorkflow`], and [`DBOS::join_workflows`] is the call.
 ///
 /// **An empty set is a satisfied wait**, answered at once, where an empty
-/// [`select_workflow`](fn@select_workflow) is refused. That difference cost something when this
-/// took a step id — a set computed from state could be empty on one execution and not the next,
-/// shifting every later step — and costs nothing now that it takes none.
+/// [`select_workflow`](fn@select_workflow) is refused. Answering early is safe only because this
+/// takes no step id: a set computed from state could be empty on one execution and not the next,
+/// and a call that took an id in one and none in the other would shift every later step.
 ///
 /// **A replay asks the set again, rather than returning from anything it recorded.** That is the
 /// point of taking no step id, and it is what makes the members' *current* state the answer. The
@@ -363,8 +360,8 @@ pub async fn join_workflows<E: crate::DurableError>(workflow_ids: &[&str]) -> cr
 /// written. [`select_workflow`](fn@select_workflow) accepts a repeated id for the same reason: the
 /// answer names one workflow however many entries pointed at it.
 ///
-/// The value is a [`Result`](crate::Result), because the wait itself can fail. Each arm binds its
-/// own handle's result, so an arm decides for itself whether to `?` it, match it, or report it.
+/// The value is a [`Result`], because the wait itself can fail. Each arm binds its own handle's
+/// result, so an arm decides for itself whether to `?` it, match it, or report it.
 #[macro_export]
 macro_rules! select_workflow {
     // The two public forms differ only in which wait they reach for, so both hand the same arms to
@@ -759,12 +756,12 @@ impl Connection {
             //
             // **Both references make it too, without writing it down**, because returning a
             // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
-            // `KeyError` on exactly this (`_dbos.py:1636`), and TypeScript's
+            // `KeyError` on exactly this (`_dbos.py`), and TypeScript's
             // `handleMap.get(completedId)!` is an assertion that is false on it, so the caller is
-            // handed `undefined` as a handle and learns about it somewhere else. Answering with
-            // the id means nothing here dereferences it against the set, so the check that comes
-            // free there has to be spelled — which is the whole cost of it. It reads no extra
-            // state: the winner is the payload this call records anyway.
+            // handed `undefined` as a handle and learns about it somewhere else. Answering with the
+            // id means nothing here dereferences it against the set, so the check that comes free
+            // there has to be spelled — which is the whole cost of it. It reads no extra state: the
+            // winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order

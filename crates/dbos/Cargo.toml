@@ -17,27 +17,21 @@ readme = "../../README.md"
 [features]
 default = ["engine", "macros"]
 # Gates the durable execution engine: the lifecycle, registry, contexts, workflows, steps,
-# events, recovery, queues and the client so far, with the scheduler and messaging to come.
-# With it off, what remains is the system database and Conductor layers — the surface a future
-# FFI host would consume. `cargo check --no-default-features` is a standing CI gate, so the
-# boundary is checked continuously rather than rediscovered once it has already blurred.
+# events, messaging, recovery, queues and the client. With it off, what remains is the system
+# database layer — the surface a future FFI host would consume. `cargo check
+# --no-default-features` is a standing CI gate, so the boundary is checked continuously.
 #
-# `tokio/rt` is enabled from here rather than from the dependency itself, which is what keeps
-# the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`, `spawn` — is the
-# engine's, and a core-only build has no business pulling one in.
-# `macros` joins `rt` for the same reason: the step supervisor races a body against its timeout
-# with `tokio::select!`, and that is engine code. Without it here the lib only compiled because
-# dev-dependencies happened to turn the feature on for the test build — which `cargo doc` and
-# `--no-default-features` both see through.
+# `tokio/rt` and `tokio/macros` are enabled from here rather than from the dependency itself,
+# which is what keeps the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`,
+# `spawn` — and the `tokio::select!` the step supervisor races a body against its timeout with
+# are the engine's, and a core-only build has no business pulling them in.
 engine = ["tokio/rt", "tokio/macros"]
 # Re-exports `select_step!` from `dbos-macros`. Implies `engine`, because the expansion is engine
 # code — it names the race's checkpoint through `dbos::__private`.
 #
-# **Default-on**, which is a decision about what a durable race is: not an advanced corner of the
-# API but the only sound way to race inside a workflow body, and a macro nobody enabled is a trap
-# rather than a feature — the mistake it exists to prevent is the one a caller reaches for when it
-# is missing. What it costs is `syn` and `quote` at build time, in a crate the compiler loads and
-# links into nothing, and a build that would rather not pay it can turn the feature off.
+# **Default-on**, because the durable race is the only sound way to race inside a workflow body,
+# and a macro nobody enabled is exactly the trap it exists to prevent. What it costs is `syn` and
+# `quote` at build time; a build that would rather not pay that can turn the feature off.
 macros = ["engine", "dep:dbos-macros"]
 
 [dependencies]
@@ -59,18 +53,17 @@ async-trait = "0.1"
 # `CancellationToken` alone: the step supervisor needs a signal a body can observe from work the
 # runtime cannot interrupt by dropping a future — a `spawn_blocking` thread, or a client holding
 # its own cancel handle. Already in the tree as a transitive dependency of `sqlx`, so this adds a
-# name to the manifest and no crate to the build. PLAN.md §4.5 already reaches for the same crate's
-# `TaskTracker` at shutdown.
+# name to the manifest and no crate to the build.
 tokio-util = { version = "0.7", default-features = false }
 # Owner identities for the single-execution guard, and workflow ids.
 uuid = { version = "1", features = ["v4"] }
 # Columns whose shape this layer owns rather than passes through: `authenticated_roles` is always
 # a JSON array of strings, unlike `input`/`output`/`error`, which are opaque caller-encoded
-# payloads. PLAN.md §4.6 already commits to this crate for `rust_serde`.
+# payloads.
 serde_json = "1"
 # Derives only, for the payloads this layer puts in a step's `output` column. Nothing here is a
 # wire format — a step is replayed by the SDK that wrote it — so the derived shape is ours to
-# choose, and choosing it by hand for each type was the alternative.
+# choose.
 serde = { version = "1", features = ["derive"] }
 # `time` for backoff between retries; `sync` for the semaphore capping concurrent polling reads.
 # `rt` arrives with the `engine` feature rather than here.
@@ -80,10 +73,8 @@ tokio = { version = "1", features = ["time", "sync"] }
 # `#[from]`/`#[error(transparent)]` idiom on both sides of the boundary.
 thiserror = "2"
 # `workflow_schedules.last_fired_at` is ISO-8601 text rather than the epoch milliseconds every
-# other time column holds, so one column needs a calendar. `std` has none — `SystemTime` and
-# `Duration` and nothing else — and the alternative was hand-written civil-date arithmetic to
-# honour a rule written before any column needed one. Parsing and formatting only: no timezone
-# database, since the column is always UTC.
+# other time column holds, so one column needs a calendar, and `std` has none. Parsing and
+# formatting only: no timezone database, since the column is always UTC.
 time = { version = "0.3", default-features = false, features = [
     "parsing",
     "formatting",

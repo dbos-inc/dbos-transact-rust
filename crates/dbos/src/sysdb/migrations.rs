@@ -27,7 +27,7 @@ pub mod runner;
 ///
 /// Read from the file rather than from a list beside it. A migration is online exactly when it
 /// carries a `{{concurrently}}` placeholder — see [`Placeholders`] — so a list would be a second
-/// copy of a fact the file already states, and the two could disagree. They cannot now.
+/// copy of a fact the file already states, and the two could disagree.
 ///
 /// Never true on CockroachDB, which applies schema changes online regardless and does not take
 /// the keyword; the placeholder renders empty there.
@@ -391,8 +391,7 @@ pub fn source(name: &str) -> Option<&'static MigrationSource> {
 /// under 100 is a claim about schema state, so a database left half-migrated by one
 /// implementation is picked up correctly by another only if their version *n* describes the same
 /// schema. Our 45, 46 and 47 are Python's `fortyfive`, `fortysix` and `fortyseven` down to the
-/// index names. PLAN.md §4.14 records the decision: keep the Go/Python/Java numbering below 100,
-/// then jump to 100.
+/// index names. The rule: keep the Go/Python/Java numbering below 100, then jump to 100.
 ///
 /// What the shared base changes is only what happens *above* it — see
 /// [`SHARED_MIGRATION_BASE`]. It does not make the numbers below it free.
@@ -475,11 +474,11 @@ pub struct Migration {
 /// A migration that does not apply renders empty rather than being dropped: versions are
 /// positional, so removing one would renumber everything after it.
 ///
-/// TODO(dbos-team): UPSTREAM item 15. `use_listen_notify` decides both how *this process* waits
-/// and whether the *database* gets its NOTIFY triggers — and the second is permanent and shared.
-/// A database migrated with it off has no triggers, so a Go peer, which has no such config and
-/// always LISTENs on Postgres (`dialect.go:207`), waits out every `recv` timeout in silence. Rust
-/// gates here because Python and Java do; whether any of them should is the question.
+/// TODO(dbos-team): UPSTREAM item 15. `use_listen_notify` decides both how *this process* waits and
+/// whether the *database* gets its NOTIFY triggers — and the second is permanent and shared. A
+/// database migrated with it off has no triggers, so a Go peer, which has no such config and always
+/// LISTENs on Postgres (`dialect.go`), waits out every `recv` timeout in silence. Rust gates here
+/// because Python and Java do; whether any of them should is the question.
 pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool) -> Vec<Migration> {
     let quoted = quote_identifier(schema);
     // CockroachDB has no LISTEN/NOTIFY, so asking for it there is asking for nothing.
@@ -532,9 +531,9 @@ mod tests {
 
     /// Each version is assembled from the files that apply to it, and no others.
     ///
-    /// The cases that used to be `match` arms in the assembler, now declared on the files
-    /// themselves. Asserted against the built output rather than against `Applies`, so the rules
-    /// are pinned by what they produce rather than by how they are spelled.
+    /// Which files apply is declared on the files themselves rather than in the assembler.
+    /// Asserted against the built output rather than against `Applies`, so the rules are pinned by
+    /// what they produce rather than by how they are spelled.
     #[test]
     fn a_version_is_the_files_that_apply_to_it() {
         let built = |dialect, notify| {
@@ -853,11 +852,12 @@ mod tests {
 
     /// No migration compares against a bare, unquoted schema name.
     ///
-    /// Migration 10's PostgreSQL file used to: its `DO` block matched `n.nspname = '%s'`, a
-    /// string comparison needing the unquoted name, while the `ALTER` beside it needed the
-    /// quoted identifier. Rendering the quoted form into both produced valid-looking SQL
-    /// whose guard silently never matched — making the one migration whose entire purpose is
-    /// idempotence run unconditionally. That file has been replaced by a runner check.
+    /// The hazard is a file that needs both forms: a `DO` block matching `n.nspname = '%s'` — a
+    /// string comparison wanting the unquoted name — beside an `ALTER` wanting the quoted
+    /// identifier. Rendering the quoted form into both produces valid-looking SQL whose guard
+    /// silently never matches, so a migration whose whole purpose is idempotence runs
+    /// unconditionally. Migration 10's guard is a probe the runner executes with the schema bound
+    /// as `$1` (`MIGRATION_10_PK_PROBE`) for exactly that reason.
     ///
     /// Asserted so a migration that reintroduces a bare-name comparison is caught here
     /// rather than at runtime.
@@ -956,7 +956,6 @@ mod tests {
     /// the runner will have to honour it.
     #[test]
     fn dollar_quoted_files_contain_semicolons_inside_their_blocks() {
-        // Migration 10's `DO` block used to be a fifth; it was replaced by a runner check.
         let expected = [
             "1_initial_dbos_schema_listen_notify.sql",
             "14_add_pgsql_client_functions.sql",

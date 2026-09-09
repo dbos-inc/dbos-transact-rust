@@ -193,10 +193,10 @@ async fn a_recovered_workflow_keeps_the_deadline_it_already_had() {
 
 /// Shutdown must not durably cancel: the row stays PENDING so a later executor recovers it.
 ///
-/// This is go #426's bug, which cost Go a fix: its shutdown cancelled a context, the context fired
-/// the durable cancel hook, and workflows that should have waited for recovery were written
-/// CANCELLED instead. Here shutdown aborts the task and the deadline is a `select!` branch, so
-/// there is no shared hook to misfire — this test is what keeps it that way.
+/// The failure mode is Go's #426: a shutdown that cancels a context, a context that fires the
+/// durable cancel hook, and workflows that should wait for recovery written CANCELLED instead. Here
+/// shutdown aborts the task and the deadline is a `select!` branch, so there is no shared hook to
+/// misfire — this test is what keeps it that way.
 #[tokio::test]
 async fn shutdown_does_not_durably_cancel_a_workflow_that_has_a_deadline() {
     let db = test_database().await;

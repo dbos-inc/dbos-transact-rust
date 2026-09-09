@@ -31,8 +31,7 @@ tokio = { version = "1", features = [
 serde = { version = "1", features = ["derive"] }
 # The application's own tables. Same driver the SDK uses, and deliberately a *separate* pool: the
 # products and orders tables are the application's, not DBOS's, and nothing here is transactional
-# with the system database — a step's checkpoint and the row it wrote are two commits. Rust has no
-# transactional step yet; when it lands, the four write steps below are what it replaces.
+# with the system database — see `src/store.rs` for what that costs.
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

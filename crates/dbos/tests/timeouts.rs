@@ -363,9 +363,9 @@ async fn the_cancellation_token_fires_before_the_body_is_dropped() {
 /// dropping the future — a blocking thread, a task the body spawned — learns that its step is over.
 ///
 /// The timeout and preemption paths cancel the token themselves, but a step can be abandoned in
-/// other ways: a caller dropping it, or a combinator dropping it as a losing branch. Those left the
-/// token silent, and a step with neither watchdog had no token to fire at all. Here the step is
-/// raced against a signal it sends itself, so it is dropped while parked inside its own body.
+/// other ways: a caller dropping it, or a combinator dropping it as a losing branch. Those must
+/// fire it too, even for a step with neither watchdog. Here the step is raced against a signal it
+/// sends itself, so it is dropped while parked inside its own body.
 #[tokio::test]
 async fn a_dropped_step_fires_its_cancellation_token() {
     let db = test_database().await;
