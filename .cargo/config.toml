@@ -1,0 +1,5 @@
+# `cargo xtask <level>` cuts a release. See DEVELOPING.md, and `xtask/src/main.rs` for what it
+# runs. The indirection is the standard xtask pattern: repository automation written in Rust,
+# built by the toolchain a contributor already has, so it runs the same on every platform.
+[alias]
+xtask = "run --package xtask --"

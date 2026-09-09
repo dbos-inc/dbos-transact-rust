@@ -145,7 +145,7 @@ and the tooling moves both together.
 than claiming to be a version that shipped, and a stray `cargo publish` from `main` fails the
 exact-version pin instead of quietly shipping a release-numbered build.
 
-Released lines live on their own branches. `scripts/release.sh release` creates `release/vX.Y` at
+Released lines live on their own branches. `cargo xtask release` creates `release/vX.Y` at
 the release commit and pushes it, and patches to that line are made there rather than on `main` —
 the same layout the Java and Python SDKs use.
 
@@ -167,22 +167,32 @@ cargo login   # a crates.io token with the publish scope
 From a clean `main`:
 
 ```bash
-scripts/release.sh release --dry-run   # print every step, change nothing
-scripts/release.sh release             # 0.5.0-dev -> 0.5.0, then main -> 0.6.0-dev
+cargo xtask release --dry-run   # print every step, publish nothing
+cargo xtask release             # 0.5.0-dev -> 0.5.0, then main -> 0.6.0-dev
 ```
 
-The script does all of this, in order. There are no manual git steps:
+It does all of this, in order. There are no manual git steps:
 
 1. Bumps the workspace version and the exact-version pin, from `0.5.0-dev` to `0.5.0`.
-2. Commits, and tags the commit `v0.5.0`.
+2. Commits that as `Version 0.5.0`.
 3. Publishes `dbos-macros`, waits for it to appear on the index, then publishes `dbos`.
-4. Pushes `main` and the tag.
-5. **Creates the branch `release/v0.5`** at the release commit and pushes it. Patches to the
+4. Tags the release commit `v0.5.0`.
+5. Pushes `main` and the tag.
+6. **Creates the branch `release/v0.5`** at the release commit and pushes it. Patches to the
    `0.5` line are cut from there, so the branch is made now rather than when it is first needed.
-6. Commits `main` at `0.6.0-dev` and pushes again.
+7. Commits `main` at `0.6.0-dev` and pushes again.
 
-Steps 5 and 6 run only for a final release. An `rc` stops after step 4, and so does a `patch` on
+Steps 6 and 7 run only for a final release. An `rc` stops after step 5, and so does a `patch` on
 a release branch.
+
+Those are cargo-release's per-step subcommands — `version`, `commit`, `publish`, `tag`, `push` —
+rather than the all-in-one `cargo release <level>`, and the reason is step 1. cargo-release
+checks dependency requirements against the manifests as they are **on disk**, never against the
+versions it is planning, so with the bump unapplied it reads `dbos`'s pin as `=0.5.0-dev`, finds
+that nothing it is about to publish satisfies it and that no such version was ever published, and
+aborts with `dbos 0.5.0 depends on unpublished workspace package dbos-macros 0.5.0`. Bumping and
+committing first leaves the pin naming the `dbos-macros` version that is about to go up, which is
+what the check is actually asking about.
 
 The publish order is not optional: `dbos` requires `=<version>` of `dbos-macros` to already be on
 the index, so publishing them the other way round fails verification.
@@ -193,10 +203,19 @@ release from a dirty tree, or from any branch but `main` and `release/v*`.
 **Run the dry run first.** A crates.io publish is permanent. A version can be yanked, which stops
 new resolutions from selecting it, but it cannot be deleted or replaced.
 
+The dry run does the local half for real — steps 1, 2 and 4, the bump, its commit and the tag —
+and undoes all of it before returning. Only the two steps that leave your machine, the publish and
+the push, are simulated. It works that way for the same reason step 1 does: a dry run that left
+the manifests alone would report the unsatisfiable `-dev` pin and package crates still carrying
+the `-dev` version, so it would never once look at the artifacts a release would upload. The
+scratch commit stays in the reflog, the tag is deleted by name only if the dry run cut it, and the
+reset is exact because the tree was verified clean before anything started — which is also why the
+dry run refuses to start on a dirty tree.
+
 ### Release candidates
 
 ```bash
-scripts/release.sh rc     # 0.5.0-dev -> 0.5.0-rc.1, then rc.1 -> rc.2, ...
+cargo xtask rc     # 0.5.0-dev -> 0.5.0-rc.1, then rc.1 -> rc.2, ...
 ```
 
 A release candidate publishes to crates.io like any other version and is invisible to anyone who
@@ -221,11 +240,11 @@ cargo release version 1.0.0-dev --execute
 
 That rewrites the workspace version and the exact-version pin together. Commit, review, merge.
 This is the natural place to land the breaking-change notes, since merging it is the moment the
-team agrees the next release is a major one. Then release exactly as usual: `scripts/release.sh rc`
-for candidates, then `scripts/release.sh release` to ship `1.0.0` and move `main` to `1.1.0-dev`.
+team agrees the next release is a major one. Then release exactly as usual: `cargo xtask rc`
+for candidates, then `cargo xtask release` to ship `1.0.0` and move `main` to `1.1.0-dev`.
 
 `cargo release major` would also get from `0.9.0-dev` to `1.0.0` in one step, but it decides the
-bump at release time, on one person's machine, in a command nobody reviews. `scripts/release.sh`
+bump at release time, on one person's machine, in a command nobody reviews. `cargo xtask`
 accepts only `rc` and `release` for that reason. The same applies to `2.0` later: retarget `main`
 to `2.0.0-dev` and release.
 
@@ -240,17 +259,17 @@ change then means retargeting `main` to `2.0.0-dev`, never shipping it in a mino
 
 Patches are cut from a release branch, never from `main`. This is forced by the `-dev`
 convention: the moment `0.5.0` ships, `main` declares `0.6.0-dev`, so there is no point on `main`
-from which `0.5.1` is the next version. `scripts/release.sh` refuses `patch` anywhere but a
+from which `0.5.1` is the next version. `cargo xtask` refuses `patch` anywhere but a
 release branch for that reason.
 
-`scripts/release.sh release` creates `release/vX.Y` and pushes it as part of every final
+`cargo xtask release` creates `release/vX.Y` and pushes it as part of every final
 release, so the branch you need already exists and there is nothing to set up. Check out the one
 for the line being patched, put the fix on it, and release:
 
 ```bash
 git switch release/v0.5
 git cherry-pick <sha>          # the fix, already reviewed and merged to main
-scripts/release.sh patch       # 0.5.0 -> 0.5.1, then 0.5.1 -> 0.5.2, ...
+cargo xtask patch       # 0.5.0 -> 0.5.1, then 0.5.1 -> 0.5.2, ...
 ```
 
 Fix on `main` first, then cherry-pick onto the release branch. A fix that lands only on the
@@ -266,7 +285,7 @@ Older lines stay patchable indefinitely, since each has its own branch. Patching
 ### Publishing from CI
 
 Releases are triggered by a person today. Moving to tag-triggered publishing is a small change:
-set `publish = false` in [`release.toml`](./release.toml) so the script only versions, tags, and
+set `publish = false` in [`release.toml`](./release.toml) so the command only versions, tags, and
 pushes, then add a workflow on `v*` tags that runs `cargo publish --workspace`. crates.io
 supports Trusted Publishing for GitHub Actions, which issues a short-lived token and avoids
 storing a long-lived secret. It is configured per crate on the crate's settings page by a user
