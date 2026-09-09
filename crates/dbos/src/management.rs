@@ -514,9 +514,11 @@ impl DBOS {
     ///
     /// Every id must exist. The whole batch is one statement, so an id with no row behind it fails
     /// the call and nothing is enqueued, rather than resuming the ones that happened to be spelled
-    /// correctly. Python and Java draw the same line on the batch; **Go deliberately does not**,
-    /// and says so — its `ResumeWorkflows` skips a missing id where its `ResumeWorkflow` refuses
-    /// one. Following Python here keeps the batch and the single form answering the same way.
+    /// correctly. Python draws the same line on the batch; **Go and Java do not** — Go says so,
+    /// its `ResumeWorkflows` skipping a missing id where its `ResumeWorkflow` refuses one, and
+    /// Java's `resumeWorkflows` being a single `UPDATE ... WHERE workflow_uuid = ANY(?)` that
+    /// never notices one. Following Python here keeps the batch and the single form answering the
+    /// same way.
     pub fn resume_all<'a, R: 'a, E: 'a>(
         &self,
         workflow_ids: &'a [&'a str],
@@ -1338,8 +1340,8 @@ impl Connection {
 ///
 /// A chosen id belongs to the half of the surface that names its step. **Every reference draws the
 /// same line**, by giving the search half no parameter to pass one through: Python's
-/// `fork_from_failure` (`_sys_db.py:1680`) and TypeScript's `forkFromFailure`
-/// (`system_database.ts:2004`) generate a UUID per source and take no id; Go's `ForkFromDBInput`
+/// `fork_from_failure` (`_sys_db.py:1752`) and TypeScript's `forkFromFailure`
+/// (`system_database.ts:2112`) generate a UUID per source and take no id; Go's `ForkFromDBInput`
 /// (`system_database.go:2773`) has no id field and leaves `ForkedWorkflowIDs` unset; Java splits
 /// the options type outright, `ForkFromFailureOptions` carrying only the version, queue and
 /// partition key where its `ForkOptions` leads with `forkedWorkflowId`. Refusing is the merged

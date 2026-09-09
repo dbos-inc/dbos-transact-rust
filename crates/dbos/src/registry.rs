@@ -70,7 +70,7 @@ impl WorkflowKey {
     ///
     /// Both spellings are in the wild, and Java's own code is the evidence rather than an
     /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
-    /// compares an init against an existing row (`WorkflowDAO.java:120`), which is a defence
+    /// compares an init against an existing row (`WorkflowDAO.java:161`), which is a defence
     /// nobody writes against a distinction that cannot occur.
     pub(crate) fn from_row(
         name: impl Into<String>,
@@ -472,7 +472,8 @@ mod tests {
 
     #[test]
     fn a_row_written_with_empty_strings_resolves_to_the_same_key_as_one_written_with_nulls() {
-        // Java writes `""` where Python writes NULL, and both must find this registration.
+        // Some SDKs spell absence `""` where Python writes NULL, and both must find this
+        // registration.
         let free = WorkflowKey::new("checkout");
         assert_eq!(WorkflowKey::from_row("checkout", None, None), free);
         assert_eq!(WorkflowKey::from_row("checkout", Some(""), Some("")), free);

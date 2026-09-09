@@ -1,9 +1,10 @@
 //! Retrying system database operations that failed for reasons that may pass.
 //!
-//! Every implementation wraps its sysdb calls in this: Python has 26 `@db_retry` decorators,
-//! Java 69 `dbRetry(...)` calls, Go a `Retry` helper on every statement. The bargain is stated
-//! most plainly in Python's docstring — if DBOS loses its database connection, *everything
-//! pauses until the connection is recovered, trading off availability for correctness*.
+//! Every implementation wraps its sysdb calls in this: Python a `@db_retry` decorator on each
+//! sysdb method, Java a `dbRetry(...)` call on each, Go a `Retry` helper on every statement. The
+//! bargain is stated most plainly in Python's docstring — if DBOS loses its database connection,
+//! *everything pauses until the connection is recovered, trading off availability for
+//! correctness*.
 //!
 //! That trade is the point. A workflow engine whose durable state is briefly unreachable has
 //! two choices: block, or report a failure that the caller will treat as a real outcome and act

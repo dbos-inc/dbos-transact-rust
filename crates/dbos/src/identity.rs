@@ -79,8 +79,9 @@ impl Environment {
     /// Reads the environment this process was started with.
     pub(crate) fn read() -> Self {
         // An empty variable is an unset one throughout: a deployment that exports a name it has
-        // not filled in yet means "nothing", and Java's later `isEmpty` checks reach the same
-        // conclusion by a longer route.
+        // not filled in yet means "nothing". Java reaches the same conclusion for the app name by
+        // a longer route, rejecting an empty one after the fact, but keeps an empty `DBOS__VMID`
+        // as `""` rather than falling back the way this does.
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         Self {
             // `Boolean.parseBoolean` in Java: a case-insensitive `true`, and anything else —

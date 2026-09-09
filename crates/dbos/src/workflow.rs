@@ -301,14 +301,14 @@ pub struct StartOptions<'a> {
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
 /// id, a priority, a partition key, a delay and a
 /// [`duplication_policy`](Self::duplication_policy) each mean nothing without a queue: Go checks
-/// all five at start and returns `InvalidOptionError` for
-/// each (`workflow.go:1178`–`1199`, and `:1175` for the policy), which is five runtime errors
-/// describing states its type system allowed it to build. Owning them from the queue makes the
-/// same five unrepresentable — there is no queue-less value here to hang them on. Three rules
-/// survive as refusals at start, because no shape can take them:
+/// all five at start and returns `InvalidOptionError` for each (`workflow.go:1144`–`1166`, and
+/// `:1175`–`1181` for the policy), which is five runtime errors describing states its type system
+/// allowed it to build. Owning them from the queue makes the same five unrepresentable — there is
+/// no queue-less value here to hang them on. Three rules survive as refusals at start, because no
+/// shape can take them:
 ///
 /// - **A [`deduplication_id`](Self::deduplication_id) and a [`partition_key`](Self::partition_key)
-///   cannot both be set.** Go refuses the same pair (`workflow.go:1201`), and it is not a policy
+///   cannot both be set.** Go refuses the same pair (`workflow.go:1169`), and it is not a policy
 ///   choice: a partitioned queue's sweep claims one head-of-line workflow per partition and leans
 ///   on the `PENDING` gate to hold concurrency at one, while a deduplication key is enforced by a
 ///   partial unique index over `(queue_name, deduplication_id)` that knows nothing about
@@ -321,7 +321,7 @@ pub struct StartOptions<'a> {
 ///   and Go refuse the same pair (`_enqueue_options.py:82`, `workflow.go:1177`), and keeping the
 ///   two apart is what makes the ordinary enqueue — a key, no policy — the short one to write.
 ///
-/// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts:324`), which
+/// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts:343`), which
 /// is the nearest precedent; Go and Python keep them flat on their options struct.
 ///
 /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
@@ -472,7 +472,7 @@ impl<'a> Enqueue<'a> {
     /// pair of rules that are about the options themselves:
     ///
     /// - **A deduplication id and a partition key cannot both be set.** Go refuses the same pair
-    ///   (`workflow.go:1201`) and it is not a policy choice: the two ask the dequeue for
+    ///   (`workflow.go:1169`) and it is not a policy choice: the two ask the dequeue for
     ///   incompatible things. A partitioned queue's sweep claims one head-of-line workflow per
     ///   partition and relies on the `PENDING` gate to hold concurrency at one, while a
     ///   deduplication key is enforced by a partial unique index over `(queue_name,
@@ -744,7 +744,7 @@ impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
 ///   `withDeadline` and the precedence that follows from it, which Rust lacks.
 /// - **TypeScript** spells the three as `number | null | undefined` (`context.ts:31`) and branches
 ///   on the middle one under the comment *"Detach child deadline if a null timeout is configured"*
-///   (`dbos.ts:1969`, and again at `enqueue_workflow.ts:92`).
+///   (`dbos.ts:1972`, and again at `enqueue_workflow.ts:92`).
 /// - **Python** reaches them through `SetWorkflowTimeout(None)`, whose `__enter__` clears the
 ///   propagated deadline as well as the timeout (`_context.py:568`).
 /// - **Go** gets all three for free, because its deadline rides on a `context` a caller may
@@ -1675,7 +1675,7 @@ impl Parent<'_> {
     /// both references that also carry a class and a config. Python records
     /// `get_dbos_func_name(func)` and hands the other two to `_init_workflow` separately
     /// (`_core.py:1428`); Java records `workflowName` beside a `className` on the status row
-    /// (`DBOSExecutor.java:2035`); Go has one name to record. The qualification belongs to the
+    /// (`DBOSExecutor.java:2184`); Go has one name to record. The qualification belongs to the
     /// child's own row, which the `init_workflow` call above fills in — this column is the
     /// *parent's* step listing, where the name is what a reader is looking for.
     async fn record_child(

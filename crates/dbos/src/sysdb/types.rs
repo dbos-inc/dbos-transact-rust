@@ -869,9 +869,9 @@ pub enum Applications<'a> {
 /// [`applications`](Self::applications) is the exception, and deliberately so: its default scopes
 /// to the caller's own application rather than to everything.
 ///
-/// The set is the union of all four implementations, which do not agree on it. Go has 28
-/// filters, Python 26, Java adds two Go lacks. Where they diverge it is noted on the field, so a
-/// missing filter reads as a decision rather than an oversight.
+/// The set is the union of all four implementations, which do not agree on it: each carries a
+/// couple the others lack. Where they diverge it is noted on the field, so a missing filter
+/// reads as a decision rather than an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
@@ -1260,11 +1260,10 @@ impl WorkflowDelay {
 
 /// Why a workflow is being submitted, which decides whether it may claim a row someone holds.
 ///
-/// The references model this as two booleans, `is_recovery_request` and `is_dequeued_request`,
-/// but **no call site in any of them sets both** — Python's dispatchers pass exactly
-/// `(True, False)` from recovery and `(False, True)` from the queue, and nothing else. A
-/// three-way choice is what it has always been, and naming it removes an unreadable pair of
-/// adjacent `bool` arguments that would compile just as happily swapped.
+/// Java models this as two booleans, `isRecoveryRequest` and `isDequeuedRequest`, but **no call
+/// site sets both** — its dispatcher branches on one or the other, never the pair. A three-way
+/// choice is what it has always been, and naming it removes an unreadable pair of adjacent
+/// `bool` arguments that would compile just as happily swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Submission {
     /// A first attempt, which does not claim a workflow another owner already holds.
@@ -2192,14 +2191,14 @@ pub struct ForkOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run before it is cancelled.
     ///
-    /// Java and TypeScript both carry this on their fork options; Python and Go do not.
+    /// All four references carry this on their fork options.
     pub timeout: Option<Duration>,
     /// Child workflow ids to rewrite as the fork's steps are copied.
     ///
     /// When a tree of workflows is forked together, the parent's recorded children are the
     /// *original* children — replaying them would make the fork adopt the originals rather than
-    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy. Python
-    /// and TypeScript both take this map; Go and Java do not.
+    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy. Python,
+    /// TypeScript and Go all take this map; Java does not.
     pub replacement_children: &'a [(&'a str, &'a str)],
 }
 

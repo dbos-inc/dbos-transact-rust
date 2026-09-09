@@ -339,7 +339,7 @@ pub struct QueueChange {
 /// is refused when it does.
 ///
 /// **Named at the call, never defaulted.** Python and TypeScript default it per surface — to
-/// `update_if_latest_version` for an application (`_dbos.py:981`, `dbos.ts:2745`) and to
+/// `update_if_latest_version` for an application (`_dbos.py:981`, `dbos.ts:2747`) and to
 /// `always_update` for a client (`_client.py:382`, `client.ts:559`) — which one Rust type cannot
 /// express, a default being a property of the type rather than of the caller. So a registration
 /// says which it means.
@@ -382,9 +382,10 @@ pub enum QueueConflict {
 ///   because the dequeue clamps its budgets with `.max(0)`: a `Some(0)` reaches the database, is
 ///   read back as a limit of nothing, and leaves a queue that silently never dequeues, with no
 ///   error and nothing in the log to explain it.
-/// - **A fleet-wide limit cannot be below a per-process one**, which Python, TypeScript and Go all
-///   check and Java does not. The pair is incoherent rather than merely useless: the smaller number
-///   wins in the dequeue, so the configuration does not say what it appears to say.
+/// - **A fleet-wide limit cannot be below a per-process one**, which all four references check —
+///   Java's is in `QueueRegistry.registerQueue`. The pair is incoherent rather than merely
+///   useless: the smaller number wins in the dequeue, so the configuration does not say what it
+///   appears to say.
 fn validate(name: &str, options: &QueueOptions) -> Result<()> {
     validate_fields(options)
         .map_err(|(_, detail)| Error::Config(format!("queue `{name}`: {detail}")))
