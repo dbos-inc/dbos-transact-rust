@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "dbos"
-version = "0.1.2"
+version = "0.5.0-dev"
 dependencies = [
  "async-trait",
  "dbos-macros",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "dbos-macros"
-version = "0.1.2"
+version = "0.5.0-dev"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "dbos-rust-starter"
-version = "0.1.2"
+version = "0.5.0-dev"
 dependencies = [
  "axum",
  "dbos",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "dbos-rust-widget-store"
-version = "0.1.2"
+version = "0.5.0-dev"
 dependencies = [
  "axum",
  "dbos",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "dbos-test-support"
-version = "0.1.2"
+version = "0.5.0-dev"
 dependencies = [
  "dbos",
  "sqlx",
