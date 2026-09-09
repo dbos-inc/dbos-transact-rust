@@ -339,8 +339,8 @@ pub struct QueueChange {
 /// is refused when it does.
 ///
 /// **Named at the call, never defaulted.** Python and TypeScript default it per surface — to
-/// `update_if_latest_version` for an application (`_dbos.py:981`, `dbos.ts:2747`) and to
-/// `always_update` for a client (`_client.py:382`, `client.ts:559`) — which one Rust type cannot
+/// `update_if_latest_version` for an application (`_dbos.py`, `dbos.ts`) and to
+/// `always_update` for a client (`_client.py`, `client.ts`) — which one Rust type cannot
 /// express, a default being a property of the type rather than of the caller. So a registration
 /// says which it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,8 +355,8 @@ pub enum QueueConflict {
     ///
     /// **A [`Client`](crate::Client) is refused this**, having no version to be the latest of:
     /// [`Client::register_queue`](crate::Client::register_queue) returns [`Error::Config`], which
-    /// is where Python and TypeScript raise on the same combination (`_client.py:455`,
-    /// `client.ts:561`).
+    /// is where Python and TypeScript raise on the same combination (`_client.py`,
+    /// `client.ts`).
     UpdateIfLatestVersion,
     /// Always overwrite the stored limits.
     ///
@@ -711,8 +711,8 @@ impl Connection {
                 // **A handle with no application version cannot answer this question**, which is
                 // the case a [`Client`](crate::Client) is: it runs none of the application's code,
                 // so there is no version of it to weigh against the registered ones. Python and
-                // TypeScript refuse the same combination on the same grounds (`_client.py:455`,
-                // `client.ts:561`). Only a client reaches it: `DBOS::register_queue` passes the
+                // TypeScript refuse the same combination on the same grounds (`_client.py`,
+                // `client.ts`). Only a client reaches it: `DBOS::register_queue` passes the
                 // executor's version, which a launched instance always has.
                 let Some(version) = app_version else {
                     return Err(Error::Config(format!(

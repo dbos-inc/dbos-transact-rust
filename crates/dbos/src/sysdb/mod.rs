@@ -209,12 +209,12 @@ pub trait SystemDatabase: Send + Sync {
     /// polling for a row that will never reappear.
     ///
     /// All four references draw the line in the same place, each in its own words — Python's
-    /// `fail_if_missing` (`_sys_db.py:1980`), Go's and Java's required `failIfMissing`,
+    /// `fail_if_missing` (`_sys_db.py`), Go's and Java's required `failIfMissing`,
     /// TypeScript's optional one — and they all give the same reason for it. Python puts it most
-    /// plainly (`_core.py:1094`): *"The row is known to exist (this dispatch inserted or read it),
+    /// plainly (`_core.py`): *"The row is known to exist (this dispatch inserted or read it),
     /// so a missing row means it was deleted: fail fast rather than polling forever."* Python, Go
     /// and TypeScript pass `true` only where a run parks on its own outcome; **Java also passes it
-    /// at a handle**, on a start that finds the row already `SUCCESS` (`DBOSExecutor.java:1914`),
+    /// at a handle**, on a start that finds the row already `SUCCESS` (`DBOSExecutor.java`),
     /// and carries the flag on the handle itself — `WorkflowHandleDBPoll`, defaulting to `false`,
     /// *"for handles built from a `workflow_status` row that was just read"*.
     ///
@@ -483,7 +483,7 @@ pub trait SystemDatabase: Send + Sync {
     /// read is caught. Only the commit actually stops a parent, at its next step boundary.
     ///
     /// **Python and Java get more from the same order than this does**, and the difference is the
-    /// transaction. Python commits each level (`_sys_db.py:1150`, a `with self.engine.begin()` per
+    /// transaction. Python commits each level (`_sys_db.py`, a `with self.engine.begin()` per
     /// level, its child reads outside any transaction), so a parent reading its own status between
     /// levels finds `CANCELLED` and stops spawning mid-walk. Wrapping the cascade to commit it with
     /// the step checkpoint — which is what this whole surface does — trades that visibility for
@@ -1311,7 +1311,7 @@ pub trait SystemDatabase: Send + Sync {
     /// The caller for this is an enqueue that **lost a race and wants to adopt the winner**:
     /// submitting under a key another workflow holds fails on the unique index, and a
     /// return-the-existing-one policy then asks who won and reports that id instead of erroring
-    /// (`client.ts:440`, `Debouncer.java:322`). `None` means the holder finished between the
+    /// (`client.ts`, `Debouncer.java`). `None` means the holder finished between the
     /// conflict and this read — the key is free again and the caller should retry the insert
     /// rather than treat it as an error.
     ///
@@ -1355,7 +1355,7 @@ pub trait SystemDatabase: Send + Sync {
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
     /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
     /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts:408`); this layer names no driver type, so it takes the step instead and owns the
+    /// `dbos.ts`); this layer names no driver type, so it takes the step instead and owns the
     /// transaction — the same shape as [`send_messages`](Self::send_messages) and
     /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
     async fn create_schedule(
@@ -1379,7 +1379,7 @@ pub trait SystemDatabase: Send + Sync {
     /// meaning it has on [`create_schedule`](Self::create_schedule) — but on weaker precedent.
     /// **No reference runs this as a step.** TypeScript has no counterpart at all: its upsert is
     /// inlined in `applySchedules`, which takes no connection. Python's `upsert_schedule`
-    /// (`_sys_db.py:6356`) does take one, but only ever from `apply_schedules`, which is a plain
+    /// (`_sys_db.py`) does take one, but only ever from `apply_schedules`, which is a plain
     /// transaction rather than a step. The parameter is here because the signature is Python's and
     /// a schedule registered from inside a workflow wants the same atomicity its siblings get, not
     /// because a reference does it.
@@ -1406,7 +1406,7 @@ pub trait SystemDatabase: Send + Sync {
     /// **No step, unlike its siblings.** This is a startup call, made before the process runs any
     /// workflow, and TypeScript's takes no connection and is not step-wrapped either. Python has
     /// no method here at all — its `apply_schedules` is a loop over
-    /// [`upsert_schedule`](Self::upsert_schedule) one layer up (`_dbos.py:3242`).
+    /// [`upsert_schedule`](Self::upsert_schedule) one layer up (`_dbos.py`).
     async fn apply_schedules(&self, schedules: &[NewSchedule<'_>]) -> Result<(), Error>;
 
     /// Reads one schedule, or `None` if there is no such name.

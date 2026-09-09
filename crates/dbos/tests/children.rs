@@ -257,7 +257,7 @@ async fn a_start_dropped_after_it_begins_still_starts_the_child() {
 /// names no row, because the insert lost the key and nothing was written under it. What the parent
 /// records at that step is the *holder's* id, so a replay of this position resolves to the same
 /// workflow instead of trying to start a child that never existed. Go records the same mapping at
-/// the same reserved step id, for the reason it states at `workflow.go:1465`.
+/// the same reserved step id, for the reason it states at `workflow.go`.
 #[tokio::test]
 async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
     let db = test_database().await;

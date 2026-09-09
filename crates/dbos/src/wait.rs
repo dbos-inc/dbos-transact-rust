@@ -756,7 +756,7 @@ impl Connection {
             //
             // **Both references make it too, without writing it down**, because returning a
             // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
-            // `KeyError` on exactly this (`_dbos.py:1636`), and TypeScript's
+            // `KeyError` on exactly this (`_dbos.py`), and TypeScript's
             // `handleMap.get(completedId)!` is an assertion that is false on it, so the caller is
             // handed `undefined` as a handle and learns about it somewhere else. Answering with
             // the id means nothing here dereferences it against the set, so the check that comes

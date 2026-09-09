@@ -362,7 +362,7 @@ impl ChildResultPlacement {
         // and there the recorded row is the only thing that knows which workflow answered.
         // Adopting some other workflow's outcome as this one's is what this refuses, and every
         // implementation writes the id needed to refuse it (Python's `record_get_result` stores
-        // the awaited id as `child_workflow_id` too, `_sys_db.py:3026`).
+        // the awaited id as `child_workflow_id` too, `_sys_db.py`).
         if recorded.child_workflow_id.as_deref() != Some(awaited_workflow_id) {
             return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                 workflow_id: workflow_id.to_owned(),
@@ -401,7 +401,7 @@ impl ChildResultPlacement {
     ///
     /// **Rust follows Go here, against the other three.** Go filters this case out of its await
     /// checkpoint deliberately and says so — *"either the workflow result proper (no dlq, no raw
-    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go:419`). Python,
+    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go`). Python,
     /// TypeScript and Java all record it, because in all three the await runs inside the generic
     /// step wrapper and that wrapper checkpoints whatever exception it caught.
     ///

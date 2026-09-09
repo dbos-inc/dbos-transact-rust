@@ -1219,7 +1219,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 /// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
 /// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less
 /// value to hang them on. Go returns `InvalidOptionError` for each of those four
-/// (`workflow.go:1178`–`1199`). What is left is the pair no shape can express.
+/// (`workflow.go`). What is left is the pair no shape can express.
 #[tokio::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;

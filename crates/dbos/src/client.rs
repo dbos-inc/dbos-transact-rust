@@ -461,8 +461,8 @@ impl Client {
     ///
     /// **Java's client is the other unchecked one**, and its javadoc sends users to that same pair:
     /// *"This call does not ensure that the workflow exists; use the returned handle's
-    /// `getStatus()`"* (`DBOSClient.java:1157`). Python's and Go's spend a round trip instead and
-    /// refuse an id that names nothing (`_client.py:570`, `workflow.go:4433`) — which is what a
+    /// `getStatus()`"* (`DBOSClient.java`). Python's and Go's spend a round trip instead and
+    /// refuse an id that names nothing (`_client.py`, `workflow.go`) — which is what a
     /// caller who wants it writes here as [`workflow_status`](Self::workflow_status) before taking
     /// the handle — or bounds the wait instead, since dropping the future ends it and
     /// `tokio::time::timeout` is the whole of what Go's `WithHandleTimeout` exists to provide.
@@ -498,7 +498,7 @@ impl Client {
     /// code, so there is no version of it to be the latest of. Ask for
     /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate), which is what Python's and
     /// TypeScript's clients default to, or [`NeverUpdate`](crate::QueueConflict::NeverUpdate). They
-    /// refuse the same combination (`_client.py:455`, `client.ts:561`).
+    /// refuse the same combination (`_client.py`, `client.ts`).
     ///
     /// **A client with no application name of its own registers over a peer's queue rather than
     /// being refused**, replacing its stored limits — the ownership check every implementation

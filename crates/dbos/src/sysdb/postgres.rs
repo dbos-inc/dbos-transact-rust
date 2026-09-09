@@ -715,7 +715,7 @@ impl std::ops::DerefMut for StepConn {
 /// What a replayed step hands back, decoded from the row that recorded it.
 ///
 /// Only a success is ever recorded by the two step runners, so a step carrying an error is a row
-/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py:7028`);
+/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py`);
 /// reporting beats asserting, but the expectation is identical.
 ///
 /// A void method reaches here too, and does not trip the missing-output check: `()` serialises to
@@ -747,8 +747,8 @@ impl PostgresSystemDatabase {
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
     /// The shape every system-database call needs when it must be atomic with the step recording
-    /// it: **check, run, record**. Python's `call_txn_as_step` (`_sys_db.py:7015`) and
-    /// TypeScript's `runTransactionalStep` (`system_database.ts:1769`) are the same three steps
+    /// it: **check, run, record**. Python's `call_txn_as_step` (`_sys_db.py`) and
+    /// TypeScript's `runTransactionalStep` (`system_database.ts`) are the same three steps
     /// around a caller's connection; this one owns the transaction instead.
     ///
     /// - **Already recorded** — the stored output is decoded and returned.
@@ -809,8 +809,8 @@ impl PostgresSystemDatabase {
 
         // A failure rolls the transaction back and records nothing, so the replay runs the work
         // again. Both references do exactly this — Python's `with self.engine.begin()`
-        // (`_sys_db.py:7023`) and TypeScript's `catch { ROLLBACK; throw }`
-        // (`system_database.ts:1800`) — and the alternative is worse than it sounds: a step
+        // (`_sys_db.py`) and TypeScript's `catch { ROLLBACK; throw }`
+        // (`system_database.ts`) — and the alternative is worse than it sounds: a step
         // recorded from a dropped connection freezes a transient outage into a permanent answer for
         // that workflow.
         let (mut tx, value) = work(tx).await?;
@@ -1671,7 +1671,7 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
     };
     // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and no
     // SDK can write it — all four reject an unpaired limit at their public surface. Read as *no
-    // limit* rather than reported, matching TypeScript (`wfqueue.ts:245`), so a hand-edited row
+    // limit* rather than reported, matching TypeScript (`wfqueue.ts`), so a hand-edited row
     // does not make a peer and this implementation disagree about what the same queue is.
     //
     // One reader for both pairs, so the queue-wide limit and the per-partition one cannot come to
@@ -5528,9 +5528,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             // count it: that arm is Java's, and Java can own the count because Java re-invokes a
             // `PENDING` row instead of re-enqueueing it, so its upsert sees the claim this
             // statement sees. The three implementations that re-enqueue all count in their claim
-            // exactly here — go `system_database.go:4987`, ts `system_database.ts:3874` and
-            // `:4048`, python `_sys_db.py:4663`, whose comment says it outright: *"Count this
-            // dispatch against the DLQ limit; no later insert does it."*
+            // exactly here — go `system_database.go`, ts `system_database.ts` (in both of
+            // its claim paths), python `_sys_db.py`, whose comment says it outright: *"Count
+            // this dispatch against the DLQ limit; no later insert does it."*
             //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
             // already moved the row, so a loser matches nothing, charges the workflow nothing, and

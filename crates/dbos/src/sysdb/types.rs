@@ -2331,7 +2331,7 @@ pub mod step_names {
     /// reference.** Every other constant here is a string some other implementation already writes,
     /// because a step row a Python or TypeScript reader may see should say what that reader calls
     /// the operation. This one does not follow that rule. Python records `"DBOS.waitFirst"`
-    /// (`_dbos.py:1634`) and TypeScript records the same string from `DBOS.waitFirst`; this crate
+    /// (`_dbos.py`) and TypeScript records the same string from `DBOS.waitFirst`; this crate
     /// names the call [`select_workflow`](crate::select_workflow()), after the concurrency shape
     /// rather than after the wait, and the step a caller reads in a listing is named for the call
     /// they wrote — so this follows the call.
@@ -2356,7 +2356,7 @@ pub mod step_names {
     ///
     /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above
     /// and for the same reason. Go's `Select` records `"DBOS.select"`
-    /// (`workflow.go:3082`); this crate's call is [`select_step!`](crate::select_step), because a
+    /// (`workflow.go`); this crate's call is [`select_step!`](crate::select_step), because a
     /// bare `select` in a Rust namespace reads as a future combinator where this one takes only
     /// steps, and the recorded name follows the call a reader wrote. Python's `asyncio_wait`
     /// records `"DBOS.asyncio_wait"` and could not have been borrowed at all.

@@ -700,7 +700,7 @@ async fn dispatch(
     // The status is `init_workflow`'s own `RETURNING`, and its `ON CONFLICT` never writes the
     // status column — so this is what the row holds as of a round trip ago, rather than as of the
     // batch read that preceded every dispatch in this tick. The other four check the batch read's
-    // copy (`_core.py:1313`, `dbos-executor.ts:702`, `queue.go:798`, and Java's non-owner
+    // copy (`_core.py`, `dbos-executor.ts`, `queue.go`, and Java's non-owner
     // rollback), which narrows the window rather than closing it; this narrows it further.
     //
     // `should_execute` cannot stand in for this. It reports whether another owner holds the row
