@@ -3599,13 +3599,20 @@ async fn a_value_published_during_the_wait_still_arrives() {
     // write before the reader has been polled once — and a value already in the table is answered
     // by the *first* look, so the test would pass with the re-query loop deleted. Pinned here, the
     // read is polled throughout the gate below and is known not to have answered when it lifts.
+    //
+    // What the gate establishes directly is that the read did not *answer* in two whole intervals,
+    // which is not quite the same as having taken a look. The step from one to the other is that
+    // the pool is already warm — `publisher_and_reader` above ran its inserts through this very
+    // handle — so the first look is a round trip on a live connection, issued microseconds into
+    // the gate rather than after it. A read still pending two intervals later has therefore
+    // looked, missed, and gone back round the loop at least once.
     let read = sys.get_event("wf-publisher", "progress", RECHECK * 600, None);
     let mut read = std::pin::pin!(read);
     tokio::select! {
         answered = &mut read => {
             panic!("the read answered before anything was published: {answered:?}")
         }
-        () = tokio::time::sleep(BRIEFLY) => {}
+        () = tokio::time::sleep(RECHECK * 2) => {}
     }
 
     // The other half of the ordering, and this one is checked rather than assumed: the key is

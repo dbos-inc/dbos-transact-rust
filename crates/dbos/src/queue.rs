@@ -381,7 +381,7 @@ pub enum QueueConflict {
 ///   read back as a limit of nothing, and leaves a queue that silently never dequeues, with no
 ///   error and nothing in the log to explain it.
 /// - **A fleet-wide limit cannot be below a per-process one**, which all four references check —
-///   Java's is in `QueueRegistry.registerQueue`. The pair is incoherent rather than merely
+///   Java's is in `QueueRegistry.register`. The pair is incoherent rather than merely
 ///   useless: the smaller number wins in the dequeue, so the configuration does not say what it
 ///   appears to say.
 fn validate(name: &str, options: &QueueOptions) -> Result<()> {
