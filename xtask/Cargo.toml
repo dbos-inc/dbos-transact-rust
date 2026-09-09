@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Repository automation for this workspace. Not published."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# `cargo release` must leave this out of the release set. It carries its own fixed version rather
+# than inheriting the shared workspace one, precisely so that a release never has to think about
+# it: nothing depends on it and nothing ships it.
+[package.metadata.release]
+release = false
