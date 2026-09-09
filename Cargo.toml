@@ -19,7 +19,7 @@ members = [
 # reads as unreleased and a stray `cargo publish` from here would fail the `=` pin below rather
 # than ship a release-numbered build. `cargo release` (see `release.toml`) strips the suffix,
 # tags, publishes, and re-appends it — never edit these by hand for a release.
-version = "0.5.0-dev"
+version = "0.5.0"
 edition = "2024"
 # Latest stable minus two, rolling. Stable was 1.97.1 on 2026-08-05. Bump this when
 # stable moves; CI is what makes it real.
@@ -38,4 +38,4 @@ categories = ["asynchronous", "database"]
 # above, because it has to be bumped in the same edit — a release that moves the workspace version
 # and leaves this behind either fails to publish `dbos` or resolves a macro naming paths that have
 # moved.
-dbos-macros = { path = "crates/dbos-macros", version = "=0.5.0-dev" }
+dbos-macros = { path = "crates/dbos-macros", version = "=0.5.0" }
