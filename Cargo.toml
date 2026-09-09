@@ -1,9 +1,11 @@
 [workspace]
 resolver = "3"
 # Each crate is created by the work that first ships code into it, rather than scaffolded up
-# front: `dbos-macros` arrives with the attribute macros, and `dbos-transact` only when a
-# signpost release to `dbos` is cut. `test-support` is unpublished and exists so that tests
-# needing a real database can live beside the code they test, rather than only under `tests/`.
+# front: `dbos-macros` arrives with the attribute macros. Two crates are published, `dbos` and
+# `dbos-macros`, and the `dbos-transact` name — held on crates.io at an 0.1.1 placeholder — stays
+# a placeholder: a signpost crate was considered and dropped, since `dbos` is the name users are
+# pointed at everywhere. `test-support` is unpublished and exists so that tests needing a real
+# database can live beside the code they test, rather than only under `tests/`.
 members = [
     "crates/dbos",
     "crates/dbos-macros",
@@ -13,18 +15,22 @@ members = [
 ]
 
 [workspace.package]
-# Published placeholders occupy 0.1.1 on crates.io, so the first real release must be
-# 0.1.2 or later. Nothing here is published yet.
-version = "0.1.2"
+# `main` always carries the *next* release with a `-dev` suffix, so a git dependency on `main`
+# reads as unreleased and a stray `cargo publish` from here would fail the `=` pin below rather
+# than ship a release-numbered build. `cargo release` (see `release.toml`) strips the suffix,
+# tags, publishes, and re-appends it — never edit these by hand for a release.
+version = "0.5.0-dev"
 edition = "2024"
 # Latest stable minus two, rolling. Stable was 1.97.1 on 2026-08-05. Bump this when
 # stable moves; CI is what makes it real.
 rust-version = "1.95"
 license = "MIT"
 authors = ["DBOS, Inc."]
-# `repository` is deliberately unset while dbos-inc/dbos-transact-rust is private: a
-# repository link that 404s is worse than none. Set it when the repo goes public, which
-# has to happen before any non-placeholder release anyway.
+repository = "https://github.com/dbos-inc/dbos-transact-rust"
+homepage = "https://dbos.dev"
+documentation = "https://docs.dbos.dev"
+keywords = ["durable-execution", "workflow", "postgres", "orchestration", "queue"]
+categories = ["asynchronous", "database"]
 
 [workspace.dependencies]
 # `dbos-macros` expands into `dbos::__private`, this workspace's own unstable surface, so the two
@@ -32,4 +38,4 @@ authors = ["DBOS, Inc."]
 # above, because it has to be bumped in the same edit — a release that moves the workspace version
 # and leaves this behind either fails to publish `dbos` or resolves a macro naming paths that have
 # moved.
-dbos-macros = { path = "crates/dbos-macros", version = "=0.1.2" }
+dbos-macros = { path = "crates/dbos-macros", version = "=0.5.0-dev" }
