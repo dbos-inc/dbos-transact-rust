@@ -3356,7 +3356,7 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
 ///
 /// Written with raw SQL rather than through the writers, so the read shape is pinned on its own:
 /// the rows go in out of order, with mixed topics and formats, and the readers must sort and
-/// report them whoever wrote them.
+/// report them regardless of who wrote them.
 #[tokio::test]
 async fn the_bulk_readers_return_notifications_events_and_streams() {
     let (sys, db) = sysdb().await;
@@ -3588,44 +3588,67 @@ async fn a_value_published_during_the_wait_still_arrives() {
         db.pool().await,
         &Settings::default(),
     ));
-    // Two handles over one database: separate registries, so the wake `set_event` does on its way
-    // out lands where the reader is not subscribed and only the row itself crosses between them.
+    // Two handles over one database, each with its own pool: separate registries, so the wake
+    // `set_event` does on its way out lands where the reader is not subscribed and only the row
+    // itself crosses between them.
     let publisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
 
-    let publishing = tokio::spawn(async move {
-        // Long enough that the reader's first look has already found nothing, so the value can
-        // only be delivered by a later pass of the loop.
-        tokio::time::sleep(BRIEFLY).await;
-        publisher
-            .set_event(
-                "wf-publisher",
-                0,
-                "progress",
-                "\"done\"",
-                Some("portable_json"),
-            )
-            .await
-            .unwrap();
-    });
+    // **The read is driven here rather than raced against a sleeping publisher**, because a sleep
+    // does not order the two. A spawned publisher can be scheduled, sleep out its whole delay and
+    // write before the reader has been polled once — and a value already in the table is answered
+    // by the *first* look, so the test would pass with the re-query loop deleted. Pinned here, the
+    // read is polled throughout the gate below and is known not to have answered when it lifts.
+    let read = sys.get_event("wf-publisher", "progress", RECHECK * 600, None);
+    let mut read = std::pin::pin!(read);
+    tokio::select! {
+        answered = &mut read => {
+            panic!("the read answered before anything was published: {answered:?}")
+        }
+        () = tokio::time::sleep(BRIEFLY) => {}
+    }
+
+    // The other half of the ordering, and this one is checked rather than assumed: the key is
+    // absent at this instant, so every look the read has taken has looked at a table without it.
+    let mut probe = db.admin_connection().await;
+    let present: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(
+        "SELECT count(*) FROM dbos.workflow_events \
+         WHERE workflow_uuid = 'wf-publisher' AND key = 'progress'",
+    ))
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(
+        present.0, 0,
+        "the value was already published, so the first look could have answered the read",
+    );
+
+    // Timed from here, so what the bound below measures is the publish reaching the reader rather
+    // than anything the gate above spent.
+    let began = Timestamp::now();
+    publisher
+        .set_event(
+            "wf-publisher",
+            0,
+            "progress",
+            "\"done\"",
+            Some("portable_json"),
+        )
+        .await
+        .unwrap();
 
     // The read is given ten minutes, so its deadline cannot be what ends the wait — only the loop
     // finding the value can be. Bounded at ten intervals so that a loop which has slowed to some
     // longer period fails here rather than passing: "eventually" is the regression.
-    let began = Timestamp::now();
-    let found = tokio::time::timeout(
-        RECHECK * 10,
-        sys.get_event("wf-publisher", "progress", RECHECK * 600, None),
-    )
-    .await
-    .expect("the wait loop never delivered a value that was published during it")
-    .unwrap();
+    let found = tokio::time::timeout(RECHECK * 10, read)
+        .await
+        .expect("the wait loop never delivered a value that was published during it")
+        .unwrap();
     assert!(
         Timestamp::now().duration_since(began).unwrap() < RECHECK * 5,
         "delivered, but far slower than the interval it is supposed to run at",
     );
 
-    publishing.await.unwrap();
     assert_eq!(
         found,
         Some(EncodedValue {
