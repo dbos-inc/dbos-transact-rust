@@ -339,10 +339,9 @@ pub struct QueueChange {
 /// is refused when it does.
 ///
 /// **Named at the call, never defaulted.** Python and TypeScript default it per surface — to
-/// `update_if_latest_version` for an application (`_dbos.py`, `dbos.ts`) and to
-/// `always_update` for a client (`_client.py`, `client.ts`) — which one Rust type cannot
-/// express, a default being a property of the type rather than of the caller. So a registration
-/// says which it means.
+/// `update_if_latest_version` for an application (`_dbos.py`, `dbos.ts`) and to `always_update` for
+/// a client (`_client.py`, `client.ts`) — which one Rust type cannot express, a default being a
+/// property of the type rather than of the caller. So a registration says which it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueConflict {
     /// Overwrite only if this process is running the **latest registered application version**.
@@ -355,8 +354,7 @@ pub enum QueueConflict {
     ///
     /// **A [`Client`](crate::Client) is refused this**, having no version to be the latest of:
     /// [`Client::register_queue`](crate::Client::register_queue) returns [`Error::Config`], which
-    /// is where Python and TypeScript raise on the same combination (`_client.py`,
-    /// `client.ts`).
+    /// is where Python and TypeScript raise on the same combination (`_client.py`, `client.ts`).
     UpdateIfLatestVersion,
     /// Always overwrite the stored limits.
     ///

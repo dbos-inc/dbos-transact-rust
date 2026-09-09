@@ -715,8 +715,8 @@ impl std::ops::DerefMut for StepConn {
 /// What a replayed step hands back, decoded from the row that recorded it.
 ///
 /// Only a success is ever recorded by the two step runners, so a step carrying an error is a row
-/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py`);
-/// reporting beats asserting, but the expectation is identical.
+/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py`); reporting
+/// beats asserting, but the expectation is identical.
 ///
 /// A void method reaches here too, and does not trip the missing-output check: `()` serialises to
 /// the four-character string `null`, so the column holds a value rather than SQL NULL. Whether a
@@ -747,9 +747,9 @@ impl PostgresSystemDatabase {
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
     /// The shape every system-database call needs when it must be atomic with the step recording
-    /// it: **check, run, record**. Python's `call_txn_as_step` (`_sys_db.py`) and
-    /// TypeScript's `runTransactionalStep` (`system_database.ts`) are the same three steps
-    /// around a caller's connection; this one owns the transaction instead.
+    /// it: **check, run, record**. Python's `call_txn_as_step` (`_sys_db.py`) and TypeScript's
+    /// `runTransactionalStep` (`system_database.ts`) are the same three steps around a caller's
+    /// connection; this one owns the transaction instead.
     ///
     /// - **Already recorded** — the stored output is decoded and returned.
     /// - **Succeeds** — the result and the checkpoint commit together, so no crash can leave one
@@ -809,10 +809,9 @@ impl PostgresSystemDatabase {
 
         // A failure rolls the transaction back and records nothing, so the replay runs the work
         // again. Both references do exactly this — Python's `with self.engine.begin()`
-        // (`_sys_db.py`) and TypeScript's `catch { ROLLBACK; throw }`
-        // (`system_database.ts`) — and the alternative is worse than it sounds: a step
-        // recorded from a dropped connection freezes a transient outage into a permanent answer for
-        // that workflow.
+        // (`_sys_db.py`) and TypeScript's `catch { ROLLBACK; throw }` (`system_database.ts`) — and
+        // the alternative is worse than it sounds: a step recorded from a dropped connection
+        // freezes a transient outage into a permanent answer for that workflow.
         let (mut tx, value) = work(tx).await?;
 
         if let Some((workflow_id, step_id)) = caller {
@@ -1671,8 +1670,8 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
     };
     // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and no
     // SDK can write it — all four reject an unpaired limit at their public surface. Read as *no
-    // limit* rather than reported, matching TypeScript (`wfqueue.ts`), so a hand-edited row
-    // does not make a peer and this implementation disagree about what the same queue is.
+    // limit* rather than reported, matching TypeScript (`wfqueue.ts`), so a hand-edited row does
+    // not make a peer and this implementation disagree about what the same queue is.
     //
     // One reader for both pairs, so the queue-wide limit and the per-partition one cannot come to
     // disagree about what half a limit means.
@@ -5521,16 +5520,16 @@ impl SystemDatabase for PostgresSystemDatabase {
             // One statement for the batch rather than one per workflow: every limit above has
             // already bounded `max_tasks`, so nothing is left to stop this part-way through.
             //
-            // **`recovery_attempts` is counted here, and only here.** This is the transition
-            // that starts a workflow, and since recovery re-enqueues rather than re-invoking, it
-            // is the transition every recovered workflow makes too — so a budget counted anywhere
-            // else is a budget never spent. `init_workflow`'s `ON CONFLICT` deliberately does not
-            // count it: that arm is Java's, and Java can own the count because Java re-invokes a
-            // `PENDING` row instead of re-enqueueing it, so its upsert sees the claim this
-            // statement sees. The three implementations that re-enqueue all count in their claim
-            // exactly here — go `system_database.go`, ts `system_database.ts` (in both of
-            // its claim paths), python `_sys_db.py`, whose comment says it outright: *"Count
-            // this dispatch against the DLQ limit; no later insert does it."*
+            // **`recovery_attempts` is counted here, and only here.** This is the transition that
+            // starts a workflow, and since recovery re-enqueues rather than re-invoking, it is the
+            // transition every recovered workflow makes too — so a budget counted anywhere else is
+            // a budget never spent. `init_workflow`'s `ON CONFLICT` deliberately does not count it:
+            // that arm is Java's, and Java can own the count because Java re-invokes a `PENDING`
+            // row instead of re-enqueueing it, so its upsert sees the claim this statement sees.
+            // The three implementations that re-enqueue all count in their claim exactly here — go
+            // `system_database.go`, ts `system_database.ts` (in both of its claim paths), python
+            // `_sys_db.py`, whose comment says it outright: *"Count this dispatch against the DLQ
+            // limit; no later insert does it."*
             //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
             // already moved the row, so a loser matches nothing, charges the workflow nothing, and

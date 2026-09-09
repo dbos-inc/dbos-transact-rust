@@ -1340,13 +1340,12 @@ impl Connection {
 ///
 /// A chosen id belongs to the half of the surface that names its step. **Every reference draws the
 /// same line**, by giving the search half no parameter to pass one through: Python's
-/// `fork_from_failure` (`_sys_db.py`) and TypeScript's `forkFromFailure`
-/// (`system_database.ts`) generate a UUID per source and take no id; Go's `ForkFromDBInput`
-/// (`system_database.go`) has no id field and leaves `ForkedWorkflowIDs` unset; Java splits
-/// the options type outright, `ForkFromFailureOptions` carrying only the version, queue and
-/// partition key where its `ForkOptions` leads with `forkedWorkflowId`. Refusing is the merged
-/// shape's version of Java's missing field; silently dropping the id is the one behaviour no
-/// reference has.
+/// `fork_from_failure` (`_sys_db.py`) and TypeScript's `forkFromFailure` (`system_database.ts`)
+/// generate a UUID per source and take no id; Go's `ForkFromDBInput` (`system_database.go`) has no
+/// id field and leaves `ForkedWorkflowIDs` unset; Java splits the options type outright,
+/// `ForkFromFailureOptions` carrying only the version, queue and partition key where its
+/// `ForkOptions` leads with `forkedWorkflowId`. Refusing is the merged shape's version of Java's
+/// missing field; silently dropping the id is the one behaviour no reference has.
 ///
 /// **Made by the surfaces rather than inside the connection**, because a refused call must not
 /// spend a step id and the connection is only reached once one has been taken. Both surfaces that

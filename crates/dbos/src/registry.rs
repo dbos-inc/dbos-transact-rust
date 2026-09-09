@@ -70,8 +70,8 @@ impl WorkflowKey {
     ///
     /// Both spellings are in the wild, and Java's own code is the evidence rather than an
     /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
-    /// compares an init against an existing row (`WorkflowDAO.java`), which is a defence
-    /// nobody writes against a distinction that cannot occur.
+    /// compares an init against an existing row (`WorkflowDAO.java`), which is a defence nobody
+    /// writes against a distinction that cannot occur.
     pub(crate) fn from_row(
         name: impl Into<String>,
         class_name: Option<&str>,

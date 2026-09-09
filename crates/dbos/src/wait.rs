@@ -758,10 +758,10 @@ impl Connection {
             // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
             // `KeyError` on exactly this (`_dbos.py`), and TypeScript's
             // `handleMap.get(completedId)!` is an assertion that is false on it, so the caller is
-            // handed `undefined` as a handle and learns about it somewhere else. Answering with
-            // the id means nothing here dereferences it against the set, so the check that comes
-            // free there has to be spelled — which is the whole cost of it. It reads no extra
-            // state: the winner is the payload this call records anyway.
+            // handed `undefined` as a handle and learns about it somewhere else. Answering with the
+            // id means nothing here dereferences it against the set, so the check that comes free
+            // there has to be spelled — which is the whole cost of it. It reads no extra state: the
+            // winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order

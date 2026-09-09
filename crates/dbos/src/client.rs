@@ -461,11 +461,11 @@ impl Client {
     ///
     /// **Java's client is the other unchecked one**, and its javadoc sends users to that same pair:
     /// *"This call does not ensure that the workflow exists; use the returned handle's
-    /// `getStatus()`"* (`DBOSClient.java`). Python's and Go's spend a round trip instead and
-    /// refuse an id that names nothing (`_client.py`, `workflow.go`) — which is what a
-    /// caller who wants it writes here as [`workflow_status`](Self::workflow_status) before taking
-    /// the handle — or bounds the wait instead, since dropping the future ends it and
-    /// `tokio::time::timeout` is the whole of what Go's `WithHandleTimeout` exists to provide.
+    /// `getStatus()`"* (`DBOSClient.java`). Python's and Go's spend a round trip instead and refuse
+    /// an id that names nothing (`_client.py`, `workflow.go`) — which is what a caller who wants it
+    /// writes here as [`workflow_status`](Self::workflow_status) before taking the handle — or
+    /// bounds the wait instead, since dropping the future ends it and `tokio::time::timeout` is the
+    /// whole of what Go's `WithHandleTimeout` exists to provide.
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> WorkflowHandle<R, E> {
         WorkflowHandle::polling(Arc::clone(&self.0), workflow_id.to_owned(), false)
     }
