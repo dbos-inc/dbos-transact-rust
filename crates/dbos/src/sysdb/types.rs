@@ -921,6 +921,8 @@ pub struct WorkflowFilter<'a> {
     pub has_parent: Option<bool>,
     /// Workflows forked from any of these.
     pub forked_from: Vec<&'a str>,
+    /// Whether the workflow is itself a fork, i.e. whether it has a `forked_from`.
+    pub is_fork: Option<bool>,
     /// Whether this workflow was itself forked from another.
     pub was_forked_from: Option<bool>,
 
@@ -994,6 +996,7 @@ impl Default for WorkflowFilter<'_> {
             parent_workflow_ids: Vec::new(),
             has_parent: None,
             forked_from: Vec::new(),
+            is_fork: None,
             was_forked_from: None,
             created_after: None,
             created_before: None,

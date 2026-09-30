@@ -3162,6 +3162,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                     if filter.queues_only {
                         clause(&mut q, "queue_name IS NOT NULL");
                     }
+                    if let Some(is_fork) = filter.is_fork {
+                        clause(
+                            &mut q,
+                            if is_fork {
+                                "forked_from IS NOT NULL"
+                            } else {
+                                "forked_from IS NULL"
+                            },
+                        );
+                    }
                     if let Some(has_parent) = filter.has_parent {
                         clause(
                             &mut q,
