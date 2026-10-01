@@ -248,6 +248,59 @@ async fn an_enqueue_may_claim_an_application_or_leave_it_unclaimed() {
     }
 }
 
+/// Migration 113's `enqueue_workflow` writes the inputs to `workflow_input` and nothing to the
+/// legacy `workflow_status.inputs`, the same as every SDK's own enqueue.
+#[tokio::test]
+async fn an_sql_enqueue_writes_its_inputs_to_the_payload_table() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    apply_all(
+        &pool,
+        schema,
+        &build_migrations(schema, dialect_for(db.backend()), true),
+    )
+    .await;
+
+    let id: String = sqlx::query_scalar(
+        r#"SELECT "dbos".enqueue_workflow($1::TEXT, $2::TEXT, ARRAY['7'::JSON], '{}'::JSON,
+             NULL, NULL, $3::TEXT)"#,
+    )
+    .bind("a-workflow")
+    .bind("a-queue")
+    .bind("sql-enqueued")
+    .fetch_one(&pool)
+    .await
+    .expect("the enqueue should succeed");
+
+    let legacy: Option<String> = sqlx::query_scalar(
+        r#"SELECT "inputs" FROM "dbos"."workflow_status" WHERE "workflow_uuid" = $1"#,
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy, None, "the legacy column must not be written");
+
+    let inputs: Option<String> = sqlx::query_scalar(
+        r#"SELECT "inputs" FROM "dbos"."workflow_input" WHERE "workflow_uuid" = $1"#,
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await
+    .expect("the inputs should be in workflow_input");
+    let inputs: serde_json::Value =
+        serde_json::from_str(&inputs.expect("inputs were written")).unwrap();
+    assert_eq!(
+        inputs,
+        serde_json::json!({"positionalArgs": [7], "namedArgs": {}})
+    );
+}
+
 /// Migrations 106 and 107 both land, splitting version-name uniqueness by owner.
 ///
 /// The two are separate migrations because they build differently: 106's predicate matches no

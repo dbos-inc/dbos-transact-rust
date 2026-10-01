@@ -11011,32 +11011,119 @@ async fn payloads_in_the_payload_tables_are_read() {
     }
 }
 
-/// A row written before migration 109, payloads on `workflow_status` and nothing in the new
-/// tables, still reads back: every reader falls back to the legacy columns.
+/// Rows written before migration 109 — payloads on `workflow_status`, nothing in the new tables —
+/// still read back through every reader: the single read, the list with and without payloads, and
+/// the result wait, for both a success and a failure.
 #[tokio::test]
 async fn payloads_in_the_legacy_columns_are_still_read() {
     let (sys, db) = sysdb().await;
     let pool = db.pool().await;
     sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, inputs, output)
+           VALUES ('wf-legacy-ok', 'SUCCESS', 'checkout', '"old input"', '"old output"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
         r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, inputs, error)
-           VALUES ('wf-legacy', 'ERROR', 'checkout', '"old input"', '"old error"')"#,
+           VALUES ('wf-legacy-err', 'ERROR', 'checkout', '"old input"', '"old error"')"#,
     )
     .execute(&pool)
     .await
     .unwrap();
 
-    let read = sys.get_workflow("wf-legacy").await.unwrap().unwrap();
-    assert_eq!(read.input.as_deref(), Some("\"old input\""));
-    assert_eq!(read.error.as_deref(), Some("\"old error\""));
+    let ok = sys.get_workflow("wf-legacy-ok").await.unwrap().unwrap();
+    assert_eq!(ok.input.as_deref(), Some("\"old input\""));
+    assert_eq!(ok.output.as_deref(), Some("\"old output\""));
+    assert_eq!(ok.error, None);
+    let err = sys.get_workflow("wf-legacy-err").await.unwrap().unwrap();
+    assert_eq!(err.input.as_deref(), Some("\"old input\""));
+    assert_eq!(err.output, None);
+    assert_eq!(err.error.as_deref(), Some("\"old error\""));
+
+    let listed = sys
+        .list_workflows(&WorkflowFilter::default(), None)
+        .await
+        .unwrap();
+    for (id, expected) in [("wf-legacy-ok", &ok), ("wf-legacy-err", &err)] {
+        let row = listed
+            .iter()
+            .find(|w| w.workflow_id == id)
+            .unwrap_or_else(|| panic!("{id} was not listed"));
+        assert_eq!(row.input, expected.input, "{id}");
+        assert_eq!(row.output, expected.output, "{id}");
+        assert_eq!(row.error, expected.error, "{id}");
+    }
+
+    // Declining the payloads still declines them: the fallback does not leak the legacy columns
+    // into a list that asked for none.
+    let bare = sys
+        .list_workflows(
+            &WorkflowFilter {
+                load_input: false,
+                load_output: false,
+                ..WorkflowFilter::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        bare.iter()
+            .all(|w| w.input.is_none() && w.output.is_none() && w.error.is_none()),
+        "declined payloads came back: {bare:?}"
+    );
 
     match sys
-        .await_workflow_result("wf-legacy", BRISK_POLL, true)
+        .await_workflow_result("wf-legacy-ok", BRISK_POLL, true)
+        .await
+        .unwrap()
+    {
+        AwaitedOutcome::Succeeded { output, .. } => {
+            assert_eq!(output.as_deref(), Some("\"old output\""));
+        }
+        other => panic!("expected a success, got {other:?}"),
+    }
+    match sys
+        .await_workflow_result("wf-legacy-err", BRISK_POLL, true)
         .await
         .unwrap()
     {
         AwaitedOutcome::Failed { error, .. } => assert_eq!(error, "\"old error\""),
         other => panic!("expected a failure, got {other:?}"),
     }
+}
+
+/// When both layouts hold a value, the payload table's wins: the legacy column is only a fallback
+/// for rows the new tables know nothing about.
+#[tokio::test]
+async fn the_payload_tables_win_over_the_legacy_columns() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, inputs, output)
+           VALUES ('wf-both', 'SUCCESS', 'checkout', '"legacy input"', '"legacy output"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_input" (workflow_uuid, inputs) VALUES ('wf-both', '"new input"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_output" (workflow_uuid, output) VALUES ('wf-both', '"new output"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let read = sys.get_workflow("wf-both").await.unwrap().unwrap();
+    assert_eq!(read.input.as_deref(), Some("\"new input\""));
+    assert_eq!(read.output.as_deref(), Some("\"new output\""));
 }
 
 /// Starting a workflow and finishing it write the payloads to the new tables and nothing to the
@@ -11064,6 +11151,25 @@ async fn payloads_are_written_to_the_payload_tables() {
     .unwrap();
     assert_eq!(stored, (Some("\"done\"".to_owned()), None));
     assert_eq!(legacy_payloads(&pool, "wf-new").await, (None, None, None));
+
+    // And a failure, whose error takes the same route.
+    sys.init_workflow(&workflow("wf-new-failed"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    sys.record_workflow_outcome("wf-new-failed", Outcome::Error("\"boom\""))
+        .await
+        .unwrap();
+    let stored: (Option<String>, Option<String>) = sqlx::query_as(
+        r#"SELECT output, error FROM "dbos"."workflow_output" WHERE workflow_uuid = 'wf-new-failed'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, (None, Some("\"boom\"".to_owned())));
+    assert_eq!(
+        legacy_payloads(&pool, "wf-new-failed").await,
+        (None, None, None)
+    );
 }
 
 /// Resubmitting an existing workflow leaves its recorded input alone: that is the input it ran

@@ -472,6 +472,66 @@ async fn a_queue_registered_after_launch_is_dequeued_from() {
     dbos.shutdown().await;
 }
 
+/// **A queued workflow written before migration 109 runs with its input.**
+///
+/// Its input is in the legacy `workflow_status.inputs` column and `workflow_input` has no row for
+/// it. The dequeue reads it the way every reader does — the payload table, falling back to the
+/// legacy column — so the body is handed the arguments it was enqueued with, not `NULL`.
+///
+/// The row is made legacy by enqueueing onto a queue nothing polls yet, moving its input into the
+/// legacy column, and only then registering the queue.
+#[tokio::test]
+async fn a_queued_workflow_with_a_legacy_input_runs_with_it() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-legacy-input-app", &db));
+    let workflow = dbos
+        .register_workflow("doubles", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "enqueued-before-109";
+    let handle = workflow
+        .start_with(
+            21,
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(Enqueue::new("legacy-queue")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let pool = db.pool().await;
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET inputs =
+             (SELECT inputs FROM "dbos"."workflow_input" WHERE workflow_uuid = $1)
+           WHERE workflow_uuid = $1"#,
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let moved = sqlx::query(r#"DELETE FROM "dbos"."workflow_input" WHERE workflow_uuid = $1"#)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(moved, 1, "the enqueue should have written workflow_input");
+
+    dbos.register_queue(
+        "legacy-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    assert_eq!(handle.result().await.expect("the workflow failed"), 42);
+
+    dbos.shutdown().await;
+}
+
 /// **A queued workflow's budget becomes a deadline on dequeue, not at enqueue.**
 ///
 /// The timeout is recorded and the deadline left null, so a workflow that waits an hour in a queue
