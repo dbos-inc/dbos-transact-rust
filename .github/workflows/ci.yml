@@ -49,12 +49,12 @@ jobs:
     # This job is the only thing that makes that number true.
     env:
       # Overrides rust-toolchain.toml, which tracks stable on purpose.
-      RUSTUP_TOOLCHAIN: "1.95"
+      RUSTUP_TOOLCHAIN: "1.97"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.95"
+          toolchain: "1.97"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --all-features
 

@@ -21,9 +21,9 @@ members = [
 # tags, publishes, and re-appends it — never edit these by hand for a release.
 version = "0.6.0-dev"
 edition = "2024"
-# Latest stable minus two, rolling. Stable was 1.97.1 on 2026-08-05. Bump this when
+# Latest stable minus two, rolling. Stable was 1.99.0 on 2026-09-28. Bump this when
 # stable moves; CI is what makes it real.
-rust-version = "1.95"
+rust-version = "1.97"
 license = "MIT"
 authors = ["DBOS, Inc."]
 repository = "https://github.com/dbos-inc/dbos-transact-rust"
