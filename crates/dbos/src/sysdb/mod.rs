@@ -529,14 +529,16 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Deletes workflows and everything hanging off them.
     ///
-    /// Steps, notifications, events, and streams go with the row: the schema declares
-    /// `ON DELETE CASCADE` on every child table, so one `DELETE` is the whole operation.
+    /// Steps and the two payload tables are deleted by id, and notifications, events, and streams
+    /// go with the row through their `ON DELETE CASCADE`, all in one transaction. The steps lost
+    /// their cascade in migration 112 and the payload tables never had one, so a status delete on
+    /// its own would leave them behind.
     ///
     /// Unlike [`cancel_workflows`](Self::cancel_workflows), the descendants are collected first
-    /// and deleted in one statement rather than level by level: the cascade does the work that
-    /// cancelling needs a statement per level for. Interleaving would buy nothing here, because
-    /// what stops a parent spawning is the delete itself, and that is one statement whichever
-    /// order the tree was read in.
+    /// and deleted together rather than level by level: one set of statements over the whole
+    /// tree does the work that cancelling needs a statement per level for. Interleaving would buy
+    /// nothing here, because what stops a parent spawning is the delete itself, and that is one
+    /// transaction whichever order the tree was read in.
     ///
     /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
     /// Go have it, and this follows them.

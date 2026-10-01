@@ -1044,6 +1044,7 @@ impl PostgresSystemDatabase {
         let (replace_from, replace_to) = (&replace_from[..], &replace_to[..]);
 
         let workflow_table = self.tables.workflow_status.as_str();
+        let input_table = self.tables.workflow_input.as_str();
         let steps_table = self.tables.operation_outputs.as_str();
         let events_table = self.tables.workflow_events.as_str();
         let history_table = self.tables.workflow_events_history.as_str();
@@ -1081,12 +1082,12 @@ impl PostgresSystemDatabase {
         sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {workflow_table} (workflow_uuid, status, name, class_name, config_name, \
                 application_version, application_id, authenticated_user, authenticated_roles, \
-                assumed_role, inputs, serialization, request, queue_name, \
+                assumed_role, serialization, request, queue_name, \
                 queue_partition_key, forked_from, attributes, workflow_timeout_ms, \
                 application_name) \
              SELECT m.fork_id, 'ENQUEUED', w.name, w.class_name, w.config_name, \
                 COALESCE($4, w.application_version), w.application_id, w.authenticated_user, \
-                w.authenticated_roles, w.assumed_role, w.inputs, w.serialization, w.request, \
+                w.authenticated_roles, w.assumed_role, w.serialization, w.request, \
                 $5, $6, w.workflow_uuid, w.attributes, $7, \
                 COALESCE(w.application_name, $8) \
              FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
@@ -1100,6 +1101,25 @@ impl PostgresSystemDatabase {
         .bind(options.queue_partition_key)
         .bind(timeout_ms)
         .bind(application_name)
+        .execute(&mut *tx)
+        .await?;
+
+        // The input, copied under the fork's id. Read the way every reader reads it — the
+        // payload table first, the legacy column for a source written before migration 109 — so a
+        // fork of an old workflow still gets its arguments, and lands them where readers now look.
+        //
+        // An upsert for the reason `init_workflow`'s is: a `workflow_input` row can outlive its
+        // status row, and a fork named with a reused id must not inherit what it left.
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {input_table} (workflow_uuid, inputs) \
+             SELECT m.fork_id, COALESCE(i.inputs, w.inputs) \
+             FROM unnest($1::text[], $2::text[]) AS m(source_id, fork_id) \
+             JOIN {workflow_table} w ON w.workflow_uuid = m.source_id \
+             LEFT JOIN {input_table} i ON i.workflow_uuid = m.source_id \
+             ON CONFLICT (workflow_uuid) DO UPDATE SET inputs = EXCLUDED.inputs"
+        )))
+        .bind(source_ids)
+        .bind(forked_ids)
         .execute(&mut *tx)
         .await?;
 
@@ -1376,6 +1396,8 @@ fn version_predicate(is_latest: bool, param: usize) -> String {
 /// table should be a compile error rather than a runtime `None`.
 struct Tables {
     workflow_status: String,
+    workflow_input: String,
+    workflow_output: String,
     operation_outputs: String,
     application_versions: String,
     notifications: String,
@@ -1391,6 +1413,8 @@ impl Tables {
         let schema = quote_identifier(schema);
         Self {
             workflow_status: format!("{schema}.{}", quote_identifier("workflow_status")),
+            workflow_input: format!("{schema}.{}", quote_identifier("workflow_input")),
+            workflow_output: format!("{schema}.{}", quote_identifier("workflow_output")),
             operation_outputs: format!("{schema}.{}", quote_identifier("operation_outputs")),
             application_versions: format!("{schema}.{}", quote_identifier("application_versions")),
             notifications: format!("{schema}.{}", quote_identifier("notifications")),
@@ -1489,14 +1513,56 @@ const WORKFLOW_COLUMNS: &str = "workflow_uuid, status, name, class_name, config_
 /// selects the wrong thing. The cast is required either way: a bare `NULL` has no type for the
 /// driver to decode.
 ///
+/// **The payloads live in `workflow_input` and `workflow_output`** (migration 109), and every
+/// SDK now writes them there and nowhere else. A row written before that move has them in the
+/// legacy `workflow_status` columns instead, so each is read as the new table's value falling
+/// back to the old column, as Python, TypeScript and Java do.
+///
+/// Correlated subqueries on the two tables' primary key rather than a join: a join would put a
+/// second `workflow_uuid`, `output` and `error` in scope, and every unqualified column in
+/// [`WORKFLOW_COLUMNS`] and in `list_workflows`' filters would then be ambiguous. The subqueries
+/// keep `workflow_status` the only table in the `FROM`, so nothing else has to be qualified.
+///
 /// Order does not matter, because [`workflow_from_row`] reads columns by name.
-fn workflow_payloads(load_input: bool, load_output: bool) -> &'static str {
-    match (load_input, load_output) {
-        (true, true) => "inputs, output, error",
-        (true, false) => "inputs, NULL::text AS output, NULL::text AS error",
-        (false, true) => "NULL::text AS inputs, output, error",
-        (false, false) => "NULL::text AS inputs, NULL::text AS output, NULL::text AS error",
-    }
+fn workflow_payloads(tables: &Tables, load_input: bool, load_output: bool) -> String {
+    let inputs = if load_input {
+        payload_column(tables, PayloadColumn::Inputs)
+    } else {
+        "NULL::text AS inputs".to_owned()
+    };
+    let outcome = if load_output {
+        format!(
+            "{}, {}",
+            payload_column(tables, PayloadColumn::Output),
+            payload_column(tables, PayloadColumn::Error)
+        )
+    } else {
+        "NULL::text AS output, NULL::text AS error".to_owned()
+    };
+    format!("{inputs}, {outcome}")
+}
+
+/// One of the three payload columns a workflow carries.
+#[derive(Clone, Copy)]
+enum PayloadColumn {
+    Inputs,
+    Output,
+    Error,
+}
+
+/// A payload column as `COALESCE(<new table's value>, <legacy column>) AS <name>`, for a query
+/// whose `FROM` is `workflow_status` unaliased. See [`workflow_payloads`].
+fn payload_column(tables: &Tables, column: PayloadColumn) -> String {
+    let status = &tables.workflow_status;
+    let (table, name) = match column {
+        PayloadColumn::Inputs => (&tables.workflow_input, "inputs"),
+        PayloadColumn::Output => (&tables.workflow_output, "output"),
+        PayloadColumn::Error => (&tables.workflow_output, "error"),
+    };
+    format!(
+        "COALESCE((SELECT p.{name} FROM {table} p WHERE p.workflow_uuid = {status}.workflow_uuid), \
+         {status}.{name}) AS {name}"
+    )
 }
 
 /// Encodes the roles list for the column, which is `NULL` when there are none.
@@ -2641,8 +2707,12 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
-        let (workflow_table, pool, owner_xid) =
-            (workflow_table.as_str(), &self.pool, owner_xid.as_str());
+        let (workflow_table, input_table, pool, owner_xid) = (
+            workflow_table.as_str(),
+            self.tables.workflow_input.as_str(),
+            &self.pool,
+            owner_xid.as_str(),
+        );
 
         with_retry(&self.retry, "init_workflow", move || async move {
             // **A transaction, because the caller's record has to land with the row.**
@@ -2656,9 +2726,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             let mut tx = pool.begin().await?;
 
             // The column list is Java's INSERT, in its order, plus Python's two debounce
-            // columns. Columns absent from it are absent deliberately: `output`, `error`,
-            // `started_at`, `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited`
-            // are written by execution, forking, and the rate limiter — never at creation.
+            // columns. Columns absent from it are absent deliberately: `started_at`,
+            // `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited` are written by
+            // execution, forking, and the rate limiter — never at creation. The legacy payload
+            // columns, `inputs`, `output` and `error`, are never written at all: the input goes to
+            // `workflow_input` below, and the outcome to `workflow_output`.
             //
             // The executor re-stamp is guarded on ownership, which is a deliberate divergence.
             // On conflict the upsert would otherwise hand `executor_id` to whoever submitted
@@ -2682,7 +2754,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // exactly this, so it wants proposing upstream rather than carrying as a Rust-only
             // difference.
             let row = sqlx::query(AssertSqlSafe(format!(
-                "INSERT INTO {workflow_table} (workflow_uuid, status, inputs, \
+                "INSERT INTO {workflow_table} (workflow_uuid, status, \
                  name, class_name, config_name, \
                  queue_name, deduplication_id, priority, queue_partition_key, delay_until_epoch_ms, \
                  authenticated_user, assumed_role, authenticated_roles, \
@@ -2692,11 +2764,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                  parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
                  debounce_deadline_epoch_ms, is_debounced, application_name) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::jsonb, $27, $28, $29, $30) \
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26, $27, $28, $29) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    recovery_attempts = CASE \
                        WHEN {workflow_table}.status != 'ENQUEUED' AND {workflow_table}.status != 'DELAYED' \
-                       THEN {workflow_table}.recovery_attempts + $31 \
+                       THEN {workflow_table}.recovery_attempts + $30 \
                        ELSE {workflow_table}.recovery_attempts \
                    END, \
                    updated_at = {NOW_MS_SQL}, \
@@ -2705,7 +2777,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                        THEN {workflow_table}.executor_id \
                        WHEN {workflow_table}.owner_xid IS NULL \
                          OR {workflow_table}.owner_xid = EXCLUDED.owner_xid \
-                         OR $32 \
+                         OR $31 \
                        THEN EXCLUDED.executor_id \
                        ELSE {workflow_table}.executor_id \
                    END \
@@ -2714,7 +2786,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             )))
             .bind(workflow.workflow_id)
             .bind(initial_status.as_str())
-            .bind(workflow.input)
             .bind(workflow.name)
             .bind(workflow.class_name)
             .bind(workflow.config_name)
@@ -2824,9 +2895,35 @@ impl SystemDatabase for PostgresSystemDatabase {
                 );
             }
 
+            // Whether another attempt owns the row. The stored `owner_xid` is this attempt's
+            // exactly when this attempt created the row: the conflict arm above never rewrites it,
+            // and the identity is fresh per logical attempt — so a match is either the insert that
+            // just happened or a retry of it after a lost acknowledgement.
+            let owner_differs = stored_owner.as_deref() != Some(owner_xid);
+
+            // The input, in its own table, **only when this attempt created the row** (a retry
+            // after a lost acknowledgement writes the same input again). A submission that found
+            // an existing row must not touch its input: that is the input the workflow was
+            // recorded with, and a replay has to see it.
+            //
+            // Java gates on creation the same way; Python, TypeScript and Go write unconditionally
+            // with `ON CONFLICT DO NOTHING`, which is equivalent for a row that has its input. The
+            // upsert is for one that does not: a `workflow_input` row whose status row is gone —
+            // deleted by a writer that relied on the cascade migration 112 removed, or outlived
+            // by the retention sweep — would otherwise hand this fresh workflow a stale input.
+            if !owner_differs {
+                sqlx::query(AssertSqlSafe(format!(
+                    "INSERT INTO {input_table} (workflow_uuid, inputs) VALUES ($1, $2) \
+                     ON CONFLICT (workflow_uuid) DO UPDATE SET inputs = EXCLUDED.inputs"
+                )))
+                .bind(workflow.workflow_id)
+                .bind(workflow.input)
+                .execute(&mut *tx)
+                .await?;
+            }
+
             // Parked once it has been recovered more often than allowed — but only if some *other*
             // attempt is responsible, so a caller retrying its own attempt is not punished for it.
-            let owner_differs = stored_owner.as_deref() != Some(owner_xid);
             if let Some(limit) = max_recovery_attempts
                 && !status.is_terminal()
                 && recovery_attempts > limit + 1
@@ -2835,7 +2932,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', deduplication_id = NULL, \
-                         started_at_epoch_ms = NULL, queue_name = NULL \
+                         started_at_epoch_ms = NULL, queue_name = NULL, \
+                         updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
                      WHERE workflow_uuid = $1 AND status = 'PENDING'"
                 )))
                 .bind(workflow.workflow_id)
@@ -2897,18 +2995,19 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error> {
         let workflow_table = &self.tables.workflow_status;
+        let select = format!(
+            "SELECT {WORKFLOW_COLUMNS}, {} FROM {workflow_table} WHERE workflow_uuid = $1",
+            workflow_payloads(&self.tables, true, true)
+        );
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let (select, pool) = (select.as_str(), &self.pool);
 
         with_retry(&self.retry, "get_workflow", move || async move {
-            let row = sqlx::query(AssertSqlSafe(format!(
-                "SELECT {WORKFLOW_COLUMNS}, {} FROM {workflow_table} WHERE workflow_uuid = $1",
-                workflow_payloads(true, true)
-            )))
-            .bind(workflow_id)
-            .fetch_optional(pool)
-            .await?;
+            let row = sqlx::query(AssertSqlSafe(select))
+                .bind(workflow_id)
+                .fetch_optional(pool)
+                .await?;
 
             row.as_ref().map(workflow_from_row).transpose()
         })
@@ -2961,9 +3060,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                     let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
                     // One row reader serves every query, so a declined column is selected as a
                     // typed NULL rather than dropped.
-                    q.push(WORKFLOW_COLUMNS)
-                        .push(", ")
-                        .push(workflow_payloads(filter.load_input, filter.load_output));
+                    q.push(WORKFLOW_COLUMNS).push(", ").push(workflow_payloads(
+                        &self.tables,
+                        filter.load_input,
+                        filter.load_output,
+                    ));
                     q.push(" FROM ").push(workflow_table);
 
                     // `separated(" AND ")` writes the separator only between clauses, so neither a
@@ -3163,11 +3264,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         outcome: Outcome<'_>,
     ) -> Result<OutcomeWrite, Error> {
-        let workflow_table = &self.tables.workflow_status;
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        let (workflow_table, output_table, pool) = (
+            self.tables.workflow_status.as_str(),
+            self.tables.workflow_output.as_str(),
+            &self.pool,
+        );
         let (output, error) = outcome.columns();
 
         with_retry(&self.retry, "record_workflow_outcome", move || async move {
+            let mut tx = pool.begin().await?;
+
             // The `status = 'PENDING'` predicate is the whole mechanism: an executor that has
             // been presumed dead and superseded finds zero rows updated, and learns it lost
             // rather than clobbering the winner's result. It also makes this retry-safe — a
@@ -3176,29 +3282,48 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Finishing releases the deduplication key, as it does in all four implementations.
             // The unique index spans every status, so a key left on a finished row would be
             // held forever and nothing could ever be submitted under it again.
+            //
+            // The legacy `output` and `error` columns are cleared rather than left alone. Readers
+            // fall back to them column by column, so a workflow that failed under the old layout
+            // and then succeeded — resumed, say — would otherwise go on reporting its old error
+            // beside its new output.
             let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET status = $2, output = $3, error = $4, \
+                "UPDATE {workflow_table} SET status = $2, output = NULL, error = NULL, \
                  updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}, \
                  deduplication_id = NULL \
                  WHERE workflow_uuid = $1 AND status = 'PENDING'"
             )))
             .bind(workflow_id)
             .bind(outcome.status().as_str())
-            .bind(output)
-            .bind(error)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
 
-            Ok(if updated > 0 {
-                OutcomeWrite::Recorded
-            } else {
+            if updated == 0 {
                 tracing::debug!(
                     workflow_id,
                     "outcome not recorded; the workflow is no longer this run's to finish"
                 );
-                OutcomeWrite::AlreadyFinished
-            })
+                // Nothing written, so nothing to commit; dropping the transaction rolls it back.
+                return Ok(OutcomeWrite::AlreadyFinished);
+            }
+
+            // The payload, in its own table and the same transaction, and only behind a status
+            // change that landed: an outcome that was refused leaves no orphan row behind. An
+            // upsert because a resumed or rewound workflow finishes more than once.
+            sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO {output_table} (workflow_uuid, output, error) VALUES ($1, $2, $3) \
+                 ON CONFLICT (workflow_uuid) DO UPDATE \
+                 SET output = EXCLUDED.output, error = EXCLUDED.error"
+            )))
+            .bind(workflow_id)
+            .bind(output)
+            .bind(error)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(OutcomeWrite::Recorded)
         })
         .await
     }
@@ -3213,10 +3338,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         // Four columns and the attempt count, not the whole row: this runs once per interval for
         // as long as the caller waits, where `get_workflow` reads thirty-odd columns to answer a
-        // question about one. Python reads the same narrow set for the same reason.
+        // question about one. Python reads the same narrow set for the same reason. The outcome
+        // is read the way `get_workflow` reads it — see `workflow_payloads`.
         let select = format!(
-            "SELECT status, output, error, serialization, recovery_attempts \
-             FROM {workflow_table} WHERE workflow_uuid = $1"
+            "SELECT status, {}, {}, serialization, recovery_attempts \
+             FROM {workflow_table} WHERE workflow_uuid = $1",
+            payload_column(&self.tables, PayloadColumn::Output),
+            payload_column(&self.tables, PayloadColumn::Error),
         );
         let select = &select;
         let polling = &self.polling;
@@ -3253,9 +3381,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                         }),
                         WorkflowStatus::Error => Some(AwaitedOutcome::Failed {
                             // A failed workflow with no error is a row no implementation writes:
-                            // the status and the payload are set by one statement. Reported rather
-                            // than turned into an empty message, which a caller would try to
-                            // deserialize.
+                            // the status and the payload are set in one transaction. Reported
+                            // rather than turned into an empty message, which a caller would try
+                            // to deserialize.
                             error: row.try_get::<Option<String>, _>("error")?.ok_or_else(|| {
                                 Error::Malformed(format!(
                                     "workflow {workflow_id} failed with no error recorded"
@@ -3799,19 +3927,19 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // A workflow cannot delete itself, and cannot delete an ancestor whose tree it is inside.
         // The checkpoint for this step is written to `operation_outputs` in the same transaction as
-        // the delete, and migration 1's foreign key points it at the `workflow_status` row the
-        // cascade has just removed — so the insert violates the key and takes the delete down with
-        // it. Refused here, before either statement runs, because the alternative is a foreign key
-        // violation surfacing as a backend error with nothing in it a caller could act on.
+        // the delete, so it would land as an orphan of the status row the delete just removed, and
+        // the workflow would go on running with no row to record its outcome on. (Before migration
+        // 112 dropped the foreign key, the same insert failed outright and took the delete down
+        // with it.) Refused here, before anything runs, so the caller hears why.
         //
         // Only the caller's own id is checked, not its ancestry: an ancestor is a target only when
         // it was named with `delete_children`, and then the walk above has already put the caller
         // in `targets`. A parent deleted on its own leaves this workflow's row alone.
         //
         // TODO(dbos-team): UPSTREAM item 25. The other three implementations write the same
-        // checkpoint against the same foreign key and none of them refuses the call, so a
-        // self-delete from inside a workflow fails there too — Python and TypeScript with the
-        // delete already committed and the checkpoint failing behind it, which is worse than this.
+        // checkpoint and none of them refuses the call. Against the foreign key a self-delete
+        // failed there too — Python and TypeScript with the delete already committed and the
+        // checkpoint failing behind it — and without it, it succeeds and leaves the orphan.
         // Whether a workflow may delete itself at all is the cross-implementation question; this
         // refusal is the conservative reading, and is Rust alone until the four agree.
         if let Some((caller_id, _)) = caller
@@ -3826,28 +3954,43 @@ impl SystemDatabase for PostgresSystemDatabase {
             });
         }
 
-        let workflow_table = self.tables.workflow_status.as_str();
+        let tables = &self.tables;
         let targets = targets.as_slice();
         let started_at = Timestamp::now();
 
         with_retry(&self.retry, "delete_workflows", move || async move {
-            self.run_single_statement_step(
+            self.run_transactional_step(
                 caller,
                 step_names::DELETE_WORKFLOW,
                 started_at,
-                |mut conn| async move {
-                    // Steps, notifications, events, and streams go with the row: every child
-                    // table declares `ON DELETE CASCADE` on this foreign key, from migration 1
-                    // onward.
+                |mut tx| async move {
+                    // Steps and the two payload tables are deleted by id. None of the three has a
+                    // foreign key to `workflow_status` any more — the payload tables never had one,
+                    // and migration 112 dropped the steps' — so the status delete no longer takes
+                    // them with it. Notifications, events, their history and streams still
+                    // declare `ON DELETE CASCADE`, and go with the row.
+                    for table in [
+                        &tables.workflow_input,
+                        &tables.workflow_output,
+                        &tables.operation_outputs,
+                    ] {
+                        sqlx::query(AssertSqlSafe(format!(
+                            "DELETE FROM {table} WHERE workflow_uuid = ANY($1)"
+                        )))
+                        .bind(targets)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    let workflow_table = &tables.workflow_status;
                     let deleted = sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
                     )))
                     .bind(targets)
-                    .execute(&mut *conn)
+                    .execute(&mut *tx)
                     .await?
                     .rows_affected();
                     tracing::debug!(deleted, targets = targets.len(), "deleted workflows");
-                    Ok((conn, deleted))
+                    Ok((tx, deleted))
                 },
             )
             .await
@@ -6073,6 +6216,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<Debounce, Error> {
         request.validate()?;
         let workflow_table = self.tables.workflow_status.as_str();
+        let input_table = self.tables.workflow_input.as_str();
         let application_name = request
             .application_name
             .or(self.application_name.as_deref());
@@ -6105,6 +6249,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                         // each other's inputs; without `is_debounced`, an ordinary deduplicated
                         // enqueue would be silently rescheduled.
                         //
+                        // The new inputs are written separately, to `workflow_input`, once this
+                        // has found the workflow — see below.
+                        //
                         // `application_name` is claimed for the target the way its dequeue would:
                         // left unclaimed, every peer coalesces onto the one workflow and the last
                         // inputs win.
@@ -6120,14 +6267,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                                      THEN debounce_deadline_epoch_ms \
                                      ELSE $4 \
                                  END, \
-                                 inputs = $5, serialization = $6, \
+                                 serialization = $5, \
                                  updated_at = {NOW_MS_SQL}, \
-                                 application_name = COALESCE(application_name, $7) \
+                                 application_name = COALESCE(application_name, $6) \
                              WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
-                               AND class_name IS NOT DISTINCT FROM $8 \
-                               AND config_name IS NOT DISTINCT FROM $9 \
+                               AND class_name IS NOT DISTINCT FROM $7 \
+                               AND config_name IS NOT DISTINCT FROM $8 \
                                AND status = 'DELAYED' AND is_debounced = TRUE \
-                               AND ($7::text IS NULL OR application_name = $7 \
+                               AND ($6::text IS NULL OR application_name = $6 \
                                     OR application_name IS NULL) \
                              RETURNING workflow_uuid"
                         )))
@@ -6135,7 +6282,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(request.queue_name)
                         .bind(request.deduplication_id)
                         .bind(request.delay_until.as_epoch_ms())
-                        .bind(request.inputs)
                         .bind(request.serialization)
                         .bind(application_name)
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL
@@ -6146,6 +6292,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .await?;
 
                         if let Some(workflow_id) = bounced {
+                            // The bounce replaces the held workflow's inputs, which readers find in
+                            // `workflow_input` before the legacy column — so that is where they go,
+                            // or a reader would go on running the inputs of the first request. An
+                            // upsert, because a workflow enqueued before migration 109 has no row.
+                            sqlx::query(AssertSqlSafe(format!(
+                                "INSERT INTO {input_table} (workflow_uuid, inputs) VALUES ($1, $2) \
+                                 ON CONFLICT (workflow_uuid) DO UPDATE SET inputs = EXCLUDED.inputs"
+                            )))
+                            .bind(&workflow_id)
+                            .bind(request.inputs)
+                            .execute(&mut *tx)
+                            .await?;
                             return Ok((tx, Debounce::Bounced { workflow_id }));
                         }
 

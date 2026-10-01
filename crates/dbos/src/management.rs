@@ -146,9 +146,9 @@ pub enum Children {
     ///
     /// The walk is the system database's, and the two operations walk differently on purpose:
     /// cancelling interleaves level by level, which narrows the window a parent can spawn behind
-    /// the sweep in, while deleting collects the whole tree first — the cascade does in one
-    /// statement what cancelling needs one per level for. Neither closes the window: a child
-    /// committed after the walk has passed its level survives, in both.
+    /// the sweep in, while deleting collects the whole tree first and removes it in one
+    /// transaction, where cancelling needs a statement per level. Neither closes the window: a
+    /// child committed after the walk has passed its level survives, in both.
     Include,
 }
 
@@ -276,8 +276,8 @@ impl DBOS {
     /// two halves of a checkpointed management call are combined: the step id comes from the
     /// ambient workflow's counter and the checkpoint is written through *this* instance's system
     /// database, so a handle to some other instance would write the row where the workflow that
-    /// allocated the id cannot see it — and, since `operation_outputs` carries a foreign key onto
-    /// `workflow_status` from migration 1 onward, usually cannot write it at all.
+    /// allocated the id cannot see it, usually as an orphan, since that database has no such
+    /// workflow.
     /// [`get_event`](Self::get_event) and [`WorkflowRef::parent`](crate::WorkflowRef) refuse the
     /// same combination for the same reason. Inside a step there is nothing to refuse: nothing is
     /// checkpointed, so the two halves are never combined and the call is plain whichever
@@ -663,8 +663,8 @@ impl DBOS {
 
     /// Removes a workflow and everything recorded against it.
     ///
-    /// Steps, events, messages and streams go with the row — the schema cascades — so this is not
-    /// a status change and there is nothing left to resume. [`cancel`](Self::cancel) is the form
+    /// Steps, inputs, outcome, events, messages and streams go with the row, so this is not a
+    /// status change and there is nothing left to resume. [`cancel`](Self::cancel) is the form
     /// that stops a workflow and keeps it.
     ///
     /// **No status guard, deliberately.** A running workflow is deleted like any other: naming an
@@ -700,8 +700,7 @@ impl DBOS {
     /// Returns how many rows went, descendants included.
     ///
     /// Unlike [`cancel_all`](Self::cancel_all), the tree is collected first and deleted in one
-    /// statement rather than level by level — the schema's cascade does what cancelling needs a
-    /// statement per level for.
+    /// transaction rather than level by level.
     ///
     /// **A tree that is still running can outlive the walk.** A child committed after the walk
     /// has read its parent's level is not in the target set, and survives with
@@ -711,8 +710,9 @@ impl DBOS {
     ///
     /// **A workflow cannot delete itself, or an ancestor it would go down with.** From inside a
     /// workflow this call is a step, and the step's checkpoint is written in the same transaction
-    /// as the delete — against a row the cascade has just removed. Rather than let that fail as a
-    /// foreign key violation, a target set containing the calling workflow is refused whole:
+    /// as the delete — for a row the delete has just removed, leaving an orphan checkpoint and a
+    /// workflow running with no row to finish on. So a target set containing the calling
+    /// workflow is refused whole:
     /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is deleted. Deleting the
     /// caller's own tree from outside it, or deleting an unrelated tree from inside a workflow,
     /// is unaffected.

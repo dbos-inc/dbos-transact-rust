@@ -1726,12 +1726,12 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
     dbos.shutdown().await;
 }
 
-/// **A workflow cannot delete itself, and is told so rather than failing on a foreign key.**
+/// **A workflow cannot delete itself, and is told so.**
 ///
 /// From inside a workflow the delete is a step, and the step's checkpoint lands in
-/// `operation_outputs` in the same transaction — pointed by migration 1's foreign key at the
-/// `workflow_status` row the cascade has just removed. The refusal is what keeps that from
-/// surfacing as a constraint violation with the delete rolled back under it.
+/// `operation_outputs` in the same transaction — for the `workflow_status` row the delete has just
+/// removed. Allowed, it would leave an orphan checkpoint and a workflow running with no row to
+/// finish on.
 #[tokio::test]
 async fn a_workflow_cannot_delete_itself() {
     let db = test_database().await;
@@ -1842,8 +1842,8 @@ async fn a_workflow_cannot_delete_an_ancestors_tree() {
 /// The third place [`Error::WrongInstance`] is reachable from, and it is here for the reason the
 /// other two are: the step id comes from *this* workflow's counter while the checkpoint is written
 /// through the other instance's system database, landing where the workflow that allocated it
-/// cannot see it — and `operation_outputs` carries a foreign key onto `workflow_status`, so
-/// usually it cannot be written at all. `DBOS::get_event` refuses the same combination, and
+/// cannot see it — usually as an orphan, since the other instance's database has no such
+/// workflow. `DBOS::get_event` refuses the same combination, and
 /// `WorkflowRef::parent` refuses it for starting a child.
 ///
 /// The second half of the test is the leaf rule: from inside a *step* nothing is checkpointed, so
@@ -2303,6 +2303,134 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
             .expect("read failed")
             .is_none(),
         "a fork was written even though the call was refused",
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **No workflow write reaches the legacy payload columns.**
+///
+/// Every kind of workflow this crate writes — run directly, enqueued and dequeued, started as a
+/// child, failed, and forked — and then a sweep of the whole database: no `workflow_status` row
+/// carries `inputs`, `output` or `error`, and every workflow has its input in `workflow_input`.
+/// A sweep rather than a check per call, so a write path added later that forgets the payload
+/// tables fails here without anyone having to remember to test it.
+#[tokio::test]
+async fn no_workflow_write_reaches_the_legacy_payload_columns() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("legacy-sweep-app", &db));
+    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+    #[error("this workflow always fails")]
+    struct Boom;
+
+    let doubles = dbos
+        .register_workflow("doubles", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let fails = dbos
+        .register_workflow("fails", |()| async move {
+            Err(Boom)?;
+            Ok::<(), dbos::Error<Boom>>(())
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let doubles = doubles.clone();
+            move |()| {
+                let doubles = doubles.clone();
+                async move { doubles.start(5).await?.result().await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "sweep-queue",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    let direct = doubles
+        .run_with(
+            1,
+            dbos::RunOptions {
+                workflow_id: Some("sweep-direct"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the direct run failed");
+    assert_eq!(direct, 2);
+
+    let queued = doubles
+        .start_with(
+            2,
+            StartOptions {
+                workflow_id: Some("sweep-queued"),
+                queue: Some(Enqueue::new("sweep-queue")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    assert_eq!(queued.result().await.expect("the queued run failed"), 4);
+
+    assert_eq!(parent.run(()).await.expect("the parent failed"), 10);
+    assert!(
+        fails.run(()).await.is_err(),
+        "the failing workflow succeeded"
+    );
+
+    let forked = dbos
+        .fork::<u32, EngineOnly>("sweep-direct", ForkFrom::Beginning)
+        .await
+        .expect("fork failed");
+    assert_eq!(forked.result().await.expect("the fork failed"), 2);
+
+    let pool = db.pool().await;
+    let workflows: i64 = sqlx::query_scalar(r#"SELECT count(*) FROM "dbos"."workflow_status""#)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Direct, queued, parent, its child, the failure and the fork.
+    assert_eq!(workflows, 6, "the sweep should cover every kind of write");
+
+    let legacy: Vec<String> = sqlx::query_scalar(
+        r#"SELECT workflow_uuid FROM "dbos"."workflow_status"
+           WHERE inputs IS NOT NULL OR output IS NOT NULL OR error IS NOT NULL"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        legacy.is_empty(),
+        "payloads written to workflow_status: {legacy:?}"
+    );
+
+    let without_input: Vec<String> = sqlx::query_scalar(
+        r#"SELECT s.workflow_uuid FROM "dbos"."workflow_status" s
+           LEFT JOIN "dbos"."workflow_input" i ON i.workflow_uuid = s.workflow_uuid
+           WHERE i.workflow_uuid IS NULL"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        without_input.is_empty(),
+        "workflows with no workflow_input row: {without_input:?}"
+    );
+
+    let finished_without_output: Vec<String> = sqlx::query_scalar(
+        r#"SELECT s.workflow_uuid FROM "dbos"."workflow_status" s
+           LEFT JOIN "dbos"."workflow_output" o ON o.workflow_uuid = s.workflow_uuid
+           WHERE s.status IN ('SUCCESS', 'ERROR') AND o.workflow_uuid IS NULL"#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        finished_without_output.is_empty(),
+        "finished workflows with no workflow_output row: {finished_without_output:?}"
     );
 
     dbos.shutdown().await;

@@ -15,7 +15,7 @@
 //!   render with [`render`]. Single braces are literal, so `'{}'::JSON` and plpgsql's own
 //!   `%s` format strings need no escaping.
 //! - Give whole files to the driver. Splitting statements on `;` breaks the `$$`-quoted blocks
-//!   in migrations 1, 14, 38, 39, and 105.
+//!   in migrations 1, 14, 38, 39, 105, and 113.
 //!
 //! Applying the corpus to both backends is what verifies it; reading the SQL is not enough.
 
@@ -362,6 +362,33 @@ sources![
         Applies::Always
     ),
     (108, "108_add_queue_partition_limits.sql", Applies::Always),
+    (109, "109_add_workflow_payload_tables.sql", Applies::Always),
+    (
+        110,
+        "110_add_operation_outputs_retention_timestamp.sql",
+        Applies::Always
+    ),
+    (
+        111,
+        "111_add_operation_outputs_retention_index.sql",
+        Applies::Always
+    ),
+    (
+        112,
+        "112_drop_operation_outputs_workflow_fk.sql",
+        Applies::Always
+    ),
+    (113, "113_enqueue_workflow_input_table.sql", Applies::Always),
+    (
+        113,
+        "113_set_enqueue_workflow_search_path.sql",
+        Applies::Postgres
+    ),
+    (
+        114,
+        "114_drop_duplicate_notifications_index.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -410,7 +437,7 @@ pub const LOCAL_MIGRATIONS: u32 = 47;
 pub const SHARED_MIGRATION_BASE: u32 = 100;
 
 /// The highest migration defined here, and the version a fully migrated database records.
-pub const SHARED_MIGRATIONS: u32 = 108;
+pub const SHARED_MIGRATIONS: u32 = 114;
 
 /// Which SQL dialect the system database speaks.
 ///
@@ -626,12 +653,13 @@ mod tests {
         //
         // 100 to 107 are all about `application_name`, the column the series was opened to add;
         // 108 is the first that is not, so the assertion is what the padding check needs — that
-        // the shared numbers do work — rather than what they happen to work on.
+        // the shared numbers do work — rather than what they happen to work on. 114 only drops an
+        // index, which is why `DROP` counts.
         for version in SHARED_MIGRATION_BASE..=SHARED_MIGRATIONS {
             let m = &migrations[version as usize - 1];
             assert_eq!(m.version, version);
             assert!(
-                m.sql.contains("ALTER TABLE") || m.sql.contains("CREATE"),
+                m.sql.contains("ALTER TABLE") || m.sql.contains("CREATE") || m.sql.contains("DROP"),
                 "migration {version} should carry the shared series' work",
             );
         }
@@ -639,9 +667,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 62 files: 61 the runner applies, plus the migration-10 probe, which is bound
+        // 69 files: 68 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 61);
+        assert_eq!(SOURCES.len(), 68);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -656,12 +684,12 @@ mod tests {
             "the corpus should cover its own history and the shared series, and nothing between",
         );
 
-        // Five files share a version with another: the LISTEN/NOTIFY halves of migrations 1
-        // and 20, the CockroachDB form of 28, and the search-path halves of 38 and 105.
+        // Six files share a version with another: the LISTEN/NOTIFY halves of migrations 1
+        // and 20, the CockroachDB form of 28, and the search-path halves of 38, 105 and 113.
         assert_eq!(
             SOURCES.len() - versions.len(),
-            5,
-            "expected 5 variant files"
+            6,
+            "expected 6 variant files"
         );
     }
 
@@ -717,7 +745,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 60, "expected 60 files to carry a numbered header");
+        assert_eq!(checked, 67, "expected 67 files to carry a numbered header");
     }
 
     #[test]
@@ -729,7 +757,7 @@ mod tests {
         assert_eq!(
             online,
             [
-                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47, 107
+                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47, 107, 111, 114
             ],
         );
         // 106 is the counterexample in the shared series: an index whose predicate matches
@@ -962,6 +990,7 @@ mod tests {
             "38_update_enqueue_workflow.sql",
             "39_create_streams_trigger.sql",
             "105_enqueue_workflow_application_name.sql",
+            "113_enqueue_workflow_input_table.sql",
         ];
         let found: Vec<&str> = SOURCES
             .iter()
