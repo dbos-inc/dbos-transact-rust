@@ -1726,12 +1726,12 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
     dbos.shutdown().await;
 }
 
-/// **A workflow cannot delete itself, and is told so rather than failing on a foreign key.**
+/// **A workflow cannot delete itself, and is told so.**
 ///
 /// From inside a workflow the delete is a step, and the step's checkpoint lands in
-/// `operation_outputs` in the same transaction — pointed by migration 1's foreign key at the
-/// `workflow_status` row the cascade has just removed. The refusal is what keeps that from
-/// surfacing as a constraint violation with the delete rolled back under it.
+/// `operation_outputs` in the same transaction — for the `workflow_status` row the delete has just
+/// removed. Allowed, it would leave an orphan checkpoint and a workflow running with no row to
+/// finish on.
 #[tokio::test]
 async fn a_workflow_cannot_delete_itself() {
     let db = test_database().await;
@@ -1842,8 +1842,8 @@ async fn a_workflow_cannot_delete_an_ancestors_tree() {
 /// The third place [`Error::WrongInstance`] is reachable from, and it is here for the reason the
 /// other two are: the step id comes from *this* workflow's counter while the checkpoint is written
 /// through the other instance's system database, landing where the workflow that allocated it
-/// cannot see it — and `operation_outputs` carries a foreign key onto `workflow_status`, so
-/// usually it cannot be written at all. `DBOS::get_event` refuses the same combination, and
+/// cannot see it — usually as an orphan, since the other instance's database has no such
+/// workflow. `DBOS::get_event` refuses the same combination, and
 /// `WorkflowRef::parent` refuses it for starting a child.
 ///
 /// The second half of the test is the leaf rule: from inside a *step* nothing is checkpointed, so

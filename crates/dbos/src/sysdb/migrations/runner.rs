@@ -336,14 +336,14 @@ pub async fn run(
 /// what lets implementations at different versions share one database: the schema only ever
 /// gains, so a newer one still has everything these queries name.
 ///
-/// **The bar is [`SHARED_MIGRATIONS`], not this implementation's own history.** Everything the
-/// corpus defines is something some statement here names — `QUEUE_COLUMNS` selects
-/// `application_name` from migration 101 and the per-partition limits from 108 — so a database
-/// that stopped short of the ceiling is one this build cannot read, whatever it can parse. The
-/// distinction matters because the shared series has migrations **Go and Java** have not ported —
-/// Python and TypeScript run past this build's ceiling, both of those stop at 107 — so a peer
-/// that migrated to 107 and stopped leaves a database that would pass any lower bar and then
-/// fail on the first queue read.
+/// **The bar is [`SHARED_MIGRATIONS`], not this implementation's own history.** Most of the shared
+/// series is something some statement here names — `QUEUE_COLUMNS` selects `application_name`
+/// from migration 101 and the per-partition limits from 108, and every payload read and write
+/// goes through migration 109's tables — so a database that stopped short of the ceiling is one
+/// this build cannot be sure of reading, whatever it can parse. The distinction matters because
+/// the SDKs reach the series at different paces: a database another implementation's older
+/// release migrated (Java 1.1 stops at 112, Go 1.4 at 113) is turned away here rather than read
+/// on the assumption that the missing migrations do not matter.
 pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
     let required = i64::from(SHARED_MIGRATIONS);
     let recorded = match recorded_version(pool, schema).await {

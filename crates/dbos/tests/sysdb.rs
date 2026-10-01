@@ -2667,12 +2667,16 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
     assert!(sys.get_workflow("wf-gone").await.unwrap().is_none());
     assert!(sys.get_workflow("wf-gone-kid").await.unwrap().is_some());
 
-    // The step went with the row: the foreign key cascades, so no second delete is needed.
+    // The step went with the row, though nothing cascades to it any more: the delete names
+    // `operation_outputs` itself.
     let steps = sys
         .list_workflow_steps("wf-gone", true, None, None, None)
         .await
         .unwrap();
-    assert!(steps.is_empty(), "operation_outputs should cascade");
+    assert!(
+        steps.is_empty(),
+        "operation_outputs should be deleted with the workflow"
+    );
 
     // With the flag, descendants go too.
     for (id, parent) in [
@@ -10915,4 +10919,351 @@ async fn a_replayed_bounce_reports_the_original_holder() {
         replayed, first,
         "the recorded holder is reported, not one re-read after it changed",
     );
+}
+
+// --- Payload tables (migration 109) ------------------------------------------------------------
+
+/// How many rows `table` holds for `workflow_id`.
+async fn rows_for(pool: &sqlx::PgPool, table: &str, workflow_id: &str) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        r#"SELECT count(*) FROM "dbos"."{table}" WHERE workflow_uuid = $1"#
+    )))
+    .bind(workflow_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The legacy `workflow_status` payload columns for `workflow_id`.
+async fn legacy_payloads(
+    pool: &sqlx::PgPool,
+    workflow_id: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    sqlx::query_as(
+        r#"SELECT inputs, output, error FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+    )
+    .bind(workflow_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Inserts a finished workflow row the way the other SDKs now write one: no payload on
+/// `workflow_status`, the input in `workflow_input` and the outcome in `workflow_output`.
+async fn seed_payload_table_row(pool: &sqlx::PgPool, workflow_id: &str) {
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, serialization)
+           VALUES ($1, 'SUCCESS', 'checkout', 'portable_json')"#,
+    )
+    .bind(workflow_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(r#"INSERT INTO "dbos"."workflow_input" (workflow_uuid, inputs) VALUES ($1, $2)"#)
+        .bind(workflow_id)
+        .bind(r#"{"positionalArgs":[7],"namedArgs":{}}"#)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_output" (workflow_uuid, output, error)
+           VALUES ($1, $2, NULL)"#,
+    )
+    .bind(workflow_id)
+    .bind("\"shipped\"")
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A row whose payloads live only in the new tables — what Python, TypeScript and Java write —
+/// reads back through every reader: the single read, the list, and the result wait.
+#[tokio::test]
+async fn payloads_in_the_payload_tables_are_read() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    seed_payload_table_row(&pool, "wf-peer").await;
+
+    let read = sys.get_workflow("wf-peer").await.unwrap().unwrap();
+    assert_eq!(
+        read.input.as_deref(),
+        Some(r#"{"positionalArgs":[7],"namedArgs":{}}"#)
+    );
+    assert_eq!(read.output.as_deref(), Some("\"shipped\""));
+    assert_eq!(read.error, None);
+
+    let listed = &sys
+        .list_workflows(&WorkflowFilter::default(), None)
+        .await
+        .unwrap()[0];
+    assert_eq!(listed.input, read.input);
+    assert_eq!(listed.output, read.output);
+
+    match sys
+        .await_workflow_result("wf-peer", BRISK_POLL, true)
+        .await
+        .unwrap()
+    {
+        AwaitedOutcome::Succeeded { output, .. } => {
+            assert_eq!(output.as_deref(), Some("\"shipped\""));
+        }
+        other => panic!("expected a success, got {other:?}"),
+    }
+}
+
+/// A row written before migration 109, payloads on `workflow_status` and nothing in the new
+/// tables, still reads back: every reader falls back to the legacy columns.
+#[tokio::test]
+async fn payloads_in_the_legacy_columns_are_still_read() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, inputs, error)
+           VALUES ('wf-legacy', 'ERROR', 'checkout', '"old input"', '"old error"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let read = sys.get_workflow("wf-legacy").await.unwrap().unwrap();
+    assert_eq!(read.input.as_deref(), Some("\"old input\""));
+    assert_eq!(read.error.as_deref(), Some("\"old error\""));
+
+    match sys
+        .await_workflow_result("wf-legacy", BRISK_POLL, true)
+        .await
+        .unwrap()
+    {
+        AwaitedOutcome::Failed { error, .. } => assert_eq!(error, "\"old error\""),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+/// Starting a workflow and finishing it write the payloads to the new tables and nothing to the
+/// legacy columns, so a peer that reads only the new tables sees them.
+#[tokio::test]
+async fn payloads_are_written_to_the_payload_tables() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.init_workflow(&workflow("wf-new"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    assert_eq!(rows_for(&pool, "workflow_input", "wf-new").await, 1);
+    assert_eq!(legacy_payloads(&pool, "wf-new").await, (None, None, None));
+
+    let outcome = sys
+        .record_workflow_outcome("wf-new", Outcome::Output(Some("\"done\"")))
+        .await
+        .unwrap();
+    assert_eq!(outcome, OutcomeWrite::Recorded);
+    let stored: (Option<String>, Option<String>) = sqlx::query_as(
+        r#"SELECT output, error FROM "dbos"."workflow_output" WHERE workflow_uuid = 'wf-new'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, (Some("\"done\"".to_owned()), None));
+    assert_eq!(legacy_payloads(&pool, "wf-new").await, (None, None, None));
+}
+
+/// Resubmitting an existing workflow leaves its recorded input alone: that is the input it ran
+/// with, and a replay has to see it.
+#[tokio::test]
+async fn a_resubmission_does_not_replace_the_input() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-same"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    let again = NewWorkflow {
+        input: Some("\"something else\""),
+        ..workflow("wf-same")
+    };
+    sys.init_workflow(&again, None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let read = sys.get_workflow("wf-same").await.unwrap().unwrap();
+    assert_eq!(read.input, workflow("wf-same").input.map(str::to_owned));
+}
+
+/// A `workflow_input` row left behind by a status row that is gone does not leak into a fresh
+/// workflow started under the same id.
+#[tokio::test]
+async fn a_fresh_start_replaces_an_orphaned_input() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_input" (workflow_uuid, inputs)
+           VALUES ('wf-reused', '"stale"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sys.init_workflow(&workflow("wf-reused"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    let read = sys.get_workflow("wf-reused").await.unwrap().unwrap();
+    assert_eq!(read.input, workflow("wf-reused").input.map(str::to_owned));
+}
+
+/// An outcome the status guard refuses writes no payload: the workflow is no longer this run's
+/// to finish, and the winner's result is the only one readers should find.
+#[tokio::test]
+async fn a_refused_outcome_writes_no_payload() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.init_workflow(&workflow("wf-cancelled"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    sys.cancel_workflows(&["wf-cancelled"], false, None)
+        .await
+        .unwrap();
+
+    let outcome = sys
+        .record_workflow_outcome("wf-cancelled", Outcome::Output(Some("\"late\"")))
+        .await
+        .unwrap();
+    assert_eq!(outcome, OutcomeWrite::AlreadyFinished);
+    assert_eq!(rows_for(&pool, "workflow_output", "wf-cancelled").await, 0);
+}
+
+/// A workflow that failed under the legacy layout and then succeeded reports its new output and
+/// no error: readers fall back column by column, so the old error must not survive.
+#[tokio::test]
+async fn a_new_outcome_hides_a_legacy_one() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    // Pending again, as a resume leaves it, but still carrying the error its first run wrote to
+    // the legacy column.
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, error)
+           VALUES ('wf-retried', 'PENDING', 'checkout', '"first run failed"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sys.record_workflow_outcome("wf-retried", Outcome::Output(Some("\"second run\"")))
+        .await
+        .unwrap();
+    let read = sys.get_workflow("wf-retried").await.unwrap().unwrap();
+    assert_eq!(read.output.as_deref(), Some("\"second run\""));
+    assert_eq!(read.error, None, "the legacy error must not show through");
+}
+
+/// A fork carries its source's input into `workflow_input` under the fork's id, whether the
+/// source's input is in the new table or only in the legacy column.
+#[tokio::test]
+async fn a_fork_copies_the_input_to_the_payload_table() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    seed_payload_table_row(&pool, "wf-src-new").await;
+    sqlx::query(
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, inputs)
+           VALUES ('wf-src-old', 'SUCCESS', 'checkout', '"legacy input"')"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let forks = [
+        Fork {
+            forked_id: Some("wf-fork-new"),
+            ..Fork::new("wf-src-new")
+        },
+        Fork {
+            forked_id: Some("wf-fork-old"),
+            ..Fork::new("wf-src-old")
+        },
+    ];
+    sys.fork_workflows(&forks, &ForkOptions::default(), None)
+        .await
+        .unwrap();
+
+    for (fork, expected) in [
+        ("wf-fork-new", r#"{"positionalArgs":[7],"namedArgs":{}}"#),
+        ("wf-fork-old", "\"legacy input\""),
+    ] {
+        assert_eq!(rows_for(&pool, "workflow_input", fork).await, 1, "{fork}");
+        assert_eq!(legacy_payloads(&pool, fork).await.0, None, "{fork}");
+        let read = sys.get_workflow(fork).await.unwrap().unwrap();
+        assert_eq!(read.input.as_deref(), Some(expected), "{fork}");
+    }
+}
+
+/// Deleting a workflow removes its payload rows and steps too. None of the three cascades from
+/// `workflow_status` any more, so the delete has to name them.
+#[tokio::test]
+async fn deleting_a_workflow_removes_its_payloads_and_steps() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.init_workflow(
+        &workflow("wf-doomed-payload"),
+        None,
+        Submission::Fresh,
+        None,
+    )
+    .await
+    .unwrap();
+    sys.record_step(
+        "wf-doomed-payload",
+        0,
+        "charge",
+        Outcome::Output(None),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    sys.record_workflow_outcome("wf-doomed-payload", Outcome::Output(Some("1")))
+        .await
+        .unwrap();
+
+    sys.delete_workflows(&["wf-doomed-payload"], false, None)
+        .await
+        .unwrap();
+    for table in [
+        "workflow_status",
+        "workflow_input",
+        "workflow_output",
+        "operation_outputs",
+    ] {
+        assert_eq!(
+            rows_for(&pool, table, "wf-doomed-payload").await,
+            0,
+            "{table} kept a row"
+        );
+    }
+}
+
+/// A bounce writes the new inputs where readers look first, and leaves the legacy column alone.
+#[tokio::test]
+async fn a_bounce_writes_the_inputs_to_the_payload_table() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    let delay = std::time::Duration::from_secs(3600);
+    enqueue_debounced(&sys, "wf-held", "checkout", "key-1", delay, None).await;
+
+    let bounced = sys
+        .debounce_delayed_workflow(
+            &bounce(
+                "checkout",
+                "key-1",
+                Timestamp::now().checked_add(delay).unwrap(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(bounced, Debounce::Bounced { .. }));
+
+    let stored: Option<String> = sqlx::query_scalar(
+        r#"SELECT inputs FROM "dbos"."workflow_input" WHERE workflow_uuid = 'wf-held'"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some("\"later\""));
+    assert_eq!(legacy_payloads(&pool, "wf-held").await.0, None);
 }
