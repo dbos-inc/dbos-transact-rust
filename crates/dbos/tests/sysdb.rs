@@ -1471,6 +1471,22 @@ async fn every_filter_narrows() {
             &["wf-c"],
         ),
         (
+            "is_fork",
+            F {
+                is_fork: Some(true),
+                ..F::default()
+            },
+            &["wf-c"],
+        ),
+        (
+            "is_fork = false",
+            F {
+                is_fork: Some(false),
+                ..F::default()
+            },
+            &["wf-a", "wf-b", "wf-d", "other-100%-done"],
+        ),
+        (
             "was_forked_from",
             F {
                 was_forked_from: Some(true),
