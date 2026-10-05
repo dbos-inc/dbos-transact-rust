@@ -27,12 +27,15 @@ pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
 /// another — it is a cross-SDK constant, not an encoding this layer is free to change.
 pub const NULL_TOPIC: &str = "__null__topic__";
 
-/// The value written to a stream to mark it closed.
+/// The value written to a stream to mark it closed, as stored: the string
+/// `__DBOS_STREAM_CLOSED__` encoded as portable JSON, quotes included.
 ///
 /// A sentinel entry rather than a column, so closing is an ordinary append and a reader learns
-/// of it in the same pass that reads the values. Python, Java and Go all write exactly this
-/// string, so it is a cross-SDK constant.
-pub const STREAM_CLOSED: &str = "__DBOS_STREAM_CLOSED__";
+/// of it in the same pass that reads the values. Always labelled `portable_json`, whatever the
+/// workflow's serializer, so a reader recognises it without knowing which serializer wrote the
+/// stream. **A close is this value under that label**, never the value alone: a user value
+/// encoded by another JSON-based serializer can be the same text.
+pub const STREAM_CLOSED: &str = "\"__DBOS_STREAM_CLOSED__\"";
 
 /// Partitions a single partitioned sweep will look at.
 ///
@@ -790,9 +793,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Marks a stream closed, so a reader knows no more values are coming.
     ///
-    /// An ordinary append of [`STREAM_CLOSED`], which is why closing is durable and replayable
-    /// on the same terms as any other write. Always a workflow-level step: a stream is closed by
-    /// the workflow that owns it.
+    /// An ordinary append of [`STREAM_CLOSED`], which is why closing is durable and
+    /// replayable on the same terms as any other write. Always a workflow-level step: a stream is
+    /// closed by the workflow that owns it.
     async fn close_stream(&self, workflow_id: &str, step_id: i32, key: &str) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
