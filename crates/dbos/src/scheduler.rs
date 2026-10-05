@@ -20,6 +20,7 @@ use tracing::Instrument;
 use crate::Executor;
 use crate::cron::{CronSchedule, firing_id};
 use crate::error::Result;
+use crate::schedule::Firing;
 use crate::sysdb::types::{ScheduleFilter, ScheduleRecord, ScheduleStatus, Timestamp};
 use crate::workflow::spawn_tracked;
 
@@ -77,7 +78,10 @@ impl Signature {
 /// A schedule's running task, and the definition it was started for.
 struct Running {
     signature: Signature,
-    task: JoinHandle<()>,
+    task: JoinHandle<Ended>,
+    /// The task ended because the schedule cannot be fired. Kept here because a finished task can
+    /// be awaited only once.
+    unfireable: bool,
 }
 
 /// Lists the schedules and brings the running tasks into line with them, forever.
@@ -133,12 +137,28 @@ async fn reconcile_once(
             continue;
         }
         let signature = Signature::of(&record);
-        match running.get(&record.schedule_id) {
-            // **Including a task that has ended.** One ends only on a schedule it cannot fire —
-            // an expression a peer stored without checking, or one that has stopped firing — and
-            // restarting it would fail the same way on every poll. A change to the definition
-            // is what gives it another chance.
-            Some(current) if current.signature == signature => continue,
+        let catch_up = match running.get_mut(&record.schedule_id) {
+            Some(current) if current.signature == signature => {
+                if current.unfireable || !current.task.is_finished() {
+                    continue;
+                }
+                // Finished, so awaiting it hands back how it ended without waiting.
+                match (&mut current.task).await {
+                    // **Not restarted.** A schedule the task could not fire — an expression a peer
+                    // stored without checking, or one that has stopped firing — would fail the same
+                    // way on every poll. A change to the definition is what gives it another
+                    // chance.
+                    Ok(Ended::Unfireable) => {
+                        current.unfireable = true;
+                        continue;
+                    }
+                    // It found its row paused or changed before this poll saw either, and the row
+                    // has since come back as it was: a resume, which catches up like any start.
+                    Ok(Ended::Superseded) | Err(_) => true,
+                }
+            }
+            // A definition change restarts the task without catching up, as in Python: the ticks
+            // since the last firing belonged to the old definition.
             Some(_) => {
                 tracing::info!(
                     schedule = record.schedule_name,
@@ -147,109 +167,188 @@ async fn reconcile_once(
                 if let Some(stale) = running.remove(&record.schedule_id) {
                     stale.task.abort();
                 }
+                false
             }
-            None => catch_up(executor, &record).await,
-        }
+            // New to this executor — just launched, just created, or just resumed.
+            None => true,
+        };
         let id = record.schedule_id.clone();
         let task = spawn_tracked(
             executor,
-            fire_forever(Arc::clone(executor), record.clone())
+            fire_forever(Arc::clone(executor), record.clone(), catch_up)
                 .instrument(tracing::info_span!("schedule", name = record.schedule_name)),
         );
-        running.insert(id, Running { signature, task });
+        running.insert(
+            id,
+            Running {
+                signature,
+                task,
+                unfireable: false,
+            },
+        );
     }
 }
 
-/// Enqueues the ticks a schedule missed while no task here was firing it, if it asks for that.
+/// Why a schedule's task stopped on its own.
+enum Ended {
+    /// The schedule cannot be fired: its expression does not parse, or it has no next tick.
+    Unfireable,
+    /// The row under the schedule's name is no longer the one the task was started for — deleted,
+    /// replaced, paused or redefined since the reconciler last looked.
+    Superseded,
+}
+
+/// How long a task trusts what it last read about its schedule before reading it again.
 ///
-/// From `last_fired_at` to now, which is the downtime as this schedule saw it. Only when a task
-/// *starts*: a definition change restarts the task without catching up, as in Python.
-async fn catch_up(executor: &Arc<Executor>, record: &ScheduleRecord) {
-    let Some(last_fired_at) = record.last_fired_at.and_then(Timestamp::to_system_time) else {
-        return;
-    };
-    if !record.automatic_backfill {
-        return;
-    }
-    let now = std::time::SystemTime::now();
-    if last_fired_at >= now {
-        return;
-    }
-    match executor
-        .connection()
-        .backfill_schedule::<(), crate::EngineOnly>(&record.schedule_name, last_fired_at, now)
-        .await
-    {
-        Ok(handles) if !handles.is_empty() => tracing::info!(
-            schedule = record.schedule_name,
-            ticks = handles.len(),
-            "caught up on ticks missed while the schedule was not running"
-        ),
-        Ok(_) => {}
-        Err(error) => tracing::warn!(
-            schedule = record.schedule_name,
-            error = %error,
-            "could not catch up on missed ticks"
-        ),
-    }
-}
+/// A task re-reads its row before firing — it may have been deleted, paused or redefined since the
+/// reconciler last looked, which is up to a polling interval ago — and the owner's latest version
+/// with it. Once a second at most, so a catch-up walking a backlog of ticks does not cost two extra
+/// reads per tick.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Sleeps to each tick of a schedule and enqueues its run, until aborted.
+/// The longest wait between attempts at a tick that failed.
+const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Sleeps to each tick of a schedule and enqueues its run, until aborted or superseded.
 ///
 /// **Ticks are walked from the previous tick, not from the clock**, so a task that wakes late —
 /// a stalled runtime, a slow enqueue — fires the ticks it overslept rather than skipping them, as
 /// Python's does.
-async fn fire_forever(executor: Arc<Executor>, record: ScheduleRecord) {
+///
+/// **Catching up is the same walk, started earlier.** With `catch_up` and the schedule's
+/// [`automatic_backfill`](ScheduleRecord::automatic_backfill), the walk starts from `last_fired_at`
+/// rather than now: the missed ticks are all due, so they fire back to back, and the walk carries
+/// on into the live ticks with nothing between them. A backfill that ended at its own "now" and a
+/// loop that started from a later one would drop whatever fell between the two.
+async fn fire_forever(executor: Arc<Executor>, record: ScheduleRecord, catch_up: bool) -> Ended {
     let cron = match CronSchedule::parse(&record.schedule, record.cron_timezone.as_deref()) {
         Ok(cron) => cron,
         Err(detail) => {
             tracing::error!("cannot run schedule `{}`: {detail}", record.schedule_name);
-            return;
+            return Ended::Unfireable;
         }
     };
-    let mut cursor = Instant::now();
+    let now = Instant::now();
+    let mut cursor = match record.last_fired_at {
+        Some(last) if catch_up && record.automatic_backfill => {
+            let last = Instant::from_millisecond(last.as_epoch_ms()).unwrap_or(now);
+            if last < now {
+                tracing::info!(
+                    schedule = record.schedule_name,
+                    since = %last,
+                    "catching up on ticks missed while the schedule was not running"
+                );
+            }
+            last.min(now)
+        }
+        _ => now,
+    };
+    let mut fresh: Option<(Firing, std::time::Instant)> = None;
     loop {
         let Some(tick) = cron.next_after(cursor) else {
             tracing::error!(
                 "schedule `{}` no longer fires; stopping it",
                 record.schedule_name
             );
-            return;
+            return Ended::Unfireable;
         };
         cursor = tick.timestamp();
         let until = Duration::try_from(cursor.duration_since(Instant::now())).unwrap_or_default();
         tokio::time::sleep(until + jitter(until)).await;
 
         let workflow_id = firing_id(&record.schedule_name, &tick);
-        if let Err(error) = fire(&executor, &record, cursor, &workflow_id).await {
-            tracing::error!(
-                workflow_id,
-                error = %error,
-                "could not fire schedule `{}`",
-                record.schedule_name
-            );
+        let next_tick = cron.next_after(cursor).map(|next| next.timestamp());
+        let mut wait = Duration::from_secs(1);
+        loop {
+            match fire(&executor, &record, &mut fresh, cursor, &workflow_id).await {
+                Ok(true) => break,
+                Ok(false) => {
+                    tracing::info!(
+                        schedule = record.schedule_name,
+                        "the schedule was paused, changed or deleted; stopping it"
+                    );
+                    return Ended::Superseded;
+                }
+                // **Retried until the next tick is due**, rather than dropped: a database that is
+                // away for longer than the system database's own retries would otherwise cost a
+                // daily schedule a day. The next tick is the bound because past it this one has
+                // been overtaken, and two ticks' runs racing each other is worse than one missing.
+                Err(error) => {
+                    let remaining = next_tick.and_then(|next| {
+                        Duration::try_from(next.duration_since(Instant::now())).ok()
+                    });
+                    if remaining.is_none_or(|remaining| remaining <= wait) {
+                        tracing::error!(
+                            workflow_id,
+                            error = %error,
+                            "could not fire schedule `{}`; giving up on this tick",
+                            record.schedule_name
+                        );
+                        break;
+                    }
+                    tracing::warn!(
+                        workflow_id,
+                        error = %error,
+                        "could not fire schedule `{}`; retrying",
+                        record.schedule_name
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(MAX_RETRY_INTERVAL);
+                    // Read again on the next attempt: the failure may have been the row changing.
+                    fresh = None;
+                }
+            }
         }
     }
 }
 
-/// Enqueues one tick and records it as the schedule's last.
+/// Enqueues one tick and records it as the schedule's last, or reports that the schedule is no
+/// longer this task's to fire.
+///
+/// `Ok(false)` when the row under the name is gone, paused, a different schedule, or redefined:
+/// whatever this task was started for, it is not that any more.
 async fn fire(
     executor: &Executor,
     record: &ScheduleRecord,
+    fresh: &mut Option<(Firing, std::time::Instant)>,
     tick: Instant,
     workflow_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let conn = executor.connection();
-    conn.fire_unless_fired(record, tick, workflow_id).await?;
+    let stale = fresh
+        .as_ref()
+        .is_none_or(|(_, read_at)| read_at.elapsed() >= REFRESH_INTERVAL);
+    if stale {
+        let current = conn.get_schedule(&record.schedule_name, None).await?;
+        let Some(current) = current.filter(|current| {
+            current.schedule_id == record.schedule_id
+                && current.status == ScheduleStatus::Active
+                && Signature::of(current) == Signature::of(record)
+        }) else {
+            return Ok(false);
+        };
+        // From the row as it is now: the definition is the same, but the owner may have claimed
+        // an unclaimed schedule since.
+        *fresh = Some((
+            conn.prepare_firing(&current).await?,
+            std::time::Instant::now(),
+        ));
+    }
+    let Some((firing, _)) = fresh.as_ref() else {
+        unreachable!("refreshed above");
+    };
+    conn.fire_unless_fired(record, firing, tick, workflow_id)
+        .await?;
     // The tick, not the clock: it is what automatic backfill resumes from, and a backfill from the
     // clock would skip whatever fired between the tick and the write.
     conn.sysdb()
         .update_schedule_last_fired_at(
-            &record.schedule_name,
+            &record.schedule_id,
             Timestamp::from_epoch_ms(tick.as_millisecond()),
         )
         .await
-        .map_err(crate::Error::SystemDatabase)
+        .map_err(crate::Error::SystemDatabase)?;
+    Ok(true)
 }
 
 /// A delay of up to a tenth of `until`, capped at [`MAX_JITTER`], so a fleet does not stampede.

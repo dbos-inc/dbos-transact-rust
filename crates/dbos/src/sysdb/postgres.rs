@@ -6754,7 +6754,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn update_schedule_last_fired_at(
         &self,
-        name: &str,
+        schedule_id: &str,
         last_fired_at: Timestamp,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
@@ -6768,9 +6768,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             "update_schedule_last_fired_at",
             move || async move {
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {schedules_table} SET last_fired_at = $2 WHERE schedule_name = $1"
+                    "UPDATE {schedules_table} SET last_fired_at = $2 \
+                     WHERE schedule_id = $1 \
+                       AND (last_fired_at IS NULL \
+                            OR last_fired_at::timestamptz < $2::timestamptz)"
                 )))
-                .bind(name)
+                .bind(schedule_id)
                 .bind(last_fired_at)
                 .execute(pool)
                 .await?;

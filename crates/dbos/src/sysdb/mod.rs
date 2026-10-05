@@ -1495,9 +1495,19 @@ pub trait SystemDatabase: Send + Sync {
     /// Records when a schedule last fired.
     ///
     /// Written by the scheduler after each firing, and read back to decide where a backfill
-    /// resumes. **Silent when the name matches nothing**, unlike the writes above: the scheduler
+    /// resumes. **Silent when the id matches nothing**, unlike the writes above: the scheduler
     /// races an operator's delete, and a schedule removed between firing and this write is a
     /// benign outcome rather than an error the loop has to absorb.
+    ///
+    /// **Keyed by id rather than name**, because the loop's task belongs to one row: a schedule
+    /// deleted and created again under the same name is a different schedule, and a task still
+    /// running for the old one must not write the new one's progress.
+    ///
+    /// **Only ever forwards.** A write earlier than the stored instant is dropped, so an executor
+    /// that stalls between firing a tick and recording it cannot move the schedule back behind a
+    /// tick a peer has since fired — which would make the next automatic backfill walk ticks
+    /// again. The stored text is compared as an instant (`::timestamptz`), since the four
+    /// implementations each write a different spelling of one.
     ///
     /// The column is **text, not epoch milliseconds** — the one time column in the schema that
     /// is — so this takes an instant and formats it, rather than taking a string and trusting the
@@ -1518,7 +1528,7 @@ pub trait SystemDatabase: Send + Sync {
     /// Neither TypeScript nor Python takes a connection here.
     async fn update_schedule_last_fired_at(
         &self,
-        name: &str,
+        schedule_id: &str,
         last_fired_at: Timestamp,
     ) -> Result<(), Error>;
 

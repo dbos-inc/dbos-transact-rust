@@ -356,7 +356,13 @@ impl DBOS {
             built,
             move |executor, placement| async move {
                 let conn = executor.connection();
-                refuse_unknown_queue(conn, spec, OPERATION).await?;
+                refuse_unknown_queue(
+                    conn,
+                    &spec.schedule_name,
+                    spec.queue_name.as_deref(),
+                    OPERATION,
+                )
+                .await?;
                 conn.create_schedule(spec, placement.step()).await
             },
         )
@@ -378,7 +384,13 @@ impl DBOS {
         for spec in specs {
             spec.validate(OPERATION)?;
             refuse_unregistered(&executor, &spec.workflow, OPERATION)?;
-            refuse_unknown_queue(executor.connection(), spec, OPERATION).await?;
+            refuse_unknown_queue(
+                executor.connection(),
+                &spec.schedule_name,
+                spec.queue_name.as_deref(),
+                OPERATION,
+            )
+            .await?;
         }
         executor.connection().apply_schedules(specs).await
     }
@@ -419,7 +431,8 @@ impl DBOS {
     /// Changes a schedule's definition, leaving what `change` does not name.
     ///
     /// Running executors restart the schedule with the new definition at their next poll. A name
-    /// with no schedule is an error, even for an empty change.
+    /// with no schedule is an error, even for an empty change, and a new queue must be registered,
+    /// as [`create_schedule`](Self::create_schedule) requires.
     pub fn update_schedule<'a>(
         &self,
         name: &'a str,
@@ -435,9 +448,11 @@ impl DBOS {
             step_names::UPDATE_SCHEDULE,
             built,
             move |(executor, context), placement| async move {
-                executor
-                    .connection()
-                    .update_schedule(name, change, context.as_deref(), placement.step())
+                let conn = executor.connection();
+                if let Change::Set(queue) = change.queue_name {
+                    refuse_unknown_queue(conn, name, queue, OPERATION).await?;
+                }
+                conn.update_schedule(name, change, context.as_deref(), placement.step())
                     .await
             },
         )
@@ -445,10 +460,10 @@ impl DBOS {
 
     /// Stops a schedule firing, until [`resume_schedule`](Self::resume_schedule).
     ///
-    /// Ticks that pass while it is paused are not enqueued on resume, even with
-    /// [`automatic_backfill`](ScheduleSpec::automatic_backfill): that catches up after downtime,
-    /// and a pause is not downtime. [`backfill_schedule`](Self::backfill_schedule) is how to run
-    /// them deliberately.
+    /// **With [`automatic_backfill`](ScheduleSpec::automatic_backfill), resuming runs the ticks
+    /// missed while paused**, because the schedule catches up from when it last fired whenever an
+    /// executor starts firing it — and resuming is that. Python and TypeScript behave the same way.
+    /// Without it, ticks that passed during the pause are not run.
     pub fn pause_schedule<'a>(&self, name: &'a str) -> PendingStep<'a, ()> {
         PendingStep::placed(
             step_names::PAUSE_SCHEDULE,
@@ -550,10 +565,11 @@ fn refuse_unregistered(
 /// dequeued — the same check Python makes. On [`DBOS`] only, as in Python.
 async fn refuse_unknown_queue(
     conn: &Connection,
-    spec: &ScheduleSpec,
+    schedule_name: &str,
+    queue: Option<&str>,
     operation: &'static str,
 ) -> Result<()> {
-    let Some(queue) = spec.queue_name.as_deref() else {
+    let Some(queue) = queue else {
         return Ok(());
     };
     if queue == INTERNAL_QUEUE || conn.queue(queue).await?.is_some() {
@@ -562,8 +578,8 @@ async fn refuse_unknown_queue(
     Err(Error::InvalidArgument {
         operation: operation.into(),
         detail: format!(
-            "schedule `{}`: queue `{queue}` is not registered; register it before scheduling onto it",
-            spec.schedule_name
+            "schedule `{schedule_name}`: queue `{queue}` is not registered; register it before \
+             scheduling onto it"
         ),
     })
 }
@@ -763,23 +779,42 @@ impl Connection {
         )?;
         let end = to_jiff(end)?;
         let mut cursor = to_jiff(start)?;
+        // Once for the whole window: the owner's version and the context are the same for every
+        // tick, and a long window would otherwise read them once per tick.
+        let firing = self.prepare_firing(&record).await?;
         let mut handles = Vec::new();
+        let mut first_failure = None;
         while let Some(tick) = cron.next_after(cursor) {
             cursor = tick.timestamp();
             if cursor >= end {
                 break;
             }
             let workflow_id = firing_id(name, &tick);
-            self.fire_unless_fired(&record, cursor, &workflow_id)
-                .await?;
-            handles.push(WorkflowHandle::polling(Arc::clone(self), workflow_id, true));
+            // **On past a tick that fails**, so one bad tick does not leave the rest of the window
+            // unfilled. The call still fails, with the first error, once the window is walked; a
+            // second call over the same window enqueues only what is still missing.
+            match self
+                .fire_unless_fired(&record, &firing, cursor, &workflow_id)
+                .await
+            {
+                Ok(()) => {
+                    handles.push(WorkflowHandle::polling(Arc::clone(self), workflow_id, true))
+                }
+                Err(error) => {
+                    tracing::warn!(workflow_id, error = %error, "could not backfill a tick");
+                    first_failure.get_or_insert(error);
+                }
+            }
         }
         tracing::info!(
             schedule = name,
             ticks = handles.len(),
             "backfilled a schedule"
         );
-        Ok(handles)
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(handles),
+        }
     }
 
     /// Enqueues one run now, under an id of its own.
@@ -790,7 +825,8 @@ impl Connection {
         let record = self.schedule_to_fire(name).await?;
         let now = jiff::Timestamp::now();
         let workflow_id = trigger_id(name, now);
-        self.fire(&record, SystemTime::from(now), &workflow_id)
+        let firing = self.prepare_firing(&record).await?;
+        self.fire(&record, &firing, SystemTime::from(now), &workflow_id)
             .await?;
         tracing::info!(schedule = name, workflow_id, "triggered a schedule");
         Ok(WorkflowHandle::polling(Arc::clone(self), workflow_id, true))
@@ -815,6 +851,7 @@ impl Connection {
     pub(crate) async fn fire_unless_fired(
         &self,
         record: &ScheduleRecord,
+        firing: &Firing,
         at: jiff::Timestamp,
         workflow_id: &str,
     ) -> Result<()> {
@@ -824,7 +861,8 @@ impl Connection {
             .await
             .map_err(Error::SystemDatabase)?;
         if existing.is_none() {
-            self.fire(record, SystemTime::from(at), workflow_id).await?;
+            self.fire(record, firing, SystemTime::from(at), workflow_id)
+                .await?;
         }
         Ok(())
     }
@@ -843,27 +881,14 @@ impl Connection {
     async fn fire(
         &self,
         record: &ScheduleRecord,
+        firing: &Firing,
         scheduled_time: SystemTime,
         workflow_id: &str,
     ) -> Result<()> {
-        let owner = record.application_name.as_deref().or(self.app_name());
-        // `None` when the owner has registered no version — a schedule created by a client before
-        // its application ever launched. An unversioned row is dequeued by whichever executor is
-        // on the latest version once there is one, which is what stamping the latest would mean.
-        let version = self
-            .sysdb()
-            .get_latest_application_version(owner)
-            .await
-            .map_err(Error::SystemDatabase)?
-            .map(|version| version.version_name);
-
-        // Decoded to a value and encoded again inside the input, rather than spliced in as text,
-        // so a context that is not JSON fails here rather than in every run.
-        let context: serde_json::Value = decode(Some(&record.context), "schedule context")?;
         let input = encode(
             &ScheduledWorkflowInput {
                 scheduled_time,
-                context,
+                context: &firing.context,
             },
             "argument",
         )?;
@@ -874,8 +899,8 @@ impl Connection {
             input: Some(&input),
             serialization: Some(self.serializer().name()),
             executor_id: None,
-            application_name: owner,
-            application_version: version.as_deref(),
+            application_name: firing.owner.as_deref(),
+            application_version: firing.version.as_deref(),
             schedule_name: Some(&record.schedule_name),
             ..new_row(workflow_id, Some(&queue))
         };
@@ -886,6 +911,50 @@ impl Connection {
             "enqueued a scheduled run"
         );
         Ok(())
+    }
+}
+
+/// What every run of a schedule shares, read once rather than per tick.
+pub(crate) struct Firing {
+    /// The application the runs belong to: the schedule's owner, or the firing handle's for an
+    /// unclaimed schedule.
+    owner: Option<String>,
+    /// The owner's latest application version.
+    version: Option<String>,
+    /// The schedule's context, decoded.
+    context: serde_json::Value,
+}
+
+impl Connection {
+    /// Reads what [`fire`](Self::fire) stamps on a run of `record`.
+    ///
+    /// **The latest version is read at the time of firing**, not at the time the schedule was
+    /// loaded: a deploy that lands while a schedule is running should get that schedule's next
+    /// tick. The loop refreshes this at most once a second, so a long catch-up does not read it
+    /// once per tick either.
+    pub(crate) async fn prepare_firing(&self, record: &ScheduleRecord) -> Result<Firing> {
+        let owner = record
+            .application_name
+            .as_deref()
+            .or(self.app_name())
+            .map(str::to_owned);
+        // `None` when the owner has registered no version — a schedule created by a client before
+        // its application ever launched. An unversioned row is dequeued by whichever executor is
+        // on the latest version once there is one, which is what stamping the latest would mean.
+        let version = self
+            .sysdb()
+            .get_latest_application_version(owner.as_deref())
+            .await
+            .map_err(Error::SystemDatabase)?
+            .map(|version| version.version_name);
+        // Decoded to a value and encoded again inside each input, rather than spliced in as text,
+        // so a context that is not JSON fails here rather than in every run.
+        let context = decode(Some(&record.context), "schedule context")?;
+        Ok(Firing {
+            owner,
+            version,
+            context,
+        })
     }
 }
 

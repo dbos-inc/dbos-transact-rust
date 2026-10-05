@@ -9591,9 +9591,12 @@ async fn a_schedule_keeps_its_identity_across_a_re_apply() {
     sys.set_schedule_status("nightly", ScheduleStatus::Paused, None)
         .await
         .unwrap();
-    sys.update_schedule_last_fired_at("nightly", Timestamp::from_epoch_ms(1_786_492_800_000))
-        .await
-        .unwrap();
+    sys.update_schedule_last_fired_at(
+        &first.schedule_id,
+        Timestamp::from_epoch_ms(1_786_492_800_000),
+    )
+    .await
+    .unwrap();
     sys.upsert_schedule(
         &NewSchedule {
             workflow_class_name: Some("Reports"),
@@ -10078,7 +10081,13 @@ async fn updating_a_schedule_touches_only_its_definition() {
     sys.set_schedule_status("nightly", ScheduleStatus::Paused, None)
         .await
         .unwrap();
-    sys.update_schedule_last_fired_at("nightly", Timestamp::from_epoch_ms(1_786_492_800_000))
+    let id = sys
+        .get_schedule("nightly", None)
+        .await
+        .unwrap()
+        .unwrap()
+        .schedule_id;
+    sys.update_schedule_last_fired_at(&id, Timestamp::from_epoch_ms(1_786_492_800_000))
         .await
         .unwrap();
     let before = sys.get_schedule("nightly", None).await.unwrap().unwrap();
@@ -10141,9 +10150,12 @@ async fn addressing_a_missing_schedule_is_refused() {
 
     // The two that race a concurrent delete stay silent, so the scheduler loop has nothing to
     // absorb when an operator removes a schedule between firing and recording it.
-    sys.update_schedule_last_fired_at("ghost", Timestamp::from_epoch_ms(1_786_492_800_000))
-        .await
-        .unwrap();
+    sys.update_schedule_last_fired_at(
+        "no-such-schedule-id",
+        Timestamp::from_epoch_ms(1_786_492_800_000),
+    )
+    .await
+    .unwrap();
     sys.delete_schedule("ghost", None).await.unwrap();
 
     // An empty update against a schedule that does exist changes nothing and succeeds.
@@ -10163,6 +10175,84 @@ async fn addressing_a_missing_schedule_is_refused() {
     );
 }
 
+/// The scheduler's progress only moves forwards, and only on the row it was fired for.
+#[tokio::test]
+async fn last_fired_at_only_moves_forwards_and_only_on_its_own_row() {
+    let (sys, db) = sysdb().await;
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+    let old = sys.get_schedule("nightly", None).await.unwrap().unwrap();
+    let later = Timestamp::from_epoch_ms(1_786_492_800_000);
+    let earlier = Timestamp::from_epoch_ms(1_786_406_400_000);
+
+    sys.update_schedule_last_fired_at(&old.schedule_id, later)
+        .await
+        .unwrap();
+    // A stalled executor recording an earlier tick does not move it back.
+    sys.update_schedule_last_fired_at(&old.schedule_id, earlier)
+        .await
+        .unwrap();
+    async fn read(sys: &PostgresSystemDatabase) -> Option<Timestamp> {
+        sys.get_schedule("nightly", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_fired_at
+    }
+    assert_eq!(read(&sys).await, Some(later));
+
+    // Compared as instants, not as text. Python writes the tick on the schedule's own wall clock:
+    // `2026-08-12T01:00:00+01:00` is midnight UTC, so it sorts *after* `2026-08-12T00:30:00Z` as
+    // text though it is half an hour earlier as an instant.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_schedules SET last_fired_at = '2026-08-12T01:00:00+01:00' \
+         WHERE schedule_name = 'nightly'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    sys.update_schedule_last_fired_at(
+        &old.schedule_id,
+        Timestamp::from_epoch_ms(1_786_489_200_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read(&sys).await,
+        Some(later),
+        "an earlier instant was written"
+    );
+    sys.update_schedule_last_fired_at(
+        &old.schedule_id,
+        Timestamp::from_epoch_ms(1_786_494_600_000),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read(&sys).await,
+        Some(Timestamp::from_epoch_ms(1_786_494_600_000)),
+        "a later instant was dropped"
+    );
+
+    // Deleted and created again under the same name: the old row's id writes nothing.
+    sys.delete_schedule("nightly", None).await.unwrap();
+    sys.create_schedule(
+        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+        None,
+    )
+    .await
+    .unwrap();
+    sys.update_schedule_last_fired_at(&old.schedule_id, later)
+        .await
+        .unwrap();
+    assert_eq!(read(&sys).await, None);
+}
+
 /// Pausing and resuming move only the status, and deleting removes the row.
 #[tokio::test]
 async fn a_schedule_pauses_resumes_and_deletes() {
@@ -10173,7 +10263,13 @@ async fn a_schedule_pauses_resumes_and_deletes() {
     )
     .await
     .unwrap();
-    sys.update_schedule_last_fired_at("nightly", Timestamp::from_epoch_ms(1_786_492_800_000))
+    let id = sys
+        .get_schedule("nightly", None)
+        .await
+        .unwrap()
+        .unwrap()
+        .schedule_id;
+    sys.update_schedule_last_fired_at(&id, Timestamp::from_epoch_ms(1_786_492_800_000))
         .await
         .unwrap();
 

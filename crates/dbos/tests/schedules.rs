@@ -327,6 +327,28 @@ async fn updating_a_schedule_changes_only_what_it_names() {
         "{error}"
     );
 
+    // A queue nothing has registered is refused, as it is on create: its ticks would never run.
+    let error = dbos
+        .update_schedule(
+            "updatable",
+            &ScheduleChange {
+                queue_name: Change::Set(Some("never-registered")),
+                ..ScheduleChange::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("is not registered"), "{error}");
+    assert_eq!(
+        dbos.get_schedule("updatable")
+            .await
+            .unwrap()
+            .unwrap()
+            .queue_name
+            .as_deref(),
+        Some("update-queue")
+    );
+
     let error = dbos
         .update_schedule("missing", &ScheduleChange::default())
         .await
@@ -357,7 +379,7 @@ async fn applying_schedules_creates_and_replaces_and_keeps_runtime_state() {
     dbos.pause_schedule("apply-a").await.unwrap();
     reader(&db)
         .await
-        .update_schedule_last_fired_at("apply-a", Timestamp::from_epoch_ms(1_000))
+        .update_schedule_last_fired_at(&a.schedule_id, Timestamp::from_epoch_ms(1_000))
         .await
         .unwrap();
 
@@ -775,10 +797,16 @@ async fn a_restart_catches_up_on_missed_ticks_when_asked() {
     spec.automatic_backfill = true;
     client.create_schedule(&spec).await.unwrap();
     let three_and_a_half_hours_ago = SystemTime::now() - Duration::from_secs(3 * 3600 + 1800);
+    let schedule_id = client
+        .get_schedule("catch-up")
+        .await
+        .unwrap()
+        .unwrap()
+        .schedule_id;
     reader(&db)
         .await
         .update_schedule_last_fired_at(
-            "catch-up",
+            &schedule_id,
             Timestamp::from_system_time(three_and_a_half_hours_ago).unwrap(),
         )
         .await
@@ -1018,5 +1046,35 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
             .unwrap()
             .is_none()
     );
+    dbos.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
+    let db = test_database().await;
+
+    // Stored without the checks `create_schedule` makes, as a peer SDK with a laxer parser might.
+    reader(&db)
+        .await
+        .create_schedule(
+            &dbos::sysdb::types::NewSchedule::new("unparseable", "healthy-workflow", "0 0 L-1 * *"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let dbos = DBOS::new(config("sched-unfireable-app", &db));
+    let (workflow, seen) = recorder(&dbos, "healthy-workflow");
+    dbos.launch().await.expect("launch failed");
+
+    // Several polls over the unfireable schedule, so the reconciler has to look at its ended task
+    // more than once.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let healthy = ScheduleSpec::new("healthy", &workflow, EVERY_SECOND, &"ok".to_owned()).unwrap();
+    dbos.create_schedule(&healthy).await.unwrap();
+    eventually("a schedule created afterwards to fire", || {
+        contexts(&seen).len() >= 2
+    })
+    .await;
     dbos.shutdown().await;
 }
