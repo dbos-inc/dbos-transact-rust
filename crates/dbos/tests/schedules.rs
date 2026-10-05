@@ -379,7 +379,7 @@ async fn applying_schedules_creates_and_replaces_and_keeps_runtime_state() {
     dbos.pause_schedule("apply-a").await.unwrap();
     reader(&db)
         .await
-        .update_schedule_last_fired_at(&a.schedule_id, Timestamp::from_epoch_ms(1_000))
+        .update_schedule_last_fired_at("apply-a", Timestamp::from_epoch_ms(1_000))
         .await
         .unwrap();
 
@@ -797,16 +797,10 @@ async fn a_restart_catches_up_on_missed_ticks_when_asked() {
     spec.automatic_backfill = true;
     client.create_schedule(&spec).await.unwrap();
     let three_and_a_half_hours_ago = SystemTime::now() - Duration::from_secs(3 * 3600 + 1800);
-    let schedule_id = client
-        .get_schedule("catch-up")
-        .await
-        .unwrap()
-        .unwrap()
-        .schedule_id;
     reader(&db)
         .await
         .update_schedule_last_fired_at(
-            &schedule_id,
+            "catch-up",
             Timestamp::from_system_time(three_and_a_half_hours_ago).unwrap(),
         )
         .await

@@ -403,15 +403,16 @@ async fn fire(
         .fire_unless_fired(record, firing, tick, workflow_id)
         .await?;
     // Recorded by whichever executor enqueued the tick, rather than by every executor that woke
-    // for it: the write is a no-op for all but one of them, and they would all queue on the
-    // schedule's row lock to find that out.
+    // for it as Python and TypeScript do. They would all write the same tick, queuing on the
+    // schedule's row lock to do it — and the write is last-writer-wins, so every extra writer is
+    // another chance for a straggler to move the value backwards.
     //
     // The tick, not the clock: it is what automatic backfill resumes from, and a backfill from the
     // clock would skip whatever fired between the tick and the write.
     if enqueued {
         conn.sysdb()
             .update_schedule_last_fired_at(
-                &record.schedule_id,
+                &record.schedule_name,
                 Timestamp::from_epoch_ms(tick.as_millisecond()),
             )
             .await
