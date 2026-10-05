@@ -8,7 +8,7 @@
 //! # Status
 //!
 //! Under construction. The system database layer, the lifecycle, registration, workflows,
-//! steps, events, messaging, recovery, queues and the client are here; the scheduler is not yet.
+//! steps, events, messaging, recovery, queues, schedules and the client are here.
 //!
 //! # Cargo features
 //!
@@ -38,6 +38,8 @@ mod connection;
 #[cfg(feature = "engine")]
 mod context;
 #[cfg(feature = "engine")]
+mod cron;
+#[cfg(feature = "engine")]
 mod dequeue;
 #[cfg(feature = "engine")]
 mod error;
@@ -59,6 +61,10 @@ mod queue;
 mod recovery;
 #[cfg(feature = "engine")]
 mod registry;
+#[cfg(feature = "engine")]
+mod schedule;
+#[cfg(feature = "engine")]
+mod scheduler;
 #[cfg(feature = "engine")]
 mod select;
 #[cfg(feature = "engine")]
@@ -103,6 +109,8 @@ pub use message::{
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
+#[cfg(feature = "engine")]
+pub use schedule::{ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]

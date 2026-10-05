@@ -352,6 +352,12 @@ impl DBOS {
                 "recovered workflows are on their queues"
             );
         }
+        // Every executor fires every schedule of its application; the deterministic id of each run
+        // is what keeps the fleet from enqueueing a tick more than once.
+        crate::scheduler::spawn(
+            Arc::clone(&executor),
+            self.0.config.scheduler_polling_interval(),
+        );
         // The dequeue loop starts unconditionally, because a queue this process never registered
         // is still one it should dequeue from: the worker set is rebuilt from the `queues` table
         // on every supervisor sweep, not from this instance's `register_queue` calls. A queue

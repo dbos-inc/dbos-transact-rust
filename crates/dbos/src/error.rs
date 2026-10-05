@@ -149,6 +149,19 @@ pub enum Error<E = EngineOnly> {
         operation: Cow<'static, str>,
     },
 
+    /// An operation the references never made replayable was called from inside a workflow.
+    ///
+    /// [`apply_schedules`](crate::DBOS::apply_schedules),
+    /// [`backfill_schedule`](crate::DBOS::backfill_schedule) and
+    /// [`trigger_schedule`](crate::DBOS::trigger_schedule) each write a batch that no reference
+    /// records as a step, so a replay would write it again. Python, TypeScript and Go refuse all
+    /// three inside a workflow, and so does this.
+    #[error("cannot {operation} from within a workflow")]
+    InsideWorkflow {
+        /// The operation that was called inside a workflow.
+        operation: Cow<'static, str>,
+    },
+
     /// An instance method was called from inside a workflow another instance is running.
     ///
     /// An instance method takes its executor from the handle it was called on, and its step ids
@@ -461,6 +474,7 @@ impl<E> Error<E> {
             Error::AlreadyLaunched { operation } => Error::AlreadyLaunched { operation },
             Error::NotInWorkflow { operation } => Error::NotInWorkflow { operation },
             Error::InsideStep { operation } => Error::InsideStep { operation },
+            Error::InsideWorkflow { operation } => Error::InsideWorkflow { operation },
             Error::WrongInstance { operation } => Error::WrongInstance { operation },
             Error::Config(message) => Error::Config(message),
             Error::InvalidArgument { operation, detail } => {

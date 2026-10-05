@@ -183,6 +183,14 @@ pub struct Config {
     /// meaningful and *not* rejected — it turns coalescing off, which is a push per write. That is
     /// the one duration here where zero is a setting rather than a mistake.
     pub notification_coalesce: Option<Duration>,
+
+    /// How often the scheduler re-reads the schedules table for schedules created, changed,
+    /// paused or deleted since its last look.
+    ///
+    /// `None` is thirty seconds, as in Python, TypeScript and Go. For the first minute after
+    /// launch the scheduler looks every second whatever this says, so a schedule created at
+    /// startup starts promptly. Zero is rejected, as a busy loop.
+    pub scheduler_polling_interval: Option<Duration>,
 }
 
 impl Config {
@@ -206,6 +214,7 @@ impl Config {
             outcome_poll_interval: None,
             listen_queues: None,
             notification_coalesce: None,
+            scheduler_polling_interval: None,
         }
     }
 
@@ -255,6 +264,11 @@ impl Config {
                 "`outcome_poll_interval` cannot be zero".to_owned(),
             ));
         }
+        if self.scheduler_polling_interval == Some(Duration::ZERO) {
+            return Err(crate::Error::Config(
+                "`scheduler_polling_interval` cannot be zero".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -263,7 +277,16 @@ impl Config {
         self.outcome_poll_interval
             .unwrap_or(DEFAULT_OUTCOME_POLL_INTERVAL)
     }
+
+    /// How often the scheduler re-reads the schedules table, resolved.
+    pub(crate) fn scheduler_polling_interval(&self) -> Duration {
+        self.scheduler_polling_interval
+            .unwrap_or(DEFAULT_SCHEDULER_POLLING_INTERVAL)
+    }
 }
+
+/// The interval Python, TypeScript and Go re-read the schedules table at.
+pub(crate) const DEFAULT_SCHEDULER_POLLING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The interval every implementation polls a workflow's outcome at.
 pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
