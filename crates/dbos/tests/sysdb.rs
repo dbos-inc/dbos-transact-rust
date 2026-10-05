@@ -6850,7 +6850,7 @@ async fn closing_a_stream_appends_the_sentinel() {
         dbos::sysdb::STREAM_CLOSED,
         "closing is an ordinary append of the sentinel"
     );
-    // Labelled portable JSON, and is it: decoding by the label gives back the sentinel.
+    // Labelled portable JSON, and it is: decoding by the label gives back the sentinel.
     assert_eq!(entries[1].serialization.as_deref(), Some("portable_json"));
     assert_eq!(
         serde_json::from_str::<String>(&entries[1].value).unwrap(),
