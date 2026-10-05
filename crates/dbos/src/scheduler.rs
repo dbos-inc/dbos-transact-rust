@@ -19,6 +19,7 @@ use tracing::Instrument;
 
 use crate::Executor;
 use crate::cron::{CronSchedule, firing_id};
+use crate::dequeue::random_unit;
 use crate::error::Result;
 use crate::schedule::Firing;
 use crate::sysdb::types::{ScheduleFilter, ScheduleRecord, ScheduleStatus, Timestamp};
@@ -75,13 +76,27 @@ impl Signature {
     }
 }
 
-/// A schedule's running task, and the definition it was started for.
+/// A schedule's task, and the definition it was started for.
 struct Running {
     signature: Signature,
-    task: JoinHandle<Ended>,
-    /// The task ended because the schedule cannot be fired. Kept here because a finished task can
-    /// be awaited only once.
-    unfireable: bool,
+    task: Task,
+}
+
+/// Where a schedule's task stands, as far as the reconciler knows.
+enum Task {
+    /// Running, or finished and not yet looked at.
+    Live(JoinHandle<Ended>),
+    /// Ended because the schedule cannot be fired. A state of its own because a finished task can
+    /// be awaited only once, and this outcome has to outlive that.
+    Unfireable,
+}
+
+impl Task {
+    fn abort(&self) {
+        if let Task::Live(handle) = self {
+            handle.abort();
+        }
+    }
 }
 
 /// Lists the schedules and brings the running tasks into line with them, forever.
@@ -139,21 +154,24 @@ async fn reconcile_once(
         let signature = Signature::of(&record);
         let catch_up = match running.get_mut(&record.schedule_id) {
             Some(current) if current.signature == signature => {
-                if current.unfireable || !current.task.is_finished() {
+                let Task::Live(handle) = &mut current.task else {
+                    // **Not restarted.** A schedule the task could not fire — an expression a peer
+                    // stored without checking, a context that is not JSON, a pattern that has
+                    // stopped firing — would fail the same way on every poll. A change to the
+                    // definition is what gives it another chance.
+                    continue;
+                };
+                if !handle.is_finished() {
                     continue;
                 }
                 // Finished, so awaiting it hands back how it ended without waiting.
-                match (&mut current.task).await {
-                    // **Not restarted.** A schedule the task could not fire — an expression a peer
-                    // stored without checking, or one that has stopped firing — would fail the same
-                    // way on every poll. A change to the definition is what gives it another
-                    // chance.
+                match handle.await {
                     Ok(Ended::Unfireable) => {
-                        current.unfireable = true;
+                        current.task = Task::Unfireable;
                         continue;
                     }
-                    // It found its row paused or changed before this poll saw either, and the row
-                    // has since come back as it was: a resume, which catches up like any start.
+                    // It found its row replaced or redefined before this poll saw it, and the row
+                    // is back as it was: restarted like any start.
                     Ok(Ended::Superseded) | Err(_) => true,
                 }
             }
@@ -182,8 +200,7 @@ async fn reconcile_once(
             id,
             Running {
                 signature,
-                task,
-                unfireable: false,
+                task: Task::Live(task),
             },
         );
     }
@@ -191,10 +208,11 @@ async fn reconcile_once(
 
 /// Why a schedule's task stopped on its own.
 enum Ended {
-    /// The schedule cannot be fired: its expression does not parse, or it has no next tick.
+    /// The schedule cannot be fired: its expression does not parse, it has no next tick, or its
+    /// context is not JSON.
     Unfireable,
     /// The row under the schedule's name is no longer the one the task was started for — deleted,
-    /// replaced, paused or redefined since the reconciler last looked.
+    /// replaced or redefined since the reconciler last looked.
     Superseded,
 }
 
@@ -261,23 +279,20 @@ async fn fire_forever(executor: Arc<Executor>, record: ScheduleRecord, catch_up:
         let mut wait = Duration::from_secs(1);
         loop {
             match fire(&executor, &record, &mut fresh, cursor, &workflow_id).await {
-                Ok(true) => break,
-                Ok(false) => {
+                Ok(Attempt::Fired | Attempt::Paused) => break,
+                Ok(Attempt::Superseded) => {
                     tracing::info!(
                         schedule = record.schedule_name,
-                        "the schedule was paused, changed or deleted; stopping it"
+                        "the schedule was changed or deleted; stopping it"
                     );
                     return Ended::Superseded;
                 }
-                // **Retried until the next tick is due**, rather than dropped: a database that is
-                // away for longer than the system database's own retries would otherwise cost a
-                // daily schedule a day. The next tick is the bound because past it this one has
-                // been overtaken, and two ticks' runs racing each other is worse than one missing.
+                Ok(Attempt::Unfireable(detail)) => {
+                    tracing::error!("cannot run schedule `{}`: {detail}", record.schedule_name);
+                    return Ended::Unfireable;
+                }
                 Err(error) => {
-                    let remaining = next_tick.and_then(|next| {
-                        Duration::try_from(next.duration_since(Instant::now())).ok()
-                    });
-                    if remaining.is_none_or(|remaining| remaining <= wait) {
+                    if overtaken(next_tick, wait) {
                         tracing::error!(
                             workflow_id,
                             error = %error,
@@ -302,53 +317,107 @@ async fn fire_forever(executor: Arc<Executor>, record: ScheduleRecord, catch_up:
     }
 }
 
-/// Enqueues one tick and records it as the schedule's last, or reports that the schedule is no
-/// longer this task's to fire.
+/// Whether a failed tick should be given up on, because the next tick will be due before the next
+/// attempt.
 ///
-/// `Ok(false)` when the row under the name is gone, paused, a different schedule, or redefined:
-/// whatever this task was started for, it is not that any more.
+/// **Retried rather than dropped**, because a database away for longer than the system database's
+/// own retries would otherwise cost a daily schedule a day. The next tick is the bound for a live
+/// tick because past it this one has been overtaken, and two ticks' runs racing each other is
+/// worse than one missing.
+///
+/// **No bound while catching up.** There the next tick is already due — every tick of a backlog is
+/// — and giving up would drop the tick for good: the ticks after it move `last_fired_at` past it,
+/// so no later catch-up comes back for it. Nothing races a backlog, which is walked one tick at a
+/// time. The last tick of a pattern that stops firing has no next tick, and is retried for the same
+/// reason.
+fn overtaken(next_tick: Option<Instant>, wait: Duration) -> bool {
+    let Some(next_tick) = next_tick else {
+        return false;
+    };
+    match Duration::try_from(next_tick.duration_since(Instant::now())) {
+        Ok(remaining) => remaining <= wait,
+        // Already due: catching up.
+        Err(_) => false,
+    }
+}
+
+/// What one attempt at a tick came to.
+enum Attempt {
+    /// Enqueued, by this executor or a peer.
+    Fired,
+    /// The schedule is paused, so the tick is skipped. The task keeps going rather than ending, so
+    /// a resume before the reconciler's next poll loses nothing; a pause that lasts is ended by
+    /// the reconciler.
+    Paused,
+    /// The row under the name is gone, a different schedule, or redefined: whatever this task was
+    /// started for, it is not that any more.
+    Superseded,
+    /// The schedule can never be fired as it stands. Carries why.
+    Unfireable(String),
+}
+
+/// Enqueues one tick and records it as the schedule's last, unless the schedule says otherwise.
 async fn fire(
     executor: &Executor,
     record: &ScheduleRecord,
     fresh: &mut Option<(Firing, std::time::Instant)>,
     tick: Instant,
     workflow_id: &str,
-) -> Result<bool> {
+) -> Result<Attempt> {
     let conn = executor.connection();
-    let stale = fresh
-        .as_ref()
-        .is_none_or(|(_, read_at)| read_at.elapsed() >= REFRESH_INTERVAL);
-    if stale {
-        let current = conn.get_schedule(&record.schedule_name, None).await?;
-        let Some(current) = current.filter(|current| {
-            current.schedule_id == record.schedule_id
-                && current.status == ScheduleStatus::Active
-                && Signature::of(current) == Signature::of(record)
-        }) else {
-            return Ok(false);
-        };
-        // From the row as it is now: the definition is the same, but the owner may have claimed
-        // an unclaimed schedule since.
-        *fresh = Some((
-            conn.prepare_firing(&current).await?,
-            std::time::Instant::now(),
-        ));
-    }
-    let Some((firing, _)) = fresh.as_ref() else {
-        unreachable!("refreshed above");
+    let firing = match fresh {
+        Some((firing, read_at)) if read_at.elapsed() < REFRESH_INTERVAL => firing,
+        _ => {
+            let Some(current) = conn
+                .get_schedule(&record.schedule_name, None)
+                .await?
+                .filter(|current| {
+                    current.schedule_id == record.schedule_id
+                        && Signature::of(current) == Signature::of(record)
+                })
+            else {
+                return Ok(Attempt::Superseded);
+            };
+            if current.status != ScheduleStatus::Active {
+                // Not cached: the next tick reads again, to see whether it has been resumed.
+                *fresh = None;
+                return Ok(Attempt::Paused);
+            }
+            // From the row as it is now: the definition is the same, but the owner may have
+            // claimed an unclaimed schedule since.
+            let prepared = match conn.prepare_firing(&current).await {
+                Ok(prepared) => prepared,
+                // A context this SDK cannot read — written by another one, say — will not become
+                // readable by trying again.
+                Err(crate::Error::Deserialization { message, .. }) => {
+                    return Ok(Attempt::Unfireable(format!(
+                        "its context cannot be decoded: {message}"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
+            &fresh.insert((prepared, std::time::Instant::now())).0
+        }
     };
-    conn.fire_unless_fired(record, firing, tick, workflow_id)
+    let enqueued = conn
+        .fire_unless_fired(record, firing, tick, workflow_id)
         .await?;
+    // Recorded by whichever executor enqueued the tick, rather than by every executor that woke
+    // for it: the write is a no-op for all but one of them, and they would all queue on the
+    // schedule's row lock to find that out.
+    //
     // The tick, not the clock: it is what automatic backfill resumes from, and a backfill from the
     // clock would skip whatever fired between the tick and the write.
-    conn.sysdb()
-        .update_schedule_last_fired_at(
-            &record.schedule_id,
-            Timestamp::from_epoch_ms(tick.as_millisecond()),
-        )
-        .await
-        .map_err(crate::Error::SystemDatabase)?;
-    Ok(true)
+    if enqueued {
+        conn.sysdb()
+            .update_schedule_last_fired_at(
+                &record.schedule_id,
+                Timestamp::from_epoch_ms(tick.as_millisecond()),
+            )
+            .await
+            .map_err(crate::Error::SystemDatabase)?;
+    }
+    Ok(Attempt::Fired)
 }
 
 /// A delay of up to a tenth of `until`, capped at [`MAX_JITTER`], so a fleet does not stampede.
@@ -357,16 +426,27 @@ async fn fire(
 /// Spreading them out costs a tick a few seconds of latency at most. Python's formula; TypeScript
 /// and Go cap it the same way.
 ///
-/// Drawn from a v4 UUID, as the dequeue loop's jitter is, rather than a dependency added for it.
+/// Drawn the way the dequeue loop's jitter is, rather than from a dependency added for it.
 fn jitter(until: Duration) -> Duration {
-    let ceiling = (until / 10).min(MAX_JITTER);
-    let bits = uuid::Uuid::new_v4().as_u128() as u32;
-    ceiling.mul_f64(f64::from(bits) / f64::from(u32::MAX))
+    (until / 10).min(MAX_JITTER).mul_f64(random_unit())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_tick_is_given_up_only_when_a_future_tick_would_overtake_it() {
+        let wait = Duration::from_secs(4);
+        let in_ = |secs: i64| Some(Instant::now() + jiff::SignedDuration::from_secs(secs));
+        // Live: the next tick is far enough away to try again, then too close.
+        assert!(!overtaken(in_(3600), wait));
+        assert!(overtaken(in_(2), wait));
+        // Catching up: the next tick is already due, so the backlog waits for this one.
+        assert!(!overtaken(in_(-60), wait));
+        // The last tick of a pattern that stops firing.
+        assert!(!overtaken(None, wait));
+    }
 
     #[test]
     fn jitter_is_at_most_a_tenth_and_at_most_ten_seconds() {

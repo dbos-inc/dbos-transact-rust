@@ -1063,6 +1063,23 @@ async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
         .await
         .unwrap();
 
+    // And one whose context is not JSON — another SDK's encoding — which no attempt will read.
+    reader(&db)
+        .await
+        .create_schedule(
+            &dbos::sysdb::types::NewSchedule {
+                context: "gASVBQAAAAAAAACMAW+ULg==",
+                ..dbos::sysdb::types::NewSchedule::new(
+                    "undecodable",
+                    "healthy-workflow",
+                    EVERY_SECOND,
+                )
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
     let dbos = DBOS::new(config("sched-unfireable-app", &db));
     let (workflow, seen) = recorder(&dbos, "healthy-workflow");
     dbos.launch().await.expect("launch failed");
@@ -1076,5 +1093,20 @@ async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
         contexts(&seen).len() >= 2
     })
     .await;
+    let undecodable = reader(&db)
+        .await
+        .list_workflows(
+            &WorkflowFilter {
+                schedule_names: vec!["undecodable"],
+                ..WorkflowFilter::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        undecodable.is_empty(),
+        "a run was enqueued for an undecodable context"
+    );
     dbos.shutdown().await;
 }

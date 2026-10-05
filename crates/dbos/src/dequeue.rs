@@ -760,7 +760,14 @@ fn is_contention(error: &sysdb::Error) -> bool {
 /// already a dependency, and one number per poll does not justify another.
 fn jitter(interval: Duration) -> Duration {
     let (low, high) = JITTER;
+    interval.mul_f64(low + (high - low) * random_unit())
+}
+
+/// A uniformly random number in `[0, 1)`, for jitter.
+///
+/// From a v4 UUID, which this crate already depends on, rather than from `rand` added for jitter
+/// alone. Shared with the scheduler's jitter.
+pub(crate) fn random_unit() -> f64 {
     let bits = uuid::Uuid::new_v4().as_u128() as u32;
-    let factor = low + (high - low) * (f64::from(bits) / f64::from(u32::MAX).next_up());
-    interval.mul_f64(factor)
+    f64::from(bits) / f64::from(u32::MAX).next_up()
 }

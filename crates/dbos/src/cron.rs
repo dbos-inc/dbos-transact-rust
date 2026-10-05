@@ -25,9 +25,9 @@ impl CronSchedule {
     /// The error is a sentence for a caller to wrap, naming what was wrong: the expression, the
     /// timezone, or that the pattern never fires.
     ///
-    /// **UTC when unset**, as Python and the bead that commissioned this both have it. TypeScript
-    /// and Go fall back to the process's local zone, which makes a schedule's firing times depend
-    /// on where its executor happens to run.
+    /// **UTC when unset**, as in Python. TypeScript and Go fall back to the process's local zone,
+    /// which makes a schedule's firing times depend on where its executor happens to run — and,
+    /// for a fleet spread across regions, makes two executors disagree about when a tick is.
     pub(crate) fn parse(expression: &str, timezone: Option<&str>) -> Result<Self, String> {
         let zone = match timezone {
             None => TimeZone::UTC,
@@ -390,10 +390,21 @@ mod tests {
             firings("30 2 * * *", ny, "2025-03-09T04:00:00Z", 2),
             ["2025-03-09T07:00:00Z", "2025-03-10T06:30:00Z"]
         );
-        // 01:30 happens twice on 2025-11-02, and fires on the first only.
+        // 01:30 happens twice on 2025-11-02, and a fixed time of day fires on the first only.
         assert_eq!(
             firings("30 1 * * *", ny, "2025-11-02T04:00:00Z", 2),
             ["2025-11-02T05:30:00Z", "2025-11-03T06:30:00Z"]
+        );
+        // An interval fires in both of the repeated hours: 01:00 and 01:30 EDT, then 01:00 and
+        // 01:30 EST.
+        assert_eq!(
+            firings("0 */30 * * * *", ny, "2025-11-02T04:45:00Z", 4),
+            [
+                "2025-11-02T05:00:00Z",
+                "2025-11-02T05:30:00Z",
+                "2025-11-02T06:00:00Z",
+                "2025-11-02T06:30:00Z"
+            ]
         );
     }
 

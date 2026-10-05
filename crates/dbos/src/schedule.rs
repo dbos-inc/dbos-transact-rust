@@ -43,6 +43,7 @@
 //! are refused inside a workflow instead, as in Python, TypeScript and Go: each writes a batch the
 //! references never made replayable.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -143,9 +144,11 @@ mod rfc3339 {
 /// pattern, which Python reads as a year, is refused as TypeScript refuses it.
 ///
 /// **Daylight saving follows classic cron rather than TypeScript.** A wall-clock time skipped at
-/// spring-forward fires at the first instant after the gap rather than not at all, and one repeated
-/// at fall-back fires once rather than twice. A daily job at `02:30` therefore runs every day of the
-/// year here, where TypeScript skips it once a year and runs it twice once a year.
+/// spring-forward fires at the first instant after the gap rather than not at all. At fall-back, a
+/// pattern for a fixed time of day fires once, on the first of the two repeated hours, while an
+/// interval pattern such as `*/15 * * * *` fires in both, since each is a quarter-hour that
+/// happened. A daily job at `02:30` or `01:30` therefore runs exactly once every day of the year
+/// here, where TypeScript skips the first once a year and runs the second twice once a year.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSpec {
     /// The schedule's name, unique across every application sharing the database.
@@ -381,16 +384,21 @@ impl DBOS {
         const OPERATION: &str = "apply schedules";
         let executor = self.executor(OPERATION)?;
         refuse_inside_workflow(OPERATION)?;
+        // Each distinct queue read once: a startup declaring many schedules usually puts them on
+        // a few queues.
+        let mut checked = HashSet::new();
         for spec in specs {
             spec.validate(OPERATION)?;
             refuse_unregistered(&executor, &spec.workflow, OPERATION)?;
-            refuse_unknown_queue(
-                executor.connection(),
-                &spec.schedule_name,
-                spec.queue_name.as_deref(),
-                OPERATION,
-            )
-            .await?;
+            if checked.insert(spec.queue_name.as_deref()) {
+                refuse_unknown_queue(
+                    executor.connection(),
+                    &spec.schedule_name,
+                    spec.queue_name.as_deref(),
+                    OPERATION,
+                )
+                .await?;
+            }
         }
         executor.connection().apply_schedules(specs).await
     }
@@ -797,9 +805,7 @@ impl Connection {
                 .fire_unless_fired(&record, &firing, cursor, &workflow_id)
                 .await
             {
-                Ok(()) => {
-                    handles.push(WorkflowHandle::polling(Arc::clone(self), workflow_id, true))
-                }
+                Ok(_) => handles.push(WorkflowHandle::polling(Arc::clone(self), workflow_id, true)),
                 Err(error) => {
                     tracing::warn!(workflow_id, error = %error, "could not backfill a tick");
                     first_failure.get_or_insert(error);
@@ -842,29 +848,32 @@ impl Connection {
         })
     }
 
-    /// Enqueues the tick at `at` under `workflow_id`, unless a workflow already has that id.
+    /// Enqueues the tick at `at` under `workflow_id`, unless a workflow already has that id, and
+    /// says whether it did.
     ///
     /// Read first, as Python and Go do, so a tick another executor already enqueued costs a read
     /// rather than an insert. The insert would be harmless anyway — an `ENQUEUED` row taken again
     /// is left as it was — but an executor fleet all waking for the same tick is the common case,
-    /// and this keeps it to one write.
+    /// and this keeps it to one write. Two executors can both read nothing and both insert, so
+    /// `true` means this call wrote the row or tied for it.
     pub(crate) async fn fire_unless_fired(
         &self,
         record: &ScheduleRecord,
         firing: &Firing,
         at: jiff::Timestamp,
         workflow_id: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let existing = self
             .sysdb()
             .get_workflow(workflow_id)
             .await
             .map_err(Error::SystemDatabase)?;
-        if existing.is_none() {
-            self.fire(record, firing, SystemTime::from(at), workflow_id)
-                .await?;
+        if existing.is_some() {
+            return Ok(false);
         }
-        Ok(())
+        self.fire(record, firing, SystemTime::from(at), workflow_id)
+            .await?;
+        Ok(true)
     }
 
     /// Enqueues one run of a schedule's workflow, called for `scheduled_time`.
