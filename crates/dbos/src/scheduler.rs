@@ -1,9 +1,9 @@
 //! The loop that fires schedules: one task per active schedule, reconciled against the table.
 //!
 //! [`poll_schedules`] lists this application's schedules every polling interval, and
-//! [`reconcile`] keeps one task per active schedule: starting one for a new schedule, stopping it
-//! for a paused or deleted one, and restarting it when the definition changes. Each task sleeps to
-//! its schedule's next tick and enqueues the run.
+//! [`reconcile_schedules`] keeps one task per active schedule: starting one for a new schedule,
+//! stopping it for a paused or deleted one, and restarting it when the definition changes. Each
+//! task sleeps to its schedule's next tick and enqueues the run.
 //!
 //! Every executor of an application runs this loop, so every executor fires every tick. The run is
 //! enqueued under an id derived from the schedule and the tick, which is what makes the fleet
@@ -46,37 +46,28 @@ pub(crate) fn spawn(executor: Arc<Executor>, polling_interval: Duration) {
     );
 }
 
-/// What a schedule's task was started for. A change to any of these restarts it.
+/// Whether two rows define the same schedule to fire. A change to any of these restarts its task.
 ///
-/// The definition, and nothing the loop itself writes. `status` is not here because a paused schedule has no task to compare; `last_fired_at`
-/// because the task writes it every tick; `automatic_backfill` because it only matters when a task
-/// starts; the id and the owner because neither changes what is fired.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Signature {
-    workflow_name: String,
-    workflow_class_name: Option<String>,
-    schedule: String,
-    context: String,
-    cron_timezone: Option<String>,
-    queue_name: Option<String>,
+/// The definition, and nothing the loop itself writes. `status` is not compared because a paused
+/// schedule has no task to compare; `last_fired_at` because the task writes it every tick;
+/// `automatic_backfill` because it only matters when a task starts; the id and the owner because
+/// neither changes what is fired.
+///
+/// Compared field by field, by reference, rather than through a copy or a hash of the fields: it
+/// runs for every active schedule on every poll, and the context can be large.
+fn same_definition(a: &ScheduleRecord, b: &ScheduleRecord) -> bool {
+    a.workflow_name == b.workflow_name
+        && a.workflow_class_name == b.workflow_class_name
+        && a.schedule == b.schedule
+        && a.context == b.context
+        && a.cron_timezone == b.cron_timezone
+        && a.queue_name == b.queue_name
 }
 
-impl Signature {
-    fn of(record: &ScheduleRecord) -> Self {
-        Self {
-            workflow_name: record.workflow_name.clone(),
-            workflow_class_name: record.workflow_class_name.clone(),
-            schedule: record.schedule.clone(),
-            context: record.context.clone(),
-            cron_timezone: record.cron_timezone.clone(),
-            queue_name: record.queue_name.clone(),
-        }
-    }
-}
-
-/// A schedule's task, and the definition it was started for.
+/// A schedule's task, and the row it was started for.
 struct Running {
-    signature: Signature,
+    /// Shared with the task, which fires from it.
+    record: Arc<ScheduleRecord>,
     task: Task,
 }
 
@@ -97,7 +88,8 @@ impl Task {
     }
 }
 
-/// Lists the schedules every polling interval and hands each listing to [`reconcile`], forever.
+/// Lists the schedules every polling interval and hands each listing to [`reconcile_schedules`],
+/// forever.
 ///
 /// Ended by shutdown aborting it, which aborts the per-schedule tasks with it: every one is
 /// spawned through [`spawn_tracked`].
@@ -112,7 +104,7 @@ async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
             .list_schedules(&ScheduleFilter::default(), None)
             .await
         {
-            Ok(schedules) => reconcile(&executor, &mut running, schedules).await,
+            Ok(schedules) => reconcile_schedules(&executor, &mut running, schedules).await,
             Err(error) => tracing::warn!(error = %error, "could not list schedules"),
         }
         let wait = if std::time::Instant::now() < fast_until {
@@ -125,7 +117,7 @@ async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
 }
 
 /// Brings the running tasks into line with one listing of the schedules.
-async fn reconcile(
+async fn reconcile_schedules(
     executor: &Arc<Executor>,
     running: &mut HashMap<String, Running>,
     schedules: Vec<ScheduleRecord>,
@@ -149,9 +141,8 @@ async fn reconcile(
             }
             continue;
         }
-        let signature = Signature::of(&record);
         let catch_up = match running.get_mut(&record.schedule_id) {
-            Some(current) if current.signature == signature => {
+            Some(current) if same_definition(&current.record, &record) => {
                 let Task::Live(handle) = &mut current.task else {
                     // **Not restarted.** A schedule the task could not fire — an expression a peer
                     // stored without checking, a context that is not JSON, a pattern that has
@@ -188,16 +179,16 @@ async fn reconcile(
             // New to this executor — just launched, just created, or just resumed.
             None => true,
         };
-        let id = record.schedule_id.clone();
+        let span = tracing::info_span!("schedule", name = record.schedule_name);
+        let record = Arc::new(record);
         let task = spawn_tracked(
             executor,
-            fire_forever(Arc::clone(executor), record.clone(), catch_up)
-                .instrument(tracing::info_span!("schedule", name = record.schedule_name)),
+            fire_forever(Arc::clone(executor), Arc::clone(&record), catch_up).instrument(span),
         );
         running.insert(
-            id,
+            record.schedule_id.clone(),
             Running {
-                signature,
+                record,
                 task: Task::Live(task),
             },
         );
@@ -235,7 +226,11 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// rather than now: the missed ticks are all due, so they fire back to back, and the walk carries
 /// on into the live ticks with nothing between them. A backfill that ended at its own "now" and a
 /// loop that started from a later one would drop whatever fell between the two.
-async fn fire_forever(executor: Arc<Executor>, record: ScheduleRecord, catch_up: bool) -> Ended {
+async fn fire_forever(
+    executor: Arc<Executor>,
+    record: Arc<ScheduleRecord>,
+    catch_up: bool,
+) -> Ended {
     let cron = match CronSchedule::parse(&record.schedule, record.cron_timezone.as_deref()) {
         Ok(cron) => cron,
         Err(detail) => {
@@ -369,8 +364,7 @@ async fn fire(
                 .get_schedule(&record.schedule_name, None)
                 .await?
                 .filter(|current| {
-                    current.schedule_id == record.schedule_id
-                        && Signature::of(current) == Signature::of(record)
+                    current.schedule_id == record.schedule_id && same_definition(current, record)
                 })
             else {
                 return Ok(Attempt::Superseded);
@@ -453,9 +447,9 @@ mod tests {
         assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 
-    #[test]
-    fn the_signature_ignores_what_the_loop_writes() {
-        let record = ScheduleRecord {
+    /// A row as the scheduler reads it, for the comparisons below.
+    fn row() -> ScheduleRecord {
+        ScheduleRecord {
             schedule_id: "id".into(),
             schedule_name: "s".into(),
             workflow_name: "w".into(),
@@ -468,44 +462,80 @@ mod tests {
             cron_timezone: None,
             queue_name: None,
             application_name: None,
-        };
+        }
+    }
+
+    #[test]
+    fn what_the_loop_writes_is_not_part_of_the_definition() {
+        let record = row();
         let same = ScheduleRecord {
             schedule_id: "other-id".into(),
+            schedule_name: "renamed".into(),
             status: ScheduleStatus::Paused,
             last_fired_at: Some(Timestamp::from_epoch_ms(1)),
             automatic_backfill: true,
             application_name: Some("app".into()),
-            ..record.clone()
+            ..row()
         };
-        assert_eq!(Signature::of(&record), Signature::of(&same));
+        assert!(same_definition(&record, &same));
+        assert!(
+            same_definition(&record, &record),
+            "a row is its own definition"
+        );
+    }
 
-        for changed in [
-            ScheduleRecord {
-                workflow_name: "w2".into(),
-                ..record.clone()
-            },
-            ScheduleRecord {
-                workflow_class_name: Some("C".into()),
-                ..record.clone()
-            },
-            ScheduleRecord {
-                schedule: "0 * * * *".into(),
-                ..record.clone()
-            },
-            ScheduleRecord {
-                context: "1".into(),
-                ..record.clone()
-            },
-            ScheduleRecord {
-                cron_timezone: Some("UTC".into()),
-                ..record.clone()
-            },
-            ScheduleRecord {
-                queue_name: Some("q".into()),
-                ..record.clone()
-            },
+    #[test]
+    fn every_field_of_the_definition_restarts_the_task() {
+        let record = row();
+        for (field, changed) in [
+            (
+                "workflow_name",
+                ScheduleRecord {
+                    workflow_name: "w2".into(),
+                    ..row()
+                },
+            ),
+            (
+                "workflow_class_name",
+                ScheduleRecord {
+                    workflow_class_name: Some("C".into()),
+                    ..row()
+                },
+            ),
+            (
+                "schedule",
+                ScheduleRecord {
+                    schedule: "0 * * * *".into(),
+                    ..row()
+                },
+            ),
+            (
+                "context",
+                ScheduleRecord {
+                    context: "1".into(),
+                    ..row()
+                },
+            ),
+            (
+                "cron_timezone",
+                ScheduleRecord {
+                    cron_timezone: Some("UTC".into()),
+                    ..row()
+                },
+            ),
+            (
+                "queue_name",
+                ScheduleRecord {
+                    queue_name: Some("q".into()),
+                    ..row()
+                },
+            ),
         ] {
-            assert_ne!(Signature::of(&record), Signature::of(&changed));
+            assert!(!same_definition(&record, &changed), "{field} was ignored");
+            assert!(
+                !same_definition(&changed, &record),
+                "{field} was ignored the other way"
+            );
         }
     }
 }

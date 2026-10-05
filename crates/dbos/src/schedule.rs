@@ -20,10 +20,13 @@
 //! # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
 //! use dbos::{ScheduleSpec, ScheduledWorkflowInput};
 //!
-//! let report = dbos.register_workflow("nightly-report", |input: ScheduledWorkflowInput<String>| async move {
-//!     println!("report for {} at {:?}", input.context, input.scheduled_time);
-//!     Ok::<(), dbos::Error>(())
-//! })?;
+//! let report = dbos.register_workflow(
+//!     "nightly-report",
+//!     |input: ScheduledWorkflowInput<String>| async move {
+//!         println!("report for {} at {:?}", input.context, input.scheduled_time);
+//!         Ok::<(), dbos::Error>(())
+//!     },
+//! )?;
 //! dbos.launch().await?;
 //!
 //! let mut spec = ScheduleSpec::new("nightly", &report, "0 0 2 * * *", &"emea".to_owned())?;
@@ -119,7 +122,8 @@ mod rfc3339 {
 /// Five or six fields, seconds first when there are six. A five-field pattern fires at second
 /// zero.
 ///
-/// - **Nicknames:** `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight`, `@hourly`.
+/// - **Nicknames:** `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight`,
+///   `@hourly`.
 /// - **Names:** months and weekdays, three-letter or in full, in any case.
 /// - **`?`** in day-of-month or day-of-week, meaning `*`.
 /// - **`L`** (the last day of the month), **`LW`** (its last weekday) and **`nW`** (the weekday
@@ -843,10 +847,11 @@ impl Connection {
     /// Enqueues the tick at `at` under `workflow_id`, unless a workflow already has that id, and
     /// says whether it did.
     ///
-    /// Read first, so a tick another executor already enqueued costs a read rather than an insert. The insert would be harmless anyway — an `ENQUEUED` row taken again
-    /// is left as it was — but an executor fleet all waking for the same tick is the common case,
-    /// and this keeps it to one write. Two executors can both read nothing and both insert, so
-    /// `true` means this call wrote the row or tied for it.
+    /// Read first, so a tick another executor already enqueued costs a read rather than an
+    /// insert. The insert would be harmless anyway — an `ENQUEUED` row taken again is left as it
+    /// was — but an executor fleet all waking for the same tick is the common case, and this keeps
+    /// it to one write. Two executors can both read nothing and both insert, so `true` means this
+    /// call wrote the row or tied for it.
     pub(crate) async fn fire_unless_fired(
         &self,
         record: &ScheduleRecord,

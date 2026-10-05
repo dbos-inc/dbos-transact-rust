@@ -41,9 +41,9 @@ impl CronSchedule {
             .parse(&normalize(expression))
             .map_err(|error| format!("invalid cron schedule `{expression}`: {error}"))?;
         let schedule = Self { cron, zone };
-        // **Checked here rather than left to the loop**, because `croner` parses `0 0 31 2 *` without
-        // complaint and only fails when asked for a time. Refusing it here means a schedule that
-        // can never fire is never created. Asked from now, because a pattern that has stopped
+        // **Checked here rather than left to the loop**, because `croner` parses `0 0 31 2 *`
+        // without complaint and only fails when asked for a time. Refusing it here means a schedule
+        // that can never fire is never created. Asked from now, because a pattern that has stopped
         // firing is as dead as one that never could.
         if schedule.next_after(Timestamp::now()).is_none() {
             return Err(format!("cron schedule `{expression}` never fires"));
