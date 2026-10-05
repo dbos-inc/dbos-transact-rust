@@ -1,7 +1,7 @@
 //! Cron expressions: parsing one, and walking its firing times on a timezone's wall clock.
 //!
 //! **`croner` does the work.** What is here is the dialect around it — which of its options this
-//! crate turns on, and the two spellings it does not accept that TypeScript does — and the one
+//! crate turns on, and the two spellings this crate accepts that `croner` does not — and the one
 //! check it leaves to its caller, that a pattern fires at all.
 //!
 //! The dialect is documented on [`ScheduleSpec`](crate::ScheduleSpec), where a user meets it.
@@ -25,9 +25,9 @@ impl CronSchedule {
     /// The error is a sentence for a caller to wrap, naming what was wrong: the expression, the
     /// timezone, or that the pattern never fires.
     ///
-    /// **UTC when unset**, as in Python. TypeScript and Go fall back to the process's local zone,
-    /// which makes a schedule's firing times depend on where its executor happens to run — and,
-    /// for a fleet spread across regions, makes two executors disagree about when a tick is.
+    /// **UTC when unset**, never the process's local zone: a schedule's firing times must not
+    /// depend on where its executor happens to run, and two executors in different regions must
+    /// agree about when a tick is.
     pub(crate) fn parse(expression: &str, timezone: Option<&str>) -> Result<Self, String> {
         let zone = match timezone {
             None => TimeZone::UTC,
@@ -42,10 +42,9 @@ impl CronSchedule {
             .map_err(|error| format!("invalid cron schedule `{expression}`: {error}"))?;
         let schedule = Self { cron, zone };
         // **Checked here rather than left to the loop**, because `croner` parses `0 0 31 2 *` without
-        // complaint and only fails when asked for a time. Python accepts such a pattern and its
-        // schedule thread dies on the first fire; TypeScript refuses it on create, and so does
-        // this. Asked from now, because a pattern that has stopped firing is as dead as one that
-        // never could.
+        // complaint and only fails when asked for a time. Refusing it here means a schedule that
+        // can never fire is never created. Asked from now, because a pattern that has stopped
+        // firing is as dead as one that never could.
         if schedule.next_after(Timestamp::now()).is_none() {
             return Err(format!("cron schedule `{expression}` never fires"));
         }
@@ -65,8 +64,8 @@ impl CronSchedule {
 
 /// The expression with the two spellings `croner` does not take rewritten into ones it does.
 ///
-/// `@midnight` is `@daily` in every dialect that has it. Full month and weekday names are
-/// TypeScript's; `croner` takes the three-letter forms only, and turns `Friday` into `5DAY`.
+/// `@midnight` is `@daily`. Full month and weekday names are rewritten to their three-letter
+/// forms, the only ones `croner` takes: left alone, it turns `Friday` into `5DAY`.
 fn normalize(expression: &str) -> String {
     const FULL_NAMES: [(&str, &str); 19] = [
         // Weekdays first, and every name whose short form is a prefix of a longer one is
@@ -106,9 +105,9 @@ fn normalize(expression: &str) -> String {
 ///
 /// The time is RFC 3339 to the second, on the schedule's wall clock: `Z` at a zero offset and
 /// `±hh:mm` otherwise, with no fraction and no zone name — `2026-10-05T12:00:00Z`,
-/// `2026-10-05T08:00:00-04:00`. That is Go's `time.RFC3339`, and what Java's scheduler is moving
-/// to; Python writes `+00:00` for UTC and TypeScript always writes UTC with milliseconds, so two
-/// SDKs firing one schedule only deduplicate against each other when they agree on this.
+/// `2026-10-05T08:00:00-04:00`. The id is only deterministic if every executor spells the time
+/// the same way, so this format is fixed: changing it would make a backfill re-run ticks the loop
+/// already fired under the old spelling.
 pub(crate) fn firing_id(schedule_name: &str, at: &Zoned) -> String {
     format!("sched-{schedule_name}-{}", rfc3339_seconds(at))
 }
@@ -116,7 +115,7 @@ pub(crate) fn firing_id(schedule_name: &str, at: &Zoned) -> String {
 /// The workflow id of a manual trigger at `now`: `sched-<name>-trigger-<time>`.
 ///
 /// Not deterministic, and not meant to be: two triggers are two runs. The time is UTC to the
-/// nanosecond with trailing zeros dropped, which is Go's `time.RFC3339Nano`.
+/// nanosecond with trailing zeros dropped.
 pub(crate) fn trigger_id(schedule_name: &str, now: Timestamp) -> String {
     format!("sched-{schedule_name}-trigger-{now}")
 }
@@ -438,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn forms_typescript_takes_and_this_does_not_are_refused_rather_than_misread() {
+    fn l_minus_n_and_wrapping_ranges_are_refused_rather_than_misread() {
         for pattern in ["0 0 L-1 * *", "0 22-2 * * *", "0 0 * * Fri-Mon"] {
             assert!(
                 refused(pattern).starts_with("invalid cron schedule"),
@@ -476,8 +475,8 @@ mod tests {
             "sched-nightly-2026-10-05T08:00:00-04:00"
         );
 
-        // A zone at a zero offset writes `Z`, as Go's `RFC3339` does: the offset is the format's
-        // business, not the zone's name.
+        // Any zone at a zero offset writes `Z`, not just UTC: the offset decides the spelling, not
+        // the zone's name.
         let london = at("2026-01-05T12:00:00Z").to_zoned(TimeZone::get("Europe/London").unwrap());
         assert_eq!(
             firing_id("nightly", &london),

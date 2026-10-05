@@ -1,8 +1,8 @@
 //! Schedules, against real databases: managing them, and the scheduler firing them.
 //!
-//! Ported from Python's `tests/test_scheduler.py`. The firing tests use the six-field every-second
-//! expression and rely on the scheduler polling every second for the first minute after launch,
-//! as Python's do, so a schedule created just after `launch` starts within a second or two.
+//! The firing tests use the six-field every-second expression and rely on the scheduler polling
+//! every second for the first minute after launch, so a schedule created just after `launch`
+//! starts within a second or two.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,7 +25,7 @@ const EVERY_SECOND: &str = "* * * * * *";
 
 /// Daily at a time that is not soon, so a schedule created with it never fires during a test.
 ///
-/// Python's `daily_cron_far_from_now`: twelve hours from now, on the hour.
+/// Twelve hours from now, on the hour.
 fn daily_far_from_now() -> String {
     let hour = (jiff::Timestamp::now().as_second() / 3600 + 12) % 24;
     format!("0 0 {hour} * * *")
@@ -1047,7 +1047,7 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
 async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
     let db = test_database().await;
 
-    // Stored without the checks `create_schedule` makes, as a peer SDK with a laxer parser might.
+    // Stored directly through the system database, bypassing the checks `create_schedule` makes.
     reader(&db)
         .await
         .create_schedule(
@@ -1057,7 +1057,7 @@ async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
         .await
         .unwrap();
 
-    // And one whose context is not JSON — another SDK's encoding — which no attempt will read.
+    // And one whose context is not JSON, which no attempt will read.
     reader(&db)
         .await
         .create_schedule(

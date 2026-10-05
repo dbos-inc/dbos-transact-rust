@@ -149,13 +149,13 @@ pub enum Error<E = EngineOnly> {
         operation: Cow<'static, str>,
     },
 
-    /// An operation the references never made replayable was called from inside a workflow.
+    /// An operation that is not recorded as a step was called from inside a workflow.
     ///
     /// [`apply_schedules`](crate::DBOS::apply_schedules),
     /// [`backfill_schedule`](crate::DBOS::backfill_schedule) and
-    /// [`trigger_schedule`](crate::DBOS::trigger_schedule) each write a batch that no reference
-    /// records as a step, so a replay would write it again. Python, TypeScript and Go refuse all
-    /// three inside a workflow, and so does this.
+    /// [`trigger_schedule`](crate::DBOS::trigger_schedule) each write a batch with no checkpoint,
+    /// so a replay of the workflow would write it again. Refusing the call is what keeps a
+    /// workflow's replay from repeating those writes.
     #[error("cannot {operation} from within a workflow")]
     InsideWorkflow {
         /// The operation that was called inside a workflow.

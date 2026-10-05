@@ -3,9 +3,7 @@
 //! **A schedule is a database object, not a decorator.** It names a workflow, a cron expression
 //! and a context, and every executor of its application fires it: each computes the next tick,
 //! sleeps until then, and enqueues the workflow under an id derived from the schedule and the
-//! tick, so the fleet runs each tick once however many executors woke for it. Python, TypeScript,
-//! Go and Java all moved to this shape; the decorator form they had before is gone from them, and
-//! this crate never had it.
+//! tick, so the fleet runs each tick once however many executors woke for it.
 //!
 //! Schedules are managed at runtime, from [`DBOS`] or from a [`Client`](crate::Client), and the
 //! running executors notice within a poll — creating, pausing, changing or deleting one needs no
@@ -36,12 +34,12 @@
 //!
 //! # Called from inside a workflow
 //!
-//! As on the rest of the management surface, every operation on [`DBOS`] that the references
-//! record as a step is recorded as one here, under the same names — `DBOS.createSchedule`,
-//! `DBOS.listSchedules` and so on. [`apply_schedules`](DBOS::apply_schedules),
+//! As on the rest of the management surface, the single-schedule operations on [`DBOS`] are
+//! recorded as steps — `DBOS.createSchedule`, `DBOS.listSchedules` and so on — so a replay reads
+//! back what the first run did. [`apply_schedules`](DBOS::apply_schedules),
 //! [`backfill_schedule`](DBOS::backfill_schedule) and [`trigger_schedule`](DBOS::trigger_schedule)
-//! are refused inside a workflow instead, as in Python, TypeScript and Go: each writes a batch the
-//! references never made replayable.
+//! are refused inside a workflow instead: each writes a batch with no checkpoint, which a replay
+//! would write again.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -70,9 +68,8 @@ use crate::workflow::{DuplicationPolicy, Enqueue, init_or_join, new_row};
 /// What a scheduled workflow is called with: the tick it is running for, and the schedule's
 /// context.
 ///
-/// Go's `ScheduledWorkflowInput`, and encoded as Go encodes it — `scheduled_time` as RFC 3339 text
-/// and `context` as the schedule stored it. Python and TypeScript pass the same pair as two
-/// positional arguments; a Rust workflow takes one argument, so the pair is a struct.
+/// A struct because a workflow takes one argument. Encoded as `{"scheduled_time": <RFC 3339 text>,
+/// "context": <the stored context>}`.
 ///
 /// `scheduled_time` is the **tick**, not the moment the workflow started: a workflow that waited
 /// in a queue, or one enqueued by a backfill, still reports the time it was scheduled for. A
@@ -88,8 +85,7 @@ pub struct ScheduledWorkflowInput<C = ()> {
 
 /// `SystemTime` as RFC 3339 text, rather than serde's `{secs_since_epoch, nanos_since_epoch}`.
 ///
-/// Text because it is what Go writes for the same field, and what a reader of the row can make
-/// sense of without arithmetic.
+/// Text so that a reader of the row can make sense of it without arithmetic.
 mod rfc3339 {
     use std::time::SystemTime;
 
@@ -115,14 +111,13 @@ mod rfc3339 {
 /// A schedule's definition: what [`create_schedule`](DBOS::create_schedule) creates and
 /// [`apply_schedules`](DBOS::apply_schedules) reconciles.
 ///
-/// Go's `ScheduleSpec`, field for field. The context is encoded when the spec is built, so a
-/// spec that exists is one whose context could be written; the rest are plain fields to set after
-/// construction.
+/// The context is encoded when the spec is built, so a spec that exists is one whose context could
+/// be written; the rest are plain fields to set after construction.
 ///
 /// # The cron dialect
 ///
-/// Five or six fields, seconds first when there are six, which is what Python
-/// (`second_at_beginning=True`) and TypeScript accept. A five-field pattern fires at second zero.
+/// Five or six fields, seconds first when there are six. A five-field pattern fires at second
+/// zero.
 ///
 /// - **Nicknames:** `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight`, `@hourly`.
 /// - **Names:** months and weekdays, three-letter or in full, in any case.
@@ -131,24 +126,23 @@ mod rfc3339 {
 ///   nearest day *n*) in day-of-month; **`nL`** (the last weekday *n* of the month) and **`n#m`**
 ///   (the *m*th weekday *n*) in day-of-week. Day-of-week `7` is Sunday, as `0` is.
 /// - **Steps** on `*` or on a range: `*/15`, `10-50/10`. A step on a single value (`5/10`) is
-///   refused, as TypeScript refuses it.
+///   refused.
 /// - **Day-of-month and day-of-week must both match** when both are restricted, so `0 0 13 * 5`
-///   is Friday the 13th. TypeScript's rule; Python's vendored croniter, and classic cron, take
-///   either.
+///   is Friday the 13th, not every Friday and every 13th.
 /// - **A pattern that can never fire is refused**, such as `0 0 31 2 *`.
 ///
-/// # Where the dialect differs from TypeScript
+/// # Not accepted
 ///
-/// TypeScript's parser is the fullest of the SDKs', and two of its forms are refused here: `L-n`
-/// (the *n*th-from-last day) and inverted ranges that wrap (`22-2`, `Fri-Mon`). A seven-field
-/// pattern, which Python reads as a year, is refused as TypeScript refuses it.
+/// `L-n` (the *n*th-from-last day), inverted ranges (`22-2`, `Fri-Mon`), and a seventh field are
+/// all refused.
 ///
-/// **Daylight saving follows classic cron rather than TypeScript.** A wall-clock time skipped at
-/// spring-forward fires at the first instant after the gap rather than not at all. At fall-back, a
-/// pattern for a fixed time of day fires once, on the first of the two repeated hours, while an
-/// interval pattern such as `*/15 * * * *` fires in both, since each is a quarter-hour that
-/// happened. A daily job at `02:30` or `01:30` therefore runs exactly once every day of the year
-/// here, where TypeScript skips the first once a year and runs the second twice once a year.
+/// # Daylight saving
+///
+/// A wall-clock time skipped at spring-forward fires at the first instant after the gap. At
+/// fall-back, a pattern for a fixed time of day fires once, on the first of the two repeated
+/// hours, while an interval pattern such as `*/15 * * * *` fires in both, since each is a
+/// quarter-hour that happened. A daily job at `02:30` or `01:30` therefore runs exactly once every
+/// day of the year.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSpec {
     /// The schedule's name, unique across every application sharing the database.
@@ -157,8 +151,7 @@ pub struct ScheduleSpec {
     pub schedule: String,
     /// The workflow each tick enqueues.
     ///
-    /// A configured instance cannot be scheduled: the table has no column for one, which is why
-    /// Python and TypeScript refuse it too.
+    /// A configured instance cannot be scheduled: the table has no column for one.
     pub workflow: WorkflowKey,
     /// The context each tick is called with, encoded.
     context: String,
@@ -263,11 +256,9 @@ impl ScheduleSpec {
 
 /// A change to a schedule's definition, leaving what it does not name.
 ///
-/// TypeScript's `updateSchedule`, which is the only reference with one: Python and Go change a
-/// schedule by [`apply_schedules`](DBOS::apply_schedules). The workflow cannot be changed, as in
-/// TypeScript — a schedule for a different workflow is a different schedule — and neither can the
-/// status, which is [`pause_schedule`](DBOS::pause_schedule)'s, nor `last_fired_at`, which is the
-/// loop's.
+/// The workflow cannot be changed — a schedule for a different workflow is a different schedule —
+/// and neither can the status, which is [`pause_schedule`](DBOS::pause_schedule)'s, nor
+/// `last_fired_at`, which is the loop's.
 ///
 /// The context is a [`serde_json::Value`] rather than the workflow's type, because nothing here
 /// holds the workflow to check it against.
@@ -319,8 +310,8 @@ impl ScheduleChange<'_> {
 impl ScheduleRecord {
     /// The schedule's context, decoded as `C`.
     ///
-    /// Go's `DecodeScheduleContext`. A schedule another SDK wrote may hold a context this one
-    /// cannot read, which is why listing hands back the encoded form and this decodes on request.
+    /// A schedule written by another SDK may hold a context this one cannot read, which is why
+    /// listing hands back the encoded form and this decodes on request.
     pub fn decode_context<C: DeserializeOwned>(&self) -> Result<C> {
         decode(Some(&self.context), "schedule context")
     }
@@ -379,7 +370,7 @@ impl DBOS {
     /// schedule or re-run a tick.
     ///
     /// Every spec is checked as [`create_schedule`](Self::create_schedule) checks one before any
-    /// is written. **Refused inside a workflow**, as in every reference.
+    /// is written. **Refused inside a workflow**: it writes many rows with no checkpoint.
     pub async fn apply_schedules(&self, specs: &[ScheduleSpec]) -> Result<()> {
         const OPERATION: &str = "apply schedules";
         let executor = self.executor(OPERATION)?;
@@ -470,7 +461,7 @@ impl DBOS {
     ///
     /// **With [`automatic_backfill`](ScheduleSpec::automatic_backfill), resuming runs the ticks
     /// missed while paused**, because the schedule catches up from when it last fired whenever an
-    /// executor starts firing it — and resuming is that. Python and TypeScript behave the same way.
+    /// executor starts firing it — and resuming is that.
     /// Without it, ticks that passed during the pause are not run.
     pub fn pause_schedule<'a>(&self, name: &'a str) -> PendingStep<'a, ()> {
         PendingStep::placed(
@@ -520,7 +511,7 @@ impl DBOS {
     ///
     /// Each tick is enqueued under the id the loop would have used, so a tick that already ran is
     /// not run again — its handle is returned all the same, so the result covers the whole
-    /// window. **Refused inside a workflow**, as in every reference.
+    /// window. **Refused inside a workflow**: it enqueues many runs with no checkpoint.
     pub async fn backfill_schedule<R, E>(
         &self,
         name: &str,
@@ -539,8 +530,8 @@ impl DBOS {
     /// Enqueues one run of a schedule's workflow now, outside its cron expression.
     ///
     /// The run is called with the time it was triggered as its
-    /// [`scheduled_time`](ScheduledWorkflowInput::scheduled_time). **Refused inside a workflow**,
-    /// as in every reference.
+    /// [`scheduled_time`](ScheduledWorkflowInput::scheduled_time). **Refused inside a workflow**:
+    /// its run id is generated from the clock, so a replay would enqueue a second run.
     pub async fn trigger_schedule<R, E>(&self, name: &str) -> Result<WorkflowHandle<R, E>> {
         const OPERATION: &str = "trigger a schedule";
         let executor = self.executor(OPERATION)?;
@@ -551,8 +542,8 @@ impl DBOS {
 
 /// [`Error::InvalidArgument`] for a workflow this executor has no registration for.
 ///
-/// On [`DBOS`] only, as in Python: a [`Client`] runs no workflows, and may well be scheduling one
-/// for an application written in another language.
+/// On [`DBOS`] only: a [`Client`] runs no workflows, and may well be scheduling one for an
+/// application written in another language.
 fn refuse_unregistered(
     executor: &crate::Executor,
     workflow: &WorkflowKey,
@@ -570,7 +561,8 @@ fn refuse_unregistered(
 /// [`Error::InvalidArgument`] for a queue nobody has registered.
 ///
 /// Read rather than taken on faith, because a tick enqueued on a queue with no row is never
-/// dequeued — the same check Python makes. On [`DBOS`] only, as in Python.
+/// dequeued. On [`DBOS`] only, like [`refuse_unregistered`]: a client may be scheduling onto a
+/// queue its application registers later.
 async fn refuse_unknown_queue(
     conn: &Connection,
     schedule_name: &str,
@@ -851,8 +843,7 @@ impl Connection {
     /// Enqueues the tick at `at` under `workflow_id`, unless a workflow already has that id, and
     /// says whether it did.
     ///
-    /// Read first, as Python and Go do, so a tick another executor already enqueued costs a read
-    /// rather than an insert. The insert would be harmless anyway — an `ENQUEUED` row taken again
+    /// Read first, so a tick another executor already enqueued costs a read rather than an insert. The insert would be harmless anyway — an `ENQUEUED` row taken again
     /// is left as it was — but an executor fleet all waking for the same tick is the common case,
     /// and this keeps it to one write. Two executors can both read nothing and both insert, so
     /// `true` means this call wrote the row or tied for it.
@@ -878,7 +869,7 @@ impl Connection {
 
     /// Enqueues one run of a schedule's workflow, called for `scheduled_time`.
     ///
-    /// What every reference writes for a scheduled run:
+    /// What a scheduled run is written as:
     ///
     /// - **`ENQUEUED`**, on the schedule's queue or the internal one, with nobody claiming it.
     /// - **The owner's latest application version.** A schedule is fired by every executor of its

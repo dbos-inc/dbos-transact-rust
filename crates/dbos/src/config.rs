@@ -187,9 +187,9 @@ pub struct Config {
     /// How often the scheduler re-reads the schedules table for schedules created, changed,
     /// paused or deleted since its last look.
     ///
-    /// `None` is thirty seconds, as in Python, TypeScript and Go. For the first minute after
-    /// launch the scheduler looks every second whatever this says, so a schedule created at
-    /// startup starts promptly. Zero is rejected, as a busy loop.
+    /// `None` is thirty seconds. For the first minute after launch the scheduler looks every
+    /// second whatever this says, so a schedule created at startup starts promptly. Zero is
+    /// rejected: it would re-read the table continuously.
     pub scheduler_polling_interval: Option<Duration>,
 }
 
@@ -285,7 +285,7 @@ impl Config {
     }
 }
 
-/// The interval Python, TypeScript and Go re-read the schedules table at.
+/// How often the scheduler re-reads the schedules table when nothing else is configured.
 pub(crate) const DEFAULT_SCHEDULER_POLLING_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The interval every implementation polls a workflow's outcome at.

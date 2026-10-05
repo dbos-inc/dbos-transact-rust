@@ -1,9 +1,9 @@
 //! The loop that fires schedules: one task per active schedule, reconciled against the table.
 //!
-//! **Python's `dynamic_scheduler_loop`, and TypeScript's equivalent.** A reconciler lists this
-//! application's schedules every polling interval and keeps one task per active schedule, starting
-//! one for a new schedule, stopping it for a paused or deleted one, and restarting it when the
-//! definition changes. Each task sleeps to its schedule's next tick and enqueues the run.
+//! [`poll_schedules`] lists this application's schedules every polling interval, and
+//! [`reconcile`] keeps one task per active schedule: starting one for a new schedule, stopping it
+//! for a paused or deleted one, and restarting it when the definition changes. Each task sleeps to
+//! its schedule's next tick and enqueues the run.
 //!
 //! Every executor of an application runs this loop, so every executor fires every tick. The run is
 //! enqueued under an id derived from the schedule and the tick, which is what makes the fleet
@@ -25,32 +25,30 @@ use crate::schedule::Firing;
 use crate::sysdb::types::{ScheduleFilter, ScheduleRecord, ScheduleStatus, Timestamp};
 use crate::workflow::spawn_tracked;
 
-/// How long after launch the reconciler polls fast.
+/// How long after launch the schedules are polled fast.
 ///
 /// A schedule created during startup — by the application itself, just after `launch` — would
-/// otherwise wait out a whole polling interval before its first tick. Python and TypeScript both
-/// poll every second for the first minute for this reason.
+/// otherwise wait out a whole polling interval before its first tick.
 const STARTUP_FAST_POLL_DURATION: Duration = Duration::from_secs(60);
 
-/// How often the reconciler polls during [`STARTUP_FAST_POLL_DURATION`].
+/// How often the schedules are polled during [`STARTUP_FAST_POLL_DURATION`].
 const STARTUP_FAST_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The ceiling on how long a tick is delayed to spread a fleet out.
 const MAX_JITTER: Duration = Duration::from_secs(10);
 
-/// Starts the reconciler. Called once, by `launch`.
+/// Starts polling the schedules. Called once, by `launch`.
 pub(crate) fn spawn(executor: Arc<Executor>, polling_interval: Duration) {
     spawn_tracked(
         &executor,
-        reconcile(Arc::clone(&executor), polling_interval)
+        poll_schedules(Arc::clone(&executor), polling_interval)
             .instrument(tracing::info_span!("scheduler")),
     );
 }
 
 /// What a schedule's task was started for. A change to any of these restarts it.
 ///
-/// Python's thread signature, and TypeScript's: the definition, and nothing the loop itself
-/// writes. `status` is not here because a paused schedule has no task to compare; `last_fired_at`
+/// The definition, and nothing the loop itself writes. `status` is not here because a paused schedule has no task to compare; `last_fired_at`
 /// because the task writes it every tick; `automatic_backfill` because it only matters when a task
 /// starts; the id and the owner because neither changes what is fired.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,22 +97,22 @@ impl Task {
     }
 }
 
-/// Lists the schedules and brings the running tasks into line with them, forever.
+/// Lists the schedules every polling interval and hands each listing to [`reconcile`], forever.
 ///
 /// Ended by shutdown aborting it, which aborts the per-schedule tasks with it: every one is
 /// spawned through [`spawn_tracked`].
-async fn reconcile(executor: Arc<Executor>, polling_interval: Duration) {
+async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
     let fast_until = std::time::Instant::now() + STARTUP_FAST_POLL_DURATION;
     let mut running: HashMap<String, Running> = HashMap::new();
     loop {
-        // This application's schedules and the unclaimed ones — the default scope, and the one
-        // every reference fires.
+        // This application's schedules and the unclaimed ones: the default scope, and the set
+        // this application is responsible for firing.
         match executor
             .sysdb()
             .list_schedules(&ScheduleFilter::default(), None)
             .await
         {
-            Ok(schedules) => reconcile_once(&executor, &mut running, schedules).await,
+            Ok(schedules) => reconcile(&executor, &mut running, schedules).await,
             Err(error) => tracing::warn!(error = %error, "could not list schedules"),
         }
         let wait = if std::time::Instant::now() < fast_until {
@@ -126,14 +124,14 @@ async fn reconcile(executor: Arc<Executor>, polling_interval: Duration) {
     }
 }
 
-/// One pass of the reconciler.
-async fn reconcile_once(
+/// Brings the running tasks into line with one listing of the schedules.
+async fn reconcile(
     executor: &Arc<Executor>,
     running: &mut HashMap<String, Running>,
     schedules: Vec<ScheduleRecord>,
 ) {
-    // Keyed by id rather than name, as Python keys its threads: a schedule deleted and created
-    // again under the same name between two polls is a new schedule.
+    // Keyed by id rather than name: a schedule deleted and created again under the same name
+    // between two polls is a new schedule.
     let present: HashSet<&str> = schedules.iter().map(|s| s.schedule_id.as_str()).collect();
     running.retain(|id, schedule| {
         let keep = present.contains(id.as_str());
@@ -175,8 +173,8 @@ async fn reconcile_once(
                     Ok(Ended::Superseded) | Err(_) => true,
                 }
             }
-            // A definition change restarts the task without catching up, as in Python: the ticks
-            // since the last firing belonged to the old definition.
+            // A definition change restarts the task without catching up: the ticks since the last
+            // firing belonged to the old definition.
             Some(_) => {
                 tracing::info!(
                     schedule = record.schedule_name,
@@ -230,8 +228,7 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// Sleeps to each tick of a schedule and enqueues its run, until aborted or superseded.
 ///
 /// **Ticks are walked from the previous tick, not from the clock**, so a task that wakes late —
-/// a stalled runtime, a slow enqueue — fires the ticks it overslept rather than skipping them, as
-/// Python's does.
+/// a stalled runtime, a slow enqueue — fires the ticks it overslept rather than skipping them.
 ///
 /// **Catching up is the same walk, started earlier.** With `catch_up` and the schedule's
 /// [`automatic_backfill`](ScheduleRecord::automatic_backfill), the walk starts from `last_fired_at`
@@ -387,8 +384,7 @@ async fn fire(
             // claimed an unclaimed schedule since.
             let prepared = match conn.prepare_firing(&current).await {
                 Ok(prepared) => prepared,
-                // A context this SDK cannot read — written by another one, say — will not become
-                // readable by trying again.
+                // A context that cannot be decoded will not become readable by trying again.
                 Err(crate::Error::Deserialization { message, .. }) => {
                     return Ok(Attempt::Unfireable(format!(
                         "its context cannot be decoded: {message}"
@@ -403,9 +399,9 @@ async fn fire(
         .fire_unless_fired(record, firing, tick, workflow_id)
         .await?;
     // Recorded by whichever executor enqueued the tick, rather than by every executor that woke
-    // for it as Python and TypeScript do. They would all write the same tick, queuing on the
-    // schedule's row lock to do it — and the write is last-writer-wins, so every extra writer is
-    // another chance for a straggler to move the value backwards.
+    // for it. They would all write the same tick, queuing on the schedule's row lock to do it —
+    // and the write is last-writer-wins, so every extra writer is another chance for a straggler
+    // to move the value backwards.
     //
     // The tick, not the clock: it is what automatic backfill resumes from, and a backfill from the
     // clock would skip whatever fired between the tick and the write.
@@ -424,8 +420,7 @@ async fn fire(
 /// A delay of up to a tenth of `until`, capped at [`MAX_JITTER`], so a fleet does not stampede.
 ///
 /// Every executor of an application wakes for the same tick, and they race to enqueue one row.
-/// Spreading them out costs a tick a few seconds of latency at most. Python's formula; TypeScript
-/// and Go cap it the same way.
+/// Spreading them out costs a tick a few seconds of latency at most.
 ///
 /// Drawn the way the dequeue loop's jitter is, rather than from a dependency added for it.
 fn jitter(until: Duration) -> Duration {
