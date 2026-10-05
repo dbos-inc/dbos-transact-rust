@@ -4397,7 +4397,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         written_by: WrittenBy,
     ) -> Result<(), Error> {
         // Derived, not passed: a close is recorded as a close whichever entry point reached it.
-        let step_name = if value == STREAM_CLOSED {
+        // The label is part of the match, so a user value that encodes to the same text is not.
+        let step_name = if value == STREAM_CLOSED && serialization == Some(PORTABLE_JSON) {
             step_names::CLOSE_STREAM
         } else {
             step_names::WRITE_STREAM

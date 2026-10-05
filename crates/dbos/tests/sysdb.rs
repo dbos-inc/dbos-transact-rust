@@ -6628,9 +6628,11 @@ async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
         sys.read_stream_value("wf-stream", "progress", 1)
             .await
             .unwrap()
-            .value
-            .map(|v| v.value),
-        Some(dbos::sysdb::STREAM_CLOSED.to_owned()),
+            .value,
+        Some(EncodedValue {
+            value: dbos::sysdb::STREAM_CLOSED.to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        }),
         "the sentinel is a value at an offset like any other",
     );
     // And it is the last one: nothing follows a close.
@@ -6675,7 +6677,12 @@ async fn the_offsets_of_a_stream_read_back_as_the_stream() {
             .await
             .unwrap();
         match at.value {
-            Some(v) if v.value == dbos::sysdb::STREAM_CLOSED => break,
+            Some(v)
+                if v.value == dbos::sysdb::STREAM_CLOSED
+                    && v.serialization.as_deref() == Some("portable_json") =>
+            {
+                break;
+            }
             Some(v) => read.push(v.value),
             None => break,
         }
@@ -6843,6 +6850,12 @@ async fn closing_a_stream_appends_the_sentinel() {
         dbos::sysdb::STREAM_CLOSED,
         "closing is an ordinary append of the sentinel"
     );
+    // Labelled portable JSON, and is it: decoding by the label gives back the sentinel.
+    assert_eq!(entries[1].serialization.as_deref(), Some("portable_json"));
+    assert_eq!(
+        serde_json::from_str::<String>(&entries[1].value).unwrap(),
+        "__DBOS_STREAM_CLOSED__",
+    );
 
     // Recorded as a close, which is what tells a replay it was closing rather than writing.
     let steps = sys
@@ -6862,6 +6875,41 @@ async fn closing_a_stream_appends_the_sentinel() {
     assert_eq!(
         sys.get_all_stream_entries("wf-close").await.unwrap().len(),
         2
+    );
+}
+
+/// The sentinel's text under another label is a value, not a close.
+///
+/// Another JSON-based serializer encodes the user string `__DBOS_STREAM_CLOSED__` to exactly the
+/// sentinel's text, so only the label tells the two apart.
+#[tokio::test]
+async fn the_sentinel_text_under_another_label_is_an_ordinary_write() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-lookalike"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    sys.write_stream(
+        "wf-lookalike",
+        0,
+        "k",
+        dbos::sysdb::STREAM_CLOSED,
+        Some("rust_serde"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let steps = sys
+        .list_workflow_steps("wf-lookalike", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| s.step_name.as_str())
+            .collect::<Vec<_>>(),
+        ["DBOS.writeStream"],
     );
 }
 
