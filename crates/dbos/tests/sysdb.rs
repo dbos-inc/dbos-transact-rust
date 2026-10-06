@@ -79,6 +79,40 @@ async fn payloads_are_stored_verbatim() {
     assert_eq!(read.input.as_deref(), r.input);
 }
 
+/// A start stamps `created_at` and `updated_at` from the database clock, in the same transaction
+/// as the input row, so all three carry the same instant.
+///
+/// The retention sweep depends on it: it spares a payload only while its workflow's `created_at`
+/// is no later than the payload's own stamp, so a `created_at` from a process clock running ahead
+/// of the database would expose a live workflow's input to a peer's sweep.
+#[tokio::test]
+async fn a_start_stamps_its_row_and_input_from_the_database_clock() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.init_workflow(&workflow("wf-clock"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let (created_at, updated_at, input_stamp): (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT s.created_at, s.updated_at, i.retention_timestamp
+           FROM "dbos"."workflow_status" s
+           JOIN "dbos"."workflow_input" i ON i.workflow_uuid = s.workflow_uuid
+           WHERE s.workflow_uuid = $1"#,
+    )
+    .bind("wf-clock")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        created_at, input_stamp,
+        "created_at should be the input's instant"
+    );
+    assert_eq!(
+        updated_at, input_stamp,
+        "updated_at should be the input's instant"
+    );
+}
+
 /// An unknown id reads as absent rather than erroring.
 #[tokio::test]
 async fn a_missing_workflow_reads_as_none() {
