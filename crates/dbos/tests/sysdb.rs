@@ -79,6 +79,40 @@ async fn payloads_are_stored_verbatim() {
     assert_eq!(read.input.as_deref(), r.input);
 }
 
+/// A start stamps `created_at` and `updated_at` from the database clock, in the same transaction
+/// as the input row, so all three carry the same instant.
+///
+/// The retention sweep depends on it: it spares a payload only while its workflow's `created_at`
+/// is no later than the payload's own stamp, so a `created_at` from a process clock running ahead
+/// of the database would expose a live workflow's input to a peer's sweep.
+#[tokio::test]
+async fn a_start_stamps_its_row_and_input_from_the_database_clock() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    sys.init_workflow(&workflow("wf-clock"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let (created_at, updated_at, input_stamp): (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT s.created_at, s.updated_at, i.retention_timestamp
+           FROM "dbos"."workflow_status" s
+           JOIN "dbos"."workflow_input" i ON i.workflow_uuid = s.workflow_uuid
+           WHERE s.workflow_uuid = $1"#,
+    )
+    .bind("wf-clock")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        created_at, input_stamp,
+        "created_at should be the input's instant"
+    );
+    assert_eq!(
+        updated_at, input_stamp,
+        "updated_at should be the input's instant"
+    );
+}
+
 /// An unknown id reads as absent rather than erroring.
 #[tokio::test]
 async fn a_missing_workflow_reads_as_none() {
@@ -3335,7 +3369,7 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
     // Promoting v1 makes it current even though v2 was created later — which is the whole point
     // of ordering on `version_timestamp` rather than `created_at`.
     let promoted = Timestamp::from_epoch_ms(latest.version_timestamp.as_epoch_ms() + 60_000);
-    sys.update_application_version_timestamp("v1", promoted, None)
+    sys.update_application_version_timestamp("v1", Some(promoted), None)
         .await
         .unwrap();
 
@@ -7475,7 +7509,11 @@ async fn registering_a_peers_version_name_is_refused() {
         .unwrap()
         .version_timestamp;
     let promote = beta
-        .update_application_version_timestamp("v1.0.0", Timestamp::from_epoch_ms(9_000_000), None)
+        .update_application_version_timestamp(
+            "v1.0.0",
+            Some(Timestamp::from_epoch_ms(9_000_000)),
+            None,
+        )
         .await;
     assert!(matches!(promote, Err(Error::RegisteredByAnother { .. })));
     assert_eq!(
@@ -7518,7 +7556,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
         .await
         .unwrap();
     anonymous
-        .update_application_version_timestamp("v1", Timestamp::from_epoch_ms(5_000_000), None)
+        .update_application_version_timestamp("v1", Some(Timestamp::from_epoch_ms(5_000_000)), None)
         .await
         .unwrap();
     let unclaimed = anonymous
@@ -7614,7 +7652,7 @@ async fn a_named_target_overrides_the_handles_own_application() {
     alpha
         .update_application_version_timestamp(
             "beta-v1",
-            Timestamp::from_epoch_ms(99_000_000_000_000),
+            Some(Timestamp::from_epoch_ms(99_000_000_000_000)),
             Some("beta"),
         )
         .await

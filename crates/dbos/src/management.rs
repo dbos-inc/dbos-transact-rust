@@ -748,10 +748,8 @@ impl DBOS {
     /// **And a second clock decides when the row is acted on.** The workflow is released by
     /// whichever supervisor next runs, comparing the stamp against *its* reading — so the moment a
     /// fleet honours is two clocks away from the one that set it, and a skewed operator host moves
-    /// a release time the whole fleet obeys. `init_workflow` carries the reasoning for leaving it
-    /// there, and UPSTREAM item 22 the proposal to close it: the database's clock is the answer,
-    /// in every implementation at once rather than here alone at the cost of a round trip none of
-    /// them spends.
+    /// a release time the whole fleet obeys. UPSTREAM item 22 is the proposal to close it:
+    /// resolve the delay against the database's clock, read once before the write.
     ///
     /// [`WorkflowDelay::Until`] removes the first of those readings: an absolute instant is
     /// written as given, and nothing on this path consults a clock to do it.

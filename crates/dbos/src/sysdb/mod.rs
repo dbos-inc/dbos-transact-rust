@@ -311,10 +311,10 @@ pub trait SystemDatabase: Send + Sync {
     /// call can observe finishing at all**. Two candidate orderings look like improvements and are
     /// not:
     ///
-    /// - `ORDER BY completed_at` would be a lie for the one status hardest to reason about. The
-    ///   dead-letter transition sets neither `completed_at` nor `updated_at`, so a parked member
-    ///   sorts on a stale or absent value and would systematically win or lose by where `NULLS`
-    ///   were put — not by when it stopped.
+    /// - `ORDER BY completed_at` would report an order this call cannot observe. Every terminal
+    ///   transition stamps it, dead-letter included, but which of two members settled first within
+    ///   one interval is below the resolution described above, and sorting by the stamp would
+    ///   present that as a guarantee.
     /// - `ORDER BY workflow_uuid` would be stable and meaningless: it turns *which finished first*
     ///   into *which sorts first* whenever more than one is ready, biasing every tie toward
     ///   `task-0` in a fan-out named that way. Stable nondeterminism reads as a guarantee and is
@@ -1101,10 +1101,15 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **A name that matches nothing is `Ok`, not [`Error::NotRegistered`].** The write moves no
     /// row and says so to nobody, so a misspelled rollback reports success; UPSTREAM item 2.
+    ///
+    /// `timestamp` of `None` stamps the database's clock, which is what a promotion wants: every
+    /// executor compares versions by this column, so a stamp from a process clock running behind
+    /// would leave the promoted version older than the one it replaces. `Some` sets an exact
+    /// instant, for a caller that must order versions deterministically.
     async fn update_application_version_timestamp(
         &self,
         version_name: &str,
-        timestamp: Timestamp,
+        timestamp: Option<Timestamp>,
         application_name: Option<&str>,
     ) -> Result<(), Error>;
 

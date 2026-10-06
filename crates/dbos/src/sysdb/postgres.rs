@@ -1636,11 +1636,13 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 
 /// The database's clock, in epoch milliseconds, as a SQL expression.
 ///
-/// **Used wherever one executor's timestamp is compared against another's.** A rate limit stamps
-/// `started_at_epoch_ms` on the row it claims and the next dequeue measures its window back from
-/// now; if the two executors read their own clocks, a host running fast writes starts that a peer
-/// judges to be outside its window and both admit a full allowance. One clock, so the window
-/// means the same thing everywhere. Python spells it `_now_ms_sql` and TypeScript inlines it.
+/// **Every timestamp the system database stores comes from here**, or from a column default that
+/// computes the same value, because stamps written by different executors are compared with each
+/// other. A rate limit stamps `started_at_epoch_ms` on the row it claims and the next dequeue
+/// measures its window back from now; if the two executors read their own clocks, a host running
+/// fast writes starts that a peer judges to be outside its window and both admit a full allowance.
+/// A retention sweep compares a workflow's `created_at` with its payloads' stamps the same way.
+/// One clock, so these comparisons mean the same thing everywhere.
 ///
 /// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
 /// and the stamp taken later in the same transaction agree on one instant.
@@ -2677,29 +2679,20 @@ impl SystemDatabase for PostgresSystemDatabase {
         // `should_execute: false` for a workflow this caller does in fact own. Java's comment
         // says the same: "generated outside of the DB retry loop, in case commit acks get lost".
         let owner_xid = uuid::Uuid::new_v4().to_string();
-        // One clock reading for every timestamp this row gets, so `delay_until` cannot disagree
-        // with `created_at`, and a retry cannot push the delay further out each time — which is
-        // also why `delay` crosses the API as a duration rather than an instant.
+        // `created_at` and `updated_at` come from the database clock, inside the statement, as
+        // the input row's `retention_timestamp` does through its column default. A retention sweep
+        // run by any executor sharing this database relies on that: a payload stamped before its
+        // workflow's `created_at` can be swept while the workflow is live, and a process clock
+        // running ahead of the database's would do exactly that. A retry re-reads `now()`, which
+        // only moves the stamps later, and later is safe.
         //
-        // **This process's clock rather than the database's, and deliberately.** Both columns
-        // are read by *other* processes and compared against *their* clocks: `created_at` is the
-        // dequeue's FIFO order across the whole fleet, and `delay_until_epoch_ms` is what the
-        // supervisor's `transition_delayed_workflows` releases on. So an enqueuer running fast
-        // does reach them — but that is a gap every implementation shares rather than one this
-        // port should close on its own. Python resolves the delay in `_context.py` and stamps
-        // `created_at` from `time.time()`, Go computes `time.Now().Add(delay)` in `workflow.go`,
-        // and TypeScript does the same; all three bind an absolute instant.
+        // The delay is the exception. It is a duration resolved to an instant, so it is read once
+        // here, outside the retry: re-reading it on every attempt would release the workflow late
+        // by however long the retries took, and `with_retry` starts at a one-second backoff. It
+        // comes from this process's clock and is compared against the supervisor's.
         //
-        // `NOW_MS_SQL` here instead would trade a skew they all have for a drift only this one
-        // would have: it is re-read on every attempt, and `with_retry` starts at a one-second
-        // backoff with no attempt limit, so an insert that lost its first attempt to a
-        // serialization failure would release its workflow a second late — and a
-        // hundred-millisecond delay would be off by an order of magnitude. The `ON CONFLICT` arm
-        // below does not rewrite the column, but that only covers the lost-acknowledgement case,
-        // where the first attempt did commit.
-        //
-        // TODO(dbos-team): UPSTREAM item 22. The skew is worth closing, but in all four at once
-        // and against the database's clock, read once outside the retry.
+        // TODO(dbos-team): UPSTREAM item 22. The delay should resolve against the database clock,
+        // read once outside the retry.
         let now = Timestamp::now();
         let delay_until = workflow
             .delay
@@ -2764,11 +2757,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                  parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
                  debounce_deadline_epoch_ms, is_debounced, application_name) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, $26, $27, $28, $29) \
+                 {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, $19, $20, $21, $22, $23::jsonb, $24, $25, \
+                 $26, $27) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    recovery_attempts = CASE \
                        WHEN {workflow_table}.status != 'ENQUEUED' AND {workflow_table}.status != 'DELAYED' \
-                       THEN {workflow_table}.recovery_attempts + $30 \
+                       THEN {workflow_table}.recovery_attempts + $28 \
                        ELSE {workflow_table}.recovery_attempts \
                    END, \
                    updated_at = {NOW_MS_SQL}, \
@@ -2777,7 +2771,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                        THEN {workflow_table}.executor_id \
                        WHEN {workflow_table}.owner_xid IS NULL \
                          OR {workflow_table}.owner_xid = EXCLUDED.owner_xid \
-                         OR $31 \
+                         OR $29 \
                        THEN EXCLUDED.executor_id \
                        ELSE {workflow_table}.executor_id \
                    END \
@@ -2803,8 +2797,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.executor_id)
             .bind(workflow.application_version)
             .bind(workflow.application_id)
-            .bind(now.as_epoch_ms())
-            .bind(now.as_epoch_ms())
             .bind(initial_attempts)
             .bind(workflow.timeout.map(|d| d.as_millis() as i64))
             .bind(workflow.deadline.map(Timestamp::as_epoch_ms))
@@ -3561,16 +3553,13 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         let workflow_table = &self.tables.workflow_status;
         // Resolved once, outside the retry, so a relative delay does not creep further out with
-        // each attempt. Go's `resolveDelayUntil` collapses its two options to one absolute
-        // `time.Time` before the write for the same reason; see `init_workflow` on why the
-        // caller's clock is the one that resolves it.
+        // each attempt, as on `init_workflow`.
         //
         // A relative delay is stamped by *this* process, and released by whichever supervisor
         // next runs, against *its* clock — so a skewed operator host moves a release time the
-        // whole fleet honours. That is UPSTREAM item 22, anchored on `init_workflow` and shared
-        // with all four implementations: Go's `resolveDelayUntil` reads `time.Now()`, Python and
-        // TypeScript the same. Closing it here alone would cost a round trip that none of them
-        // spends, so the clock stays this one and the gap stays the team's to close.
+        // whole fleet honours.
+        //
+        // TODO(dbos-team): UPSTREAM item 22, as on `init_workflow`.
         let now = Timestamp::now();
         let delay_until = delay.resolve(now).as_epoch_ms();
         let workflow_table = workflow_table.as_str();
@@ -3603,7 +3592,6 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error> {
         let workflow_table = &self.tables.workflow_status;
-        let now = Timestamp::now().as_epoch_ms();
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
 
         with_retry(&self.retry, "clear_queue_assignment", move || async move {
@@ -3611,11 +3599,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // workflow that never came from a queue has none to go back to.
             let updated = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
-                 updated_at = $2 \
+                 updated_at = {NOW_MS_SQL} \
                  WHERE workflow_uuid = $1 AND queue_name IS NOT NULL AND status = 'PENDING'"
             )))
             .bind(workflow_id)
-            .bind(now)
             .execute(pool)
             .await?
             .rows_affected();
@@ -3722,16 +3709,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // is holding an identity for, and a retry should release whatever has since come
                 // due rather than replay a stale cutoff.
                 //
-                // The supervisor's own clock, matching Python's `now_ms`, so this compares a
-                // reading taken here against a stamp some other process wrote. See
-                // `init_workflow` on why that skew is left where every implementation has it.
+                // The cutoff is this supervisor's own clock, a process clock as delays are, but
+                // usually not the process that resolved the delay: this compares a reading taken
+                // here against an instant some other process resolved (UPSTREAM item 22, see
+                // `init_workflow`). `updated_at` is a stamp rather than a comparison, so it comes
+                // from the database.
                 let now = Timestamp::now().as_epoch_ms();
                 // Clearing the debounce key belongs in this statement, not a second one. The id
                 // is held only while the workflow is DELAYED; once released the workflow is
                 // committed to running, and a later debounce with the same key must start a
                 // fresh workflow rather than bounce this one.
                 let moved = sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {workflow_table} SET status = 'ENQUEUED', updated_at = $1, \
+                    "UPDATE {workflow_table} SET status = 'ENQUEUED', updated_at = {NOW_MS_SQL}, \
                      deduplication_id = CASE WHEN is_debounced THEN NULL \
                                              ELSE deduplication_id END \
                      WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1 \
@@ -5259,7 +5248,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn update_application_version_timestamp(
         &self,
         version_name: &str,
-        timestamp: Timestamp,
+        timestamp: Option<Timestamp>,
         application_name: Option<&str>,
     ) -> Result<(), Error> {
         let versions_table = &self.tables.application_versions;
@@ -5287,12 +5276,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // application and a bare name match would retime every copy. The `SET` also
                 // claims an unclaimed row, which would otherwise stay every peer's latest.
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {versions_table} SET version_timestamp = $2, application_name = $3 \
+                    "UPDATE {versions_table} \
+                     SET version_timestamp = COALESCE($2, {NOW_MS_SQL}), application_name = $3 \
                      WHERE version_name = $1 \
                        AND (application_name IS NULL OR application_name = $3)"
                 )))
                 .bind(version_name)
-                .bind(timestamp.as_epoch_ms())
+                .bind(timestamp.map(Timestamp::as_epoch_ms))
                 .bind(owner.as_deref())
                 .execute(&mut *tx)
                 .await?;
@@ -5368,7 +5358,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                   partition_worker_concurrency, partition_rate_limit_max, \
                   partition_rate_limit_period_sec, polling_interval_sec, updated_at, \
                   application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {NOW_MS_SQL}, $13) \
                  {on_conflict}"
             )))
             .bind(queue.name)
@@ -5383,7 +5373,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(queue.partition_rate_limit.map(|r| r.limit))
             .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
             .bind(queue.polling_interval.as_secs_f64())
-            .bind(Timestamp::now().as_epoch_ms())
             .bind(owner.as_deref())
             .execute(&mut *tx)
             .await?;
@@ -6206,8 +6195,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 set.push("partition_rate_limit_period_sec = ");
                 set.push_bind_unseparated(limit.map(|l| l.period.as_secs_f64()));
             }
-            set.push("updated_at = ");
-            set.push_bind_unseparated(Timestamp::now().as_epoch_ms());
+            set.push("updated_at = ").push_unseparated(NOW_MS_SQL);
 
             q.push(" WHERE name = ").push_bind(name);
             q.push(" RETURNING ").push(QUEUE_COLUMNS);
