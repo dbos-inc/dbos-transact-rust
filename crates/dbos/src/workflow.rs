@@ -1708,9 +1708,10 @@ impl Parent<'_> {
 /// the application's — carries the workflow id without threading it anywhere.
 ///
 /// `slot` is carried, never read: a dequeued workflow holds its place in its queue's local running
-/// tally for exactly as long as this task lives, so the release happens on a return, a panic, or
-/// shutdown aborting it, without anything having to watch for the end. Every other submitter
-/// passes `None`.
+/// tally for as long as this task lives, so the release happens on a return, a panic, or shutdown
+/// aborting it, without anything having to watch for the end. The one earlier release is an
+/// execution another one has overtaken, which [`adopt_superseded`] gives up before it waits. Every
+/// other submitter passes `None`.
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
     key: WorkflowKey,
@@ -1725,12 +1726,11 @@ pub(crate) fn spawn_execution(
         {
             let executor = Arc::clone(executor);
             async move {
-                let _slot = slot;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline);
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, ctx).await
+                execute(&executor, &key, &workflow_id, input, ctx, slot).await
             }
         }
         .instrument(span),
@@ -1844,12 +1844,15 @@ async fn cancel_at_deadline(
 }
 
 /// Runs the body with a context ambient and records what it did.
+///
+/// `slot` is the queue slot a dequeued execution holds, kept for as long as this runs.
 async fn execute(
     executor: &Executor,
     key: &WorkflowKey,
     workflow_id: &str,
     input: Option<String>,
     ctx: Ctx,
+    slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<Option<String>, Failure> {
     let workflow = executor
         .workflows()
@@ -1886,6 +1889,24 @@ async fn execute(
                 .sysdb()
                 .record_workflow_outcome(workflow_id, Outcome::Output(output.as_deref()))
                 .await
+        }
+        // Another execution checkpointed a step this one was about to, so it is ahead and this
+        // one is superseded — the same position as `OutcomeWrite::AlreadyFinished` below, one
+        // level down. The conflict is a fact about ownership, not a failure of the workflow, so
+        // the caller gets the outcome the winner records rather than an error for a workflow
+        // that may well succeed.
+        Err(Failure::Control(Error::SystemDatabase(
+            crate::sysdb::Error::StepAlreadyRecorded {
+                workflow_id: conflicted,
+                step_id,
+            },
+        ))) if conflicted == workflow_id => {
+            tracing::warn!(
+                workflow_id,
+                step_id,
+                "another execution recorded this workflow's step first; waiting for its outcome"
+            );
+            return adopt_superseded(executor, workflow_id, slot).await;
         }
         // A control signal is not the workflow's outcome, so this execution writes nothing
         // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
@@ -1932,11 +1953,28 @@ async fn execute(
                 workflow_id,
                 "another execution recorded this workflow's outcome first"
             );
-            // Park-and-adopt: this run inserted the row, so a missing one has been deleted. The
-            // path every reference passes its own flag on.
-            executor.connection().adopt(workflow_id, true).await
+            adopt_superseded(executor, workflow_id, slot).await
         }
     }
+}
+
+/// Returns the outcome another execution records, for an execution that execution has overtaken.
+///
+/// The superseded execution writes nothing: what it computed is not the answer, and every caller
+/// must agree on the one that is.
+///
+/// **The queue slot goes first.** It counts work this process is doing, and waiting on another
+/// execution is not work — while a dequeued execution's result has no reader at all, so holding the
+/// slot would stop this process dequeuing from that queue for as long as the winner runs.
+async fn adopt_superseded(
+    executor: &Executor,
+    workflow_id: &str,
+    slot: Option<crate::dequeue::Slot>,
+) -> std::result::Result<Option<String>, Failure> {
+    drop(slot);
+    // Park-and-adopt, the path every reference passes its own flag on: this execution has read the
+    // row, whether it created it, recovered it or dequeued it, so a missing one has been deleted.
+    executor.connection().adopt(workflow_id, true).await
 }
 
 impl Connection {
