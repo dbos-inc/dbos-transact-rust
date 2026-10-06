@@ -1887,6 +1887,25 @@ async fn execute(
                 .record_workflow_outcome(workflow_id, Outcome::Output(output.as_deref()))
                 .await
         }
+        // Another execution checkpointed a step this one was about to, so it is ahead and this
+        // one is superseded — the same position as `OutcomeWrite::AlreadyFinished` below, one
+        // level down. The conflict is a fact about ownership, not a failure of the workflow, so
+        // the caller gets the outcome the winner records rather than an error for a workflow
+        // that may well succeed.
+        Err(Failure::Control(Error::SystemDatabase(
+            crate::sysdb::Error::StepAlreadyRecorded {
+                workflow_id: conflicted,
+                step_id,
+            },
+        ))) if conflicted == workflow_id => {
+            tracing::warn!(
+                workflow_id,
+                step_id,
+                "another execution recorded this workflow's step first; waiting for its outcome"
+            );
+            // Park-and-adopt: this run initialized the row, so a missing one has been deleted.
+            return executor.connection().adopt(workflow_id, true).await;
+        }
         // A control signal is not the workflow's outcome, so this execution writes nothing
         // terminal. Where that leaves the row depends on the signal — PENDING for a later executor
         // after a shutdown or a failed write, already CANCELLED when the signal is a cancellation

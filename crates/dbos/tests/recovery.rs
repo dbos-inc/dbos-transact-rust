@@ -308,3 +308,113 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
 
     second.shutdown().await;
 }
+
+/// An execution that loses a step-checkpoint race returns the winner's outcome, not an error.
+///
+/// Recovery hands a workflow to a second execution while the first is still running — the first
+/// was presumed dead, and was not. Both run the same step; the second records it and finishes the
+/// workflow; the first then finishes its step and finds the position already taken. Its caller
+/// must get the workflow's recorded outcome, which is the second execution's, rather than a
+/// system-database error for a workflow that succeeded.
+#[tokio::test]
+async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
+    let entered = Arc::new(AtomicU32::new(0));
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let build = |db: &TestDatabase| {
+        let dbos = DBOS::new(config("step-race-app", db));
+        let (entered, reached, release) = (
+            Arc::clone(&entered),
+            Arc::clone(&reached_gate),
+            Arc::clone(&release_gate),
+        );
+        let workflow = dbos
+            .register_workflow("racy", move |()| {
+                let (entered, reached, release) = (
+                    Arc::clone(&entered),
+                    Arc::clone(&reached),
+                    Arc::clone(&release),
+                );
+                async move {
+                    let output = dbos::step("work", || {
+                        let (entered, reached, release) = (
+                            Arc::clone(&entered),
+                            Arc::clone(&reached),
+                            Arc::clone(&release),
+                        );
+                        async move {
+                            // The first execution holds its step open until the second has
+                            // recorded the same one; every later execution completes at once.
+                            if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                                reached.notify_one();
+                                release.notified().await;
+                                Ok("first".to_owned())
+                            } else {
+                                Ok("second".to_owned())
+                            }
+                        }
+                    })
+                    .await?;
+                    Ok::<_, dbos::Error>(output)
+                }
+            })
+            .unwrap();
+        (dbos, workflow)
+    };
+    let reader = reader(&db).await;
+    let id = "step-race";
+
+    let (first, workflow) = build(&db);
+    first.launch().await.expect("launch failed");
+    let handle = workflow
+        .start_with(
+            (),
+            dbos::StartOptions {
+                workflow_id: Some(id),
+                ..dbos::StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    tokio::time::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the first execution never entered its step");
+
+    // Same executor id, so this launch recovers the workflow the first instance is still running.
+    let (second, _workflow) = build(&db);
+    second.launch().await.expect("second launch failed");
+    let row = await_status(&reader, id, WorkflowStatus::Success).await;
+    assert_eq!(row.output.as_deref(), Some("\"second\""));
+
+    release_gate.notify_one();
+    let result = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the losing execution never returned");
+    assert_eq!(
+        result.expect("the losing execution's caller got an error"),
+        "second",
+        "the caller adopts the recorded outcome, not what its own execution computed"
+    );
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        2,
+        "both executions ran the step"
+    );
+
+    let row = reader
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row exists");
+    assert_eq!(row.status, WorkflowStatus::Success);
+    assert_eq!(
+        row.output.as_deref(),
+        Some("\"second\""),
+        "the loser wrote nothing"
+    );
+
+    second.shutdown().await;
+    first.shutdown().await;
+}
