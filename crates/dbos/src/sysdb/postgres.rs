@@ -5483,7 +5483,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let rate_limit_period_ms = period_ms(limits.rate_limit);
         let partition_rate_limit_period_ms = period_ms(limits.partition_rate_limit);
 
-        with_retry(&self.retry, "start_queued_workflows", move || async move {
+        // Conflicts are not replayed here. A dequeue raised above read committed expects to lose
+        // races to its peers, and its caller's answer to a lost one — poll again later, or skip
+        // this partition — is the right one, which a replay underneath it would hide.
+        let retry = self.retry.without_conflict_replay();
+        with_retry(&retry, "start_queued_workflows", move || async move {
             let mut tx = pool.begin().await?;
 
             // Read committed otherwise: with no shared budget nothing here reads a total, so a
@@ -5835,8 +5839,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let pool = &self.pool;
         let application_name = self.application_name.as_deref();
 
+        // Conflicts are not replayed, as in `start_queued_workflows`: losing a race is the caller's
+        // to answer.
+        let retry = self.retry.without_conflict_replay();
         with_retry(
-            &self.retry,
+            &retry,
             "start_queued_partitioned_workflows",
             move || async move {
                 let mut tx = pool.begin().await?;
