@@ -5602,7 +5602,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
             if let (Some(concurrency), Some(key)) = (limits.partition_concurrency, partition_key) {
                 // Its own query rather than one grouped with the queue-wide count: this predicate
-                // rides `idx_workflow_status_partition_dequeue_v2`, which a queue-wide scan loses.
+                // rides `idx_workflow_status_partition_dequeue_v3`, which a queue-wide scan loses.
                 let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT count(*) FROM {workflow_table} \
                      WHERE queue_name = $3 AND status = 'PENDING' \
@@ -5752,7 +5752,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // A loose index scan, not `SELECT DISTINCT`. Neither backend can skip to the next
             // distinct value inside a plain distinct, so it degenerates into reading every
             // enqueued row; each step of this recursion is one seek on
-            // `idx_workflow_status_partition_dequeue_v2`, so the cost follows the number of
+            // `idx_workflow_status_partition_dequeue_v3`, so the cost follows the number of
             // partitions rather than the depth of the backlog.
             let partitions: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "WITH RECURSIVE partitions AS ( \
@@ -5872,7 +5872,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 //
                 // TODO(dbos-team): UPSTREAM item 21. Python and TypeScript place the `LIMIT` and
                 // the version predicate here too, and the fix worth having —
-                // `application_version` in `idx_workflow_status_partition_dequeue_v2` — is a
+                // `application_version` in `idx_workflow_status_partition_dequeue_v3` — is a
                 // shared migration in any case.
                 //
                 // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
