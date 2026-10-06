@@ -187,8 +187,8 @@ pub struct Config {
     /// How often the scheduler re-reads the schedules table for schedules created, changed,
     /// paused or deleted since its last look.
     ///
-    /// `None` is thirty seconds. For the first minute after launch the scheduler looks every
-    /// second whatever this says, so a schedule created at startup starts promptly. Zero is
+    /// `None` is thirty seconds. For the first minute after launch the scheduler looks at least
+    /// once a second whatever this says, so a schedule created at startup starts promptly. Zero is
     /// rejected: it would re-read the table continuously.
     pub scheduler_polling_interval: Option<Duration>,
 }

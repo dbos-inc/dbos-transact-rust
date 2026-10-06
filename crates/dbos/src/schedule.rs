@@ -878,7 +878,7 @@ impl Connection {
         start: SystemTime,
         end: SystemTime,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        let record = self.schedule_to_fire(name).await?;
+        let record = self.get_schedule_or_not_found(name).await?;
         let cron = CronSchedule::parse(&record.schedule, record.cron_timezone.as_deref()).map_err(
             |detail| Error::InvalidArgument {
                 operation: "backfill a schedule".into(),
@@ -928,18 +928,18 @@ impl Connection {
         self: &Arc<Self>,
         name: &str,
     ) -> Result<WorkflowHandle<R, E>> {
-        let record = self.schedule_to_fire(name).await?;
+        let record = self.get_schedule_or_not_found(name).await?;
         let now = jiff::Timestamp::now();
         let workflow_id = trigger_id(name, now);
         let firing = self.prepare_firing(&record).await?;
-        self.fire(&record, &firing, SystemTime::from(now), &workflow_id)
+        self.enqueue_run(&record, &firing, SystemTime::from(now), &workflow_id)
             .await?;
         tracing::info!(schedule = name, workflow_id, "triggered a schedule");
         Ok(WorkflowHandle::polling(Arc::clone(self), workflow_id, true))
     }
 
     /// The schedule, or the system database's `NotRegistered` for a name with none.
-    async fn schedule_to_fire(&self, name: &str) -> Result<ScheduleRecord> {
+    async fn get_schedule_or_not_found(&self, name: &str) -> Result<ScheduleRecord> {
         self.get_schedule(name, None).await?.ok_or_else(|| {
             Error::SystemDatabase(crate::sysdb::Error::NotRegistered {
                 kind: "Schedule".into(),
@@ -971,7 +971,7 @@ impl Connection {
         if existing.is_some() {
             return Ok(false);
         }
-        self.fire(record, firing, SystemTime::from(at), workflow_id)
+        self.enqueue_run(record, firing, SystemTime::from(at), workflow_id)
             .await?;
         Ok(true)
     }
@@ -987,7 +987,7 @@ impl Connection {
     /// - **`application_name`** the schedule's owner, or this handle's for an unclaimed schedule.
     /// - **`schedule_name`**, which is what lists a schedule's runs.
     /// - **No parent and no creator**: nothing called this, so nothing records having called it.
-    async fn fire(
+    async fn enqueue_run(
         &self,
         record: &ScheduleRecord,
         firing: &Firing,
@@ -1035,7 +1035,7 @@ pub(crate) struct Firing {
 }
 
 impl Connection {
-    /// Reads what [`fire`](Self::fire) stamps on a run of `record`.
+    /// Reads what [`enqueue_run`](Self::enqueue_run) stamps on a run of `record`.
     ///
     /// **The latest version is read at the time of firing**, not at the time the schedule was
     /// loaded: a deploy that lands while a schedule is running should get that schedule's next

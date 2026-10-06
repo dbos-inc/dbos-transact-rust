@@ -159,6 +159,17 @@ async fn reconcile_schedules(
                         current.task = Task::Unfireable;
                         continue;
                     }
+                    // **Parked like an unfireable schedule.** Whatever panicked will most likely
+                    // panic again, and restarting on every poll would loop on it.
+                    Err(error) if error.is_panic() => {
+                        tracing::error!(
+                            "the task firing schedule `{}` panicked; it is stopped until the \
+                             schedule's definition changes",
+                            record.schedule_name
+                        );
+                        current.task = Task::Unfireable;
+                        continue;
+                    }
                     // It found its row replaced or redefined before this poll saw it, and the row
                     // is back as it was: restarted like any start.
                     Ok(Ended::Superseded) | Err(_) => true,
@@ -254,6 +265,9 @@ async fn run_schedule(
         _ => now,
     };
     let mut fresh: Option<(Firing, std::time::Instant)> = None;
+    // Whether the last attempt found the schedule paused, so the next one that finds it active
+    // knows it has been resumed.
+    let mut paused = false;
     loop {
         let Some(tick) = cron.next_after(cursor) else {
             tracing::error!(
@@ -268,10 +282,39 @@ async fn run_schedule(
 
         let workflow_id = firing_id(&record.schedule_name, &tick);
         let next_tick = cron.next_after(cursor).map(|next| next.timestamp());
+        // Settled once, when the tick is reached: a live tick whose retries run past the next one
+        // has been overtaken, not turned into a backlog.
+        let catching_up = next_tick.is_some_and(|next| next <= Instant::now());
+        let mut tick_state = TickState {
+            paused,
+            enqueued: false,
+        };
         let mut wait = Duration::from_secs(1);
         loop {
-            match fire(&executor, &record, &mut fresh, cursor, &workflow_id).await {
-                Ok(Attempt::Fired | Attempt::Paused) => break,
+            match attempt_tick(
+                &executor,
+                &record,
+                &mut fresh,
+                &mut tick_state,
+                cursor,
+                &workflow_id,
+            )
+            .await
+            {
+                Ok(Attempt::Fired) => {
+                    paused = false;
+                    break;
+                }
+                Ok(Attempt::Paused) => {
+                    paused = true;
+                    break;
+                }
+                Ok(Attempt::Resumed { last_fired_at }) => {
+                    paused = false;
+                    // Walked again from where resuming says to start, which includes this tick.
+                    cursor = resume_cursor(record.automatic_backfill, last_fired_at, cursor);
+                    break;
+                }
                 Ok(Attempt::Superseded) => {
                     tracing::info!(
                         schedule = record.schedule_name,
@@ -284,7 +327,7 @@ async fn run_schedule(
                     return Ended::Unfireable;
                 }
                 Err(error) => {
-                    if overtaken(next_tick, wait) {
+                    if give_up(next_tick, catching_up, Instant::now(), wait) {
                         tracing::error!(
                             workflow_id,
                             error = %error,
@@ -309,28 +352,59 @@ async fn run_schedule(
     }
 }
 
-/// Whether a failed tick should be given up on, because the next tick will be due before the next
-/// attempt.
+/// Whether to stop retrying a tick that failed.
 ///
 /// **Retried rather than dropped**, because a database away for longer than the system database's
-/// own retries would otherwise cost a daily schedule a day. The next tick is the bound for a live
-/// tick because past it this one has been overtaken, and two ticks' runs racing each other is
-/// worse than one missing.
+/// own retries would otherwise cost a daily schedule a day. A live tick is retried until the next
+/// tick would be due before the next attempt, and given up once the next tick has arrived: past
+/// that, this one has been overtaken, and two ticks' runs racing each other is worse than one
+/// missing.
 ///
-/// **No bound while catching up.** There the next tick is already due — every tick of a backlog is
-/// — and giving up would drop the tick for good: the ticks after it move `last_fired_at` past it,
-/// so no later catch-up comes back for it. Nothing races a backlog, which is walked one tick at a
-/// time. The last tick of a pattern that stops firing has no next tick, and is retried for the same
-/// reason.
-fn overtaken(next_tick: Option<Instant>, wait: Duration) -> bool {
+/// **No bound while catching up** — `catching_up`, settled when the tick was reached, says the next
+/// tick was already due then. Giving up there would drop the tick for good: the ticks after it move
+/// `last_fired_at` past it, so no later catch-up comes back for it. Nothing races a backlog, which
+/// is walked one tick at a time. The last tick of a pattern that stops firing has no next tick, and
+/// is retried for the same reason.
+fn give_up(next_tick: Option<Instant>, catching_up: bool, now: Instant, wait: Duration) -> bool {
     let Some(next_tick) = next_tick else {
         return false;
     };
-    match Duration::try_from(next_tick.duration_since(Instant::now())) {
-        Ok(remaining) => remaining <= wait,
-        // Already due: catching up.
-        Err(_) => false,
+    if catching_up {
+        return false;
     }
+    match Duration::try_from(next_tick.duration_since(now)) {
+        Ok(remaining) => remaining <= wait,
+        // The next tick arrived while this one was being retried.
+        Err(_) => true,
+    }
+}
+
+/// Where to walk from once a paused schedule is found active again, given the tick it was found
+/// active at.
+///
+/// With automatic backfill, from when the schedule last fired, so the ticks skipped while it was
+/// paused run — the same catch-up a resume gets when the reconciler restarts the task. Without it,
+/// from just before the current tick, so that tick runs and the paused ones do not.
+fn resume_cursor(
+    automatic_backfill: bool,
+    last_fired_at: Option<Timestamp>,
+    tick: Instant,
+) -> Instant {
+    let just_before = tick - jiff::SignedDuration::from_nanos(1);
+    match last_fired_at {
+        Some(last) if automatic_backfill => Instant::from_millisecond(last.as_epoch_ms())
+            .map_or(just_before, |last| last.min(just_before)),
+        _ => just_before,
+    }
+}
+
+/// What the attempts at one tick have learned, kept across retries.
+struct TickState {
+    /// The previous tick found the schedule paused, so finding it active means it was resumed.
+    paused: bool,
+    /// This executor enqueued the tick's run. Kept across retries so that a retry after a failed
+    /// `last_fired_at` write — which finds the run already there — still records it.
+    enqueued: bool,
 }
 
 /// What one attempt at a tick came to.
@@ -341,6 +415,12 @@ enum Attempt {
     /// a resume before the reconciler's next poll loses nothing; a pause that lasts is ended by
     /// the reconciler.
     Paused,
+    /// The schedule was paused at the previous tick and is active again. Nothing was fired: the
+    /// task walks again from [`resume_cursor`], which includes this tick.
+    Resumed {
+        /// When the schedule last fired, as the row says now.
+        last_fired_at: Option<Timestamp>,
+    },
     /// The row under the name is gone, a different schedule, or redefined: whatever this task was
     /// started for, it is not that any more.
     Superseded,
@@ -348,11 +428,13 @@ enum Attempt {
     Unfireable(String),
 }
 
-/// Enqueues one tick and records it as the schedule's last, unless the schedule says otherwise.
-async fn fire(
+/// Tries once to enqueue a tick and record it as the schedule's last, unless re-reading the
+/// schedule says it is paused, resumed, changed or deleted.
+async fn attempt_tick(
     executor: &Executor,
     record: &ScheduleRecord,
     fresh: &mut Option<(Firing, std::time::Instant)>,
+    state: &mut TickState,
     tick: Instant,
     workflow_id: &str,
 ) -> Result<Attempt> {
@@ -374,6 +456,11 @@ async fn fire(
                 *fresh = None;
                 return Ok(Attempt::Paused);
             }
+            if state.paused {
+                return Ok(Attempt::Resumed {
+                    last_fired_at: current.last_fired_at,
+                });
+            }
             // From the row as it is now: the definition is the same, but the owner may have
             // claimed an unclaimed schedule since.
             let prepared = match conn.prepare_firing(&current).await {
@@ -389,9 +476,12 @@ async fn fire(
             &fresh.insert((prepared, std::time::Instant::now())).0
         }
     };
-    let enqueued = conn
+    if conn
         .fire_unless_fired(record, firing, tick, workflow_id)
-        .await?;
+        .await?
+    {
+        state.enqueued = true;
+    }
     // Recorded by whichever executor enqueued the tick, rather than by every executor that woke
     // for it. They would all write the same tick, queuing on the schedule's row lock to do it —
     // and the write is last-writer-wins, so every extra writer is another chance for a straggler
@@ -399,7 +489,7 @@ async fn fire(
     //
     // The tick, not the clock: it is what automatic backfill resumes from, and a backfill from the
     // clock would skip whatever fired between the tick and the write.
-    if enqueued {
+    if state.enqueued {
         conn.sysdb()
             .update_schedule_last_fired_at(
                 &record.schedule_name,
@@ -425,17 +515,54 @@ fn jitter(until: Duration) -> Duration {
 mod tests {
     use super::*;
 
+    fn at(rfc3339: &str) -> Instant {
+        rfc3339.parse().unwrap()
+    }
+
     #[test]
-    fn a_failed_tick_is_given_up_only_when_a_future_tick_would_overtake_it() {
+    fn a_live_tick_is_retried_until_the_next_tick_would_overtake_it() {
+        let now = at("2026-10-05T12:00:00Z");
         let wait = Duration::from_secs(4);
-        let in_ = |secs: i64| Some(Instant::now() + jiff::SignedDuration::from_secs(secs));
-        // Live: the next tick is far enough away to try again, then too close.
-        assert!(!overtaken(in_(3600), wait));
-        assert!(overtaken(in_(2), wait));
-        // Catching up: the next tick is already due, so the backlog waits for this one.
-        assert!(!overtaken(in_(-60), wait));
-        // The last tick of a pattern that stops firing.
-        assert!(!overtaken(None, wait));
+        // The next tick is far enough away to try again, then too close.
+        assert!(!give_up(Some(at("2026-10-05T13:00:00Z")), false, now, wait));
+        assert!(give_up(Some(at("2026-10-05T12:00:02Z")), false, now, wait));
+        // The next tick arrived while this one was being retried: overtaken, not a backlog.
+        assert!(give_up(Some(at("2026-10-05T11:59:00Z")), false, now, wait));
+    }
+
+    #[test]
+    fn a_tick_of_a_backlog_or_the_last_tick_is_never_given_up() {
+        let now = at("2026-10-05T12:00:00Z");
+        let wait = Duration::from_secs(4);
+        assert!(!give_up(Some(at("2026-10-05T11:00:00Z")), true, now, wait));
+        assert!(!give_up(Some(at("2026-10-05T12:00:02Z")), true, now, wait));
+        assert!(!give_up(None, false, now, wait));
+    }
+
+    #[test]
+    fn a_resume_with_automatic_backfill_walks_from_the_last_firing() {
+        let tick = at("2026-10-05T12:00:20Z");
+        let last = Timestamp::from_epoch_ms(at("2026-10-05T12:00:05Z").as_millisecond());
+        assert_eq!(
+            resume_cursor(true, Some(last), tick),
+            at("2026-10-05T12:00:05Z")
+        );
+        // Never past the tick it was found active at, which must still run.
+        let later = Timestamp::from_epoch_ms(at("2026-10-05T12:01:00Z").as_millisecond());
+        assert!(resume_cursor(true, Some(later), tick) < tick);
+        // Nothing to walk back to.
+        assert!(resume_cursor(true, None, tick) < tick);
+    }
+
+    #[test]
+    fn a_resume_without_automatic_backfill_runs_only_the_current_tick() {
+        let tick = at("2026-10-05T12:00:20Z");
+        let last = Timestamp::from_epoch_ms(at("2026-10-05T12:00:05Z").as_millisecond());
+        let cursor = resume_cursor(false, Some(last), tick);
+        assert!(cursor < tick);
+        assert!(cursor > at("2026-10-05T12:00:19Z"));
+        let cron = CronSchedule::parse("* * * * * *", None).unwrap();
+        assert_eq!(cron.next_after(cursor).unwrap().timestamp(), tick);
     }
 
     #[test]

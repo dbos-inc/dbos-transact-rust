@@ -1523,8 +1523,9 @@ pub trait SystemDatabase: Send + Sync {
     /// that stalls between firing a tick and recording it can move the value back behind a tick a
     /// peer has since fired — the next automatic backfill then walks those ticks again, and only
     /// the deterministic run ids keep them from running twice. Keying the write by `schedule_id`
-    /// and refusing to move it backwards would close both; it is kept as it is because executors
-    /// of other SDKs share this row and write it the same way.
+    /// and refusing to move it backwards would close both. The write stays unconditional and
+    /// keyed by name because the row is shared by every executor that fires the schedule, and they
+    /// must all agree on how it is written.
     async fn update_schedule_last_fired_at(
         &self,
         name: &str,
