@@ -110,7 +110,7 @@ pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
-pub use schedule::{ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
+pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]

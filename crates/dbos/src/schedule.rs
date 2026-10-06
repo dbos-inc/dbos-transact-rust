@@ -64,7 +64,7 @@ use crate::serialization::{decode, encode};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     Change, NewSchedule, NewWorkflow, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, step_names,
+    ScheduleUpdate, Timestamp, step_names,
 };
 use crate::workflow::{DuplicationPolicy, Enqueue, init_or_join, new_row};
 
@@ -311,13 +311,113 @@ impl ScheduleChange<'_> {
     }
 }
 
-impl ScheduleRecord {
-    /// The schedule's context, decoded as `C`.
-    ///
-    /// A schedule written by another SDK may hold a context this one cannot read, which is why
-    /// listing hands back the encoded form and this decodes on request.
+/// A schedule, as the database holds it.
+///
+/// What [`get_schedule`](DBOS::get_schedule) and [`list_schedules`](DBOS::list_schedules) return:
+/// the definition a [`ScheduleSpec`] wrote, and the state the scheduler keeps beside it — whether
+/// it is paused, and when it last fired.
+///
+/// The context is kept encoded, and [`decode_context`](Self::decode_context) decodes it on request:
+/// a schedule written by another SDK may hold a context this one cannot read, and listing it should
+/// not fail for that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Schedule {
+    id: String,
+    name: String,
+    workflow: WorkflowKey,
+    schedule: String,
+    status: ScheduleStatus,
+    context: String,
+    last_fired_at: Option<SystemTime>,
+    automatic_backfill: bool,
+    cron_timezone: Option<String>,
+    queue_name: Option<String>,
+    application_name: Option<String>,
+}
+
+impl Schedule {
+    /// Builds the read view from a row.
+    pub(crate) fn from_record(record: ScheduleRecord) -> Self {
+        Self {
+            workflow: WorkflowKey::from_row(
+                record.workflow_name,
+                record.workflow_class_name.as_deref(),
+                None,
+            ),
+            id: record.schedule_id,
+            name: record.schedule_name,
+            schedule: record.schedule,
+            status: record.status,
+            context: record.context,
+            // A `Timestamp` the clock cannot represent is not one a schedule fired at.
+            last_fired_at: record.last_fired_at.and_then(Timestamp::to_system_time),
+            automatic_backfill: record.automatic_backfill,
+            cron_timezone: record.cron_timezone,
+            queue_name: record.queue_name,
+            application_name: record.application_name,
+        }
+    }
+
+    /// The schedule's name, unique across every application sharing the database.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The id the database generated for the schedule. A schedule deleted and created again under
+    /// the same name has a new one.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The workflow each tick enqueues.
+    pub fn workflow(&self) -> &WorkflowKey {
+        &self.workflow
+    }
+
+    /// The cron expression.
+    pub fn schedule(&self) -> &str {
+        &self.schedule
+    }
+
+    /// Whether the schedule is firing or paused.
+    pub fn status(&self) -> ScheduleStatus {
+        self.status
+    }
+
+    /// The context each tick is called with, encoded.
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    /// The context each tick is called with, decoded as `C`.
     pub fn decode_context<C: DeserializeOwned>(&self) -> Result<C> {
         decode(Some(&self.context), "schedule context")
+    }
+
+    /// The tick the schedule last fired for, or `None` if it has not fired.
+    pub fn last_fired_at(&self) -> Option<SystemTime> {
+        self.last_fired_at
+    }
+
+    /// Whether an executor picking the schedule up first enqueues the ticks it missed.
+    pub fn automatic_backfill(&self) -> bool {
+        self.automatic_backfill
+    }
+
+    /// The IANA timezone the cron expression is read in, or `None` for UTC.
+    pub fn cron_timezone(&self) -> Option<&str> {
+        self.cron_timezone.as_deref()
+    }
+
+    /// The queue each tick is enqueued on, or `None` for the engine's internal queue.
+    pub fn queue_name(&self) -> Option<&str> {
+        self.queue_name.as_deref()
+    }
+
+    /// The application that owns the schedule, or `None` if it is unclaimed and every
+    /// application sharing the database fires it.
+    pub fn application_name(&self) -> Option<&str> {
+        self.application_name.as_deref()
     }
 }
 
@@ -404,29 +504,31 @@ impl DBOS {
     pub fn list_schedules<'a>(
         &self,
         filter: &'a ScheduleFilter<'a>,
-    ) -> PendingStep<'a, Vec<ScheduleRecord>> {
+    ) -> PendingStep<'a, Vec<Schedule>> {
         PendingStep::placed(
             step_names::LIST_SCHEDULES,
             self.placed("list schedules"),
             move |executor, placement| async move {
-                executor
+                let records = executor
                     .connection()
                     .list_schedules(filter, placement.step())
-                    .await
+                    .await?;
+                Ok(records.into_iter().map(Schedule::from_record).collect())
             },
         )
     }
 
     /// The schedule with this name, or `None`.
-    pub fn get_schedule<'a>(&self, name: &'a str) -> PendingStep<'a, Option<ScheduleRecord>> {
+    pub fn get_schedule<'a>(&self, name: &'a str) -> PendingStep<'a, Option<Schedule>> {
         PendingStep::placed(
             step_names::GET_SCHEDULE,
             self.placed("read a schedule"),
             move |executor, placement| async move {
-                executor
+                let record = executor
                     .connection()
                     .get_schedule(name, placement.step())
-                    .await
+                    .await?;
+                Ok(record.map(Schedule::from_record))
             },
         )
     }
@@ -612,13 +714,15 @@ impl Client {
     }
 
     /// The schedules matching `filter`. See [`DBOS::list_schedules`].
-    pub async fn list_schedules(&self, filter: &ScheduleFilter<'_>) -> Result<Vec<ScheduleRecord>> {
-        self.connection().list_schedules(filter, None).await
+    pub async fn list_schedules(&self, filter: &ScheduleFilter<'_>) -> Result<Vec<Schedule>> {
+        let records = self.connection().list_schedules(filter, None).await?;
+        Ok(records.into_iter().map(Schedule::from_record).collect())
     }
 
     /// The schedule with this name, or `None`.
-    pub async fn get_schedule(&self, name: &str) -> Result<Option<ScheduleRecord>> {
-        self.connection().get_schedule(name, None).await
+    pub async fn get_schedule(&self, name: &str) -> Result<Option<Schedule>> {
+        let record = self.connection().get_schedule(name, None).await?;
+        Ok(record.map(Schedule::from_record))
     }
 
     /// Changes a schedule's definition. See [`DBOS::update_schedule`].
@@ -979,7 +1083,7 @@ mod tests {
     use crate::error::EngineOnly;
 
     #[test]
-    fn the_input_encodes_as_go_does() {
+    fn the_input_encodes_its_tick_as_rfc3339_text() {
         let input = ScheduledWorkflowInput {
             scheduled_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_665_600),
             context: "emea",
@@ -993,6 +1097,66 @@ mod tests {
             decode::<_, EngineOnly>(Some(&encoded), "argument").unwrap();
         assert_eq!(decoded.scheduled_time, input.scheduled_time);
         assert_eq!(decoded.context, "emea");
+    }
+
+    #[test]
+    fn a_schedule_reads_back_everything_its_row_holds() {
+        let schedule = Schedule::from_record(ScheduleRecord {
+            schedule_id: "id-1".into(),
+            schedule_name: "nightly".into(),
+            workflow_name: "report".into(),
+            workflow_class_name: Some("Reports".into()),
+            schedule: "0 0 2 * * *".into(),
+            status: ScheduleStatus::Paused,
+            context: r#""emea""#.into(),
+            last_fired_at: Some(Timestamp::from_epoch_ms(1_759_665_600_000)),
+            automatic_backfill: true,
+            cron_timezone: Some("Europe/Paris".into()),
+            queue_name: Some("reports".into()),
+            application_name: Some("app".into()),
+        });
+        assert_eq!(schedule.id(), "id-1");
+        assert_eq!(schedule.name(), "nightly");
+        assert_eq!(
+            schedule.workflow(),
+            &WorkflowKey {
+                name: "report".into(),
+                class_name: Some("Reports".into()),
+                config_name: None,
+            }
+        );
+        assert_eq!(schedule.schedule(), "0 0 2 * * *");
+        assert_eq!(schedule.status(), ScheduleStatus::Paused);
+        assert_eq!(schedule.context(), r#""emea""#);
+        assert_eq!(schedule.decode_context::<String>().unwrap(), "emea");
+        assert_eq!(
+            schedule.last_fired_at(),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_665_600))
+        );
+        assert!(schedule.automatic_backfill());
+        assert_eq!(schedule.cron_timezone(), Some("Europe/Paris"));
+        assert_eq!(schedule.queue_name(), Some("reports"));
+        assert_eq!(schedule.application_name(), Some("app"));
+    }
+
+    #[test]
+    fn an_empty_class_name_reads_as_none() {
+        let schedule = Schedule::from_record(ScheduleRecord {
+            schedule_id: "id".into(),
+            schedule_name: "s".into(),
+            workflow_name: "w".into(),
+            workflow_class_name: Some(String::new()),
+            schedule: "* * * * *".into(),
+            status: ScheduleStatus::Active,
+            context: "null".into(),
+            last_fired_at: None,
+            automatic_backfill: false,
+            cron_timezone: None,
+            queue_name: None,
+            application_name: None,
+        });
+        assert_eq!(schedule.workflow(), &WorkflowKey::new("w"));
+        assert_eq!(schedule.last_fired_at(), None);
     }
 
     #[test]

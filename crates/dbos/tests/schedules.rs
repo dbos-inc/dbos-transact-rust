@@ -124,16 +124,16 @@ async fn schedules_are_created_read_listed_and_deleted() {
         .await
         .unwrap()
         .expect("the schedule is missing");
-    assert_eq!(record.workflow_name, "crud-workflow");
-    assert_eq!(record.workflow_class_name, None);
-    assert_eq!(record.schedule, spec.schedule);
-    assert_eq!(record.status, ScheduleStatus::Active);
+    assert_eq!(record.workflow().name, "crud-workflow");
+    assert_eq!(record.workflow().class_name, None);
+    assert_eq!(record.schedule(), spec.schedule);
+    assert_eq!(record.status(), ScheduleStatus::Active);
     assert_eq!(record.decode_context::<String>().unwrap(), "ctx");
-    assert_eq!(record.cron_timezone.as_deref(), Some("America/New_York"));
-    assert_eq!(record.last_fired_at, None);
-    assert!(!record.automatic_backfill);
-    assert_eq!(record.queue_name, None);
-    assert_eq!(record.application_name.as_deref(), Some("sched-crud-app"));
+    assert_eq!(record.cron_timezone(), Some("America/New_York"));
+    assert_eq!(record.last_fired_at(), None);
+    assert!(!record.automatic_backfill());
+    assert_eq!(record.queue_name(), None);
+    assert_eq!(record.application_name(), Some("sched-crud-app"));
 
     assert!(
         dbos.get_schedule("no-such-schedule")
@@ -186,8 +186,8 @@ async fn schedules_are_created_read_listed_and_deleted() {
     .unwrap();
     dbos.create_schedule(&other_spec).await.unwrap();
     dbos.pause_schedule("other-schedule").await.unwrap();
-    let names = |records: Vec<dbos::sysdb::types::ScheduleRecord>| -> Vec<String> {
-        records.into_iter().map(|r| r.schedule_name).collect()
+    let names = |schedules: Vec<dbos::Schedule>| -> Vec<String> {
+        schedules.into_iter().map(|s| s.name().to_owned()).collect()
     };
     assert_eq!(
         names(
@@ -250,7 +250,13 @@ async fn pausing_and_resuming_toggle_the_status_and_name_a_missing_schedule() {
     let spec =
         ScheduleSpec::new("pausable", &workflow, daily_far_from_now(), &String::new()).unwrap();
     dbos.create_schedule(&spec).await.unwrap();
-    let status = || async { dbos.get_schedule("pausable").await.unwrap().unwrap().status };
+    let status = || async {
+        dbos.get_schedule("pausable")
+            .await
+            .unwrap()
+            .unwrap()
+            .status()
+    };
 
     dbos.pause_schedule("pausable").await.unwrap();
     assert_eq!(status().await, ScheduleStatus::Paused);
@@ -302,15 +308,15 @@ async fn updating_a_schedule_changes_only_what_it_names() {
     };
     dbos.update_schedule("updatable", &change).await.unwrap();
     let after = dbos.get_schedule("updatable").await.unwrap().unwrap();
-    assert_eq!(after.schedule, "0 30 1 * * *");
+    assert_eq!(after.schedule(), "0 30 1 * * *");
     assert_eq!(after.decode_context::<String>().unwrap(), "v2");
-    assert_eq!(after.cron_timezone.as_deref(), Some("Asia/Tokyo"));
-    assert_eq!(after.queue_name.as_deref(), Some("update-queue"));
+    assert_eq!(after.cron_timezone(), Some("Asia/Tokyo"));
+    assert_eq!(after.queue_name(), Some("update-queue"));
     // What the change did not name, and what is not a change's to make.
-    assert_eq!(after.schedule_id, before.schedule_id);
-    assert_eq!(after.workflow_name, before.workflow_name);
-    assert_eq!(after.status, ScheduleStatus::Paused);
-    assert!(!after.automatic_backfill);
+    assert_eq!(after.id(), before.id());
+    assert_eq!(after.workflow().name, before.workflow().name);
+    assert_eq!(after.status(), ScheduleStatus::Paused);
+    assert!(!after.automatic_backfill());
 
     let error = dbos
         .update_schedule(
@@ -344,8 +350,7 @@ async fn updating_a_schedule_changes_only_what_it_names() {
             .await
             .unwrap()
             .unwrap()
-            .queue_name
-            .as_deref(),
+            .queue_name(),
         Some("update-queue")
     );
 
@@ -391,13 +396,13 @@ async fn applying_schedules_creates_and_replaces_and_keeps_runtime_state() {
 
     let a2 = dbos.get_schedule("apply-a").await.unwrap().unwrap();
     assert_eq!(a2.decode_context::<String>().unwrap(), "a2");
-    assert!(a2.automatic_backfill);
-    assert_eq!(a2.cron_timezone.as_deref(), Some("Europe/Paris"));
-    assert_eq!(a2.schedule_id, a.schedule_id, "re-applying keeps the id");
-    assert_eq!(a2.status, ScheduleStatus::Paused, "and the status");
+    assert!(a2.automatic_backfill());
+    assert_eq!(a2.cron_timezone(), Some("Europe/Paris"));
+    assert_eq!(a2.id(), a.id(), "re-applying keeps the id");
+    assert_eq!(a2.status(), ScheduleStatus::Paused, "and the status");
     assert_eq!(
-        a2.last_fired_at,
-        Some(Timestamp::from_epoch_ms(1_000)),
+        a2.last_fired_at(),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
         "and the last tick"
     );
     assert!(dbos.get_schedule("apply-c").await.unwrap().is_some());
@@ -569,7 +574,10 @@ async fn a_schedule_fires_on_its_timezone_and_records_each_tick() {
         );
     }
     let record = dbos.get_schedule("fire-utc").await.unwrap().unwrap();
-    assert!(record.last_fired_at.is_some(), "the loop records each tick");
+    assert!(
+        record.last_fired_at().is_some(),
+        "the loop records each tick"
+    );
 
     dbos.shutdown().await;
 }
@@ -986,7 +994,7 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(record.application_name.as_deref(), Some("sched-client-app"));
+    assert_eq!(record.application_name(), Some("sched-client-app"));
     assert_eq!(
         client
             .list_schedules(&ScheduleFilter::default())
@@ -1003,7 +1011,7 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
             .await
             .unwrap()
             .unwrap()
-            .status,
+            .status(),
         ScheduleStatus::Paused
     );
     client.resume_schedule("client-schedule").await.unwrap();
