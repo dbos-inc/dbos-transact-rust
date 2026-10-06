@@ -307,11 +307,13 @@ pub enum BackendErrorKind {
     /// Retried by default, and the one class [`super::retry::RetryPolicy`] can be told to give up
     /// on: a caller that would rather see the failure than block can opt out.
     Connection,
-    /// Contention — a serialization failure or a deadlock.
+    /// A transaction conflict the database has already rolled back: a serialization failure or a
+    /// deadlock.
     ///
-    /// Always retried, whatever the policy says. The database is working; it asked this
-    /// transaction to step aside so another could commit, and not asking again loses the write.
-    Transient,
+    /// The database is working; it asked this transaction to step aside so another could commit.
+    /// Replaying it is safe because nothing of it was kept. Replayed by default; a caller can opt
+    /// out with [`super::retry::RetryPolicy::retry_conflicts`].
+    Conflict,
     /// The database understood the request and rejected it.
     ///
     /// A syntax error, a constraint violation, a missing table. Asking again cannot help.
