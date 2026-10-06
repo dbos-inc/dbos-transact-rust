@@ -347,6 +347,147 @@ async fn version_uniqueness_is_split_by_owner() {
     }
 }
 
+/// Splits an index definition, as `pg_indexes.indexdef` reports it, into its key columns and its
+/// included columns.
+///
+/// PostgreSQL prints `(a, b) INCLUDE (c)` and CockroachDB `(a ASC, b ASC) STORING (c)`, so this
+/// reads past both spellings to the column lists the schema has to agree on.
+fn index_columns(definition: &str) -> (Vec<String>, Vec<String>) {
+    fn list(after: &str) -> Vec<String> {
+        let inner = &after[..after.find(')').expect("unterminated column list")];
+        inner
+            .split(',')
+            .map(|c| c.trim().trim_end_matches(" ASC").to_owned())
+            .collect()
+    }
+    let keys = definition
+        .split_once("USING btree (")
+        .map(|(_, rest)| list(rest))
+        .expect("a btree column list");
+    let included = ["INCLUDE (", "STORING ("]
+        .iter()
+        .find_map(|marker| definition.split_once(marker))
+        .map(|(_, rest)| list(rest))
+        .unwrap_or_default();
+    (keys, included)
+}
+
+/// Migrations 115 to 120 replace three indexes, and only the replacements are left.
+///
+/// Each pair builds the new index before dropping the one it supersedes, both online. The
+/// replacements must have exactly the agreed key columns, `application_name` as an included
+/// column, and the predicate of the index they replace, because every implementation sharing the
+/// database builds them under the same names. Only valid indexes count as built, since PostgreSQL
+/// leaves a failed concurrent build in place, marked invalid; a superseded index must be gone
+/// whether it is valid or not, since an interrupted concurrent drop leaves it invalid.
+#[tokio::test]
+async fn the_index_rebuilds_replace_their_predecessors() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    apply_all(
+        &pool,
+        schema,
+        &build_migrations(schema, dialect_for(db.backend()), true),
+    )
+    .await;
+
+    let definitions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 \
+         AND tablename IN ('workflow_status', 'operation_outputs')",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list index definitions");
+    let valid: Vec<String> = sqlx::query_scalar(
+        "SELECT i.relname FROM pg_index ix \
+         JOIN pg_class i ON i.oid = ix.indexrelid \
+         JOIN pg_class t ON t.oid = ix.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = $1 AND t.relname IN ('workflow_status', 'operation_outputs') \
+         AND ix.indisvalid",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list valid indexes");
+
+    let in_flight = ["ENQUEUED", "PENDING"].as_slice();
+    for (built, keys, predicate, dropped) in [
+        (
+            "idx_workflow_status_in_flight_v2", // 115
+            ["queue_name", "status", "priority", "created_at"].as_slice(),
+            in_flight,
+            "idx_workflow_status_in_flight", // 116
+        ),
+        (
+            "idx_workflow_status_partition_dequeue_v3", // 117
+            [
+                "queue_name",
+                "status",
+                "queue_partition_key",
+                "priority",
+                "created_at",
+                "workflow_uuid",
+            ]
+            .as_slice(),
+            ["ENQUEUED", "PENDING", "queue_partition_key IS NOT NULL"].as_slice(),
+            "idx_workflow_status_partition_dequeue_v2", // 118
+        ),
+        (
+            "idx_operation_outputs_completed_at_function_name_v2", // 119
+            ["completed_at_epoch_ms", "function_name"].as_slice(),
+            [].as_slice(),
+            "idx_operation_outputs_completed_at_function_name", // 120
+        ),
+    ] {
+        assert!(
+            valid.iter().any(|i| i == built),
+            "{built} is missing or invalid; got {valid:?}",
+        );
+        let definition = &definitions
+            .iter()
+            .find(|(name, _)| name == built)
+            .expect("a valid index has a definition")
+            .1;
+        let (actual_keys, included) = index_columns(definition);
+        assert_eq!(actual_keys, keys, "{built} key columns: {definition}");
+        assert_eq!(
+            included,
+            ["application_name"],
+            "{built} included columns: {definition}"
+        );
+        match predicate {
+            [] => assert!(
+                !definition.contains(" WHERE "),
+                "{built} should be a full index: {definition}"
+            ),
+            fragments => {
+                let (_, condition) = definition
+                    .split_once(" WHERE ")
+                    .unwrap_or_else(|| panic!("{built} should be partial: {definition}"));
+                for fragment in fragments {
+                    assert!(
+                        condition.contains(fragment),
+                        "{built} predicate lacks {fragment}: {definition}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            !definitions.iter().any(|(name, _)| name == dropped),
+            "{dropped} should have been dropped; got {definitions:?}",
+        );
+    }
+}
+
 /// Migrations 43 and 44 leave only the notifications trigger behind.
 ///
 /// Migration 1 installs notification and workflow-events triggers and 39 adds the streams
@@ -381,7 +522,8 @@ async fn only_the_notifications_trigger_survives() {
     .expect("failed to list triggers");
     assert_eq!(names, vec!["dbos_notifications_trigger".to_owned()]);
 
-    // The v1 partition index is created by 45 and dropped by 47; only v2 survives.
+    // The v1 partition index is created by 45 and dropped by 47, v2 is created by 46 and dropped
+    // by 118; only 117's v3 survives.
     let indexes: Vec<String> = sqlx::query_scalar(
         "SELECT indexname FROM pg_indexes WHERE schemaname = $1 \
          AND indexname LIKE 'idx_workflow_status_partition%' ORDER BY 1",
@@ -392,7 +534,7 @@ async fn only_the_notifications_trigger_survives() {
     .expect("failed to list indexes");
     assert_eq!(
         indexes,
-        vec!["idx_workflow_status_partition_dequeue_v2".to_owned()],
+        vec!["idx_workflow_status_partition_dequeue_v3".to_owned()],
     );
 }
 

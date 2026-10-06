@@ -389,6 +389,28 @@ sources![
         "114_drop_duplicate_notifications_index.sql",
         Applies::Always
     ),
+    (115, "115_add_in_flight_index_v2.sql", Applies::Always),
+    (116, "116_drop_in_flight_index.sql", Applies::Always),
+    (
+        117,
+        "117_add_partition_dequeue_index_v3.sql",
+        Applies::Always
+    ),
+    (
+        118,
+        "118_drop_partition_dequeue_index_v2.sql",
+        Applies::Always
+    ),
+    (
+        119,
+        "119_add_operation_outputs_completed_at_index_v2.sql",
+        Applies::Always
+    ),
+    (
+        120,
+        "120_drop_operation_outputs_completed_at_index.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -437,7 +459,22 @@ pub const LOCAL_MIGRATIONS: u32 = 47;
 pub const SHARED_MIGRATION_BASE: u32 = 100;
 
 /// The highest migration defined here, and the version a fully migrated database records.
-pub const SHARED_MIGRATIONS: u32 = 114;
+///
+/// Computed from [`SOURCES`], so listing a new file there is what raises it.
+pub const SHARED_MIGRATIONS: u32 = highest_version(SOURCES);
+
+/// The highest version among `sources`, or 0 when there are none.
+const fn highest_version(sources: &[MigrationSource]) -> u32 {
+    let mut highest = 0;
+    let mut i = 0;
+    while i < sources.len() {
+        if sources[i].version > highest {
+            highest = sources[i].version;
+        }
+        i += 1;
+    }
+    highest
+}
 
 /// Which SQL dialect the system database speaks.
 ///
@@ -653,8 +690,8 @@ mod tests {
         //
         // 100 to 107 are all about `application_name`, the column the series was opened to add;
         // 108 is the first that is not, so the assertion is what the padding check needs — that
-        // the shared numbers do work — rather than what they happen to work on. 114 only drops an
-        // index, which is why `DROP` counts.
+        // the shared numbers do work — rather than what they happen to work on. 114, 116, 118 and
+        // 120 only drop an index, which is why `DROP` counts.
         for version in SHARED_MIGRATION_BASE..=SHARED_MIGRATIONS {
             let m = &migrations[version as usize - 1];
             assert_eq!(m.version, version);
@@ -667,9 +704,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 69 files: 68 the runner applies, plus the migration-10 probe, which is bound
+        // 75 files: 74 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 68);
+        assert_eq!(SOURCES.len(), 74);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -745,7 +782,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 67, "expected 67 files to carry a numbered header");
+        assert_eq!(checked, 73, "expected 73 files to carry a numbered header");
     }
 
     #[test]
@@ -757,7 +794,8 @@ mod tests {
         assert_eq!(
             online,
             [
-                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47, 107, 111, 114
+                22, 23, 24, 25, 26, 27, 29, 30, 31, 32, 34, 35, 37, 45, 46, 47, 107, 111, 114, 115,
+                116, 117, 118, 119, 120
             ],
         );
         // 106 is the counterexample in the shared series: an index whose predicate matches
