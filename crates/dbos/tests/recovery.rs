@@ -11,7 +11,7 @@ use std::time::Duration;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
-use dbos::{Config, DBOS, Error};
+use dbos::{Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, StartOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -276,9 +276,9 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
     workflow
         .start_with(
             (),
-            dbos::StartOptions {
+            StartOptions {
                 workflow_id: Some(id),
-                ..dbos::StartOptions::default()
+                ..StartOptions::default()
             },
         )
         .await
@@ -371,9 +371,9 @@ async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
     let handle = workflow
         .start_with(
             (),
-            dbos::StartOptions {
+            StartOptions {
                 workflow_id: Some(id),
-                ..dbos::StartOptions::default()
+                ..StartOptions::default()
             },
         )
         .await
@@ -413,6 +413,142 @@ async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
         row.output.as_deref(),
         Some("\"second\""),
         "the loser wrote nothing"
+    );
+
+    second.shutdown().await;
+    first.shutdown().await;
+}
+
+/// A dequeued execution that loses a step race gives up its queue slot before it waits.
+///
+/// The queue allows one workflow per process. The first instance dequeues the racing workflow and
+/// holds its step open; a second instance with the same executor id recovers it, dequeues it in
+/// turn, records the step, and holds the workflow open afterwards. When the first instance's step
+/// loses, that execution waits for the second's outcome — and the next workflow on the queue must
+/// still run on the first instance meanwhile, which it can only do if the waiting execution has
+/// let its slot go.
+#[tokio::test]
+async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
+    const QUEUE: &str = "race-queue";
+
+    let entered = Arc::new(AtomicU32::new(0));
+    let reached_step = Arc::new(tokio::sync::Notify::new());
+    let release_step = Arc::new(tokio::sync::Notify::new());
+    let winner_holding = Arc::new(tokio::sync::Notify::new());
+    let release_winner = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let build = async |db: &TestDatabase| {
+        let dbos = DBOS::new(config("superseded-slot-app", db));
+        let gates = (
+            Arc::clone(&entered),
+            Arc::clone(&reached_step),
+            Arc::clone(&release_step),
+            Arc::clone(&winner_holding),
+            Arc::clone(&release_winner),
+        );
+        let racy = dbos
+            .register_workflow("racy", move |()| {
+                let (entered, reached, release, holding, hold) = (
+                    Arc::clone(&gates.0),
+                    Arc::clone(&gates.1),
+                    Arc::clone(&gates.2),
+                    Arc::clone(&gates.3),
+                    Arc::clone(&gates.4),
+                );
+                async move {
+                    let output = dbos::step("work", || {
+                        let (entered, reached, release) = (
+                            Arc::clone(&entered),
+                            Arc::clone(&reached),
+                            Arc::clone(&release),
+                        );
+                        async move {
+                            if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                                reached.notify_one();
+                                release.notified().await;
+                                Ok("first".to_owned())
+                            } else {
+                                Ok("second".to_owned())
+                            }
+                        }
+                    })
+                    .await?;
+                    // Only the execution that recorded the step gets here.
+                    holding.notify_one();
+                    hold.notified().await;
+                    Ok::<_, dbos::Error>(output)
+                }
+            })
+            .unwrap();
+        let next = dbos
+            .register_workflow("next", async |()| Ok::<_, dbos::Error>(()))
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+        dbos.register_queue(
+            QUEUE,
+            QueueOptions {
+                worker_concurrency: Some(1),
+                polling_interval: Duration::from_millis(100),
+                ..QueueOptions::default()
+            },
+            QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("queue registration failed");
+        (dbos, racy, next)
+    };
+    let enqueue = |id| StartOptions {
+        workflow_id: Some(id),
+        queue: Some(Enqueue::new(QUEUE)),
+        ..StartOptions::default()
+    };
+    let reader = reader(&db).await;
+
+    let (first, racy, next) = build(&db).await;
+    racy.start_with((), enqueue("racy-1"))
+        .await
+        .expect("enqueue failed");
+    tokio::time::timeout(DEADLINE, reached_step.notified())
+        .await
+        .expect("the first instance never ran the step");
+
+    // Same executor id, so this launch returns the running workflow to its queue, and the second
+    // instance — the one with a free slot — dequeues it.
+    let (second, _racy, _next) = build(&db).await;
+    tokio::time::timeout(DEADLINE, winner_holding.notified())
+        .await
+        .expect("the second instance never recorded the step");
+
+    release_step.notify_one();
+    next.start_with((), enqueue("next-1"))
+        .await
+        .expect("enqueue failed");
+    // The second instance's one slot is held by the winner, so only the first can run this.
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        await_status(&reader, "next-1", WorkflowStatus::Success),
+    )
+    .await
+    .expect("the next workflow never ran: the superseded execution kept its slot");
+    let racy_row = reader
+        .get_workflow("racy-1")
+        .await
+        .expect("read failed")
+        .expect("the row exists");
+    assert_eq!(
+        racy_row.status,
+        WorkflowStatus::Pending,
+        "the winner is still holding the racing workflow open"
+    );
+
+    release_winner.notify_one();
+    let row = await_status(&reader, "racy-1", WorkflowStatus::Success).await;
+    assert_eq!(row.output.as_deref(), Some("\"second\""));
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        2,
+        "both executions ran the step"
     );
 
     second.shutdown().await;
