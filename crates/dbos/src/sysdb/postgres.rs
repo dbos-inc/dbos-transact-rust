@@ -1636,13 +1636,18 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 
 /// The database's clock, in epoch milliseconds, as a SQL expression.
 ///
-/// **Every timestamp the system database stores comes from here**, or from a column default that
-/// computes the same value, because stamps written by different executors are compared with each
-/// other. A rate limit stamps `started_at_epoch_ms` on the row it claims and the next dequeue
-/// measures its window back from now; if the two executors read their own clocks, a host running
-/// fast writes starts that a peer judges to be outside its window and both admit a full allowance.
-/// A retention sweep compares a workflow's `created_at` with its payloads' stamps the same way.
-/// One clock, so these comparisons mean the same thing everywhere.
+/// **The stamps that record when a row was written or changed state come from here**, or from a
+/// column default that computes the same value: `created_at`, `updated_at`, `completed_at`, the
+/// claim's `started_at_epoch_ms`, and the payload rows' `retention_timestamp`. Stamps written by
+/// different executors are compared with each other. A rate limit stamps `started_at_epoch_ms` on
+/// the row it claims and the next dequeue measures its window back from now; if the two executors
+/// read their own clocks, a host running fast writes starts that a peer judges to be outside its
+/// window and both admit a full allowance. A retention sweep compares a workflow's `created_at`
+/// with its payloads' stamps the same way. One clock, so these comparisons mean the same thing
+/// everywhere.
+///
+/// Times a caller supplies or resolves still come from the process clock: delays, deadlines, step
+/// timings, durable sleep, and the `version_timestamp` a promotion writes.
 ///
 /// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
 /// and the stamp taken later in the same transaction agree on one instant.
