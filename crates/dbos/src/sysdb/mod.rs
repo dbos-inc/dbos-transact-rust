@@ -1516,6 +1516,16 @@ pub trait SystemDatabase: Send + Sync {
     /// **No step, unlike its siblings**, and for the same reason it is silent about a missing row:
     /// the scheduler loop writes this after every firing, and a loop is not a workflow step.
     /// Neither TypeScript nor Python takes a connection here.
+    ///
+    /// **An unconditional write by name**, which leaves two races open. A loop still running for a
+    /// schedule that was deleted and created again under the same name writes the new schedule's
+    /// progress, because the name is all it matches on. And the last writer wins, so an executor
+    /// that stalls between firing a tick and recording it can move the value back behind a tick a
+    /// peer has since fired — the next automatic backfill then walks those ticks again, and only
+    /// the deterministic run ids keep them from running twice. Keying the write by `schedule_id`
+    /// and refusing to move it backwards would close both. The write stays unconditional and
+    /// keyed by name because the row is shared by every executor that fires the schedule, and they
+    /// must all agree on how it is written.
     async fn update_schedule_last_fired_at(
         &self,
         name: &str,

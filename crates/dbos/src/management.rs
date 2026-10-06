@@ -293,7 +293,7 @@ impl DBOS {
     /// check of its own — [`fork_all`](Self::fork_all)'s refusal of a chosen id,
     /// [`fork_with`](Self::fork_with)'s of a fork point that cannot name one — makes it between
     /// the launch check and this, so a refused call spends nothing.
-    fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
+    pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
     }
 

@@ -25,7 +25,7 @@ default = ["engine", "macros"]
 # which is what keeps the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`,
 # `spawn` — and the `tokio::select!` the step supervisor races a body against its timeout with
 # are the engine's, and a core-only build has no business pulling them in.
-engine = ["tokio/rt", "tokio/macros"]
+engine = ["tokio/rt", "tokio/macros", "dep:croner", "dep:jiff"]
 # Re-exports `select_step!` from `dbos-macros`. Implies `engine`, because the expansion is engine
 # code — it names the race's checkpoint through `dbos::__private`.
 #
@@ -79,6 +79,14 @@ time = { version = "0.3", default-features = false, features = [
     "parsing",
     "formatting",
 ] }
+
+# The scheduler's cron dialect: five or six fields, `L`, `W`, `#`, `?` and the `@` nicknames. The
+# `jiff` backend because a schedule names an IANA timezone and fires on that zone's wall clock,
+# which `time` cannot do without a timezone database. Engine-only: the system database layer
+# stores `workflow_schedules.cron` uninterpreted.
+croner = { version = "4.0.1", default-features = false, features = ["jiff"], optional = true }
+# The timezone database behind `cron_timezone`, and the calendar the scheduler walks in it.
+jiff = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Tests define application error types to check that a workflow's *own* failures round-trip, which
