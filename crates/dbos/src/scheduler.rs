@@ -183,7 +183,7 @@ async fn reconcile_schedules(
         let record = Arc::new(record);
         let task = spawn_tracked(
             executor,
-            fire_forever(Arc::clone(executor), Arc::clone(&record), catch_up).instrument(span),
+            run_schedule(Arc::clone(executor), Arc::clone(&record), catch_up).instrument(span),
         );
         running.insert(
             record.schedule_id.clone(),
@@ -226,7 +226,7 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// rather than now: the missed ticks are all due, so they fire back to back, and the walk carries
 /// on into the live ticks with nothing between them. A backfill that ended at its own "now" and a
 /// loop that started from a later one would drop whatever fell between the two.
-async fn fire_forever(
+async fn run_schedule(
     executor: Arc<Executor>,
     record: Arc<ScheduleRecord>,
     catch_up: bool,
