@@ -309,10 +309,13 @@ async fn run_schedule(
                     paused = true;
                     break;
                 }
-                Ok(Attempt::Resumed { last_fired_at }) => {
+                Ok(Attempt::Resumed {
+                    last_fired_at,
+                    automatic_backfill,
+                }) => {
                     paused = false;
                     // Walked again from where resuming says to start, which includes this tick.
-                    cursor = resume_cursor(record.automatic_backfill, last_fired_at, cursor);
+                    cursor = resume_cursor(automatic_backfill, last_fired_at, cursor);
                     break;
                 }
                 Ok(Attempt::Superseded) => {
@@ -420,6 +423,9 @@ enum Attempt {
     Resumed {
         /// When the schedule last fired, as the row says now.
         last_fired_at: Option<Timestamp>,
+        /// Whether to catch up on the paused ticks, as the row says now: the flag is not part of
+        /// the definition, so it can have changed since the task started.
+        automatic_backfill: bool,
     },
     /// The row under the name is gone, a different schedule, or redefined: whatever this task was
     /// started for, it is not that any more.
@@ -459,6 +465,7 @@ async fn attempt_tick(
             if state.paused {
                 return Ok(Attempt::Resumed {
                     last_fired_at: current.last_fired_at,
+                    automatic_backfill: current.automatic_backfill,
                 });
             }
             // From the row as it is now: the definition is the same, but the owner may have

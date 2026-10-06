@@ -444,8 +444,9 @@ impl DBOS {
     pub fn create_schedule<'a>(&self, spec: &'a ScheduleSpec) -> PendingStep<'a, ()> {
         const OPERATION: &str = "create a schedule";
         let built = self.executor(OPERATION).and_then(|executor| {
+            // Checks of the spec alone, which a replay answers the same way, so they can refuse
+            // the call before it takes a step id.
             spec.validate(OPERATION)?;
-            refuse_unregistered(&executor, &spec.workflow, OPERATION)?;
             let placement = StepPlacement::of(executor.connection(), OPERATION)?;
             Ok((executor, placement))
         });
@@ -454,13 +455,23 @@ impl DBOS {
             built,
             move |executor, placement| async move {
                 let conn = executor.connection();
-                refuse_unknown_queue(
-                    conn,
-                    &spec.schedule_name,
-                    spec.queue_name.as_deref(),
-                    OPERATION,
-                )
-                .await?;
+                // Checks of the world as it is now — the registry, the queues table — only on the
+                // first run. A replay returns what that run recorded, even if the queue has since
+                // been deleted.
+                if placement
+                    .check(conn, step_names::CREATE_SCHEDULE)
+                    .await?
+                    .is_none()
+                {
+                    refuse_unregistered(&executor, &spec.workflow, OPERATION)?;
+                    refuse_unknown_queue(
+                        conn,
+                        &spec.schedule_name,
+                        spec.queue_name.as_deref(),
+                        OPERATION,
+                    )
+                    .await?;
+                }
                 conn.create_schedule(spec, placement.step()).await
             },
         )
@@ -554,7 +565,13 @@ impl DBOS {
             built,
             move |(executor, context), placement| async move {
                 let conn = executor.connection();
-                if let Change::Set(queue) = change.queue_name {
+                // As in `create_schedule`: the queue is checked on the first run only.
+                if let Change::Set(queue) = change.queue_name
+                    && placement
+                        .check(conn, step_names::UPDATE_SCHEDULE)
+                        .await?
+                        .is_none()
+                {
                     refuse_unknown_queue(conn, name, queue, OPERATION).await?;
                 }
                 conn.update_schedule(name, change, context.as_deref(), placement.step())
@@ -598,7 +615,7 @@ impl DBOS {
 
     /// Deletes a schedule. Deleting one that does not exist is not an error.
     ///
-    /// Runs it already enqueued are not touched.
+    /// Runs the schedule has already enqueued are not touched.
     pub fn delete_schedule<'a>(&self, name: &'a str) -> PendingStep<'a, ()> {
         PendingStep::placed(
             step_names::DELETE_SCHEDULE,

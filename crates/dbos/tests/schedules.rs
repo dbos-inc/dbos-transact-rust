@@ -1112,3 +1112,62 @@ async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
     );
     dbos.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_replayed_create_returns_what_it_recorded_even_if_its_queue_is_gone() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("sched-replay-app", &db));
+    let (target, _) = recorder(&dbos, "replay-target");
+    let mut spec =
+        ScheduleSpec::new("replayed", &target, daily_far_from_now(), &String::new()).unwrap();
+    spec.queue_name = Some("replay-queue".to_owned());
+    let creator = dbos
+        .register_workflow("schedule-creator", {
+            let dbos = dbos.clone();
+            let spec = spec.clone();
+            move |()| {
+                let dbos = dbos.clone();
+                let spec = spec.clone();
+                async move {
+                    dbos.create_schedule(&spec).await?;
+                    let found = dbos.get_schedule("replayed").await?;
+                    Ok::<bool, Error>(found.is_some())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "replay-queue",
+        QueueOptions::default(),
+        QueueConflict::AlwaysUpdate,
+    )
+    .await
+    .unwrap();
+
+    let first = creator
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("schedule-creator-run"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the first run failed");
+    assert!(first);
+
+    // The queue goes away. A fork from the second step copies the create's checkpoint, so the
+    // create replays — and must return its recorded success rather than check the queue again.
+    dbos.delete_queue("replay-queue").await.unwrap();
+    let forked = dbos
+        .fork::<bool, EngineOnly>("schedule-creator-run", dbos::ForkFrom::Step(1))
+        .await
+        .expect("fork failed");
+    assert!(
+        forked.result().await.expect("the replayed create failed"),
+        "the schedule the original run created is still there"
+    );
+
+    dbos.shutdown().await;
+}
