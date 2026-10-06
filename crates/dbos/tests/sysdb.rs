@@ -3369,7 +3369,7 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
     // Promoting v1 makes it current even though v2 was created later — which is the whole point
     // of ordering on `version_timestamp` rather than `created_at`.
     let promoted = Timestamp::from_epoch_ms(latest.version_timestamp.as_epoch_ms() + 60_000);
-    sys.update_application_version_timestamp("v1", Some(promoted), None)
+    sys.update_application_version_timestamp("v1", promoted, None)
         .await
         .unwrap();
 
@@ -7509,11 +7509,7 @@ async fn registering_a_peers_version_name_is_refused() {
         .unwrap()
         .version_timestamp;
     let promote = beta
-        .update_application_version_timestamp(
-            "v1.0.0",
-            Some(Timestamp::from_epoch_ms(9_000_000)),
-            None,
-        )
+        .update_application_version_timestamp("v1.0.0", Timestamp::from_epoch_ms(9_000_000), None)
         .await;
     assert!(matches!(promote, Err(Error::RegisteredByAnother { .. })));
     assert_eq!(
@@ -7556,7 +7552,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
         .await
         .unwrap();
     anonymous
-        .update_application_version_timestamp("v1", Some(Timestamp::from_epoch_ms(5_000_000)), None)
+        .update_application_version_timestamp("v1", Timestamp::from_epoch_ms(5_000_000), None)
         .await
         .unwrap();
     let unclaimed = anonymous
@@ -7652,7 +7648,7 @@ async fn a_named_target_overrides_the_handles_own_application() {
     alpha
         .update_application_version_timestamp(
             "beta-v1",
-            Some(Timestamp::from_epoch_ms(99_000_000_000_000)),
+            Timestamp::from_epoch_ms(99_000_000_000_000),
             Some("beta"),
         )
         .await

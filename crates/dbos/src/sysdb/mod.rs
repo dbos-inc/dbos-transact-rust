@@ -1101,15 +1101,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **A name that matches nothing is `Ok`, not [`Error::NotRegistered`].** The write moves no
     /// row and says so to nobody, so a misspelled rollback reports success; UPSTREAM item 2.
-    ///
-    /// `timestamp` of `None` stamps the database's clock, which is what a promotion wants: every
-    /// executor compares versions by this column, so a stamp from a process clock running behind
-    /// would leave the promoted version older than the one it replaces. `Some` sets an exact
-    /// instant, for a caller that must order versions deterministically.
     async fn update_application_version_timestamp(
         &self,
         version_name: &str,
-        timestamp: Option<Timestamp>,
+        timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error>;
 

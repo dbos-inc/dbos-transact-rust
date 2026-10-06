@@ -5248,7 +5248,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn update_application_version_timestamp(
         &self,
         version_name: &str,
-        timestamp: Option<Timestamp>,
+        timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error> {
         let versions_table = &self.tables.application_versions;
@@ -5276,13 +5276,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // application and a bare name match would retime every copy. The `SET` also
                 // claims an unclaimed row, which would otherwise stay every peer's latest.
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {versions_table} \
-                     SET version_timestamp = COALESCE($2, {NOW_MS_SQL}), application_name = $3 \
+                    "UPDATE {versions_table} SET version_timestamp = $2, application_name = $3 \
                      WHERE version_name = $1 \
                        AND (application_name IS NULL OR application_name = $3)"
                 )))
                 .bind(version_name)
-                .bind(timestamp.map(Timestamp::as_epoch_ms))
+                .bind(timestamp.as_epoch_ms())
                 .bind(owner.as_deref())
                 .execute(&mut *tx)
                 .await?;

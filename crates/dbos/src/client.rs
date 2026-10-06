@@ -68,7 +68,7 @@ use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::serialization::encode;
 use crate::sysdb::DEFAULT_SCHEMA;
-use crate::sysdb::types::{NewWorkflow, VersionInfo, WorkflowStatus};
+use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
@@ -616,7 +616,7 @@ impl Client {
     pub async fn set_latest_application_version(&self, version_name: &str) -> Result<()> {
         self.0
             .sysdb()
-            .update_application_version_timestamp(version_name, None, self.0.app_name())
+            .update_application_version_timestamp(version_name, Timestamp::now(), self.0.app_name())
             .await
             .map_err(Error::SystemDatabase)
     }
@@ -652,7 +652,11 @@ impl Client {
     ) -> Result<()> {
         self.0
             .sysdb()
-            .update_application_version_timestamp(version_name, None, Some(application_name))
+            .update_application_version_timestamp(
+                version_name,
+                Timestamp::now(),
+                Some(application_name),
+            )
             .await
             .map_err(Error::SystemDatabase)
     }
