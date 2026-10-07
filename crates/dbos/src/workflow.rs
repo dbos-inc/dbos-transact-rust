@@ -372,6 +372,12 @@ pub struct Enqueue<'a> {
     /// unit of ordering: work sharing a key runs in sequence, and work under different keys runs
     /// concurrently.
     ///
+    /// **Required on a partitioned queue, and not checked.** A partitioned queue is dequeued one
+    /// partition at a time, and its partitions are the keys present on its rows, so a workflow
+    /// enqueued on one without a key is in no partition and is never dequeued. The enqueue does not
+    /// read the queue's configuration to catch this, since that would cost a round trip on every
+    /// enqueue. On an unpartitioned queue a key is stored and ignored.
+    ///
     /// **Mutually exclusive with [`deduplication_id`](Self::deduplication_id)**: a start naming
     /// both is refused.
     pub partition_key: Option<&'a str>,

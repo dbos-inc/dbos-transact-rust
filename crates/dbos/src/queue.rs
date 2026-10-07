@@ -308,9 +308,10 @@ pub struct QueueChange {
     /// **Setting or clearing this partitions or un-partitions the queue**, since partitioning is
     /// derived from the limits. Doing so to a queue with a backlog re-reads that backlog under
     /// different rules: rows already `ENQUEUED` keep whatever partition key they were given, so
-    /// partitioning a queue whose backlog has no keys leaves that work in a single unnamed
-    /// partition, and un-partitioning one releases every key's work at once. Neither is
-    /// corruption, and neither is likely what was meant mid-flight.
+    /// partitioning a queue whose backlog has no keys **strands that work** — a partitioned queue
+    /// is dequeued one key at a time, and an unkeyed row is in no partition — and un-partitioning
+    /// one releases every key's work at once. [`DBOS::update_queue`] logs a warning when an update
+    /// partitions a queue; drain the queue first, or re-enqueue the stranded work with a key.
     pub partition_concurrency: Change<Option<i32>>,
     /// How many may run at once within one partition, in one process.
     pub partition_worker_concurrency: Change<Option<i32>>,
@@ -879,6 +880,17 @@ impl Connection {
             partition_rate_limit: change.partition_rate_limit,
         };
 
+        // Read ahead of the update only to say whether it partitioned the queue, which the warning
+        // below needs and `validate` cannot report, being free of side effects. Outside the
+        // update's transaction, so a concurrent update can make the warning fire or not when it
+        // should not; it is a log line, and the row itself is not affected.
+        let was_partitioned = self
+            .sysdb()
+            .get_queue(name)
+            .await
+            .map_err(Error::SystemDatabase)?
+            .is_some_and(|stored| stored.resolved_limits().is_partitioned());
+
         // The row as written, so there is no read back to do: it left the transaction that wrote
         // it, which is a stronger guarantee than a re-read afterwards could give.
         let record = self
@@ -896,7 +908,19 @@ impl Connection {
                 }
                 other => Error::SystemDatabase(other),
             })?;
-        tracing::info!(queue = name, "updated the queue's limits");
+        // **Partitioning a queue can strand what is already on it.** A partitioned queue is
+        // dequeued partition by partition, and its partitions are the keys present on its rows, so
+        // a row enqueued without a key is never claimed.
+        if !was_partitioned && record.resolved_limits().is_partitioned() {
+            tracing::warn!(
+                queue = name,
+                "the queue is now partitioned; any workflow already enqueued on it without a \
+                 partition key will never be dequeued, so drain it before partitioning it or \
+                 re-enqueue such workflows with a key"
+            );
+        } else {
+            tracing::info!(queue = name, "updated the queue's limits");
+        }
         Ok(Queue::from_record(record))
     }
     /// Removes a queue's registration.
