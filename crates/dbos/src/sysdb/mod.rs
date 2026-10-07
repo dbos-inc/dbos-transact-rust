@@ -66,8 +66,8 @@ use types::{
     NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite,
     QueueRecord, QueueUpdate, RenameBatching, RenameFrom, ScheduleFilter, ScheduleRecord,
     ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
-    WrittenBy,
+    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -1108,10 +1108,13 @@ pub trait SystemDatabase: Send + Sync {
         application_name: Option<&str>,
     ) -> Result<(), Error>;
 
-    /// Registers a queue, reporting whether this call created it.
+    /// Registers a queue, returning the row it found and the row it left.
     ///
-    /// `false` means the row was already there, whether or not [`OnExistingQueue`] changed it.
-    /// Callers use that to tell a first registration from a restart.
+    /// Both are read in the registration's transaction, the first under `FOR UPDATE`.
+    /// [`UpsertedQueue::created`] tells a first registration from a restart: a found row means the
+    /// queue was already there, whether or not [`OnExistingQueue`] changed it. The pair also lets a
+    /// caller judge the transition, such as whether the registration partitioned the queue,
+    /// against the row the write actually replaced.
     ///
     /// **A name already held by another application is [`Error::RegisteredByAnother`] in either
     /// mode**, for a caller with an application name of its own. A queue name addresses one row
@@ -1125,7 +1128,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         queue: &NewQueue<'_>,
         on_existing: OnExistingQueue,
-    ) -> Result<bool, Error>;
+    ) -> Result<UpsertedQueue, Error>;
 
     /// Claims up to a queue's worth of enqueued workflows for this executor, returning what it got.
     ///
@@ -1269,8 +1272,10 @@ pub trait SystemDatabase: Send + Sync {
     /// [`update_schedule`](Self::update_schedule) — the row has to be read to check against it, so
     /// its absence is known here rather than inferred from a row count.
     ///
-    /// Returns the row as written, which spares the caller a read back that a later transaction
-    /// would have answered anyway.
+    /// Returns the row as this transaction read it beside the row as written, which spares the
+    /// caller a read back that a later transaction would have answered anyway, and lets it judge
+    /// the transition (for example, whether the update partitioned the queue) against the row the
+    /// write actually replaced.
     ///
     /// Unscoped, like the other reads and writes addressed by queue name. Ownership is not
     /// updatable: see [`QueueUpdate`].
@@ -1281,7 +1286,7 @@ pub trait SystemDatabase: Send + Sync {
         validate: &(
              dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
          ),
-    ) -> Result<QueueRecord, Error>;
+    ) -> Result<UpdatedQueue, Error>;
 
     /// Extends a debounced workflow's delay and replaces its inputs, or reports who holds the key.
     ///

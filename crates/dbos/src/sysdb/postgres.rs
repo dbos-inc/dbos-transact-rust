@@ -86,9 +86,9 @@ use super::types::{
     InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
     OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
     ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
-    StreamRead, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
-    is_valid_application_name, validate_attributes,
+    StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
+    duration_from_secs, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -5416,7 +5416,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         queue: &NewQueue<'_>,
         on_existing: OnExistingQueue,
-    ) -> Result<bool, Error> {
+    ) -> Result<UpsertedQueue, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
         let application_name = queue.application_name.or(self.application_name.as_deref());
@@ -5448,14 +5448,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "upsert_queue", move || async move {
             let mut tx = pool.begin().await?;
 
-            // Asked before the write, because afterwards there is no way to tell a row this call
-            // created from one it found — both leave a row behind.
-            let existed: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT name FROM {queues_table} WHERE name = $1"
+            // Read before the write, because afterwards there is no way to tell a row this call
+            // created from one it found — both leave a row behind. Locked, so the row returned as
+            // the one replaced is the one the write below actually replaces.
+            let before = sqlx::query(AssertSqlSafe(format!(
+                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
             )))
             .bind(queue.name)
             .fetch_optional(&mut *tx)
-            .await?;
+            .await?
+            .as_ref()
+            .map(queue_from_row)
+            .transpose()?;
 
             // A peer holding the name is refused in either mode: the name is the queue's address,
             // so registering over it would point this application at a peer's work.
@@ -5489,11 +5493,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(true)
             // Derived, never asked for: the column is written to agree with the per-partition
             // limits for readers that still consult it, and is never read here.
-            .bind(
-                queue.partition_concurrency.is_some()
-                    || queue.partition_worker_concurrency.is_some()
-                    || queue.partition_rate_limit.is_some(),
-            )
+            .bind(queue.is_partitioned())
             .bind(queue.partition_concurrency)
             .bind(queue.partition_worker_concurrency)
             .bind(queue.partition_rate_limit.map(|r| r.limit))
@@ -5515,8 +5515,18 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
 
+            // The row as this registration left it, read before the commit: under `Leave` that is
+            // the stored row, which is what a caller's dequeues will honour.
+            let after = sqlx::query(AssertSqlSafe(format!(
+                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1"
+            )))
+            .bind(queue.name)
+            .fetch_one(&mut *tx)
+            .await?;
+            let after = queue_from_row(&after)?;
+
             tx.commit().await?;
-            Ok(existed.is_none())
+            Ok(UpsertedQueue { before, after })
         })
         .await
     }
@@ -6239,7 +6249,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         validate: &(
              dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
          ),
-    ) -> Result<QueueRecord, Error> {
+    ) -> Result<UpdatedQueue, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
 
@@ -6268,7 +6278,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // asked for nothing is not asking to have the stored row judged.
             if update.is_empty() {
                 tx.commit().await?;
-                return Ok(stored);
+                return Ok(UpdatedQueue {
+                    before: stored.clone(),
+                    after: stored,
+                });
             }
 
             // The caller's verdict on the row as it would be, delivered while this transaction
@@ -6336,7 +6349,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             let written = queue_from_row(&row)?;
 
             tx.commit().await?;
-            Ok(written)
+            Ok(UpdatedQueue {
+                before: stored,
+                after: written,
+            })
         })
         .await
     }

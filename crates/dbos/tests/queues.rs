@@ -1960,6 +1960,15 @@ async fn a_queue_carries_a_rate_limit_and_is_always_a_priority_queue() {
     };
     assert!(priority_enabled().await, "registered as a priority queue");
 
+    // A row stored `FALSE` before every queue was a priority queue is corrected by its next
+    // update, whatever the update names.
+    sqlx::query(
+        r#"UPDATE "dbos"."queues" SET priority_enabled = FALSE WHERE name = 'limited-queue'"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("clearing the flag failed");
+
     // Changed at runtime, like every other limit.
     let updated = dbos
         .update_queue(
@@ -1972,7 +1981,10 @@ async fn a_queue_carries_a_rate_limit_and_is_always_a_priority_queue() {
         .await
         .expect("update failed");
     assert_eq!(updated.rate_limit(), None);
-    assert!(priority_enabled().await, "still a priority queue");
+    assert!(
+        priority_enabled().await,
+        "the update rewrote the stored flag to TRUE"
+    );
 
     dbos.shutdown().await;
 }
@@ -2221,8 +2233,9 @@ async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
     assert_eq!(queue.worker_concurrency(), Some(1));
     assert_eq!(queue.partition_concurrency(), None);
 
-    // Unpartitioned, so a workflow without a key is dequeued and runs.
-    let output = workflow
+    // Unpartitioned, so a workflow without a key is dequeued and runs. Bounded, so a regression
+    // that reads the flag again fails here rather than hanging on a workflow nothing dequeues.
+    let handle = workflow
         .start_with(
             41,
             StartOptions {
@@ -2231,9 +2244,10 @@ async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
             },
         )
         .await
-        .expect("enqueue failed")
-        .result()
+        .expect("enqueue failed");
+    let output = tokio::time::timeout(Duration::from_secs(20), handle.result())
         .await
+        .expect("the unkeyed workflow was never dequeued")
         .expect("the workflow failed");
     assert_eq!(output, 42);
 

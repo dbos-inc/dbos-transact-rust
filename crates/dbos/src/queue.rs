@@ -451,8 +451,9 @@ fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, 
     }
     // **A per-partition limit above its queue-wide counterpart never binds.** The queue-wide one
     // is reached first and is the only one that ever stops anything, so the per-partition number
-    // would sit in the row saying something the dequeue can never do. Python and TypeScript
-    // refuse the same four concurrency comparisons; the rate-limit pair below is Rust-only.
+    // would sit in the row saying something the dequeue can never do. Only concurrency is
+    // compared: the rate limits are not, because a per-partition window shorter than the
+    // queue-wide one caps bursts the queue-wide one allows (see `QueueOptions`).
     if let (Some(partition), Some(worker)) = (
         options.partition_worker_concurrency,
         options.worker_concurrency,
@@ -617,6 +618,20 @@ impl DBOS {
 // `impl DBOS`. The public methods differ only in how they come by a connection, and in the
 // application version only one of them has.
 
+/// Warns that a write has just partitioned a queue that was not partitioned.
+///
+/// **Partitioning a queue can strand what is already on it.** A partitioned queue is dequeued
+/// partition by partition, and its partitions are the keys present on its rows, so a row enqueued
+/// without a key is never claimed.
+fn warn_partitioned(name: &str) {
+    tracing::warn!(
+        queue = name,
+        "the queue is now partitioned; any workflow already enqueued on it without a partition key \
+         will never be dequeued, so drain it before partitioning it or re-enqueue such workflows \
+         with a key"
+    );
+}
+
 impl Connection {
     /// Registers a queue, or reports the one already registered under this name.
     ///
@@ -689,7 +704,8 @@ impl Connection {
             }
         };
 
-        let created = self
+        // The row as found and the row as left, both read in the registration's transaction.
+        let upserted = self
             .sysdb()
             .upsert_queue(
                 &NewQueue {
@@ -708,23 +724,16 @@ impl Connection {
             .await
             .map_err(Error::SystemDatabase)?;
 
-        // Read back rather than echo: with `Leave`, and with a row a peer wrote, what this
-        // executor will actually dequeue under is the row, not the request.
-        let record = self
-            .sysdb()
-            .get_queue(name)
-            .await
-            .map_err(Error::SystemDatabase)?
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "queue `{name}` is missing from the database after registering it"
-                ))
-            })?;
-
-        if created {
-            tracing::info!(queue = name, "registered a queue");
+        // The row as left rather than an echo of the request: with `Leave`, and with a row a peer
+        // wrote, what this executor will actually dequeue under is the row.
+        match &upserted.before {
+            None => tracing::info!(queue = name, "registered a queue"),
+            Some(before) if !before.is_partitioned() && upserted.after.is_partitioned() => {
+                warn_partitioned(name);
+            }
+            Some(_) => {}
         }
-        Ok(Queue::from_record(record))
+        Ok(Queue::from_record(upserted.after))
     }
     /// The queue registered under this name, or `None` if there is none.
     pub(crate) async fn queue(&self, name: &str) -> Result<Option<Queue>> {
@@ -790,20 +799,10 @@ impl Connection {
             partition_rate_limit: change.partition_rate_limit,
         };
 
-        // Read ahead of the update only to say whether it partitioned the queue, which the warning
-        // below needs and `validate` cannot report, being free of side effects. Outside the
-        // update's transaction, so a concurrent update can make the warning fire or not when it
-        // should not; it is a log line, and the row itself is not affected.
-        let was_partitioned = self
-            .sysdb()
-            .get_queue(name)
-            .await
-            .map_err(Error::SystemDatabase)?
-            .is_some_and(|stored| stored.is_partitioned());
-
         // The row as written, so there is no read back to do: it left the transaction that wrote
-        // it, which is a stronger guarantee than a re-read afterwards could give.
-        let record = self
+        // it, which is a stronger guarantee than a re-read afterwards could give. The row it
+        // replaced comes back beside it, read under the same lock.
+        let updated = self
             .sysdb()
             .update_queue(name, &update, &validate)
             .await
@@ -818,20 +817,12 @@ impl Connection {
                 }
                 other => Error::SystemDatabase(other),
             })?;
-        // **Partitioning a queue can strand what is already on it.** A partitioned queue is
-        // dequeued partition by partition, and its partitions are the keys present on its rows, so
-        // a row enqueued without a key is never claimed.
-        if !was_partitioned && record.is_partitioned() {
-            tracing::warn!(
-                queue = name,
-                "the queue is now partitioned; any workflow already enqueued on it without a \
-                 partition key will never be dequeued, so drain it before partitioning it or \
-                 re-enqueue such workflows with a key"
-            );
+        if !updated.before.is_partitioned() && updated.after.is_partitioned() {
+            warn_partitioned(name);
         } else {
             tracing::info!(queue = name, "updated the queue's limits");
         }
-        Ok(Queue::from_record(record))
+        Ok(Queue::from_record(updated.after))
     }
     /// Removes a queue's registration.
     pub(crate) async fn delete_queue(&self, name: &str) -> Result<()> {

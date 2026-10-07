@@ -8078,7 +8078,8 @@ async fn a_queue_round_trips_through_the_registry() {
     assert!(
         sys.upsert_queue(&queue, OnExistingQueue::Update)
             .await
-            .unwrap(),
+            .unwrap()
+            .created(),
         "the first registration creates the row",
     );
 
@@ -8111,17 +8112,26 @@ async fn re_registering_a_queue_reports_it_existed() {
         sys.upsert_queue(&first, OnExistingQueue::Update)
             .await
             .unwrap()
+            .created()
     );
 
     let second = NewQueue {
         concurrency: Some(9),
         ..NewQueue::new("orders")
     };
-    assert!(
-        !sys.upsert_queue(&second, OnExistingQueue::Update)
-            .await
-            .unwrap(),
-        "the second registration finds the row already there",
+    let upserted = sys
+        .upsert_queue(&second, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    assert_eq!(
+        upserted.before.map(|row| row.concurrency),
+        Some(Some(1)),
+        "the second registration finds the first one's row",
+    );
+    assert_eq!(
+        upserted.after.concurrency,
+        Some(9),
+        "and returns what it wrote"
     );
     assert_eq!(
         sys.get_queue("orders").await.unwrap().unwrap().concurrency,
@@ -8133,10 +8143,15 @@ async fn re_registering_a_queue_reports_it_existed() {
         concurrency: Some(3),
         ..NewQueue::new("orders")
     };
-    assert!(
-        !sys.upsert_queue(&third, OnExistingQueue::Leave)
-            .await
-            .unwrap()
+    let upserted = sys
+        .upsert_queue(&third, OnExistingQueue::Leave)
+        .await
+        .unwrap();
+    assert!(!upserted.created());
+    assert_eq!(
+        upserted.after.concurrency,
+        Some(9),
+        "Leave returns what is stored, not what was asked for",
     );
     assert_eq!(
         sys.get_queue("orders").await.unwrap().unwrap().concurrency,

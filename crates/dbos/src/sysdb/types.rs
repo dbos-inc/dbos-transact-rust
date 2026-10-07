@@ -1505,24 +1505,42 @@ pub struct QueueUpdate {
     pub polling_interval: Change<Duration>,
 }
 
+/// What [`SystemDatabase::upsert_queue`](crate::sysdb::SystemDatabase::upsert_queue) returns: the
+/// row the registration found, if any, and the row as the registration left it, both read in its
+/// transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertedQueue {
+    /// The row that was there before, read under the registration's own lock, or `None` if this
+    /// call created the queue.
+    pub before: Option<QueueRecord>,
+    /// The row as the registration left it: what was written, or, under
+    /// [`OnExistingQueue::Leave`], what was already stored.
+    pub after: QueueRecord,
+}
+
+impl UpsertedQueue {
+    /// Whether this call created the queue rather than finding it.
+    pub fn created(&self) -> bool {
+        self.before.is_none()
+    }
+}
+
+/// What [`SystemDatabase::update_queue`](crate::sysdb::SystemDatabase::update_queue) returns: the
+/// row as the update's transaction read it, and the row as it wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatedQueue {
+    /// The row the update replaced, read under the update's own lock.
+    pub before: QueueRecord,
+    /// The row as written.
+    pub after: QueueRecord,
+}
+
 impl QueueUpdate {
     /// This update applied to a record, giving the row as it would be after the write.
     ///
     /// What a caller's validation is handed: a limit is rarely wrong on its own and usually wrong
     /// only beside another, so the merged result is the only thing worth checking.
     pub fn apply_to(&self, record: &QueueRecord) -> QueueRecord {
-        let partition_concurrency = self
-            .partition_concurrency
-            .set()
-            .unwrap_or(record.partition_concurrency);
-        let partition_worker_concurrency = self
-            .partition_worker_concurrency
-            .set()
-            .unwrap_or(record.partition_worker_concurrency);
-        let partition_rate_limit = self
-            .partition_rate_limit
-            .set()
-            .unwrap_or(record.partition_rate_limit);
         QueueRecord {
             name: record.name.clone(),
             concurrency: self.concurrency.set().unwrap_or(record.concurrency),
@@ -1531,9 +1549,18 @@ impl QueueUpdate {
                 .set()
                 .unwrap_or(record.worker_concurrency),
             rate_limit: self.rate_limit.set().unwrap_or(record.rate_limit),
-            partition_concurrency,
-            partition_worker_concurrency,
-            partition_rate_limit,
+            partition_concurrency: self
+                .partition_concurrency
+                .set()
+                .unwrap_or(record.partition_concurrency),
+            partition_worker_concurrency: self
+                .partition_worker_concurrency
+                .set()
+                .unwrap_or(record.partition_worker_concurrency),
+            partition_rate_limit: self
+                .partition_rate_limit
+                .set()
+                .unwrap_or(record.partition_rate_limit),
             polling_interval: self
                 .polling_interval
                 .set()
@@ -1760,6 +1787,16 @@ pub struct NewQueue<'a> {
     pub polling_interval: Duration,
     /// The application to register the queue for; `None` means the writing handle's own.
     pub application_name: Option<&'a str>,
+}
+
+impl NewQueue<'_> {
+    /// Whether the queue is partitioned, which any per-partition limit makes it. The same rule as
+    /// [`QueueRecord::is_partitioned`], for the row before it is written.
+    pub fn is_partitioned(&self) -> bool {
+        self.partition_concurrency.is_some()
+            || self.partition_worker_concurrency.is_some()
+            || self.partition_rate_limit.is_some()
+    }
 }
 
 impl<'a> NewQueue<'a> {
