@@ -2029,8 +2029,8 @@ async fn an_unhonourable_queue_configuration_is_refused() {
 /// Per-partition limits sit beside the queue-wide ones, and partitioning is derived from them.
 ///
 /// There is no `partition_queue` switch on this surface: setting a partition limit is the
-/// statement that partitions exist, and the stored flag — which is what an implementation still
-/// reading it sees — follows the limits in both directions.
+/// statement that partitions exist, and the stored column, written for readers that still consult
+/// it, follows the limits in both directions.
 #[tokio::test]
 async fn per_partition_limits_partition_a_queue() {
     let db = test_database().await;
@@ -2056,15 +2056,18 @@ async fn per_partition_limits_partition_a_queue() {
     assert_eq!(queue.partition_concurrency(), Some(4));
     assert_eq!(queue.partition_worker_concurrency(), Some(2));
 
-    let stored = reader(&db)
-        .await
-        .get_queue("sharded")
+    let pool = db.pool().await;
+    let stored_flag = || async {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT partition_queue FROM "dbos"."queues" WHERE name = 'sharded'"#,
+        )
+        .fetch_one(&pool)
         .await
         .expect("read failed")
-        .expect("no row");
+    };
     assert!(
-        stored.partition_queue,
-        "the derived flag is written for implementations that still read it"
+        stored_flag().await,
+        "the derived flag is written for readers that still consult it"
     );
 
     // Clearing the last partition limit un-partitions the queue, flag included.
@@ -2085,40 +2088,36 @@ async fn per_partition_limits_partition_a_queue() {
         Some(60),
         "the queue-wide limits are untouched"
     );
-    let stored = reader(&db)
-        .await
-        .get_queue("sharded")
-        .await
-        .expect("read failed")
-        .expect("no row");
-    assert!(
-        !stored.partition_queue,
-        "the flag follows the limits back off"
-    );
+    assert!(!stored_flag().await, "the flag follows the limits back off");
 }
 
-/// A row a peer wrote with the deprecated flag is read as the per-partition limits it means.
-///
-/// Under `partition_queue` every queue-wide limit applies per partition, so that is where they are
-/// reported — matching Python's `_resolve_limits` and TypeScript's `resolveQueueLimits`. Go and
-/// Java still write rows in this shape.
+/// **The stored `partition_queue` flag is not read.** A row with the flag set and only queue-wide
+/// limits, the shape the deprecated flag used to give "these limits apply per partition", is an
+/// unpartitioned queue with queue-wide limits: it reports no partitioning, takes a per-partition
+/// limit like any other queue, and dequeues a workflow that carries no partition key.
 #[tokio::test]
-async fn a_legacy_partitioned_row_is_read_as_per_partition_limits() {
+async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
     let db = test_database().await;
     let sys = reader(&db).await;
     sys.upsert_queue(
         &NewQueue {
             concurrency: Some(1),
             worker_concurrency: Some(1),
-            partition_queue: true,
             ..NewQueue::new("legacy")
         },
         OnExistingQueue::Update,
     )
     .await
     .expect("write failed");
+    sqlx::query(r#"UPDATE "dbos"."queues" SET partition_queue = TRUE WHERE name = 'legacy'"#)
+        .execute(&db.pool().await)
+        .await
+        .expect("flagging the row failed");
 
     let dbos = DBOS::new(config("queue-legacy-app", &db));
+    let workflow = dbos
+        .register_workflow("unkeyed", |n: u32| async move { Ok::<u32, Error>(n + 1) })
+        .unwrap();
     dbos.launch().await.expect("launch failed");
     let queue = dbos
         .queue("legacy")
@@ -2126,34 +2125,44 @@ async fn a_legacy_partitioned_row_is_read_as_per_partition_limits() {
         .expect("read failed")
         .expect("no queue");
 
-    assert!(queue.is_partitioned());
-    assert_eq!(
-        queue.partition_concurrency(),
-        Some(1),
-        "the flag re-scopes the queue-wide limit rather than adding to it"
-    );
-    assert_eq!(queue.partition_worker_concurrency(), Some(1));
+    assert!(!queue.is_partitioned(), "the flag alone partitions nothing");
     assert_eq!(
         queue.concurrency(),
-        None,
-        "nothing is enforced queue-wide on a legacy row"
+        Some(1),
+        "the queue-wide limit stays queue-wide"
     );
+    assert_eq!(queue.worker_concurrency(), Some(1));
+    assert_eq!(queue.partition_concurrency(), None);
 
-    // Adding a per-partition limit to such a row is refused rather than leaving two answers in it.
-    let error = dbos
+    // Unpartitioned, so a workflow without a key is dequeued and runs.
+    let output = workflow
+        .start_with(
+            41,
+            StartOptions {
+                queue: Some(Enqueue::new("legacy")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed")
+        .result()
+        .await
+        .expect("the workflow failed");
+    assert_eq!(output, 42);
+
+    // And a per-partition limit is taken like on any other queue.
+    let updated = dbos
         .update_queue(
             "legacy",
             QueueChange {
-                partition_concurrency: Change::Set(Some(4)),
+                partition_concurrency: Change::Set(Some(1)),
                 ..QueueChange::default()
             },
         )
         .await
-        .expect_err("the update was accepted");
-    assert!(
-        matches!(&error, Error::Config(message) if message.contains("deprecated `partition_queue`")),
-        "got {error:?}"
-    );
+        .expect("the update was refused");
+    assert!(updated.is_partitioned());
+    assert_eq!(updated.concurrency(), Some(1));
 
     dbos.shutdown().await;
 }

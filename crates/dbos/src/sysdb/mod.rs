@@ -1152,10 +1152,8 @@ pub trait SystemDatabase: Send + Sync {
     /// above go on counting the whole queue. A queue can therefore hold both, and the caller
     /// sweeping one partition still cannot spend a budget that belongs to the queue.
     ///
-    /// Which limit sits at which scope is [`QueueRecord::resolved_limits`]'s answer, not the
-    /// columns': a row a peer wrote with the deprecated `partition_queue` flag keeps its
-    /// per-partition numbers in the queue-wide columns, and enforcing those queue-wide would admit
-    /// one workflow for the whole queue where the flag promised one per key.
+    /// Each limit applies at the scope its column names, and the stored `partition_queue` flag plays
+    /// no part; see [`QueueRecord::is_partitioned`].
     ///
     /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
     /// `NOWAIT`, so every executor sees a consistent count rather than a partial one — at
