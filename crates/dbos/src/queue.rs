@@ -150,13 +150,15 @@ impl Queue {
 ///
 /// **Every limit set is enforced, and the tightest wins.** They are not alternatives: a queue can
 /// say "sixty at a time overall, four per customer, and no more than two of those in any one
-/// process" by setting three of the four. A limit narrower in scope may not exceed the one that
-/// contains it — a per-partition allowance above the queue-wide one could never bind — and that is
-/// refused at registration rather than stored.
+/// process" by setting three of the four. A concurrency limit narrower in scope may not exceed the
+/// one that contains it — a per-partition allowance above the queue-wide one could never bind — and
+/// that is refused at registration rather than stored.
 ///
-/// The rate limits pair the same way: [`rate_limit`](Self::rate_limit) governs the queue,
+/// The rate limits pair the same way in scope: [`rate_limit`](Self::rate_limit) governs the queue,
 /// [`partition_rate_limit`](Self::partition_rate_limit) governs one key, and both are counted in
-/// the database over a trailing window.
+/// the database over a trailing window. They are not compared with each other, because their
+/// windows need not match: a per-partition limit over a shorter window caps bursts the queue-wide
+/// one allows, even where its long-run rate is higher.
 ///
 /// Setting any per-partition limit is what **partitions** the queue; there is no separate switch.
 /// See [`partition_concurrency`](Self::partition_concurrency).
@@ -199,8 +201,7 @@ pub struct QueueOptions {
     /// nothing without selecting anything.
     ///
     /// Queue-wide, so a partitioned queue may carry this *and* a
-    /// [`partition_rate_limit`](Self::partition_rate_limit): both are enforced, and the
-    /// per-partition one may not exceed it.
+    /// [`partition_rate_limit`](Self::partition_rate_limit), and both are enforced.
     pub rate_limit: Option<RateLimit>,
     /// How many of this queue's workflows may run at once **within one partition**, across every
     /// executor.
@@ -228,9 +229,9 @@ pub struct QueueOptions {
     /// How fast this queue's workflows may start within one partition, or `None` for unthrottled.
     ///
     /// The per-partition counterpart of [`rate_limit`](Self::rate_limit), counted in the database
-    /// against the starts in the trailing window that share the partition key, and may not allow
-    /// a faster rate than that one does — the two periods need not match, so it is the rates that
-    /// are compared and not the counts.
+    /// against the starts in the trailing window that share the partition key. Not compared with
+    /// that one: with 100 per 10 s queue-wide, 20 per 1 s per partition still binds, holding each
+    /// key to 20 in a second the queue-wide window would let 100 through.
     pub partition_rate_limit: Option<RateLimit>,
 }
 
@@ -498,29 +499,6 @@ fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, 
             format!(
                 "`concurrency` must be greater than or equal to \
                  `partition_worker_concurrency`, got {global} and {partition}"
-            ),
-        );
-    }
-    // The rate limits pair the same way, and `rate_limit`'s documentation says so — but the
-    // comparison is not `>`, because a rate limit is a count over a window and the two windows
-    // need not match. Compared as rates, cross-multiplied rather than divided so that neither
-    // side loses precision, in `u128` so that neither product can overflow. Both `limit`s are
-    // at least 1 by the checks above, so the casts are widening.
-    //
-    // Python and TypeScript stop after the four concurrency pairs and would store this one.
-    // Refusing it here follows the rule the other four rest on rather than the reference
-    // implementations, which is a deliberate divergence — `10/s` queue-wide with `100/s` per
-    // partition is a row whose second number the dequeue can never reach.
-    if let (Some(partition), Some(global)) = (options.partition_rate_limit, options.rate_limit)
-        && u128::from(partition.limit.unsigned_abs()) * global.period.as_nanos()
-            > u128::from(global.limit.unsigned_abs()) * partition.period.as_nanos()
-    {
-        return refuse(
-            "partition_rate_limit",
-            format!(
-                "`rate_limit` must allow at least the rate `partition_rate_limit` does, \
-                 got {}/{:?} and {}/{:?}",
-                global.limit, global.period, partition.limit, partition.period
             ),
         );
     }

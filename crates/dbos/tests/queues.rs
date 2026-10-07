@@ -284,6 +284,43 @@ async fn a_per_process_limit_may_equal_the_fleet_limit() {
     dbos.shutdown().await;
 }
 
+/// **The two rate limits are not compared**, because their windows need not match.
+///
+/// 20 per second per partition has a higher long-run rate than 100 per 10 seconds queue-wide, but it
+/// still binds: the queue-wide window would let all 100 start in one second, and the per-partition
+/// one holds each key to 20 of them.
+#[tokio::test]
+async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-burst-cap-app", &db));
+    dbos.launch().await.expect("launch failed");
+
+    let queue_wide = RateLimit {
+        limit: 100,
+        period: Duration::from_secs(10),
+    };
+    let per_partition = RateLimit {
+        limit: 20,
+        period: Duration::from_secs(1),
+    };
+    let queue = dbos
+        .register_queue(
+            "burst-capped",
+            QueueOptions {
+                rate_limit: Some(queue_wide),
+                partition_rate_limit: Some(per_partition),
+                ..QueueOptions::default()
+            },
+            QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("registration was refused");
+    assert_eq!(queue.rate_limit(), Some(queue_wide));
+    assert_eq!(queue.partition_rate_limit(), Some(per_partition));
+
+    dbos.shutdown().await;
+}
+
 /// Registering a queue needs a launched instance, because it is a write.
 #[tokio::test]
 async fn registering_before_launch_is_refused() {
@@ -2021,38 +2058,6 @@ async fn an_unhonourable_queue_configuration_is_refused() {
             },
             "`worker_concurrency` must be greater than or equal to \
              `partition_worker_concurrency`",
-        ),
-        (
-            "a partition allowed to start faster than the whole queue",
-            QueueOptions {
-                rate_limit: Some(RateLimit {
-                    limit: 10,
-                    period: Duration::from_secs(1),
-                }),
-                partition_rate_limit: Some(RateLimit {
-                    limit: 100,
-                    period: Duration::from_secs(1),
-                }),
-                ..QueueOptions::default()
-            },
-            "`rate_limit` must allow at least the rate `partition_rate_limit` does",
-        ),
-        (
-            // The counts alone say the opposite — 5 is below 10 — so only comparing the two as
-            // rates catches this one.
-            "a partition faster than the queue over a different window",
-            QueueOptions {
-                rate_limit: Some(RateLimit {
-                    limit: 10,
-                    period: Duration::from_secs(60),
-                }),
-                partition_rate_limit: Some(RateLimit {
-                    limit: 5,
-                    period: Duration::from_secs(1),
-                }),
-                ..QueueOptions::default()
-            },
-            "`rate_limit` must allow at least the rate `partition_rate_limit` does",
         ),
     ];
 
