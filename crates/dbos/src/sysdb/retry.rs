@@ -15,8 +15,11 @@
 //! Classification lives with the backend, in [`BackendErrorKind`], because the evidence is
 //! backend-specific. This module only acts on the verdict:
 //!
-//! - [`BackendErrorKind::Transient`] — always retried, whatever the policy says.
-//! - [`BackendErrorKind::Connection`] — retried unless the policy opts out.
+//! - [`BackendErrorKind::Connection`] — retried until the database answers, unless the policy
+//!   opts out.
+//! - [`BackendErrorKind::Conflict`] — replayed on a short schedule of its own, unless the policy
+//!   opts out. The database rolled the transaction back so a peer could commit, which makes the
+//!   replay safe.
 //! - [`BackendErrorKind::Permanent`], and every non-backend error, are returned immediately.
 //!
 //! [`Error::ConflictingWorkflow`] and [`Error::MaxRecoveryAttemptsExceeded`] fall in the last
@@ -36,22 +39,32 @@ use super::{BackendErrorKind, Error};
 
 /// How long to wait between attempts, and what to give up on.
 ///
-/// The defaults are Python's and Java's, which agree: one second, doubling to a minute, and no
-/// attempt limit. Go starts at 100ms and caps at 30s, but retries statements rather than whole
-/// operations.
+/// Two schedules, because the two failures that are retried clear on different timescales. A lost
+/// connection waits for the database to come back: one second, doubling to a minute. A transaction
+/// conflict is over as soon as the peer commits: 50 ms, doubling to two seconds. Neither has an
+/// attempt limit: giving up would report a failure for work that only had to wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Wait before the second attempt.
+    /// Wait before the second attempt after a connection failure.
     pub initial_backoff: Duration,
-    /// Ceiling the backoff doubles up to.
+    /// Ceiling the connection backoff doubles up to.
     pub max_backoff: Duration,
     /// Whether to block on connection failures rather than reporting them.
     ///
     /// `true` is the trade described above. Setting it `false` opts out — Python exposes the
     /// same switch as `retry_connection_errors=False` — and suits a caller that would rather
-    /// handle the failure itself than wait. It does not affect contention, which is always
-    /// retried.
+    /// handle the failure itself than wait. It does not affect conflicts, which have a switch of
+    /// their own.
     pub retry_connection_errors: bool,
+    /// Whether to replay transaction conflicts rather than reporting them.
+    ///
+    /// `false` returns the first conflict to the caller, which is what a caller that has its own
+    /// answer to losing a race wants. Connection failures are unaffected.
+    pub retry_conflicts: bool,
+    /// Wait before replaying the first conflict.
+    pub conflict_initial_backoff: Duration,
+    /// Ceiling the conflict backoff doubles up to.
+    pub conflict_max_backoff: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -60,29 +73,33 @@ impl Default for RetryPolicy {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             retry_connection_errors: true,
+            retry_conflicts: true,
+            conflict_initial_backoff: Duration::from_millis(50),
+            conflict_max_backoff: Duration::from_secs(2),
         }
     }
 }
 
 impl RetryPolicy {
-    /// Whether this failure should be retried.
-    fn should_retry(&self, error: &Error) -> bool {
-        match error {
-            Error::Backend(e) => match e.kind {
-                BackendErrorKind::Transient => true,
-                BackendErrorKind::Connection => self.retry_connection_errors,
-                BackendErrorKind::Permanent => false,
-            },
-            _ => false,
+    /// This policy with conflict replay turned off and connection retries left as they are.
+    ///
+    /// For a caller whose own reaction to losing a race is the right one, so the conflict has to
+    /// reach it rather than be slept off underneath it.
+    pub(crate) fn without_conflict_replay(&self) -> Self {
+        Self {
+            retry_conflicts: false,
+            ..*self
         }
     }
 }
 
 /// Runs `work` until it succeeds or fails for a reason that will not pass.
 ///
-/// There is no attempt limit, matching every other implementation. The bound in practice is the
-/// caller: dropping this future stops the loop at the next await point, so a shutdown or a
-/// timeout cancels it without needing a count.
+/// There is no attempt limit, for connection failures or for conflicts. Giving up would hand the
+/// caller a failure for work that only had to wait: a workflow whose checkpoint write gave up
+/// stops where it is and stays `PENDING` until recovery, where waiting would have let it go on.
+/// The bound in practice is the caller: dropping this future stops the loop at the next await
+/// point, so a shutdown or a timeout cancels it without needing a count.
 ///
 /// `work` is `FnMut() -> Fut` rather than an async closure, because the returned future must be
 /// `Send` — every caller is behind `#[async_trait]` — and `AsyncFnMut` has no way to say that
@@ -98,27 +115,58 @@ where
     Fut: Future<Output = Result<T, Error>> + Send,
 {
     let mut backoff = policy.initial_backoff;
+    let mut conflict_backoff = policy.conflict_initial_backoff;
     let mut attempt: u32 = 0;
     loop {
-        match work().await {
+        let error = match work().await {
             Ok(value) => return Ok(value),
-            Err(error) => {
-                attempt += 1;
-                if !policy.should_retry(&error) {
-                    return Err(error);
-                }
+            Err(error) => error,
+        };
+        attempt += 1;
+        let kind = match &error {
+            Error::Backend(backend) => backend.kind,
+            _ => return Err(error),
+        };
+        // Whether this retry is worth a warning, alongside how long it waits.
+        let (delay, loud) = match kind {
+            BackendErrorKind::Permanent => return Err(error),
+            BackendErrorKind::Connection if !policy.retry_connection_errors => return Err(error),
+            BackendErrorKind::Connection => {
                 let delay = jitter(backoff);
-                tracing::warn!(
-                    operation,
-                    attempt,
-                    delay_ms = delay.as_millis() as u64,
-                    error = %error,
-                    "system database operation failed; retrying"
-                );
-                tokio::time::sleep(delay).await;
                 backoff = (backoff * 2).min(policy.max_backoff);
+                (delay, true)
             }
+            BackendErrorKind::Conflict if !policy.retry_conflicts => return Err(error),
+            BackendErrorKind::Conflict => {
+                // A conflict is ordinary contention and usually clears within a replay or two,
+                // so it is logged at debug. Once the backoff has reached its ceiling the call has
+                // been losing for seconds, which is worth a warning: with no attempt limit, the
+                // log is the only place a conflict that never clears shows up.
+                let loud = conflict_backoff >= policy.conflict_max_backoff;
+                let delay = jitter(conflict_backoff);
+                conflict_backoff = (conflict_backoff * 2).min(policy.conflict_max_backoff);
+                (delay, loud)
+            }
+        };
+        let delay_ms = delay.as_millis() as u64;
+        if loud {
+            tracing::warn!(
+                operation,
+                attempt,
+                delay_ms,
+                error = %error,
+                "system database operation failed; retrying"
+            );
+        } else {
+            tracing::debug!(
+                operation,
+                attempt,
+                delay_ms,
+                error = %error,
+                "system database operation lost a transaction conflict; replaying"
+            );
         }
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -157,18 +205,20 @@ mod tests {
         RetryPolicy {
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(4),
+            conflict_initial_backoff: Duration::from_millis(1),
+            conflict_max_backoff: Duration::from_millis(4),
             ..RetryPolicy::default()
         }
     }
 
     #[tokio::test]
-    async fn a_transient_failure_is_retried_until_it_succeeds() {
+    async fn a_conflict_is_replayed_until_it_succeeds() {
         let calls = AtomicU32::new(0);
         let calls = &calls;
         let result = with_retry(&fast(), "test", move || async move {
             let seen = calls.fetch_add(1, Ordering::Relaxed) + 1;
             if seen < 3 {
-                Err(backend(BackendErrorKind::Transient))
+                Err(backend(BackendErrorKind::Conflict))
             } else {
                 Ok(seen)
             }
@@ -216,10 +266,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
-    /// Opting out covers connection failures only; contention still has to be retried, or the
-    /// write is simply lost.
+    /// Opting out covers connection failures only; conflicts have a switch of their own.
     #[tokio::test]
-    async fn opting_out_covers_connection_errors_but_not_contention() {
+    async fn opting_out_covers_connection_errors_but_not_conflicts() {
         let policy = RetryPolicy {
             retry_connection_errors: false,
             ..fast()
@@ -244,7 +293,7 @@ mod tests {
         let result = with_retry(&policy, "test", move || async move {
             let seen = calls.fetch_add(1, Ordering::Relaxed) + 1;
             if seen < 2 {
-                Err(backend(BackendErrorKind::Transient))
+                Err(backend(BackendErrorKind::Conflict))
             } else {
                 Ok(())
             }
@@ -254,7 +303,46 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::Relaxed),
             2,
-            "contention ignores the opt-out"
+            "conflicts ignore the opt-out"
+        );
+    }
+
+    /// With conflict replay off, the first conflict is the caller's to handle, while connection
+    /// failures are still waited out.
+    #[tokio::test]
+    async fn without_conflict_replay_returns_the_first_conflict() {
+        let policy = fast().without_conflict_replay();
+
+        let calls = AtomicU32::new(0);
+        let calls = &calls;
+        let result: Result<(), _> = with_retry(&policy, "test", move || async move {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(backend(BackendErrorKind::Conflict))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the conflict was replayed"
+        );
+
+        let calls = AtomicU32::new(0);
+        let calls = &calls;
+        let result = with_retry(&policy, "test", move || async move {
+            let seen = calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if seen < 3 {
+                Err(backend(BackendErrorKind::Connection))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "connection retries stay on"
         );
     }
 

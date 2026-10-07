@@ -717,8 +717,8 @@ async fn observe_cancellation(ctx: &Ctx) {
         // happen is worse than not watching.
         Ok(_) => std::future::pending().await,
         // **Not retried here, deliberately.** `await_workflow_result` polls in a loop with
-        // `with_retry` inside it, and that policy has no attempt limit for transient or connection
-        // failures — a database that is merely unreachable never reaches this arm, because the
+        // `with_retry` inside it, and that policy has no attempt limit for connection failures
+        // or conflicts — a database that is merely unreachable never reaches this arm, because the
         // wait blocks until it comes back. What does reach it is the class `sysdb::retry` returns
         // immediately: `Permanent` and non-backend errors, which will fail again identically. So
         // this parks too, and the step finishes on its own terms — the same outcome as not having

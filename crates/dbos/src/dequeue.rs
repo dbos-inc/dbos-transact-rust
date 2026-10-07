@@ -44,13 +44,17 @@ use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 /// this is how often the set of workers is brought back in line with the table.
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The ceiling a contended worker's polling interval backs off to.
+/// The ceiling the polling interval of a worker that keeps losing serialization conflicts backs
+/// off to.
 const MAX_POLLING_INTERVAL: Duration = Duration::from_secs(120);
 
-/// What a contended pass multiplies the polling interval by.
+/// What a pass that lost a serialization conflict multiplies the polling interval by.
+///
+/// See [`Contention`] for why only that kind of contention backs off.
 const BACKOFF_FACTOR: f64 = 2.0;
 
-/// What a clean pass multiplies it by, walking it back towards the queue's own interval.
+/// What every other pass multiplies it by, walking it back towards the queue's own interval —
+/// including a pass that found the rows locked by a peer.
 const SCALEBACK_FACTOR: f64 = 0.9;
 
 /// The band every wait is jittered into.
@@ -337,9 +341,11 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
         let ceiling = floor.max(MAX_POLLING_INTERVAL);
         interval = interval.clamp(floor, ceiling);
 
-        let contended = poll_once(&executor, &queue, &running).await;
+        let backs_off = poll_once(&executor, &queue, &running)
+            .await
+            .is_some_and(Contention::backs_off);
 
-        interval = if contended {
+        interval = if backs_off {
             interval.mul_f64(BACKOFF_FACTOR).min(ceiling)
         } else {
             interval.mul_f64(SCALEBACK_FACTOR).max(floor)
@@ -362,7 +368,7 @@ fn worker_budget(limits: &ResolvedLimits, running: i64) -> Option<i64> {
         .map(|worker| (i64::from(worker) - running).max(0))
 }
 
-/// One dequeue and the dispatch of whatever it claimed. Reports whether it met contention.
+/// One dequeue and the dispatch of whatever it claimed. Reports the contention it met, if any.
 ///
 /// **Three shapes, which is the split TypeScript makes.** An unpartitioned queue is one claim. A
 /// partitioned queue whose only limit is one-at-a-time-per-key is a single batched sweep, which is
@@ -370,7 +376,11 @@ fn worker_budget(limits: &ResolvedLimits, running: i64) -> Option<i64> {
 /// partitioned queue walks its partitions one at a time, because the limits it carries have to be
 /// counted within each key — and in a shuffled order, so a queue with more partitions than budget
 /// does not starve the ones sorting last.
-async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<Running>) -> bool {
+async fn poll_once(
+    executor: &Arc<Executor>,
+    queue: &QueueRecord,
+    running: &Arc<Running>,
+) -> Option<Contention> {
     let limits = queue.resolved_limits();
 
     if !limits.is_partitioned() {
@@ -388,7 +398,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
         {
             Ok(claimed) => {
                 dispatch_claimed(executor, queue, None, running, claimed).await;
-                false
+                None
             }
             Err(error) => report_dequeue_error(&error),
         };
@@ -399,7 +409,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
     let already_running = running.count(&queue.name);
     let budget = worker_budget(&limits, already_running);
     if budget == Some(0) {
-        return false;
+        return None;
     }
 
     // The batched path, and the only one that does not count: see
@@ -424,7 +434,7 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
                 // The sweep returns one head per partition and does not say which; each claimed
                 // row carries its own key, so the tally is credited from the rows themselves.
                 dispatch_claimed(executor, queue, None, running, claimed).await;
-                false
+                None
             }
             Err(error) => report_dequeue_error(&error),
         };
@@ -453,12 +463,14 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
             .await
         {
             Ok(claimed) => claimed,
-            // A peer holds this partition's rows. Skipping just this key is the point of walking
-            // them separately — one contended partition is not a reason to back the whole queue
-            // off, and the next poll shuffles into a different order anyway.
-            Err(error) if is_contention(&error) => {
+            // A peer holds this partition's rows, or committed to them first. Skipping just this
+            // key is the point of walking them separately — one contended partition is not a
+            // reason to back the whole queue off, whichever kind of contention it was, and the next
+            // poll shuffles into a different order anyway.
+            Err(error) if contention(&error).is_some() => {
                 tracing::debug!(
                     partition,
+                    error = %error,
                     "a peer is mid-dequeue on this partition; skipping it"
                 );
                 continue;
@@ -471,19 +483,19 @@ async fn poll_once(executor: &Arc<Executor>, queue: &QueueRecord, running: &Arc<
         claimed_here += i64::try_from(claimed.len()).unwrap_or(i64::MAX);
         dispatch_claimed(executor, queue, Some(&partition), running, claimed).await;
     }
-    false
+    None
 }
 
-/// Turns a failed dequeue into the "was it contention" answer the caller backs off on.
-fn report_dequeue_error(error: &sysdb::Error) -> bool {
-    if is_contention(error) {
-        // Not a failure at this layer: a peer holds the rows this dequeue wanted to lock, which
-        // is the system working. It costs an interval, and says nothing louder.
-        tracing::debug!(error = %error, "a peer is mid-dequeue; backing off");
-        return true;
+/// Logs a failed dequeue at the level it deserves, and reports the contention it was, if any.
+fn report_dequeue_error(error: &sysdb::Error) -> Option<Contention> {
+    let contention = contention(error);
+    match contention {
+        // Not a failure at this layer: a peer was dequeuing from the same rows, which is the
+        // system working. It costs a poll, and says nothing louder.
+        Some(_) => tracing::debug!(error = %error, "a peer is mid-dequeue; polling again later"),
+        None => tracing::warn!(error = %error, "could not dequeue from the queue"),
     }
-    tracing::warn!(error = %error, "could not dequeue from the queue");
-    false
+    contention
 }
 
 /// Fisher-Yates, so a walk visits partitions in a different order each poll.
@@ -738,20 +750,46 @@ async fn dispatch(
     Ok(())
 }
 
-/// Whether a failed dequeue means a peer was mid-dequeue rather than something being wrong.
+/// How a dequeue lost a race to a peer, as opposed to failing.
 ///
-/// **`55P03` by code, not by class.** A `NOWAIT` conflict is `lock_not_available`, and the
-/// backend classifier works by SQLSTATE class prefix — class `55` is not class `40`, so a lock
-/// conflict arrives as [`BackendErrorKind::Permanent`](crate::sysdb::BackendErrorKind::Permanent)
-/// and never reaches the retry layer. That is the right call for the retry layer, which cannot
-/// know that asking again later is exactly what this caller does; it just means the runner has to
-/// recognise the code itself. Serialization failures (class `40`) do not appear here at all —
-/// `start_queued_workflows` retries those internally.
-fn is_contention(error: &sysdb::Error) -> bool {
-    matches!(
-        error,
-        sysdb::Error::Backend(backend) if backend.sqlstate.as_deref() == Some("55P03")
-    )
+/// Both kinds reach the poll loop as they happened: the dequeue replays neither. A lock conflict is
+/// [`BackendErrorKind::Permanent`](crate::sysdb::BackendErrorKind::Permanent) to the retry layer,
+/// and the dequeue turns conflict replay off, so a serialization failure is returned on the first
+/// attempt. Asking again later is exactly what this caller does, and it is the caller that knows
+/// how much later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Contention {
+    /// `55P03` `lock_not_available`: the `NOWAIT` lock a rate-limited dequeue takes found a peer
+    /// holding the rows. The peer commits in milliseconds, so the next poll finds them free, and
+    /// backing off would only leave waiting work unclaimed.
+    LockNotAvailable,
+    /// `40001` `serialization_failure`: a dequeue running at repeatable read or serialisable lost
+    /// to a peer that committed first. On PostgreSQL that is a dequeue raised to keep a shared
+    /// budget consistent; on CockroachDB, whose default isolation is serialisable, any dequeue.
+    /// Contenders can keep colliding on every poll, so the worker backs off to spread them out.
+    SerializationFailure,
+}
+
+impl Contention {
+    /// Whether this contention should lengthen the polling interval.
+    fn backs_off(self) -> bool {
+        self == Contention::SerializationFailure
+    }
+}
+
+/// The contention a failed dequeue was, or `None` if something is actually wrong.
+///
+/// By exact code. `40P01`, a deadlock, is deliberately not contention: nothing in the dequeue
+/// expects one, so it is a real error and is logged as one.
+fn contention(error: &sysdb::Error) -> Option<Contention> {
+    let sysdb::Error::Backend(backend) = error else {
+        return None;
+    };
+    match backend.sqlstate.as_deref() {
+        Some("55P03") => Some(Contention::LockNotAvailable),
+        Some("40001") => Some(Contention::SerializationFailure),
+        _ => None,
+    }
 }
 
 /// Spreads a wait over [`JITTER`], so a fleet that started together stops polling in lockstep.
@@ -770,4 +808,49 @@ fn jitter(interval: Duration) -> Duration {
 pub(crate) fn random_unit() -> f64 {
     let bits = uuid::Uuid::new_v4().as_u128() as u32;
     f64::from(bits) / f64::from(u32::MAX).next_up()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sysdb::{BackendError, BackendErrorKind};
+
+    fn backend(sqlstate: &str, kind: BackendErrorKind) -> sysdb::Error {
+        sysdb::Error::Backend(BackendError {
+            message: "boom".to_owned(),
+            sqlstate: Some(sqlstate.to_owned()),
+            kind,
+        })
+    }
+
+    /// The two ways of losing a dequeue race are told apart, and only a serialization failure
+    /// lengthens the polling interval.
+    #[test]
+    fn only_a_serialization_failure_backs_off() {
+        let locked = contention(&backend("55P03", BackendErrorKind::Permanent));
+        assert_eq!(locked, Some(Contention::LockNotAvailable));
+        assert!(!locked.unwrap().backs_off());
+
+        let conflict = contention(&backend("40001", BackendErrorKind::Conflict));
+        assert_eq!(conflict, Some(Contention::SerializationFailure));
+        assert!(conflict.unwrap().backs_off());
+    }
+
+    /// A deadlock is not something the dequeue expects, so it is an error rather than contention,
+    /// as is anything that is not a backend failure at all.
+    #[test]
+    fn a_deadlock_is_not_contention() {
+        assert_eq!(
+            contention(&backend("40P01", BackendErrorKind::Conflict)),
+            None
+        );
+        assert_eq!(
+            contention(&backend("23505", BackendErrorKind::Permanent)),
+            None
+        );
+        assert_eq!(
+            contention(&sysdb::Error::Malformed("bad row".to_owned())),
+            None
+        );
+    }
 }

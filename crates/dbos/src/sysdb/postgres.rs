@@ -141,26 +141,29 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 
 /// Whether a driver failure is worth asking again about.
 ///
-/// The classes are the union of the other implementations', which agree on the SQLSTATE prefixes
-/// and differ only in how they group them:
+/// | SQLSTATE | Meaning | Kind |
+/// |---|---|---|
+/// | `08…` | connection exception | connection |
+/// | `57…` | operator intervention — shutdown, cannot connect now | connection |
+/// | `53…` | insufficient resources — out of memory, too many connections | connection |
+/// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
+/// | anything else | the request reached the database and was refused | permanent |
 ///
-/// | Prefix | Meaning | Java | Python | Go |
-/// |---|---|---|---|---|
-/// | `08` | connection exception | connection | connection | retryable |
-/// | `57` | operator intervention — shutdown, cannot connect now | connection | connection | retryable |
-/// | `53` | insufficient resources — out of memory, too many connections | transient | connection | — |
-/// | `40` | serialization failure, deadlock detected | transient | — | transaction-retryable |
-///
-/// `53` is grouped with connections here, following Python: `53300 too_many_connections` is a
-/// failure to obtain a connection, and the difference only decides whether
+/// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
+/// connection, and the difference only decides whether
 /// [`RetryPolicy::retry_connection_errors`] can opt out of it.
+///
+/// **Class `40` by exact code, every other class by prefix.** A prefix covers codes nobody has seen
+/// yet, which is right for a class whose every member means the same thing. Class `40` is not
+/// one: only `40001` and `40P01` say the database rolled the transaction back so a peer could
+/// commit, which is what makes a replay safe. `40002`, an integrity constraint violated at commit,
+/// is a refusal like any other; `40003`, statement completion unknown, is how CockroachDB reports
+/// an ambiguous result, where the transaction may have committed and a replay could apply it
+/// twice. Both are permanent, so they reach the caller.
 ///
 /// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
 /// call a transport failure permanent. See [`is_transport_failure`].
-///
-/// Prefixes rather than exact codes, deliberately: a list of codes misses the ones nobody has
-/// seen yet, and the class the standard defines covers them.
 ///
 /// TODO(dbos-team): UPSTREAM item 8. Classifying by class prefix means a *protocol* violation
 /// lands in whichever class it happens to carry rather than being called permanent, so some are
@@ -168,23 +171,7 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// they classify by code lists, which have the opposite failure mode.
 fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     if let Some(code) = sqlstate {
-        return match &code[..2.min(code.len())] {
-            "40" => BackendErrorKind::Transient,
-            "08" | "53" | "57" => BackendErrorKind::Connection,
-            // `XX` is the internal-error class, and CockroachDB's `XXUUU` is its catch-all: the
-            // code it attaches to a failure it has no better code for. That includes losing the
-            // connection to a client mid-read, which it reports as an internal error whose
-            // message is the transport failure verbatim. Reading the message is the only way to
-            // tell those apart, and getting it wrong in this direction is what the reference
-            // implementations already accept: Python and TypeScript both match driver message
-            // text alongside the code, rather than letting a code that is not in the connection
-            // set end the decision.
-            "XX" => match error.as_database_error().map(|e| e.message()) {
-                Some(message) if is_transport_failure(message) => BackendErrorKind::Connection,
-                _ => BackendErrorKind::Permanent,
-            },
-            _ => BackendErrorKind::Permanent,
-        };
+        return classify_sqlstate(code, error.as_database_error().map(|e| e.message()));
     }
     // No SQLSTATE means the database never answered, so the request never reached it. Java
     // matches driver message text for this case; sqlx gives the variants directly.
@@ -198,6 +185,29 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
         // Calling it a connection error makes any operation issued after shutdown hang instead of
         // returning, which is the one outcome the retry layer must never produce.
         sqlx::Error::PoolClosed => BackendErrorKind::Permanent,
+        _ => BackendErrorKind::Permanent,
+    }
+}
+
+/// [`classify`] for a failure the database answered, from its SQLSTATE and message alone.
+fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
+    if matches!(code, "40001" | "40P01") {
+        return BackendErrorKind::Conflict;
+    }
+    match &code[..2.min(code.len())] {
+        "08" | "53" | "57" => BackendErrorKind::Connection,
+        // `XX` is the internal-error class, and CockroachDB's `XXUUU` is its catch-all: the
+        // code it attaches to a failure it has no better code for. That includes losing the
+        // connection to a client mid-read, which it reports as an internal error whose
+        // message is the transport failure verbatim. Reading the message is the only way to
+        // tell those apart, and getting it wrong in this direction is what the reference
+        // implementations already accept: Python and TypeScript both match driver message
+        // text alongside the code, rather than letting a code that is not in the connection
+        // set end the decision.
+        "XX" => match message {
+            Some(message) if is_transport_failure(message) => BackendErrorKind::Connection,
+            _ => BackendErrorKind::Permanent,
+        },
         _ => BackendErrorKind::Permanent,
     }
 }
@@ -4306,8 +4316,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // No isolation level is pinned, unlike TypeScript's explicit `READ COMMITTED`. On
         // PostgreSQL that is the default and the predicate above arbitrates; on CockroachDB the
-        // default is `SERIALIZABLE`, which aborts the loser instead — a `40` SQLSTATE, which the
-        // retry policy classifies as transient, so it comes back round, finds nothing unconsumed,
+        // default is `SERIALIZABLE`, which aborts the loser instead — `40001`, which the retry
+        // policy replays as a conflict, so it comes back round, finds nothing unconsumed,
         // and records the same `None` it would have recorded either way.
         with_retry(&self.retry, "recv", move || async move {
             let mut tx = pool.begin().await?;
@@ -4490,7 +4500,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                      {STREAM_OFFSET_ATTEMPTS} offset races"
                 ),
                 sqlstate: None,
-                kind: BackendErrorKind::Transient,
+                kind: BackendErrorKind::Conflict,
             }))
         })
         .await
@@ -5473,7 +5483,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let rate_limit_period_ms = period_ms(limits.rate_limit);
         let partition_rate_limit_period_ms = period_ms(limits.partition_rate_limit);
 
-        with_retry(&self.retry, "start_queued_workflows", move || async move {
+        // Conflicts are not replayed here. A dequeue raised above read committed expects to lose
+        // races to its peers, and its caller's answer to a lost one — poll again later, or skip
+        // this partition — is the right one, which a replay underneath it would hide.
+        let retry = self.retry.without_conflict_replay();
+        with_retry(&retry, "start_queued_workflows", move || async move {
             let mut tx = pool.begin().await?;
 
             // Read committed otherwise: with no shared budget nothing here reads a total, so a
@@ -5825,8 +5839,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let pool = &self.pool;
         let application_name = self.application_name.as_deref();
 
+        // Conflicts are not replayed, as in `start_queued_workflows`: losing a race is the caller's
+        // to answer.
+        let retry = self.retry.without_conflict_replay();
         with_retry(
-            &self.retry,
+            &retry,
             "start_queued_partitioned_workflows",
             move || async move {
                 let mut tx = pool.begin().await?;
@@ -7127,8 +7144,57 @@ impl PostgresSystemDatabase {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transport_failure, polling_limit, split_database};
+    use super::{classify_sqlstate, is_transport_failure, polling_limit, split_database};
+    use crate::sysdb::BackendErrorKind;
     use tokio::sync::Semaphore;
+
+    /// Only the two codes that mean "rolled back so a peer could commit" are conflicts. The rest
+    /// of class 40 is refused like any other error: `40002` failed a constraint at commit, and
+    /// `40003` may have committed, so replaying either would be wrong.
+    #[test]
+    fn only_serialization_failures_and_deadlocks_are_conflicts() {
+        for code in ["40001", "40P01"] {
+            assert_eq!(
+                classify_sqlstate(code, None),
+                BackendErrorKind::Conflict,
+                "{code}"
+            );
+        }
+        for code in ["40000", "40002", "40003"] {
+            assert_eq!(
+                classify_sqlstate(code, None),
+                BackendErrorKind::Permanent,
+                "{code}"
+            );
+        }
+    }
+
+    /// The prefix classes are unchanged by the exact-code rule for class 40.
+    #[test]
+    fn connection_classes_match_by_prefix() {
+        for code in ["08006", "53300", "57P01"] {
+            assert_eq!(
+                classify_sqlstate(code, None),
+                BackendErrorKind::Connection,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            classify_sqlstate(
+                "XXUUU",
+                Some("read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o timeout")
+            ),
+            BackendErrorKind::Connection
+        );
+        assert_eq!(
+            classify_sqlstate("XX000", Some("internal error")),
+            BackendErrorKind::Permanent
+        );
+        assert_eq!(
+            classify_sqlstate("23505", None),
+            BackendErrorKind::Permanent
+        );
+    }
 
     /// The message CockroachDB attaches to `XXUUU` when a client's connection dies mid-read,
     /// which is what makes that code a connection failure rather than an internal one.
