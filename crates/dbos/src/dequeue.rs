@@ -763,9 +763,10 @@ enum Contention {
     /// holding the rows. The peer commits in milliseconds, so the next poll finds them free, and
     /// backing off would only leave waiting work unclaimed.
     LockNotAvailable,
-    /// `40001` `serialization_failure`: a dequeue raised to repeatable read or serialisable to keep
-    /// a shared budget consistent lost to a peer that committed first. Under a shared budget that
-    /// can keep happening on every poll, so the worker backs off to spread the contenders out.
+    /// `40001` `serialization_failure`: a dequeue running at repeatable read or serialisable lost
+    /// to a peer that committed first. On PostgreSQL that is a dequeue raised to keep a shared
+    /// budget consistent; on CockroachDB, whose default isolation is serialisable, any dequeue.
+    /// Contenders can keep colliding on every poll, so the worker backs off to spread them out.
     SerializationFailure,
 }
 

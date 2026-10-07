@@ -127,28 +127,45 @@ where
             Error::Backend(backend) => backend.kind,
             _ => return Err(error),
         };
-        let delay = match kind {
+        // Whether this retry is worth a warning, alongside how long it waits.
+        let (delay, loud) = match kind {
             BackendErrorKind::Permanent => return Err(error),
             BackendErrorKind::Connection if !policy.retry_connection_errors => return Err(error),
             BackendErrorKind::Connection => {
                 let delay = jitter(backoff);
                 backoff = (backoff * 2).min(policy.max_backoff);
-                delay
+                (delay, true)
             }
             BackendErrorKind::Conflict if !policy.retry_conflicts => return Err(error),
             BackendErrorKind::Conflict => {
+                // A conflict is ordinary contention and usually clears within a replay or two,
+                // so it is logged at debug. Once the backoff has reached its ceiling the call has
+                // been losing for seconds, which is worth a warning: with no attempt limit, the
+                // log is the only place a conflict that never clears shows up.
+                let loud = conflict_backoff >= policy.conflict_max_backoff;
                 let delay = jitter(conflict_backoff);
                 conflict_backoff = (conflict_backoff * 2).min(policy.conflict_max_backoff);
-                delay
+                (delay, loud)
             }
         };
-        tracing::warn!(
-            operation,
-            attempt,
-            delay_ms = delay.as_millis() as u64,
-            error = %error,
-            "system database operation failed; retrying"
-        );
+        let delay_ms = delay.as_millis() as u64;
+        if loud {
+            tracing::warn!(
+                operation,
+                attempt,
+                delay_ms,
+                error = %error,
+                "system database operation failed; retrying"
+            );
+        } else {
+            tracing::debug!(
+                operation,
+                attempt,
+                delay_ms,
+                error = %error,
+                "system database operation lost a transaction conflict; replaying"
+            );
+        }
         tokio::time::sleep(delay).await;
     }
 }

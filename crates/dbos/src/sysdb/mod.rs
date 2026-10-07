@@ -1158,10 +1158,17 @@ pub trait SystemDatabase: Send + Sync {
     /// one workflow for the whole queue where the flag promised one per key.
     ///
     /// A queue with global concurrency or a rate limit runs at `REPEATABLE READ` and locks with
-    /// `NOWAIT`, so every executor sees a consistent count rather than a partial one; without
-    /// them it stays at `READ COMMITTED` and uses `SKIP LOCKED`. A `NOWAIT` conflict therefore
-    /// surfaces as a backend error rather than an empty result — a peer is mid-dequeue, and the
-    /// caller's next poll is the retry. Both references do the same.
+    /// `NOWAIT`, so every executor sees a consistent count rather than a partial one — at
+    /// `SERIALIZABLE` when a `partition_key` is given, since sweeps of different partitions spend
+    /// the same queue-wide budget. Without those limits it stays at `READ COMMITTED` and uses
+    /// `SKIP LOCKED`.
+    ///
+    /// **A lost race is returned, not retried.** A `NOWAIT` conflict (`55P03`) surfaces as a
+    /// backend error rather than an empty result, and a serialization failure (`40001`) or
+    /// deadlock (`40P01`) is returned on the first attempt, unreplayed. In each case a peer was
+    /// dequeuing from the same rows, and the caller's next poll is the retry; replaying inside
+    /// this call would hide the race from the caller that decides how long to wait. Connection
+    /// failures are still retried here.
     ///
     /// `application_version` is this executor's. A workflow with no version recorded is eligible
     /// only when this executor is running the *latest* registered version, so a rolling deploy
