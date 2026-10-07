@@ -210,8 +210,8 @@ impl Executor {
         // process start against a genuinely quiet executor.
         //
         // What keeps an interrupted workflow from being *recorded* as failed is not this ordering
-        // but `Error::control`, which treats every system-database failure as a signal rather than
-        // an outcome. Cancelling leaves every row `PENDING`, which is what a later executor
+        // but `Error::control`, which treats a database failure as a signal rather than an
+        // outcome. Cancelling leaves every row `PENDING`, which is what a later executor
         // recovers.
         let cancelled = self.tasks.abort_all().await;
         if cancelled > 0 {

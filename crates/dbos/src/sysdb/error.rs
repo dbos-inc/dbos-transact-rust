@@ -276,6 +276,49 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether a durable step records this failure as its outcome, so a replay gives it back.
+    ///
+    /// Only the typed refusals are recorded — "already exists", "no such workflow", "nothing to
+    /// fork from" — where asking again in the same state gets the same reply. Recording them is
+    /// what keeps a replay on the branch the original run took.
+    ///
+    /// Never recorded:
+    ///
+    /// - **Any [`Backend`](Error::Backend) failure.** Connection loss and conflicts are accidents
+    ///   of the moment: the work rolled back, and [`with_retry`](super::retry::with_retry) runs it
+    ///   again. A permanent one is the database or the build rather than an answer — a schema
+    ///   behind the build, a missing grant, a column the driver cannot decode — because every
+    ///   answer the schema can give is already mapped to a typed variant. Each can be fixed after
+    ///   the fact, and a recorded failure would outlive the fix.
+    /// - **A value this build cannot read.** That says something about the build rather than the
+    ///   data; a later build may read it, and a recorded failure would outlive the fix.
+    /// - **Signals about the calling execution** — cancelled, superseded by a rival, or replaying
+    ///   code that has changed — which end the run rather than answer the call.
+    /// - **A second in-process receiver**, which is about this process, not the database.
+    ///
+    /// Exhaustive, so a new variant has to be placed on one side or the other.
+    pub(crate) fn should_record(&self) -> bool {
+        match self {
+            Error::Backend(_)
+            | Error::Malformed(_)
+            | Error::WorkflowCancelled { .. }
+            | Error::StepAlreadyRecorded { .. }
+            | Error::UnexpectedStep { .. }
+            | Error::ConcurrentRecv { .. } => false,
+            Error::ConflictingWorkflow { .. }
+            | Error::InvalidInput { .. }
+            | Error::QueueDeduplicated { .. }
+            | Error::NoForkPoint { .. }
+            | Error::NonExistentWorkflow { .. }
+            | Error::MaxRecoveryAttemptsExceeded { .. }
+            | Error::AlreadyRegistered { .. }
+            | Error::NotRegistered { .. }
+            | Error::RegisteredByAnother { .. } => true,
+        }
+    }
+}
+
 /// A failure the database or its driver reported.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackendError {
@@ -318,4 +361,55 @@ pub enum BackendErrorKind {
     ///
     /// A syntax error, a constraint violation, a missing table. Asking again cannot help.
     Permanent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(kind: BackendErrorKind) -> Error {
+        Error::Backend(BackendError {
+            message: "boom".to_owned(),
+            sqlstate: None,
+            kind,
+        })
+    }
+
+    #[test]
+    fn a_typed_refusal_should_be_recorded() {
+        assert!(
+            Error::NonExistentWorkflow {
+                workflow_ids: vec!["wf".to_owned()],
+            }
+            .should_record()
+        );
+        assert!(
+            Error::AlreadyRegistered {
+                kind: "Schedule".into(),
+                name: "nightly".to_owned(),
+            }
+            .should_record()
+        );
+    }
+
+    #[test]
+    fn a_backend_failure_or_a_signal_should_not_be_recorded() {
+        assert!(!backend(BackendErrorKind::Permanent).should_record());
+        assert!(!backend(BackendErrorKind::Connection).should_record());
+        assert!(!backend(BackendErrorKind::Conflict).should_record());
+        assert!(!Error::Malformed("unreadable".to_owned()).should_record());
+        assert!(
+            !Error::WorkflowCancelled {
+                workflow_id: "wf".to_owned(),
+            }
+            .should_record()
+        );
+        assert!(
+            !Error::StepAlreadyRecorded {
+                workflow_id: "wf".to_owned(),
+                step_id: 0,
+            }
+            .should_record()
+        );
+    }
 }

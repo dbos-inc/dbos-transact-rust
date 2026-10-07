@@ -88,12 +88,13 @@
 //! crate records, with what each one cost to settle. One call is one step, and the singular forms
 //! delegate to the bulk ones, so `cancel` and `cancel_all` spend the same one step id.
 //!
-//! Three edges, all shared with the references. Outside a workflow there is nothing to checkpoint
-//! against and the call is a plain one, which is what an operator's tool does. Inside a *step* it
-//! is also plain, by the leaf rule every other id-allocating call in this crate follows: the
-//! step's own checkpoint stands for everything its body did. And a **failure records nothing** —
-//! the transaction rolls back — so a replay makes the call again, which is what should happen when
-//! what failed was the database being unreachable rather than the operation being wrong.
+//! Three edges. Outside a workflow there is nothing to checkpoint against and the call is a plain
+//! one, which is what an operator's tool does. Inside a *step* it is also plain, by the leaf rule
+//! every other id-allocating call in this crate follows: the step's own checkpoint stands for
+//! everything its body did. And a **failure is recorded only when the database decided it**:
+//! "already exists" or "no such workflow" is replayed as the same error, so the replay takes the
+//! branch the original run took, while a database that was unreachable records nothing and the
+//! replay makes the call again.
 //!
 //! [`retrieve_workflow`](DBOS::retrieve_workflow) is the one member of the `DBOS` surface with no
 //! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its equivalent as

@@ -10513,9 +10513,9 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     assert!(steps.iter().all(|s| s.output.as_deref() == Some("null")));
 }
 
-/// A failed step leaves no checkpoint, so a replay runs the work again.
+/// A refused step records its refusal, and a replay gives it back rather than running again.
 #[tokio::test]
-async fn a_failed_schedule_step_records_nothing() {
+async fn a_refused_schedule_step_records_its_refusal() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-caller"), None, Submission::Fresh, None)
         .await
@@ -10527,8 +10527,8 @@ async fn a_failed_schedule_step_records_nothing() {
     .await
     .unwrap();
 
-    // The name is taken, so this fails — and takes the step's checkpoint down with it, both being
-    // on the one transaction.
+    // The name is taken, so the create is refused. The work rolls back, and the refusal is then
+    // recorded as the step's outcome.
     assert!(matches!(
         sys.create_schedule(
             &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
@@ -10537,24 +10537,26 @@ async fn a_failed_schedule_step_records_nothing() {
         .await,
         Err(Error::AlreadyRegistered { .. })
     ));
-    assert_eq!(
-        sys.check_step("wf-caller", 0, "DBOS.createSchedule")
-            .await
-            .unwrap(),
-        None,
-        "a write that failed is not a step a replay can adopt"
-    );
+    let step = sys
+        .check_step("wf-caller", 0, "DBOS.createSchedule")
+        .await
+        .unwrap()
+        .expect("the refusal is recorded");
+    assert!(step.output.is_none(), "{step:?}");
+    assert!(step.error.is_some(), "{step:?}");
 
-    // So the work runs again, and can now succeed — which is what both references do, and the
-    // reason a caller must not read a failed step as a settled answer.
+    // The name is freed. The same step replays its refusal and creates nothing, so the workflow
+    // takes the branch it took the first time.
     sys.delete_schedule("nightly", None).await.unwrap();
-    sys.create_schedule(
-        &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-        Some(("wf-caller", 0)),
-    )
-    .await
-    .unwrap();
-    assert!(sys.get_schedule("nightly", None).await.unwrap().is_some());
+    assert!(matches!(
+        sys.create_schedule(
+            &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
+            Some(("wf-caller", 0)),
+        )
+        .await,
+        Err(Error::AlreadyRegistered { .. })
+    ));
+    assert!(sys.get_schedule("nightly", None).await.unwrap().is_none());
 }
 
 /// Enqueues a debounced workflow holding `key`, released at `delay_until`.

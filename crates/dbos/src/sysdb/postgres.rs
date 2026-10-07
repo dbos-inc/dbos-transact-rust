@@ -724,9 +724,9 @@ impl std::ops::DerefMut for StepConn {
 
 /// What a replayed step hands back, decoded from the row that recorded it.
 ///
-/// Only a success is ever recorded by the two step runners, so a step carrying an error is a row
-/// they did not write. Python asserts the same thing at its own replay (`_sys_db.py`); reporting
-/// beats asserting, but the expectation is identical.
+/// A recorded failure comes back as the error it was, so the replay takes the branch the original
+/// run took. The step runners record a failure only when [`Error::should_record`] says to, so none
+/// of them is one [`with_retry`] would retry.
 ///
 /// A void method reaches here too, and does not trip the missing-output check: `()` serialises to
 /// the four-character string `null`, so the column holds a value rather than SQL NULL. Whether a
@@ -740,6 +740,15 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     step_name: &str,
 ) -> Result<T, Error> {
     tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
+    if let Some(recorded) = step.error.as_deref() {
+        let error: Error = serde_json::from_str(recorded).map_err(|e| {
+            Error::Malformed(format!(
+                "workflow {workflow_id} step {step_id} ({step_name}) has an error this build \
+                 cannot read: {e}"
+            ))
+        })?;
+        return Err(error);
+    }
     let recorded = step.output.as_deref().ok_or_else(|| {
         Error::Malformed(format!(
             "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
@@ -761,19 +770,13 @@ impl PostgresSystemDatabase {
     /// `runTransactionalStep` (`system_database.ts`) are the same three steps around a caller's
     /// connection; this one owns the transaction instead.
     ///
-    /// - **Already recorded** — the stored output is decoded and returned.
+    /// - **Already recorded** — the stored output is decoded and returned, or the stored error
+    ///   raised again.
     /// - **Succeeds** — the result and the checkpoint commit together, so no crash can leave one
     ///   without the other.
-    /// - **Fails** — the transaction rolls back and nothing is recorded, so a replay runs the
-    ///   work again. Both references do this, and recording the failure instead would be worse
-    ///   than it sounds: a step written from a dropped connection would freeze a transient outage
-    ///   into a permanent answer for that workflow.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 14. That last point is a real asymmetry, not a detail. An
-    /// *ordinary* step's failure is recorded and replayed as the same failure in both references;
-    /// only these internal ones drop it, so a replay can take a different branch from the run it
-    /// is replaying — create fails with "already exists", an operator deletes the schedule, and
-    /// the replay succeeds.
+    /// - **Fails** — the transaction rolls back, and the failure is recorded afterwards on a
+    ///   connection of its own when [`Error::should_record`] says to. See
+    ///   [`record_step_failure`](Self::record_step_failure).
     ///
     /// Without a `caller` this is just the work on its own transaction: no step is checked and
     /// none is written.
@@ -817,12 +820,18 @@ impl PostgresSystemDatabase {
             return replayed_output(&step, workflow_id, step_id, step_name);
         }
 
-        // A failure rolls the transaction back and records nothing, so the replay runs the work
-        // again. Both references do exactly this — Python's `with self.engine.begin()`
-        // (`_sys_db.py`) and TypeScript's `catch { ROLLBACK; throw }` (`system_database.ts`) — and
-        // the alternative is worse than it sounds: a step recorded from a dropped connection
-        // freezes a transient outage into a permanent answer for that workflow.
-        let (mut tx, value) = work(tx).await?;
+        // A failure drops the transaction inside `work`, which rolls it back.
+        let (mut tx, value) = match work(tx).await {
+            Ok(done) => done,
+            Err(error) => {
+                return match caller {
+                    Some((workflow_id, step_id)) => Err(self
+                        .record_step_failure(workflow_id, step_id, step_name, error, started_at)
+                        .await),
+                    None => Err(error),
+                };
+            }
+        };
 
         if let Some((workflow_id, step_id)) = caller {
             self.record_step_output(&mut tx, workflow_id, step_id, step_name, &value, started_at)
@@ -936,6 +945,84 @@ impl PostgresSystemDatabase {
         .await
     }
 
+    /// Records a step runner's failed work as the step's outcome, when [`Error::should_record`]
+    /// says to, and gives back the error the caller should see.
+    ///
+    /// Shared by [`run_transactional_step`](Self::run_transactional_step) and
+    /// [`run_single_statement_step`](Self::run_single_statement_step). By the time this runs, the
+    /// work's transaction has rolled back, so the record goes in on a transaction of its own
+    /// rather than beside the work. That costs nothing on the success path, which a savepoint
+    /// around the work would.
+    ///
+    /// A transaction rather than a bare connection because [`record_step_on`](Self::record_step_on)
+    /// is two statements — the step, then the executor claim — and the workflow must see the
+    /// failure that is recorded. Committed apart, a claim that failed after the step landed would
+    /// hand the workflow the claim's error while a replay gave back the recorded one.
+    ///
+    /// - **Not to be recorded** — returned as it is. A connection loss or a conflict goes back to
+    ///   [`with_retry`], which runs the whole step again.
+    /// - **Recorded** — the failure itself is returned, and a replay raises it again.
+    /// - **The record fails** — that failure is returned instead, and the step stays unrecorded.
+    ///   If it is retryable, `with_retry` runs the step again from the check.
+    /// - **A rival recorded the step first** — [`Error::StepAlreadyRecorded`], exactly as when a
+    ///   rival wins against a success: this execution is superseded.
+    ///
+    /// The gap between the rollback and the record is safe because the workflow sees the failure
+    /// only once it is recorded. A crash in between leaves nothing recorded and nothing observed,
+    /// so the replay runs the step as a first run would.
+    ///
+    /// The dropped transaction's `ROLLBACK` is sent when its connection goes back to the pool, so
+    /// a record that needs a row the work had locked waits until it is sent, and no longer.
+    async fn record_step_failure(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        step_name: &str,
+        error: Error,
+        started_at: Timestamp,
+    ) -> Error {
+        if !error.should_record() {
+            return error;
+        }
+        // `Error` is a plain serde enum, so this cannot fail on anything it holds.
+        let recorded = match serde_json::to_string(&error) {
+            Ok(recorded) => recorded,
+            Err(e) => return Error::Malformed(format!("step error is not JSON: {e}")),
+        };
+        let record = async {
+            let mut tx = self.pool.begin().await?;
+            self.record_step_on(
+                &mut tx,
+                workflow_id,
+                step_id,
+                step_name,
+                Outcome::Error(&recorded),
+                Some(RUST_SERDE),
+                Some(StepTiming {
+                    started_at,
+                    completed_at: Timestamp::now(),
+                }),
+                None,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok::<(), Error>(())
+        };
+        match record.await {
+            Ok(()) => {
+                tracing::debug!(
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    error = %error,
+                    "the step failed; its error is recorded"
+                );
+                error
+            }
+            Err(record_error) => record_error,
+        }
+    }
+
     /// [`run_transactional_step`](Self::run_transactional_step) for work that is **one
     /// statement**.
     ///
@@ -978,8 +1065,15 @@ impl PostgresSystemDatabase {
             return replayed_output(&step, workflow_id, step_id, step_name);
         }
 
-        // A failure drops the transaction, which rolls it back and records nothing — as above.
-        let (mut conn, value) = work(conn).await?;
+        // A failure drops the transaction inside `work`, which rolls it back.
+        let (mut conn, value) = match work(conn).await {
+            Ok(done) => done,
+            Err(error) => {
+                return Err(self
+                    .record_step_failure(workflow_id, step_id, step_name, error, started_at)
+                    .await);
+            }
+        };
         self.record_step_output(
             &mut conn,
             workflow_id,
@@ -1635,6 +1729,18 @@ enum SleepKind {
 /// read by the system database, so it is stored legibly rather than in whatever the workflow
 /// chose. Python does the same for the same value; Java uses the workflow's serializer.
 const PORTABLE_JSON: &str = "portable_json";
+
+/// The encoding of an error this layer records for a failed step.
+///
+/// The crate's serde encoding rather than [`PORTABLE_JSON`], because the payload is this layer's
+/// [`Error`] and a replay of the step decodes it back into the same variant. Only the step runners
+/// read it back.
+///
+/// The name is shared with the engine's default serializer, which writes the engine's own `Error`
+/// under it, and the two enums have variants of the same name. The step name says which one a
+/// row holds: these are the internal steps, and an ordinary step never records this layer's
+/// error.
+const RUST_SERDE: &str = "rust_serde";
 
 /// How many times a stream write retries onto a fresh offset before giving up.
 ///
