@@ -1494,8 +1494,6 @@ pub struct QueueUpdate {
     /// See [`QueueRecord::rate_limit`]. One field for both columns, so an update cannot leave
     /// half a limit behind.
     pub rate_limit: Change<Option<RateLimit>>,
-    /// See [`QueueRecord::priority_enabled`].
-    pub priority_enabled: Change<bool>,
     /// See [`QueueRecord::partition_concurrency`].
     pub partition_concurrency: Change<Option<i32>>,
     /// See [`QueueRecord::partition_worker_concurrency`].
@@ -1533,10 +1531,6 @@ impl QueueUpdate {
                 .set()
                 .unwrap_or(record.worker_concurrency),
             rate_limit: self.rate_limit.set().unwrap_or(record.rate_limit),
-            priority_enabled: self
-                .priority_enabled
-                .set()
-                .unwrap_or(record.priority_enabled),
             partition_concurrency,
             partition_worker_concurrency,
             partition_rate_limit,
@@ -1554,7 +1548,6 @@ impl QueueUpdate {
         self.concurrency.is_leave()
             && self.worker_concurrency.is_leave()
             && self.rate_limit.is_leave()
-            && self.priority_enabled.is_leave()
             && self.partition_concurrency.is_leave()
             && self.partition_worker_concurrency.is_leave()
             && self.partition_rate_limit.is_leave()
@@ -1713,8 +1706,6 @@ pub struct QueueRecord {
     pub worker_concurrency: Option<i32>,
     /// How fast workflows may start, or `None` for unthrottled.
     pub rate_limit: Option<RateLimit>,
-    /// Whether dequeue order honours a workflow's priority.
-    pub priority_enabled: bool,
     /// Workflows one partition may have running at once, across all executors.
     ///
     /// Setting any of the three partition limits is what partitions a queue. Each applies within
@@ -1759,8 +1750,6 @@ pub struct NewQueue<'a> {
     pub worker_concurrency: Option<i32>,
     /// See [`QueueRecord::rate_limit`].
     pub rate_limit: Option<RateLimit>,
-    /// See [`QueueRecord::priority_enabled`].
-    pub priority_enabled: bool,
     /// See [`QueueRecord::partition_concurrency`].
     pub partition_concurrency: Option<i32>,
     /// See [`QueueRecord::partition_worker_concurrency`].
@@ -1781,7 +1770,6 @@ impl<'a> NewQueue<'a> {
             concurrency: None,
             worker_concurrency: None,
             rate_limit: None,
-            priority_enabled: false,
             partition_concurrency: None,
             partition_worker_concurrency: None,
             partition_rate_limit: None,

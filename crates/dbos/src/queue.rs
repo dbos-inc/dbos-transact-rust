@@ -53,7 +53,6 @@ pub struct Queue {
     concurrency: Option<i32>,
     worker_concurrency: Option<i32>,
     rate_limit: Option<RateLimit>,
-    priority_enabled: bool,
     partition_concurrency: Option<i32>,
     partition_worker_concurrency: Option<i32>,
     partition_rate_limit: Option<RateLimit>,
@@ -68,7 +67,6 @@ impl Queue {
             concurrency: record.concurrency,
             worker_concurrency: record.worker_concurrency,
             rate_limit: record.rate_limit,
-            priority_enabled: record.priority_enabled,
             partition_concurrency: record.partition_concurrency,
             partition_worker_concurrency: record.partition_worker_concurrency,
             partition_rate_limit: record.partition_rate_limit,
@@ -94,11 +92,6 @@ impl Queue {
     /// How fast this queue's workflows may start, or `None` if it is unthrottled.
     pub fn rate_limit(&self) -> Option<RateLimit> {
         self.rate_limit
-    }
-
-    /// Whether dequeue order honours a workflow's priority.
-    pub fn priority_enabled(&self) -> bool {
-        self.priority_enabled
     }
 
     /// Whether the queue is partitioned, which any per-partition limit makes it.
@@ -209,12 +202,6 @@ pub struct QueueOptions {
     /// [`partition_rate_limit`](Self::partition_rate_limit): both are enforced, and the
     /// per-partition one may not exceed it.
     pub rate_limit: Option<RateLimit>,
-    /// Whether dequeue order honours a workflow's
-    /// [priority](crate::Enqueue::priority), lowest first.
-    ///
-    /// Off by default, which is every implementation's default: an unprioritised queue is FIFO by
-    /// `created_at`, and that is what most queues want.
-    pub priority_enabled: bool,
     /// How many of this queue's workflows may run at once **within one partition**, across every
     /// executor.
     ///
@@ -254,7 +241,6 @@ impl Default for QueueOptions {
             worker_concurrency: None,
             polling_interval: DEFAULT_POLLING_INTERVAL,
             rate_limit: None,
-            priority_enabled: false,
             partition_concurrency: None,
             partition_worker_concurrency: None,
             partition_rate_limit: None,
@@ -283,8 +269,6 @@ pub struct QueueChange {
     ///
     /// One field for both stored columns, so an update cannot leave half a limit behind.
     pub rate_limit: Change<Option<RateLimit>>,
-    /// Whether dequeue order honours priority.
-    pub priority_enabled: Change<bool>,
     /// How many may run at once within one partition, across every executor.
     ///
     /// **Setting or clearing this partitions or un-partitions the queue**, since partitioning is
@@ -735,7 +719,6 @@ impl Connection {
                     worker_concurrency: options.worker_concurrency,
                     polling_interval: options.polling_interval,
                     rate_limit: options.rate_limit,
-                    priority_enabled: options.priority_enabled,
                     partition_concurrency: options.partition_concurrency,
                     partition_worker_concurrency: options.partition_worker_concurrency,
                     partition_rate_limit: options.partition_rate_limit,
@@ -807,7 +790,6 @@ impl Connection {
                 worker_concurrency: merged.worker_concurrency,
                 polling_interval: merged.polling_interval,
                 rate_limit: merged.rate_limit,
-                priority_enabled: merged.priority_enabled,
                 partition_concurrency: merged.partition_concurrency,
                 partition_worker_concurrency: merged.partition_worker_concurrency,
                 partition_rate_limit: merged.partition_rate_limit,
@@ -825,7 +807,6 @@ impl Connection {
             worker_concurrency: change.worker_concurrency,
             polling_interval: change.polling_interval,
             rate_limit: change.rate_limit,
-            priority_enabled: change.priority_enabled,
             partition_concurrency: change.partition_concurrency,
             partition_worker_concurrency: change.partition_worker_concurrency,
             partition_rate_limit: change.partition_rate_limit,

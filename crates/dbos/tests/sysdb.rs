@@ -8072,7 +8072,6 @@ async fn a_queue_round_trips_through_the_registry() {
             limit: 100,
             period: std::time::Duration::from_millis(1_500),
         }),
-        priority_enabled: true,
         polling_interval: std::time::Duration::from_millis(250),
         ..NewQueue::new("orders")
     };
@@ -8094,7 +8093,6 @@ async fn a_queue_round_trips_through_the_registry() {
             period: std::time::Duration::from_millis(1_500),
         }),
     );
-    assert!(read.priority_enabled);
     assert_eq!(read.polling_interval, std::time::Duration::from_millis(250));
 
     assert!(sys.get_queue("no-such-queue").await.unwrap().is_none());
@@ -9174,7 +9172,6 @@ async fn an_update_changes_only_what_it_names() {
             limit: 10,
             period: std::time::Duration::from_secs(1),
         }),
-        priority_enabled: true,
         polling_interval: std::time::Duration::from_millis(500),
         ..NewQueue::new("orders")
     };
@@ -9206,7 +9203,6 @@ async fn an_update_changes_only_what_it_names() {
         }),
         "not named, so untouched",
     );
-    assert!(read.priority_enabled, "not named, so untouched");
     assert_eq!(read.polling_interval, std::time::Duration::from_millis(500));
 }
 

@@ -1788,9 +1788,9 @@ const UNSETTLED: &str = "'PENDING', 'ENQUEUED', 'DELAYED'";
 
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
-     rate_limit_period_sec, priority_enabled, partition_concurrency, \
-     partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec, \
-     polling_interval_sec, application_name";
+     rate_limit_period_sec, partition_concurrency, partition_worker_concurrency, \
+     partition_rate_limit_max, partition_rate_limit_period_sec, polling_interval_sec, \
+     application_name";
 
 /// Every column of a schedule row, in the order [`schedule_from_row`] reads them.
 const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
@@ -1885,7 +1885,6 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
         concurrency: row.try_get("concurrency")?,
         worker_concurrency: row.try_get("worker_concurrency")?,
         rate_limit: rate_limit("rate_limit_max", "rate_limit_period_sec")?,
-        priority_enabled: row.try_get("priority_enabled")?,
         partition_concurrency: row.try_get("partition_concurrency")?,
         partition_worker_concurrency: row.try_get("partition_worker_concurrency")?,
         partition_rate_limit: rate_limit(
@@ -5485,7 +5484,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(queue.worker_concurrency)
             .bind(queue.rate_limit.map(|r| r.limit))
             .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
-            .bind(queue.priority_enabled)
+            // Every queue orders by priority, so the column is always written `TRUE` for readers
+            // that still consult it, and never read here.
+            .bind(true)
             // Derived, never asked for: the column is written to agree with the per-partition
             // limits for readers that still consult it, and is never read here.
             .bind(
@@ -6282,7 +6283,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
             assign!(update.concurrency.set(), "concurrency");
             assign!(update.worker_concurrency.set(), "worker_concurrency");
-            assign!(update.priority_enabled.set(), "priority_enabled");
+            // Rewritten on every update, so a row stored `FALSE` before every queue ordered by
+            // priority is brought in line the first time anything about it changes.
+            set.push("priority_enabled = TRUE");
             // The `partition_queue` column is rewritten to agree with the per-partition limits
             // whenever one of them moves, for readers that still consult it. An update moving
             // none of them leaves it alone, so an unrelated change does not rewrite a row whose

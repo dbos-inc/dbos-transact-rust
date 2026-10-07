@@ -357,8 +357,8 @@ pub struct Enqueue<'a> {
     pub deduplication_id: Option<&'a str>,
     /// Dequeue order among this queue's waiting workflows, **lower first**.
     ///
-    /// Only honoured by a queue registered with priority enabled; on any other queue it is stored
-    /// and ignored, which is what every reference does rather than refusing it.
+    /// Every queue honours it: the dequeue orders a queue's waiting workflows by priority, and
+    /// by `created_at` among equal priorities.
     ///
     /// **`None` is not "priority zero".** The column's `0` is the references' sentinel for
     /// *unprioritised*, and it sorts ahead of every explicit priority — TypeScript says so in as

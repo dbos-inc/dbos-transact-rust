@@ -306,7 +306,6 @@ fn internal_queue() -> QueueRecord {
         concurrency: None,
         worker_concurrency: None,
         rate_limit: None,
-        priority_enabled: false,
         partition_concurrency: None,
         partition_worker_concurrency: None,
         partition_rate_limit: None,

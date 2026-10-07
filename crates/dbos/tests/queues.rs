@@ -1810,12 +1810,13 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
 
     dbos.shutdown().await;
 }
-/// A rate limit and priority ordering are stored, reported, and changeable at runtime.
+/// A rate limit is stored, reported, and changeable at runtime, and every queue is stored as a
+/// priority queue.
 ///
-/// The dequeue honours both — `start_queued_workflows` counts a window's starts and orders by
-/// priority — so what this pins is the way to ask for them.
+/// There is no priority switch: the dequeue orders every queue by priority, so the
+/// `priority_enabled` column is always written `TRUE`, for readers that still consult it.
 #[tokio::test]
-async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
+async fn a_queue_carries_a_rate_limit_and_is_always_a_priority_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-limits-app", &db));
     dbos.launch().await.expect("launch failed");
@@ -1829,7 +1830,6 @@ async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
             "limited-queue",
             QueueOptions {
                 rate_limit: Some(limit),
-                priority_enabled: true,
                 ..QueueOptions::default()
             },
             QueueConflict::UpdateIfLatestVersion,
@@ -1837,23 +1837,32 @@ async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
         .await
         .expect("registration failed");
     assert_eq!(queue.rate_limit(), Some(limit));
-    assert!(queue.priority_enabled());
     assert!(!queue.is_partitioned());
 
-    // Changed at runtime, like every other limit: cleared, and priority turned back off.
+    let pool = db.pool().await;
+    let priority_enabled = || async {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT priority_enabled FROM "dbos"."queues" WHERE name = 'limited-queue'"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read failed")
+    };
+    assert!(priority_enabled().await, "registered as a priority queue");
+
+    // Changed at runtime, like every other limit.
     let updated = dbos
         .update_queue(
             "limited-queue",
             QueueChange {
                 rate_limit: Change::Set(None),
-                priority_enabled: Change::Set(false),
                 ..QueueChange::default()
             },
         )
         .await
         .expect("update failed");
     assert_eq!(updated.rate_limit(), None);
-    assert!(!updated.priority_enabled());
+    assert!(priority_enabled().await, "still a priority queue");
 
     dbos.shutdown().await;
 }
