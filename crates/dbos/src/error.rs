@@ -564,8 +564,8 @@ impl<E> Error<E> {
             Error::Interrupted { workflow_id } => Some(Error::Interrupted {
                 workflow_id: workflow_id.clone(),
             }),
-            // *Every* system-database failure, not just a cancellation. A database failure is a
-            // failure of the engine's substrate; it is never a statement about what the workflow
+            // Every system-database failure but a typed refusal. A database failure is a failure
+            // of the engine's substrate; it is never a statement about what the workflow
             // computed, so recording it as that workflow's outcome asserts something false. A
             // transient blip while the engine checkpoints would otherwise permanently fail a
             // workflow that had not failed — and the row is the only copy of that fact.
@@ -574,7 +574,14 @@ impl<E> Error<E> {
             // fast. That is the deliberate trade: `MAX_RECOVERY_ATTEMPTS` bounds it and parks the
             // workflow, where recording ERROR would have discarded work a fixed deployment could
             // still have finished.
-            Error::SystemDatabase(error) => Some(Error::SystemDatabase(error.clone())),
+            //
+            // A typed refusal — "already exists", "no such workflow" — is the opposite case: an
+            // answer the call gave, which its step records and every replay gives back. Waiting
+            // for a later recovery cannot change it, so a workflow that returns one has failed
+            // with it, as it would with any step's error.
+            Error::SystemDatabase(error) if !error.should_record() => {
+                Some(Error::SystemDatabase(error.clone()))
+            }
             _ => None,
         }
     }
@@ -690,5 +697,37 @@ mod tests {
             failed.control().is_none(),
             "an application failure is an outcome, not a signal"
         );
+    }
+
+    #[test]
+    fn a_typed_refusal_is_an_outcome_and_database_trouble_a_signal() {
+        let refused: Error = Error::SystemDatabase(crate::sysdb::Error::AlreadyRegistered {
+            kind: "Schedule".into(),
+            name: "nightly".to_owned(),
+        });
+        assert!(
+            refused.control().is_none(),
+            "a refusal is the call's answer, so a workflow returning it has failed"
+        );
+
+        let signals: [crate::sysdb::Error; 4] = [
+            crate::sysdb::Error::Backend(crate::sysdb::BackendError {
+                message: "relation does not exist".to_owned(),
+                sqlstate: Some("42P01".to_owned()),
+                kind: crate::sysdb::BackendErrorKind::Permanent,
+            }),
+            crate::sysdb::Error::WorkflowCancelled {
+                workflow_id: "wf-1".to_owned(),
+            },
+            crate::sysdb::Error::StepAlreadyRecorded {
+                workflow_id: "wf-1".to_owned(),
+                step_id: 0,
+            },
+            crate::sysdb::Error::Malformed("unreadable".to_owned()),
+        ];
+        for signal in signals {
+            let error: Error = Error::SystemDatabase(signal);
+            assert!(error.control().is_some(), "{error} is a signal");
+        }
     }
 }

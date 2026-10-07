@@ -1171,3 +1171,142 @@ async fn a_replayed_create_returns_what_it_recorded_even_if_its_queue_is_gone() 
 
     dbos.shutdown().await;
 }
+
+/// **A create refused because the name is taken replays as the same refusal once the name is
+/// free.**
+///
+/// The refusal is the step's answer, and the workflow branches on it. If the refusal were not
+/// recorded, a replay after the holder was deleted would create the schedule and take the other
+/// branch.
+#[tokio::test]
+async fn a_refused_create_replays_its_refusal_after_the_name_is_freed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("sched-refused-app", &db));
+    let (target, _) = recorder(&dbos, "refused-target");
+    let spec = ScheduleSpec::new("taken", &target, daily_far_from_now(), &String::new()).unwrap();
+    let creator = dbos
+        .register_workflow("refused-creator", {
+            let dbos = dbos.clone();
+            let spec = spec.clone();
+            move |()| {
+                let dbos = dbos.clone();
+                let spec = spec.clone();
+                async move {
+                    match dbos.create_schedule(&spec).await {
+                        Ok(()) => Ok::<_, Error>("created".to_owned()),
+                        Err(Error::SystemDatabase(dbos::sysdb::Error::AlreadyRegistered {
+                            ..
+                        })) => Ok("already there".to_owned()),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.create_schedule(&spec)
+        .await
+        .expect("the holder could not be created");
+
+    let first = creator
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("refused-creator-run"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the first run failed");
+    assert_eq!(first, "already there");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("refused-creator-run", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "DBOS.createSchedule");
+    assert!(
+        steps[0].error.is_some() && steps[0].output.is_none(),
+        "the refusal is recorded as the step's error: {:?}",
+        steps[0]
+    );
+
+    // The name is freed. A fork from the second step copies the create's checkpoint, so the
+    // create replays, and must give back its refusal rather than create the schedule.
+    dbos.delete_schedule("taken").await.unwrap();
+    let forked = dbos
+        .fork::<String, EngineOnly>("refused-creator-run", dbos::ForkFrom::Step(1))
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        forked.result().await.expect("the replay failed"),
+        "already there",
+        "the replay took a different branch from the run it replayed"
+    );
+    assert!(
+        dbos.get_schedule("taken").await.unwrap().is_none(),
+        "the replay created the schedule"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A workflow that returns a refused create with `?` fails with the refusal.**
+///
+/// The refusal is the call's answer, recorded at its step, so no later recovery could do better:
+/// the workflow ends `ERROR` rather than staying `PENDING` to be recovered into the same answer.
+#[tokio::test]
+async fn a_workflow_returning_a_refused_create_ends_in_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("sched-propagate-app", &db));
+    let (target, _) = recorder(&dbos, "propagate-target");
+    let spec = ScheduleSpec::new("held", &target, daily_far_from_now(), &String::new()).unwrap();
+    let creator = dbos
+        .register_workflow("propagating-creator", {
+            let dbos = dbos.clone();
+            let spec = spec.clone();
+            move |()| {
+                let dbos = dbos.clone();
+                let spec = spec.clone();
+                async move {
+                    dbos.create_schedule(&spec).await?;
+                    Ok::<(), Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.create_schedule(&spec)
+        .await
+        .expect("the holder could not be created");
+
+    let failed = creator
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("propagating-creator-run"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the create was refused, so the workflow fails");
+    assert!(
+        matches!(
+            failed,
+            Error::SystemDatabase(dbos::sysdb::Error::AlreadyRegistered { .. })
+        ),
+        "{failed:?}"
+    );
+
+    let row = reader(&db)
+        .await
+        .get_workflow("propagating-creator-run")
+        .await
+        .unwrap()
+        .expect("the row is missing");
+    assert_eq!(row.status, WorkflowStatus::Error, "{row:?}");
+
+    dbos.shutdown().await;
+}

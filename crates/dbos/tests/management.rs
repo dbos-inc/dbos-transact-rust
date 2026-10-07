@@ -1726,6 +1726,87 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
     dbos.shutdown().await;
 }
 
+/// **A resume refused because the workflow does not exist replays as the same refusal once it
+/// does.**
+///
+/// The workflow branches on the refusal. Recorded, the replay takes the same branch; unrecorded,
+/// it would resume the workflow that has since appeared.
+#[tokio::test]
+async fn a_refused_resume_replays_its_refusal_after_the_workflow_appears() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refused-resume-app", &db));
+    let target = dbos
+        .register_workflow("late-target", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("resuming-operator", {
+            let dbos = dbos.clone();
+            move |missing: String| {
+                let dbos = dbos.clone();
+                async move {
+                    match dbos.resume::<u32, EngineOnly>(&missing).await {
+                        Ok(_) => Ok::<_, Error>("resumed".to_owned()),
+                        Err(Error::SystemDatabase(dbos::sysdb::Error::NonExistentWorkflow {
+                            ..
+                        })) => Ok("missing".to_owned()),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let first = operator
+        .run_with(
+            "late-arrival".to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some("resuming-operator-run"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the first run failed");
+    assert_eq!(first, "missing");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("resuming-operator-run", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "DBOS.resumeWorkflow");
+    assert!(
+        steps[0].error.is_some() && steps[0].output.is_none(),
+        "the refusal is recorded as the step's error: {:?}",
+        steps[0]
+    );
+
+    // The workflow now exists. A fork from the second step copies the resume's checkpoint, so
+    // the resume replays, and must give back its refusal rather than resume it.
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("late-arrival"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the late arrival failed");
+    let forked = dbos
+        .fork::<String, EngineOnly>("resuming-operator-run", ForkFrom::Step(1))
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        forked.result().await.expect("the replay failed"),
+        "missing",
+        "the replay took a different branch from the run it replayed"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **A workflow cannot delete itself, and is told so.**
 ///
 /// From inside a workflow the delete is a step, and the step's checkpoint lands in

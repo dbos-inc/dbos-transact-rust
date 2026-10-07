@@ -109,8 +109,9 @@ pub struct StepOptions<E = EngineOnly> {
     /// helps nobody.
     ///
     /// **A control signal never reaches it.** Cancellation, shutdown and system-database failures
-    /// end the step before the policy is consulted, so a predicate cannot elect to retry against a
-    /// database that is down, and does not need an arm for a case it will never see. Use
+    /// other than a typed refusal end the step before the policy is consulted, so a predicate
+    /// cannot elect to retry against a database that is down, and does not need an arm for a case
+    /// it will never see. Use
     /// [`should_retry`](Self::should_retry) rather than writing the `Arc` by hand.
     pub should_retry: Option<ShouldRetry<E>>,
 }
@@ -321,9 +322,10 @@ where
 /// `operation_outputs` has no attempt column in any of the five implementations.
 ///
 /// **A control signal is never retried.** Cancellation, shutdown, and any system-database failure
-/// end the step immediately with nothing recorded, so the workflow stays `PENDING` and is
-/// recovered — a database blip is not evidence that the body is wrong, and retrying against a
-/// database that is down would burn the whole policy before the first useful attempt.
+/// other than a typed refusal end the step immediately with nothing recorded, so the workflow
+/// stays `PENDING` and is recovered — a database blip is not evidence that the body is wrong, and
+/// retrying against a database that is down would burn the whole policy before the first useful
+/// attempt.
 ///
 /// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
 /// to after the final attempt, rather than the last attempt alone. Python takes its
