@@ -1164,11 +1164,14 @@ pub trait SystemDatabase: Send + Sync {
     /// `SKIP LOCKED`.
     ///
     /// **A lost race is returned, not retried.** A `NOWAIT` conflict (`55P03`) surfaces as a
-    /// backend error rather than an empty result, and a serialization failure (`40001`) or
-    /// deadlock (`40P01`) is returned on the first attempt, unreplayed. In each case a peer was
-    /// dequeuing from the same rows, and the caller's next poll is the retry; replaying inside
-    /// this call would hide the race from the caller that decides how long to wait. Connection
-    /// failures are still retried here.
+    /// backend error rather than an empty result, and a serialization failure (`40001`) is
+    /// returned on the first attempt, unreplayed. Either way a peer was dequeuing from the same
+    /// rows, and the caller's next poll is the retry; replaying inside this call would hide the
+    /// race from the caller that decides how long to wait.
+    ///
+    /// A deadlock (`40P01`) is returned unreplayed too, but it is not a lost race: nothing in the
+    /// dequeue expects one, so the caller treats it as an error. Connection failures are still
+    /// retried here.
     ///
     /// `application_version` is this executor's. A workflow with no version recorded is eligible
     /// only when this executor is running the *latest* registered version, so a rolling deploy
