@@ -385,14 +385,13 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
             EnqueueOptions {
                 workflow_id: Some("never-written"),
                 ..EnqueueOptions::on(Enqueue {
-                    deduplication_id: Some("key"),
-                    partition_key: Some("part"),
+                    priority: Some(0),
                     ..Enqueue::new("work")
                 })
             },
         )
         .await
-        .expect_err("a deduplication id and a partition key cannot both be set");
+        .expect_err("a priority of 0 was accepted");
     assert!(matches!(error, Error::Config(_)), "{error}");
 
     assert!(
@@ -404,6 +403,50 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
             .is_none(),
         "nothing should have been written"
     );
+
+    client.close().await;
+}
+
+/// **A client's deduplication id is held across partitions**, as an in-process enqueue's is: a key
+/// held on one partition refuses the same key on another, and `ReturnExisting` joins the holder.
+#[tokio::test]
+async fn a_clients_deduplication_id_is_held_across_partitions() {
+    let db = test_database().await;
+    let client = client("client-dedup-partition", &db).await;
+    let enqueue = |id, partition, policy| {
+        client.enqueue_with::<_, (), Error>(
+            "report",
+            (),
+            EnqueueOptions {
+                workflow_id: Some(id),
+                ..EnqueueOptions::on(Enqueue {
+                    deduplication_id: Some("nightly-report"),
+                    partition_key: Some(partition),
+                    duplication_policy: policy,
+                    ..Enqueue::new("tenants")
+                })
+            },
+        )
+    };
+
+    enqueue("tenant-a-report", "tenant-a", DuplicationPolicy::Reject)
+        .await
+        .expect("the first enqueue failed");
+    let error = enqueue("tenant-b-report", "tenant-b", DuplicationPolicy::Reject)
+        .await
+        .expect_err("another partition took the held key");
+    assert!(
+        format!("{error}").contains("nightly-report"),
+        "the refusal must name the key, got {error:?}"
+    );
+    let joined = enqueue(
+        "tenant-c-report",
+        "tenant-c",
+        DuplicationPolicy::ReturnExisting,
+    )
+    .await
+    .expect("return-existing was refused");
+    assert_eq!(joined.workflow_id(), "tenant-a-report");
 
     client.close().await;
 }

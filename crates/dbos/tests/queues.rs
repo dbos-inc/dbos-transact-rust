@@ -1279,7 +1279,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 /// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
 /// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less value
 /// to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`). What is
-/// left is the pair no shape can express.
+/// left is what no shape can express.
 #[tokio::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;
@@ -1297,15 +1297,6 @@ async fn an_incoherent_enqueue_is_refused() {
     .expect("registration failed");
 
     let cases = [
-        (
-            "a deduplication id beside a partition key",
-            Enqueue {
-                deduplication_id: Some("key"),
-                partition_key: Some("shard-1"),
-                ..Enqueue::new("demo-queue")
-            },
-            "`deduplication_id` and `partition_key` cannot both be set",
-        ),
         (
             "the unprioritised sentinel spelled as a priority",
             Enqueue {
@@ -1517,6 +1508,88 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
                 ..StartOptions::default()
             },
         )
+        .await
+        .expect("the key was not released when the holder finished");
+
+    dbos.shutdown().await;
+}
+
+/// **A deduplication id is held across the whole queue, partitions included.**
+///
+/// A key held on one partition refuses the same key on another, and `ReturnExisting` joins the
+/// holder whichever partition it is in. The key is released when the holder finishes, after which
+/// any partition may take it. The queue is registered only after the collisions, so nothing
+/// dequeues the holder until then.
+#[tokio::test]
+async fn a_deduplication_id_is_held_across_partitions() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-dedup-partition-app", &db));
+    let workflow = dbos
+        .register_workflow("per-tenant", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let on = |partition, policy| Enqueue {
+        deduplication_id: Some("nightly-report"),
+        partition_key: Some(partition),
+        duplication_policy: policy,
+        ..Enqueue::new("tenants")
+    };
+    let start = |id, queue| {
+        workflow.start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(queue),
+                ..StartOptions::default()
+            },
+        )
+    };
+
+    let holder = start("tenant-a-report", on("tenant-a", DuplicationPolicy::Reject))
+        .await
+        .expect("the first enqueue failed");
+
+    let error = start("tenant-b-report", on("tenant-b", DuplicationPolicy::Reject))
+        .await
+        .expect_err("another partition took the held key");
+    assert!(
+        format!("{error}").contains("nightly-report"),
+        "the refusal must name the key, got {error:?}"
+    );
+
+    let joined = start(
+        "tenant-c-report",
+        on("tenant-c", DuplicationPolicy::ReturnExisting),
+    )
+    .await
+    .expect("return-existing was refused");
+    assert_eq!(
+        joined.workflow_id(),
+        "tenant-a-report",
+        "return-existing joins the holder in the other partition"
+    );
+
+    dbos.register_queue(
+        "tenants",
+        QueueOptions {
+            partition_concurrency: Some(1),
+            ..QueueOptions::default()
+        },
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), holder.result())
+            .await
+            .expect("the holder never ran")
+            .expect("the holder failed"),
+        7
+    );
+
+    // Finishing released the key, so another partition can take it now.
+    start("tenant-b-report", on("tenant-b", DuplicationPolicy::Reject))
         .await
         .expect("the key was not released when the holder finished");
 
