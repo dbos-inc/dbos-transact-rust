@@ -5566,11 +5566,19 @@ impl SystemDatabase for PostgresSystemDatabase {
             || queue.partition_concurrency.is_some()
             || queue.rate_limit.is_some()
             || queue.partition_rate_limit.is_some();
-        // Whether that budget is shared across partitions too, which is a second hazard and needs
-        // a stronger answer. Two calls sweeping different keys read the same queue-wide total and
-        // then write disjoint rows, so no snapshot conflict fires under repeatable read and each
-        // spends the whole budget — write skew, which only serialisable catches.
-        let has_write_skew =
+        // Whether this call sweeps one partition of a queue whose budget spans every partition,
+        // which is a second hazard and needs a stronger answer. Two calls sweeping different keys
+        // read the same queue-wide total and then claim disjoint rows, so no snapshot conflict or
+        // row lock fires under repeatable read and each spends the whole budget: write skew,
+        // which only serialisable catches.
+        //
+        // Only the queue-wide limits count here. A per-partition limit is counted within the
+        // swept key, and two calls spending it are sweeping the same key: they select the same
+        // head-of-line rows, and the `NOWAIT` lock on those rows makes the loser fail. That holds
+        // only while both select the same head. Two calls whose selections differ, for example
+        // because a version filter hides the head from one of them, lock different rows and can
+        // both admit a workflow against a per-partition limit of one.
+        let budget_spans_partitions =
             partition_key.is_some() && (queue.concurrency.is_some() || queue.rate_limit.is_some());
         // Marks the rows a limited queue started, which is what the windows below count and why
         // cancelling clears it. A limit at either scope makes a start countable: flagging only
@@ -5601,7 +5609,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Read committed otherwise: with no shared budget nothing here reads a total, so a
             // stronger isolation would buy a retry rate and nothing else.
             if has_shared_budget {
-                let isolation = if has_write_skew {
+                let isolation = if budget_spans_partitions {
                     "SERIALIZABLE"
                 } else {
                     "REPEATABLE READ"
