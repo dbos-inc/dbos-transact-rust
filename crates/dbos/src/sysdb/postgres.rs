@@ -7250,8 +7250,13 @@ impl PostgresSystemDatabase {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_sqlstate, is_transport_failure, polling_limit, split_database};
-    use crate::sysdb::BackendErrorKind;
+    use super::{
+        AssertSqlSafe, PostgresSystemDatabase, Settings, classify_sqlstate, is_transport_failure,
+        polling_limit, split_database, with_retry,
+    };
+    use crate::sysdb::types::{NewWorkflow, Submission, Timestamp};
+    use crate::sysdb::{BackendError, BackendErrorKind, Error, SystemDatabase};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::Semaphore;
 
     /// Only the two codes that mean "rolled back so a peer could commit" are conflicts. The rest
@@ -7393,5 +7398,145 @@ mod tests {
     fn a_url_without_a_database_has_nothing_to_split() {
         assert_eq!(split_database("postgresql://host:5432/"), None);
         assert_eq!(split_database("postgresql://host:5432"), None);
+    }
+
+    const STEP: &str = "test.transactionalStep";
+
+    /// A migrated database holding one `PENDING` workflow, `wf-caller`, for the runner to record
+    /// steps against.
+    async fn caller() -> (PostgresSystemDatabase, dbos_test_support::TestDatabase) {
+        let db = dbos_test_support::test_database().await;
+        let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        sys.init_workflow(
+            &NewWorkflow {
+                name: Some("checkout"),
+                ..NewWorkflow::new("wf-caller")
+            },
+            None,
+            Submission::Fresh,
+            None,
+        )
+        .await
+        .expect("init_workflow failed");
+        (sys, db)
+    }
+
+    /// Renames `wf-caller` on the work's transaction, so a test can tell whether the work's
+    /// writes were kept.
+    async fn touch(
+        sys: &PostgresSystemDatabase,
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    ) -> Result<(), Error> {
+        let workflow_table = sys.tables.workflow_status.as_str();
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {workflow_table} SET name = 'touched' WHERE workflow_uuid = 'wf-caller'"
+        )))
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    async fn name_of_caller(sys: &PostgresSystemDatabase) -> Option<String> {
+        sys.get_workflow("wf-caller")
+            .await
+            .unwrap()
+            .expect("wf-caller exists")
+            .name
+    }
+
+    /// A backend failure inside the work leaves neither the work's writes nor a recorded error.
+    ///
+    /// The failure is a real one from the server, a division by zero, which is permanent, so
+    /// nothing retries it. Recording it would replay it after whatever caused it had been fixed.
+    #[tokio::test]
+    async fn a_backend_failure_in_the_work_records_nothing() {
+        let (sys, _db) = caller().await;
+        let sys = &sys;
+
+        let outcome = sys
+            .run_transactional_step(
+                Some(("wf-caller", 0)),
+                STEP,
+                Timestamp::now(),
+                |mut tx| async move {
+                    touch(sys, &mut tx).await?;
+                    let quotient: i64 = sqlx::query_scalar("SELECT 1::BIGINT / 0::BIGINT")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                    Ok((tx, quotient))
+                },
+            )
+            .await;
+
+        match outcome {
+            Err(Error::Backend(backend)) => {
+                assert_eq!(backend.kind, BackendErrorKind::Permanent, "{backend:?}")
+            }
+            other => panic!("expected a backend error, got {other:?}"),
+        }
+        assert_eq!(
+            sys.check_step("wf-caller", 0, STEP).await.unwrap(),
+            None,
+            "a backend failure is never recorded"
+        );
+        assert_eq!(name_of_caller(sys).await.as_deref(), Some("checkout"));
+    }
+
+    /// A conflict inside the work is retried, and the retry that succeeds is the one checkpoint.
+    ///
+    /// The first attempt writes and then loses a conflict. The second writes and succeeds. What
+    /// is left is the second attempt's output, with no error, and a later call replays it without
+    /// running the work again.
+    #[tokio::test]
+    async fn a_conflict_in_the_work_reruns_to_one_checkpoint() {
+        let (sys, _db) = caller().await;
+        let sys = &sys;
+        let attempts = &AtomicU32::new(0);
+        let started_at = Timestamp::now();
+
+        let run = || {
+            with_retry(&sys.retry, STEP, move || async move {
+                sys.run_transactional_step(
+                    Some(("wf-caller", 0)),
+                    STEP,
+                    started_at,
+                    |mut tx| async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        touch(sys, &mut tx).await?;
+                        if attempt == 0 {
+                            return Err(Error::Backend(BackendError {
+                                message: "could not serialize access".to_owned(),
+                                sqlstate: Some("40001".to_owned()),
+                                kind: BackendErrorKind::Conflict,
+                            }));
+                        }
+                        Ok((tx, attempt))
+                    },
+                )
+                .await
+            })
+        };
+
+        assert_eq!(run().await.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let step = sys
+            .check_step("wf-caller", 0, STEP)
+            .await
+            .unwrap()
+            .expect("the success is recorded");
+        assert_eq!(step.output.as_deref(), Some("1"), "{step:?}");
+        assert!(step.error.is_none(), "{step:?}");
+        assert_eq!(name_of_caller(sys).await.as_deref(), Some("touched"));
+
+        assert_eq!(
+            run().await.unwrap(),
+            1,
+            "the replay returns the recorded output"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the replay runs no work"
+        );
     }
 }
