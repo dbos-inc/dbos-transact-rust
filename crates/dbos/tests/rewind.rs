@@ -338,6 +338,88 @@ async fn a_rewind_resets_the_row_and_discards_the_history() {
     dbos.shutdown().await;
 }
 
+/// **A workflow whose outcome is only in the legacy columns is rewound like any other.**
+///
+/// A workflow that finished before the payload tables existed has its error in
+/// `workflow_status.error` and no `workflow_output` row. Readers fall back to that column, so a
+/// rewind that left it would report the old failure for a workflow that is about to run again.
+#[tokio::test]
+async fn a_rewind_clears_an_outcome_held_only_in_the_legacy_columns() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("rewind-legacy-app", &db));
+    let runs = counter();
+    let workflow = dbos
+        .register_workflow("legacy", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                async move { Ok::<u32, Error>(runs.fetch_add(1, Ordering::SeqCst) + 1) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "legacy-run";
+    workflow
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the first run failed");
+
+    // Recast as a failure recorded before migration 109: the error in the status row's own
+    // column, and nothing in the payload table.
+    let pool = db.pool().await;
+    sqlx::query("DELETE FROM dbos.workflow_output WHERE workflow_uuid = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("clearing the payload row failed");
+    sqlx::query(
+        "UPDATE dbos.workflow_status SET status = 'ERROR', output = NULL, \
+         error = '\"failed before the payload tables\"' WHERE workflow_uuid = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("seeding the legacy outcome failed");
+    let reader = reader(&db).await;
+    let before = row(&reader, id).await;
+    assert_eq!(before.status, WorkflowStatus::Error);
+    assert_eq!(
+        before.error.as_deref(),
+        Some("\"failed before the payload tables\""),
+        "the reader falls back to the legacy column"
+    );
+
+    dbos.rewind_with::<u32, EngineOnly>(
+        id,
+        RewindOptions {
+            queue: Some(PARKING),
+            ..RewindOptions::default()
+        },
+    )
+    .await
+    .expect("rewind failed");
+    let parked = row(&reader, id).await;
+    assert_eq!(parked.status, WorkflowStatus::Enqueued);
+    assert_eq!(parked.output, None);
+    assert_eq!(parked.error, None, "the legacy error survived the rewind");
+
+    let rerun = dbos
+        .resume::<u32, EngineOnly>(id)
+        .await
+        .expect("resume failed");
+    assert_eq!(rerun.result().await.expect("the re-run failed"), 2);
+    assert_eq!(row(&reader, id).await.error, None);
+
+    dbos.shutdown().await;
+}
+
 /// **A recv records which step consumed its message**, and a message nobody received has none.
 ///
 /// Then the rewind to the second recv: the message the first recv took stays, since that recv

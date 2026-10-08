@@ -130,11 +130,12 @@ pub enum Error {
         /// The ids with no row behind them.
         workflow_ids: Vec<String>,
     },
-    /// A rewind named a workflow that has not finished.
+    /// A rewind named a workflow that is running or waiting to run.
     ///
-    /// Only a terminal workflow can be rewound. A `PENDING`, `ENQUEUED` or `DELAYED` one may be
-    /// running or about to, and rewinding it would delete the history its own execution is
-    /// replaying from. Cancelling it first makes it rewindable.
+    /// A `PENDING`, `ENQUEUED` or `DELAYED` workflow may be running or about to, and rewinding it
+    /// would delete the history its own execution is replaying from. Every other status is
+    /// rewindable, `MAX_RECOVERY_ATTEMPTS_EXCEEDED` included. Cancelling it first makes it
+    /// rewindable.
     WorkflowNotRewindable {
         /// The workflow named.
         workflow_id: String,
@@ -263,8 +264,8 @@ impl std::fmt::Display for Error {
                 status,
             } => write!(
                 f,
-                "cannot rewind workflow {workflow_id} ({status}): only a workflow in a terminal \
-                 state can be rewound, so cancel it first"
+                "cannot rewind workflow {workflow_id} ({status}): it is running or waiting to \
+                 run, so cancel it first"
             ),
             Error::RewindInterrupted {
                 workflow_id,
