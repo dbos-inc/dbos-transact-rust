@@ -998,9 +998,10 @@ async fn a_recovered_caller_does_not_rewind_its_target_again() {
     dbos.shutdown().await;
 }
 
-/// **A negative step refused inside a workflow moves no step counter.**
+/// **An invalid option refused inside a workflow moves no step counter.**
 ///
-/// The refusal comes before the step id is taken, so the step after it gets id 0.
+/// A negative step and an empty version are both refused before the step id is taken, so the
+/// step after them gets id 0.
 #[tokio::test]
 async fn a_refused_rewind_inside_a_workflow_takes_no_step() {
     let db = test_database().await;
@@ -1011,19 +1012,24 @@ async fn a_refused_rewind_inside_a_workflow_takes_no_step() {
             move |()| {
                 let dbos = dbos.clone();
                 async move {
-                    let refused = dbos
-                        .rewind_with::<u32, EngineOnly>(
-                            "anything",
-                            RewindOptions {
-                                start_step: -1,
-                                ..RewindOptions::default()
-                            },
-                        )
-                        .await;
-                    assert!(
-                        matches!(refused, Err(Error::InvalidArgument { .. })),
-                        "{refused:?}"
-                    );
+                    for options in [
+                        RewindOptions {
+                            start_step: -1,
+                            ..RewindOptions::default()
+                        },
+                        RewindOptions {
+                            app_version: Some(""),
+                            ..RewindOptions::default()
+                        },
+                    ] {
+                        let refused = dbos
+                            .rewind_with::<u32, EngineOnly>("anything", options)
+                            .await;
+                        assert!(
+                            matches!(refused, Err(Error::InvalidArgument { .. })),
+                            "{options:?}: {refused:?}"
+                        );
+                    }
                     dbos::step("after", || async { Ok::<(), Error>(()) }).await
                 }
             }

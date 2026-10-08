@@ -674,10 +674,14 @@ pub trait SystemDatabase: Send + Sync {
     ///   runs before the history rows past the cut go.
     /// - **Messages** the discarded steps consumed are deleted, and so is every message not yet
     ///   consumed, whenever it was sent. The replayed `recv` then waits for a new message rather
-    ///   than taking one meant for the run that was discarded.
-    /// - **Streams** keep every entry, because an offset is an address a reader may already hold;
-    ///   the replay appends after them. Only a close written at or past the cut is deleted, so
-    ///   the stream reopens.
+    ///   than taking one meant for the run that was discarded. Which step consumed a message is
+    ///   recorded from migration 121 on, so a message consumed before then has no consumer step,
+    ///   is never past the cut, and stays consumed.
+    /// - **Streams** keep every value entry, because an offset is an address a reader may already
+    ///   hold; the replay appends after them. Only a close written at or past the cut is deleted,
+    ///   so the stream reopens — and since a write takes the offset after the highest one present,
+    ///   the replay's first write lands at the offset the close held. A reader that saw the close
+    ///   there finds a value there instead.
     /// - **The output** is deleted, and the row goes back to `ENQUEUED` with its recovery count,
     ///   deadline, deduplication id, start and completion cleared. Its timeout is kept, so the
     ///   dequeue derives a fresh deadline from it.
@@ -690,6 +694,12 @@ pub trait SystemDatabase: Send + Sync {
     /// [`Error::WorkflowNotRewindable`] if it is `PENDING`, `ENQUEUED` or `DELAYED`, and
     /// [`Error::RewindInterrupted`] if its status changed while the rewind ran. Each writes
     /// nothing: the whole rewind is one transaction.
+    ///
+    /// **`MAX_RECOVERY_ATTEMPTS_EXCEEDED` is rewindable**, though
+    /// [`WorkflowStatus::is_terminal`](types::WorkflowStatus::is_terminal) does not count it as
+    /// finished. Re-running a workflow that kept dying is one of the things a rewind is for, and
+    /// the line drawn here is the one a wait draws: the three refused statuses are the ones a
+    /// workflow result is still waited for in.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// rewind and its step checkpoint **commit together**, so a recovered caller replays the step

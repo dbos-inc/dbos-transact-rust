@@ -4295,7 +4295,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     };
                     // A status this build does not know is refused rather than guessed at. A
                     // workflow that may be running is refused too: its own execution replays from
-                    // the history this would delete.
+                    // the history this would delete. These are the three statuses in
+                    // `UNSETTLED`; `MAX_RECOVERY_ATTEMPTS_EXCEEDED` passes, deliberately — see
+                    // the trait method.
                     let status = parse_workflow_status(&status)?;
                     if matches!(
                         status,

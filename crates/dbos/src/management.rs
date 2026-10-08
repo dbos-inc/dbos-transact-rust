@@ -722,12 +722,27 @@ impl DBOS {
     /// last value below the cut, or are removed. Messages they consumed are deleted, and so is
     /// every message not yet consumed, so the replayed `recv` waits for a new one. Stream entries
     /// are kept, since a reader may already hold their offsets, and the re-run appends after
-    /// them; only a close is removed, which reopens the stream.
+    /// them; only a close is removed, which reopens the stream, and the re-run's first write
+    /// takes the offset the close held. See
+    /// [`SystemDatabase::rewind_workflow`](crate::sysdb::SystemDatabase::rewind_workflow) for the
+    /// details, including messages consumed before the schema recorded which step took them.
     ///
-    /// **Only a finished workflow can be rewound.** One that is `PENDING`, `ENQUEUED` or `DELAYED`
-    /// is refused with `WorkflowNotRewindable`, and [`cancel`](Self::cancel) first is how a live
-    /// one is rewound. An id with no row is `NonExistentWorkflow`. Both arrive as
-    /// [`Error::SystemDatabase`], and either way nothing is written.
+    /// **Only a workflow that is not running or waiting to run can be rewound.** One that is
+    /// `PENDING`, `ENQUEUED` or `DELAYED` is refused with `WorkflowNotRewindable`. An id with no
+    /// row is `NonExistentWorkflow`. Both arrive as [`Error::SystemDatabase`], and either way
+    /// nothing is written. `SUCCESS`, `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED`
+    /// are all rewindable.
+    ///
+    /// # Rewinding a workflow that is still running
+    ///
+    /// **[`cancel`](Self::cancel) first, but know that it does not wait.** Cancelling writes
+    /// `CANCELLED`, and a running execution finds out at its next step boundary. A rewind issued
+    /// before then sets the row back to `ENQUEUED`, so that execution never sees the
+    /// cancellation and runs on beside the re-run, both writing at the same step ids. Cancelling
+    /// first is what makes the rewind possible at all, but it narrows the window rather than
+    /// closing it. To close it, wait until the cancelled execution has stopped — its last step has
+    /// been recorded and it has had a step boundary to observe the cancellation at — before
+    /// rewinding.
     ///
     /// **Children are not rewound.** The parent replays to each child's id and adopts the row
     /// already there, result included. To repair a failed child, rewind the child, then rewind
@@ -753,10 +768,10 @@ impl DBOS {
         workflow_id: &'a str,
         options: RewindOptions<'a>,
     ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        // The argument check between the launch check and the placement, so a negative step
-        // refuses the call without moving the workflow's step counter.
+        // The argument check between the launch check and the placement, so a refused option
+        // does not move the workflow's step counter.
         let built = self.executor("rewind a workflow").and_then(|executor| {
-            refuse_negative_start_step(options.start_step)?;
+            refuse_invalid_rewind_options(&options)?;
             let placement = StepPlacement::of(executor.connection(), "rewind a workflow")?;
             Ok((executor, placement))
         });
@@ -1190,7 +1205,7 @@ impl crate::Client {
         workflow_id: &str,
         options: RewindOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        refuse_negative_start_step(options.start_step)?;
+        refuse_invalid_rewind_options(&options)?;
         self.connection().rewind(workflow_id, options, None).await
     }
 
@@ -1548,16 +1563,34 @@ fn refuse_forked_id_in_bulk(options: &ForkOptions<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a negative rewind step.
+/// Refuses a negative rewind step, and an option given as an empty string.
 ///
 /// Made by the surfaces rather than inside the connection, as
-/// [`refuse_chosen_id_without_a_step`] is, so a refused call spends no step id.
-fn refuse_negative_start_step(start_step: i32) -> Result<()> {
-    if start_step < 0 {
-        return Err(Error::InvalidArgument {
+/// [`refuse_chosen_id_without_a_step`] is, so a refused call spends no step id. The system
+/// database checks the same things again for its own callers.
+fn refuse_invalid_rewind_options(options: &RewindOptions<'_>) -> Result<()> {
+    let refuse = |detail: String| {
+        Err(Error::InvalidArgument {
             operation: "rewind a workflow".into(),
-            detail: format!("RewindOptions::start_step must not be negative, got {start_step}"),
-        });
+            detail,
+        })
+    };
+    if options.start_step < 0 {
+        return refuse(format!(
+            "RewindOptions::start_step must not be negative, got {}",
+            options.start_step
+        ));
+    }
+    for (field, value) in [
+        ("app_version", options.app_version),
+        ("queue", options.queue),
+        ("queue_partition_key", options.queue_partition_key),
+    ] {
+        if value == Some("") {
+            return refuse(format!(
+                "RewindOptions::{field} must be absent rather than empty"
+            ));
+        }
     }
     Ok(())
 }
