@@ -390,10 +390,17 @@ mod tests {
     ///
     /// The branches return a `u32` and a `String`, which is the thing a `Vec`-taking core cannot
     /// express and the whole reason this is a macro.
+    ///
+    /// The winner waits for the loser to say it has started, because being polled first does not
+    /// start a step's body: each branch reads its checkpoint before running, and the winner's read,
+    /// body and record can all land before the loser's read returns.
     #[tokio::test]
     async fn a_race_runs_one_arm_and_the_loser_records_nothing() {
         let (dbos, _db) = workflow("wf-macro").await;
         let loser_ran = Arc::new(AtomicU32::new(0));
+        let (started, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut started = Some(started);
+        let mut started_rx = Some(started_rx);
 
         let answer: crate::Result<String> = Ctx::scope(ctx(&dbos, "wf-macro"), {
             let loser_ran = Arc::clone(&loser_ran);
@@ -403,15 +410,26 @@ mod tests {
                         let loser_ran = Arc::clone(&loser_ran);
                         move || {
                             let loser_ran = Arc::clone(&loser_ran);
+                            // Taken by the first attempt; a step is built once and run once here.
+                            let started = started.take();
                             async move {
                                 loser_ran.fetch_add(1, Ordering::SeqCst);
+                                if let Some(started) = started {
+                                    let _ = started.send(());
+                                }
                                 std::future::pending::<()>().await;
                                 Ok::<_, crate::Error>(1u32)
                             }
                         }
                     }) => format!("the counter won with {}", slow?),
-                    quick = step("quick", || async {
-                        Ok::<_, crate::Error>("hello".to_owned())
+                    quick = step("quick", move || {
+                        let started_rx = started_rx.take();
+                        async move {
+                            if let Some(started_rx) = started_rx {
+                                let _ = started_rx.await;
+                            }
+                            Ok::<_, crate::Error>("hello".to_owned())
+                        }
                     }) => format!("the namer won with {}", quick?)
                 }
             }
@@ -419,12 +437,12 @@ mod tests {
         .await;
 
         assert_eq!(answer.unwrap(), "the namer won with hello");
-        // Polled once, in source order, before the winner was reached: the loser really did start,
-        // so "records nothing" is about the drop rather than about never having run.
+        // The loser really did start, so "records nothing" is about the drop rather than about
+        // never having run.
         assert_eq!(
             loser_ran.load(Ordering::SeqCst),
             1,
-            "the loser was polled and started before the winner finished"
+            "the loser started before the winner finished"
         );
         // The loser was *built*, so it spent id 0, and dropped without recording — which is what
         // keeps the numbering stable across a replay that never runs it.
@@ -604,9 +622,14 @@ mod tests {
     /// `record_sleep` writes when the sleep is first polled and the wait comes after it, so
     /// what this asserts is a row for a wait that was abandoned — beside the winner's, and
     /// indistinguishable from one.
+    ///
+    /// The winner waits for the sleep's row before it returns, because being polled first does not
+    /// get the sleep as far as its write: the winner's own read, body and record can all land
+    /// before the sleep's write does.
     #[tokio::test]
     async fn a_losing_sleep_leaves_a_row_for_a_wait_it_never_finished() {
         let (dbos, _db) = workflow("wf-losing-sleep").await;
+        let executor = dbos.executor("test").expect("launched");
 
         let answer: crate::Result<String> = Ctx::scope(ctx(&dbos, "wf-losing-sleep"), async {
             crate::select_step! {
@@ -614,7 +637,27 @@ mod tests {
                     timeout?;
                     "timed out".to_owned()
                 }
-                quick = step("quick", || async { Ok::<_, crate::Error>("hello".to_owned()) })
+                quick = step("quick", || {
+                    let executor = Arc::clone(&executor);
+                    async move {
+                        let recorded = async {
+                            while executor
+                                .sysdb()
+                                .list_workflow_steps("wf-losing-sleep", true, None, None, None)
+                                .await
+                                .expect("read failed")
+                                .iter()
+                                .all(|step| step.step_id != 0)
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        };
+                        tokio::time::timeout(std::time::Duration::from_secs(10), recorded)
+                            .await
+                            .expect("the sleep never recorded its row");
+                        Ok::<_, crate::Error>("hello".to_owned())
+                    }
+                })
                     => format!("the namer won with {}", quick?)
             }
         })
