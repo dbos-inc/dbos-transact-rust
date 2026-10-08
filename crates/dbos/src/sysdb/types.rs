@@ -1757,10 +1757,26 @@ impl QueueRecord {
     /// never read: a row with the flag set and only queue-wide limits is an unpartitioned queue
     /// with queue-wide limits, and every limit applies at the scope its column names.
     pub fn is_partitioned(&self) -> bool {
-        self.partition_concurrency.is_some()
-            || self.partition_worker_concurrency.is_some()
-            || self.partition_rate_limit.is_some()
+        has_partition_limit(
+            self.partition_concurrency,
+            self.partition_worker_concurrency,
+            self.partition_rate_limit,
+        )
     }
+}
+
+/// Whether any per-partition limit is set, which is what partitions a queue.
+///
+/// The one statement of the rule, shared by the stored row, the row to register, and the engine's
+/// `Queue`, since it also decides what the `partition_queue` column holds.
+pub(crate) fn has_partition_limit(
+    partition_concurrency: Option<i32>,
+    partition_worker_concurrency: Option<i32>,
+    partition_rate_limit: Option<RateLimit>,
+) -> bool {
+    partition_concurrency.is_some()
+        || partition_worker_concurrency.is_some()
+        || partition_rate_limit.is_some()
 }
 
 /// A queue to register, as the caller supplies it.
@@ -1793,9 +1809,11 @@ impl NewQueue<'_> {
     /// Whether the queue is partitioned, which any per-partition limit makes it. The same rule as
     /// [`QueueRecord::is_partitioned`], for the row before it is written.
     pub fn is_partitioned(&self) -> bool {
-        self.partition_concurrency.is_some()
-            || self.partition_worker_concurrency.is_some()
-            || self.partition_rate_limit.is_some()
+        has_partition_limit(
+            self.partition_concurrency,
+            self.partition_worker_concurrency,
+            self.partition_rate_limit,
+        )
     }
 }
 

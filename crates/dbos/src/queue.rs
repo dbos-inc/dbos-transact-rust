@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::sysdb::types::{
     Applications, Change, NewQueue, OnExistingQueue, QueueRecord, QueueUpdate, RateLimit,
+    has_partition_limit,
 };
 use crate::sysdb::{Error as SysdbError, INTERNAL_QUEUE};
 
@@ -96,9 +97,11 @@ impl Queue {
 
     /// Whether the queue is partitioned, which any per-partition limit makes it.
     pub fn is_partitioned(&self) -> bool {
-        self.partition_concurrency.is_some()
-            || self.partition_worker_concurrency.is_some()
-            || self.partition_rate_limit.is_some()
+        has_partition_limit(
+            self.partition_concurrency,
+            self.partition_worker_concurrency,
+            self.partition_rate_limit,
+        )
     }
 
     /// How many of this queue's workflows may run at once **within one partition**, fleet-wide.
