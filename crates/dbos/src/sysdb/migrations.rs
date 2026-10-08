@@ -411,6 +411,11 @@ sources![
         "120_drop_operation_outputs_completed_at_index.sql",
         Applies::Always
     ),
+    (
+        121,
+        "121_notifications_consumed_by_function_id.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -704,9 +709,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 75 files: 74 the runner applies, plus the migration-10 probe, which is bound
+        // 76 files: 75 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 74);
+        assert_eq!(SOURCES.len(), 75);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -782,7 +787,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 73, "expected 73 files to carry a numbered header");
+        assert_eq!(checked, 74, "expected 74 files to carry a numbered header");
     }
 
     #[test]

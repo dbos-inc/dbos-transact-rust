@@ -1,15 +1,15 @@
-//! The management surface: finding workflows, and cancelling, resuming, forking, delaying and
-//! deleting them.
+//! The management surface: finding workflows, and cancelling, resuming, forking, rewinding,
+//! delaying and deleting them.
 //!
 //! **The operator's half of the API.** Everything here addresses a workflow by id rather than by
 //! calling it, and the process doing the addressing is usually a tool, a Conductor session, or an
 //! admin endpoint rather than a host that can run the work — it may not even have the code. The
 //! surface is shaped by that: nothing here runs a workflow.
 //!
-//! [`resume`](DBOS::resume) and [`fork`](DBOS::fork) each write an `ENQUEUED` row and leave it for
-//! whichever executor next polls that queue, which is what every reference does — so both hand back
-//! a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process is very
-//! probably not the one doing the work.
+//! [`resume`](DBOS::resume), [`fork`](DBOS::fork) and [`rewind`](DBOS::rewind) each write an
+//! `ENQUEUED` row and leave it for whichever executor next polls that queue — so all three hand
+//! back a **polling** [`WorkflowHandle`]. Awaiting one watches the database, because this process
+//! is very probably not the one doing the work.
 //!
 //! **The whole surface exists twice**, on [`DBOS`] for an application managing its own workflows
 //! and on [`Client`](crate::Client) for a process outside it — which, given the paragraph above, is
@@ -22,7 +22,8 @@
 //! A method names its noun exactly when the verb would otherwise be ambiguous in this crate. A
 //! queue can be deleted and so can a workflow, so [`delete`](DBOS::delete) sits beside
 //! [`delete_queue`](DBOS::delete_queue) and both say what they take; nothing but a workflow can be
-//! cancelled, resumed or forked, so those are bare verbs. Listing always says what it lists.
+//! cancelled, resumed, forked or rewound, so those are bare verbs. Listing always says what it
+//! lists.
 //!
 //! The references spell every one of these `*_workflow`/`*_workflows`, because their entry point is
 //! a bare `DBOS` class rather than a handle you already hold. The concepts are theirs and the
@@ -124,8 +125,8 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
-    Fork, ForkOptions as SysForkOptions, ForkPoint, StepRecord, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, step_names,
+    Fork, ForkOptions as SysForkOptions, ForkPoint, RewindOptions as SysRewindOptions, StepRecord,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, step_names,
 };
 
 /// Whether an operation reaches a workflow's descendants.
@@ -255,6 +256,35 @@ pub struct ForkOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
+}
+
+/// Where a rewind cuts a workflow's history, and where the rewound workflow goes.
+///
+/// **`None` does not mean the same thing across these fields**, as on [`ForkOptions`]:
+/// [`app_version`](Self::app_version) keeps the workflow's own, while the queue and its partition
+/// are the rewind's. Saying nothing about those two asks for the internal queue and no partition,
+/// not the ones the workflow ran on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RewindOptions<'a> {
+    /// The first step to discard. Every step below it replays from its checkpoint; this one and
+    /// every one after it run again.
+    ///
+    /// Step ids start at 0, so the default rewinds the whole workflow. Negative is an
+    /// [`Error::InvalidArgument`].
+    pub start_step: i32,
+    /// The version the workflow is re-run under. `None` keeps the one it has.
+    ///
+    /// As with a fork, this is how a workflow that failed against broken code is re-run on the
+    /// deployment that fixes it: only executors running that version will dequeue it.
+    pub app_version: Option<&'a str>,
+    /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
+    pub queue: Option<&'a str>,
+    /// The partition of that queue, which a partitioned [`queue`](Self::queue) requires.
+    ///
+    /// **Not kept.** `None` clears whatever key the workflow had, so a key from the queue it ran
+    /// on does not follow it onto another. A partitioned queue sweeps one partition at a time and
+    /// never reads an unkeyed row, so leaving this out there produces a workflow that never runs.
+    pub queue_partition_key: Option<&'a str>,
 }
 
 impl DBOS {
@@ -662,6 +692,101 @@ impl DBOS {
         )
     }
 
+    /// Re-runs a finished workflow from its first step, under the same id.
+    ///
+    /// [`rewind_with`](Self::rewind_with) for choosing the step and where it runs.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// let handle = dbos.rewind::<u32, dbos::EngineOnly>("failed-workflow").await?;
+    /// let rerun = handle.result().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn rewind<'a, R: 'a, E: 'a>(
+        &self,
+        workflow_id: &'a str,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+        self.rewind_with(workflow_id, RewindOptions::default())
+    }
+
+    /// Discards a finished workflow's history from a step on, and re-enqueues it under the same
+    /// id.
+    ///
+    /// The steps below [`RewindOptions::start_step`] replay from their checkpoints and the rest
+    /// run again. **The id is kept, which is the difference from [`fork`](Self::fork)**: a fork is
+    /// a new workflow, so peers addressing the original by id — a sender, an event reader, a
+    /// parent awaiting it — never see its re-run, and a rewind is how the original itself is
+    /// repaired.
+    ///
+    /// What the discarded steps did is undone with them. Events they published revert to their
+    /// last value below the cut, or are removed. Messages they consumed are deleted, and so is
+    /// every message not yet consumed, so the replayed `recv` waits for a new one. Stream entries
+    /// are kept, since a reader may already hold their offsets, and the re-run appends after
+    /// them; only a close is removed, which reopens the stream, and the re-run's first write
+    /// takes the offset the close held. See
+    /// [`SystemDatabase::rewind_workflow`](crate::sysdb::SystemDatabase::rewind_workflow) for the
+    /// details, including messages consumed before the schema recorded which step took them.
+    ///
+    /// **Only a workflow that is not running or waiting to run can be rewound.** One that is
+    /// `PENDING`, `ENQUEUED` or `DELAYED` is refused with `WorkflowNotRewindable`. An id with no
+    /// row is `NonExistentWorkflow`. Both arrive as [`Error::SystemDatabase`], and either way
+    /// nothing is written. `SUCCESS`, `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED`
+    /// are all rewindable.
+    ///
+    /// # Rewinding a workflow that is still running
+    ///
+    /// **[`cancel`](Self::cancel) first, but know that it does not wait.** Cancelling writes
+    /// `CANCELLED`, and a running execution finds out at its next step boundary. A rewind issued
+    /// before then sets the row back to `ENQUEUED`, so that execution never sees the
+    /// cancellation and runs on beside the re-run, both writing at the same step ids. Cancelling
+    /// first is what makes the rewind possible at all, but it narrows the window rather than
+    /// closing it. To close it, wait until the cancelled execution has stopped — its last step has
+    /// been recorded and it has had a step boundary to observe the cancellation at — before
+    /// rewinding.
+    ///
+    /// **Children are not rewound.** The parent replays to each child's id and adopts the row
+    /// already there, result included. To repair a failed child, rewind the child, then rewind
+    /// the parent to the step that awaited it.
+    ///
+    /// **Enqueued, never started.** The handle is a polling one — see the module documentation —
+    /// and its result is the re-run's.
+    ///
+    /// Called from inside a workflow, the rewind is checkpointed as a step in the transaction that
+    /// performs it, so a recovered caller replays the step and does not rewind the target again.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// // Re-run from step 3 on the deployment with the fix.
+    /// let handle = dbos.rewind_with::<u32, dbos::EngineOnly>(
+    ///     "failed-workflow",
+    ///     dbos::RewindOptions { start_step: 3, app_version: Some("v2"), ..Default::default() },
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn rewind_with<'a, R: 'a, E: 'a>(
+        &self,
+        workflow_id: &'a str,
+        options: RewindOptions<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+        // The argument check between the launch check and the placement, so a refused option
+        // does not move the workflow's step counter.
+        let built = self.executor("rewind a workflow").and_then(|executor| {
+            refuse_invalid_rewind_options(&options)?;
+            let placement = StepPlacement::of(executor.connection(), "rewind a workflow")?;
+            Ok((executor, placement))
+        });
+        PendingStep::placed(
+            step_names::REWIND_WORKFLOW,
+            built,
+            move |executor, placement| async move {
+                executor
+                    .connection()
+                    .rewind(workflow_id, options, placement.step())
+                    .await
+            },
+        )
+    }
+
     /// Removes a workflow and everything recorded against it.
     ///
     /// Steps, inputs, outcome, events, messages and streams go with the row, so this is not a
@@ -1053,6 +1178,37 @@ impl crate::Client {
             .await
     }
 
+    /// Re-runs a finished workflow from its first step, under the same id.
+    ///
+    /// See [`DBOS::rewind`]. The handle polls, as every handle a client holds does.
+    pub async fn rewind<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
+        self.rewind_with(workflow_id, RewindOptions::default())
+            .await
+    }
+
+    /// [`rewind`](Self::rewind), choosing the step it re-runs from and where it runs.
+    ///
+    /// See [`DBOS::rewind_with`] for what is discarded and what is kept.
+    ///
+    /// ```no_run
+    /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
+    /// let handle = client
+    ///     .rewind_with::<u32, dbos::EngineOnly>(
+    ///         "failed-workflow",
+    ///         dbos::RewindOptions { start_step: 2, ..Default::default() },
+    ///     )
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn rewind_with<R, E>(
+        &self,
+        workflow_id: &str,
+        options: RewindOptions<'_>,
+    ) -> Result<WorkflowHandle<R, E>> {
+        refuse_invalid_rewind_options(&options)?;
+        self.connection().rewind(workflow_id, options, None).await
+    }
+
     /// Removes a workflow and everything recorded against it.
     ///
     /// See [`DBOS::delete`]. Anyone awaiting the deleted workflow goes on waiting — deleting a row
@@ -1251,6 +1407,35 @@ impl Connection {
             .collect())
     }
 
+    /// Rewinds a workflow, and hands back a handle to its re-run.
+    pub(crate) async fn rewind<R, E>(
+        self: &Arc<Self>,
+        workflow_id: &str,
+        options: RewindOptions<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<WorkflowHandle<R, E>> {
+        let sys_options = SysRewindOptions {
+            application_version: options.app_version,
+            queue_name: options.queue,
+            queue_partition_key: options.queue_partition_key,
+        };
+        self.sysdb()
+            .rewind_workflow(workflow_id, options.start_step, &sys_options, caller)
+            .await
+            .map_err(Error::SystemDatabase)?;
+        tracing::info!(
+            workflow_id,
+            start_step = options.start_step,
+            "rewound the workflow onto its queue"
+        );
+        // The rewind refuses an id with no row, so this names one it has just re-enqueued.
+        Ok(WorkflowHandle::polling(
+            Arc::clone(self),
+            workflow_id.to_owned(),
+            true,
+        ))
+    }
+
     /// Removes workflows and everything recorded against them, and reports how many rows went.
     pub(crate) async fn delete_all(
         &self,
@@ -1374,6 +1559,38 @@ fn refuse_forked_id_in_bulk(options: &ForkOptions<'_>) -> Result<()> {
             detail: "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
                 .to_owned(),
         });
+    }
+    Ok(())
+}
+
+/// Refuses a negative rewind step, and an option given as an empty string.
+///
+/// Made by the surfaces rather than inside the connection, as
+/// [`refuse_chosen_id_without_a_step`] is, so a refused call spends no step id. The system
+/// database checks the same things again for its own callers.
+fn refuse_invalid_rewind_options(options: &RewindOptions<'_>) -> Result<()> {
+    let refuse = |detail: String| {
+        Err(Error::InvalidArgument {
+            operation: "rewind a workflow".into(),
+            detail,
+        })
+    };
+    if options.start_step < 0 {
+        return refuse(format!(
+            "RewindOptions::start_step must not be negative, got {}",
+            options.start_step
+        ));
+    }
+    for (field, value) in [
+        ("app_version", options.app_version),
+        ("queue", options.queue),
+        ("queue_partition_key", options.queue_partition_key),
+    ] {
+        if value == Some("") {
+            return refuse(format!(
+                "RewindOptions::{field} must be absent rather than empty"
+            ));
+        }
     }
     Ok(())
 }
