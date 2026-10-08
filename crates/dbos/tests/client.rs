@@ -16,8 +16,8 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, ForkFrom, ForkOptions, Message, QueueChange, QueueConflict,
-    QueueOptions, SendOptions, StartOptions, WorkflowHandle,
+    EnqueueOptions, Error, ForkOptions, Message, QueueChange, QueueConflict, QueueOptions,
+    SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -1164,7 +1164,7 @@ async fn a_client_forks_a_workflow_the_application_then_runs() {
     let fork = client
         .fork_with::<u32, EngineOnly>(
             source,
-            ForkFrom::Beginning,
+            0,
             ForkOptions {
                 app_version: Some(APP_VERSION),
                 ..ForkOptions::default()
@@ -1194,7 +1194,7 @@ async fn a_clients_bulk_fork_refuses_a_chosen_id() {
     let error = client
         .fork_all::<u32, EngineOnly>(
             &["a", "b"],
-            ForkFrom::Beginning,
+            0,
             ForkOptions {
                 forked_id: Some("only-one-of-me"),
                 ..ForkOptions::default()
@@ -1207,35 +1207,21 @@ async fn a_clients_bulk_fork_refuses_a_chosen_id() {
     client.close().await;
 }
 
-/// A searched fork point cannot name its step, so a chosen id has nothing to attach to and the
-/// client refuses it rather than forking under a generated one — the same refusal `DBOS::fork_with`
-/// makes, checked here because the two surfaces enforce it independently.
+/// A negative step is refused before any I/O — the same refusal `DBOS::fork_with` makes, checked
+/// here because the two surfaces enforce it independently.
 #[tokio::test]
-async fn a_clients_fork_refuses_a_chosen_id_without_a_step() {
+async fn a_clients_fork_refuses_a_negative_step() {
     let db = test_database().await;
-    let client = client("client-fork-searched", &db).await;
+    let client = client("client-fork-negative", &db).await;
 
-    for from in [
-        ForkFrom::LastFailure,
-        ForkFrom::LastStep,
-        ForkFrom::StepNamed("only"),
-    ] {
-        let error = client
-            .fork_with::<u32, EngineOnly>(
-                "has-a-step",
-                from,
-                ForkOptions {
-                    forked_id: Some("chosen"),
-                    ..ForkOptions::default()
-                },
-            )
-            .await
-            .expect_err("a chosen id was accepted for a searched fork point");
-        assert!(
-            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
-            "expected an argument refusal for {from:?}, got {error:?}"
-        );
-    }
+    let error = client
+        .fork::<u32, EngineOnly>("has-a-step", -1)
+        .await
+        .expect_err("a negative step was accepted");
+    assert!(
+        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
+        "{error:?}"
+    );
 
     client.close().await;
 }

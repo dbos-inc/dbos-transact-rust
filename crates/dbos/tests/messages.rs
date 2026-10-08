@@ -500,7 +500,7 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
     original.result().await.expect("the workflow failed");
 
     let fork = dbos
-        .fork::<(), dbos::EngineOnly>(&original_id, dbos::ForkFrom::Beginning)
+        .fork::<(), dbos::EngineOnly>(&original_id, 0)
         .await
         .expect("fork failed");
     let fork_id = fork.workflow_id().to_owned();

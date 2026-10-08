@@ -12,7 +12,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Client, ClientConfig, Config, DBOS, Error, ForkFrom, StartOptions, WorkflowHandle};
+use dbos::{Client, ClientConfig, Config, DBOS, Error, StartOptions, WorkflowHandle};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -671,10 +671,8 @@ async fn a_recorded_refusal_replays_rather_than_being_decided_again() {
         .expect("the parent failed");
     assert!(described.contains("no workflow ids"), "{described}");
 
-    let forked: WorkflowHandle<String, Error> = dbos
-        .fork(&parent_id, ForkFrom::Step(1))
-        .await
-        .expect("fork failed");
+    let forked: WorkflowHandle<String, Error> =
+        dbos.fork(&parent_id, 1).await.expect("fork failed");
     let replayed = tokio::time::timeout(DEADLINE, forked.result())
         .await
         .expect("the fork never finished")

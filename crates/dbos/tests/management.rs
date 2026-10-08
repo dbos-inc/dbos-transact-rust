@@ -5,7 +5,6 @@
 //! the two listings are reads and writes against the row itself, and are checked against the
 //! system database directly.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,8 +13,7 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
 use dbos::{
-    Children, Config, DBOS, EngineOnly, Enqueue, Error, ForkFrom, ForkOptions, ResumeOptions,
-    StartOptions,
+    Children, Config, DBOS, EngineOnly, Enqueue, Error, ForkOptions, ResumeOptions, StartOptions,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -120,7 +118,7 @@ async fn resuming_a_workflow_that_does_not_exist_is_an_error() {
 /// The source fails on its first attempt and records no steps at all, so there is nothing below
 /// the fork point to replay and the body runs from the top. The fork gets its own id, and the
 /// source keeps the outcome it had. Where the fork point falls when there *are* steps is
-/// [`forking_from_a_chosen_step_replays_the_steps_below_it`] and the two tests after it.
+/// [`forking_from_a_chosen_step_replays_the_steps_below_it`].
 #[tokio::test]
 async fn forking_from_the_beginning_runs_the_workflow_again_under_a_new_id() {
     let db = test_database().await;
@@ -160,7 +158,7 @@ async fn forking_from_the_beginning_runs_the_workflow_again_under_a_new_id() {
     assert!(first.is_err(), "the first attempt was supposed to fail");
 
     let forked = dbos
-        .fork::<u32, FirstAttempt>(id, ForkFrom::Beginning)
+        .fork::<u32, FirstAttempt>(id, 0)
         .await
         .expect("fork failed");
     assert_ne!(forked.workflow_id(), id, "the fork reused the source's id");
@@ -214,7 +212,7 @@ async fn a_fork_takes_the_id_and_queue_it_is_given() {
     let forked = dbos
         .fork_with::<u32, EngineOnly>(
             id,
-            ForkFrom::Beginning,
+            0,
             ForkOptions {
                 forked_id: Some("the-fork"),
                 queue: Some("forks"),
@@ -290,7 +288,7 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
     // Enqueued first, so it has had every sweep the keyed fork had.
     dbos.fork_with::<u32, EngineOnly>(
         id,
-        ForkFrom::Beginning,
+        0,
         ForkOptions {
             forked_id: Some("unkeyed-fork"),
             queue: Some("partitioned-forks"),
@@ -303,7 +301,7 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
     let keyed = dbos
         .fork_with::<u32, EngineOnly>(
             id,
-            ForkFrom::Beginning,
+            0,
             ForkOptions {
                 forked_id: Some("keyed-fork"),
                 queue: Some("partitioned-forks"),
@@ -354,9 +352,7 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
 /// **A fork from a chosen step replays everything below it and re-runs the rest.**
 ///
 /// The steps a fork copies are those with `function_id < start_step`, so forking from step 1
-/// carries step 0's recorded result across and leaves 1 and 2 to run again. This is the half of
-/// [`ForkFrom`] that needs no lookup — the caller supplied the number, and `fork_batch` goes
-/// straight to `fork_workflows` with it.
+/// carries step 0's recorded result across and leaves 1 and 2 to run again.
 #[tokio::test]
 async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
     let db = test_database().await;
@@ -397,7 +393,7 @@ async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
     ran.lock().unwrap().clear();
 
     let forked = dbos
-        .fork::<u32, EngineOnly>(id, ForkFrom::Step(1))
+        .fork::<u32, EngineOnly>(id, 1)
         .await
         .expect("fork failed");
     let forked_id = forked.workflow_id().to_owned();
@@ -420,183 +416,6 @@ async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
             .map(|s| s.step_name.as_str())
             .collect::<Vec<_>>(),
         ["one", "two", "three"],
-    );
-
-    dbos.shutdown().await;
-}
-
-/// **`LastFailure` resolves against each source's own history, not a step worked out once.**
-///
-/// Two sources of the same workflow, failing at different steps: one at its first, one at its
-/// last. A single [`fork_all`](dbos::DBOS::fork_all) with [`ForkFrom::LastFailure`] forks each
-/// from wherever *it* failed, so one fork re-runs everything and the other re-runs one step.
-/// That is the claim the batch makes, and it cannot be checked by forking a single workflow.
-#[tokio::test]
-async fn forking_from_the_last_failure_uses_each_sources_own_history() {
-    let db = test_database().await;
-    let dbos = DBOS::new(config("fork-failure-app", &db));
-    #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
-    #[error("the first attempt fails")]
-    struct FirstAttempt;
-
-    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
-    let seen: Arc<Mutex<HashSet<String>>> = Arc::default();
-    let workflow = dbos
-        .register_workflow("staged", {
-            let ran = Arc::clone(&ran);
-            let seen = Arc::clone(&seen);
-            move |source: String| {
-                let ran = Arc::clone(&ran);
-                let seen = Arc::clone(&seen);
-                async move {
-                    // `a` fails at its first step and `b` at its last, and only on the run that
-                    // first sees the id — so the forks get through.
-                    let fails_at = if source == "a" { 0 } else { 2 };
-                    let first_run = seen.lock().unwrap().insert(source.clone());
-                    for (index, name) in ["one", "two", "three"].into_iter().enumerate() {
-                        let source = &source;
-                        let ran = &ran;
-                        dbos::step(name, || async {
-                            ran.lock().unwrap().push(format!("{source}:{name}"));
-                            if first_run && index == fails_at {
-                                Err(FirstAttempt)?;
-                            }
-                            Ok::<u32, dbos::Error<FirstAttempt>>(0)
-                        })
-                        .await?;
-                    }
-                    Ok::<u32, dbos::Error<FirstAttempt>>(0)
-                }
-            }
-        })
-        .unwrap();
-    dbos.launch().await.expect("launch failed");
-
-    for id in ["a", "b"] {
-        let outcome = workflow
-            .run_with(
-                id.to_owned(),
-                dbos::RunOptions {
-                    workflow_id: Some(id),
-                    ..dbos::RunOptions::default()
-                },
-            )
-            .await;
-        assert!(outcome.is_err(), "the source was supposed to fail");
-    }
-    ran.lock().unwrap().clear();
-
-    let forks = dbos
-        .fork_all::<u32, FirstAttempt>(&["a", "b"], ForkFrom::LastFailure, ForkOptions::default())
-        .await
-        .expect("bulk fork failed");
-    assert_eq!(forks.len(), 2);
-    for fork in forks {
-        fork.result().await.expect("the fork failed");
-    }
-
-    // Cloned out rather than held: the two forks ran concurrently, so this is a snapshot to
-    // split by source, and nothing below needs the lock.
-    let ran = ran.lock().unwrap().clone();
-    let for_source = |source: &str| -> Vec<String> {
-        ran.iter()
-            .filter(|entry| entry.starts_with(&format!("{source}:")))
-            .cloned()
-            .collect()
-    };
-    assert_eq!(
-        for_source("a"),
-        ["a:one", "a:two", "a:three"],
-        "`a` failed at step 0, so its fork had nothing to replay"
-    );
-    assert_eq!(
-        for_source("b"),
-        ["b:three"],
-        "`b` failed at step 2, so its fork should have replayed the two below it"
-    );
-
-    dbos.shutdown().await;
-}
-
-/// **`LastStep`, `StepNamed`, and the fallback that makes `LastFailure` useful.**
-///
-/// One source, which succeeded — so nothing recorded an error, and
-/// [`ForkFrom::LastFailure`] has nothing to filter on. Its `COALESCE` falls back to the last
-/// recorded step, which is what makes it work on a workflow killed mid-step: such a workflow
-/// records no error at all, and reporting "no failure to fork from" would be useless.
-///
-/// So `LastStep` and `LastFailure` land on the same step here, and `StepNamed` finds `two`
-/// wherever it happens to fall. The forks run one at a time because they share an id and an
-/// input, and only the order they run in tells them apart.
-#[tokio::test]
-async fn forking_from_the_last_step_and_from_a_named_one() {
-    let db = test_database().await;
-    let dbos = DBOS::new(config("fork-named-app", &db));
-    let ran: Arc<Mutex<Vec<String>>> = Arc::default();
-    let workflow = dbos
-        .register_workflow("staged", {
-            let ran = Arc::clone(&ran);
-            move |()| {
-                let ran = Arc::clone(&ran);
-                async move {
-                    for name in ["one", "two", "three"] {
-                        dbos::step(name, || async {
-                            ran.lock().unwrap().push(name.to_owned());
-                            Ok::<u32, Error>(0)
-                        })
-                        .await?;
-                    }
-                    Ok::<u32, Error>(0)
-                }
-            }
-        })
-        .unwrap();
-    dbos.launch().await.expect("launch failed");
-
-    let id = "the-source";
-    workflow
-        .run_with(
-            (),
-            dbos::RunOptions {
-                workflow_id: Some(id),
-                ..dbos::RunOptions::default()
-            },
-        )
-        .await
-        .expect("the source failed");
-
-    for (from, expected) in [
-        (ForkFrom::LastStep, &["three"][..]),
-        (ForkFrom::LastFailure, &["three"][..]),
-        (ForkFrom::StepNamed("two"), &["two", "three"][..]),
-    ] {
-        ran.lock().unwrap().clear();
-        let forked = dbos
-            .fork::<u32, EngineOnly>(id, from)
-            .await
-            .expect("fork failed");
-        forked.result().await.expect("the fork failed");
-        assert_eq!(
-            *ran.lock().unwrap(),
-            expected,
-            "{from:?} forked from the wrong step"
-        );
-    }
-
-    // A name the source never recorded resolves to no step at all. That is its own refusal,
-    // naming the step as well as the workflow — not the beginning, and not the missing-workflow
-    // error an unresolvable id gets.
-    let error = dbos
-        .fork::<u32, EngineOnly>(id, ForkFrom::StepNamed("never-ran"))
-        .await
-        .expect_err("a fork from a step that does not exist was allowed");
-    assert!(
-        matches!(
-            &error,
-            Error::SystemDatabase(dbos::sysdb::Error::NoForkPoint { step_name, .. })
-                if step_name.as_deref() == Some("never-ran")
-        ),
-        "expected a no-fork-point refusal naming the step, got {error:?}"
     );
 
     dbos.shutdown().await;
@@ -629,11 +448,11 @@ async fn the_management_surface_needs_a_launched_instance() {
     );
     refused!(
         "forked a workflow",
-        dbos.fork::<u32, EngineOnly>("x", ForkFrom::Beginning).await
+        dbos.fork::<u32, EngineOnly>("x", 0).await
     );
     refused!(
         "forked workflows",
-        dbos.fork_all::<u32, EngineOnly>(&["x"], ForkFrom::Beginning, ForkOptions::default())
+        dbos.fork_all::<u32, EngineOnly>(&["x"], 0, ForkOptions::default())
             .await
     );
     // The launch check outranks the option check, so a call that is wrong in both ways still
@@ -642,7 +461,7 @@ async fn the_management_surface_needs_a_launched_instance() {
         "forked workflows with an id it should have refused",
         dbos.fork_all::<u32, EngineOnly>(
             &["x"],
-            ForkFrom::Beginning,
+            0,
             ForkOptions {
                 forked_id: Some("one-id-for-many"),
                 ..ForkOptions::default()
@@ -1073,7 +892,7 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
     // From the top rather than from either source's history: neither recorded a step, and the
     // count below is what says the bodies ran again.
     let forks = dbos
-        .fork_all::<u32, EngineOnly>(&ids, ForkFrom::Beginning, ForkOptions::default())
+        .fork_all::<u32, EngineOnly>(&ids, 0, ForkOptions::default())
         .await
         .expect("bulk fork failed");
     assert_eq!(forks.len(), 2);
@@ -1090,11 +909,7 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
 }
 
 /// One id cannot name many forks, so asking for one in the bulk form is refused rather than
-/// quietly ignored — whatever the fork point, since the objection is the batch rather than the
-/// step.
-///
-/// The other half of the rule, where a *single* fork's point is searched rather than named, is
-/// `forking_from_a_searched_point_refuses_a_chosen_id` below.
+/// quietly ignored — whatever the step, since the objection is the batch.
 #[tokio::test]
 async fn forking_in_bulk_refuses_a_chosen_id() {
     let db = test_database().await;
@@ -1104,7 +919,7 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
     let error = dbos
         .fork_all::<u32, EngineOnly>(
             &["a", "b"],
-            ForkFrom::Beginning,
+            0,
             ForkOptions {
                 forked_id: Some("the-only-one"),
                 ..ForkOptions::default()
@@ -1131,17 +946,12 @@ async fn forking_in_bulk_refuses_a_chosen_id() {
     dbos.shutdown().await;
 }
 
-/// A searched fork point resolves its step inside the write and generates the id with it, so a
-/// chosen one is refused rather than dropped on the floor.
-///
-/// The line every reference draws by omission — Python's `fork_from_failure`, TypeScript's
-/// `forkFromFailure` and Go's `ForkFromDBInput` take no id, and Java's `ForkFromFailureOptions`
-/// has no field for one. Merging both halves into one `ForkFrom` is what makes it sayable here,
-/// and this is what it costs.
+/// A fork from a negative step is refused before anything is written, on the single and the bulk
+/// form alike.
 #[tokio::test]
-async fn forking_from_a_searched_point_refuses_a_chosen_id() {
+async fn forking_from_a_negative_step_is_refused() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("searched-fork-id-app", &db));
+    let dbos = DBOS::new(config("negative-fork-step-app", &db));
     let workflow = dbos
         .register_workflow("forkable", |()| async move {
             dbos::step("only", || async { Ok::<u32, Error>(1) }).await
@@ -1161,52 +971,49 @@ async fn forking_from_a_searched_point_refuses_a_chosen_id() {
         .await
         .expect("the workflow failed");
 
-    for from in [
-        ForkFrom::LastFailure,
-        ForkFrom::LastStep,
-        ForkFrom::StepNamed("only"),
-    ] {
-        let error = dbos
-            .fork_with::<u32, EngineOnly>(
-                id,
-                from,
-                ForkOptions {
-                    forked_id: Some("chosen"),
-                    ..ForkOptions::default()
-                },
-            )
-            .await
-            .expect_err("a chosen id was accepted for a searched fork point");
-        assert!(
-            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("forked_id")),
-            "expected a configuration refusal for {from:?}, got {error:?}"
-        );
-    }
-
-    // Nothing was written under the id that was refused, and nothing was forked at all.
-    assert!(
-        reader(&db)
-            .await
-            .get_workflow("chosen")
-            .await
-            .expect("read failed")
-            .is_none(),
-        "a fork was written under the refused id",
-    );
-
-    // The half that does name its step still honours it.
-    let handle = dbos
+    let error = dbos
         .fork_with::<u32, EngineOnly>(
             id,
-            ForkFrom::Beginning,
+            -1,
             ForkOptions {
                 forked_id: Some("chosen"),
                 ..ForkOptions::default()
             },
         )
         .await
-        .expect("forking from the beginning refused a chosen id");
-    assert_eq!(handle.workflow_id(), "chosen");
+        .expect_err("a negative step was accepted");
+    assert!(
+        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
+        "{error:?}"
+    );
+    let error = dbos
+        .fork_all::<u32, EngineOnly>(&[id], -1, ForkOptions::default())
+        .await
+        .expect_err("a negative step was accepted in bulk");
+    assert!(
+        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
+        "{error:?}"
+    );
+
+    let reader = reader(&db).await;
+    assert!(
+        reader
+            .get_workflow("chosen")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "a fork was written under the refused call's id",
+    );
+    // The bulk call generates its ids, so the source is what shows whether anything was forked.
+    assert!(
+        !reader
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the source is gone")
+            .was_forked_from,
+        "a refused call forked the source",
+    );
 
     dbos.shutdown().await;
 }
@@ -1615,9 +1422,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
                 move |source: String| {
                     let dbos = dbos.clone();
                     async move {
-                        let fork = dbos
-                            .fork::<u32, EngineOnly>(&source, ForkFrom::Beginning)
-                            .await?;
+                        let fork = dbos.fork::<u32, EngineOnly>(&source, 0).await?;
                         let forked_id = fork.workflow_id().to_owned();
                         // Long enough that shutdown lands after the fork is recorded.
                         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1683,9 +1488,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
             move |source: String| {
                 let dbos = dbos.clone();
                 async move {
-                    let fork = dbos
-                        .fork::<u32, EngineOnly>(&source, ForkFrom::Beginning)
-                        .await?;
+                    let fork = dbos.fork::<u32, EngineOnly>(&source, 0).await?;
                     Ok::<String, Error>(fork.workflow_id().to_owned())
                 }
             }
@@ -1795,7 +1598,7 @@ async fn a_refused_resume_replays_its_refusal_after_the_workflow_appears() {
         .await
         .expect("the late arrival failed");
     let forked = dbos
-        .fork::<String, EngineOnly>("resuming-operator-run", ForkFrom::Step(1))
+        .fork::<String, EngineOnly>("resuming-operator-run", 1)
         .await
         .expect("fork failed");
     assert_eq!(
@@ -1961,7 +1764,7 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
                     let handle = other
                         .fork_with::<u32, EngineOnly>(
                             &id,
-                            ForkFrom::Beginning,
+                            0,
                             ForkOptions {
                                 forked_id: Some("refused-fork"),
                                 ..ForkOptions::default()
@@ -2281,8 +2084,8 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
 /// **A management call refused by its own arguments moves no step counter.**
 ///
 /// The launch check comes first, then the call's own argument check, and only then the step id —
-/// so `fork_all` refusing a chosen id, and `fork_with` refusing a fork point that cannot name one,
-/// leave the step after them on the slot it would have had. The instance-level refusals are
+/// so `fork_all` refusing a chosen id, and `fork` refusing a negative step, leave the step after
+/// them on the slot it would have had. The instance-level refusals are
 /// covered by `management_through_another_instance_from_inside_a_workflow_is_refused`; these are
 /// the ones the method itself raises.
 #[tokio::test]
@@ -2302,7 +2105,7 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                     let refused = dbos
                         .fork_all::<u32, EngineOnly>(
                             &[&id],
-                            ForkFrom::Beginning,
+                            0,
                             ForkOptions {
                                 forked_id: Some("chosen"),
                                 ..ForkOptions::default()
@@ -2314,20 +2117,11 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                         "a chosen id should be refused in bulk"
                     );
 
-                    // And a searched fork point has no step to hang a chosen id on.
-                    let refused = dbos
-                        .fork_with::<u32, EngineOnly>(
-                            &id,
-                            ForkFrom::LastFailure,
-                            ForkOptions {
-                                forked_id: Some("chosen"),
-                                ..ForkOptions::default()
-                            },
-                        )
-                        .await;
+                    // And there is no step below zero to fork from.
+                    let refused = dbos.fork::<u32, EngineOnly>(&id, -1).await;
                     assert!(
                         matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
-                        "a chosen id needs a fork point that names its step"
+                        "a negative step should be refused"
                     );
 
                     dbos::step("after", || async { Ok(()) }).await?;
@@ -2463,7 +2257,7 @@ async fn no_workflow_write_reaches_the_legacy_payload_columns() {
     );
 
     let forked = dbos
-        .fork::<u32, EngineOnly>("sweep-direct", ForkFrom::Beginning)
+        .fork::<u32, EngineOnly>("sweep-direct", 0)
         .await
         .expect("fork failed");
     assert_eq!(forked.result().await.expect("the fork failed"), 2);
