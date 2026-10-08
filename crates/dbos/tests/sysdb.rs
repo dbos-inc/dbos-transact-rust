@@ -8072,15 +8072,14 @@ async fn a_queue_round_trips_through_the_registry() {
             limit: 100,
             period: std::time::Duration::from_millis(1_500),
         }),
-        priority_enabled: true,
-        partition_queue: true,
         polling_interval: std::time::Duration::from_millis(250),
         ..NewQueue::new("orders")
     };
     assert!(
         sys.upsert_queue(&queue, OnExistingQueue::Update)
             .await
-            .unwrap(),
+            .unwrap()
+            .created(),
         "the first registration creates the row",
     );
 
@@ -8095,11 +8094,44 @@ async fn a_queue_round_trips_through_the_registry() {
             period: std::time::Duration::from_millis(1_500),
         }),
     );
-    assert!(read.priority_enabled);
-    assert!(read.partition_queue);
     assert_eq!(read.polling_interval, std::time::Duration::from_millis(250));
 
     assert!(sys.get_queue("no-such-queue").await.unwrap().is_none());
+}
+
+/// Of concurrent first registrations, exactly one reports creating the queue, and every other one
+/// reports the row it found. A read before the write could not promise this, since a lock on a row
+/// that does not exist yet holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_registrations_create_the_queue_once() {
+    let (sys, _db) = sysdb().await;
+    let sys = std::sync::Arc::new(sys);
+
+    for round in 0..5 {
+        let name = format!("contended-{round}");
+        let mut registrations = tokio::task::JoinSet::new();
+        for n in 0..8 {
+            let sys = std::sync::Arc::clone(&sys);
+            let name = name.clone();
+            registrations.spawn(async move {
+                sys.upsert_queue(
+                    &NewQueue {
+                        concurrency: Some(n + 1),
+                        ..NewQueue::new(&name)
+                    },
+                    OnExistingQueue::Update,
+                )
+                .await
+                .expect("registration failed")
+            });
+        }
+        let upserted = registrations.join_all().await;
+        assert_eq!(
+            upserted.iter().filter(|u| u.created()).count(),
+            1,
+            "{name}: one registration creates the queue, the rest find it",
+        );
+    }
 }
 
 /// Re-registering reports that the queue already existed, and honours what to do with it.
@@ -8115,17 +8147,26 @@ async fn re_registering_a_queue_reports_it_existed() {
         sys.upsert_queue(&first, OnExistingQueue::Update)
             .await
             .unwrap()
+            .created()
     );
 
     let second = NewQueue {
         concurrency: Some(9),
         ..NewQueue::new("orders")
     };
-    assert!(
-        !sys.upsert_queue(&second, OnExistingQueue::Update)
-            .await
-            .unwrap(),
-        "the second registration finds the row already there",
+    let upserted = sys
+        .upsert_queue(&second, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    assert_eq!(
+        upserted.before.map(|row| row.concurrency),
+        Some(Some(1)),
+        "the second registration finds the first one's row",
+    );
+    assert_eq!(
+        upserted.after.concurrency,
+        Some(9),
+        "and returns what it wrote"
     );
     assert_eq!(
         sys.get_queue("orders").await.unwrap().unwrap().concurrency,
@@ -8137,10 +8178,15 @@ async fn re_registering_a_queue_reports_it_existed() {
         concurrency: Some(3),
         ..NewQueue::new("orders")
     };
-    assert!(
-        !sys.upsert_queue(&third, OnExistingQueue::Leave)
-            .await
-            .unwrap()
+    let upserted = sys
+        .upsert_queue(&third, OnExistingQueue::Leave)
+        .await
+        .unwrap();
+    assert!(!upserted.created());
+    assert_eq!(
+        upserted.after.concurrency,
+        Some(9),
+        "Leave returns what is stored, not what was asked for",
     );
     assert_eq!(
         sys.get_queue("orders").await.unwrap().unwrap().concurrency,
@@ -8775,8 +8821,7 @@ async fn an_unrepresentable_period_is_malformed() {
 /// Registers a partitioned queue that a sweep will accept.
 async fn partitioned_queue(sys: &PostgresSystemDatabase, name: &'static str) -> QueueRecord {
     let queue = NewQueue {
-        concurrency: Some(1),
-        partition_queue: true,
+        partition_concurrency: Some(1),
         ..NewQueue::new(name)
     };
     sys.upsert_queue(&queue, OnExistingQueue::Update)
@@ -9070,24 +9115,17 @@ async fn a_sweep_refuses_an_unsuitable_queue() {
             concurrency: Some(1),
             ..NewQueue::new("plain")
         },
-        // Partitioned, but admitting more than one per partition.
+        // Partitioned and single, but rate limited queue-wide — which needs the counting a sweep
+        // omits.
         NewQueue {
-            concurrency: Some(2),
-            partition_queue: true,
-            ..NewQueue::new("wide")
-        },
-        // Partitioned and single, but rate limited — which needs the counting a sweep omits.
-        NewQueue {
-            concurrency: Some(1),
-            partition_queue: true,
+            partition_concurrency: Some(1),
             rate_limit: Some(RateLimit {
                 limit: 5,
                 period: std::time::Duration::from_secs(1),
             }),
             ..NewQueue::new("limited")
         },
-        // The same three in the shape a queue registered here has: a per-partition limit above
-        // one has to be counted, ...
+        // A per-partition limit above one has to be counted, ...
         NewQueue {
             partition_concurrency: Some(2),
             ..NewQueue::new("wide-partition")
@@ -9184,7 +9222,6 @@ async fn an_update_changes_only_what_it_names() {
             limit: 10,
             period: std::time::Duration::from_secs(1),
         }),
-        priority_enabled: true,
         polling_interval: std::time::Duration::from_millis(500),
         ..NewQueue::new("orders")
     };
@@ -9216,7 +9253,6 @@ async fn an_update_changes_only_what_it_names() {
         }),
         "not named, so untouched",
     );
-    assert!(read.priority_enabled, "not named, so untouched");
     assert_eq!(read.polling_interval, std::time::Duration::from_millis(500));
 }
 

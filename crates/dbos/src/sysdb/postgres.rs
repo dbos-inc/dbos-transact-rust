@@ -86,9 +86,9 @@ use super::types::{
     InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
     OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
     ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
-    StreamRead, StreamRecord, Submission, Timestamp, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
-    is_valid_application_name, validate_attributes,
+    StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
+    duration_from_secs, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -1788,9 +1788,37 @@ const UNSETTLED: &str = "'PENDING', 'ENQUEUED', 'DELAYED'";
 
 /// Every column of `queues` [`queue_from_row`] reads.
 const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_max, \
-     rate_limit_period_sec, priority_enabled, partition_queue, partition_concurrency, \
-     partition_worker_concurrency, partition_rate_limit_max, partition_rate_limit_period_sec, \
-     polling_interval_sec, application_name";
+     rate_limit_period_sec, partition_concurrency, partition_worker_concurrency, \
+     partition_rate_limit_max, partition_rate_limit_period_sec, polling_interval_sec, \
+     application_name";
+
+/// Binds a queue registration to `$1`–`$13`, in the order both of
+/// [`upsert_queue`](SystemDatabase::upsert_queue)'s statements name its columns: the name, the
+/// eleven settings, and the owner.
+fn bind_new_queue<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    queue: &NewQueue<'q>,
+    owner: Option<&'q str>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    query
+        .bind(queue.name)
+        .bind(queue.concurrency)
+        .bind(queue.worker_concurrency)
+        .bind(queue.rate_limit.map(|r| r.limit))
+        .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
+        // Every queue orders by priority, so the column is always written `TRUE` for readers that
+        // still consult it, and never read here.
+        .bind(true)
+        // Derived, never asked for: the column is written to agree with the per-partition limits
+        // for readers that still consult it, and is never read here.
+        .bind(queue.is_partitioned())
+        .bind(queue.partition_concurrency)
+        .bind(queue.partition_worker_concurrency)
+        .bind(queue.partition_rate_limit.map(|r| r.limit))
+        .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
+        .bind(queue.polling_interval.as_secs_f64())
+        .bind(owner)
+}
 
 /// Every column of a schedule row, in the order [`schedule_from_row`] reads them.
 const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
@@ -1885,8 +1913,6 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
         concurrency: row.try_get("concurrency")?,
         worker_concurrency: row.try_get("worker_concurrency")?,
         rate_limit: rate_limit("rate_limit_max", "rate_limit_period_sec")?,
-        priority_enabled: row.try_get("priority_enabled")?,
-        partition_queue: row.try_get("partition_queue")?,
         partition_concurrency: row.try_get("partition_concurrency")?,
         partition_worker_concurrency: row.try_get("partition_worker_concurrency")?,
         partition_rate_limit: rate_limit(
@@ -5418,46 +5444,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         queue: &NewQueue<'_>,
         on_existing: OnExistingQueue,
-    ) -> Result<bool, Error> {
+    ) -> Result<UpsertedQueue, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
         let application_name = queue.application_name.or(self.application_name.as_deref());
-        // Ownership is claimed, never taken: `COALESCE` leaves a row that already has an owner
-        // alone, so a registration landing between the resolve below and this write keeps the
-        // name it took. The stored limits are a different matter — those the caller asked to
-        // replace.
-        let on_conflict = match on_existing {
-            OnExistingQueue::Update => format!(
-                "ON CONFLICT (name) DO UPDATE SET \
-                   concurrency = EXCLUDED.concurrency, \
-                   worker_concurrency = EXCLUDED.worker_concurrency, \
-                   rate_limit_max = EXCLUDED.rate_limit_max, \
-                   rate_limit_period_sec = EXCLUDED.rate_limit_period_sec, \
-                   priority_enabled = EXCLUDED.priority_enabled, \
-                   partition_queue = EXCLUDED.partition_queue, \
-                   partition_concurrency = EXCLUDED.partition_concurrency, \
-                   partition_worker_concurrency = EXCLUDED.partition_worker_concurrency, \
-                   partition_rate_limit_max = EXCLUDED.partition_rate_limit_max, \
-                   partition_rate_limit_period_sec = EXCLUDED.partition_rate_limit_period_sec, \
-                   polling_interval_sec = EXCLUDED.polling_interval_sec, \
-                   updated_at = EXCLUDED.updated_at, \
-                   application_name = COALESCE({queues_table}.application_name, EXCLUDED.application_name)"
-            ),
-            OnExistingQueue::Leave => "ON CONFLICT (name) DO NOTHING".to_owned(),
-        };
-        let on_conflict = on_conflict.as_str();
 
         with_retry(&self.retry, "upsert_queue", move || async move {
             let mut tx = pool.begin().await?;
-
-            // Asked before the write, because afterwards there is no way to tell a row this call
-            // created from one it found — both leave a row behind.
-            let existed: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT name FROM {queues_table} WHERE name = $1"
-            )))
-            .bind(queue.name)
-            .fetch_optional(&mut *tx)
-            .await?;
 
             // A peer holding the name is refused in either mode: the name is the queue's address,
             // so registering over it would point this application at a peer's work.
@@ -5471,35 +5464,55 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
 
-            sqlx::query(AssertSqlSafe(format!(
-                "INSERT INTO {queues_table} \
-                 (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, \
-                  priority_enabled, partition_queue, partition_concurrency, \
-                  partition_worker_concurrency, partition_rate_limit_max, \
-                  partition_rate_limit_period_sec, polling_interval_sec, updated_at, \
-                  application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {NOW_MS_SQL}, $13) \
-                 {on_conflict}"
-            )))
-            .bind(queue.name)
-            .bind(queue.concurrency)
-            .bind(queue.worker_concurrency)
-            .bind(queue.rate_limit.map(|r| r.limit))
-            .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
-            .bind(queue.priority_enabled)
-            .bind(queue.partition_queue)
-            .bind(queue.partition_concurrency)
-            .bind(queue.partition_worker_concurrency)
-            .bind(queue.partition_rate_limit.map(|r| r.limit))
-            .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
-            .bind(queue.polling_interval.as_secs_f64())
-            .bind(owner.as_deref())
-            .execute(&mut *tx)
-            .await?;
+            // Insert first, because only the insert can tell a row this call created from one it
+            // found. `ON CONFLICT DO NOTHING` waits out a peer's uncommitted insert of the same
+            // name, so of two first registrations exactly one gets its row back. A read beforehand
+            // cannot decide it: `FOR UPDATE` locks nothing while the row is absent, so both would
+            // find nothing and both report creating the queue. Looped because the row the conflict
+            // found can be deleted before the lock below reaches it.
+            let before = loop {
+                let inserted = bind_new_queue(
+                    sqlx::query(AssertSqlSafe(format!(
+                        "INSERT INTO {queues_table} \
+                         (name, concurrency, worker_concurrency, rate_limit_max, \
+                          rate_limit_period_sec, priority_enabled, partition_queue, \
+                          partition_concurrency, partition_worker_concurrency, \
+                          partition_rate_limit_max, partition_rate_limit_period_sec, \
+                          polling_interval_sec, updated_at, application_name) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {NOW_MS_SQL}, $13) \
+                         ON CONFLICT (name) DO NOTHING \
+                         RETURNING {QUEUE_COLUMNS}"
+                    ))),
+                    queue,
+                    owner.as_deref(),
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(row) = inserted {
+                    let after = queue_from_row(&row)?;
+                    tx.commit().await?;
+                    return Ok(UpsertedQueue {
+                        before: None,
+                        after,
+                    });
+                }
 
-            // Read back, because both conflict clauses decline silently: neither says whether the
-            // row it found belongs to this application or to a peer that registered in between.
-            resolve_owning_application(
+                // Found rather than created. Locked, so the row returned as the one replaced is
+                // the one the update below actually replaces.
+                let found = sqlx::query(AssertSqlSafe(format!(
+                    "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
+                )))
+                .bind(queue.name)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(row) = found {
+                    break queue_from_row(&row)?;
+                }
+            };
+
+            // Asked again of the locked row, because the conflict says nothing about who holds
+            // it: a peer may have registered the name since the first resolve.
+            let owner = resolve_owning_application(
                 &mut tx,
                 queues_table,
                 "name",
@@ -5509,8 +5522,40 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
 
+            let after = match on_existing {
+                // The stored row stands, and it is what a caller's dequeues will honour.
+                OnExistingQueue::Leave => before.clone(),
+                // Ownership is claimed, never taken: `COALESCE` leaves a row that already has an
+                // owner alone. The stored limits are a different matter — those the caller asked
+                // to replace.
+                OnExistingQueue::Update => {
+                    let row = bind_new_queue(
+                        sqlx::query(AssertSqlSafe(format!(
+                            "UPDATE {queues_table} SET \
+                               concurrency = $2, worker_concurrency = $3, rate_limit_max = $4, \
+                               rate_limit_period_sec = $5, priority_enabled = $6, \
+                               partition_queue = $7, partition_concurrency = $8, \
+                               partition_worker_concurrency = $9, partition_rate_limit_max = $10, \
+                               partition_rate_limit_period_sec = $11, polling_interval_sec = $12, \
+                               updated_at = {NOW_MS_SQL}, \
+                               application_name = COALESCE(application_name, $13) \
+                             WHERE name = $1 \
+                             RETURNING {QUEUE_COLUMNS}"
+                        ))),
+                        queue,
+                        owner.as_deref(),
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    queue_from_row(&row)?
+                }
+            };
+
             tx.commit().await?;
-            Ok(existed.is_none())
+            Ok(UpsertedQueue {
+                before: Some(before),
+                after,
+            })
         })
         .await
     }
@@ -5554,27 +5599,31 @@ impl SystemDatabase for PostgresSystemDatabase {
         // selection wear it: a queue-wide limit counts the whole queue whichever partition this
         // call is sweeping, which is what makes the two scopes independent.
         let partition_predicate = "($2::text IS NULL OR queue_partition_key = $2)";
-        // **Read through `resolved_limits`, never off the columns.** A row a peer wrote with the
-        // deprecated flag holds its per-partition numbers in the queue-wide columns, and enforcing
-        // those queue-wide would admit one workflow for the whole queue instead of one per key.
-        let limits = queue.resolved_limits();
         // Whether any limit here is a budget peer executors spend from as well. Worker
         // concurrency is not one: it is answered from this process's own running count.
-        let has_shared_budget = limits.concurrency.is_some()
-            || limits.partition_concurrency.is_some()
-            || limits.rate_limit.is_some()
-            || limits.partition_rate_limit.is_some();
-        // Whether that budget is shared across partitions too, which is a second hazard and needs
-        // a stronger answer. Two calls sweeping different keys read the same queue-wide total and
-        // then write disjoint rows, so no snapshot conflict fires under repeatable read and each
-        // spends the whole budget — write skew, which only serialisable catches.
-        let has_write_skew = partition_key.is_some()
-            && (limits.concurrency.is_some() || limits.rate_limit.is_some());
+        let has_shared_budget = queue.concurrency.is_some()
+            || queue.partition_concurrency.is_some()
+            || queue.rate_limit.is_some()
+            || queue.partition_rate_limit.is_some();
+        // Whether this call sweeps one partition of a queue whose budget spans every partition,
+        // which is a second hazard and needs a stronger answer. Two calls sweeping different keys
+        // read the same queue-wide total and then claim disjoint rows, so no snapshot conflict or
+        // row lock fires under repeatable read and each spends the whole budget: write skew,
+        // which only serialisable catches.
+        //
+        // Only the queue-wide limits count here. A per-partition limit is counted within the
+        // swept key, and two calls spending it are sweeping the same key: they select the same
+        // head-of-line rows, and the `NOWAIT` lock on those rows makes the loser fail. That holds
+        // only while both select the same head. Two calls whose selections differ, for example
+        // because a version filter hides the head from one of them, lock different rows and can
+        // both admit a workflow against a per-partition limit of one.
+        let budget_spans_partitions =
+            partition_key.is_some() && (queue.concurrency.is_some() || queue.rate_limit.is_some());
         // Marks the rows a limited queue started, which is what the windows below count and why
         // cancelling clears it. A limit at either scope makes a start countable: flagging only
         // queue-wide starts would leave a per-partition window counting nothing, and the limit it
         // measures unenforceable.
-        let rate_limited = limits.rate_limit.is_some() || limits.partition_rate_limit.is_some();
+        let rate_limited = queue.rate_limit.is_some() || queue.partition_rate_limit.is_some();
         // The window's width, which the database subtracts from its own clock — see
         // [`NOW_MS_SQL`]. Fixed for the run, since only the instant it is subtracted from moves.
         //
@@ -5586,8 +5635,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 i64::try_from(limit.period.as_millis()).unwrap_or(i64::MAX)
             })
         };
-        let rate_limit_period_ms = period_ms(limits.rate_limit);
-        let partition_rate_limit_period_ms = period_ms(limits.partition_rate_limit);
+        let rate_limit_period_ms = period_ms(queue.rate_limit);
+        let partition_rate_limit_period_ms = period_ms(queue.partition_rate_limit);
 
         // Conflicts are not replayed here. A dequeue raised above read committed expects to lose
         // races to its peers, and its caller's answer to a lost one — poll again later, or skip
@@ -5599,7 +5648,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Read committed otherwise: with no shared budget nothing here reads a total, so a
             // stronger isolation would buy a retry rate and nothing else.
             if has_shared_budget {
-                let isolation = if has_write_skew {
+                let isolation = if budget_spans_partitions {
                     "SERIALIZABLE"
                 } else {
                     "REPEATABLE READ"
@@ -5622,13 +5671,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Worker concurrency first, because it costs no query. Answered from what this
             // process is already running rather than from the database, which cannot see a
             // running workflow that has not written a step yet.
-            if let Some(worker_concurrency) = limits.worker_concurrency {
+            if let Some(worker_concurrency) = queue.worker_concurrency {
                 max_tasks = narrow(
                     max_tasks,
                     (i64::from(worker_concurrency) - local_running_count).max(0),
                 );
             }
-            if let Some(worker_concurrency) = limits.partition_worker_concurrency
+            if let Some(worker_concurrency) = queue.partition_worker_concurrency
                 && partition_key.is_some()
             {
                 max_tasks = narrow(
@@ -5647,7 +5696,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             //
             // Twice over when a partition is named: the queue-wide window counts the whole queue,
             // the per-partition one only this key, and the tighter of the two governs.
-            if let Some(limit) = limits.rate_limit {
+            if let Some(limit) = queue.rate_limit {
                 let recent_starts: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT count(*) FROM {workflow_table} \
                      WHERE queue_name = $2 AND rate_limited = TRUE \
@@ -5662,7 +5711,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
                 max_tasks = narrow(max_tasks, (i64::from(limit.limit) - recent_starts).max(0));
             }
-            if let (Some(limit), Some(key)) = (limits.partition_rate_limit, partition_key) {
+            if let (Some(limit), Some(key)) = (queue.partition_rate_limit, partition_key) {
                 let partition_starts: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT count(*) FROM {workflow_table} \
                      WHERE queue_name = $3 AND rate_limited = TRUE \
@@ -5690,7 +5739,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // Then the concurrency limits, each a count minus what is already pending at that
             // limit's scope. Last because each is a query, and a call the cheaper limits have
             // already closed never reaches them.
-            if let Some(concurrency) = limits.concurrency {
+            if let Some(concurrency) = queue.concurrency {
                 // Unscoped whichever partition is being swept: a queue-wide limit governs the
                 // queue, and counting only this key would let every other key spend it again.
                 let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -5713,7 +5762,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 }
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
             }
-            if let (Some(concurrency), Some(key)) = (limits.partition_concurrency, partition_key) {
+            if let (Some(concurrency), Some(key)) = (queue.partition_concurrency, partition_key) {
                 // Its own query rather than one grouped with the queue-wide count: this predicate
                 // rides `idx_workflow_status_partition_dequeue_v3`, which a queue-wide scan loses.
                 let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -5901,11 +5950,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // `partition_worker_concurrency` is not in the list, and does not need to be: it is at
         // least 1, and a partition already capped at one workflow across the fleet cannot exceed
         // one in this process. It could never bind here, so allowing it costs nothing.
-        let limits = queue.resolved_limits();
-        if limits.partition_concurrency != Some(1)
-            || limits.concurrency.is_some()
-            || limits.rate_limit.is_some()
-            || limits.partition_rate_limit.is_some()
+        if queue.partition_concurrency != Some(1)
+            || queue.concurrency.is_some()
+            || queue.rate_limit.is_some()
+            || queue.partition_rate_limit.is_some()
         {
             return Err(Error::InvalidInput {
                 field: "queue".into(),
@@ -5914,10 +5962,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                      {:?} has partition_concurrency={:?} concurrency={:?} rate_limited={} \
                      partition_rate_limited={}",
                     queue.name,
-                    limits.partition_concurrency,
-                    limits.concurrency,
-                    limits.rate_limit.is_some(),
-                    limits.partition_rate_limit.is_some(),
+                    queue.partition_concurrency,
+                    queue.concurrency,
+                    queue.rate_limit.is_some(),
+                    queue.partition_rate_limit.is_some(),
                 ),
             });
         }
@@ -6230,7 +6278,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         validate: &(
              dyn for<'r, 's> Fn(&'r QueueRecord, &'s QueueRecord) -> Result<(), Error> + Send + Sync
          ),
-    ) -> Result<QueueRecord, Error> {
+    ) -> Result<UpdatedQueue, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
 
@@ -6259,7 +6307,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // asked for nothing is not asking to have the stored row judged.
             if update.is_empty() {
                 tx.commit().await?;
-                return Ok(stored);
+                return Ok(UpdatedQueue {
+                    before: stored.clone(),
+                    after: stored,
+                });
             }
 
             // The caller's verdict on the row as it would be, delivered while this transaction
@@ -6282,22 +6333,19 @@ impl SystemDatabase for PostgresSystemDatabase {
             }
             assign!(update.concurrency.set(), "concurrency");
             assign!(update.worker_concurrency.set(), "worker_concurrency");
-            assign!(update.priority_enabled.set(), "priority_enabled");
-            // **The flag and the limits are two spellings of one fact**, so the column is never
-            // written disagreeing with them. `apply_to` has already resolved which of the three
-            // cases this update is — the flag named outright, the flag rewritten to match a
-            // moved per-partition limit, or neither touched — so the value to store is the
-            // merged row's, and the only question left here is whether to assign at all.
-            //
-            // Assigning nothing when neither is touched is what lets a row a peer wrote with the
-            // deprecated flag and no limits keep what it says.
-            if !(update.partition_queue.is_leave()
-                && update.partition_concurrency.is_leave()
+            // Rewritten on every update, so a row stored `FALSE` before every queue ordered by
+            // priority is brought in line the first time anything about it changes.
+            set.push("priority_enabled = TRUE");
+            // The `partition_queue` column is rewritten to agree with the per-partition limits
+            // whenever one of them moves, for readers that still consult it. An update moving
+            // none of them leaves it alone, so an unrelated change does not rewrite a row whose
+            // flag another writer set.
+            if !(update.partition_concurrency.is_leave()
                 && update.partition_worker_concurrency.is_leave()
                 && update.partition_rate_limit.is_leave())
             {
                 set.push("partition_queue = ");
-                set.push_bind_unseparated(merged.partition_queue);
+                set.push_bind_unseparated(merged.is_partitioned());
             }
             assign!(update.partition_concurrency.set(), "partition_concurrency");
             assign!(
@@ -6330,7 +6378,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             let written = queue_from_row(&row)?;
 
             tx.commit().await?;
-            Ok(written)
+            Ok(UpdatedQueue {
+                before: stored,
+                after: written,
+            })
         })
         .await
     }

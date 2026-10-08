@@ -303,14 +303,9 @@ pub struct StartOptions<'a> {
 /// each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError`
 /// for each, including the policy (`workflow.go`), which is five runtime errors describing states
 /// its type system allowed it to build. Owning them from the queue makes the same five
-/// unrepresentable — there is no queue-less value here to hang them on. Three rules survive as
+/// unrepresentable — there is no queue-less value here to hang them on. Two rules survive as
 /// refusals at start, because no shape can take them:
 ///
-/// - **A [`deduplication_id`](Self::deduplication_id) and a [`partition_key`](Self::partition_key)
-///   cannot both be set.** Go refuses the same pair (`workflow.go`), and it is not a policy choice:
-///   a partitioned queue's sweep claims one head-of-line workflow per partition and leans on the
-///   `PENDING` gate to hold concurrency at one, while a deduplication key is enforced by a partial
-///   unique index over `(queue_name, deduplication_id)` that knows nothing about partitions.
 /// - **A [`priority`](Self::priority) must be between 1 and [`i32::MAX`].** `0` is the stored
 ///   sentinel for unprioritised, so accepting it would give that state a second spelling that
 ///   reads like a real priority.
@@ -320,7 +315,7 @@ pub struct StartOptions<'a> {
 ///   (`_enqueue_options.py`, `workflow.go`), and keeping the two apart is what makes the ordinary
 ///   enqueue — a key, no policy — the short one to write.
 ///
-/// TypeScript groups the same three into an `EnqueueOptions` bag (`system_database.ts`), which is
+/// TypeScript groups the same options into an `EnqueueOptions` bag (`system_database.ts`), which is
 /// the nearest precedent; Go and Python keep them flat on their options struct.
 ///
 /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
@@ -352,13 +347,16 @@ pub struct Enqueue<'a> {
     /// A second enqueue under a held key is refused, unless [`duplication_policy`](Self::duplication_policy)
     /// asks to join the holder instead.
     ///
-    /// **Mutually exclusive with [`partition_key`](Self::partition_key)**: a start naming both is
-    /// refused, for the reason this type's own documentation gives.
+    /// **Held across the whole queue, partitions included.** On a partitioned queue a key held by a
+    /// workflow in one partition blocks the same key in every other, and under
+    /// [`DuplicationPolicy::ReturnExisting`] the caller joins the holder whichever partition it is
+    /// in. For a key scoped to one partition, put the partition key into it, for example
+    /// `format!("{tenant}:{key}")`.
     pub deduplication_id: Option<&'a str>,
     /// Dequeue order among this queue's waiting workflows, **lower first**.
     ///
-    /// Only honoured by a queue registered with priority enabled; on any other queue it is stored
-    /// and ignored, which is what every reference does rather than refusing it.
+    /// Every queue honours it: the dequeue orders a queue's waiting workflows by priority, and
+    /// by `created_at` among equal priorities.
     ///
     /// **`None` is not "priority zero".** The column's `0` is the references' sentinel for
     /// *unprioritised*, and it sorts ahead of every explicit priority — TypeScript says so in as
@@ -372,8 +370,14 @@ pub struct Enqueue<'a> {
     /// unit of ordering: work sharing a key runs in sequence, and work under different keys runs
     /// concurrently.
     ///
-    /// **Mutually exclusive with [`deduplication_id`](Self::deduplication_id)**: a start naming
-    /// both is refused.
+    /// **Required on a partitioned queue, and not checked.** A partitioned queue is dequeued one
+    /// partition at a time, and its partitions are the keys present on its rows, so a workflow
+    /// enqueued on one without a key is in no partition and is never dequeued. The enqueue does not
+    /// read the queue's configuration to catch this, since that would cost a round trip on every
+    /// enqueue. On an unpartitioned queue a key is stored and ignored.
+    ///
+    /// A [`deduplication_id`](Self::deduplication_id) set beside it is held across the whole
+    /// queue, not within this partition.
     pub partition_key: Option<&'a str>,
     /// How long to hold the workflow before it may be dequeued at all.
     ///
@@ -468,14 +472,10 @@ impl<'a> Enqueue<'a> {
     ///
     /// **Only what the shape could not rule out.** Nesting these options under the queue already
     /// makes "a delay with no queue" and its three siblings unbuildable, so what is left is the
-    /// pair of rules that are about the options themselves:
+    /// rules that are about the options themselves:
     ///
-    /// - **A deduplication id and a partition key cannot both be set.** Go refuses the same pair
-    ///   (`workflow.go`) and it is not a policy choice: the two ask the dequeue for incompatible
-    ///   things. A partitioned queue's sweep claims one head-of-line workflow per partition and
-    ///   relies on the `PENDING` gate to hold concurrency at one, while a deduplication key is
-    ///   enforced by a partial unique index over `(queue_name, deduplication_id)` that knows
-    ///   nothing about partitions.
+    /// - **[`DuplicationPolicy::ReturnExisting`] needs a deduplication id**, since with no key
+    ///   there is no collision to resolve.
     /// - **A priority must be at least 1.** `0` is the stored sentinel for unprioritised, so
     ///   accepting it would give that state a second spelling that reads like a real priority;
     ///   the references' documented range starts at 1 for the same reason. The ceiling is
@@ -491,13 +491,6 @@ impl<'a> Enqueue<'a> {
             )))
         };
 
-        if self.deduplication_id.is_some() && self.partition_key.is_some() {
-            return refuse(
-                "`deduplication_id` and `partition_key` cannot both be set: a partitioned \
-                 queue's dequeue and a deduplication key enforce different things"
-                    .to_owned(),
-            );
-        }
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
             && self.deduplication_id.is_none()
         {

@@ -1494,10 +1494,6 @@ pub struct QueueUpdate {
     /// See [`QueueRecord::rate_limit`]. One field for both columns, so an update cannot leave
     /// half a limit behind.
     pub rate_limit: Change<Option<RateLimit>>,
-    /// See [`QueueRecord::priority_enabled`].
-    pub priority_enabled: Change<bool>,
-    /// See [`QueueRecord::partition_queue`].
-    pub partition_queue: Change<bool>,
     /// See [`QueueRecord::partition_concurrency`].
     pub partition_concurrency: Change<Option<i32>>,
     /// See [`QueueRecord::partition_worker_concurrency`].
@@ -1509,48 +1505,42 @@ pub struct QueueUpdate {
     pub polling_interval: Change<Duration>,
 }
 
+/// What [`SystemDatabase::upsert_queue`](crate::sysdb::SystemDatabase::upsert_queue) returns: the
+/// row the registration found, if any, and the row as the registration left it, both read in its
+/// transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertedQueue {
+    /// The row that was there before, read under the registration's own lock, or `None` if this
+    /// call created the queue.
+    pub before: Option<QueueRecord>,
+    /// The row as the registration left it: what was written, or, under
+    /// [`OnExistingQueue::Leave`], what was already stored.
+    pub after: QueueRecord,
+}
+
+impl UpsertedQueue {
+    /// Whether this call created the queue rather than finding it.
+    pub fn created(&self) -> bool {
+        self.before.is_none()
+    }
+}
+
+/// What [`SystemDatabase::update_queue`](crate::sysdb::SystemDatabase::update_queue) returns: the
+/// row as the update's transaction read it, and the row as it wrote it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatedQueue {
+    /// The row the update replaced, read under the update's own lock.
+    pub before: QueueRecord,
+    /// The row as written.
+    pub after: QueueRecord,
+}
+
 impl QueueUpdate {
     /// This update applied to a record, giving the row as it would be after the write.
     ///
     /// What a caller's validation is handed: a limit is rarely wrong on its own and usually wrong
     /// only beside another, so the merged result is the only thing worth checking.
     pub fn apply_to(&self, record: &QueueRecord) -> QueueRecord {
-        let partition_concurrency = self
-            .partition_concurrency
-            .set()
-            .unwrap_or(record.partition_concurrency);
-        let partition_worker_concurrency = self
-            .partition_worker_concurrency
-            .set()
-            .unwrap_or(record.partition_worker_concurrency);
-        let partition_rate_limit = self
-            .partition_rate_limit
-            .set()
-            .unwrap_or(record.partition_rate_limit);
-        // **The flag follows the limits**, so the merged row carries the flag the write will
-        // store rather than the one the stored row happened to have. Three cases, and they are
-        // the three the `UPDATE` assigns by: an update naming the flag is taken at its word; one
-        // moving any per-partition limit has the flag rewritten to match what the row will hold;
-        // one touching neither keeps what the row says, which is how a peer's
-        // flag-without-limits row survives an unrelated update.
-        //
-        // Derived here rather than only in the `UPDATE` so that a validator is handed the row it
-        // will actually get. An update clearing the last partition limit would otherwise be
-        // judged against a row that still looked legacy-partitioned, and so through the
-        // re-scoping in [`QueueRecord::resolved_limits`] — which points a refusal at the wrong
-        // field even where the verdict comes out the same.
-        let partition_queue = match self.partition_queue.set() {
-            Some(flag) => flag,
-            None if !(self.partition_concurrency.is_leave()
-                && self.partition_worker_concurrency.is_leave()
-                && self.partition_rate_limit.is_leave()) =>
-            {
-                partition_concurrency.is_some()
-                    || partition_worker_concurrency.is_some()
-                    || partition_rate_limit.is_some()
-            }
-            None => record.partition_queue,
-        };
         QueueRecord {
             name: record.name.clone(),
             concurrency: self.concurrency.set().unwrap_or(record.concurrency),
@@ -1559,14 +1549,18 @@ impl QueueUpdate {
                 .set()
                 .unwrap_or(record.worker_concurrency),
             rate_limit: self.rate_limit.set().unwrap_or(record.rate_limit),
-            priority_enabled: self
-                .priority_enabled
+            partition_concurrency: self
+                .partition_concurrency
                 .set()
-                .unwrap_or(record.priority_enabled),
-            partition_queue,
-            partition_concurrency,
-            partition_worker_concurrency,
-            partition_rate_limit,
+                .unwrap_or(record.partition_concurrency),
+            partition_worker_concurrency: self
+                .partition_worker_concurrency
+                .set()
+                .unwrap_or(record.partition_worker_concurrency),
+            partition_rate_limit: self
+                .partition_rate_limit
+                .set()
+                .unwrap_or(record.partition_rate_limit),
             polling_interval: self
                 .polling_interval
                 .set()
@@ -1581,8 +1575,6 @@ impl QueueUpdate {
         self.concurrency.is_leave()
             && self.worker_concurrency.is_leave()
             && self.rate_limit.is_leave()
-            && self.priority_enabled.is_leave()
-            && self.partition_queue.is_leave()
             && self.partition_concurrency.is_leave()
             && self.partition_worker_concurrency.is_leave()
             && self.partition_rate_limit.is_leave()
@@ -1741,21 +1733,14 @@ pub struct QueueRecord {
     pub worker_concurrency: Option<i32>,
     /// How fast workflows may start, or `None` for unthrottled.
     pub rate_limit: Option<RateLimit>,
-    /// Whether dequeue order honours a workflow's priority.
-    pub priority_enabled: bool,
-    /// Whether the queue is partitioned, so a dequeue names the partition it wants.
-    ///
-    /// Stored rather than derived, because it is how the implementations that predate the
-    /// per-partition limits say the same thing: under the deprecated flag every queue-wide limit
-    /// applies per partition instead. A row with any partition limit set is partitioned whatever
-    /// this column says.
-    pub partition_queue: bool,
     /// Workflows one partition may have running at once, across all executors.
     ///
     /// Setting any of the three partition limits is what partitions a queue. Each applies within
     /// one partition rather than to the queue as a whole, so they sit beside the queue-wide
-    /// limits rather than replacing them: both are enforced, and neither is allowed to exceed
-    /// its queue-wide counterpart.
+    /// limits rather than replacing them: both are enforced. A per-partition concurrency limit
+    /// may not exceed its queue-wide counterpart, which it could then never bind under. The two
+    /// rate limits are validated separately and never compared, because their windows may
+    /// differ: a per-partition limit over a shorter window caps bursts the queue-wide one allows.
     pub partition_concurrency: Option<i32>,
     /// Workflows one executor may have running at once within one partition.
     pub partition_worker_concurrency: Option<i32>,
@@ -1767,83 +1752,33 @@ pub struct QueueRecord {
     pub application_name: Option<String>,
 }
 
-/// Every limit on a queue, resolved to the scope it is actually enforced at.
-///
-/// The queue-wide fields are `None` for a legacy-partitioned row, which is the whole reason this
-/// type exists rather than the dequeue reading [`QueueRecord`]'s columns directly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ResolvedLimits {
-    /// See [`QueueRecord::concurrency`].
-    pub concurrency: Option<i32>,
-    /// See [`QueueRecord::worker_concurrency`].
-    pub worker_concurrency: Option<i32>,
-    /// See [`QueueRecord::rate_limit`].
-    pub rate_limit: Option<RateLimit>,
-    /// See [`QueueRecord::partition_concurrency`].
-    pub partition_concurrency: Option<i32>,
-    /// See [`QueueRecord::partition_worker_concurrency`].
-    pub partition_worker_concurrency: Option<i32>,
-    /// See [`QueueRecord::partition_rate_limit`].
-    pub partition_rate_limit: Option<RateLimit>,
-}
-
-impl ResolvedLimits {
-    /// Whether the queue is partitioned, which any per-partition limit makes it.
-    pub fn is_partitioned(&self) -> bool {
-        self.partition_concurrency.is_some()
-            || self.partition_worker_concurrency.is_some()
-            || self.partition_rate_limit.is_some()
-    }
-}
-
 impl QueueRecord {
-    /// Whether any per-partition limit is set, which is what partitions a queue.
+    /// Whether the queue is partitioned, which any per-partition limit makes it.
     ///
-    /// The [`partition_queue`](Self::partition_queue) column can say so too, and for a row written
-    /// by an implementation that predates these limits it is the only thing that does.
-    pub fn has_partition_limits(&self) -> bool {
-        self.partition_concurrency.is_some()
-            || self.partition_worker_concurrency.is_some()
-            || self.partition_rate_limit.is_some()
+    /// Asked of the limits alone. The `partition_queue` column is written, derived from them, and
+    /// never read: a row with the flag set and only queue-wide limits is an unpartitioned queue
+    /// with queue-wide limits, and every limit applies at the scope its column names.
+    pub fn is_partitioned(&self) -> bool {
+        has_partition_limit(
+            self.partition_concurrency,
+            self.partition_worker_concurrency,
+            self.partition_rate_limit,
+        )
     }
+}
 
-    /// A row written with the deprecated flag and no per-partition limits.
-    ///
-    /// Nothing this crate registers is one — partitioning here *is* the limits — but Go and Java
-    /// still write them, and a database is shared.
-    pub fn is_legacy_partitioned(&self) -> bool {
-        self.partition_queue && !self.has_partition_limits()
-    }
-
-    /// This row's limits, each at the scope it is actually enforced at.
-    ///
-    /// **The deprecated flag re-scopes rather than adds.** Under `partition_queue`, `concurrency`,
-    /// `worker_concurrency` and the rate limit all apply *per partition* — so they move into the
-    /// partition fields and the queue-wide ones are dropped, leaving nothing enforced queue-wide.
-    /// That is what the flag has always meant; Python spells it `_resolve_limits` and TypeScript
-    /// `resolveQueueLimits`, both returning exactly this, and reading such a row any other way
-    /// would either over-admit or strand a peer's backlog.
-    ///
-    /// **Everything that enforces a limit reads it through here**, never off the columns: the
-    /// dequeue included, since a legacy row's `concurrency` is not a queue-wide number.
-    pub fn resolved_limits(&self) -> ResolvedLimits {
-        if self.is_legacy_partitioned() {
-            return ResolvedLimits {
-                partition_concurrency: self.concurrency,
-                partition_worker_concurrency: self.worker_concurrency,
-                partition_rate_limit: self.rate_limit,
-                ..ResolvedLimits::default()
-            };
-        }
-        ResolvedLimits {
-            concurrency: self.concurrency,
-            worker_concurrency: self.worker_concurrency,
-            rate_limit: self.rate_limit,
-            partition_concurrency: self.partition_concurrency,
-            partition_worker_concurrency: self.partition_worker_concurrency,
-            partition_rate_limit: self.partition_rate_limit,
-        }
-    }
+/// Whether any per-partition limit is set, which is what partitions a queue.
+///
+/// The one statement of the rule, shared by the stored row, the row to register, and the engine's
+/// `Queue`, since it also decides what the `partition_queue` column holds.
+pub(crate) fn has_partition_limit(
+    partition_concurrency: Option<i32>,
+    partition_worker_concurrency: Option<i32>,
+    partition_rate_limit: Option<RateLimit>,
+) -> bool {
+    partition_concurrency.is_some()
+        || partition_worker_concurrency.is_some()
+        || partition_rate_limit.is_some()
 }
 
 /// A queue to register, as the caller supplies it.
@@ -1860,10 +1795,6 @@ pub struct NewQueue<'a> {
     pub worker_concurrency: Option<i32>,
     /// See [`QueueRecord::rate_limit`].
     pub rate_limit: Option<RateLimit>,
-    /// See [`QueueRecord::priority_enabled`].
-    pub priority_enabled: bool,
-    /// See [`QueueRecord::partition_queue`].
-    pub partition_queue: bool,
     /// See [`QueueRecord::partition_concurrency`].
     pub partition_concurrency: Option<i32>,
     /// See [`QueueRecord::partition_worker_concurrency`].
@@ -1876,6 +1807,18 @@ pub struct NewQueue<'a> {
     pub application_name: Option<&'a str>,
 }
 
+impl NewQueue<'_> {
+    /// Whether the queue is partitioned, which any per-partition limit makes it. The same rule as
+    /// [`QueueRecord::is_partitioned`], for the row before it is written.
+    pub fn is_partitioned(&self) -> bool {
+        has_partition_limit(
+            self.partition_concurrency,
+            self.partition_worker_concurrency,
+            self.partition_rate_limit,
+        )
+    }
+}
+
 impl<'a> NewQueue<'a> {
     /// A queue with no limits, polling once a second — the defaults every implementation shares.
     pub fn new(name: &'a str) -> Self {
@@ -1884,8 +1827,6 @@ impl<'a> NewQueue<'a> {
             concurrency: None,
             worker_concurrency: None,
             rate_limit: None,
-            priority_enabled: false,
-            partition_queue: false,
             partition_concurrency: None,
             partition_worker_concurrency: None,
             partition_rate_limit: None,

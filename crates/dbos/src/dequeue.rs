@@ -33,8 +33,8 @@ use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    Applications, NewWorkflow, QueueRecord, ResolvedLimits, Submission, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus,
+    Applications, NewWorkflow, QueueRecord, Submission, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
@@ -306,8 +306,6 @@ fn internal_queue() -> QueueRecord {
         concurrency: None,
         worker_concurrency: None,
         rate_limit: None,
-        priority_enabled: false,
-        partition_queue: false,
         partition_concurrency: None,
         partition_worker_concurrency: None,
         partition_rate_limit: None,
@@ -359,11 +357,11 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
 /// Local by construction: worker concurrency is the limit a process can answer without asking the
 /// database. A per-partition worker limit of zero pauses this worker outright — nothing this crate
 /// registers can hold one, since validation wants at least 1, but a peer's row can.
-fn worker_budget(limits: &ResolvedLimits, running: i64) -> Option<i64> {
-    if limits.partition_worker_concurrency.is_some_and(|w| w <= 0) {
+fn worker_budget(queue: &QueueRecord, running: i64) -> Option<i64> {
+    if queue.partition_worker_concurrency.is_some_and(|w| w <= 0) {
         return Some(0);
     }
-    limits
+    queue
         .worker_concurrency
         .map(|worker| (i64::from(worker) - running).max(0))
 }
@@ -381,9 +379,7 @@ async fn poll_once(
     queue: &QueueRecord,
     running: &Arc<Running>,
 ) -> Option<Contention> {
-    let limits = queue.resolved_limits();
-
-    if !limits.is_partitioned() {
+    if !queue.is_partitioned() {
         return match executor
             .sysdb()
             .start_queued_workflows(
@@ -407,7 +403,7 @@ async fn poll_once(
     // Snapshot once. Dispatch is asynchronous, so re-reading between partitions would count this
     // poll's own claims twice — once in the tally and once in `claimed`.
     let already_running = running.count(&queue.name);
-    let budget = worker_budget(&limits, already_running);
+    let budget = worker_budget(queue, already_running);
     if budget == Some(0) {
         return None;
     }
@@ -415,10 +411,10 @@ async fn poll_once(
     // The batched path, and the only one that does not count: see
     // `start_queued_partitioned_workflows` for why these four conditions are the whole of its
     // precondition.
-    if limits.partition_concurrency == Some(1)
-        && limits.concurrency.is_none()
-        && limits.rate_limit.is_none()
-        && limits.partition_rate_limit.is_none()
+    if queue.partition_concurrency == Some(1)
+        && queue.concurrency.is_none()
+        && queue.rate_limit.is_none()
+        && queue.partition_rate_limit.is_none()
     {
         return match executor
             .sysdb()
@@ -447,7 +443,7 @@ async fn poll_once(
 
     let mut claimed_here = 0i64;
     for partition in partitions {
-        if worker_budget(&limits, already_running + claimed_here) == Some(0) {
+        if worker_budget(queue, already_running + claimed_here) == Some(0) {
             break;
         }
         let claimed = match executor

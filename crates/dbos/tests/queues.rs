@@ -284,6 +284,99 @@ async fn a_per_process_limit_may_equal_the_fleet_limit() {
     dbos.shutdown().await;
 }
 
+/// **The two rate limits are not compared**, because their windows need not match, and the
+/// per-partition one binds even where its long-run rate is the higher.
+///
+/// 2 per minute per partition is twice the long-run rate of 10 per ten minutes queue-wide, so a
+/// comparison of rates would refuse it. It still caps each key's burst: of four workflows per key,
+/// the queue-wide window would start all eight, and the per-partition one starts two of each. Both
+/// windows outlast the test, so none of them reopens while it runs.
+#[tokio::test]
+async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-burst-cap-app", &db));
+
+    let started: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+    let workflow = dbos
+        .register_workflow("burst", {
+            let started = Arc::clone(&started);
+            move |key: String| {
+                let started = Arc::clone(&started);
+                async move {
+                    *started.lock().unwrap().entry(key.clone()).or_default() += 1;
+                    Ok::<String, Error>(key)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let queue_wide = RateLimit {
+        limit: 10,
+        period: Duration::from_secs(600),
+    };
+    let per_partition = RateLimit {
+        limit: 2,
+        period: Duration::from_secs(60),
+    };
+    let queue = dbos
+        .register_queue(
+            "burst-capped",
+            QueueOptions {
+                rate_limit: Some(queue_wide),
+                partition_rate_limit: Some(per_partition),
+                polling_interval: Duration::from_millis(100),
+                ..QueueOptions::default()
+            },
+            QueueConflict::UpdateIfLatestVersion,
+        )
+        .await
+        .expect("registration was refused");
+    assert_eq!(queue.rate_limit(), Some(queue_wide));
+    assert_eq!(queue.partition_rate_limit(), Some(per_partition));
+
+    for key in ["tenant-a", "tenant-b"] {
+        for n in 0..4 {
+            workflow
+                .start_with(
+                    key.to_owned(),
+                    StartOptions {
+                        workflow_id: Some(&format!("{key}-{n}")),
+                        queue: Some(Enqueue {
+                            partition_key: Some(key),
+                            ..Enqueue::new("burst-capped")
+                        }),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+                .expect("enqueue failed");
+        }
+    }
+
+    let per_key = || {
+        let started = started.lock().unwrap();
+        ["tenant-a", "tenant-b"].map(|key| started.get(key).copied().unwrap_or(0))
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while per_key().iter().sum::<usize>() < 4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the queue never started four: {:?}", per_key()));
+
+    // Ten more polls: a limit that only slowed the burst would admit more here.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        per_key(),
+        [2, 2],
+        "the per-partition limit did not cap each key's burst"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// Registering a queue needs a launched instance, because it is a write.
 #[tokio::test]
 async fn registering_before_launch_is_refused() {
@@ -1279,7 +1372,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 /// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
 /// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less value
 /// to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`). What is
-/// left is the pair no shape can express.
+/// left is what no shape can express.
 #[tokio::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;
@@ -1297,15 +1390,6 @@ async fn an_incoherent_enqueue_is_refused() {
     .expect("registration failed");
 
     let cases = [
-        (
-            "a deduplication id beside a partition key",
-            Enqueue {
-                deduplication_id: Some("key"),
-                partition_key: Some("shard-1"),
-                ..Enqueue::new("demo-queue")
-            },
-            "`deduplication_id` and `partition_key` cannot both be set",
-        ),
         (
             "the unprioritised sentinel spelled as a priority",
             Enqueue {
@@ -1517,6 +1601,88 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
                 ..StartOptions::default()
             },
         )
+        .await
+        .expect("the key was not released when the holder finished");
+
+    dbos.shutdown().await;
+}
+
+/// **A deduplication id is held across the whole queue, partitions included.**
+///
+/// A key held on one partition refuses the same key on another, and `ReturnExisting` joins the
+/// holder whichever partition it is in. The key is released when the holder finishes, after which
+/// any partition may take it. The queue is registered only after the collisions, so nothing
+/// dequeues the holder until then.
+#[tokio::test]
+async fn a_deduplication_id_is_held_across_partitions() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("enqueue-dedup-partition-app", &db));
+    let workflow = dbos
+        .register_workflow("per-tenant", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let on = |partition, policy| Enqueue {
+        deduplication_id: Some("nightly-report"),
+        partition_key: Some(partition),
+        duplication_policy: policy,
+        ..Enqueue::new("tenants")
+    };
+    let start = |id, queue| {
+        workflow.start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                queue: Some(queue),
+                ..StartOptions::default()
+            },
+        )
+    };
+
+    let holder = start("tenant-a-report", on("tenant-a", DuplicationPolicy::Reject))
+        .await
+        .expect("the first enqueue failed");
+
+    let error = start("tenant-b-report", on("tenant-b", DuplicationPolicy::Reject))
+        .await
+        .expect_err("another partition took the held key");
+    assert!(
+        format!("{error}").contains("nightly-report"),
+        "the refusal must name the key, got {error:?}"
+    );
+
+    let joined = start(
+        "tenant-c-report",
+        on("tenant-c", DuplicationPolicy::ReturnExisting),
+    )
+    .await
+    .expect("return-existing was refused");
+    assert_eq!(
+        joined.workflow_id(),
+        "tenant-a-report",
+        "return-existing joins the holder in the other partition"
+    );
+
+    dbos.register_queue(
+        "tenants",
+        QueueOptions {
+            partition_concurrency: Some(1),
+            ..QueueOptions::default()
+        },
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(20), holder.result())
+            .await
+            .expect("the holder never ran")
+            .expect("the holder failed"),
+        7
+    );
+
+    // Finishing released the key, so another partition can take it now.
+    start("tenant-b-report", on("tenant-b", DuplicationPolicy::Reject))
         .await
         .expect("the key was not released when the holder finished");
 
@@ -1810,12 +1976,13 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
 
     dbos.shutdown().await;
 }
-/// A rate limit and priority ordering are stored, reported, and changeable at runtime.
+/// A rate limit is stored, reported, and changeable at runtime, and every queue is stored as a
+/// priority queue.
 ///
-/// The dequeue honours both — `start_queued_workflows` counts a window's starts and orders by
-/// priority — so what this pins is the way to ask for them.
+/// There is no priority switch: the dequeue orders every queue by priority, so the
+/// `priority_enabled` column is always written `TRUE`, for readers that still consult it.
 #[tokio::test]
-async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
+async fn a_queue_carries_a_rate_limit_and_is_always_a_priority_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-limits-app", &db));
     dbos.launch().await.expect("launch failed");
@@ -1829,7 +1996,6 @@ async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
             "limited-queue",
             QueueOptions {
                 rate_limit: Some(limit),
-                priority_enabled: true,
                 ..QueueOptions::default()
             },
             QueueConflict::UpdateIfLatestVersion,
@@ -1837,23 +2003,44 @@ async fn a_queue_carries_a_rate_limit_and_priority_ordering() {
         .await
         .expect("registration failed");
     assert_eq!(queue.rate_limit(), Some(limit));
-    assert!(queue.priority_enabled());
     assert!(!queue.is_partitioned());
 
-    // Changed at runtime, like every other limit: cleared, and priority turned back off.
+    let pool = db.pool().await;
+    let priority_enabled = || async {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT priority_enabled FROM "dbos"."queues" WHERE name = 'limited-queue'"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read failed")
+    };
+    assert!(priority_enabled().await, "registered as a priority queue");
+
+    // A row stored `FALSE` before every queue was a priority queue is corrected by its next
+    // update, whatever the update names.
+    sqlx::query(
+        r#"UPDATE "dbos"."queues" SET priority_enabled = FALSE WHERE name = 'limited-queue'"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("clearing the flag failed");
+
+    // Changed at runtime, like every other limit.
     let updated = dbos
         .update_queue(
             "limited-queue",
             QueueChange {
                 rate_limit: Change::Set(None),
-                priority_enabled: Change::Set(false),
                 ..QueueChange::default()
             },
         )
         .await
         .expect("update failed");
     assert_eq!(updated.rate_limit(), None);
-    assert!(!updated.priority_enabled());
+    assert!(
+        priority_enabled().await,
+        "the update rewrote the stored flag to TRUE"
+    );
 
     dbos.shutdown().await;
 }
@@ -1940,38 +2127,6 @@ async fn an_unhonourable_queue_configuration_is_refused() {
             "`worker_concurrency` must be greater than or equal to \
              `partition_worker_concurrency`",
         ),
-        (
-            "a partition allowed to start faster than the whole queue",
-            QueueOptions {
-                rate_limit: Some(RateLimit {
-                    limit: 10,
-                    period: Duration::from_secs(1),
-                }),
-                partition_rate_limit: Some(RateLimit {
-                    limit: 100,
-                    period: Duration::from_secs(1),
-                }),
-                ..QueueOptions::default()
-            },
-            "`rate_limit` must allow at least the rate `partition_rate_limit` does",
-        ),
-        (
-            // The counts alone say the opposite — 5 is below 10 — so only comparing the two as
-            // rates catches this one.
-            "a partition faster than the queue over a different window",
-            QueueOptions {
-                rate_limit: Some(RateLimit {
-                    limit: 10,
-                    period: Duration::from_secs(60),
-                }),
-                partition_rate_limit: Some(RateLimit {
-                    limit: 5,
-                    period: Duration::from_secs(1),
-                }),
-                ..QueueOptions::default()
-            },
-            "`rate_limit` must allow at least the rate `partition_rate_limit` does",
-        ),
     ];
 
     for (what, options, expected) in cases {
@@ -2029,8 +2184,8 @@ async fn an_unhonourable_queue_configuration_is_refused() {
 /// Per-partition limits sit beside the queue-wide ones, and partitioning is derived from them.
 ///
 /// There is no `partition_queue` switch on this surface: setting a partition limit is the
-/// statement that partitions exist, and the stored flag — which is what an implementation still
-/// reading it sees — follows the limits in both directions.
+/// statement that partitions exist, and the stored column, written for readers that still consult
+/// it, follows the limits in both directions.
 #[tokio::test]
 async fn per_partition_limits_partition_a_queue() {
     let db = test_database().await;
@@ -2056,15 +2211,18 @@ async fn per_partition_limits_partition_a_queue() {
     assert_eq!(queue.partition_concurrency(), Some(4));
     assert_eq!(queue.partition_worker_concurrency(), Some(2));
 
-    let stored = reader(&db)
-        .await
-        .get_queue("sharded")
+    let pool = db.pool().await;
+    let stored_flag = || async {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT partition_queue FROM "dbos"."queues" WHERE name = 'sharded'"#,
+        )
+        .fetch_one(&pool)
         .await
         .expect("read failed")
-        .expect("no row");
+    };
     assert!(
-        stored.partition_queue,
-        "the derived flag is written for implementations that still read it"
+        stored_flag().await,
+        "the derived flag is written for readers that still consult it"
     );
 
     // Clearing the last partition limit un-partitions the queue, flag included.
@@ -2085,40 +2243,36 @@ async fn per_partition_limits_partition_a_queue() {
         Some(60),
         "the queue-wide limits are untouched"
     );
-    let stored = reader(&db)
-        .await
-        .get_queue("sharded")
-        .await
-        .expect("read failed")
-        .expect("no row");
-    assert!(
-        !stored.partition_queue,
-        "the flag follows the limits back off"
-    );
+    assert!(!stored_flag().await, "the flag follows the limits back off");
 }
 
-/// A row a peer wrote with the deprecated flag is read as the per-partition limits it means.
-///
-/// Under `partition_queue` every queue-wide limit applies per partition, so that is where they are
-/// reported — matching Python's `_resolve_limits` and TypeScript's `resolveQueueLimits`. Go and
-/// Java still write rows in this shape.
+/// **The stored `partition_queue` flag is not read.** A row with the flag set and only queue-wide
+/// limits, the shape the deprecated flag used to give "these limits apply per partition", is an
+/// unpartitioned queue with queue-wide limits: it reports no partitioning, takes a per-partition
+/// limit like any other queue, and dequeues a workflow that carries no partition key.
 #[tokio::test]
-async fn a_legacy_partitioned_row_is_read_as_per_partition_limits() {
+async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
     let db = test_database().await;
     let sys = reader(&db).await;
     sys.upsert_queue(
         &NewQueue {
             concurrency: Some(1),
             worker_concurrency: Some(1),
-            partition_queue: true,
             ..NewQueue::new("legacy")
         },
         OnExistingQueue::Update,
     )
     .await
     .expect("write failed");
+    sqlx::query(r#"UPDATE "dbos"."queues" SET partition_queue = TRUE WHERE name = 'legacy'"#)
+        .execute(&db.pool().await)
+        .await
+        .expect("flagging the row failed");
 
     let dbos = DBOS::new(config("queue-legacy-app", &db));
+    let workflow = dbos
+        .register_workflow("unkeyed", |n: u32| async move { Ok::<u32, Error>(n + 1) })
+        .unwrap();
     dbos.launch().await.expect("launch failed");
     let queue = dbos
         .queue("legacy")
@@ -2126,34 +2280,46 @@ async fn a_legacy_partitioned_row_is_read_as_per_partition_limits() {
         .expect("read failed")
         .expect("no queue");
 
-    assert!(queue.is_partitioned());
-    assert_eq!(
-        queue.partition_concurrency(),
-        Some(1),
-        "the flag re-scopes the queue-wide limit rather than adding to it"
-    );
-    assert_eq!(queue.partition_worker_concurrency(), Some(1));
+    assert!(!queue.is_partitioned(), "the flag alone partitions nothing");
     assert_eq!(
         queue.concurrency(),
-        None,
-        "nothing is enforced queue-wide on a legacy row"
+        Some(1),
+        "the queue-wide limit stays queue-wide"
     );
+    assert_eq!(queue.worker_concurrency(), Some(1));
+    assert_eq!(queue.partition_concurrency(), None);
 
-    // Adding a per-partition limit to such a row is refused rather than leaving two answers in it.
-    let error = dbos
+    // Unpartitioned, so a workflow without a key is dequeued and runs. Bounded, so a regression
+    // that reads the flag again fails here rather than hanging on a workflow nothing dequeues.
+    let handle = workflow
+        .start_with(
+            41,
+            StartOptions {
+                queue: Some(Enqueue::new("legacy")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    let output = tokio::time::timeout(Duration::from_secs(20), handle.result())
+        .await
+        .expect("the unkeyed workflow was never dequeued")
+        .expect("the workflow failed");
+    assert_eq!(output, 42);
+
+    // And a per-partition limit is taken like on any other queue.
+    let updated = dbos
         .update_queue(
             "legacy",
             QueueChange {
-                partition_concurrency: Change::Set(Some(4)),
+                partition_concurrency: Change::Set(Some(1)),
                 ..QueueChange::default()
             },
         )
         .await
-        .expect_err("the update was accepted");
-    assert!(
-        matches!(&error, Error::Config(message) if message.contains("deprecated `partition_queue`")),
-        "got {error:?}"
-    );
+        .expect("the update was refused");
+    assert!(updated.is_partitioned());
+    assert_eq!(updated.concurrency(), Some(1));
 
     dbos.shutdown().await;
 }

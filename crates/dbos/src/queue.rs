@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::sysdb::types::{
     Applications, Change, NewQueue, OnExistingQueue, QueueRecord, QueueUpdate, RateLimit,
+    has_partition_limit,
 };
 use crate::sysdb::{Error as SysdbError, INTERNAL_QUEUE};
 
@@ -44,20 +45,15 @@ pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 /// Holding one is not what makes a queue work — the name is the address, and
 /// [`StartOptions::queue`](crate::StartOptions::queue) takes a name. This is a receipt.
 ///
-/// **Its own fields rather than a wrapped [`QueueRecord`]**, which is what Go's `queueFromConfig`,
-/// TypeScript's `WorkflowQueue._fromRecord` and Python's `ResolvedQueueLimits` each build too. Two
-/// reasons: this reports every limit at the scope it is enforced at, where the row spells them as
-/// the columns a deprecated `partition_queue` flag re-scopes; and derived equality over a wrapped
-/// row would compare [`application_name`](QueueRecord::application_name) and `partition_queue`,
-/// neither of which this type reports, so two queues identical through every accessor here could
-/// still differ.
+/// **Its own fields rather than a wrapped [`QueueRecord`]**, because derived equality over a
+/// wrapped row would compare [`application_name`](QueueRecord::application_name), which this type
+/// does not report, so two queues identical through every accessor here could still differ.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queue {
     name: String,
     concurrency: Option<i32>,
     worker_concurrency: Option<i32>,
     rate_limit: Option<RateLimit>,
-    priority_enabled: bool,
     partition_concurrency: Option<i32>,
     partition_worker_concurrency: Option<i32>,
     partition_rate_limit: Option<RateLimit>,
@@ -66,27 +62,16 @@ pub struct Queue {
 
 impl Queue {
     /// Builds the receipt from the row that was read back.
-    ///
-    /// **Reports the limits resolved, not as the row spells them.** For a queue this crate
-    /// registered the two are the same. For one a peer wrote with the deprecated `partition_queue`
-    /// flag they are not: that flag means every queue-wide limit applies per partition, so
-    /// [`QueueRecord::resolved_limits`] moves them into the partition fields and the receipt says
-    /// what the queue actually does rather than which columns happen to hold it.
     fn from_record(record: QueueRecord) -> Self {
-        let name = record.name.clone();
-        let polling_interval = record.polling_interval;
-        let priority_enabled = record.priority_enabled;
-        let limits = record.resolved_limits();
         Self {
-            name,
-            concurrency: limits.concurrency,
-            worker_concurrency: limits.worker_concurrency,
-            rate_limit: limits.rate_limit,
-            priority_enabled,
-            partition_concurrency: limits.partition_concurrency,
-            partition_worker_concurrency: limits.partition_worker_concurrency,
-            partition_rate_limit: limits.partition_rate_limit,
-            polling_interval,
+            name: record.name,
+            concurrency: record.concurrency,
+            worker_concurrency: record.worker_concurrency,
+            rate_limit: record.rate_limit,
+            partition_concurrency: record.partition_concurrency,
+            partition_worker_concurrency: record.partition_worker_concurrency,
+            partition_rate_limit: record.partition_rate_limit,
+            polling_interval: record.polling_interval,
         }
     }
 
@@ -110,16 +95,13 @@ impl Queue {
         self.rate_limit
     }
 
-    /// Whether dequeue order honours a workflow's priority.
-    pub fn priority_enabled(&self) -> bool {
-        self.priority_enabled
-    }
-
     /// Whether the queue is partitioned, which any per-partition limit makes it.
     pub fn is_partitioned(&self) -> bool {
-        self.partition_concurrency.is_some()
-            || self.partition_worker_concurrency.is_some()
-            || self.partition_rate_limit.is_some()
+        has_partition_limit(
+            self.partition_concurrency,
+            self.partition_worker_concurrency,
+            self.partition_rate_limit,
+        )
     }
 
     /// How many of this queue's workflows may run at once **within one partition**, fleet-wide.
@@ -171,13 +153,15 @@ impl Queue {
 ///
 /// **Every limit set is enforced, and the tightest wins.** They are not alternatives: a queue can
 /// say "sixty at a time overall, four per customer, and no more than two of those in any one
-/// process" by setting three of the four. A limit narrower in scope may not exceed the one that
-/// contains it — a per-partition allowance above the queue-wide one could never bind — and that is
-/// refused at registration rather than stored.
+/// process" by setting three of the four. A concurrency limit narrower in scope may not exceed the
+/// one that contains it — a per-partition allowance above the queue-wide one could never bind — and
+/// that is refused at registration rather than stored.
 ///
-/// The rate limits pair the same way: [`rate_limit`](Self::rate_limit) governs the queue,
+/// The rate limits pair the same way in scope: [`rate_limit`](Self::rate_limit) governs the queue,
 /// [`partition_rate_limit`](Self::partition_rate_limit) governs one key, and both are counted in
-/// the database over a trailing window.
+/// the database over a trailing window. They are not compared with each other, because their
+/// windows need not match: a per-partition limit over a shorter window caps bursts the queue-wide
+/// one allows, even where its long-run rate is higher.
 ///
 /// Setting any per-partition limit is what **partitions** the queue; there is no separate switch.
 /// See [`partition_concurrency`](Self::partition_concurrency).
@@ -198,11 +182,8 @@ pub struct QueueOptions {
     /// [`worker_concurrency`](Self::worker_concurrency) is the per-process one, and `worker_` is
     /// the whole of what marks it.
     ///
-    /// Spelled as the column is. Python, TypeScript and Go renamed theirs `global_concurrency`
-    /// once a per-partition limit existed, because under their deprecated `partition_queue` flag a
-    /// bare `concurrency` silently *became* per-partition and the name had stopped being true.
-    /// Nothing here re-scopes a limit, so this one is fleet-wide whatever else the queue carries
-    /// and the qualifier would mark a distinction that does not exist.
+    /// Spelled as the column is. Nothing re-scopes a limit, so this one is fleet-wide whatever
+    /// else the queue carries, partition limits included.
     pub concurrency: Option<i32>,
     /// How many of this queue's workflows may run at once in **this** process.
     ///
@@ -223,15 +204,8 @@ pub struct QueueOptions {
     /// nothing without selecting anything.
     ///
     /// Queue-wide, so a partitioned queue may carry this *and* a
-    /// [`partition_rate_limit`](Self::partition_rate_limit): both are enforced, and the
-    /// per-partition one may not exceed it.
+    /// [`partition_rate_limit`](Self::partition_rate_limit), and both are enforced.
     pub rate_limit: Option<RateLimit>,
-    /// Whether dequeue order honours a workflow's
-    /// [priority](crate::Enqueue::priority), lowest first.
-    ///
-    /// Off by default, which is every implementation's default: an unprioritised queue is FIFO by
-    /// `created_at`, and that is what most queues want.
-    pub priority_enabled: bool,
     /// How many of this queue's workflows may run at once **within one partition**, across every
     /// executor.
     ///
@@ -241,10 +215,9 @@ pub struct QueueOptions {
     /// [`Enqueue::partition_key`](crate::Enqueue::partition_key); work sharing a key contends for
     /// these limits, work under different keys does not.
     ///
-    /// `partition_concurrency: Some(1)` is the one-workflow-per-key ordering that the deprecated
-    /// `partition_queue` flag meant in the other implementations — see [`QueueRecord`] on how a
-    /// row written by one of them is read here. It is also the only shape the batched sweep can
-    /// dequeue; see [`SystemDatabase::start_queued_partitioned_workflows`].
+    /// `partition_concurrency: Some(1)` runs one workflow per key at a time. It is also the only
+    /// shape the batched sweep can dequeue; see
+    /// [`SystemDatabase::start_queued_partitioned_workflows`].
     ///
     /// [`SystemDatabase::start_queued_partitioned_workflows`]:
     ///     crate::sysdb::SystemDatabase::start_queued_partitioned_workflows
@@ -259,9 +232,9 @@ pub struct QueueOptions {
     /// How fast this queue's workflows may start within one partition, or `None` for unthrottled.
     ///
     /// The per-partition counterpart of [`rate_limit`](Self::rate_limit), counted in the database
-    /// against the starts in the trailing window that share the partition key, and may not allow
-    /// a faster rate than that one does — the two periods need not match, so it is the rates that
-    /// are compared and not the counts.
+    /// against the starts in the trailing window that share the partition key. Not compared with
+    /// that one: with 100 per 10 s queue-wide, 20 per 1 s per partition still binds, holding each
+    /// key to 20 in a second the queue-wide window would let 100 through.
     pub partition_rate_limit: Option<RateLimit>,
 }
 
@@ -272,7 +245,6 @@ impl Default for QueueOptions {
             worker_concurrency: None,
             polling_interval: DEFAULT_POLLING_INTERVAL,
             rate_limit: None,
-            priority_enabled: false,
             partition_concurrency: None,
             partition_worker_concurrency: None,
             partition_rate_limit: None,
@@ -301,16 +273,15 @@ pub struct QueueChange {
     ///
     /// One field for both stored columns, so an update cannot leave half a limit behind.
     pub rate_limit: Change<Option<RateLimit>>,
-    /// Whether dequeue order honours priority.
-    pub priority_enabled: Change<bool>,
     /// How many may run at once within one partition, across every executor.
     ///
     /// **Setting or clearing this partitions or un-partitions the queue**, since partitioning is
     /// derived from the limits. Doing so to a queue with a backlog re-reads that backlog under
     /// different rules: rows already `ENQUEUED` keep whatever partition key they were given, so
-    /// partitioning a queue whose backlog has no keys leaves that work in a single unnamed
-    /// partition, and un-partitioning one releases every key's work at once. Neither is
-    /// corruption, and neither is likely what was meant mid-flight.
+    /// partitioning a queue whose backlog has no keys **strands that work** — a partitioned queue
+    /// is dequeued one key at a time, and an unkeyed row is in no partition — and un-partitioning
+    /// one releases every key's work at once. [`DBOS::update_queue`] logs a warning when an update
+    /// partitions a queue; drain the queue first, or re-enqueue the stranded work with a key.
     pub partition_concurrency: Change<Option<i32>>,
     /// How many may run at once within one partition, in one process.
     pub partition_worker_concurrency: Change<Option<i32>>,
@@ -483,8 +454,9 @@ fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, 
     }
     // **A per-partition limit above its queue-wide counterpart never binds.** The queue-wide one
     // is reached first and is the only one that ever stops anything, so the per-partition number
-    // would sit in the row saying something the dequeue can never do. Python and TypeScript
-    // refuse the same four concurrency comparisons; the rate-limit pair below is Rust-only.
+    // would sit in the row saying something the dequeue can never do. Only concurrency is
+    // compared: the rate limits are not, because a per-partition window shorter than the
+    // queue-wide one caps bursts the queue-wide one allows (see `QueueOptions`).
     if let (Some(partition), Some(worker)) = (
         options.partition_worker_concurrency,
         options.worker_concurrency,
@@ -531,29 +503,6 @@ fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, 
             format!(
                 "`concurrency` must be greater than or equal to \
                  `partition_worker_concurrency`, got {global} and {partition}"
-            ),
-        );
-    }
-    // The rate limits pair the same way, and `rate_limit`'s documentation says so — but the
-    // comparison is not `>`, because a rate limit is a count over a window and the two windows
-    // need not match. Compared as rates, cross-multiplied rather than divided so that neither
-    // side loses precision, in `u128` so that neither product can overflow. Both `limit`s are
-    // at least 1 by the checks above, so the casts are widening.
-    //
-    // Python and TypeScript stop after the four concurrency pairs and would store this one.
-    // Refusing it here follows the rule the other four rest on rather than the reference
-    // implementations, which is a deliberate divergence — `10/s` queue-wide with `100/s` per
-    // partition is a row whose second number the dequeue can never reach.
-    if let (Some(partition), Some(global)) = (options.partition_rate_limit, options.rate_limit)
-        && u128::from(partition.limit.unsigned_abs()) * global.period.as_nanos()
-            > u128::from(global.limit.unsigned_abs()) * partition.period.as_nanos()
-    {
-        return refuse(
-            "partition_rate_limit",
-            format!(
-                "`rate_limit` must allow at least the rate `partition_rate_limit` does, \
-                 got {}/{:?} and {}/{:?}",
-                global.limit, global.period, partition.limit, partition.period
             ),
         );
     }
@@ -672,6 +621,20 @@ impl DBOS {
 // `impl DBOS`. The public methods differ only in how they come by a connection, and in the
 // application version only one of them has.
 
+/// Warns that a write has just partitioned a queue that was not partitioned.
+///
+/// **Partitioning a queue can strand what is already on it.** A partitioned queue is dequeued
+/// partition by partition, and its partitions are the keys present on its rows, so a row enqueued
+/// without a key is never claimed.
+fn warn_partitioned(name: &str) {
+    tracing::warn!(
+        queue = name,
+        "the queue is now partitioned; any workflow already enqueued on it without a partition key \
+         will never be dequeued, so drain it before partitioning it or re-enqueue such workflows \
+         with a key"
+    );
+}
+
 impl Connection {
     /// Registers a queue, or reports the one already registered under this name.
     ///
@@ -744,7 +707,8 @@ impl Connection {
             }
         };
 
-        let created = self
+        // The row as found and the row as left, both read in the registration's transaction.
+        let upserted = self
             .sysdb()
             .upsert_queue(
                 &NewQueue {
@@ -752,13 +716,6 @@ impl Connection {
                     worker_concurrency: options.worker_concurrency,
                     polling_interval: options.polling_interval,
                     rate_limit: options.rate_limit,
-                    priority_enabled: options.priority_enabled,
-                    // **Derived, never asked for.** Partitioning here *is* the per-partition
-                    // limits, so the column is written to agree with them — which is also what
-                    // makes the row legible to an implementation that still reads the flag.
-                    partition_queue: options.partition_concurrency.is_some()
-                        || options.partition_worker_concurrency.is_some()
-                        || options.partition_rate_limit.is_some(),
                     partition_concurrency: options.partition_concurrency,
                     partition_worker_concurrency: options.partition_worker_concurrency,
                     partition_rate_limit: options.partition_rate_limit,
@@ -770,23 +727,16 @@ impl Connection {
             .await
             .map_err(Error::SystemDatabase)?;
 
-        // Read back rather than echo: with `Leave`, and with a row a peer wrote, what this
-        // executor will actually dequeue under is the row, not the request.
-        let record = self
-            .sysdb()
-            .get_queue(name)
-            .await
-            .map_err(Error::SystemDatabase)?
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "queue `{name}` is missing from the database after registering it"
-                ))
-            })?;
-
-        if created {
-            tracing::info!(queue = name, "registered a queue");
+        // The row as left rather than an echo of the request: with `Leave`, and with a row a peer
+        // wrote, what this executor will actually dequeue under is the row.
+        match &upserted.before {
+            None => tracing::info!(queue = name, "registered a queue"),
+            Some(before) if !before.is_partitioned() && upserted.after.is_partitioned() => {
+                warn_partitioned(name);
+            }
+            Some(_) => {}
         }
-        Ok(Queue::from_record(record))
+        Ok(Queue::from_record(upserted.after))
     }
     /// The queue registered under this name, or `None` if there is none.
     pub(crate) async fn queue(&self, name: &str) -> Result<Option<Queue>> {
@@ -824,64 +774,38 @@ impl Connection {
         // The merged row rather than the change, because a limit is rarely wrong on its own:
         // `worker_concurrency` is always fine by itself and only becomes wrong beside the
         // `concurrency` already stored.
-        //
-        // Resolved rather than raw, so an update to a peer's legacy-partitioned row is judged
-        // against the scopes its limits are actually enforced at.
-        let touches_partition = !(change.partition_concurrency.is_leave()
-            && change.partition_worker_concurrency.is_leave()
-            && change.partition_rate_limit.is_leave());
-        let validate = |stored: &QueueRecord, merged: &QueueRecord| -> StdResult<(), SysdbError> {
-            // **A legacy-partitioned row cannot take a per-partition limit.** Its queue-wide
-            // limits already *are* its per-partition ones, so adding a second set would leave two
-            // answers to the same question in one row. TypeScript refuses the same six setters
-            // (`requireNotLegacyPartitioned`); re-register the queue to move it across.
-            //
-            // Asked of the row as stored, not as merged: a change that clears the last partition
-            // limit leaves a row that *looks* legacy — flag still set, no limits — and refusing
-            // that would make un-partitioning impossible.
-            if touches_partition && stored.is_legacy_partitioned() {
-                return Err(SysdbError::InvalidInput {
-                    field: "partition_concurrency".into(),
-                    detail: "this queue is registered with the deprecated `partition_queue` flag, \
-                                 under which its queue-wide limits already apply per partition; \
-                                 re-register it with the per-partition limits instead"
-                        .to_owned(),
-                });
-            }
-            let limits = merged.resolved_limits();
+        let validate = |_stored: &QueueRecord, merged: &QueueRecord| -> StdResult<(), SysdbError> {
             let options = QueueOptions {
-                concurrency: limits.concurrency,
-                worker_concurrency: limits.worker_concurrency,
+                concurrency: merged.concurrency,
+                worker_concurrency: merged.worker_concurrency,
                 polling_interval: merged.polling_interval,
-                rate_limit: limits.rate_limit,
-                priority_enabled: merged.priority_enabled,
-                partition_concurrency: limits.partition_concurrency,
-                partition_worker_concurrency: limits.partition_worker_concurrency,
-                partition_rate_limit: limits.partition_rate_limit,
+                rate_limit: merged.rate_limit,
+                partition_concurrency: merged.partition_concurrency,
+                partition_worker_concurrency: merged.partition_worker_concurrency,
+                partition_rate_limit: merged.partition_rate_limit,
             };
             validate_fields(&options)
                 .map_err(|(field, detail)| SysdbError::InvalidInput { field, detail })
         };
 
-        // **The flag follows the limits.** Partitioning is not separately settable, so a change
-        // that sets the first partition limit turns it on and one that clears the last turns it
-        // off. Computing that needs the stored row, so it happens inside the system database's
-        // transaction — `partition_queue_after` is applied to the row the write is locking.
+        // Partitioning is not separately settable: a change that sets the first partition limit
+        // partitions the queue, and one that clears the last un-partitions it. The system
+        // database rewrites the stored `partition_queue` column to match whenever a partition
+        // limit moves.
         let update = QueueUpdate {
             concurrency: change.concurrency,
             worker_concurrency: change.worker_concurrency,
             polling_interval: change.polling_interval,
             rate_limit: change.rate_limit,
-            priority_enabled: change.priority_enabled,
-            partition_queue: Change::Leave,
             partition_concurrency: change.partition_concurrency,
             partition_worker_concurrency: change.partition_worker_concurrency,
             partition_rate_limit: change.partition_rate_limit,
         };
 
         // The row as written, so there is no read back to do: it left the transaction that wrote
-        // it, which is a stronger guarantee than a re-read afterwards could give.
-        let record = self
+        // it, which is a stronger guarantee than a re-read afterwards could give. The row it
+        // replaced comes back beside it, read under the same lock.
+        let updated = self
             .sysdb()
             .update_queue(name, &update, &validate)
             .await
@@ -896,8 +820,12 @@ impl Connection {
                 }
                 other => Error::SystemDatabase(other),
             })?;
-        tracing::info!(queue = name, "updated the queue's limits");
-        Ok(Queue::from_record(record))
+        if !updated.before.is_partitioned() && updated.after.is_partitioned() {
+            warn_partitioned(name);
+        } else {
+            tracing::info!(queue = name, "updated the queue's limits");
+        }
+        Ok(Queue::from_record(updated.after))
     }
     /// Removes a queue's registration.
     pub(crate) async fn delete_queue(&self, name: &str) -> Result<()> {
