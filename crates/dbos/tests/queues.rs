@@ -284,24 +284,40 @@ async fn a_per_process_limit_may_equal_the_fleet_limit() {
     dbos.shutdown().await;
 }
 
-/// **The two rate limits are not compared**, because their windows need not match.
+/// **The two rate limits are not compared**, because their windows need not match, and the
+/// per-partition one binds even where its long-run rate is the higher.
 ///
-/// 20 per second per partition has a higher long-run rate than 100 per 10 seconds queue-wide, but it
-/// still binds: the queue-wide window would let all 100 start in one second, and the per-partition
-/// one holds each key to 20 of them.
+/// 2 per minute per partition is twice the long-run rate of 10 per ten minutes queue-wide, so a
+/// comparison of rates would refuse it. It still caps each key's burst: of four workflows per key,
+/// the queue-wide window would start all eight, and the per-partition one starts two of each. Both
+/// windows outlast the test, so none of them reopens while it runs.
 #[tokio::test]
 async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-burst-cap-app", &db));
+
+    let started: Arc<Mutex<std::collections::HashMap<String, usize>>> = Arc::default();
+    let workflow = dbos
+        .register_workflow("burst", {
+            let started = Arc::clone(&started);
+            move |key: String| {
+                let started = Arc::clone(&started);
+                async move {
+                    *started.lock().unwrap().entry(key.clone()).or_default() += 1;
+                    Ok::<String, Error>(key)
+                }
+            }
+        })
+        .unwrap();
     dbos.launch().await.expect("launch failed");
 
     let queue_wide = RateLimit {
-        limit: 100,
-        period: Duration::from_secs(10),
+        limit: 10,
+        period: Duration::from_secs(600),
     };
     let per_partition = RateLimit {
-        limit: 20,
-        period: Duration::from_secs(1),
+        limit: 2,
+        period: Duration::from_secs(60),
     };
     let queue = dbos
         .register_queue(
@@ -309,6 +325,7 @@ async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
             QueueOptions {
                 rate_limit: Some(queue_wide),
                 partition_rate_limit: Some(per_partition),
+                polling_interval: Duration::from_millis(100),
                 ..QueueOptions::default()
             },
             QueueConflict::UpdateIfLatestVersion,
@@ -317,6 +334,45 @@ async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
         .expect("registration was refused");
     assert_eq!(queue.rate_limit(), Some(queue_wide));
     assert_eq!(queue.partition_rate_limit(), Some(per_partition));
+
+    for key in ["tenant-a", "tenant-b"] {
+        for n in 0..4 {
+            workflow
+                .start_with(
+                    key.to_owned(),
+                    StartOptions {
+                        workflow_id: Some(&format!("{key}-{n}")),
+                        queue: Some(Enqueue {
+                            partition_key: Some(key),
+                            ..Enqueue::new("burst-capped")
+                        }),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+                .expect("enqueue failed");
+        }
+    }
+
+    let per_key = || {
+        let started = started.lock().unwrap();
+        ["tenant-a", "tenant-b"].map(|key| started.get(key).copied().unwrap_or(0))
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while per_key().iter().sum::<usize>() < 4 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the queue never started four: {:?}", per_key()));
+
+    // Ten more polls: a limit that only slowed the burst would admit more here.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        per_key(),
+        [2, 2],
+        "the per-partition limit did not cap each key's burst"
+    );
 
     dbos.shutdown().await;
 }

@@ -1792,6 +1792,34 @@ const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_m
      partition_rate_limit_max, partition_rate_limit_period_sec, polling_interval_sec, \
      application_name";
 
+/// Binds a queue registration to `$1`–`$13`, in the order both of
+/// [`upsert_queue`](SystemDatabase::upsert_queue)'s statements name its columns: the name, the
+/// eleven settings, and the owner.
+fn bind_new_queue<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    queue: &NewQueue<'q>,
+    owner: Option<&'q str>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    query
+        .bind(queue.name)
+        .bind(queue.concurrency)
+        .bind(queue.worker_concurrency)
+        .bind(queue.rate_limit.map(|r| r.limit))
+        .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
+        // Every queue orders by priority, so the column is always written `TRUE` for readers that
+        // still consult it, and never read here.
+        .bind(true)
+        // Derived, never asked for: the column is written to agree with the per-partition limits
+        // for readers that still consult it, and is never read here.
+        .bind(queue.is_partitioned())
+        .bind(queue.partition_concurrency)
+        .bind(queue.partition_worker_concurrency)
+        .bind(queue.partition_rate_limit.map(|r| r.limit))
+        .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
+        .bind(queue.polling_interval.as_secs_f64())
+        .bind(owner)
+}
+
 /// Every column of a schedule row, in the order [`schedule_from_row`] reads them.
 const SCHEDULE_COLUMNS: &str = "schedule_id, schedule_name, workflow_name, workflow_class_name, \
      schedule, status, context, last_fired_at, automatic_backfill, cron_timezone, queue_name, \
@@ -5420,46 +5448,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
         let application_name = queue.application_name.or(self.application_name.as_deref());
-        // Ownership is claimed, never taken: `COALESCE` leaves a row that already has an owner
-        // alone, so a registration landing between the resolve below and this write keeps the
-        // name it took. The stored limits are a different matter — those the caller asked to
-        // replace.
-        let on_conflict = match on_existing {
-            OnExistingQueue::Update => format!(
-                "ON CONFLICT (name) DO UPDATE SET \
-                   concurrency = EXCLUDED.concurrency, \
-                   worker_concurrency = EXCLUDED.worker_concurrency, \
-                   rate_limit_max = EXCLUDED.rate_limit_max, \
-                   rate_limit_period_sec = EXCLUDED.rate_limit_period_sec, \
-                   priority_enabled = EXCLUDED.priority_enabled, \
-                   partition_queue = EXCLUDED.partition_queue, \
-                   partition_concurrency = EXCLUDED.partition_concurrency, \
-                   partition_worker_concurrency = EXCLUDED.partition_worker_concurrency, \
-                   partition_rate_limit_max = EXCLUDED.partition_rate_limit_max, \
-                   partition_rate_limit_period_sec = EXCLUDED.partition_rate_limit_period_sec, \
-                   polling_interval_sec = EXCLUDED.polling_interval_sec, \
-                   updated_at = EXCLUDED.updated_at, \
-                   application_name = COALESCE({queues_table}.application_name, EXCLUDED.application_name)"
-            ),
-            OnExistingQueue::Leave => "ON CONFLICT (name) DO NOTHING".to_owned(),
-        };
-        let on_conflict = on_conflict.as_str();
 
         with_retry(&self.retry, "upsert_queue", move || async move {
             let mut tx = pool.begin().await?;
-
-            // Read before the write, because afterwards there is no way to tell a row this call
-            // created from one it found — both leave a row behind. Locked, so the row returned as
-            // the one replaced is the one the write below actually replaces.
-            let before = sqlx::query(AssertSqlSafe(format!(
-                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
-            )))
-            .bind(queue.name)
-            .fetch_optional(&mut *tx)
-            .await?
-            .as_ref()
-            .map(queue_from_row)
-            .transpose()?;
 
             // A peer holding the name is refused in either mode: the name is the queue's address,
             // so registering over it would point this application at a peer's work.
@@ -5473,39 +5464,55 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
 
-            sqlx::query(AssertSqlSafe(format!(
-                "INSERT INTO {queues_table} \
-                 (name, concurrency, worker_concurrency, rate_limit_max, rate_limit_period_sec, \
-                  priority_enabled, partition_queue, partition_concurrency, \
-                  partition_worker_concurrency, partition_rate_limit_max, \
-                  partition_rate_limit_period_sec, polling_interval_sec, updated_at, \
-                  application_name) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {NOW_MS_SQL}, $13) \
-                 {on_conflict}"
-            )))
-            .bind(queue.name)
-            .bind(queue.concurrency)
-            .bind(queue.worker_concurrency)
-            .bind(queue.rate_limit.map(|r| r.limit))
-            .bind(queue.rate_limit.map(|r| r.period.as_secs_f64()))
-            // Every queue orders by priority, so the column is always written `TRUE` for readers
-            // that still consult it, and never read here.
-            .bind(true)
-            // Derived, never asked for: the column is written to agree with the per-partition
-            // limits for readers that still consult it, and is never read here.
-            .bind(queue.is_partitioned())
-            .bind(queue.partition_concurrency)
-            .bind(queue.partition_worker_concurrency)
-            .bind(queue.partition_rate_limit.map(|r| r.limit))
-            .bind(queue.partition_rate_limit.map(|r| r.period.as_secs_f64()))
-            .bind(queue.polling_interval.as_secs_f64())
-            .bind(owner.as_deref())
-            .execute(&mut *tx)
-            .await?;
+            // Insert first, because only the insert can tell a row this call created from one it
+            // found. `ON CONFLICT DO NOTHING` waits out a peer's uncommitted insert of the same
+            // name, so of two first registrations exactly one gets its row back. A read beforehand
+            // cannot decide it: `FOR UPDATE` locks nothing while the row is absent, so both would
+            // find nothing and both report creating the queue. Looped because the row the conflict
+            // found can be deleted before the lock below reaches it.
+            let before = loop {
+                let inserted = bind_new_queue(
+                    sqlx::query(AssertSqlSafe(format!(
+                        "INSERT INTO {queues_table} \
+                         (name, concurrency, worker_concurrency, rate_limit_max, \
+                          rate_limit_period_sec, priority_enabled, partition_queue, \
+                          partition_concurrency, partition_worker_concurrency, \
+                          partition_rate_limit_max, partition_rate_limit_period_sec, \
+                          polling_interval_sec, updated_at, application_name) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, {NOW_MS_SQL}, $13) \
+                         ON CONFLICT (name) DO NOTHING \
+                         RETURNING {QUEUE_COLUMNS}"
+                    ))),
+                    queue,
+                    owner.as_deref(),
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(row) = inserted {
+                    let after = queue_from_row(&row)?;
+                    tx.commit().await?;
+                    return Ok(UpsertedQueue {
+                        before: None,
+                        after,
+                    });
+                }
 
-            // Read back, because both conflict clauses decline silently: neither says whether the
-            // row it found belongs to this application or to a peer that registered in between.
-            resolve_owning_application(
+                // Found rather than created. Locked, so the row returned as the one replaced is
+                // the one the update below actually replaces.
+                let found = sqlx::query(AssertSqlSafe(format!(
+                    "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
+                )))
+                .bind(queue.name)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(row) = found {
+                    break queue_from_row(&row)?;
+                }
+            };
+
+            // Asked again of the locked row, because the conflict says nothing about who holds
+            // it: a peer may have registered the name since the first resolve.
+            let owner = resolve_owning_application(
                 &mut tx,
                 queues_table,
                 "name",
@@ -5515,18 +5522,40 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
 
-            // The row as this registration left it, read before the commit: under `Leave` that is
-            // the stored row, which is what a caller's dequeues will honour.
-            let after = sqlx::query(AssertSqlSafe(format!(
-                "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1"
-            )))
-            .bind(queue.name)
-            .fetch_one(&mut *tx)
-            .await?;
-            let after = queue_from_row(&after)?;
+            let after = match on_existing {
+                // The stored row stands, and it is what a caller's dequeues will honour.
+                OnExistingQueue::Leave => before.clone(),
+                // Ownership is claimed, never taken: `COALESCE` leaves a row that already has an
+                // owner alone. The stored limits are a different matter — those the caller asked
+                // to replace.
+                OnExistingQueue::Update => {
+                    let row = bind_new_queue(
+                        sqlx::query(AssertSqlSafe(format!(
+                            "UPDATE {queues_table} SET \
+                               concurrency = $2, worker_concurrency = $3, rate_limit_max = $4, \
+                               rate_limit_period_sec = $5, priority_enabled = $6, \
+                               partition_queue = $7, partition_concurrency = $8, \
+                               partition_worker_concurrency = $9, partition_rate_limit_max = $10, \
+                               partition_rate_limit_period_sec = $11, polling_interval_sec = $12, \
+                               updated_at = {NOW_MS_SQL}, \
+                               application_name = COALESCE(application_name, $13) \
+                             WHERE name = $1 \
+                             RETURNING {QUEUE_COLUMNS}"
+                        ))),
+                        queue,
+                        owner.as_deref(),
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    queue_from_row(&row)?
+                }
+            };
 
             tx.commit().await?;
-            Ok(UpsertedQueue { before, after })
+            Ok(UpsertedQueue {
+                before: Some(before),
+                after,
+            })
         })
         .await
     }

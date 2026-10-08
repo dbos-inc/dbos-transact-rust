@@ -1737,8 +1737,10 @@ pub struct QueueRecord {
     ///
     /// Setting any of the three partition limits is what partitions a queue. Each applies within
     /// one partition rather than to the queue as a whole, so they sit beside the queue-wide
-    /// limits rather than replacing them: both are enforced, and neither is allowed to exceed
-    /// its queue-wide counterpart.
+    /// limits rather than replacing them: both are enforced. A per-partition concurrency limit
+    /// may not exceed its queue-wide counterpart, which it could then never bind under. The two
+    /// rate limits are validated separately and never compared, because their windows may
+    /// differ: a per-partition limit over a shorter window caps bursts the queue-wide one allows.
     pub partition_concurrency: Option<i32>,
     /// Workflows one executor may have running at once within one partition.
     pub partition_worker_concurrency: Option<i32>,

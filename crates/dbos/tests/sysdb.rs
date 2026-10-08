@@ -8099,6 +8099,41 @@ async fn a_queue_round_trips_through_the_registry() {
     assert!(sys.get_queue("no-such-queue").await.unwrap().is_none());
 }
 
+/// Of concurrent first registrations, exactly one reports creating the queue, and every other one
+/// reports the row it found. A read before the write could not promise this, since a lock on a row
+/// that does not exist yet holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_registrations_create_the_queue_once() {
+    let (sys, _db) = sysdb().await;
+    let sys = std::sync::Arc::new(sys);
+
+    for round in 0..5 {
+        let name = format!("contended-{round}");
+        let mut registrations = tokio::task::JoinSet::new();
+        for n in 0..8 {
+            let sys = std::sync::Arc::clone(&sys);
+            let name = name.clone();
+            registrations.spawn(async move {
+                sys.upsert_queue(
+                    &NewQueue {
+                        concurrency: Some(n + 1),
+                        ..NewQueue::new(&name)
+                    },
+                    OnExistingQueue::Update,
+                )
+                .await
+                .expect("registration failed")
+            });
+        }
+        let upserted = registrations.join_all().await;
+        assert_eq!(
+            upserted.iter().filter(|u| u.created()).count(),
+            1,
+            "{name}: one registration creates the queue, the rest find it",
+        );
+    }
+}
+
 /// Re-registering reports that the queue already existed, and honours what to do with it.
 #[tokio::test]
 async fn re_registering_a_queue_reports_it_existed() {

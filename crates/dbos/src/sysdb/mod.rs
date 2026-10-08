@@ -1110,9 +1110,10 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Registers a queue, returning the row it found and the row it left.
     ///
-    /// Both are read in the registration's transaction, the first under `FOR UPDATE`.
+    /// Both are read in the registration's transaction, a found row under `FOR UPDATE`.
     /// [`UpsertedQueue::created`] tells a first registration from a restart: a found row means the
-    /// queue was already there, whether or not [`OnExistingQueue`] changed it. The pair also lets a
+    /// queue was already there, whether or not [`OnExistingQueue`] changed it. Of concurrent first
+    /// registrations, exactly one reports creating the queue; the rest find its row. The pair also lets a
     /// caller judge the transition, such as whether the registration partitioned the queue,
     /// against the row the write actually replaced.
     ///
