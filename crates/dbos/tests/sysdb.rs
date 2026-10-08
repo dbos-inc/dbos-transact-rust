@@ -6,9 +6,9 @@ use dbos::sysdb::types::{
     Applications, AwaitedOutcome, Change, Debounce, DebounceRequest, EncodedValue, Fork,
     ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule,
     NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming,
-    Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus,
-    WrittenBy,
+    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate,
+    StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -6722,6 +6722,218 @@ async fn the_offsets_of_a_stream_read_back_as_the_stream() {
         }
     }
     assert_eq!(read, ["\"a\"", "\"b\"", "\"c\""]);
+}
+
+/// Every value at offsets `0..`, until the first empty one, as stored.
+async fn stream_values(sys: &PostgresSystemDatabase, workflow_id: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for offset in 0.. {
+        match sys
+            .read_stream_value(workflow_id, key, offset)
+            .await
+            .unwrap()
+            .value
+        {
+            Some(v) => values.push(v.value),
+            None => return values,
+        }
+    }
+    unreachable!()
+}
+
+/// A workflow that wrote `values` to `progress`, one step each, closed it if asked, and finished.
+async fn finished_stream_writer(
+    sys: &PostgresSystemDatabase,
+    workflow_id: &str,
+    values: &[&str],
+    close: bool,
+) {
+    sys.init_workflow(&workflow(workflow_id), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    for (step_id, value) in (0..).zip(values) {
+        sys.write_stream(
+            workflow_id,
+            step_id,
+            "progress",
+            value,
+            Some("portable_json"),
+            WrittenBy::Workflow,
+        )
+        .await
+        .unwrap();
+    }
+    if close {
+        let step_id = i32::try_from(values.len()).unwrap();
+        sys.close_stream(workflow_id, step_id, "progress")
+            .await
+            .unwrap();
+    }
+    sys.record_workflow_outcome(workflow_id, Outcome::Output(None))
+        .await
+        .unwrap();
+}
+
+/// **A rewind keeps every stream entry, and the re-run appends after them.**
+///
+/// An offset is an address a reader may already hold, so the entries the discarded steps wrote
+/// stay where they are. The re-run's writes, at the same steps, land at the next offsets.
+#[tokio::test]
+async fn a_rewind_keeps_stream_entries_and_the_rerun_appends_after_them() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-rewind-stream", &["\"a\"", "\"b\""], false).await;
+
+    sys.rewind_workflow("wf-rewind-stream", 0, &RewindOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_values(&sys, "wf-rewind-stream", "progress").await,
+        ["\"a\"", "\"b\""],
+        "the rewind removed entries"
+    );
+
+    // The re-run writes at steps 0 and 1 again, whose checkpoints the rewind deleted.
+    for (step_id, value) in [(0, "\"a2\""), (1, "\"b2\"")] {
+        sys.write_stream(
+            "wf-rewind-stream",
+            step_id,
+            "progress",
+            value,
+            Some("portable_json"),
+            WrittenBy::Workflow,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        stream_values(&sys, "wf-rewind-stream", "progress").await,
+        ["\"a\"", "\"b\"", "\"a2\"", "\"b2\""],
+        "the re-run appends at offsets 2 and 3"
+    );
+}
+
+/// **A rewind past a stream's close reopens it**, and the re-run's entry follows the old one.
+#[tokio::test]
+async fn a_rewind_past_a_close_reopens_the_stream() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-reopened", &["\"a\""], true).await;
+    assert_eq!(
+        stream_values(&sys, "wf-reopened", "progress").await,
+        ["\"a\"", dbos::sysdb::STREAM_CLOSED],
+    );
+
+    sys.rewind_workflow("wf-reopened", 0, &RewindOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_values(&sys, "wf-reopened", "progress").await,
+        ["\"a\""],
+        "the close is gone and the entry is kept"
+    );
+
+    sys.write_stream(
+        "wf-reopened",
+        0,
+        "progress",
+        "\"a2\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stream_values(&sys, "wf-reopened", "progress").await,
+        ["\"a\"", "\"a2\""],
+    );
+}
+
+/// **A cut above a stream's close leaves the close where it is.**
+#[tokio::test]
+async fn a_rewind_above_a_close_keeps_it() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-still-closed", &["\"a\""], true).await;
+
+    // The close is step 1, so a cut at 2 is above it.
+    sys.rewind_workflow("wf-still-closed", 2, &RewindOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_values(&sys, "wf-still-closed", "progress").await,
+        ["\"a\"", dbos::sysdb::STREAM_CLOSED],
+    );
+}
+
+/// **A value that looks like the close under another serialization is not a close**, and a rewind
+/// keeps it.
+#[tokio::test]
+async fn a_rewind_deletes_only_a_close_labelled_as_one() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-lookalike"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    sys.write_stream(
+        "wf-lookalike",
+        0,
+        "progress",
+        dbos::sysdb::STREAM_CLOSED,
+        Some("some_other_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+    sys.record_workflow_outcome("wf-lookalike", Outcome::Output(None))
+        .await
+        .unwrap();
+
+    sys.rewind_workflow("wf-lookalike", 0, &RewindOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_values(&sys, "wf-lookalike", "progress").await,
+        [dbos::sysdb::STREAM_CLOSED],
+    );
+}
+
+/// **An empty option is refused rather than written**, and nothing changes.
+///
+/// An empty version would replace the workflow's own with one no executor runs.
+#[tokio::test]
+async fn a_rewind_refuses_an_empty_option() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-empty-option", &[], false).await;
+
+    let refused = sys
+        .rewind_workflow(
+            "wf-empty-option",
+            0,
+            &RewindOptions {
+                application_version: Some(""),
+                ..RewindOptions::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, Error::InvalidInput { field, .. } if field == "application_version"),
+        "{refused:?}"
+    );
+    let refused = sys
+        .rewind_workflow("wf-empty-option", -1, &RewindOptions::default(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, Error::InvalidInput { field, .. } if field == "start_step"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        sys.get_workflow("wf-empty-option")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Success
+    );
 }
 
 /// A read waiting at a cap of one does not hold its permit across the calls around it.

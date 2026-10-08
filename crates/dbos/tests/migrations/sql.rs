@@ -488,6 +488,32 @@ async fn the_index_rebuilds_replace_their_predecessors() {
     }
 }
 
+/// Migration 121 adds `notifications.consumed_by_function_id` as a 32-bit integer on both
+/// backends, matching every other step-id column.
+///
+/// `INTEGER` would be 64-bit on CockroachDB, and a 32-bit read of the column would then fail
+/// there and only there, so the type is asserted rather than the column's presence alone.
+#[tokio::test]
+async fn migration_121_adds_a_32_bit_consumer_step_column() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    dbos::sysdb::migrations::runner::run(&pool, schema, true)
+        .await
+        .expect("migration failed");
+
+    let data_type: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'notifications' \
+           AND column_name = 'consumed_by_function_id'",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .expect("consumed_by_function_id is missing");
+    assert_eq!(data_type, "integer");
+}
+
 /// Migrations 43 and 44 leave only the notifications trigger behind.
 ///
 /// Migration 1 installs notification and workflow-events triggers and 39 adds the streams

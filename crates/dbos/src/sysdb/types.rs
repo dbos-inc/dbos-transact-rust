@@ -2201,6 +2201,43 @@ impl ForkOptions<'_> {
     }
 }
 
+/// Where a rewound workflow is re-enqueued.
+///
+/// **`None` does not mean the same thing across these fields.** The version is left as it was,
+/// while the queue and its partition are the rewind's own: `None` there is the internal queue and
+/// no partition, not the workflow's previous ones, so a partition key from the queue it ran on
+/// does not follow it onto a queue that may not be partitioned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RewindOptions<'a> {
+    /// The version the workflow is re-run under. `None` keeps its current one.
+    pub application_version: Option<&'a str>,
+    /// The queue it is re-enqueued on. `None` means [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE).
+    pub queue_name: Option<&'a str>,
+    /// The partition of that queue. `None` clears any key the workflow had.
+    pub queue_partition_key: Option<&'a str>,
+}
+
+impl RewindOptions<'_> {
+    /// Refuses an empty string in any field, as [`ForkOptions::validate`] does and for the same
+    /// reason: `Some("")` as a version would replace the workflow's own with an empty one, rather
+    /// than leave it alone.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        for (field, value) in [
+            ("application_version", &self.application_version),
+            ("queue_name", &self.queue_name),
+            ("queue_partition_key", &self.queue_partition_key),
+        ] {
+            if *value == Some("") {
+                return Err(Error::InvalidInput {
+                    field: field.into(),
+                    detail: "must be absent rather than empty".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The `DBOS.*` step names the engine records for its own operations.
 ///
 /// **Here rather than in a backend, because they are stored contract.** Each of these lands in
@@ -2371,6 +2408,7 @@ pub mod step_names {
     pub const RESUME_WORKFLOW: &str = "DBOS.resumeWorkflow";
     pub const DELETE_WORKFLOW: &str = "DBOS.deleteWorkflow";
     pub const FORK_WORKFLOW: &str = "DBOS.forkWorkflow";
+    pub const REWIND_WORKFLOW: &str = "DBOS.rewindWorkflow";
     pub const SET_WORKFLOW_DELAY: &str = "DBOS.setWorkflowDelay";
     pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.updateWorkflowAttributes";
     pub const LIST_WORKFLOWS: &str = "DBOS.listWorkflows";

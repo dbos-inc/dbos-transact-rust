@@ -85,10 +85,10 @@ use super::types::{
     DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
     InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
     OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
-    StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms,
-    duration_from_secs, is_valid_application_name, validate_attributes,
+    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord,
+    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
+    duration_from_ms, duration_from_secs, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -4252,6 +4252,186 @@ impl SystemDatabase for PostgresSystemDatabase {
             .await
     }
 
+    async fn rewind_workflow(
+        &self,
+        workflow_id: &str,
+        start_step: i32,
+        options: &RewindOptions<'_>,
+        caller: Option<(&str, i32)>,
+    ) -> Result<(), Error> {
+        if start_step < 0 {
+            return Err(Error::InvalidInput {
+                field: "start_step".into(),
+                detail: format!("must not be negative, got {start_step}"),
+            });
+        }
+        options.validate()?;
+        let tables = &self.tables;
+        let queue = options.queue_name.unwrap_or(INTERNAL_QUEUE);
+        let started_at = Timestamp::now();
+
+        with_retry(&self.retry, "rewind_workflow", move || async move {
+            self.run_transactional_step(
+                caller,
+                step_names::REWIND_WORKFLOW,
+                started_at,
+                |mut tx| async move {
+                    let workflow_table = tables.workflow_status.as_str();
+                    let events_table = tables.workflow_events.as_str();
+                    let history_table = tables.workflow_events_history.as_str();
+                    let streams_table = tables.streams.as_str();
+                    let steps_table = tables.operation_outputs.as_str();
+                    let notifications_table = tables.notifications.as_str();
+                    let output_table = tables.workflow_output.as_str();
+
+                    let status: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT status FROM {workflow_table} WHERE workflow_uuid = $1"
+                    )))
+                    .bind(workflow_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let Some(status) = status else {
+                        return Err(Error::NonExistentWorkflow {
+                            workflow_ids: vec![workflow_id.to_owned()],
+                        });
+                    };
+                    // A workflow that may be running is refused: its own execution replays from
+                    // the history this would delete. A status this build does not know is
+                    // refused too, rather than guessed at.
+                    match WorkflowStatus::parse(&status) {
+                        Some(
+                            WorkflowStatus::Pending
+                            | WorkflowStatus::Enqueued
+                            | WorkflowStatus::Delayed,
+                        ) => {
+                            return Err(Error::WorkflowNotRewindable {
+                                workflow_id: workflow_id.to_owned(),
+                                status,
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(Error::Malformed(format!(
+                                "workflow {workflow_id} has unrecognised status {status:?}"
+                            )));
+                        }
+                    }
+
+                    // Events first, while the history past the cut that both statements read is
+                    // still there. A key published at or past the cut is deleted, then restored
+                    // from its last value below the cut, if it had one. A key the discarded steps
+                    // never published is left alone.
+                    let published_past_cut = format!(
+                        "SELECT key FROM {history_table} \
+                         WHERE workflow_uuid = $1 AND function_id >= $2"
+                    );
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {events_table} \
+                         WHERE workflow_uuid = $1 AND key IN ({published_past_cut})"
+                    )))
+                    .bind(workflow_id)
+                    .bind(start_step)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(AssertSqlSafe(format!(
+                        "INSERT INTO {events_table} (workflow_uuid, key, value, serialization) \
+                         SELECT workflow_uuid, key, value, serialization FROM ( \
+                           SELECT h.workflow_uuid, h.key, h.value, h.serialization, \
+                                  row_number() OVER (PARTITION BY h.key \
+                                                     ORDER BY h.function_id DESC) AS rn \
+                           FROM {history_table} h \
+                           WHERE h.workflow_uuid = $1 AND h.function_id < $2 \
+                             AND h.key IN ({published_past_cut}) \
+                         ) latest WHERE rn = 1"
+                    )))
+                    .bind(workflow_id)
+                    .bind(start_step)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Only the close. Every other entry stays where a reader may already have
+                    // found it, and the replay appends after it.
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {streams_table} \
+                         WHERE workflow_uuid = $1 AND function_id >= $2 \
+                           AND value = $3 AND serialization = $4"
+                    )))
+                    .bind(workflow_id)
+                    .bind(start_step)
+                    .bind(STREAM_CLOSED)
+                    .bind(PORTABLE_JSON)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    for table in [steps_table, history_table] {
+                        sqlx::query(AssertSqlSafe(format!(
+                            "DELETE FROM {table} WHERE workflow_uuid = $1 AND function_id >= $2"
+                        )))
+                        .bind(workflow_id)
+                        .bind(start_step)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+
+                    // A message consumed below the cut stays consumed, since its recv replays. One
+                    // still unconsumed goes whenever it was sent, so the replayed recv cannot take
+                    // a message meant for the run being discarded.
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {notifications_table} \
+                         WHERE destination_uuid = $1 \
+                           AND (consumed_by_function_id >= $2 OR consumed = FALSE)"
+                    )))
+                    .bind(workflow_id)
+                    .bind(start_step)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {output_table} WHERE workflow_uuid = $1"
+                    )))
+                    .bind(workflow_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    // Guarded on the status read above: if anything moved the row since, the
+                    // rewind would be re-enqueuing a workflow in a state it never checked. The
+                    // legacy `output` and `error` columns are cleared with the payload row, as
+                    // `record_workflow_outcome` clears them. The timeout is kept so the dequeue
+                    // derives a fresh deadline.
+                    let updated = sqlx::query(AssertSqlSafe(format!(
+                        "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $3, \
+                         queue_partition_key = $4, \
+                         application_version = COALESCE($5, application_version), \
+                         recovery_attempts = 0, owner_xid = NULL, \
+                         workflow_deadline_epoch_ms = NULL, deduplication_id = NULL, \
+                         started_at_epoch_ms = NULL, completed_at = NULL, \
+                         output = NULL, error = NULL, updated_at = {NOW_MS_SQL} \
+                         WHERE workflow_uuid = $1 AND status = $2"
+                    )))
+                    .bind(workflow_id)
+                    .bind(&status)
+                    .bind(queue)
+                    .bind(options.queue_partition_key)
+                    .bind(options.application_version)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                    if updated != 1 {
+                        return Err(Error::RewindInterrupted {
+                            workflow_id: workflow_id.to_owned(),
+                            status,
+                        });
+                    }
+
+                    tracing::debug!(workflow_id, start_step, queue, "rewound workflow");
+                    Ok((tx, ()))
+                },
+            )
+            .await
+        })
+        .await
+    }
+
     async fn send_message(
         &self,
         message: &Message<'_>,
@@ -4344,8 +4524,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         // `RecordOperationResult` in one transaction under `defer tx.Rollback`, so the second
         // execution's record conflicts on `(workflow_uuid, function_id)` and its consumption is
         // discarded with it. The divergence stands and the one-line fix is still worth making.
+        //
+        // `consumed_by_function_id` is this recv's own step, not its timeout's: it is what a
+        // rewind compares against its cut, and the cut is a step a replay re-runs from.
         let consume = format!(
-            "UPDATE {notifications_table} SET consumed = TRUE \
+            "UPDATE {notifications_table} SET consumed = TRUE, consumed_by_function_id = $3 \
              WHERE message_uuid = ( \
                  SELECT message_uuid FROM {notifications_table} \
                  WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE \
@@ -4477,6 +4660,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             let row = sqlx::query(AssertSqlSafe(consume.clone()))
                 .bind(workflow_id)
                 .bind(stored_topic)
+                .bind(step_id)
                 .fetch_optional(&mut *tx)
                 .await?;
             let message = match row {

@@ -130,6 +130,28 @@ pub enum Error {
         /// The ids with no row behind them.
         workflow_ids: Vec<String>,
     },
+    /// A rewind named a workflow that has not finished.
+    ///
+    /// Only a terminal workflow can be rewound. A `PENDING`, `ENQUEUED` or `DELAYED` one may be
+    /// running or about to, and rewinding it would delete the history its own execution is
+    /// replaying from. Cancelling it first makes it rewindable.
+    WorkflowNotRewindable {
+        /// The workflow named.
+        workflow_id: String,
+        /// The status it was found in.
+        status: String,
+    },
+    /// A rewind found the workflow terminal, but its status changed before the rewind could
+    /// re-enqueue it.
+    ///
+    /// Something else — a resume, another rewind — moved the row while the rewind's transaction
+    /// was open, and the rewind rolled back. Rewinding again sees the new status.
+    RewindInterrupted {
+        /// The workflow being rewound.
+        workflow_id: String,
+        /// The status the rewind read before the row moved.
+        status: String,
+    },
     /// The workflow has been recovered too many times and is now parked.
     MaxRecoveryAttemptsExceeded {
         /// The parked workflow.
@@ -236,6 +258,22 @@ impl std::fmt::Display for Error {
             Error::NonExistentWorkflow { workflow_ids } => {
                 write!(f, "no such workflow: {}", workflow_ids.join(", "))
             }
+            Error::WorkflowNotRewindable {
+                workflow_id,
+                status,
+            } => write!(
+                f,
+                "cannot rewind workflow {workflow_id} ({status}): only a workflow in a terminal \
+                 state can be rewound, so cancel it first"
+            ),
+            Error::RewindInterrupted {
+                workflow_id,
+                status,
+            } => write!(
+                f,
+                "workflow {workflow_id} changed status from {status} while being rewound; \
+                 retry the rewind"
+            ),
             Error::MaxRecoveryAttemptsExceeded { workflow_id, limit } => write!(
                 f,
                 "workflow {workflow_id} exceeded {limit} recovery attempts"
@@ -311,6 +349,8 @@ impl Error {
             | Error::QueueDeduplicated { .. }
             | Error::NoForkPoint { .. }
             | Error::NonExistentWorkflow { .. }
+            | Error::WorkflowNotRewindable { .. }
+            | Error::RewindInterrupted { .. }
             | Error::MaxRecoveryAttemptsExceeded { .. }
             | Error::AlreadyRegistered { .. }
             | Error::NotRegistered { .. }
@@ -387,6 +427,22 @@ mod tests {
             Error::AlreadyRegistered {
                 kind: "Schedule".into(),
                 name: "nightly".to_owned(),
+            }
+            .should_record()
+        );
+        // Both of a rewind's refusals. The interrupted one is recorded too: unrecorded, a replay
+        // would run the rewind again, and could rewind a workflow the original run did not.
+        assert!(
+            Error::WorkflowNotRewindable {
+                workflow_id: "wf".to_owned(),
+                status: "PENDING".to_owned(),
+            }
+            .should_record()
+        );
+        assert!(
+            Error::RewindInterrupted {
+                workflow_id: "wf".to_owned(),
+                status: "SUCCESS".to_owned(),
             }
             .should_record()
         );
