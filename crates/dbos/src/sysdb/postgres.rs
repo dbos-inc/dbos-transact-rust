@@ -2043,10 +2043,14 @@ fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
     })
 }
 
+/// A stored `workflow_status.status`, or [`Error::Malformed`] for a value this build does not know.
+fn parse_workflow_status(text: &str) -> Result<WorkflowStatus, Error> {
+    WorkflowStatus::parse(text)
+        .ok_or_else(|| Error::Malformed(format!("unknown workflow status {text:?}")))
+}
+
 fn workflow_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Error> {
-    let status_text: String = row.try_get("status")?;
-    let status = WorkflowStatus::parse(&status_text)
-        .ok_or_else(|| Error::Malformed(format!("unknown workflow status {status_text:?}")))?;
+    let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
 
     Ok(WorkflowRecord {
         workflow_id: row.try_get("workflow_uuid")?,
@@ -2994,10 +2998,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             })?;
 
             let recovery_attempts: i64 = row.try_get("recovery_attempts")?;
-            let status_text: String = row.try_get("status")?;
-            let status = WorkflowStatus::parse(&status_text).ok_or_else(|| {
-                Error::Malformed(format!("unknown workflow status {status_text:?}"))
-            })?;
+            let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
             let stored_owner: Option<String> = row.try_get("owner_xid")?;
             let deadline: Option<i64> = row.try_get("workflow_deadline_epoch_ms")?;
             let serialization: Option<String> = row.try_get("serialization")?;
@@ -3519,10 +3520,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             match row {
                 Some(row) => {
-                    let status_text: String = row.try_get("status")?;
-                    let status = WorkflowStatus::parse(&status_text).ok_or_else(|| {
-                        Error::Malformed(format!("unknown workflow status {status_text:?}"))
-                    })?;
+                    let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
                     let settled = match status {
                         WorkflowStatus::Success => Some(AwaitedOutcome::Succeeded {
                             output: row.try_get("output")?,
@@ -4295,26 +4293,20 @@ impl SystemDatabase for PostgresSystemDatabase {
                             workflow_ids: vec![workflow_id.to_owned()],
                         });
                     };
-                    // A workflow that may be running is refused: its own execution replays from
-                    // the history this would delete. A status this build does not know is
-                    // refused too, rather than guessed at.
-                    match WorkflowStatus::parse(&status) {
-                        Some(
-                            WorkflowStatus::Pending
+                    // A status this build does not know is refused rather than guessed at. A
+                    // workflow that may be running is refused too: its own execution replays from
+                    // the history this would delete.
+                    let status = parse_workflow_status(&status)?;
+                    if matches!(
+                        status,
+                        WorkflowStatus::Pending
                             | WorkflowStatus::Enqueued
-                            | WorkflowStatus::Delayed,
-                        ) => {
-                            return Err(Error::WorkflowNotRewindable {
-                                workflow_id: workflow_id.to_owned(),
-                                status,
-                            });
-                        }
-                        Some(_) => {}
-                        None => {
-                            return Err(Error::Malformed(format!(
-                                "workflow {workflow_id} has unrecognised status {status:?}"
-                            )));
-                        }
+                            | WorkflowStatus::Delayed
+                    ) {
+                        return Err(Error::WorkflowNotRewindable {
+                            workflow_id: workflow_id.to_owned(),
+                            status: status.as_str().to_owned(),
+                        });
                     }
 
                     // Events first, while the history past the cut that both statements read is
@@ -4409,7 +4401,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                          WHERE workflow_uuid = $1 AND status = $2"
                     )))
                     .bind(workflow_id)
-                    .bind(&status)
+                    .bind(status.as_str())
                     .bind(queue)
                     .bind(options.queue_partition_key)
                     .bind(options.application_version)
@@ -4419,7 +4411,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     if updated != 1 {
                         return Err(Error::RewindInterrupted {
                             workflow_id: workflow_id.to_owned(),
-                            status,
+                            status: status.as_str().to_owned(),
                         });
                     }
 
@@ -5381,10 +5373,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 });
             };
 
-            let status_text: String = row.try_get("status")?;
-            let status = WorkflowStatus::parse(&status_text).ok_or_else(|| {
-                Error::Malformed(format!("unknown workflow status {status_text:?}"))
-            })?;
+            let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
 
             // `streams."offset"` is `NOT NULL`, so a NULL here can only mean the join matched
             // nothing: there is no entry at this offset. Python and TypeScript read the same column
