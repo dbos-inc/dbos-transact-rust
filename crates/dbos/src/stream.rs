@@ -225,7 +225,12 @@ where
 /// [`read_stream`], starting at `offset` rather than the beginning.
 ///
 /// For picking up where an earlier read stopped: [`StreamReader::offset`] is the offset to start
-/// the next one at.
+/// the next one at. A reader that ended on the close stopped *at* the close, so a read started
+/// there finds it again and ends at once.
+///
+/// **A close before `offset` is not looked for.** The reader sees the stream from `offset` on, so
+/// one started past the close does not end there: it ends when the workflow stops running, and
+/// delivers anything written after the close on the way.
 pub fn read_stream_from<T, E>(
     workflow_id: &str,
     key: &str,
@@ -249,9 +254,13 @@ where
 /// Reads the one value at `offset` of stream `key` of workflow `workflow_id`, waiting for it to be
 /// written. From a workflow body, where the read is a step.
 ///
-/// If the stream ends before reaching the offset — it is closed, or its workflow finished — no
-/// value will ever arrive, and the answer is [`Error::StreamTimeout`] with no timeout in it.
-/// Otherwise a timeout, if one is set, bounds the wait.
+/// If the stream ends with nothing at the offset — the close is there, or the workflow stops
+/// running before writing it — no value will ever arrive, and the answer is
+/// [`Error::StreamTimeout`] with no timeout in it. Otherwise a timeout, if one is set, bounds the
+/// wait.
+///
+/// **A close before `offset` is not looked for**, as in [`read_stream_from`]: an offset past the
+/// close waits for the workflow to stop, and answers with a value if one is written there first.
 pub fn read_stream_value<'a, T, E>(
     workflow_id: &'a str,
     key: &'a str,
@@ -279,8 +288,9 @@ impl DBOS {
     /// no handle, and a captured [`DBOS`] is a cycle with the registry that holds the closure.
     ///
     /// Called from inside a workflow anyway, it behaves as the free function does — each value a
-    /// step, and plain reads from inside a step — except that a handle to some *other* instance is
-    /// [`Error::WrongInstance`].
+    /// step, and plain reads from inside a step — except that, read from the workflow body, a
+    /// handle to some *other* instance is [`Error::WrongInstance`]. Inside a step the read is plain
+    /// whichever instance the handle belongs to.
     pub fn read_stream<T: DeserializeOwned>(
         &self,
         workflow_id: &str,

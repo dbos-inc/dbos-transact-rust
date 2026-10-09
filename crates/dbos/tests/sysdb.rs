@@ -6728,6 +6728,23 @@ async fn the_pages_of_a_stream_read_back_as_the_stream() {
     );
 }
 
+/// A page of fewer than one value is refused rather than read as some other size.
+#[tokio::test]
+async fn a_stream_page_below_one_is_refused() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-stream", &["\"a\""], false).await;
+
+    for limit in [0, -1] {
+        match sys
+            .read_stream_values("wf-stream", "progress", 0, limit)
+            .await
+        {
+            Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "limit"),
+            other => panic!("limit {limit} was not refused: {other:?}"),
+        }
+    }
+}
+
 /// A blocking read returns what is already there without waiting, the run after it included.
 #[tokio::test]
 async fn awaiting_a_written_offset_returns_at_once() {

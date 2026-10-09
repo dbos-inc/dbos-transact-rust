@@ -5361,7 +5361,13 @@ impl SystemDatabase for PostgresSystemDatabase {
              ORDER BY s.\"offset\""
         );
         let select = &select;
-        let end = i64::from(offset) + i64::from(limit.max(1));
+        if limit < 1 {
+            return Err(Error::InvalidInput {
+                field: "limit".into(),
+                detail: format!("must be at least 1, got {limit}"),
+            });
+        }
+        let end = i64::from(offset) + i64::from(limit);
 
         with_retry(&self.retry, "read_stream_values", move || async move {
             // A reader calls this once per page and then once per interval while it waits, so it

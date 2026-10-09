@@ -1093,7 +1093,8 @@ pub trait SystemDatabase: Send + Sync {
     /// a stream that is merely empty.
     ///
     /// Nothing at the offset is an empty `values` rather than an error — an offset a producer has
-    /// not reached yet is the ordinary case, and the reason a reader waits.
+    /// not reached yet is the ordinary case, and the reason a reader waits. A `limit` below 1 is
+    /// [`Error::InvalidInput`]: there is no run of no values to read.
     ///
     /// **Each call takes a connection**, and a reader loops it, so it runs under the polling
     /// concurrency cap like the other polls.
