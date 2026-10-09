@@ -1207,8 +1207,9 @@ async fn a_clients_bulk_fork_refuses_a_chosen_id() {
     client.close().await;
 }
 
-/// A negative step is refused before any I/O — the same refusal `DBOS::fork_with` makes, checked
-/// here because the two surfaces enforce it independently.
+/// A negative step is refused before any I/O, on the single and the bulk form — the same refusal
+/// `DBOS::fork_with` and `DBOS::fork_all` make, checked here because the two surfaces enforce it
+/// independently.
 #[tokio::test]
 async fn a_clients_fork_refuses_a_negative_step() {
     let db = test_database().await;
@@ -1218,6 +1219,14 @@ async fn a_clients_fork_refuses_a_negative_step() {
         .fork::<u32, EngineOnly>("has-a-step", -1)
         .await
         .expect_err("a negative step was accepted");
+    assert!(
+        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
+        "{error:?}"
+    );
+    let error = client
+        .fork_all::<u32, EngineOnly>(&["has-a-step"], -1, ForkOptions::default())
+        .await
+        .expect_err("a negative step was accepted in bulk");
     assert!(
         matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
         "{error:?}"

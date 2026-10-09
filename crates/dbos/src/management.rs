@@ -278,8 +278,8 @@ impl DBOS {
     /// handing back a [`PendingStep`] rather than an `async fn`: a management call built beside a
     /// step and driven with it takes the same slot on every execution. A method with an argument
     /// check of its own — [`fork_all`](Self::fork_all)'s refusal of a chosen id,
-    /// [`fork_with`](Self::fork_with)'s of a negative step — makes it between the launch check
-    /// and this, so a refused call spends nothing.
+    /// [`fork_with`](Self::fork_with)'s refusal of a negative step — makes it between the launch
+    /// check and this, so a refused call spends nothing.
     pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
     }
@@ -563,7 +563,7 @@ impl DBOS {
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// // Re-run from the step that failed, against the deployment that fixes it.
     /// let steps = dbos.list_workflow_steps("failed-workflow").await?;
-    /// let failed = steps.iter().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
+    /// let failed = steps.iter().rev().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
     /// let handle = dbos.fork_with::<u32, dbos::EngineOnly>(
     ///     "failed-workflow",
     ///     failed,
@@ -1083,7 +1083,7 @@ impl crate::Client {
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
     /// let steps = client.list_workflow_steps("failed-workflow").await?;
-    /// let failed = steps.iter().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
+    /// let failed = steps.iter().rev().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
     /// let handle = client
     ///     .fork_with::<u32, dbos::EngineOnly>(
     ///         "failed-workflow",
