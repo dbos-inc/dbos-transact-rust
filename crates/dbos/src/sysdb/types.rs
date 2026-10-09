@@ -2033,8 +2033,11 @@ pub enum AwaitedStream {
     /// At least one value, as in [`StreamRead::values`]: the first is the one at the offset asked
     /// for, and the rest follow it with no gaps.
     Values(Vec<EncodedValue>),
-    /// Nothing at the offset, and nothing ever will be: the producer is no longer running, and a
-    /// last read after seeing that found the offset still empty.
+    /// Nothing at the offset, and the producer is no longer running: a last read after seeing that
+    /// found the offset still empty.
+    ///
+    /// Not a promise that nothing will follow. A producer that is cancelled or parked can be resumed
+    /// and write again; this is the end of what a reader waiting now will see.
     ///
     /// A *closed* stream is not reported this way. Its sentinel is a value, and arrives in
     /// [`Values`](Self::Values).

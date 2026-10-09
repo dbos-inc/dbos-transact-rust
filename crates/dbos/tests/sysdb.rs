@@ -6809,14 +6809,18 @@ async fn awaiting_a_running_producer_times_out_at_the_deadline() {
     assert!(started.elapsed() >= wait, "timed out early");
 }
 
-/// A value written while a reader waits ends the wait with that value.
+/// A value written while a reader waits wakes it, well inside its polling interval.
 ///
-/// The interval is long, so on a backend whose listener delivers this is the notification; on one
-/// with none it is the next look. Either way the reader sees the write and not a timeout.
+/// The interval is a minute and the wait is allowed five seconds, so only the writer's notification
+/// can end it in time. Postgres only: CockroachDB has no listener, and every other stream test there
+/// covers the polling path.
 #[tokio::test]
-async fn a_write_ends_a_waiting_read() {
-    let (sys, _db) = sysdb().await;
-    let sys = std::sync::Arc::new(sys);
+async fn a_write_wakes_a_waiting_read() {
+    let db = test_database().await;
+    if skip_without_listen_notify(&db) {
+        return;
+    }
+    let sys = std::sync::Arc::new(listening(db.pool().await).await);
     sys.init_workflow(&workflow("wf-live"), None, Submission::Fresh, None)
         .await
         .unwrap();
@@ -6824,11 +6828,18 @@ async fn a_write_ends_a_waiting_read() {
     let reader = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.await_stream_values("wf-live", "progress", 0, 10, None, RECHECK)
-                .await
+            sys.await_stream_values(
+                "wf-live",
+                "progress",
+                0,
+                10,
+                None,
+                std::time::Duration::from_secs(60),
+            )
+            .await
         })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     sys.write_stream(
         "wf-live",
         0,
@@ -6840,9 +6851,9 @@ async fn a_write_ends_a_waiting_read() {
     .await
     .unwrap();
 
-    let awaited = tokio::time::timeout(RECHECK * 3, reader)
+    let awaited = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
         .await
-        .expect("the write never ended the wait")
+        .expect("the write never woke the waiting read")
         .unwrap()
         .unwrap();
     let AwaitedStream::Values(values) = awaited else {

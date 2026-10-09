@@ -31,7 +31,7 @@ use serde::de::DeserializeOwned;
 use crate::DBOS;
 use crate::checkpoint::{Built, PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
-use crate::context::{Ctx, StreamReadClaim};
+use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::{decode, encode};
 use crate::sysdb::types::{
@@ -411,26 +411,29 @@ impl crate::Client {
 /// }
 /// ```
 ///
-/// [`next`](Self::next) answers `Ok(None)` once the stream is closed, or once its workflow has
-/// finished and every value it wrote has been delivered. Cancelling a workflow, or timing one out,
-/// sets its status while it may still be writing, so the reader looks once more before it ends.
+/// [`next`](Self::next) answers `Ok(None)` once the stream is closed, or once its workflow is no
+/// longer running and a last look past the values delivered finds nothing more. The end is final for
+/// this reader: a workflow that is cancelled or parked and later resumed may write again, and a new
+/// reader from [`offset`](Self::offset) sees what it writes.
 ///
 /// **When the reader is a workflow, each value is a step**, named `DBOS.readStream`. The value is
 /// recorded before `next` returns it, and the end of the stream is recorded too, so a replay
 /// returns the values the first run read — not the ones the stream holds now — and ends where the
-/// first run ended. A timeout is recorded as the step's error and replays as one. While it waits,
-/// the reader stops with [`Error::WorkflowCancelled`] if its own workflow is cancelled. From inside
-/// a step, from a [`Client`](crate::Client), or from outside a workflow, nothing is recorded.
+/// first run ended. A timeout, and a stream whose workflow does not exist, are recorded as the
+/// step's error and replay as one. While it waits, the reader stops with
+/// [`Error::WorkflowCancelled`] if its own workflow is cancelled. From inside a step, from a
+/// [`Client`](crate::Client), or from outside a workflow, nothing is recorded.
 ///
-/// **One read at a time per workflow.** Every value is recorded under the same step name, so two
-/// reads in flight together would take their ids in whatever order they were asked, which a replay
-/// need not repeat and the name check cannot catch: the second is refused with
-/// [`Error::StreamNondeterminism`]. Read one stream after another, or read inside a step.
+/// **Reading from more than one place in a workflow body** follows the rule for any durable calls
+/// driven together: each `next` takes its step id where it is called, so calls built in a fixed
+/// order — `tokio::join!(a.next(), b.next())` — replay exactly. Two read *loops* running side by
+/// side do not: which loop asks next follows scheduling, and so do the ids. Interleave them in one
+/// loop, or read in a step.
 ///
 /// Not a `futures::Stream`, deliberately: a [`PendingStep`] takes its step id where it is called,
 /// and `Stream::poll_next` has no such moment — its id would follow the first poll instead.
 ///
-/// After `next` returns an error, the reader is spent: every later call is `Ok(None)`.
+/// After a read fails, the reader is spent: every later `next` is `Ok(None)`.
 #[must_use = "a stream reader reads nothing until `next` is awaited"]
 pub struct StreamReader<T, E = EngineOnly> {
     /// The connection the reads go through, or what stopped the reader being built — reported by
@@ -444,9 +447,9 @@ pub struct StreamReader<T, E = EngineOnly> {
     offset: i32,
     /// Values already read, from `offset` on, not yet delivered.
     ///
-    /// Never holds a close, or anything after one: a rewind of the producer deletes a close past
-    /// its cut and the stream carries on from that offset, so a close is acted on only when it is
-    /// read at the offset being delivered.
+    /// Holds a close only as its first entry, and nothing after one: a rewind of the producer
+    /// deletes a close past its cut and the stream carries on from that offset, so a close is acted
+    /// on only when it is read at the offset being delivered.
     buffer: VecDeque<EncodedValue>,
     /// Whether the stream has ended for this reader. Every later `next` is `Ok(None)`.
     ended: bool,
@@ -501,7 +504,7 @@ where
     /// The next value, or `Ok(None)` once the stream has ended.
     ///
     /// **The step id is taken here, at the call**, as every [`PendingStep`] takes its own: see
-    /// [`StreamReader`] for what that means for a workflow reading more than one stream.
+    /// [`StreamReader`] for what that means for a workflow reading from more than one place.
     //
     // Not `Iterator::next`, which it cannot be: the answer is a future, and each one claims a step.
     // `next` is what an async reader's method is called — `while let Some(v) = r.next().await?`.
@@ -513,10 +516,8 @@ where
         PendingStep::placed(
             step_names::READ_STREAM,
             built,
-            move |(conn, claim), placement| async move {
+            move |conn, placement| async move {
                 let read = self.read_next(&conn, &placement).await;
-                // Settled — recorded, replayed, or failed — so the next read may begin.
-                drop(claim);
                 if read.is_err() {
                     self.ended = true;
                 }
@@ -532,17 +533,17 @@ where
     }
 
     /// The next read's placement, or `None` once the stream has ended for this reader.
-    fn place(&mut self) -> Option<Built<(Arc<Connection>, Option<StreamReadClaim>)>> {
+    fn place(&mut self) -> Option<Built<Arc<Connection>>> {
         if self.ended {
             return None;
         }
         let built = match &mut self.source {
-            Ok(conn) => place(Arc::clone(conn), &self.read.key, self.operation),
+            Ok(conn) => place(Arc::clone(conn), self.operation),
             Err(refused) => Err(refused
                 .take()
                 .expect("a refusal is reported once, and the reader then ends")),
         };
-        // A refused read ends the reader like any other error, though it took no id.
+        // A refused read ends the reader like any other failure, though it took no id.
         self.ended = built.is_err();
         Some(built)
     }
@@ -572,21 +573,21 @@ where
             }
         }
 
-        let entry = match self.buffer.pop_front() {
-            Some(entry) => entry,
-            None => match self
+        if self.buffer.is_empty() {
+            match self
                 .read
-                .await_values(conn, placement, self.offset, STREAM_PAGE, started_at)
+                .await_values(conn, placement, name, self.offset, STREAM_PAGE, started_at)
                 .await?
             {
                 AwaitedStream::Values(values) => {
                     let mut values = values.into_iter();
                     let first = values.next().expect("a page of values is never empty");
-                    if !is_close(&first) {
+                    let closed = is_close(&first);
+                    self.buffer.push_back(first);
+                    if !closed {
                         self.buffer
                             .extend(values.take_while(|later| !is_close(later)));
                     }
-                    first
                 }
                 AwaitedStream::Ended => {
                     record_end(conn, placement, name, started_at).await?;
@@ -599,15 +600,21 @@ where
                         .time_out(conn, placement, name, started_at)
                         .await?);
                 }
-            },
-        };
+            }
+        }
 
-        if is_close(&entry) {
+        // Looked at, not taken: a workflow's read can be dropped while its record is in flight —
+        // the losing branch of a `select_step!` — and the value must then still be here, at the
+        // offset that has not moved, for the next read.
+        let front = self.buffer.front().expect("a value is buffered by now");
+        if is_close(front) {
             record_end(conn, placement, name, started_at).await?;
+            self.buffer.clear();
             self.ended = true;
             return Ok(None);
         }
-        record_value(conn, placement, name, &entry, started_at).await?;
+        record_value(conn, placement, name, front, started_at).await?;
+        let entry = self.buffer.pop_front().expect("the value just recorded");
         self.offset += 1;
         // Decoded only as it is delivered, so a value that cannot be decoded fails its own read
         // and none before it. After the record rather than before: what was read is settled either
@@ -639,9 +646,9 @@ where
             read.check(offset, "read_stream_value")?;
             Ok(conn)
         })
-        .and_then(|conn| place(conn, &read.key, "read_stream_value"));
-    PendingStep::placed(name, built, move |(conn, claim), placement| async move {
-        let value = async {
+        .and_then(|conn| place(conn, "read_stream_value"));
+    PendingStep::placed(name, built, move |conn, placement| async move {
+        async {
             let started_at = Timestamp::now();
             // No value will ever arrive: the stream ended before the offset.
             let ended = || Error::StreamTimeout {
@@ -655,7 +662,7 @@ where
                 None => {}
             }
             let entry = match read
-                .await_values(&conn, &placement, offset, 1, started_at)
+                .await_values(&conn, &placement, name, offset, 1, started_at)
                 .await?
             {
                 AwaitedStream::Values(values) => values
@@ -677,9 +684,8 @@ where
             record_value(&conn, &placement, name, &entry, started_at).await?;
             decode(Some(&entry.value), "stream value")
         }
-        .await;
-        drop(claim);
-        value.map_err(Error::lift)
+        .await
+        .map_err(Error::lift)
     })
 }
 
@@ -730,10 +736,16 @@ impl ReadOf {
     ///
     /// A workflow's read also watches its own workflow, and stops if that is cancelled: the wait
     /// takes no step of its own, so nothing else would notice until the stream moved.
+    ///
+    /// **A refusal that is an answer is recorded** as the step's error — a stream whose workflow
+    /// does not exist — so a workflow that catches it replays the same branch, rather than reading
+    /// live once the workflow has been created. A failure of the database is not: the read ran into
+    /// it rather than learning anything, and a replay reads again.
     async fn await_values(
         &self,
         conn: &Connection,
         placement: &StepPlacement,
+        name: &str,
         offset: i32,
         page: i32,
         started_at: Timestamp,
@@ -763,7 +775,23 @@ impl ReadOf {
             },
             _ => wait.await,
         };
-        awaited.map_err(Error::SystemDatabase)
+        match awaited {
+            Err(refused) if refused.should_record() => {
+                let refused = Error::SystemDatabase(refused);
+                let encoded = encode(&refused, "stream read refusal")?;
+                record(
+                    conn,
+                    placement,
+                    name,
+                    Outcome::Error(&encoded),
+                    Some(conn.serializer().name()),
+                    started_at,
+                )
+                .await?;
+                Err(refused)
+            }
+            awaited => awaited.map_err(Error::SystemDatabase),
+        }
     }
 
     /// Records that the wait for a value timed out, and returns the timeout to raise.
@@ -796,29 +824,10 @@ impl ReadOf {
     }
 }
 
-/// Everything a read does before it runs: the claim on the workflow's one stream read, then the
-/// step id — in that order, so a refused read takes no id.
-fn place(
-    conn: Arc<Connection>,
-    key: &str,
-    operation: &'static str,
-) -> Built<(Arc<Connection>, Option<StreamReadClaim>)> {
-    // The claim is wanted exactly where the read will be recorded: at a step boundary of a
-    // workflow served by this connection, which is the case `StepPlacement::of` answers
-    // `Recorded`.
-    let claim = Ctx::with_current(|here| match here {
-        Some(ctx) if !ctx.in_step() && Arc::ptr_eq(ctx.executor().connection(), &conn) => Some(
-            ctx.claim_stream_read()
-                .ok_or_else(|| Error::StreamNondeterminism {
-                    workflow_id: ctx.workflow_id().to_owned(),
-                    key: key.to_owned(),
-                }),
-        ),
-        _ => None,
-    })
-    .transpose()?;
+/// Everything a read does before it runs: the step id, where it takes one.
+fn place(conn: Arc<Connection>, operation: &'static str) -> Built<Arc<Connection>> {
     let placement = StepPlacement::of(&conn, operation)?;
-    Ok(((conn, claim), placement))
+    Ok((conn, placement))
 }
 
 /// What a read's step recorded, found on replay.
@@ -832,8 +841,8 @@ enum Replayed {
 /// The read's recorded outcome, if this workflow has run this far before.
 ///
 /// `None` where the read is not recorded at all — from a step, a client, or outside a workflow —
-/// as well as where it has not run yet. A recorded error is a timeout, the only failure a read
-/// records, and is raised again.
+/// as well as where it has not run yet. A recorded error — a timeout, or a stream whose workflow
+/// does not exist — is raised again.
 async fn replay(
     conn: &Connection,
     placement: &StepPlacement,

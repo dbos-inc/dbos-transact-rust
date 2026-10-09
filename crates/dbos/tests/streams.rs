@@ -511,7 +511,9 @@ async fn a_step_may_write_and_close_a_stream() {
 }
 
 /// **A workflow's read is checkpointed value by value**, so a recovered reader is handed what it
-/// read the first time — here even though the stream it read no longer exists at all.
+/// read the first time — here even though the stream it read no longer exists at all. The end is
+/// recorded too: the replayed reader ends where it ended, and a single-value read past the end
+/// replays its timeout, where a live read would now find no workflow.
 #[tokio::test]
 async fn a_workflows_read_replays_its_recorded_values() {
     let reached = Arc::new(Notify::new());
@@ -526,11 +528,24 @@ async fn a_workflows_read_replays_its_recorded_values() {
             async move {
                 let mut values =
                     dbos::read_stream::<String, EngineOnly>(&producer, "out", Default::default());
-                let first = values.next().await?;
-                let second = values.next().await?;
+                let mut read = Vec::new();
+                while let Some(value) = values.next().await? {
+                    read.push(value);
+                }
+                let past_the_end = dbos::read_stream_value::<String, EngineOnly>(
+                    &producer,
+                    "out",
+                    10,
+                    Default::default(),
+                )
+                .await;
+                let ended = matches!(
+                    past_the_end,
+                    Err(Error::StreamTimeout { timeout: None, .. })
+                );
                 reached.notify_one();
                 release.notified().await;
-                Ok::<_, Error>(vec![first, second])
+                Ok::<_, Error>((read, ended))
             }
         })
         .unwrap()
@@ -568,7 +583,13 @@ async fn a_workflows_read_replays_its_recorded_values() {
             .iter()
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
-        [(0, "DBOS.readStream"), (1, "DBOS.readStream")]
+        [
+            (0, "DBOS.readStream"),
+            (1, "DBOS.readStream"),
+            (2, "DBOS.readStream"),
+            (3, "DBOS.readStream"),
+            (4, "DBOS.readStreamValue"),
+        ]
     );
 
     // Abandon the consumer, and delete what it read: a live read would now find no workflow.
@@ -586,12 +607,17 @@ async fn a_workflows_read_replays_its_recorded_values() {
         .expect("the recovered consumer never reached its gate");
     release.notify_one();
     until_status(&reader, "wf-consumer", WorkflowStatus::Success).await;
-    let result: Vec<Option<String>> = client
+    let (read, ended): (Vec<String>, bool) = client
         .retrieve_workflow::<_, EngineOnly>("wf-consumer")
         .result()
         .await
         .expect("the consumer failed");
-    assert_eq!(result, [Some("a".to_owned()), Some("b".to_owned())]);
+    assert_eq!(
+        read,
+        ["a", "b", "c"],
+        "the recorded values, then the recorded end"
+    );
+    assert!(ended, "the read past the end replayed its recorded end");
 
     dbos.shutdown().await;
 }
@@ -698,11 +724,12 @@ async fn a_workflows_timed_out_read_replays_as_a_timeout() {
     dbos.shutdown().await;
 }
 
-/// Two reads in flight in one workflow are refused: their ids would follow scheduling.
+/// Two reads driven together in one workflow body: each took its step id where it was written, so
+/// both are allowed and both read.
 #[tokio::test]
-async fn overlapping_reads_in_one_workflow_are_refused() {
+async fn reads_joined_in_one_workflow_both_read() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("streams-overlap", &db));
+    let dbos = DBOS::new(config("streams-joined", &db));
     let writer = register_writer(&dbos);
     let reads_two = dbos
         .register_workflow("reads-two", |()| async move {
@@ -711,10 +738,7 @@ async fn overlapping_reads_in_one_workflow_are_refused() {
             let mut two =
                 dbos::read_stream::<String, EngineOnly>("wf-two", "out", Default::default());
             let (first, second) = tokio::join!(one.next(), two.next());
-            Ok::<_, Error>((
-                first.is_ok(),
-                matches!(second, Err(Error::StreamNondeterminism { .. })),
-            ))
+            Ok::<_, Error>((first?, second?))
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
@@ -726,15 +750,147 @@ async fn overlapping_reads_in_one_workflow_are_refused() {
         .await
         .expect("the writer failed");
 
-    let (first_ok, second_refused) = reads_two
+    let read = reads_two
         .start_with((), start("wf-reads-two"))
         .await
         .expect("start failed")
         .result()
         .await
         .expect("the workflow failed");
-    assert!(first_ok, "the first read is unaffected");
-    assert!(second_refused, "the overlapping read is refused");
+    assert_eq!(read, (Some("a".to_owned()), Some("a".to_owned())));
+
+    dbos.shutdown().await;
+}
+
+/// **A read dropped while it records its value loses nothing.** The losing branch of a
+/// `select_step!` is dropped wherever it stands; here a zero timeout stands in for it, polling a
+/// read once — into its record — and dropping it. The next read delivers the value the dropped one
+/// was recording, and the stream comes out whole: nothing skipped, nothing twice.
+#[tokio::test]
+async fn a_dropped_read_loses_no_value() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("streams-dropped", &db));
+    let writer = register_writer(&dbos);
+    let drops_one = dbos
+        .register_workflow("drops-one", |()| async move {
+            let mut values =
+                dbos::read_stream::<String, EngineOnly>("wf-dropped", "out", Default::default());
+            let mut read = Vec::new();
+            // Fills the read-ahead buffer with the rest of the stream.
+            read.extend(values.next().await?);
+            if let Ok(finished) = tokio::time::timeout(Duration::ZERO, values.next()).await {
+                read.extend(finished?);
+            }
+            while let Some(value) = values.next().await? {
+                read.push(value);
+            }
+            Ok::<_, Error>(read)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let many = strings(&["0", "1", "2", "3", "4"]);
+    writer
+        .start_with((many.clone(), true), start("wf-dropped"))
+        .await
+        .expect("start failed")
+        .result()
+        .await
+        .expect("the writer failed");
+
+    let read = drops_one
+        .start_with((), start("wf-drops-one"))
+        .await
+        .expect("start failed")
+        .result()
+        .await
+        .expect("the workflow failed");
+    assert_eq!(read, many);
+
+    dbos.shutdown().await;
+}
+
+/// **A read of a workflow that does not exist is recorded**, so a workflow that caught the refusal
+/// replays it — even once the workflow exists and a live read would find its value.
+#[tokio::test]
+async fn a_read_of_a_missing_workflow_replays_as_missing() {
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let db = test_database().await;
+    let dbos = DBOS::new(config("streams-missing", &db));
+    let writer = register_writer(&dbos);
+    let consumer = {
+        let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+        dbos.register_workflow("too-early", move |producer: String| {
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                let read = dbos::read_stream_value::<String, EngineOnly>(
+                    &producer,
+                    "out",
+                    0,
+                    Default::default(),
+                )
+                .await;
+                let missing = matches!(
+                    read,
+                    Err(Error::SystemDatabase(
+                        dbos::sysdb::Error::NonExistentWorkflow { .. }
+                    ))
+                );
+                reached.notify_one();
+                release.notified().await;
+                Ok::<_, Error>(missing)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let running = tokio::spawn({
+        let consumer = consumer.clone();
+        async move {
+            consumer
+                .start_with("wf-later".to_owned(), start("wf-too-early"))
+                .await?
+                .result()
+                .await
+        }
+    });
+    tokio::time::timeout(DEADLINE, reached.notified())
+        .await
+        .expect("the consumer never reached its gate");
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps("wf-too-early", true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step_name, "DBOS.readStreamValue");
+    assert!(steps[0].error.is_some(), "the refusal is the step's error");
+
+    // Now the workflow exists, with a value where the read looked.
+    writer
+        .start_with((strings(&["x"]), true), start("wf-later"))
+        .await
+        .expect("start failed")
+        .result()
+        .await
+        .expect("the writer failed");
+
+    dbos.shutdown().await;
+    let _ = running.await.expect("the task panicked");
+    dbos.launch().await.expect("relaunch failed");
+    tokio::time::timeout(DEADLINE, reached.notified())
+        .await
+        .expect("the recovered consumer never reached its gate");
+    release.notify_one();
+    until_status(&reader, "wf-too-early", WorkflowStatus::Success).await;
+    let missing: bool = client(&db)
+        .await
+        .retrieve_workflow::<_, EngineOnly>("wf-too-early")
+        .result()
+        .await
+        .expect("the consumer failed");
+    assert!(missing, "the replay read live instead of its record");
 
     dbos.shutdown().await;
 }
@@ -821,6 +977,7 @@ async fn stream_calls_refuse_what_they_cannot_do() {
 #[tokio::test]
 async fn a_waiting_workflow_read_stops_when_its_workflow_is_cancelled() {
     let returned = Arc::new(Notify::new());
+    let cancelled = Arc::new(std::sync::Mutex::new(None));
     let db = test_database().await;
     let dbos = DBOS::new(config("streams-reader-cancel", &db));
     let silent = dbos
@@ -830,13 +987,15 @@ async fn a_waiting_workflow_read_stops_when_its_workflow_is_cancelled() {
         })
         .unwrap();
     let waits = {
-        let returned = Arc::clone(&returned);
+        let (returned, cancelled) = (Arc::clone(&returned), Arc::clone(&cancelled));
         dbos.register_workflow("waits", move |producer: String| {
-            let returned = Arc::clone(&returned);
+            let (returned, cancelled) = (Arc::clone(&returned), Arc::clone(&cancelled));
             async move {
                 let mut values =
                     dbos::read_stream::<String, EngineOnly>(&producer, "out", Default::default());
                 let read = values.next().await;
+                *cancelled.lock().unwrap() =
+                    Some(matches!(read, Err(Error::WorkflowCancelled { .. })));
                 returned.notify_one();
                 read
             }
@@ -859,6 +1018,11 @@ async fn a_waiting_workflow_read_stops_when_its_workflow_is_cancelled() {
     tokio::time::timeout(DEADLINE, returned.notified())
         .await
         .expect("the read never noticed its workflow was cancelled");
+    assert_eq!(
+        *cancelled.lock().unwrap(),
+        Some(true),
+        "the read stopped with the workflow's cancellation"
+    );
 
     dbos.shutdown().await;
 }

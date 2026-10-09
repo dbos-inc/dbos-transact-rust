@@ -1088,10 +1088,9 @@ pub trait SystemDatabase: Send + Sync {
     /// nothing at the offset still reports its status, and an offset range on the
     /// `(workflow_uuid, key, offset)` primary key.
     ///
-    /// **A missing workflow is [`Error::NonExistentWorkflow`].** Python and TypeScript report a
-    /// null status instead and their engines raise immediately on it, which is the same answer one
-    /// layer up; this crate already spells a missing workflow that way in
-    /// [`await_workflow_result`](Self::await_workflow_result).
+    /// **A missing workflow is [`Error::NonExistentWorkflow`]**, as it is in
+    /// [`await_workflow_result`](Self::await_workflow_result): a stream nobody can write to is not
+    /// a stream that is merely empty.
     ///
     /// Nothing at the offset is an empty `values` rather than an error — an offset a producer has
     /// not reached yet is the ordinary case, and the reason a reader waits.
@@ -1117,9 +1116,10 @@ pub trait SystemDatabase: Send + Sync {
     /// - [`AwaitedStream::Values`] as soon as a look finds a value at `offset`, with up to `limit`
     ///   values from there;
     /// - [`AwaitedStream::Ended`] once the producer is no longer `PENDING`, `ENQUEUED` or `DELAYED`
-    ///   and **one more look** still finds nothing. Cancelling a workflow and timing one out set its status
-    ///   from outside while it may still be committing a write, so the status alone does not end a
-    ///   stream;
+    ///   and **one more look** still finds nothing. Cancelling a workflow and timing one out set its
+    ///   status from outside while it may still be committing a write, so a status read beside an
+    ///   empty offset is not taken alone as the end. The extra look narrows that window rather than
+    ///   closing it: a write that commits after it is not seen;
     /// - [`AwaitedStream::TimedOut`] once `deadline` passes with the producer still running. `None`
     ///   waits for as long as the producer runs.
     ///

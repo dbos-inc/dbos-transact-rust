@@ -442,24 +442,6 @@ pub enum Error<E = EngineOnly> {
         timeout: Option<std::time::Duration>,
     },
 
-    /// A workflow read two streams at once.
-    ///
-    /// Each value a workflow reads is a step, and both reads record under the same step name, so
-    /// when two overlap their ids follow whichever was asked for its next value first. A replay
-    /// asks in whatever order it is scheduled, and the name check cannot tell the two reads'
-    /// values apart. Refused, rather than replayed into the other read's values. Read streams one
-    /// at a time in a workflow body, or read them in a step.
-    #[error(
-        "workflow {workflow_id} read stream {key} while another stream read was in progress; \
-         reads from a workflow body must not overlap"
-    )]
-    StreamNondeterminism {
-        /// The reading workflow.
-        workflow_id: String,
-        /// The key of the read that was refused.
-        key: String,
-    },
-
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
@@ -571,9 +553,6 @@ impl<E> Error<E> {
                 key,
                 timeout,
             },
-            Error::StreamNondeterminism { workflow_id, key } => {
-                Error::StreamNondeterminism { workflow_id, key }
-            }
             Error::StepBuiltElsewhere {
                 step,
                 built,
