@@ -37,6 +37,19 @@ pub const NULL_TOPIC: &str = "__null__topic__";
 /// encoded by another JSON-based serializer can be the same text.
 pub const STREAM_CLOSED: &str = "\"__DBOS_STREAM_CLOSED__\"";
 
+/// The label [`STREAM_CLOSED`] is always written under.
+pub const STREAM_CLOSED_SERIALIZATION: &str = "portable_json";
+
+/// Whether a stored stream entry is a close: [`STREAM_CLOSED`] under
+/// [`STREAM_CLOSED_SERIALIZATION`], and never the value alone.
+///
+/// The one test for a close. A reader ends on it; a write derives its step name from it; and a
+/// rewind deletes the closes past its cut by the same pair, so a reader stops exactly where a
+/// rewind would reopen the stream.
+pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
+    value == STREAM_CLOSED && serialization == Some(STREAM_CLOSED_SERIALIZATION)
+}
+
 /// Partitions a single partitioned sweep will look at.
 ///
 /// A bound on the work one transaction does, not on what is eventually dequeued: partitions past
@@ -61,13 +74,13 @@ use std::time::Duration;
 
 use types::step_names;
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, Debounce, DebounceRequest, EncodedValue,
-    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
-    NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite,
-    QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming, StreamRead,
-    StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Debounce, DebounceRequest,
+    EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
+    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
+    OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
+    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
+    StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -849,9 +862,15 @@ pub trait SystemDatabase: Send + Sync {
     /// Marks a stream closed, so a reader knows no more values are coming.
     ///
     /// An ordinary append of [`STREAM_CLOSED`], which is why closing is durable and
-    /// replayable on the same terms as any other write. Always a workflow-level step: a stream is
-    /// closed by the workflow that owns it.
-    async fn close_stream(&self, workflow_id: &str, step_id: i32, key: &str) -> Result<(), Error>;
+    /// replayable on the same terms as any other write — including `written_by`, which decides
+    /// whether the close is a step of its own exactly as it does for a value.
+    async fn close_stream(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        key: &str,
+        written_by: WrittenBy,
+    ) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
     ///
@@ -1053,43 +1072,73 @@ pub trait SystemDatabase: Send + Sync {
     /// history lives in `workflow_events_history`, which this does not read.
     async fn get_all_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>, Error>;
 
-    /// Reads one offset of a stream, with the producing workflow's status.
+    /// Reads a run of a stream's values from `offset`, with the producing workflow's status.
     ///
-    /// The read counterpart of [`write_stream`](Self::write_stream), and **the only one of the
-    /// three reads here that does not block.** It looks once and reports what it found. The waiting
-    /// belongs to the engine's `read_stream`, which loops this over rising offsets and is what a
-    /// caller actually reaches for; this is the one indexed read underneath it.
+    /// The read counterpart of [`write_stream`](Self::write_stream), and the one look underneath
+    /// [`await_stream_values`](Self::await_stream_values): it reads once and reports what it found.
+    /// At most `limit` values, starting at `offset` and stopping at the first offset with nothing
+    /// written, so `values[i]` is always the value at `offset + i`.
     ///
-    /// That split is Python's and TypeScript's, and their method is named exactly this. Go returns
-    /// every entry from `offset` onward in one call instead — the only implementation that batches,
-    /// and the only one whose database layer has to decide how much of a stream to buy at once.
+    /// **A page rather than one offset**, because written values never change: a reader can take a
+    /// run of them in one round trip and deliver them one at a time.
     ///
-    /// **One statement, so the value and the status share a snapshot**, which is the reason this
-    /// returns [`StreamRead`] rather than a value: a reader deciding whether to wait needs both,
-    /// and needs them to agree. A `LEFT JOIN` from `workflow_status`, so a workflow with nothing at
-    /// the offset still reports its status; matching the offset exactly keeps it a single lookup
-    /// on the `(workflow_uuid, key, offset)` primary key.
+    /// **One statement, so the values and the status share a snapshot**, which is the reason this
+    /// returns [`StreamRead`] rather than values alone: a reader deciding whether to wait needs
+    /// both, and needs them to agree. A `LEFT JOIN` from `workflow_status`, so a workflow with
+    /// nothing at the offset still reports its status, and an offset range on the
+    /// `(workflow_uuid, key, offset)` primary key.
     ///
-    /// **A missing workflow is [`Error::NonExistentWorkflow`].** Python and TypeScript report a
-    /// null status instead and their engines raise immediately on it, which is the same answer one
-    /// layer up; this crate already spells a missing workflow that way in
-    /// [`await_workflow_result`](Self::await_workflow_result).
+    /// **A missing workflow is [`Error::NonExistentWorkflow`]**, as it is in
+    /// [`await_workflow_result`](Self::await_workflow_result): a stream nobody can write to is not
+    /// a stream that is merely empty.
     ///
-    /// Nothing at the offset is `value: None` rather than an error — an offset a producer has not
-    /// reached yet is the ordinary case, and the reason a reader waits.
+    /// Nothing at the offset is an empty `values` rather than an error — an offset a producer has
+    /// not reached yet is the ordinary case, and the reason a reader waits. A `limit` below 1 is
+    /// [`Error::InvalidInput`]: there is no run of no values to read.
     ///
-    /// **Each call takes a connection**, and the loop above makes it a poll, so it runs under the
-    /// polling concurrency cap like the other two. Python and TypeScript both say so at this exact
-    /// method.
+    /// **Each call takes a connection**, and a reader loops it, so it runs under the polling
+    /// concurrency cap like the other polls.
     ///
-    /// No caller, no step, no deadline. A stream read is not a checkpoint: the loop that drives it
-    /// records one, and each offset re-read on replay yields what it yielded before.
-    async fn read_stream_value(
+    /// No caller, no step, no deadline. A stream read is not a checkpoint: the reader that drives
+    /// it records one step per value it delivers.
+    async fn read_stream_values(
         &self,
         workflow_id: &str,
         key: &str,
         offset: i32,
+        limit: i32,
     ) -> Result<StreamRead, Error>;
+
+    /// Waits until something is written at `offset`, and reads the run of values from there.
+    ///
+    /// [`read_stream_values`](Self::read_stream_values) in a loop, woken by the writer's
+    /// notification and otherwise looking again every `polling_interval`. It returns:
+    ///
+    /// - [`AwaitedStream::Values`] as soon as a look finds a value at `offset`, with up to `limit`
+    ///   values from there;
+    /// - [`AwaitedStream::Ended`] once the producer is no longer `PENDING`, `ENQUEUED` or `DELAYED`
+    ///   and **one more look** still finds nothing. Cancelling a workflow and timing one out set its
+    ///   status from outside while it may still be committing a write, so a status read beside an
+    ///   empty offset is not taken alone as the end. The extra look narrows that window rather than
+    ///   closing it: a write that commits after it is not seen;
+    /// - [`AwaitedStream::TimedOut`] once `deadline` passes with the producer still running. `None`
+    ///   waits for as long as the producer runs.
+    ///
+    /// **Registered before the first look**, so a value committed between a look and the wait
+    /// after it wakes the wait rather than being missed. Nothing pushes when a workflow *ends*, so
+    /// every wait is bounded by `polling_interval` whatever the listener is doing.
+    ///
+    /// Not a checkpoint, for the reason `read_stream_values` is not one. A missing workflow is
+    /// [`Error::NonExistentWorkflow`].
+    async fn await_stream_values(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        offset: i32,
+        limit: i32,
+        deadline: Option<Timestamp>,
+        polling_interval: Duration,
+    ) -> Result<AwaitedStream, Error>;
 
     /// Every stream entry a workflow has written, grouped by key and in stream order.
     async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error>;

@@ -1,6 +1,6 @@
 //! Who is waiting for what, so a write can wake them.
 //!
-//! `recv`, `get_event` and `read_stream_value` all wait for a row another process may not have
+//! `recv`, `get_event` and `await_stream_values` all wait for a row another process may not have
 //! written yet. Each waits by looping — look at the database, wait a bounded interval, look again —
 //! and **that loop is what delivers.** Every reference works this way: a notification is only ever
 //! a hint to look again, never the value, and nobody acts on its payload. On CockroachDB, which has
@@ -80,14 +80,10 @@ pub(crate) fn event_key(workflow_id: &str, key: &str) -> String {
     format!("{EVENT_PREFIX}::{workflow_id}::{key}")
 }
 
-/// The key a `read_stream_value`'s loop waits on.
+/// The key a stream reader waits on: one stream of one workflow.
 ///
-/// **The one key here with no caller**, and deliberately so: `read_stream_value` reads a single
-/// offset and returns, so the subscription belongs to the loop above it — the engine's
-/// `read_stream`, which does not exist yet. That loop stays there rather than moving behind the
-/// trait, so this waits for an engine rather than for a change of mind. The listener already
-/// derives this key from the streams channel and wakes nobody with it, which is correct until then.
-#[allow(dead_code)]
+/// The wait is behind the trait, in `await_stream_values`, for the reason every other wait is:
+/// the registry belongs to the backend, and the engine reaches a backend only through the trait.
 pub(crate) fn stream_key(workflow_id: &str, key: &str) -> String {
     format!("{STREAM_PREFIX}::{workflow_id}::{key}")
 }
@@ -228,6 +224,23 @@ pub(crate) struct Subscription {
 }
 
 impl Subscription {
+    /// Discards any wakeup already delivered, so the next [`notified`](Self::notified) waits for a
+    /// new one.
+    ///
+    /// **For a caller about to look.** A wakeup that arrived before a look is for something the
+    /// look will see; left queued, it would end the wait after that look at once, for nothing new.
+    /// Clearing *before* the look rather than after is what keeps a wakeup that lands between the
+    /// two: it is queued after the clear, and the wait returns on it.
+    pub(crate) fn clear(&mut self) {
+        // `Lagged` is a dropped wakeup, which is spent the same way. `Empty` is the end of what was
+        // queued, and `Closed` cannot happen while this subscription holds a receiver.
+        while !matches!(
+            self.receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed)
+        ) {}
+    }
+
     /// Waits until something is written on this key.
     ///
     /// **No timeout of its own**, deliberately: the caller owns the deadline and re-checks the

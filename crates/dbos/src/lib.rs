@@ -74,6 +74,8 @@ mod sleep;
 #[cfg(feature = "engine")]
 mod step;
 #[cfg(feature = "engine")]
+mod stream;
+#[cfg(feature = "engine")]
 mod wait;
 #[cfg(feature = "engine")]
 mod workflow;
@@ -115,6 +117,11 @@ pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInpu
 pub use sleep::sleep;
 #[cfg(feature = "engine")]
 pub use step::{ShouldRetry, StepOptions, step, step_with};
+#[cfg(feature = "engine")]
+pub use stream::{
+    DEFAULT_STREAM_POLLING_INTERVAL, MIN_STREAM_POLLING_INTERVAL, ReadStreamOptions, StreamReader,
+    close_stream, read_stream, read_stream_from, read_stream_value, write_stream,
+};
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit, ScheduleFilter, ScheduleStatus, WorkflowDelay};
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not

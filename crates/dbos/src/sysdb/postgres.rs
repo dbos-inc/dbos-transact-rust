@@ -74,25 +74,29 @@ use self::listener::Listener;
 use self::notifier::Notifier;
 use super::PARTITIONED_DEQUEUE_SWEEP_CAP;
 use super::migrations::{self, quote_identifier};
-use super::notify::{EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key};
+use super::notify::{
+    EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key, stream_key,
+};
 use super::retry::{RetryPolicy, with_retry};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::types::step_names;
 use super::types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, Change, Debounce, DebounceHolder,
-    DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
-    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
-    OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
-    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord,
-    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
-    duration_from_ms, duration_from_secs, is_valid_application_name, validate_attributes,
+    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, Debounce,
+    DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
+    GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
+    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
+    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
+    ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
+    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
-    OutcomeWrite, STREAM_CLOSED, SystemDatabase, WorkflowInitResult,
+    OutcomeWrite, STREAM_CLOSED, STREAM_CLOSED_SERIALIZATION, SystemDatabase, WorkflowInitResult,
+    is_stream_closed,
 };
 
 impl From<sqlx::Error> for Error {
@@ -1774,6 +1778,9 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 
 /// The three statuses that mean a workflow has not finished doing anything yet.
+///
+/// The SQL spelling of [`WorkflowStatus::is_active`](super::types::WorkflowStatus::is_active):
+/// the two must list the same statuses.
 ///
 /// Spelled into the SQL rather than bound, because these are this crate's own enum rendered by
 /// [`WorkflowStatus::as_str`](super::types::WorkflowStatus::as_str) and never a caller's string —
@@ -4295,16 +4302,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     };
                     // A status this build does not know is refused rather than guessed at. A
                     // workflow that may be running is refused too: its own execution replays from
-                    // the history this would delete. These are the three statuses in
-                    // `UNSETTLED`; `MAX_RECOVERY_ATTEMPTS_EXCEEDED` passes, deliberately — see
-                    // the trait method.
+                    // the history this would delete. `MAX_RECOVERY_ATTEMPTS_EXCEEDED` is not
+                    // active and passes, deliberately — see the trait method.
                     let status = parse_workflow_status(&status)?;
-                    if matches!(
-                        status,
-                        WorkflowStatus::Pending
-                            | WorkflowStatus::Enqueued
-                            | WorkflowStatus::Delayed
-                    ) {
+                    if status.is_active() {
                         return Err(Error::WorkflowNotRewindable {
                             workflow_id: workflow_id.to_owned(),
                             status: status.as_str().to_owned(),
@@ -4343,8 +4344,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .execute(&mut *tx)
                     .await?;
 
-                    // Only the close. Every other entry stays where a reader may already have
-                    // found it, and the replay appends after it.
+                    // Only the close — the pair `is_stream_closed` tests, which is what a reader
+                    // ends on. Every other entry stays where a reader may already have found it,
+                    // and the replay appends after it.
                     sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM {streams_table} \
                          WHERE workflow_uuid = $1 AND function_id >= $2 \
@@ -4353,7 +4355,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .bind(workflow_id)
                     .bind(start_step)
                     .bind(STREAM_CLOSED)
-                    .bind(PORTABLE_JSON)
+                    .bind(STREAM_CLOSED_SERIALIZATION)
                     .execute(&mut *tx)
                     .await?;
 
@@ -4712,7 +4714,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         // Derived, not passed: a close is recorded as a close whichever entry point reached it.
         // The label is part of the match, so a user value that encodes to the same text is not.
-        let step_name = if value == STREAM_CLOSED && serialization == Some(PORTABLE_JSON) {
+        let step_name = if is_stream_closed(value, serialization) {
             step_names::CLOSE_STREAM
         } else {
             step_names::WRITE_STREAM
@@ -4816,14 +4818,20 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn close_stream(&self, workflow_id: &str, step_id: i32, key: &str) -> Result<(), Error> {
+    async fn close_stream(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+        key: &str,
+        written_by: WrittenBy,
+    ) -> Result<(), Error> {
         self.write_stream(
             workflow_id,
             step_id,
             key,
             STREAM_CLOSED,
-            Some(PORTABLE_JSON),
-            WrittenBy::Workflow,
+            Some(STREAM_CLOSED_SERIALIZATION),
+            written_by,
         )
         .await
     }
@@ -5323,79 +5331,148 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn read_stream_value(
+    async fn read_stream_values(
         &self,
         workflow_id: &str,
         key: &str,
         offset: i32,
+        limit: i32,
     ) -> Result<StreamRead, Error> {
         let workflow_table = self.tables.workflow_status.as_str();
         let streams_table = self.tables.streams.as_str();
         let (pool, polling) = (&self.pool, &self.polling);
-        // `workflow_status` drives the join, so the statement returns a row whenever the workflow
-        // exists — with or without a value at the offset — and no row only when it does not. The
-        // join predicate carries the key and offset rather than the `WHERE` clause, which is what
-        // makes that distinction possible at all.
+        // `workflow_status` drives the join, so the statement returns at least one row whenever
+        // the workflow exists — with or without values in the range — and none only when it does
+        // not. The join predicate carries the key and the range rather than the `WHERE` clause,
+        // which is what makes that distinction possible at all.
         //
         // `"offset"` is quoted throughout because it is a reserved word, and aliased on the way out
-        // so it can be read back plainly. Matching it exactly keeps this one lookup on the
-        // `(workflow_uuid, key, offset)` primary key.
+        // so it can be read back plainly. The range is on the `(workflow_uuid, key, offset)`
+        // primary key, and its upper bound is computed here so an offset near the top of the
+        // column's range cannot overflow in SQL.
         let select = format!(
             "SELECT w.status AS status, s.value AS value, s.serialization AS serialization, \
              s.\"offset\" AS stream_offset \
              FROM {workflow_table} w \
              LEFT OUTER JOIN {streams_table} s \
-               ON s.workflow_uuid = w.workflow_uuid AND s.key = $2 AND s.\"offset\" = $3 \
-             WHERE w.workflow_uuid = $1"
+               ON s.workflow_uuid = w.workflow_uuid AND s.key = $2 \
+              AND s.\"offset\" >= $3 AND s.\"offset\" < $4 \
+             WHERE w.workflow_uuid = $1 \
+             ORDER BY s.\"offset\""
         );
         let select = &select;
+        if limit < 1 {
+            return Err(Error::InvalidInput {
+                field: "limit".into(),
+                detail: format!("must be at least 1, got {limit}"),
+            });
+        }
+        let end = i64::from(offset) + i64::from(limit);
 
-        with_retry(&self.retry, "read_stream_value", move || async move {
-            // A reader's loop calls this once per offset and then once per interval while it waits,
-            // so it is a poll like the other two and is capped like them. Inside the retried
-            // region, so a call that is backing off is not holding a permit through its backoff.
+        with_retry(&self.retry, "read_stream_values", move || async move {
+            // A reader calls this once per page and then once per interval while it waits, so it
+            // is a poll like the others and is capped like them. Inside the retried region, so a
+            // call that is backing off is not holding a permit through its backoff.
             let _permit = polling
                 .acquire()
                 .await
                 .expect("the polling limiter is never closed");
-            let row = sqlx::query(AssertSqlSafe(select.clone()))
+            let rows = sqlx::query(AssertSqlSafe(select.clone()))
                 .bind(workflow_id)
                 .bind(key)
                 .bind(offset)
-                .fetch_optional(pool)
+                .bind(end)
+                .fetch_all(pool)
                 .await?;
 
             // No row at all means no such workflow — the outer table drives the join. Reported
             // rather than returned as an absent status, because a stream nobody can write to is not
             // a stream that is merely empty, and every engine turns the null status into this same
             // error the moment it sees one.
-            let Some(row) = row else {
+            let Some(first) = rows.first() else {
                 return Err(Error::NonExistentWorkflow {
                     workflow_ids: vec![workflow_id.to_owned()],
                 });
             };
-
-            let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
+            let status = parse_workflow_status(&first.try_get::<String, _>("status")?)?;
 
             // `streams."offset"` is `NOT NULL`, so a NULL here can only mean the join matched
-            // nothing: there is no entry at this offset. Python and TypeScript read the same column
-            // for the same reason.
+            // nothing: the range is empty, and the one row is the workflow alone.
             //
-            // Probing `value` would answer identically today, since it is `NOT NULL` too — but the
-            // question being asked is whether the *join* matched, and keying on a payload column
-            // makes the answer hostage to that column staying non-nullable. `serialization`, one
-            // column over, already is nullable.
-            let value = match row.try_get::<Option<i32>, _>("stream_offset")? {
-                Some(_) => Some(EncodedValue {
-                    value: row.try_get("value")?,
-                    serialization: row.try_get("serialization")?,
-                }),
-                None => None,
-            };
+            // Kept only while the offsets run on without a gap from `offset`, so `values[i]` is
+            // always the value at `offset + i`. Offsets are dense — a write takes the one after the
+            // highest present — so a gap is not expected; the check keeps that an invariant of
+            // this method rather than of every writer.
+            let mut values = Vec::with_capacity(rows.len());
+            for (expected, row) in (i64::from(offset)..).zip(&rows) {
+                match row.try_get::<Option<i32>, _>("stream_offset")? {
+                    Some(at) if i64::from(at) == expected => values.push(EncodedValue {
+                        value: row.try_get("value")?,
+                        serialization: row.try_get("serialization")?,
+                    }),
+                    _ => break,
+                }
+            }
 
-            Ok(StreamRead { status, value })
+            Ok(StreamRead { status, values })
         })
         .await
+    }
+
+    async fn await_stream_values(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        offset: i32,
+        limit: i32,
+        deadline: Option<Timestamp>,
+        polling_interval: Duration,
+    ) -> Result<AwaitedStream, Error> {
+        // **Before the first look, never after.** A caller that looked first and registered second
+        // would miss a value written in between and then wait out a whole interval for it. The loop
+        // below delivers on its own; a wakeup only shortens it.
+        let mut subscription = self.notify.subscribe(stream_key(workflow_id, key));
+        // Set once the producer is seen to have stopped, so the next empty look ends the stream
+        // rather than waiting. See the trait method for why one more look is owed.
+        let mut final_look = false;
+
+        loop {
+            // Any wakeup queued by now is for a write this look will see, so it is spent here:
+            // left queued, it would cut the wait below short for nothing new.
+            subscription.clear();
+            let read = self
+                .read_stream_values(workflow_id, key, offset, limit)
+                .await?;
+            if !read.values.is_empty() {
+                return Ok(AwaitedStream::Values(read.values));
+            }
+            if final_look {
+                return Ok(AwaitedStream::Ended);
+            }
+            // A `DELAYED` producer has not started, and will write when it does; a parked one will
+            // not write unless someone resumes it.
+            if !read.status.is_active() {
+                final_look = true;
+                continue;
+            }
+
+            // Bounded by the interval whatever the listener is doing: a value arriving is pushed,
+            // but the producer *ending* is not, in any implementation.
+            let mut wait = polling_interval;
+            if let Some(deadline) = deadline {
+                // Past the deadline and exactly on it are the same answer, folded here so a
+                // zero-length wait never turns into a spin.
+                let remaining = deadline
+                    .duration_since(Timestamp::now())
+                    .unwrap_or(Duration::ZERO);
+                if remaining.is_zero() {
+                    return Ok(AwaitedStream::TimedOut);
+                }
+                wait = wait.min(remaining);
+            }
+            // Elapsing is not an error: both outcomes mean look again.
+            let _ = tokio::time::timeout(wait, subscription.notified()).await;
+        }
     }
 
     async fn get_all_stream_entries(&self, workflow_id: &str) -> Result<Vec<StreamRecord>, Error> {

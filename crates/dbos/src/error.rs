@@ -420,6 +420,28 @@ pub enum Error<E = EngineOnly> {
         timeout: std::time::Duration,
     },
 
+    /// A stream read waited out its timeout with no value, or the stream ended before the offset
+    /// a single-value read asked for.
+    ///
+    /// The timeout is **per value**: the clock restarts each time the reader delivers one. A
+    /// workflow's read records this as the step's outcome, so a replay raises it again without
+    /// waiting — the same way a timed-out `get_event` replays its `None`.
+    ///
+    /// `timeout` is `None` for the single-value read of a stream that ended first, where no value
+    /// will ever arrive and there was no wait to time out.
+    #[error(
+        "no value arrived on stream {key} of workflow {workflow_id}{}",
+        timeout.map_or_else(String::new, |t| format!(" within {}ms", t.as_millis()))
+    )]
+    StreamTimeout {
+        /// The workflow whose stream was being read.
+        workflow_id: String,
+        /// The stream's key.
+        key: String,
+        /// The per-value timeout that elapsed, or `None` if the stream ended first.
+        timeout: Option<std::time::Duration>,
+    },
+
     /// A step was retried to its limit and every attempt failed.
     ///
     /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
@@ -522,6 +544,15 @@ impl<E> Error<E> {
             },
             Error::StepFailed { step, message } => Error::StepFailed { step, message },
             Error::StepTimeout { step, timeout } => Error::StepTimeout { step, timeout },
+            Error::StreamTimeout {
+                workflow_id,
+                key,
+                timeout,
+            } => Error::StreamTimeout {
+                workflow_id,
+                key,
+                timeout,
+            },
             Error::StepBuiltElsewhere {
                 step,
                 built,
