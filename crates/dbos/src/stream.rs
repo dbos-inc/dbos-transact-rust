@@ -85,18 +85,7 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    let built = Ctx::current()
-        .ok_or(Error::NotInWorkflow {
-            operation: "write_stream".into(),
-        })
-        .and_then(|ctx| {
-            let encoded = encode(value, "stream value")?;
-            Ok((
-                (Arc::clone(ctx.executor().connection()), Some(encoded)),
-                StepPlacement::at(ctx),
-            ))
-        });
-    pending_write(step_names::WRITE_STREAM, key, built)
+    pending_write(key, StreamWrite::Value(value))
 }
 
 /// Closes stream `key` of the current workflow, so its readers end once they reach the close.
@@ -109,29 +98,62 @@ pub fn close_stream<'a, E>(key: &'a str) -> PendingStep<'a, (), E>
 where
     E: DurableError + 'a,
 {
-    let built = Ctx::current()
-        .ok_or(Error::NotInWorkflow {
-            operation: "close_stream".into(),
-        })
-        .map(|ctx| {
-            (
-                (Arc::clone(ctx.executor().connection()), None),
-                StepPlacement::at(ctx),
-            )
-        });
-    pending_write(step_names::CLOSE_STREAM, key, built)
+    pending_write::<(), E>(key, StreamWrite::Close)
 }
 
-/// A write or a close as a [`PendingStep`]: `Some` value is a write, `None` the close.
-fn pending_write<'a, E>(
-    name: &'static str,
-    key: &'a str,
-    built: Built<(Arc<Connection>, Option<String>)>,
-) -> PendingStep<'a, (), E>
+/// What a stream write appends: a value, or the close.
+///
+/// The one thing that tells a write from a close, so the step name, the call a refusal names and
+/// the `sysdb` call all follow from it rather than being passed alongside each other.
+enum StreamWrite<'v, T> {
+    Value(&'v T),
+    Close,
+}
+
+impl<T> StreamWrite<'_, T> {
+    /// The step name the append records.
+    fn name(&self) -> &'static str {
+        match self {
+            StreamWrite::Value(_) => step_names::WRITE_STREAM,
+            StreamWrite::Close => step_names::CLOSE_STREAM,
+        }
+    }
+
+    /// The call a refusal names.
+    fn operation(&self) -> &'static str {
+        match self {
+            StreamWrite::Value(_) => "write_stream",
+            StreamWrite::Close => "close_stream",
+        }
+    }
+}
+
+/// A write or a close as a [`PendingStep`].
+///
+/// Refuses outside a workflow, then encodes a value, then takes the step id — in that order, so a
+/// value that cannot be encoded is a write that never happens and moves no counter.
+fn pending_write<'a, T, E>(key: &'a str, write: StreamWrite<'_, T>) -> PendingStep<'a, (), E>
 where
+    T: Serialize,
     E: DurableError + 'a,
 {
-    PendingStep::placed(name, built, move |(conn, value), placement| async move {
+    let name = write.name();
+    let built = Ctx::current()
+        .ok_or_else(|| Error::NotInWorkflow {
+            operation: write.operation().into(),
+        })
+        .and_then(|ctx| {
+            // `None` is the close, and is only ever made here, from the write it stands for.
+            let encoded = match write {
+                StreamWrite::Value(value) => Some(encode(value, "stream value")?),
+                StreamWrite::Close => None,
+            };
+            Ok((
+                (Arc::clone(ctx.executor().connection()), encoded),
+                StepPlacement::at(ctx),
+            ))
+        });
+    PendingStep::placed(name, built, move |(conn, encoded), placement| async move {
         // A step id of the workflow's own when written from its body; the enclosing step's id when
         // written from inside one, where the write records nothing and the column is all it gets.
         let (workflow_id, step_id, written_by) = match &placement {
@@ -149,7 +171,7 @@ where
             }
         };
         let sysdb = conn.sysdb();
-        match &value {
+        match &encoded {
             Some(value) => {
                 sysdb
                     .write_stream(
