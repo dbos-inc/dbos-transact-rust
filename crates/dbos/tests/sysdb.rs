@@ -3515,8 +3515,8 @@ async fn set_event_publishes_a_value_and_its_history() {
     assert_eq!(events[0].value, "50");
     assert_eq!(events[0].serialization.as_deref(), Some("portable_json"));
 
-    // The step is recorded under the name every implementation uses, so a workflow replayed by
-    // another SDK finds what it expects rather than an `UnexpectedStep`.
+    // The literal pins the library's recorded step name, so an accidental rename fails this test
+    // instead of silently changing Rust workflow replay compatibility.
     let step = sys
         .check_step("wf-publisher", 0, "DBOS.set_event")
         .await
