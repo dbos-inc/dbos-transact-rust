@@ -3,12 +3,12 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, AwaitedOutcome, Change, Debounce, DebounceRequest, EncodedValue, Fork,
-    ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule,
-    NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate,
-    StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, WrittenBy,
+    Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, EncodedValue,
+    Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue,
+    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
+    RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus,
+    ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -6558,7 +6558,7 @@ async fn a_replay_that_changed_its_send_surface_is_refused() {
     assert!(sys.get_all_notifications("wf-y").await.unwrap().is_empty());
 }
 
-/// One offset reads back with the producer's status, from one snapshot.
+/// A run of values reads back with the producer's status, from one snapshot.
 #[tokio::test]
 async fn a_stream_offset_reads_back_with_its_producers_status() {
     let (sys, _db) = sysdb().await;
@@ -6577,16 +6577,16 @@ async fn a_stream_offset_reads_back_with_its_producers_status() {
     .unwrap();
 
     let read = sys
-        .read_stream_value("wf-stream", "progress", 0)
+        .read_stream_values("wf-stream", "progress", 0, 10)
         .await
         .unwrap();
     assert_eq!(read.status, WorkflowStatus::Pending);
     assert_eq!(
-        read.value,
-        Some(EncodedValue {
+        read.values,
+        [EncodedValue {
             value: "\"a\"".to_owned(),
             serialization: Some("portable_json".to_owned()),
-        })
+        }]
     );
 }
 
@@ -6605,10 +6605,10 @@ async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
     // Nothing written at all, and no such key either — both are simply empty offsets.
     for (key, offset) in [("progress", 0), ("never-written", 0), ("progress", 7)] {
         let read = sys
-            .read_stream_value("wf-stream", key, offset)
+            .read_stream_values("wf-stream", key, offset, 10)
             .await
             .unwrap();
-        assert_eq!(read.value, None, "key {key} offset {offset}");
+        assert!(read.values.is_empty(), "key {key} offset {offset}");
         assert_eq!(read.status, WorkflowStatus::Pending);
     }
 
@@ -6617,11 +6617,11 @@ async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
         .await
         .unwrap();
     let read = sys
-        .read_stream_value("wf-stream", "progress", 0)
+        .read_stream_values("wf-stream", "progress", 0, 10)
         .await
         .unwrap();
     assert_eq!(read.status, WorkflowStatus::Success);
-    assert_eq!(read.value, None);
+    assert!(read.values.is_empty());
 }
 
 /// A stream nobody can write to is an error, not an empty stream.
@@ -6629,7 +6629,7 @@ async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
 async fn reading_a_stream_of_a_missing_workflow_is_refused() {
     let (sys, _db) = sysdb().await;
     let err = sys
-        .read_stream_value("wf-nobody", "progress", 0)
+        .read_stream_values("wf-nobody", "progress", 0, 10)
         .await
         .expect_err("there is no workflow to wait on");
     assert!(
@@ -6656,36 +6656,37 @@ async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
     )
     .await
     .unwrap();
-    sys.close_stream("wf-stream", 1, "progress").await.unwrap();
+    sys.close_stream("wf-stream", 1, "progress", WrittenBy::Workflow)
+        .await
+        .unwrap();
 
     assert_eq!(
-        sys.read_stream_value("wf-stream", "progress", 1)
+        sys.read_stream_values("wf-stream", "progress", 1, 10)
             .await
             .unwrap()
-            .value,
-        Some(EncodedValue {
+            .values,
+        [EncodedValue {
             value: dbos::sysdb::STREAM_CLOSED.to_owned(),
             serialization: Some("portable_json".to_owned()),
-        }),
+        }],
         "the sentinel is a value at an offset like any other",
     );
     // And it is the last one: nothing follows a close.
-    assert_eq!(
-        sys.read_stream_value("wf-stream", "progress", 2)
+    assert!(
+        sys.read_stream_values("wf-stream", "progress", 2, 10)
             .await
             .unwrap()
-            .value,
-        None,
+            .values
+            .is_empty(),
     );
 }
 
-/// A reader draining a stream sees every offset in order, and stops at the first empty one.
+/// A page is the run of values from its offset, at most `limit` long, and pages tile the stream.
 ///
-/// This is the engine's loop, written out by hand — the point being that everything it
-/// needs comes from this one call: the value, whether there is one, and whether the producer is
-/// still going.
+/// Read in pages of two, the stream comes back whole and in order — the close included, since
+/// recognising it is the reader's job — and a page past the end is empty.
 #[tokio::test]
-async fn the_offsets_of_a_stream_read_back_as_the_stream() {
+async fn the_pages_of_a_stream_read_back_as_the_stream() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-stream"), None, Submission::Fresh, None)
         .await
@@ -6702,43 +6703,163 @@ async fn the_offsets_of_a_stream_read_back_as_the_stream() {
         .await
         .unwrap();
     }
-    sys.close_stream("wf-stream", 3, "progress").await.unwrap();
+    sys.close_stream("wf-stream", 3, "progress", WrittenBy::Workflow)
+        .await
+        .unwrap();
 
     let mut read = Vec::new();
-    for offset in 0..10 {
-        let at = sys
-            .read_stream_value("wf-stream", "progress", offset)
+    let mut offset = 0;
+    loop {
+        let page = sys
+            .read_stream_values("wf-stream", "progress", offset, 2)
             .await
-            .unwrap();
-        match at.value {
-            Some(v)
-                if v.value == dbos::sysdb::STREAM_CLOSED
-                    && v.serialization.as_deref() == Some("portable_json") =>
-            {
-                break;
-            }
-            Some(v) => read.push(v.value),
-            None => break,
+            .unwrap()
+            .values;
+        assert!(page.len() <= 2, "a page is at most its limit");
+        if page.is_empty() {
+            break;
         }
+        offset += i32::try_from(page.len()).unwrap();
+        read.extend(page.into_iter().map(|v| v.value));
     }
-    assert_eq!(read, ["\"a\"", "\"b\"", "\"c\""]);
+    assert_eq!(
+        read,
+        ["\"a\"", "\"b\"", "\"c\"", dbos::sysdb::STREAM_CLOSED]
+    );
+}
+
+/// A blocking read returns what is already there without waiting, the run after it included.
+#[tokio::test]
+async fn awaiting_a_written_offset_returns_at_once() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-ready", &["\"a\"", "\"b\""], false).await;
+
+    let awaited = tokio::time::timeout(
+        RECHECK,
+        sys.await_stream_values(
+            "wf-ready",
+            "progress",
+            0,
+            10,
+            None,
+            std::time::Duration::from_secs(60),
+        ),
+    )
+    .await
+    .expect("a written offset should not wait")
+    .unwrap();
+    let AwaitedStream::Values(values) = awaited else {
+        panic!("expected values, got {awaited:?}");
+    };
+    assert_eq!(
+        values.iter().map(|v| v.value.as_str()).collect::<Vec<_>>(),
+        ["\"a\"", "\"b\""]
+    );
+}
+
+/// A finished producer with nothing at the offset ends the stream rather than waiting for it.
+///
+/// The polling interval is the whole timeout here: ending must not take a wait at all once the
+/// status is terminal, beyond the one more look it is owed.
+#[tokio::test]
+async fn awaiting_past_a_finished_producer_ends_the_stream() {
+    let (sys, _db) = sysdb().await;
+    finished_stream_writer(&sys, "wf-done", &["\"a\""], false).await;
+
+    let awaited = tokio::time::timeout(
+        RECHECK,
+        sys.await_stream_values(
+            "wf-done",
+            "progress",
+            1,
+            10,
+            None,
+            std::time::Duration::from_secs(60),
+        ),
+    )
+    .await
+    .expect("a finished producer should end the stream without waiting")
+    .unwrap();
+    assert_eq!(awaited, AwaitedStream::Ended);
+}
+
+/// A running producer with nothing at the offset times out at the deadline, and not before.
+#[tokio::test]
+async fn awaiting_a_running_producer_times_out_at_the_deadline() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-slow"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let wait = std::time::Duration::from_millis(300);
+    let deadline = Timestamp::now().checked_add(wait).unwrap();
+    let awaited = sys
+        .await_stream_values(
+            "wf-slow",
+            "progress",
+            0,
+            10,
+            Some(deadline),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+    assert_eq!(awaited, AwaitedStream::TimedOut);
+    assert!(started.elapsed() >= wait, "timed out early");
+}
+
+/// A value written while a reader waits ends the wait with that value.
+///
+/// The interval is long, so on a backend whose listener delivers this is the notification; on one
+/// with none it is the next look. Either way the reader sees the write and not a timeout.
+#[tokio::test]
+async fn a_write_ends_a_waiting_read() {
+    let (sys, _db) = sysdb().await;
+    let sys = std::sync::Arc::new(sys);
+    sys.init_workflow(&workflow("wf-live"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let reader = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.await_stream_values("wf-live", "progress", 0, 10, None, RECHECK)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sys.write_stream(
+        "wf-live",
+        0,
+        "progress",
+        "\"late\"",
+        Some("portable_json"),
+        WrittenBy::Workflow,
+    )
+    .await
+    .unwrap();
+
+    let awaited = tokio::time::timeout(RECHECK * 3, reader)
+        .await
+        .expect("the write never ended the wait")
+        .unwrap()
+        .unwrap();
+    let AwaitedStream::Values(values) = awaited else {
+        panic!("expected the value, got {awaited:?}");
+    };
+    assert_eq!(values[0].value, "\"late\"");
 }
 
 /// Every value at offsets `0..`, until the first empty one, as stored.
 async fn stream_values(sys: &PostgresSystemDatabase, workflow_id: &str, key: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    for offset in 0.. {
-        match sys
-            .read_stream_value(workflow_id, key, offset)
-            .await
-            .unwrap()
-            .value
-        {
-            Some(v) => values.push(v.value),
-            None => return values,
-        }
-    }
-    unreachable!()
+    sys.read_stream_values(workflow_id, key, 0, 1000)
+        .await
+        .unwrap()
+        .values
+        .into_iter()
+        .map(|v| v.value)
+        .collect()
 }
 
 /// A workflow that wrote `values` to `progress`, one step each, closed it if asked, and finished.
@@ -6765,7 +6886,7 @@ async fn finished_stream_writer(
     }
     if close {
         let step_id = i32::try_from(values.len()).unwrap();
-        sys.close_stream(workflow_id, step_id, "progress")
+        sys.close_stream(workflow_id, step_id, "progress", WrittenBy::Workflow)
             .await
             .unwrap();
     }
@@ -6968,7 +7089,7 @@ async fn capped_stream_reads_do_not_block_each_other() {
     let readers: Vec<_> = (0..8)
         .map(|_| {
             let sys = std::sync::Arc::clone(&sys);
-            tokio::spawn(async move { sys.read_stream_value("wf-stream", "progress", 0).await })
+            tokio::spawn(async move { sys.read_stream_values("wf-stream", "progress", 0, 1).await })
         })
         .collect();
     for reader in readers {
@@ -6977,7 +7098,7 @@ async fn capped_stream_reads_do_not_block_each_other() {
             .expect("a reader starved behind the polling cap")
             .unwrap()
             .unwrap();
-        assert_eq!(read.value.map(|v| v.value), Some("\"a\"".to_owned()));
+        assert_eq!(read.values[0].value, "\"a\"");
     }
 }
 
@@ -7086,7 +7207,9 @@ async fn closing_a_stream_appends_the_sentinel() {
     sys.write_stream("wf-close", 0, "k", "\"value\"", None, WrittenBy::Workflow)
         .await
         .unwrap();
-    sys.close_stream("wf-close", 1, "k").await.unwrap();
+    sys.close_stream("wf-close", 1, "k", WrittenBy::Workflow)
+        .await
+        .unwrap();
 
     let entries = sys.get_all_stream_entries("wf-close").await.unwrap();
     assert_eq!(entries.len(), 2);
@@ -7117,7 +7240,9 @@ async fn closing_a_stream_appends_the_sentinel() {
     );
 
     // And closing twice is a replay, not a second sentinel.
-    sys.close_stream("wf-close", 1, "k").await.unwrap();
+    sys.close_stream("wf-close", 1, "k", WrittenBy::Workflow)
+        .await
+        .unwrap();
     assert_eq!(
         sys.get_all_stream_entries("wf-close").await.unwrap().len(),
         2

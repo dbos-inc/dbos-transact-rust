@@ -703,7 +703,7 @@ where
 /// result while this process was still running it. There is nothing to preempt for — the step's
 /// own outcome is no longer wanted either way — so this parks rather than reporting a cancellation
 /// that did not happen, and lets the attempt finish on its own terms.
-async fn observe_cancellation(ctx: &Ctx) {
+pub(crate) async fn observe_cancellation(ctx: &Ctx) {
     let executor = ctx.executor();
     let interval = executor.outcome_poll_interval();
     match executor

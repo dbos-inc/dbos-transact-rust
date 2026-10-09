@@ -260,6 +260,19 @@ impl WorkflowStatus {
             WorkflowStatus::Success | WorkflowStatus::Error | WorkflowStatus::Cancelled
         )
     }
+
+    /// Whether the workflow is running or will run without anyone acting on it: `PENDING`,
+    /// `ENQUEUED`, or `DELAYED` until its delay elapses.
+    ///
+    /// **Not the complement of [`is_terminal`](Self::is_terminal).**
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` is neither: it is parked rather than finished, and runs
+    /// again only if someone resumes it.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            WorkflowStatus::Pending | WorkflowStatus::Enqueued | WorkflowStatus::Delayed
+        )
+    }
 }
 
 impl fmt::Display for WorkflowStatus {
@@ -1966,10 +1979,11 @@ pub struct InitWorkflowCaller<'a> {
 
 /// An encoded payload and the format it is encoded in.
 ///
-/// What the blocking reads return: this layer moves payloads as opaque strings and never decodes
-/// one, so the format has to travel with the value for the caller to make sense of it.
-/// [`get_event`](crate::sysdb::SystemDatabase::get_event) and `recv` return this, and
-/// [`StreamRead`] carries one.
+/// What the reads return: this layer moves payloads as opaque strings and never decodes one, so
+/// the format has to travel with the value for the caller to make sense of it.
+/// [`get_event`](crate::sysdb::SystemDatabase::get_event) and `recv` return one, and a stream read
+/// returns a run of them — in [`StreamRead`], and in [`AwaitedStream::Values`]. Per value, because
+/// each stream entry carries the format it was written in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedValue {
     /// The payload, exactly as it was stored.
@@ -1989,7 +2003,7 @@ pub struct EventRecord {
     pub serialization: Option<String>,
 }
 
-/// One offset of a stream, read together with its producer's liveness.
+/// A run of a stream's values from one offset, read together with its producer's liveness.
 ///
 /// The pair is the point. A reader deciding whether to wait needs to know both whether a value is
 /// there and whether the workflow that would write one is still running, and it needs them to agree
@@ -1997,18 +2011,36 @@ pub struct EventRecord {
 /// stop one value short of a stream that was complete all along.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamRead {
-    /// The producing workflow's status, from the same snapshot as `value`.
+    /// The producing workflow's status, from the same snapshot as `values`.
     ///
     /// **A terminal status does not mean the stream is finished.** Cancelling a workflow and
     /// timing one out both set the status from outside while it is still writing, so a reader that
     /// stops here must first drain to the first empty offset.
     pub status: WorkflowStatus,
-    /// The value at the offset, or `None` if nothing is written there yet.
+    /// The values at the offset read from and the ones after it, in order and with no gaps:
+    /// `values[i]` is the value at `offset + i`. Empty if nothing is written at the offset yet.
     ///
     /// The closing sentinel [`STREAM_CLOSED`](crate::sysdb::STREAM_CLOSED) arrives here like any
     /// other value; recognising it belongs to the loop, which is the only thing that knows the
     /// stream is being read rather than inspected.
-    pub value: Option<EncodedValue>,
+    pub values: Vec<EncodedValue>,
+}
+
+/// What a blocking stream read found:
+/// [`await_stream_values`](crate::sysdb::SystemDatabase::await_stream_values).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AwaitedStream {
+    /// At least one value, as in [`StreamRead::values`]: the first is the one at the offset asked
+    /// for, and the rest follow it with no gaps.
+    Values(Vec<EncodedValue>),
+    /// Nothing at the offset, and nothing ever will be: the producer is no longer running, and a
+    /// last read after seeing that found the offset still empty.
+    ///
+    /// A *closed* stream is not reported this way. Its sentinel is a value, and arrives in
+    /// [`Values`](Self::Values).
+    Ended,
+    /// The deadline passed with nothing at the offset and the producer still running.
+    TimedOut,
 }
 
 /// One entry of a workflow's stream, as `streams` holds it.
@@ -2290,6 +2322,16 @@ pub mod step_names {
     /// than passing means a close is always recorded as a close, whichever entry point reached it.
     pub const WRITE_STREAM: &str = "DBOS.writeStream";
     pub const CLOSE_STREAM: &str = "DBOS.closeStream";
+
+    /// The step names a workflow's stream read records, one step per value it delivers: the
+    /// reader's [`READ_STREAM`], and [`READ_STREAM_VALUE`] for the read of a single value.
+    ///
+    /// `DBOS.readStream` is a cross-SDK constant; `DBOS.readStreamValue` is this crate's own name.
+    /// The two reads record the same rows under different names so that a workflow changed from
+    /// one to the other is caught on replay as `UnexpectedStep` rather than handed a value the
+    /// other read recorded.
+    pub const READ_STREAM: &str = "DBOS.readStream";
+    pub const READ_STREAM_VALUE: &str = "DBOS.readStreamValue";
 
     /// The step name `set_event` records, which a replay compares against.
     ///

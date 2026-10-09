@@ -9,7 +9,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
@@ -185,6 +185,17 @@ pub(crate) struct StepMarker(u64);
 /// the counter orders nothing, it only has to stop handing out the same value twice.
 static NEXT_STEP_MARKER: AtomicU64 = AtomicU64::new(0);
 
+/// A workflow's one in-flight stream read, released when this is dropped.
+pub(crate) struct StreamReadClaim {
+    workflow: Arc<WorkflowState>,
+}
+
+impl Drop for StreamReadClaim {
+    fn drop(&mut self) {
+        self.workflow.stream_read.store(false, Ordering::Release);
+    }
+}
+
 /// The parts of a workflow that outlive any one call within it.
 struct WorkflowState {
     workflow_id: String,
@@ -211,6 +222,13 @@ struct WorkflowState {
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
+    /// Whether a stream read of this workflow's is waiting for its next value.
+    ///
+    /// **One at a time**, because every value a workflow reads is a step recorded under the same
+    /// name: two reads in flight take their ids in whichever order they are asked, which a replay
+    /// does not reproduce and the name check cannot catch. See
+    /// [`Error::StreamNondeterminism`](crate::Error::StreamNondeterminism).
+    stream_read: AtomicBool,
 }
 
 impl WorkflowState {
@@ -232,6 +250,7 @@ impl Ctx {
                 workflow_id: workflow_id.into(),
                 deadline,
                 next_step_id: AtomicI32::new(0),
+                stream_read: AtomicBool::new(false),
             }),
             step: None,
         }
@@ -321,6 +340,21 @@ impl Ctx {
     /// The next step id in this workflow, zero-based and never reused.
     pub(crate) fn next_step_id(&self) -> i32 {
         self.workflow.next_step_id()
+    }
+
+    /// Claims this workflow's one in-flight stream read, or `None` if another read holds it.
+    ///
+    /// The claim lasts as long as the returned guard, which a read holds from the call that takes
+    /// its step id until that step is settled — recorded, replayed, or abandoned with the future
+    /// that held it.
+    pub(crate) fn claim_stream_read(&self) -> Option<StreamReadClaim> {
+        self.workflow
+            .stream_read
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| StreamReadClaim {
+                workflow: Arc::clone(&self.workflow),
+            })
     }
 
     /// The executor running this workflow.
@@ -579,6 +613,7 @@ mod tests {
             workflow_id: "wf-1".to_owned(),
             deadline: None,
             next_step_id: AtomicI32::new(0),
+            stream_read: AtomicBool::new(false),
         }
     }
 

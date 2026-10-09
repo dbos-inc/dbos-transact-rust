@@ -218,6 +218,24 @@ impl<'a, T, E> PendingStep<'a, T, E> {
         }
     }
 
+    /// A call that already has its answer and takes no step id — for a read whose stream has
+    /// already ended, where there is nothing left to wait for or record.
+    ///
+    /// No placement, so the poll holds it to no workflow: it claimed no position anywhere.
+    ///
+    /// The answer is made when the call is polled, so the call holds no value of its own.
+    pub(crate) fn settled(name: impl Into<Arc<str>>, answer: fn() -> crate::Result<T, E>) -> Self
+    where
+        T: 'a,
+        E: 'a,
+    {
+        Self {
+            name: name.into(),
+            placement: None,
+            running: Box::pin(async move { answer() }),
+        }
+    }
+
     /// What this call is called — the name its checkpoint is checked against on replay.
     #[must_use]
     pub fn name(&self) -> &str {

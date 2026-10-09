@@ -232,9 +232,7 @@ impl Listener {
     /// Wakes whoever is waiting on what this notification names.
     ///
     /// A notification for nobody is the ordinary case rather than a problem: one connection sees
-    /// every process's traffic, and almost none of it is this one's callers'. Stream notifications
-    /// are all of them today — nothing in this crate waits on a stream, because the loop that would
-    /// is the engine's and does not exist yet.
+    /// every process's traffic, and almost none of it is this one's callers'.
     fn deliver(&self, channel: &str, payload: &str) {
         match key_for(channel, payload) {
             Some(key) => self.registry.wake(&key),
