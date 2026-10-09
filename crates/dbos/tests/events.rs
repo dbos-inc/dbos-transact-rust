@@ -141,7 +141,7 @@ async fn progress_events_survive_recovery_without_republishing() {
     assert_eq!(progress, Some(2));
     assert_eq!(one.load(Ordering::SeqCst), 1, "the step ran exactly once");
 
-    // The publishes are checkpoints, under the cross-SDK step name, and the replay added none.
+    // The publishes are checkpoints, under the library's step name, and the replay added none.
     let steps = reader
         .list_workflow_steps(&workflow_id, true, None, None, None)
         .await
@@ -152,7 +152,7 @@ async fn progress_events_survive_recovery_without_republishing() {
         .collect();
     assert_eq!(
         seen,
-        [(0, "one"), (1, "DBOS.setEvent"), (2, "DBOS.setEvent")]
+        [(0, "one"), (1, "DBOS.set_event"), (2, "DBOS.set_event")]
     );
 
     dbos.shutdown().await;
@@ -278,7 +278,7 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
     assert_eq!(
         steps_of("in_workflow").await,
         [
-            (0, "DBOS.getEvent".to_owned()),
+            (0, "DBOS.get_event".to_owned()),
             (1, "DBOS.sleep".to_owned())
         ],
         "the read and its deadline are checkpointed"
@@ -291,7 +291,7 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
     assert_eq!(
         steps_of("via_instance").await,
         [
-            (0, "DBOS.getEvent".to_owned()),
+            (0, "DBOS.get_event".to_owned()),
             (1, "DBOS.sleep".to_owned())
         ],
         "the instance method checkpoints a workflow's read the same way"
@@ -465,10 +465,10 @@ async fn library_calls_driven_out_of_build_order_keep_the_ids_they_were_built_wi
         recorded,
         [
             (0, "DBOS.sleep"),
-            (1, "DBOS.setEvent"),
+            (1, "DBOS.set_event"),
             // A read is two steps, and the deadline's id comes from the counter directly behind
             // the read's — which is what says the pair was not split by the poll order either.
-            (2, "DBOS.getEvent"),
+            (2, "DBOS.get_event"),
             (3, "DBOS.sleep"),
             (4, "after"),
         ],

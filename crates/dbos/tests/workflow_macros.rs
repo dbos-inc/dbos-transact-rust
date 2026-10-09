@@ -3,7 +3,7 @@
 //! What these have to show is not that the wait works — `waits.rs` covers that — but that
 //! wrapping it in a macro records nothing extra and awaits nothing extra. So every test here reads
 //! the parent's step rows back and asserts the whole sequence: the launches, the one wait, and
-//! exactly the `DBOS.getResult`s the shape calls for. A macro that quietly awaited a loser, or
+//! exactly the `DBOS.get_result`s the shape calls for. A macro that quietly awaited a loser, or
 //! checkpointed itself, would show up there and nowhere else.
 
 use std::sync::Arc;
@@ -94,8 +94,8 @@ fn race_steps() -> [(i32, String); 4] {
     [
         (0, "counter".to_owned()),
         (1, "namer".to_owned()),
-        (2, "DBOS.selectWorkflow".to_owned()),
-        (3, "DBOS.getResult".to_owned()),
+        (2, "DBOS.select_workflow".to_owned()),
+        (3, "DBOS.get_result".to_owned()),
     ]
 }
 
@@ -105,7 +105,7 @@ fn race_steps() -> [(i32, String); 4] {
 /// ids has no one type to hand back, where a fixed list of handles has one per branch.
 ///
 /// The step rows are what rule out a macro that quietly awaited the loser as well — there would be
-/// a second `DBOS.getResult` — or that checkpointed itself on top of the wait it expands to.
+/// a second `DBOS.get_result` — or that checkpointed itself on top of the wait it expands to.
 #[tokio::test]
 async fn select_workflow_runs_the_winners_arm_and_awaits_nobody_else() {
     let db = test_database().await;
@@ -142,7 +142,7 @@ async fn select_workflow_runs_the_winners_arm_and_awaits_nobody_else() {
 /// A replay takes the arm it took the first time, because the winner is read back rather than
 /// raced for again.
 ///
-/// Forked from the `DBOS.getResult`, so the two launches and the `DBOS.selectWorkflow` all replay
+/// Forked from the `DBOS.get_result`, so the two launches and the `DBOS.select_workflow` all replay
 /// from their rows and only the arm's own await runs afresh. The loser is still sitting at its gate
 /// while this happens, which is the sharper half of the claim: a fork that re-raced would have to
 /// wait for it, and this one does not wait at all.
@@ -184,7 +184,7 @@ async fn a_replayed_select_takes_the_same_arm() {
 /// Every result comes back, typed, in the order the handles were written.
 ///
 /// The step rows are the claim: nothing for the wait itself, which records nowhere, and then one
-/// `DBOS.getResult` per handle in source order. Those reads are what carries the durability — each
+/// `DBOS.get_result` per handle in source order. Those reads are what carries the durability — each
 /// records the outcome the parent goes on to use — and sequential is not a concession, since the
 /// set is already settled by the time the first one is read.
 #[tokio::test]
@@ -234,8 +234,8 @@ async fn join_workflows_returns_every_result_in_source_order() {
         [
             (0, "counter".to_owned()),
             (1, "namer".to_owned()),
-            (2, "DBOS.getResult".to_owned()),
-            (3, "DBOS.getResult".to_owned()),
+            (2, "DBOS.get_result".to_owned()),
+            (3, "DBOS.get_result".to_owned()),
         ],
         "the two launches and a result read per handle in source order, the wait recording nothing"
     );

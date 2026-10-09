@@ -38,7 +38,7 @@
 //! # Called from inside a workflow
 //!
 //! As on the rest of the management surface, the single-schedule operations on [`DBOS`] are
-//! recorded as steps — `DBOS.createSchedule`, `DBOS.listSchedules` and so on — so a replay reads
+//! recorded as steps — `DBOS.create_schedule`, `DBOS.list_schedules` and so on — so a replay reads
 //! back what the first run did. [`apply_schedules`](DBOS::apply_schedules),
 //! [`backfill_schedule`](DBOS::backfill_schedule) and [`trigger_schedule`](DBOS::trigger_schedule)
 //! are refused inside a workflow instead: each writes a batch with no checkpoint, which a replay

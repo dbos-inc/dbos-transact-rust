@@ -1290,9 +1290,8 @@ async fn attributes_are_replaced_and_can_be_searched() {
 
 /// **A management call made from inside a workflow is a step of that workflow.**
 ///
-/// The mechanism the other implementations put under their own management surface — Python's
-/// `call_function_as_step`, TypeScript's `runInternalStep`, Go's `RunAsStep` — and the recorded
-/// names are theirs, so a step listing reads the same whichever SDK wrote it.
+/// Each call is checkpointed under its `DBOS.*` name, so a replay reads back what the first run
+/// did instead of acting again.
 #[tokio::test]
 async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
     let db = test_database().await;
@@ -1371,8 +1370,8 @@ async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
         .collect();
     assert_eq!(
         recorded,
-        [(0, "DBOS.cancelWorkflow"), (1, "DBOS.listWorkflows")],
-        "the management calls were not checkpointed under the cross-SDK names",
+        [(0, "DBOS.cancel_workflow"), (1, "DBOS.list_workflows")],
+        "the management calls were not checkpointed under the library's names",
     );
 
     dbos.shutdown().await;
@@ -1461,7 +1460,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
                 .await
                 .expect("read failed");
             if !steps.is_empty() {
-                assert_eq!(steps[0].step_name, "DBOS.forkWorkflow");
+                assert_eq!(steps[0].step_name, "DBOS.fork_workflow");
                 break;
             }
             assert!(
@@ -1578,7 +1577,7 @@ async fn a_refused_resume_replays_its_refusal_after_the_workflow_appears() {
         .await
         .unwrap();
     assert_eq!(steps.len(), 1, "{steps:?}");
-    assert_eq!(steps[0].step_name, "DBOS.resumeWorkflow");
+    assert_eq!(steps[0].step_name, "DBOS.resume_workflow");
     assert!(
         steps[0].error.is_some() && steps[0].output.is_none(),
         "the refusal is recorded as the step's error: {:?}",
@@ -1972,8 +1971,8 @@ async fn an_empty_management_batch_inside_a_workflow_records_its_step() {
     assert_eq!(
         seen,
         [
-            (0, "DBOS.cancelWorkflow"),
-            (1, "DBOS.deleteWorkflow"),
+            (0, "DBOS.cancel_workflow"),
+            (1, "DBOS.delete_workflow"),
             (2, "after")
         ],
         "each empty batch recorded its own row and left `after` where it would have been anyway"
@@ -2071,9 +2070,9 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
     assert_eq!(
         recorded,
         [
-            (0, "DBOS.cancelWorkflow"),
-            (1, "DBOS.listWorkflowSteps"),
-            (2, "DBOS.listWorkflows"),
+            (0, "DBOS.cancel_workflow"),
+            (1, "DBOS.list_workflow_steps"),
+            (2, "DBOS.list_workflows"),
         ],
         "the ids follow the order the calls were built in, not the order they were polled in",
     );

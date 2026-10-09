@@ -733,9 +733,6 @@ pub trait SystemDatabase: Send + Sync {
     /// Records the step as `"DBOS.send"`, which is what makes this a separate method from
     /// [`send_messages`](Self::send_messages) rather than a caller with a one-element slice: the
     /// step name is the API surface the caller reached for, and a batch of one is still a batch.
-    /// Python and Java pass their name down from the same two surfaces
-    /// (`function_name="DBOS.send"` versus `"DBOS.send_bulk"`; `"DBOS.send"` versus
-    /// `"DBOS.sendBulk"`), and neither infers it from a count.
     ///
     /// Everything else is [`send_messages`](Self::send_messages)'s, which this shares an
     /// implementation with — the transaction, the fork fan-out, the replay skip, the two kinds of
@@ -750,10 +747,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Delivers many messages to workflows, in one transaction.
     ///
-    /// Records the step as `"DBOS.sendBulk"` however many messages it is given, one and none
+    /// Records the step as `"DBOS.send_bulk"` however many messages it is given, one and none
     /// included — see [`send_message`](Self::send_message) for why the name is the method rather
-    /// than the count. Python writes `DBOS.send_bulk` here and Java `DBOS.sendBulk`; Java's
-    /// spelling is taken because the rest of this constant family is camelCase already.
+    /// than the count.
     ///
     /// `caller` is the sending workflow and the step id to record against.
     ///
@@ -1738,11 +1734,10 @@ pub trait SystemDatabase: Send + Sync {
     /// is a separate method only so the child id stays off that signature, which every ordinary
     /// step would then pass `None` to.
     ///
-    /// The step name is not a parameter for the same reason it is not one on
-    /// [`record_sleep`](Self::record_sleep): `"DBOS.getResult"` is what all four implementations
-    /// write — Python's `_sys_db.py`, Go's `StepName`, TypeScript's and Java's the same — so a step
-    /// listing reads alike whichever SDK ran the parent, which is what Conductor renders. A caller
-    /// that could choose would be choosing wrong.
+    /// The step name is not a parameter: an awaited child is always recorded as
+    /// [`GET_RESULT`](crate::sysdb::types::step_names::GET_RESULT), which is the name
+    /// [`check_child_result`](Self::check_child_result) reads back, so a caller that could choose
+    /// would only be choosing wrong.
     async fn record_child_result(
         &self,
         parent_workflow_id: &str,

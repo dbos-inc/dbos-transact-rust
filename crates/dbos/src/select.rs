@@ -448,7 +448,7 @@ mod tests {
         // keeps the numbering stable across a replay that never runs it.
         assert_eq!(
             steps(&dbos, "wf-macro").await,
-            [(1, "quick".to_owned()), (2, "DBOS.selectStep".to_owned())],
+            [(1, "quick".to_owned()), (2, "DBOS.select_step".to_owned())],
             "the winner keeps its build-order id, the loser records nothing"
         );
 
@@ -499,7 +499,10 @@ mod tests {
         // it as the winner, which is the whole difference from a control signal.
         assert_eq!(
             steps(&dbos, "wf-two-channels").await,
-            [(0, "refused".to_owned()), (2, "DBOS.selectStep".to_owned())],
+            [
+                (0, "refused".to_owned()),
+                (2, "DBOS.select_step".to_owned())
+            ],
             "the winner's row and the select's, with the loser's id spent and unrecorded"
         );
 
@@ -609,7 +612,7 @@ mod tests {
         // than racing a third time.
         assert_eq!(
             steps(&dbos, "wf-window").await,
-            [(1, "quick".to_owned()), (2, "DBOS.selectStep".to_owned())],
+            [(1, "quick".to_owned()), (2, "DBOS.select_step".to_owned())],
             "the winner's row, and the select row that was missing"
         );
 
@@ -669,7 +672,7 @@ mod tests {
             [
                 (0, "DBOS.sleep".to_owned()),
                 (1, "quick".to_owned()),
-                (2, "DBOS.selectStep".to_owned())
+                (2, "DBOS.select_step".to_owned())
             ],
             "the sleep lost and still recorded, which is why a branch row is not a winner"
         );
@@ -795,7 +798,7 @@ mod tests {
         assert_eq!(answer.unwrap(), 10, "the tenth branch finished first");
         assert_eq!(
             steps(&dbos, "wf-macro-wide").await,
-            [(9, "j".to_owned()), (10, "DBOS.selectStep".to_owned())],
+            [(9, "j".to_owned()), (10, "DBOS.select_step".to_owned())],
             "nine losers spend their ids and record nothing"
         );
 

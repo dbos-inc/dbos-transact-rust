@@ -1944,7 +1944,7 @@ pub struct GetEventCaller<'a> {
 ///
 /// Named for its one method, as [`GetEventCaller`] is, and a struct for the same reason and then a
 /// second: this carries a step *name* as well as the two ids, and the name is the child workflow's
-/// own rather than a cross-SDK constant, so `Some(("wf", 4, "checkout"))` reads as three unrelated
+/// own rather than a library constant, so `Some(("wf", 4, "checkout"))` reads as three unrelated
 /// values. `None` is a root start — a workflow begun from outside any workflow, which has no
 /// parent to record against.
 ///
@@ -2279,10 +2279,16 @@ impl RewindOptions<'_> {
 /// The `DBOS.*` step names the engine records for its own operations.
 ///
 /// **Here rather than in a backend, because they are stored contract.** Each of these lands in
-/// `operation_outputs.function_name`, where a replay compares it, Conductor renders it, and another
-/// SDK's step listing has to agree with it — so they belong beside the row shapes rather than beside
-/// the SQL of whichever backend happens to write them. A second backend that redeclared them could
-/// drift from this one silently, and nothing would notice until a workflow crossed between the two.
+/// `operation_outputs.function_name`, where a replay compares it and a step listing shows it, so
+/// they belong beside the row shapes rather than beside the SQL of whichever backend happens to
+/// write them. A second backend that redeclared them could drift from this one silently, and
+/// nothing would notice until a workflow recorded by one was replayed by the other.
+///
+/// **`DBOS.`, then snake_case.** The prefix marks a step as the library's own rather than the
+/// application's, and the DBOS console relies on it: a step whose name starts with `DBOS.` is shown
+/// as a framework action, not as user code. After the prefix, each name is the operation's words
+/// in snake_case, as Rust spells them — `send_bulk` records `DBOS.send_bulk`, and
+/// [`DBOS::cancel`](crate::DBOS::cancel) records `DBOS.cancel_workflow`.
 ///
 /// **Public because a caller may legitimately need to name one** — filtering a step listing to the
 /// engine's own operations, or grouping by them — and retyping a string the engine already owns is
@@ -2290,195 +2296,123 @@ impl RewindOptions<'_> {
 ///
 /// **Not for asserting the contract, though.** A test that checks a recorded name against the
 /// constant the writer used cannot notice the constant changing, which is exactly the change worth
-/// noticing: these are cross-SDK strings, and renaming one silently breaks a workflow that crosses
-/// implementations. Those assertions keep their literals on purpose.
-///
-/// Each name's own doc says how far it is actually agreed, and three of them are **not** cross-SDK
-/// contract: the references disagree on `sendBulk` and `debounceDelayedWorkflow`, and
-/// `upsertSchedule` is this crate's own coinage.
+/// noticing: a workflow recorded under the old name fails its replay under the new one with
+/// [`Error::UnexpectedStep`]. Those assertions keep their literals on purpose.
 pub mod step_names {
-    /// The step name `record_sleep` records. A cross-SDK constant, like [`SET_EVENT`].
+    /// The step name `record_sleep` records.
     pub const SLEEP: &str = "DBOS.sleep";
 
     /// The step names the two send methods record, one each: `send_message` writes [`SEND`] and
     /// `send_messages` writes [`SEND_BULK`]. The name is therefore the API surface the caller
     /// reached for, never the batch's length — a batch of one is still a batch.
     ///
-    /// `"DBOS.send"` is unanimous — all four implementations record exactly that for a single send,
-    /// and a workflow replayed by another must find the name it expects or raise `UnexpectedStep`.
-    ///
-    /// The batch name is not: Python writes `DBOS.send_bulk` and Java `DBOS.sendBulk`, while
-    /// TypeScript and Go have no batch send to name. Java's spelling is taken because the rest of
-    /// this constant family is camelCase already — `DBOS.setEvent`, `DBOS.getEvent` — so
-    /// `DBOS.send_bulk` would be the odd one out in our own schema as well as in Java's.
-    ///
     /// A method apiece is why: the name comes from which one was called, so nothing has to infer
     /// it. Inferring it from the batch size would record a one-message bulk send as `DBOS.send`,
-    /// which is not the call the caller made. Python and Java pass the name down from their two
-    /// surfaces in exactly the same way.
+    /// which is not the call the caller made.
     pub const SEND: &str = "DBOS.send";
-    pub const SEND_BULK: &str = "DBOS.sendBulk";
+    pub const SEND_BULK: &str = "DBOS.send_bulk";
 
     /// The step names a stream write records, chosen by whether the value is the closing sentinel.
     ///
-    /// Python and Java both derive them the same way, from the same two strings. Deriving rather
-    /// than passing means a close is always recorded as a close, whichever entry point reached it.
-    pub const WRITE_STREAM: &str = "DBOS.writeStream";
-    pub const CLOSE_STREAM: &str = "DBOS.closeStream";
+    /// Deriving rather than passing means a close is always recorded as a close, whichever entry
+    /// point reached it.
+    pub const WRITE_STREAM: &str = "DBOS.write_stream";
+    pub const CLOSE_STREAM: &str = "DBOS.close_stream";
 
     /// The step names a workflow's stream read records, one step per value it delivers: the
     /// reader's [`READ_STREAM`], and [`READ_STREAM_VALUE`] for the read of a single value.
     ///
-    /// `DBOS.readStream` is a cross-SDK constant; `DBOS.readStreamValue` is this crate's own name.
     /// The two reads record the same rows under different names so that a workflow changed from
     /// one to the other is caught on replay as `UnexpectedStep` rather than handed a value the
     /// other read recorded.
-    pub const READ_STREAM: &str = "DBOS.readStream";
-    pub const READ_STREAM_VALUE: &str = "DBOS.readStreamValue";
+    pub const READ_STREAM: &str = "DBOS.read_stream";
+    pub const READ_STREAM_VALUE: &str = "DBOS.read_stream_value";
 
     /// The step name `set_event` records, which a replay compares against.
-    ///
-    /// A cross-SDK constant: Java and Python both record exactly `"DBOS.setEvent"`, and a workflow
-    /// replayed by another implementation must find the name it expects or raise `UnexpectedStep`.
-    pub const SET_EVENT: &str = "DBOS.setEvent";
+    pub const SET_EVENT: &str = "DBOS.set_event";
 
-    /// The step name `get_event` records. A cross-SDK constant, like [`SET_EVENT`]: all four
-    /// implementations record exactly `"DBOS.getEvent"`.
-    pub const GET_EVENT: &str = "DBOS.getEvent";
+    /// The step name `get_event` records.
+    pub const GET_EVENT: &str = "DBOS.get_event";
 
-    /// What every implementation names the step a parent writes when it awaits a child.
+    /// The step name a parent writes when it awaits a child.
     ///
-    /// Python's `function_name="DBOS.getResult"`, Go's `StepName`, and TypeScript's and Java's the
-    /// same. Written by
+    /// Written by
     /// [`record_child_result`](crate::sysdb::SystemDatabase::record_child_result) and read back by
     /// [`check_child_result`](crate::sysdb::SystemDatabase::check_child_result), which is the only
     /// reason both of those exist rather than the caller passing a name.
-    pub const GET_RESULT: &str = "DBOS.getResult";
+    pub const GET_RESULT: &str = "DBOS.get_result";
 
-    /// The step name a wait for the *first* of several workflows records.
+    /// The step name a wait for the *first* of several workflows records, named for the call that
+    /// writes it, [`select_workflow`](crate::select_workflow()).
     ///
-    /// **The one exception in this table: named for the call that writes it rather than for a
-    /// reference.** Every other constant here is a string some other implementation already writes,
-    /// because a step row a Python or TypeScript reader may see should say what that reader calls
-    /// the operation. This one does not follow that rule. Python records `"DBOS.waitFirst"`
-    /// (`_dbos.py`) and TypeScript records the same string from `DBOS.waitFirst`; this crate names
-    /// the call [`select_workflow`](crate::select_workflow()), after the concurrency shape rather
-    /// than after the wait, and the step a caller reads in a listing is named for the call they
-    /// wrote — so this follows the call.
-    ///
-    /// **What that costs, stated plainly.** A Rust workflow's wait steps do not line up with the
-    /// same wait's steps in Python or TypeScript: a cross-SDK reader — Conductor's step listing, or
-    /// anything grouping steps by name across implementations — sees two names for one operation.
-    /// Nothing breaks, because no implementation reads another's step *names* to decide anything;
-    /// the name is what a replay of this workflow checks against its own row, and that stays
-    /// internally consistent. The spelling still follows the table's convention, `DBOS.` and
-    /// camelCase, so the divergence is the word and not the shape.
-    ///
-    /// **There is no constant for the all-wait, because it records nothing.** TypeScript writes a
-    /// `"DBOS.waitAll"` row from the `runInternalStep` label in `DBOS.waitAll`, and Go, Java and
-    /// Python have the call nowhere. [`join_workflows`](crate::join_workflows()) is a plain wait
-    /// on every surface: it makes no choice a replay could make differently, and the
-    /// [`GET_RESULT`] steps it is written to precede already record the outcomes a replay reads.
-    /// The free [`join_workflows`](crate::join_workflows()) sets out the argument.
-    pub const SELECT_WORKFLOW: &str = "DBOS.selectWorkflow";
+    /// **There is no constant for the all-wait, because it records nothing.**
+    /// [`join_workflows`](crate::join_workflows()) is a plain wait on every surface: it makes no
+    /// choice a replay could make differently, and the [`GET_RESULT`] steps it is written to
+    /// precede already record the outcomes a replay reads. The free
+    /// [`join_workflows`](crate::join_workflows()) sets out the argument.
+    pub const SELECT_WORKFLOW: &str = "DBOS.select_workflow";
 
-    /// The step name a durable race over steps records.
-    ///
-    /// **A second name for a call rather than for a reference**, like [`SELECT_WORKFLOW`] above and
-    /// for the same reason. Go's `Select` records `"DBOS.select"` (`workflow.go`); this crate's
-    /// call is [`select_step!`](crate::select_step), because a bare `select` in a Rust namespace
-    /// reads as a future combinator where this one takes only steps, and the recorded name follows
-    /// the call a reader wrote. Python's `asyncio_wait` records `"DBOS.asyncio_wait"` and could not
-    /// have been borrowed at all.
-    ///
-    /// Affordable for the reason [`SELECT_WORKFLOW`] states in full: nothing reads a step name across
-    /// implementations, since a workflow only crosses one by enqueue and an enqueued workflow
-    /// starts from step zero. The divergence is the word and not the shape.
+    /// The step name a durable race over steps records, named for the call that writes it,
+    /// [`select_step!`](crate::select_step).
     ///
     /// **What it records is a position, not an outcome**: the index of the branch that won, among
     /// the branches that race at this point in the code. The winner's own result is under the
     /// winning step's own id, so recording it here too would keep one outcome in two places.
-    pub const SELECT_STEP: &str = "DBOS.selectStep";
+    pub const SELECT_STEP: &str = "DBOS.select_step";
 
-    /// The step name `recv` records. A cross-SDK constant, like [`GET_EVENT`].
+    /// The step name `recv` records.
     pub const RECV: &str = "DBOS.recv";
 
     /// The step a debounce records when a workflow does the bouncing.
-    ///
-    /// camelCase, where Python writes `DBOS.debounce_delayed_workflow`. The implementations disagree
-    /// on the spelling — as they do for `sendBulk` — and this crate follows TypeScript's, which is the
-    /// form DBOS's own type names take. Nothing reads a step name across languages, since a workflow
-    /// only crosses one by enqueue, so this is a convention rather than a wire format.
-    pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
+    pub const DEBOUNCE: &str = "DBOS.debounce_delayed_workflow";
 
     /// The step names the management surface records, which a replay compares against.
     ///
     /// Every one of these is written by a management call made *from inside a workflow* —
     /// [`DBOS::cancel`](crate::DBOS::cancel) and its neighbours — and is what another execution
-    /// of that workflow looks the recorded answer up by. Four are unanimous across the
-    /// implementations: `resumeWorkflow`, `setWorkflowDelay`, `listWorkflows` and
-    /// `forkWorkflow`. The rest are worth their reasons.
+    /// of that workflow looks the recorded answer up by.
     ///
-    /// **The singular name covers the bulk form too.** Python, TypeScript and Java record the
-    /// singular whatever the batch size; Go pluralizes, and inconsistently — `DBOS.cancelWorkflow`
-    /// for one and `DBOS.cancelWorkflows` for many, but `DBOS.deleteWorkflows` even for one.
-    /// Three of four decides it, and one name per operation is worth having on its own: the
-    /// singular forms here *are* the bulk ones with a single id, so a workflow that switches
-    /// between [`cancel`](crate::DBOS::cancel) and [`cancel_all`](crate::DBOS::cancel_all)
-    /// between runs still replays instead of raising [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
+    /// **The singular name covers the bulk form too.** The singular forms *are* the bulk ones with
+    /// a single id, so a workflow that switches between [`cancel`](crate::DBOS::cancel) and
+    /// [`cancel_all`](crate::DBOS::cancel_all) between runs still replays instead of raising
+    /// [`Error::UnexpectedStep`](crate::sysdb::Error::UnexpectedStep).
     ///
-    /// **[`LIST_WORKFLOW_STEPS`] follows the three, not Go**, which records
-    /// `DBOS.getWorkflowSteps` where Python, TypeScript and Java all say `listWorkflowSteps`.
+    /// **A queues-only listing records [`LIST_WORKFLOWS`] like any other**, because
+    /// [`WorkflowFilter::queues_only`](super::WorkflowFilter::queues_only) is a filter on the one
+    /// listing call rather than a second entry point.
     ///
-    /// **[`UPDATE_WORKFLOW_ATTRIBUTES`] is what Go's method records, not what it is called**: Go
-    /// spells the method `SetWorkflowAttributes` and the step `DBOS.updateWorkflowAttributes`, so
-    /// the step name is the half Python and Java agree with. TypeScript has no attributes method
-    /// at all.
-    ///
-    /// **There is no `DBOS.listQueuedWorkflows`.** Python and TypeScript record one because they
-    /// have a second entry point for it; here
-    /// [`WorkflowFilter::queues_only`](super::WorkflowFilter::queues_only) is that method, so a
-    /// queues-only listing records [`LIST_WORKFLOWS`] like any other.
-    ///
-    /// **Nothing names a retrieve.** Python and Go check the row and so record `DBOS.getStatus`
-    /// and `DBOS.retrieveWorkflow`; [`retrieve_workflow`](crate::DBOS::retrieve_workflow) does no
+    /// **Nothing names a retrieve.** [`retrieve_workflow`](crate::DBOS::retrieve_workflow) does no
     /// I/O, and a call that reads nothing has nothing to replay.
     ///
     /// All of these are recorded from down here rather than by the engine, because each
     /// checkpoint commits in the same transaction as the operation it records — see
     /// [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
     ///
-    /// **[`FORK_WORKFLOW`] covers every fork point.** Java splits its from-failure batch out as
-    /// `DBOS.forkFromFailure`; Go keeps one name whatever the fork point, and so does this,
-    /// because [`fork_from`](crate::sysdb::SystemDatabase::fork_from) resolves all four
+    /// **[`FORK_WORKFLOW`] covers every fork point**, because
+    /// [`fork_from`](crate::sysdb::SystemDatabase::fork_from) resolves all four
     /// [`ForkPoint`](super::ForkPoint)s through one method.
-    pub const CANCEL_WORKFLOW: &str = "DBOS.cancelWorkflow";
-    pub const RESUME_WORKFLOW: &str = "DBOS.resumeWorkflow";
-    pub const DELETE_WORKFLOW: &str = "DBOS.deleteWorkflow";
-    pub const FORK_WORKFLOW: &str = "DBOS.forkWorkflow";
-    pub const REWIND_WORKFLOW: &str = "DBOS.rewindWorkflow";
-    pub const SET_WORKFLOW_DELAY: &str = "DBOS.setWorkflowDelay";
-    pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.updateWorkflowAttributes";
-    pub const LIST_WORKFLOWS: &str = "DBOS.listWorkflows";
-    pub const LIST_WORKFLOW_STEPS: &str = "DBOS.listWorkflowSteps";
+    pub const CANCEL_WORKFLOW: &str = "DBOS.cancel_workflow";
+    pub const RESUME_WORKFLOW: &str = "DBOS.resume_workflow";
+    pub const DELETE_WORKFLOW: &str = "DBOS.delete_workflow";
+    pub const FORK_WORKFLOW: &str = "DBOS.fork_workflow";
+    pub const REWIND_WORKFLOW: &str = "DBOS.rewind_workflow";
+    pub const SET_WORKFLOW_DELAY: &str = "DBOS.set_workflow_delay";
+    pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.update_workflow_attributes";
+    pub const LIST_WORKFLOWS: &str = "DBOS.list_workflows";
+    pub const LIST_WORKFLOW_STEPS: &str = "DBOS.list_workflow_steps";
 
     /// The step names the schedule methods record, which a replay compares against.
     ///
-    /// TypeScript's spellings, from the `runTransactionalInternalStep` call sites in `dbos.ts`. Pause
-    /// and resume are two names there because they are two API calls; they reach one method here, so
-    /// the name follows the status being set rather than the method being called.
-    ///
-    /// **`DBOS.upsertSchedule` is the exception**: TypeScript has no such method — its upsert is
-    /// inlined in `applySchedules` — and Python's `upsert_schedule` is never a step. The name is this
-    /// crate's, camelCased from Python's by analogy with the seven that are verbatim.
-    pub const CREATE_SCHEDULE: &str = "DBOS.createSchedule";
-    pub const UPSERT_SCHEDULE: &str = "DBOS.upsertSchedule";
-    pub const GET_SCHEDULE: &str = "DBOS.getSchedule";
-    pub const LIST_SCHEDULES: &str = "DBOS.listSchedules";
-    pub const UPDATE_SCHEDULE: &str = "DBOS.updateSchedule";
-    pub const PAUSE_SCHEDULE: &str = "DBOS.pauseSchedule";
-    pub const RESUME_SCHEDULE: &str = "DBOS.resumeSchedule";
-    pub const DELETE_SCHEDULE: &str = "DBOS.deleteSchedule";
+    /// Pausing and resuming reach one method but record two names: the name follows the status
+    /// being set rather than the method being called.
+    pub const CREATE_SCHEDULE: &str = "DBOS.create_schedule";
+    pub const UPSERT_SCHEDULE: &str = "DBOS.upsert_schedule";
+    pub const GET_SCHEDULE: &str = "DBOS.get_schedule";
+    pub const LIST_SCHEDULES: &str = "DBOS.list_schedules";
+    pub const UPDATE_SCHEDULE: &str = "DBOS.update_schedule";
+    pub const PAUSE_SCHEDULE: &str = "DBOS.pause_schedule";
+    pub const RESUME_SCHEDULE: &str = "DBOS.resume_schedule";
+    pub const DELETE_SCHEDULE: &str = "DBOS.delete_schedule";
 }
 
 /// One message to deliver to a workflow.

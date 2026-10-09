@@ -84,8 +84,8 @@
 //! are transactional here too: a listing that replays the snapshot it recorded is worth the same
 //! one transaction, and it leaves one shape for the whole module rather than two.
 //!
-//! The recorded names are the cross-SDK spellings, in [`step_names`] beside every other name this
-//! crate records, with what each one cost to settle. One call is one step, and the singular forms
+//! The recorded names are in [`step_names`] beside every other name this crate records, with what
+//! each one cost to settle. One call is one step, and the singular forms
 //! delegate to the bulk ones, so `cancel` and `cancel_all` spend the same one step id.
 //!
 //! Three edges. Outside a workflow there is nothing to checkpoint against and the call is a plain

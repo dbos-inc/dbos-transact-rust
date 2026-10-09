@@ -584,11 +584,11 @@ async fn a_workflows_read_replays_its_recorded_values() {
             .map(|s| (s.step_id, s.step_name.as_str()))
             .collect::<Vec<_>>(),
         [
-            (0, "DBOS.readStream"),
-            (1, "DBOS.readStream"),
-            (2, "DBOS.readStream"),
-            (3, "DBOS.readStream"),
-            (4, "DBOS.readStreamValue"),
+            (0, "DBOS.read_stream"),
+            (1, "DBOS.read_stream"),
+            (2, "DBOS.read_stream"),
+            (3, "DBOS.read_stream"),
+            (4, "DBOS.read_stream_value"),
         ]
     );
 
@@ -686,7 +686,7 @@ async fn a_workflows_timed_out_read_replays_as_a_timeout() {
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].step_name, "DBOS.readStreamValue");
+    assert_eq!(steps[0].step_name, "DBOS.read_stream_value");
     assert!(steps[0].error.is_some(), "the timeout is the step's error");
 
     dbos.shutdown().await;
@@ -864,7 +864,7 @@ async fn a_read_of_a_missing_workflow_replays_as_missing() {
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].step_name, "DBOS.readStreamValue");
+    assert_eq!(steps[0].step_name, "DBOS.read_stream_value");
     assert!(steps[0].error.is_some(), "the refusal is the step's error");
 
     // Now the workflow exists, with a value where the read looked.

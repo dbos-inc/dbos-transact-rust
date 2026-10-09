@@ -961,7 +961,7 @@ where
     /// - **The start is a checkpoint of the parent.** A replayed parent gets a handle to the
     ///   recorded child without starting anything — whether that child is still running, finished
     ///   while the parent was dead, or is itself awaiting recovery.
-    /// - **Awaiting the handle is a second checkpoint**, recorded as `DBOS.getResult` (see
+    /// - **Awaiting the handle is a second checkpoint**, recorded as `DBOS.get_result` (see
     ///   [`WorkflowHandle::result`]). So [`run`](Self::run) spends two step ids, and a parent that
     ///   calls it twice has children `{parent}-0` and `{parent}-2`.
     /// - **The child inherits the parent's deadline** as the same instant. A

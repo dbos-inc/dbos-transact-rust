@@ -15,7 +15,7 @@
 //! that the documented way to write one.
 //!
 //! All four are thin: `sysdb` owns the transactional write, the replay skip, the blocking read,
-//! and the cross-SDK step names (`DBOS.setEvent`, `DBOS.getEvent`). What the engine adds is the
+//! and the step names (`DBOS.set_event`, `DBOS.get_event`). What the engine adds is the
 //! step ids from the ambient context, the payload encoding, and the guards on where each call may
 //! stand.
 
