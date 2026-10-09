@@ -486,7 +486,7 @@ where
     ) -> Self {
         let read = ReadOf::new(workflow_id, key, options);
         let source = source.and_then(|conn| {
-            read.check(offset, operation)?;
+            read.validate(offset, operation)?;
             Ok(conn)
         });
         Self {
@@ -559,7 +559,7 @@ where
         let started_at = Timestamp::now();
 
         if self.replaying {
-            match replay(conn, placement, name).await? {
+            match check(conn, placement, name).await? {
                 Some(Replayed::Value(output)) => {
                     self.offset += 1;
                     return decode(Some(&output), "stream value").map(Some);
@@ -643,7 +643,7 @@ where
     let read = ReadOf::new(workflow_id, key, options);
     let built = source
         .and_then(|conn| {
-            read.check(offset, "read_stream_value")?;
+            read.validate(offset, "read_stream_value")?;
             Ok(conn)
         })
         .and_then(|conn| place(conn, "read_stream_value"));
@@ -656,7 +656,7 @@ where
                 key: read.key.clone(),
                 timeout: None,
             };
-            match replay(&conn, &placement, name).await? {
+            match check(&conn, &placement, name).await? {
                 Some(Replayed::Value(output)) => return decode(Some(&output), "stream value"),
                 Some(Replayed::Ended) => return Err(ended()),
                 None => {}
@@ -711,7 +711,7 @@ impl ReadOf {
     }
 
     /// Refuses an offset or a polling interval no read can use, naming `operation`.
-    fn check(&self, offset: i32, operation: &'static str) -> Result<()> {
+    fn validate(&self, offset: i32, operation: &'static str) -> Result<()> {
         if offset < 0 {
             return Err(Error::InvalidArgument {
                 operation: operation.into(),
@@ -840,10 +840,13 @@ enum Replayed {
 
 /// The read's recorded outcome, if this workflow has run this far before.
 ///
+/// The read-back half of the pair whose other half is [`record`], named for the same pair in
+/// `sysdb` (`check_step` / `record_step`).
+///
 /// `None` where the read is not recorded at all — from a step, a client, or outside a workflow —
 /// as well as where it has not run yet. A recorded error — a timeout, or a stream whose workflow
 /// does not exist — is raised again.
-async fn replay(
+async fn check(
     conn: &Connection,
     placement: &StepPlacement,
     name: &str,
