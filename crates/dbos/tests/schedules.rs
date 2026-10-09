@@ -1161,7 +1161,7 @@ async fn a_replayed_create_returns_what_it_recorded_even_if_its_queue_is_gone() 
     // create replays — and must return its recorded success rather than check the queue again.
     dbos.delete_queue("replay-queue").await.unwrap();
     let forked = dbos
-        .fork::<bool, EngineOnly>("schedule-creator-run", dbos::ForkFrom::Step(1))
+        .fork::<bool, EngineOnly>("schedule-creator-run", 1)
         .await
         .expect("fork failed");
     assert!(
@@ -1237,7 +1237,7 @@ async fn a_refused_create_replays_its_refusal_after_the_name_is_freed() {
     // create replays, and must give back its refusal rather than create the schedule.
     dbos.delete_schedule("taken").await.unwrap();
     let forked = dbos
-        .fork::<String, EngineOnly>("refused-creator-run", dbos::ForkFrom::Step(1))
+        .fork::<String, EngineOnly>("refused-creator-run", 1)
         .await
         .expect("fork failed");
     assert_eq!(

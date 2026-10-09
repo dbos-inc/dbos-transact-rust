@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::{Client, ClientConfig, Config, DBOS, Error, ForkFrom, WorkflowHandle, WorkflowRef};
+use dbos::{Client, ClientConfig, Config, DBOS, Error, WorkflowHandle, WorkflowRef};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -163,10 +163,7 @@ async fn a_replayed_select_takes_the_same_arm() {
         .expect("the parent never finished")
         .expect("the parent failed");
 
-    let forked: WorkflowHandle<String> = dbos
-        .fork(&workflow_id, ForkFrom::Step(3))
-        .await
-        .expect("fork failed");
+    let forked: WorkflowHandle<String> = dbos.fork(&workflow_id, 3).await.expect("fork failed");
     let forked_id = forked.workflow_id().to_owned();
     let again = tokio::time::timeout(DEADLINE, forked.result())
         .await

@@ -2093,6 +2093,9 @@ impl<'a> Fork<'a> {
 
 /// Which step a fork restarts from, when the caller wants it worked out rather than stated.
 ///
+/// Taken by [`fork_from`](crate::sysdb::SystemDatabase::fork_from), which is kept for a handler of
+/// Conductor's `fork_from_failure` message; the engine's own fork always states its step.
+///
 /// A sum type because the four are alternatives, not options: Python and TypeScript both take
 /// them as four independent flags and raise unless exactly one is set. The resolved value is a
 /// [`Fork::start_step`], so the named step *re-runs* and everything below it replays — forking

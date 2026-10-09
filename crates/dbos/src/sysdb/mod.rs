@@ -634,9 +634,10 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Forks workflows from a step this works out for each of them.
     ///
-    /// Named for what it does: Python, Java and TypeScript all call this `fork_from_failure`,
-    /// but three of [`ForkPoint`]'s four cases have nothing to do with failure. Go calls it
-    /// `ForkFrom` for the same reason.
+    /// **Not an application operation.** It is kept for a handler of Conductor's
+    /// `fork_from_failure` message, which an operator sends from the Console; nothing in this
+    /// crate calls it. The engine's own fork takes a step number and goes through
+    /// [`fork_workflows`](Self::fork_workflows).
     ///
     /// [`fork_workflows`](Self::fork_workflows) with the start step computed rather than given:
     /// the caller says *from the failure* or *from the step called `charge_card`*, and each
