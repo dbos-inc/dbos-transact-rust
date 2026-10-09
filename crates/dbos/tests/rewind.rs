@@ -1054,7 +1054,7 @@ async fn a_recovered_caller_does_not_rewind_its_target_again() {
         .await
         .expect("read failed");
     assert_eq!(steps[0].step_id, 0);
-    assert_eq!(steps[0].step_name, "DBOS.rewindWorkflow");
+    assert_eq!(steps[0].step_name, "DBOS.rewind_workflow");
     assert!(steps[0].error.is_none(), "{:?}", steps[0]);
 
     dbos.shutdown().await;

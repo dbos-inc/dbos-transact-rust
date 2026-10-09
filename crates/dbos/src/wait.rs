@@ -74,12 +74,8 @@
 //! take, and a function and its macro that do the same thing under two different names is a seam to
 //! learn for nothing.
 //!
-//! **The recorded step name follows the call**, which is the one place in [`step_names`] that a
-//! reference's string is not taken: `DBOS.selectWorkflow` where Python and TypeScript write
-//! `DBOS.waitFirst`. A step listing should name the call the caller wrote, and nothing across the
-//! SDKs reads another's step names to decide anything — a replay checks its own workflow's rows.
-//! The cost is that one operation has two names when steps are read across implementations, and the
-//! constant says so. The all-wait records no step at all, so it needs no name.
+//! **The recorded step name follows the call**, `DBOS.select_workflow`: a step listing should
+//! name the call the caller wrote. The all-wait records no step at all, so it needs no name.
 //!
 //! # Called from inside a workflow
 //!
@@ -443,9 +439,9 @@ macro_rules! select_workflow {
 /// **The results are what get recorded, and the awaits stay sequential.** The expansion is one
 /// [`join_workflows`](fn@join_workflows), which records nothing, and then
 /// [`result`](crate::WorkflowHandle::result) on each handle in source order — so the whole of what
-/// a replay reads back is the N `DBOS.getResult` rows. Sequential is not a concession here: the set is already settled by the
+/// a replay reads back is the N `DBOS.get_result` rows. Sequential is not a concession here: the set is already settled by the
 /// time the first result is read, so every one of them is a row read that does not wait — and
-/// taking them in source order is what keeps each `DBOS.getResult` on the step id its replay
+/// taking them in source order is what keeps each `DBOS.get_result` on the step id its replay
 /// expects.
 ///
 /// **The first failure ends it**, in source order, as `try_join!` does: the tuple holds values

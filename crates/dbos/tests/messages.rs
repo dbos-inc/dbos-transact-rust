@@ -382,7 +382,7 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
     assert_eq!(
         steps(&reader, &sender_id).await,
         [(0, "DBOS.send".to_owned())],
-        "the send is recorded under the cross-SDK name, once",
+        "the send is recorded under the library's name, once",
     );
     let notifications = reader
         .get_all_notifications(&destination_id)
@@ -548,7 +548,7 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
 
 /// A workflow's batch is one checkpoint, so a replay delivers none of it again.
 ///
-/// Also pins the name the *surface* chooses: a batch records `DBOS.sendBulk` whatever its length,
+/// Also pins the name the *surface* chooses: a batch records `DBOS.send_bulk` whatever its length,
 /// a batch of one included. The name distinguishes the two API surfaces, so reaching for a
 /// different one on a replay is caught as a determinism error — while a batch that merely changed
 /// size is not, being no change of operation.
@@ -572,7 +572,7 @@ async fn a_workflows_batch_is_one_checkpoint() {
             async move {
                 dbos::send_bulk(&[Message::new(&ids[0], &"one"), Message::new(&ids[1], &"two")])
                     .await?;
-                // A batch of one: still `DBOS.sendBulk`, because that is the surface reached for.
+                // A batch of one: still `DBOS.send_bulk`, because that is the surface reached for.
                 dbos::send_bulk(&[Message::new(&ids[0], &"alone")]).await?;
                 reached.notify_one();
                 release.notified().await;
@@ -613,8 +613,8 @@ async fn a_workflows_batch_is_one_checkpoint() {
     assert_eq!(
         steps(&reader, &sender_id).await,
         [
-            (0, "DBOS.sendBulk".to_owned()),
-            (1, "DBOS.sendBulk".to_owned())
+            (0, "DBOS.send_bulk".to_owned()),
+            (1, "DBOS.send_bulk".to_owned())
         ],
         "one step per batch, named by the surface reached for — a batch of one is still a batch",
     );

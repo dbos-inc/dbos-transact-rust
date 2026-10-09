@@ -127,8 +127,7 @@ where
     /// **Awaited from inside the workflow that started it, this is a durable step.** The parent
     /// records what the child returned, so a replayed parent continues from a value it already has
     /// rather than waiting again on a workflow that may since have been forked — and the wait costs
-    /// one row read instead of a poll to completion. All four implementations record it, under the
-    /// same name, `DBOS.getResult`.
+    /// one row read instead of a poll to completion. It is recorded as `DBOS.get_result`.
     ///
     /// **That the row survives its child is a property of the recording, not a guarantee against
     /// deletion.** The value lives in the *parent's* `operation_outputs`, so a replay that has

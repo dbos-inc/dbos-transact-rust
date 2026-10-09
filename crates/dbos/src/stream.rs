@@ -426,7 +426,7 @@ impl crate::Client {
 /// this reader: a workflow that is cancelled or parked and later resumed may write again, and a new
 /// reader from [`offset`](Self::offset) sees what it writes.
 ///
-/// **When the reader is a workflow, each value is a step**, named `DBOS.readStream`. The value is
+/// **When the reader is a workflow, each value is a step**, named `DBOS.read_stream`. The value is
 /// recorded before `next` returns it, and the end of the stream is recorded too, so a replay
 /// returns the values the first run read — not the ones the stream holds now — and ends where the
 /// first run ended. A timeout, and a stream whose workflow does not exist, are recorded as the
@@ -634,7 +634,7 @@ where
 }
 
 /// The single-value read behind every `read_stream_value`: the one value at `offset`, as one step
-/// named `DBOS.readStreamValue`, and [`Error::StreamTimeout`] if the stream ends first.
+/// named `DBOS.read_stream_value`, and [`Error::StreamTimeout`] if the stream ends first.
 ///
 /// The same steps as one [`StreamReader::next`] — replay, wait, record — with a page of one and
 /// nothing kept afterwards.

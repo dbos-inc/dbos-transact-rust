@@ -57,7 +57,7 @@
 //! no batch send to compare.
 //!
 //! All of these are thin. `sysdb` owns the transactional insert, the fork fan-out, the replay
-//! skip, the consuming read, the concurrent-receive guard and the cross-SDK step names
+//! skip, the consuming read, the concurrent-receive guard and the step names
 //! (`DBOS.send`, `DBOS.recv`). What the engine adds is the step ids from the ambient context, the
 //! payload encoding, and the guards on where each call may stand.
 
@@ -156,7 +156,7 @@ where
 /// insert, so a failure halfway through delivers nothing rather than a prefix.
 ///
 /// The batch is checkpointed as **one** step, so a replay sends none of it again. The step is
-/// recorded as `DBOS.sendBulk` however long the batch is, a batch of exactly one included: the
+/// recorded as `DBOS.send_bulk` however long the batch is, a batch of exactly one included: the
 /// name says which API surface was reached for, not how many messages it carried. A workflow that
 /// swaps a [`send`] for a [`send_bulk`] between runs therefore flips names and is caught as a
 /// determinism error, while one whose message *count* merely changes is not, that being no change
@@ -179,8 +179,8 @@ where
 /// name because those four render a *pluralised noun* — Python's `cancel_workflows`, TypeScript's
 /// `cancelWorkflows`, Go's `CancelWorkflows` — into a form that reads on a type where the noun is
 /// implicit. A batch send is not that: Python and Java both chose the distinct word `bulk`, and
-/// `sysdb` already records this call under the cross-SDK step name `DBOS.sendBulk`. A method named
-/// for one word that writes another is a seam for nothing.
+/// `sysdb` already records this call as `DBOS.send_bulk`. A method named for one word that writes
+/// another is a seam for nothing.
 pub fn send_bulk<'a, T, E>(messages: &'a [Message<'a, T>]) -> PendingStep<'a, (), E>
 where
     T: Serialize,
@@ -510,7 +510,7 @@ impl Connection {
     /// rather than a generic wrapper for the one caller that could have skipped it.
     ///
     /// A method apiece rather than one taking a slice, mirroring the trait: which one is called is
-    /// what chooses the recorded step name, so a batch of one records `DBOS.sendBulk` and this
+    /// what chooses the recorded step name, so a batch of one records `DBOS.send_bulk` and this
     /// records `DBOS.send`. On the connection because that is where the serializer lives — the
     /// free [`send`] reaches it through the ambient context's connection, [`DBOS::send`] through
     /// its executor's, and [`Client::send`](crate::Client::send) through the only one it has, the

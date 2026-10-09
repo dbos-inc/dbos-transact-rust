@@ -190,10 +190,10 @@ impl<'a, T, E> PendingStep<'a, T, E> {
     /// lives there. A producer that wraps one of these in something else, rather than handing it
     /// back, is the one that has to ask for itself.
     ///
-    /// `name` is the step name the call records under, and what a refusal names: the cross-SDK
-    /// constant for the library's own calls, and the workflow's own name where the call is a
-    /// child start — which is why this takes anything that becomes an [`Arc<str>`] rather than a
-    /// `&'static str`.
+    /// `name` is the step name the call records under, and what a refusal names: a
+    /// [`step_names`](crate::sysdb::types::step_names) constant for the library's own calls, and
+    /// the workflow's own name where the call is a child start — which is why this takes anything
+    /// that becomes an [`Arc<str>`] rather than a `&'static str`.
     pub(crate) fn placed<C, F, Fut>(name: impl Into<Arc<str>>, built: Built<C>, run: F) -> Self
     where
         C: Send + 'a,
