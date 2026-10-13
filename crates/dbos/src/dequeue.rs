@@ -740,6 +740,8 @@ async fn dispatch(
         key,
         workflow_id,
         row.input,
+        // The row's own tag, which is how its input was written — by this SDK or another.
+        row.serialization,
         initialized.deadline,
         slot,
     );

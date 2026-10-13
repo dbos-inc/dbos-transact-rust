@@ -15,11 +15,11 @@ use tracing::Instrument;
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
-use crate::error::{DurableError, Error, Failure, Result};
+use crate::error::{DurableError, EncodedError, Error, Failure, Result};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::encode;
+use crate::serialization::{EncodedOutput, Format, encode};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
     WorkflowInitResult,
@@ -569,6 +569,8 @@ struct OwnedStart {
     timeout: Timeout,
     queue: Option<OwnedEnqueue>,
     input: Option<String>,
+    /// How `input` is encoded, and so how the workflow's outcome will be.
+    format: Format,
     attributes: Option<String>,
     /// When the start began, which the parent's record of it is stamped with. Read here rather
     /// than in the task so that it measures the call and not the wait for a runtime thread.
@@ -1085,15 +1087,17 @@ where
         // is derived from — and resolved *here* rather than in the task so that this call can name
         // the workflow whatever becomes of the task.
         let workflow_id = child_workflow_id(options.workflow_id, placed.parent().as_ref());
+        let (executor, placement) = placed.into_parts();
+        let format = executor.serializer().format();
         let request = OwnedStart {
             workflow_id: workflow_id.clone(),
             timeout: options.timeout,
             queue: options.queue.as_ref().map(OwnedEnqueue::from),
-            input: Some(encode(&input, "argument")?),
+            input: Some(encode(&input, &format, "argument")?),
+            format,
             attributes: encode_attributes(options.attributes)?,
             started_at: Timestamp::now(),
         };
-        let (executor, placement) = placed.into_parts();
         // The caller's span rather than one of its own: this is the same start, on another
         // thread, and its logs belong where the call was written.
         let creating = create::<R, E>(
@@ -1170,6 +1174,7 @@ async fn create<R, E>(
         timeout,
         queue,
         input,
+        format,
         attributes,
         // The caller's reading, taken before this task existed: the step spans the start as the
         // *caller* saw it, not the wait for a runtime thread to pick the task up.
@@ -1250,7 +1255,7 @@ async fn create<R, E>(
         class_name: key.class_name.as_deref(),
         config_name: key.config_name.as_deref(),
         input: input.as_deref(),
-        serialization: Some(executor.serializer().name()),
+        serialization: Some(format.name()),
         executor_id: Some(executor.executor_id()),
         application_name: Some(executor.app_name()),
         application_version: Some(executor.app_version()),
@@ -1361,6 +1366,11 @@ async fn create<R, E>(
         ));
     }
 
+    // **The row's input and encoding, not this caller's.** A row this call found rather than
+    // created keeps the input and the tag it was written with, and a recovery of it would run
+    // those — so the run does too, rather than the input this caller offered and never wrote.
+    let input = initialized.existing_input.unwrap_or(input);
+    let serialization = initialized.serialization;
     // The deadline the *database* holds, not the one this caller offered: `init_workflow`
     // turns a budget into an instant against its own clock, and an existing row keeps the
     // deadline it already had rather than taking a new one from a joining caller.
@@ -1369,6 +1379,7 @@ async fn create<R, E>(
         key.clone(),
         workflow_id.clone(),
         input,
+        serialization,
         initialized.deadline,
         // A fresh start is not a dequeue, so it holds no queue's slot.
         None,
@@ -1710,20 +1721,32 @@ pub(crate) fn spawn_execution(
     key: WorkflowKey,
     workflow_id: String,
     input: Option<String>,
+    serialization: Option<String>,
     deadline: Option<Timestamp>,
     slot: Option<crate::dequeue::Slot>,
-) -> tokio::task::JoinHandle<std::result::Result<Option<String>, Failure>> {
+) -> tokio::task::JoinHandle<std::result::Result<EncodedOutput, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
         executor,
         {
             let executor = Arc::clone(executor);
             async move {
+                // The row's tag, which says how its input was written and so how the outcome is
+                // written back. A tag this SDK cannot read is an input it cannot decode, and ends
+                // the execution as an undecodable input does: with nothing recorded.
+                let format = Format::of(serialization.as_deref()).map_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "the workflow's input is in an encoding this SDK cannot read; it records \
+                         no outcome"
+                    );
+                    Failure::Control(error)
+                })?;
                 let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline);
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, ctx, slot).await
+                execute(&executor, &key, &workflow_id, input, format, ctx, slot).await
             }
         }
         .instrument(span),
@@ -1752,7 +1775,7 @@ async fn run_until_deadline<F>(
     body: F,
 ) -> Ended
 where
-    F: Future<Output = std::result::Result<Option<String>, Failure>>,
+    F: Future<Output = std::result::Result<EncodedOutput, Failure>>,
 {
     let Some(deadline) = deadline else {
         return Ended::Body(body.await);
@@ -1775,10 +1798,10 @@ where
 /// How an execution ended, and so whether its caller has anything left to record.
 enum Ended {
     /// The body ran to a conclusion. That conclusion is this execution's outcome and is written.
-    Body(std::result::Result<Option<String>, Failure>),
+    Body(std::result::Result<EncodedOutput, Failure>),
     /// The deadline fired and the row is already terminal — cancelled here, or finished by another
     /// execution while this one was working. What it holds is the answer; nothing more is written.
-    Terminal(std::result::Result<Option<String>, Failure>),
+    Terminal(std::result::Result<EncodedOutput, Failure>),
 }
 
 /// Cancels a workflow whose deadline has passed, and settles on what the row ends up holding.
@@ -1792,7 +1815,7 @@ enum Ended {
 async fn cancel_at_deadline(
     executor: &Executor,
     workflow_id: &str,
-) -> std::result::Result<Option<String>, Failure> {
+) -> std::result::Result<EncodedOutput, Failure> {
     let cancelled = || {
         Err(Failure::Control(Error::WorkflowCancelled {
             workflow_id: workflow_id.to_owned(),
@@ -1844,9 +1867,10 @@ async fn execute(
     key: &WorkflowKey,
     workflow_id: &str,
     input: Option<String>,
+    format: Format,
     ctx: Ctx,
     slot: Option<crate::dequeue::Slot>,
-) -> std::result::Result<Option<String>, Failure> {
+) -> std::result::Result<EncodedOutput, Failure> {
     let workflow = executor
         .workflows()
         .get(key)
@@ -1866,7 +1890,10 @@ async fn execute(
         executor,
         workflow_id,
         deadline,
-        Ctx::scope(ctx, workflow(input)),
+        Ctx::scope(ctx, async move {
+            let encoded = workflow(input, format.clone()).await?;
+            Ok(EncodedOutput { encoded, format })
+        }),
     )
     .await
     {
@@ -1880,7 +1907,7 @@ async fn execute(
         Ok(output) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Output(output.as_deref()))
+                .record_workflow_outcome(workflow_id, Outcome::Output(output.encoded.as_deref()))
                 .await
         }
         // Another execution checkpointed a step this one was about to, so it is ahead and this
@@ -1915,10 +1942,10 @@ async fn execute(
             );
             return outcome;
         }
-        Err(Failure::Recorded(encoded)) => {
+        Err(Failure::Recorded(recorded)) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Error(encoded))
+                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded))
                 .await
         }
     }
@@ -1963,7 +1990,7 @@ async fn adopt_superseded(
     executor: &Executor,
     workflow_id: &str,
     slot: Option<crate::dequeue::Slot>,
-) -> std::result::Result<Option<String>, Failure> {
+) -> std::result::Result<EncodedOutput, Failure> {
     drop(slot);
     // Park-and-adopt, the path every reference passes its own flag on: this execution has read the
     // row, whether it created it, recovered it or dequeued it, so a missing one has been deleted.
@@ -1981,7 +2008,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         fail_if_missing: bool,
-    ) -> std::result::Result<Option<String>, Failure> {
+    ) -> std::result::Result<EncodedOutput, Failure> {
         let outcome = self
             .sysdb()
             .await_workflow_result(workflow_id, self.outcome_poll_interval(), fail_if_missing)
@@ -1999,11 +2026,28 @@ impl Connection {
                     other => Error::SystemDatabase(other),
                 })
             })?;
+        // The row's tag says how to read the outcome, whoever wrote it; one this SDK cannot read is
+        // reported rather than handed on to be misread.
+        let format = |serialization: Option<String>| {
+            Format::of(serialization.as_deref()).map_err(Failure::Control)
+        };
         match outcome {
-            AwaitedOutcome::Succeeded { output, .. } => Ok(output),
+            AwaitedOutcome::Succeeded {
+                output,
+                serialization,
+            } => Ok(EncodedOutput {
+                encoded: output,
+                format: format(serialization)?,
+            }),
             // Handed back encoded, for the caller to decode into its own error type — the adopting
             // caller knows what that is and this function does not.
-            AwaitedOutcome::Failed { error, .. } => Err(Failure::Recorded(error)),
+            AwaitedOutcome::Failed {
+                error,
+                serialization,
+            } => Err(Failure::Recorded(EncodedError {
+                encoded: error,
+                format: format(serialization)?,
+            })),
             AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
                 workflow_id: workflow_id.to_owned(),
             })),

@@ -2864,6 +2864,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.pool,
             owner_xid.as_str(),
         );
+        let stored_input = payload_column(&self.tables, PayloadColumn::Inputs);
+        let stored_input = stored_input.as_str();
 
         with_retry(&self.retry, "init_workflow", move || async move {
             // **A transaction, because the caller's record has to land with the row.**
@@ -3111,6 +3113,23 @@ impl SystemDatabase for PostgresSystemDatabase {
                 );
             }
 
+            // **The row's own input, where a fresh start is to run a row it did not create** —
+            // one no attempt owns. Read in the transaction that claimed the row, so the run starts
+            // from what the row holds. A recovery or a dequeue is not asked: its caller read the
+            // input with the row it claimed.
+            let existing_input = if owner_differs && !claiming && stored_owner.is_none() {
+                Some(
+                    sqlx::query_scalar::<_, Option<String>>(AssertSqlSafe(format!(
+                        "SELECT {stored_input} FROM {workflow_table} WHERE workflow_uuid = $1"
+                    )))
+                    .bind(workflow.workflow_id)
+                    .fetch_one(&mut *tx)
+                    .await?,
+                )
+            } else {
+                None
+            };
+
             // **The parent's record of the start, in the transaction that created the child.**
             // Written for a row this call merely found as well as one it created: the parent
             // started a child either way, and the id it needs to record is the same. A failure
@@ -3134,6 +3153,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 recovery_attempts,
                 deadline: deadline.map(Timestamp::from_epoch_ms),
                 serialization,
+                existing_input,
                 should_execute,
             })
         })

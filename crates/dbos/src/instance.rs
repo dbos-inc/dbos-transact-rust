@@ -2,10 +2,11 @@
 
 use std::sync::{Arc, RwLock};
 
-use crate::config::{Config, Serializer};
+use crate::config::Config;
 use crate::connection::Connection;
 use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, Snapshot};
+use crate::serialization::Serializer;
 use crate::sysdb::SystemDatabase;
 use crate::workflow::Tasks;
 use crate::{Error, Result};

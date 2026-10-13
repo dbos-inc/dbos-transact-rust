@@ -88,7 +88,7 @@ use std::marker::PhantomData;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::error::{DurableError, Error, Result};
-use crate::serialization::{decode, encode};
+use crate::serialization::{decode_tagged, encode};
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 
 /// What [`check_select`] found: a winner already recorded, or a race still to run.
@@ -230,7 +230,11 @@ pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Rac
             .await
             .map_err(Error::lift)?
     {
-        let winner: usize = decode(recorded.output.as_deref(), "the branch that won a select")?;
+        let winner: usize = decode_tagged(
+            recorded.output.as_deref(),
+            recorded.serialization.as_deref(),
+            "the branch that won a select",
+        )?;
         // **A workflow that changed how many branches it races has changed what this position of
         // its code means**, and adopting a stale winner would silently take the branch the old
         // code took. The same check [`select_workflow`](crate::select_workflow()) makes against
@@ -284,7 +288,11 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
         return Ok(());
     };
 
-    let encoded = encode(&winner, "the branch that won a select")?;
+    let encoded = encode(
+        &winner,
+        &executor.serializer().format(),
+        "the branch that won a select",
+    )?;
     placement
         .record(
             executor.connection(),
@@ -574,7 +582,12 @@ mod tests {
                 1,
                 "quick",
                 Outcome::Output(Some(
-                    &encode::<_, crate::Error>(&"hello".to_owned(), "the winner").expect("encodes"),
+                    &encode::<_, crate::Error>(
+                        &"hello".to_owned(),
+                        &crate::serialization::Format::Native,
+                        "the winner",
+                    )
+                    .expect("encodes"),
                 )),
                 Some(executor.connection().serializer().name()),
                 None,

@@ -40,7 +40,8 @@
 
 use std::time::Duration;
 
-use crate::config::{Config, Serializer};
+use crate::config::Config;
+use crate::serialization::Serializer;
 use crate::sysdb::{SystemDatabase, postgres};
 use crate::{ClientConfig, Error, Result};
 

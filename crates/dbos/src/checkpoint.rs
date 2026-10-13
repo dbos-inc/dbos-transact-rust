@@ -71,8 +71,9 @@ use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
-use crate::error::{DurableError, Error};
+use crate::error::{DurableError, EngineOnly, Error};
 use crate::instance::Executor;
+use crate::serialization::{Format, decode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// What a durable call works out at the call, before anything of it has run.
@@ -409,14 +410,20 @@ pub(crate) enum StepDurability<'a> {
 /// with its own fields, and an engine failure as the variant it was. The only payloads that do not
 /// survive are the `serde_json::Error` sources, which arrive absent rather than different.
 ///
+/// Read in the encoding its `tag` names.
+///
 /// Falls back to a plain message when the column does not hold one of ours, which is what a row
 /// written by another SDK looks like — its serializer chose its own shape, and the `serialization`
-/// column says so. A readable message beats a decode failure standing in for somebody else's error.
-pub(crate) fn revive<E: DurableError>(recorded: &str, step: &str) -> Error<E> {
-    serde_json::from_str(recorded).unwrap_or_else(|_| Error::StepFailed {
-        step: step.to_owned(),
-        message: recorded.to_owned(),
-    })
+/// column says so. A readable message beats a decode failure standing in for somebody else's
+/// error.
+pub(crate) fn revive<E: DurableError>(recorded: &str, tag: Option<&str>, step: &str) -> Error<E> {
+    Format::of::<EngineOnly>(tag)
+        .ok()
+        .and_then(|format| decode::<Error<E>, EngineOnly>(Some(recorded), &format, "error").ok())
+        .unwrap_or_else(|| Error::StepFailed {
+            step: step.to_owned(),
+            message: recorded.to_owned(),
+        })
 }
 
 /// Where a durable call stands: which of the workflow's step ids it occupies, if any.
@@ -860,6 +867,17 @@ mod tests {
             "each entry into a step body is a body of its own"
         );
         (proper, in_step, sibling, dbos, db)
+    }
+
+    /// A recorded error in an encoding this process cannot read degrades to its text, rather than
+    /// failing the replay on a decode.
+    #[test]
+    fn a_step_error_in_an_unreadable_encoding_revives_as_its_text() {
+        let revived = revive::<EngineOnly>("sealed", Some("backwards_json"), "charge");
+        assert!(
+            matches!(&revived, Error::StepFailed { step, message } if step == "charge" && message == "sealed"),
+            "{revived:?}"
+        );
     }
 
     fn durability(outcome: &crate::Result<StepDurability<'_>, EngineOnly>) -> &'static str {

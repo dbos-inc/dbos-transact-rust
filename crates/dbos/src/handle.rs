@@ -16,8 +16,8 @@ use tokio::task::JoinHandle;
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
-use crate::error::{DurableError, Error, Failure, Result};
-use crate::serialization::{decode, encode};
+use crate::error::{DurableError, EncodedError, Error, Failure, Result};
+use crate::serialization::{EncodedOutput, Format, decode_tagged, encode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 
 /// A running — or finished — workflow, by id.
@@ -38,7 +38,7 @@ pub struct WorkflowHandle<R, E = crate::EngineOnly> {
 /// Where this handle's result will come from.
 enum Provenance {
     /// The workflow runs in this process: the task's outcome is awaited directly.
-    Local(JoinHandle<std::result::Result<Option<String>, Failure>>),
+    Local(JoinHandle<std::result::Result<EncodedOutput, Failure>>),
     /// The workflow runs elsewhere, or already finished: the database is the only witness.
     Polling {
         /// Whether the call that minted this handle had the row in front of it.
@@ -58,7 +58,7 @@ impl<R, E> WorkflowHandle<R, E> {
     pub(crate) fn local(
         conn: Arc<Connection>,
         workflow_id: String,
-        task: JoinHandle<std::result::Result<Option<String>, Failure>>,
+        task: JoinHandle<std::result::Result<EncodedOutput, Failure>>,
     ) -> Self {
         Self {
             conn,
@@ -120,9 +120,10 @@ where
     ///
     /// The same answer whoever asks: a local handle awaits the task, a polling handle reads the
     /// row another execution writes, and both decode the same recorded bytes — the output, or the
-    /// workflow's own error with the fidelity the type parameter exists for. A failure that is
-    /// not ours to decode — a row another SDK wrote — degrades to
-    /// [`WorkflowFailed`](Error::WorkflowFailed) carrying the message.
+    /// workflow's own error with the fidelity the type parameter exists for. A row in an encoding
+    /// this process cannot read is [`Error::UnknownSerialization`], and an error that does not
+    /// decode in an encoding it can read degrades to [`WorkflowFailed`](Error::WorkflowFailed)
+    /// carrying the stored text.
     ///
     /// **Awaited from inside the workflow that started it, this is a durable step.** The parent
     /// records what the child returned, so a replayed parent continues from a value it already has
@@ -220,7 +221,7 @@ where
                 workflow_id = self.workflow_id,
                 "the child's outcome was already recorded; the parent does not wait again"
             );
-            return Self::interpret(recorded, self.workflow_id);
+            return Self::interpret(recorded, &self.workflow_id);
         }
 
         let started_at = Timestamp::now();
@@ -243,28 +244,19 @@ where
         };
 
         // Recorded from the outcome as it arrived, before it is decoded: the child's bytes go into
-        // the parent's row exactly as the child's own row holds them, so the two copies cannot
-        // disagree about what the child returned.
-        //
-        // The *label* beside them is this executor's serializer rather than the one that wrote
-        // the bytes, which `adopt` does not carry back. Nothing reads it to choose a decoder while
-        // there is one encoding, so it costs nothing yet; it becomes a real question when a second
-        // serializer does, and it is that change's to answer.
+        // the parent's row as the child's own row holds them, under the child's own tag, so the
+        // two copies cannot disagree about what the child returned.
         awaiting
             .record(&self.conn, &self.workflow_id, &outcome, started_at)
             .await
             .map_err(Error::lift)?;
 
         match outcome {
-            Ok(output) => decode(output.as_deref(), "result"),
+            Ok(output) => output.decode(),
             // The workflow's own failure, decoded back into the caller's error type — the same
             // fidelity the result gets. Execution and replay read the same bytes, so they return
             // the same error.
-            Err(Failure::Recorded(encoded)) => Err(decode::<_, E>(Some(&encoded), "error")
-                .unwrap_or_else(|_| Error::WorkflowFailed {
-                    workflow_id: self.workflow_id.clone(),
-                    message: encoded,
-                })),
+            Err(Failure::Recorded(recorded)) => Err(recorded.decode(&self.workflow_id)),
             // **A cancelled child is not a cancelled parent.** `WorkflowCancelled` means the
             // workflow *asking* is being cancelled — the step-replay check refusing to run it —
             // so reporting it here would read as the wrong workflow having been stopped. Every
@@ -284,15 +276,15 @@ where
     ///
     /// Which workflow the row belongs to was settled by [`ChildResultPlacement::check`] before
     /// this sees it, so what is left here is the outcome alone.
-    fn interpret(recorded: StepRecord, workflow_id: String) -> Result<R, E> {
+    fn interpret(recorded: StepRecord, workflow_id: &str) -> Result<R, E> {
+        let tag = recorded.serialization.as_deref();
         match recorded.error {
-            None => decode(recorded.output.as_deref(), "result"),
-            Some(encoded) => Err(decode::<_, E>(Some(&encoded), "error").unwrap_or_else(|_| {
-                Error::WorkflowFailed {
-                    workflow_id,
-                    message: encoded,
-                }
-            })),
+            None => decode_tagged(recorded.output.as_deref(), tag, "result"),
+            Some(encoded) => Err(EncodedError {
+                encoded,
+                format: Format::of(tag)?,
+            }
+            .decode(workflow_id)),
         }
     }
 }
@@ -419,27 +411,34 @@ impl ChildResultPlacement {
         &self,
         conn: &Connection,
         child_workflow_id: &str,
-        settled: &std::result::Result<Option<String>, Failure>,
+        settled: &std::result::Result<EncodedOutput, Failure>,
         started_at: Timestamp,
     ) -> std::result::Result<(), Error> {
         let Some((workflow_id, step_id)) = self.0.step() else {
             return Ok(());
         };
         let cancelled;
-        let outcome = match settled {
-            Ok(output) => Outcome::Output(output.as_deref()),
-            Err(Failure::Recorded(encoded)) => Outcome::Error(encoded),
+        let configured;
+        // Under the child's own tag, whatever this executor would write: the bytes are the child's,
+        // and the tag is what says how to read them.
+        let (outcome, format) = match settled {
+            Ok(output) => (Outcome::Output(output.encoded.as_deref()), &output.format),
+            Err(Failure::Recorded(recorded)) => {
+                (Outcome::Error(&recorded.encoded), &recorded.format)
+            }
             // Cancellation is the one control-shaped signal that *is* a decided outcome, and it is
             // rewritten on the way in for the same reason it is rewritten on the way out: the row
             // has to say the awaited workflow was cancelled, not this one.
             Err(Failure::Control(Error::WorkflowCancelled { workflow_id })) => {
+                configured = conn.serializer().format();
                 cancelled = encode(
                     &Error::<EngineOnly>::AwaitedWorkflowCancelled {
                         workflow_id: workflow_id.clone(),
                     },
+                    &configured,
                     "error",
                 )?;
-                Outcome::Error(&cancelled)
+                (Outcome::Error(&cancelled), &configured)
             }
             Err(Failure::Control(_)) => return Ok(()),
         };
@@ -449,7 +448,7 @@ impl ChildResultPlacement {
                 step_id,
                 child_workflow_id,
                 outcome,
-                Some(conn.serializer().name()),
+                Some(format.name()),
                 Some(StepTiming {
                     started_at,
                     completed_at: Timestamp::now(),

@@ -180,7 +180,7 @@ use crate::checkpoint::{PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
-use crate::serialization::{decode, encode};
+use crate::serialization::{decode_tagged, encode};
 use crate::sysdb::types::{Outcome, Timestamp, step_names};
 
 /// Waits until one of these workflows finishes, and reports **which**.
@@ -734,10 +734,15 @@ impl Connection {
             // empty set below, and a replay of it must refuse again rather than look at the set it
             // has now — the same rule that makes a recorded winner stand even when the set changed.
             if let Some(error) = &recorded.error {
-                return Err(revive(error, step_names::SELECT_WORKFLOW));
+                return Err(revive(
+                    error,
+                    recorded.serialization.as_deref(),
+                    step_names::SELECT_WORKFLOW,
+                ));
             }
-            let winner: String = decode(
+            let winner: String = decode_tagged(
                 recorded.output.as_deref(),
+                recorded.serialization.as_deref(),
                 "the id that won a select_workflow",
             )?;
             tracing::debug!(
@@ -787,7 +792,11 @@ impl Connection {
                 operation: "select_workflow".into(),
                 detail: "no workflow ids to wait for".to_owned(),
             };
-            let encoded = encode(&refused, "select_workflow error")?;
+            let encoded = encode(
+                &refused,
+                &self.serializer().format(),
+                "select_workflow error",
+            )?;
             placement
                 .record(
                     self,
@@ -804,7 +813,11 @@ impl Connection {
             .await
             .map_err(Error::SystemDatabase)?;
 
-        let encoded = encode(&winner, "the id that won a select_workflow")?;
+        let encoded = encode(
+            &winner,
+            &self.serializer().format(),
+            "the id that won a select_workflow",
+        )?;
         placement
             .record(
                 self,

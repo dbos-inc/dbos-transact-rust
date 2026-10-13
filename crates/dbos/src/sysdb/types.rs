@@ -1332,6 +1332,14 @@ pub struct WorkflowInitResult {
     /// May differ from what the caller offered: the first writer decides the format, and every
     /// later attempt has to read the payloads that are actually there.
     pub serialization: Option<String>,
+    /// The input the row already held, where a fresh start is to run a row it did not create — one
+    /// no attempt owns: `Some(None)` for a row with no input, and `None` otherwise.
+    ///
+    /// Only the attempt that creates a row writes its input, so a fresh start that runs an existing
+    /// one offered an input the row does not hold. The row is what a recovery runs, so the run has
+    /// to start from this, not from what the caller offered. A recovery or a dequeue gets `None`:
+    /// it read the input with the row it claimed.
+    pub existing_input: Option<Option<String>>,
     /// Whether this caller should go on to run the workflow.
     ///
     /// `false` means another owner holds it and this attempt is not a recovery — so the row is

@@ -33,7 +33,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
-use crate::serialization::{decode, encode};
+use crate::serialization::{decode_tagged, encode};
 use crate::sysdb::types::{
     AwaitedStream, EncodedValue, Outcome, StepTiming, Timestamp, WrittenBy, step_names,
 };
@@ -145,7 +145,10 @@ where
         .and_then(|ctx| {
             // `None` is the close, and is only ever made here, from the write it stands for.
             let encoded = match write {
-                StreamWrite::Value(value) => Some(encode(value, "stream value")?),
+                StreamWrite::Value(value) => {
+                    let format = ctx.executor().serializer().format();
+                    Some((encode(value, &format, "stream value")?, format))
+                }
                 StreamWrite::Close => None,
             };
             Ok((
@@ -172,14 +175,14 @@ where
         };
         let sysdb = conn.sysdb();
         match &encoded {
-            Some(value) => {
+            Some((value, format)) => {
                 sysdb
                     .write_stream(
                         workflow_id,
                         step_id,
                         key,
                         value,
-                        Some(conn.serializer().name()),
+                        Some(format.name()),
                         written_by,
                     )
                     .await
@@ -570,9 +573,9 @@ where
 
         if self.replaying {
             match check(conn, placement, name).await? {
-                Some(Replayed::Value(output)) => {
+                Some(Replayed::Value(output, tag)) => {
                     self.offset += 1;
-                    return decode(Some(&output), "stream value").map(Some);
+                    return decode_tagged(Some(&output), tag.as_deref(), "stream value").map(Some);
                 }
                 Some(Replayed::Ended) => {
                     self.ended = true;
@@ -629,7 +632,12 @@ where
         // Decoded only as it is delivered, so a value that cannot be decoded fails its own read
         // and none before it. After the record rather than before: what was read is settled either
         // way, and a replay decodes the recorded entry exactly as this does.
-        decode(Some(&entry.value), "stream value").map(Some)
+        decode_tagged(
+            Some(&entry.value),
+            entry.serialization.as_deref(),
+            "stream value",
+        )
+        .map(Some)
     }
 }
 
@@ -667,7 +675,9 @@ where
                 timeout: None,
             };
             match check(&conn, &placement, name).await? {
-                Some(Replayed::Value(output)) => return decode(Some(&output), "stream value"),
+                Some(Replayed::Value(output, tag)) => {
+                    return decode_tagged(Some(&output), tag.as_deref(), "stream value");
+                }
                 Some(Replayed::Ended) => return Err(ended()),
                 None => {}
             }
@@ -692,7 +702,11 @@ where
                 return Err(ended());
             }
             record_value(&conn, &placement, name, &entry, started_at).await?;
-            decode(Some(&entry.value), "stream value")
+            decode_tagged(
+                Some(&entry.value),
+                entry.serialization.as_deref(),
+                "stream value",
+            )
         }
         .await
         .map_err(Error::lift)
@@ -788,13 +802,14 @@ impl ReadOf {
         match awaited {
             Err(refused) if refused.should_record() => {
                 let refused = Error::SystemDatabase(refused);
-                let encoded = encode(&refused, "stream read refusal")?;
+                let format = conn.serializer().format();
+                let encoded = encode(&refused, &format, "stream read refusal")?;
                 record(
                     conn,
                     placement,
                     name,
                     Outcome::Error(&encoded),
-                    Some(conn.serializer().name()),
+                    Some(format.name()),
                     started_at,
                 )
                 .await?;
@@ -820,13 +835,14 @@ impl ReadOf {
             key: self.key.clone(),
             timeout: self.timeout,
         };
-        let encoded = encode(&timed_out, "stream timeout")?;
+        let format = conn.serializer().format();
+        let encoded = encode(&timed_out, &format, "stream timeout")?;
         record(
             conn,
             placement,
             name,
             Outcome::Error(&encoded),
-            Some(conn.serializer().name()),
+            Some(format.name()),
             started_at,
         )
         .await?;
@@ -842,8 +858,8 @@ fn place(conn: Arc<Connection>, operation: &'static str) -> Built<Arc<Connection
 
 /// What a read's step recorded, found on replay.
 enum Replayed {
-    /// The value it delivered, as recorded.
-    Value(String),
+    /// The value it delivered, as recorded, and the tag it was recorded under.
+    Value(String, Option<String>),
     /// The end of the stream.
     Ended,
 }
@@ -866,14 +882,14 @@ async fn check(
     };
     tracing::debug!(step_id = ?placement.step_id(), name, "replaying a stream read");
     if let Some(error) = step.error {
-        return Err(revive(&error, name));
+        return Err(revive(&error, step.serialization.as_deref(), name));
     }
     let output = step.output.unwrap_or_default();
     Ok(Some(
         if is_stream_closed(&output, step.serialization.as_deref()) {
             Replayed::Ended
         } else {
-            Replayed::Value(output)
+            Replayed::Value(output, step.serialization)
         },
     ))
 }

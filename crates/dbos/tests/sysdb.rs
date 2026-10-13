@@ -456,6 +456,55 @@ async fn a_second_owner_records_but_does_not_execute() {
     assert!(recovering.should_execute, "a recovery may claim the row");
 }
 
+/// The row's input goes back to a fresh start that is to run a row it did not create, and to no
+/// other: the creator wrote the input it offered, an attempt that does not run needs none, and a
+/// recovery read the input with the row it claimed.
+#[tokio::test]
+async fn the_stored_input_goes_to_a_fresh_start_that_runs_a_row_it_did_not_create() {
+    let (sys, db) = sysdb().await;
+    let stored = workflow("wf-input").input.map(str::to_owned);
+    let first = sys
+        .init_workflow(&workflow("wf-input"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    assert_eq!(first.existing_input, None, "the creator wrote its own");
+
+    let mut other = workflow("wf-input");
+    other.input = Some(r#"{"positionalArgs":[2],"namedArgs":{}}"#);
+    let joining = sys
+        .init_workflow(&other, None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    assert!(!joining.should_execute);
+    assert_eq!(joining.existing_input, None, "an attempt that does not run");
+
+    let recovering = sys
+        .init_workflow(&other, None, Submission::Recovery, None)
+        .await
+        .unwrap();
+    assert!(recovering.should_execute);
+    assert_eq!(recovering.existing_input, None, "a recovery read its own");
+
+    // A row no attempt owns, as one written without an owner is.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET owner_xid = NULL WHERE workflow_uuid = 'wf-input'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    let restarting = sys
+        .init_workflow(&other, None, Submission::Fresh, None)
+        .await
+        .unwrap();
+    assert!(restarting.should_execute);
+    assert_eq!(restarting.existing_input, Some(stored.clone()));
+    assert_eq!(
+        sys.get_workflow("wf-input").await.unwrap().unwrap().input,
+        stored,
+        "the row's input is untouched"
+    );
+}
+
 /// The first writer decides the payload format, and later attempts are told what it is.
 #[tokio::test]
 async fn the_stored_serialization_is_reported_back() {

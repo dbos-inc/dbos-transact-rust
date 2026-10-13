@@ -30,7 +30,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
-use crate::serialization::{decode, encode};
+use crate::serialization::{decode_tagged, encode};
 use crate::sysdb::types::{GetEventCaller, step_names};
 
 /// Publishes a key/value on the current workflow, for anyone to read.
@@ -102,7 +102,7 @@ fn place_set_event<T: Serialize>(value: &T) -> Built<(Arc<crate::Executor>, Stri
             operation: "set_event".into(),
         });
     }
-    let encoded = encode(value, "event value")?;
+    let encoded = encode(value, &ctx.executor().serializer().format(), "event value")?;
     // The refusals above already settled that this stands at a step boundary of its own workflow,
     // served by its own executor, so the placement has no second connection to disagree with and
     // cannot fail. It takes the context those refusals read rather than reading it again, so the
@@ -294,7 +294,12 @@ impl Connection {
             .map_err(Error::SystemDatabase)?
         {
             None => Ok(None),
-            Some(found) => decode(Some(&found.value), "event value").map(Some),
+            Some(found) => decode_tagged(
+                Some(&found.value),
+                found.serialization.as_deref(),
+                "event value",
+            )
+            .map(Some),
         }
     }
 }

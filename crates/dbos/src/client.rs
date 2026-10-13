@@ -61,12 +61,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::{DATABASE_URL_ENV, Serializer};
+use crate::config::DATABASE_URL_ENV;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
-use crate::serialization::encode;
+use crate::serialization::{Serializer, encode};
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
@@ -379,7 +379,7 @@ impl Client {
         // honour should cost a round trip, not a row.
         options.queue.validate()?;
 
-        let input = encode(&input, "argument")?;
+        let input = encode(&input, &self.0.serializer().format(), "argument")?;
         let attributes = encode_attributes(options.attributes)?;
         // Generated once, outside the retry below: a second attempt under a fresh id would enqueue
         // a *second* workflow if the first insert had in fact landed.

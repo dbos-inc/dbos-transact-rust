@@ -14,8 +14,8 @@ use std::sync::{Arc, RwLock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::error::{DurableError, EngineOnly, Failure};
-use crate::serialization::{decode, encode};
+use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
+use crate::serialization::{Format, decode, encode};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -27,8 +27,14 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// a Rust type. No context parameter appears in it, because the context is ambient. The error is
 /// erased along with the value, which is what lets a caller keep a typed error while recovery,
 /// holding only a row, keeps none.
+///
+/// The [`Format`] is the row's: how the input was encoded, and so how the outcome is encoded
+/// back.
 pub(crate) type ErasedWorkflow = Arc<
-    dyn Fn(Option<String>) -> BoxFuture<'static, std::result::Result<Option<String>, Failure>>
+    dyn Fn(
+            Option<String>,
+            Format,
+        ) -> BoxFuture<'static, std::result::Result<Option<String>, Failure>>
         + Send
         + Sync,
 >;
@@ -298,13 +304,13 @@ impl DBOS {
         E: DurableError,
     {
         let workflow = Arc::new(workflow);
-        let erased: ErasedWorkflow = Arc::new(move |input: Option<String>| {
+        let erased: ErasedWorkflow = Arc::new(move |input: Option<String>, format: Format| {
             let workflow = Arc::clone(&workflow);
             Box::pin(async move {
-                let input = decode::<P, EngineOnly>(input.as_deref(), "argument")
+                let input = decode::<P, EngineOnly>(input.as_deref(), &format, "argument")
                     .map_err(Failure::Control)?;
                 match workflow(input).await {
-                    Ok(output) => encode(&output, "result")
+                    Ok(output) => encode(&output, &format, "result")
                         .map(Some)
                         .map_err(Failure::Control),
                     // The whole `Error<E>` is what gets recorded, application variant and all, so
@@ -312,9 +318,10 @@ impl DBOS {
                     // guess whether the payload is one of ours or one of the workflow's.
                     Err(error) => Err(match error.control() {
                         Some(control) => Failure::Control(control),
-                        None => {
-                            Failure::Recorded(encode(&error, "error").map_err(Failure::Control)?)
-                        }
+                        None => Failure::Recorded(EncodedError {
+                            encoded: encode(&error, &format, "error").map_err(Failure::Control)?,
+                            format,
+                        }),
                     }),
                 }
             })
@@ -376,7 +383,7 @@ mod tests {
             .get(&WorkflowKey::new("double"))
             .expect("registered");
         assert_eq!(
-            erased(Some("21".to_owned())).await.unwrap(),
+            erased(Some("21".to_owned()), Format::Native).await.unwrap(),
             Some("42".to_owned())
         );
     }
@@ -391,7 +398,10 @@ mod tests {
             .get(&WorkflowKey::new("nothing"))
             .expect("registered");
         // The row for a zero-argument workflow has a NULL input; it must not need a `"null"`.
-        assert_eq!(erased(None).await.unwrap(), Some("\"nothing\"".to_owned()));
+        assert_eq!(
+            erased(None, Format::Native).await.unwrap(),
+            Some("\"nothing\"".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -403,7 +413,7 @@ mod tests {
         let erased = snapshot
             .get(&WorkflowKey::new("double"))
             .expect("registered");
-        let err = erased(Some("\"not a number\"".to_owned()))
+        let err = erased(Some("\"not a number\"".to_owned()), Format::Native)
             .await
             .unwrap_err();
         assert!(

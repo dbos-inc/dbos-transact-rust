@@ -88,7 +88,7 @@ pub use checkpoint::PendingStep;
 #[cfg(feature = "engine")]
 pub use client::{Client, ClientConfig, EnqueueOptions};
 #[cfg(feature = "engine")]
-pub use config::{Config, DATABASE_URL_ENV, Serializer};
+pub use config::{Config, DATABASE_URL_ENV};
 #[cfg(feature = "engine")]
 pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
 #[cfg(feature = "engine")]
@@ -113,6 +113,8 @@ pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 pub use registry::{WorkflowKey, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
+#[cfg(feature = "engine")]
+pub use serialization::Serializer;
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]

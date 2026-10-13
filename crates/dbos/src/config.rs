@@ -2,63 +2,13 @@
 
 use std::time::Duration;
 
+use crate::serialization::Serializer;
 use crate::sysdb::DEFAULT_SCHEMA;
 
 /// Environment variable naming the system database.
 ///
 /// The same name every implementation reads.
 pub const DATABASE_URL_ENV: &str = "DBOS_DATABASE_URL";
-
-/// How payloads are encoded on their way into the system database.
-///
-/// One variant for now. A workflow is only ever replayed by the SDK that wrote it — workflows
-/// cross languages by enqueue, not by execution — so there is no wire form to conform to here.
-/// What matters is that the choice is *recorded* in the `serialization` column of every row, so a
-/// later reader knows how to read what it finds.
-///
-/// # How this grows
-///
-/// The other implementations end up with two built-ins — a native one and a portable one — plus
-/// whatever a user supplies, and Python's dispatch shows the model: the two built-ins are always
-/// available *by name*, and a third-party serializer is available only when it is the one this
-/// process is configured with. A row written by some other custom serializer is an error, not a
-/// guess (`Serialization {name} is not available`). So this becomes:
-///
-/// ```text
-/// enum Serializer { Native, Portable, Custom(Arc<dyn CustomSerializer>) }
-/// ```
-///
-/// which is why `#[non_exhaustive]` is here from the start: adding those variants is then
-/// source-compatible, because a downstream `match` already needs a wildcard arm.
-///
-/// The part that needs care is the *trait*, not the enum: a trait with a generic
-/// `fn serialize<T: Serialize>` is not object-safe, so the custom variant goes through
-/// `erased-serde`, with the generic half in a free function the call site monomorphizes. The
-/// built-in two stay ordinary variants and pay none of it.
-///
-/// Two things here exist to keep that door open, and both would be breaking changes to add later:
-/// this is `Clone` and not `Copy`, because an `Arc` is not `Copy`; and [`name`](Self::name)
-/// borrows from `&self` rather than returning `&'static str`, because a custom serializer's name
-/// belongs to the serializer.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum Serializer {
-    /// `serde` with this crate's own derives, written as `rust_serde`.
-    #[default]
-    RustSerde,
-}
-
-impl Serializer {
-    /// The name written to the `serialization` column.
-    ///
-    /// Python writes `py_pickle` or `portable_json` here and TypeScript `portable_json`; the value
-    /// is a serializer's own name rather than a shared enumeration.
-    pub fn name(&self) -> &str {
-        match self {
-            Serializer::RustSerde => "rust_serde",
-        }
-    }
-}
 
 /// Everything a [`DBOS`](crate::DBOS) instance needs.
 ///
@@ -294,11 +244,6 @@ pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_serializer_names_itself_as_the_column_records_it() {
-        assert_eq!(Serializer::default().name(), "rust_serde");
-    }
 
     #[test]
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
