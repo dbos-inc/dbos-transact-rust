@@ -77,7 +77,8 @@ pub struct Config {
     /// applies only where the field is `None`. On DBOS Cloud the deployment wins either way.
     pub app_version: Option<String>,
 
-    /// How payloads are encoded, by default.
+    /// How payloads are encoded, by default: the built-in `rust_serde`, or the application's own
+    /// [`CustomSerializer`](crate::CustomSerializer).
     pub serializer: Serializer,
 
     /// Whether to use LISTEN/NOTIFY rather than polling.
@@ -219,7 +220,7 @@ impl Config {
                 "`scheduler_polling_interval` cannot be zero".to_owned(),
             ));
         }
-        Ok(())
+        self.serializer.validate()
     }
 
     /// How often an adopting caller looks, resolved.

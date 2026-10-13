@@ -1749,14 +1749,15 @@ pub(crate) fn spawn_execution(
                 // The row's tag, which says how its input was written and so how the outcome is
                 // written back. A tag this SDK cannot read is an input it cannot decode, and ends
                 // the execution as an undecodable input does: with nothing recorded.
-                let encoding = PayloadEncoding::of(serialization.as_deref()).map_err(|error| {
-                    tracing::warn!(
-                        %error,
-                        "the workflow's input is in an encoding this SDK cannot read; it records \
-                         no outcome"
-                    );
-                    Failure::Control(error)
-                })?;
+                let encoding = PayloadEncoding::of(serialization.as_deref(), executor.serializer())
+                    .map_err(|error| {
+                        tracing::warn!(
+                            %error,
+                            "the workflow's input is in an encoding this SDK cannot read; it \
+                             records no outcome"
+                        );
+                        Failure::Control(error)
+                    })?;
                 let ctx = Ctx::new(
                     Arc::clone(&executor),
                     &workflow_id,
@@ -2050,7 +2051,8 @@ impl Connection {
         // The row's tag says how to read the outcome, whoever wrote it; one this SDK cannot read is
         // reported rather than handed on to be misread.
         let encoding = |serialization: Option<String>| {
-            PayloadEncoding::of(serialization.as_deref()).map_err(Failure::Control)
+            PayloadEncoding::of(serialization.as_deref(), self.serializer())
+                .map_err(Failure::Control)
         };
         match outcome {
             AwaitedOutcome::Succeeded {

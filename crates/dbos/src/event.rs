@@ -330,6 +330,7 @@ impl Connection {
             Some(found) => decode_tagged(
                 Some(&found.value),
                 found.serialization.as_deref(),
+                self.serializer(),
                 "event value",
             )
             .map(Some),

@@ -283,6 +283,7 @@ where
                 Some(found) => decode_tagged(
                     Some(&found.value),
                     found.serialization.as_deref(),
+                    executor.serializer(),
                     "message",
                 )
                 .map(Some),

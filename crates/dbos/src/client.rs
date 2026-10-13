@@ -136,7 +136,10 @@ pub struct ClientConfig {
 
     /// How payloads are encoded, by default.
     ///
-    /// The built-in encodings are readable by both sides whatever each is configured with.
+    /// **Must match the application's** where it is [custom](Serializer::Custom): a workflow this
+    /// client enqueues in a serializer its executor is not configured with cannot be read, and
+    /// neither can that executor's results here. The built-in encodings are readable by both
+    /// sides whatever each is configured with.
     pub serializer: Serializer,
 
     /// Whether to use LISTEN/NOTIFY rather than polling.
@@ -243,6 +246,7 @@ impl ClientConfig {
         if self.max_connections == 0 {
             return Err(Error::Config("`max_connections` cannot be zero".to_owned()));
         }
+        self.serializer.validate()?;
         if self.outcome_poll_interval == Some(Duration::ZERO) {
             return Err(Error::Config(
                 "`outcome_poll_interval` cannot be zero".to_owned(),

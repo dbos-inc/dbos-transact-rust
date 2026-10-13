@@ -603,7 +603,13 @@ where
             match check(conn, placement, name).await? {
                 Some(Replayed::Value(output, tag)) => {
                     self.offset += 1;
-                    return decode_tagged(Some(&output), tag.as_deref(), "stream value").map(Some);
+                    return decode_tagged(
+                        Some(&output),
+                        tag.as_deref(),
+                        conn.serializer(),
+                        "stream value",
+                    )
+                    .map(Some);
                 }
                 Some(Replayed::Ended) => {
                     self.ended = true;
@@ -663,6 +669,7 @@ where
         decode_tagged(
             Some(&entry.value),
             entry.serialization.as_deref(),
+            conn.serializer(),
             "stream value",
         )
         .map(Some)
@@ -704,7 +711,12 @@ where
             };
             match check(&conn, &placement, name).await? {
                 Some(Replayed::Value(output, tag)) => {
-                    return decode_tagged(Some(&output), tag.as_deref(), "stream value");
+                    return decode_tagged(
+                        Some(&output),
+                        tag.as_deref(),
+                        conn.serializer(),
+                        "stream value",
+                    );
                 }
                 Some(Replayed::Ended) => return Err(ended()),
                 None => {}
@@ -733,6 +745,7 @@ where
             decode_tagged(
                 Some(&entry.value),
                 entry.serialization.as_deref(),
+                conn.serializer(),
                 "stream value",
             )
         }
@@ -910,7 +923,12 @@ async fn check(
     };
     tracing::debug!(step_id = ?placement.step_id(), name, "replaying a stream read");
     if let Some(error) = step.error {
-        return Err(revive(&error, step.serialization.as_deref(), name));
+        return Err(revive(
+            &error,
+            step.serialization.as_deref(),
+            conn.serializer(),
+            name,
+        ));
     }
     let output = step.output.unwrap_or_default();
     Ok(Some(

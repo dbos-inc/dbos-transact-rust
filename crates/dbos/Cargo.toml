@@ -25,7 +25,7 @@ default = ["engine", "macros"]
 # which is what keeps the gate meaningful: the runtime — `task_local!`, `JoinSet`, `Handle`,
 # `spawn` — and the `tokio::select!` the step supervisor races a body against its timeout with
 # are the engine's, and a core-only build has no business pulling them in.
-engine = ["tokio/rt", "tokio/macros", "dep:croner", "dep:jiff"]
+engine = ["tokio/rt", "tokio/macros", "dep:croner", "dep:jiff", "dep:erased-serde"]
 # Re-exports `select_step!` from `dbos-macros`. Implies `engine`, because the expansion is engine
 # code — it names the race's checkpoint through `dbos::__private`.
 #
@@ -88,6 +88,10 @@ time = { version = "0.3", default-features = false, features = [
 croner = { version = "4.0.1", default-features = false, features = ["jiff"], optional = true }
 # The timezone database behind `cron_timezone`, and the calendar the scheduler walks in it.
 jiff = { version = "0.2", optional = true }
+# A `CustomSerializer` is a trait object, and `serde`'s traits are not object-safe: this is what
+# lets an application's serializer see each value's real type, without the engine monomorphizing
+# its code. Engine-only, like the serializer it serves; never named in this crate's public API.
+erased-serde = { version = "0.4", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 # Tests define application error types to check that a workflow's *own* failures round-trip, which

@@ -393,10 +393,11 @@ impl DBOS {
                         Ok(output) => encode(&output, &encoding, "result")
                             .map(Some)
                             .map_err(Failure::Control),
-                        // Natively the whole `Error<E>` is what gets recorded, application variant
-                        // and all, so the column is self-describing: a reader knows the envelope
-                        // without having to guess whether the payload is one of ours or one of the
-                        // workflow's. Portably it is the envelope every SDK reads.
+                        // Natively or in a custom serializer the whole `Error<E>` is what gets
+                        // recorded, application variant and all, so the column is
+                        // self-describing: a reader knows the envelope without having to guess
+                        // whether the payload is one of ours or one of the workflow's. Portably it
+                        // is the envelope every SDK reads.
                         Err(error) => Err(match error.control() {
                             Some(control) => Failure::Control(control),
                             None => Failure::Recorded(EncodedError {

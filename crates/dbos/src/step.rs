@@ -412,8 +412,13 @@ where
         );
         let tag = recorded.serialization.as_deref();
         return match recorded.error {
-            Some(error) => Err(revive(&error, tag, name)),
-            None => decode_tagged(recorded.output.as_deref(), tag, "step result"),
+            Some(error) => Err(revive(&error, tag, executor.serializer(), name)),
+            None => decode_tagged(
+                recorded.output.as_deref(),
+                tag,
+                executor.serializer(),
+                "step result",
+            ),
         };
     }
 

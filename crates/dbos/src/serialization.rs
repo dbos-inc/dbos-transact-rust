@@ -4,18 +4,21 @@
 //! `serialization` column on each row records which encoding produced it. That is what lets a
 //! reader interpret what it finds without the two sides having agreed in advance.
 //!
-//! **Two encodings.** [`PayloadEncoding::Native`] (`rust_serde`) is `serde_json` with the
+//! **Three encodings.** [`PayloadEncoding::Native`] (`rust_serde`) is `serde_json` with the
 //! application's own derives, and is read only by this SDK. [`PayloadEncoding::Portable`]
 //! (`portable_json`) is the encoding every DBOS SDK reads and writes: the same JSON for a plain
 //! value, but a workflow input travels in a `{"positionalArgs", "namedArgs"}` envelope and an error
 //! in a `{"name", "message", "code", "data"}` one, because those are the shapes a workflow or an
 //! exception has in a language with neither a single typed argument nor a typed error.
+//! [`PayloadEncoding::Custom`] is the application's own [`CustomSerializer`], under the name it
+//! gives.
 //!
 //! **Every read honours the row's tag**, whatever the reader would itself have written. A tag
-//! this process cannot read — another SDK's native encoding — is [`Error::UnknownSerialization`],
-//! never a guess.
+//! this process cannot read — neither built-in, nor the name of the serializer it is configured
+//! with — is [`Error::UnknownSerialization`], never a guess.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -34,6 +37,120 @@ pub(crate) const PORTABLE_JSON: &str = "portable_json";
 /// it and reading it, through whatever wraps it.
 const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 
+/// The error a [`CustomSerializer`] reports.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// An application's own serializer, configured with [`Serializer::Custom`].
+///
+/// It sees every value with its real type, through `serde`: [`serialize`](Self::serialize) gets a
+/// [`Payload`], which is [`Serialize`], and [`deserialize`](Self::deserialize) hands a
+/// `serde::Deserializer` to a [`PayloadSlot`]. So any self-describing `serde` format will do —
+/// MessagePack, CBOR, JSON — and so will a wrapper that encrypts or compresses what one of them
+/// writes.
+///
+/// ```
+/// use dbos::{BoxError, CustomSerializer, Payload, PayloadSlot};
+///
+/// /// JSON, reversed: a stand-in for an encrypting serializer.
+/// #[derive(Debug)]
+/// struct Backwards;
+///
+/// impl CustomSerializer for Backwards {
+///     fn name(&self) -> &str {
+///         "backwards_json"
+///     }
+///
+///     fn serialize(&self, value: Payload<'_>) -> Result<String, BoxError> {
+///         Ok(serde_json::to_string(&value)?.chars().rev().collect())
+///     }
+///
+///     fn deserialize(&self, text: &str, into: PayloadSlot<'_>) -> Result<(), BoxError> {
+///         let json: String = text.chars().rev().collect();
+///         into.fill(&mut serde_json::Deserializer::from_str(&json))
+///     }
+/// }
+/// ```
+///
+/// **The output is text**, because the columns are. A binary format has to encode its bytes —
+/// base64, say — on the way out and decode them on the way in.
+///
+/// **The format must be self-describing**: able to read a value without knowing its type in
+/// advance, which `serde` calls `deserialize_any`. Some of what the engine writes holds a
+/// `serde_json::Value` — a schedule's context, the `code` and `data` of an
+/// [`Error::Portable`] — and a format like bincode cannot read one back.
+///
+/// **What it encodes.** Everything this process writes in its default encoding: workflow inputs,
+/// results and errors, step results and errors, events, messages and stream values, and what the
+/// engine records about the calls it checkpoints, and schedules' contexts. Not what is asked to be
+/// [`Portable`](crate::SerializationFormat::Portable) or
+/// [`Native`](crate::SerializationFormat::Native), and not what a transactional step records about
+/// itself, which the system database writes as JSON under a built-in tag.
+///
+/// **Keep it configured while its rows exist.** A row records the name it was written under, and
+/// is readable only by a process configured with a serializer of that name: one without it reports
+/// [`Error::UnknownSerialization`] rather than guess. The built-in encodings stay readable either
+/// way, so adding a serializer to an application that already has rows is safe.
+pub trait CustomSerializer: Send + Sync + std::fmt::Debug {
+    /// The name written to each row's `serialization` column.
+    ///
+    /// Must be non-empty and not one of the built-in names, `rust_serde` and `portable_json`,
+    /// which launch checks. Changing it makes every row written under the old one unreadable.
+    fn name(&self) -> &str;
+
+    /// Encodes one value.
+    fn serialize(&self, value: Payload<'_>) -> std::result::Result<String, BoxError>;
+
+    /// Decodes `text`, which this serializer wrote, by handing a deserializer for it to `into`.
+    fn deserialize(&self, text: &str, into: PayloadSlot<'_>) -> std::result::Result<(), BoxError>;
+}
+
+/// A value for a [`CustomSerializer`] to encode: whatever the application handed the engine, seen
+/// through [`Serialize`].
+pub struct Payload<'a>(&'a dyn erased_serde::Serialize);
+
+impl Serialize for Payload<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        erased_serde::serialize(self.0, serializer)
+    }
+}
+
+impl std::fmt::Debug for Payload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Payload")
+    }
+}
+
+/// Where a [`CustomSerializer`] puts the value it decodes.
+///
+/// The engine knows the type it wants and the serializer knows the format, so the serializer
+/// builds a deserializer over its text and [`fill`](Self::fill)s this from it, which decodes the
+/// type the engine asked for.
+pub struct PayloadSlot<'a> {
+    visit: &'a mut dyn for<'de> FnMut(
+        &mut dyn erased_serde::Deserializer<'de>,
+    ) -> std::result::Result<(), erased_serde::Error>,
+}
+
+impl PayloadSlot<'_> {
+    /// Decodes the value from `deserializer`.
+    pub fn fill<'de, D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> std::result::Result<(), BoxError> {
+        let mut erased = <dyn erased_serde::Deserializer>::erase(deserializer);
+        (self.visit)(&mut erased).map_err(|error| error.to_string().into())
+    }
+}
+
+impl std::fmt::Debug for PayloadSlot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PayloadSlot")
+    }
+}
+
 /// How payloads are encoded on their way into the system database, by default.
 ///
 /// This is what a workflow writes unless it, or the call, asks for
@@ -44,20 +161,43 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 /// the `serialization` column of every row, so a later reader knows how to read what it finds.
 ///
 /// The built-in encodings, `rust_serde` and `portable_json`, are always readable, whichever this
-/// is.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// is. A [`Custom`](Self::Custom) serializer's rows are readable only by a process configured with
+/// a serializer of the same name; see [`CustomSerializer`].
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum Serializer {
     /// `serde_json` with this crate's own derives, written as `rust_serde`.
     #[default]
     RustSerde,
+    /// The application's own serializer, written under its [`name`](CustomSerializer::name).
+    Custom(Arc<dyn CustomSerializer>),
 }
 
+/// Two serializers are the same when they are the same instance: one configured `Arc` and its
+/// clones.
+impl PartialEq for Serializer {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Serializer::RustSerde, Serializer::RustSerde) => true,
+            (Serializer::Custom(a), Serializer::Custom(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Serializer {}
+
 impl Serializer {
+    /// A [`Custom`](Self::Custom) serializer.
+    pub fn custom(serializer: impl CustomSerializer + 'static) -> Self {
+        Serializer::Custom(Arc::new(serializer))
+    }
+
     /// The name written to the `serialization` column.
     pub fn name(&self) -> &str {
         match self {
             Serializer::RustSerde => RUST_SERDE,
+            Serializer::Custom(custom) => custom.name(),
         }
     }
 
@@ -65,6 +205,23 @@ impl Serializer {
     pub(crate) fn encoding(&self) -> PayloadEncoding {
         match self {
             Serializer::RustSerde => PayloadEncoding::Native,
+            Serializer::Custom(custom) => PayloadEncoding::Custom(Arc::clone(custom)),
+        }
+    }
+
+    /// Refuses a custom name a reader could not tell from a built-in one, or from no name at all.
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        let Serializer::Custom(custom) = self else {
+            return Ok(());
+        };
+        match custom.name() {
+            "" => Err(crate::Error::Config(
+                "a custom serializer's name cannot be empty".to_owned(),
+            )),
+            name @ (RUST_SERDE | PORTABLE_JSON) => Err(crate::Error::Config(format!(
+                "a custom serializer cannot be named {name}, which is a built-in encoding"
+            ))),
+            _ => Ok(()),
         }
     }
 }
@@ -74,7 +231,7 @@ impl Serializer {
 /// **[`Portable`](Self::Portable) is for crossing languages.** It writes `portable_json`, the
 /// encoding every DBOS SDK reads, so a workflow another language enqueues, or a message, event or
 /// stream value another language reads, should be portable. [`Native`](Self::Native) writes this
-/// SDK's own `rust_serde`, whatever [`Serializer`] is configured.
+/// SDK's own `rust_serde`, even where a [`Serializer::Custom`] is configured.
 ///
 /// **[`Default`](Self::Default) defers**, which is what makes the choice made once reach the
 /// writes under it:
@@ -108,14 +265,23 @@ pub enum SerializationFormat {
 /// How one payload is encoded, as its row's `serialization` column records it.
 ///
 /// What a caller *asks for* is a [`SerializationFormat`], which may defer to its context; this is
-/// what that request resolves to, and what a row says it holds.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// what that request resolves to, and what a row says it holds. Two encodings are the same when
+/// their names are, which is all a row can tell apart.
+#[derive(Debug, Clone, Default)]
 pub(crate) enum PayloadEncoding {
     /// `rust_serde`: this SDK's own encoding.
     #[default]
     Native,
     /// `portable_json`: readable by every DBOS SDK.
     Portable,
+    /// The application's own serializer, under its own name.
+    Custom(Arc<dyn CustomSerializer>),
+}
+
+impl PartialEq for PayloadEncoding {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
 }
 
 impl PayloadEncoding {
@@ -124,21 +290,28 @@ impl PayloadEncoding {
         match self {
             PayloadEncoding::Native => RUST_SERDE,
             PayloadEncoding::Portable => PORTABLE_JSON,
+            PayloadEncoding::Custom(custom) => custom.name(),
         }
     }
 
-    /// The encoding a row's tag names.
+    /// The encoding a row's tag names, to a process configured with `configured`.
     ///
-    /// The built-in names are always readable, and no other is. An absent or empty tag is this
-    /// SDK's own: a row with no tag was written before tags were written, by this SDK, since a
-    /// workflow is replayed only by the SDK that wrote it.
-    pub(crate) fn of<E>(tag: Option<&str>) -> Result<PayloadEncoding, E> {
+    /// The built-in names are always readable. Any other is readable only as the configured
+    /// serializer's own name. An absent or empty tag is this SDK's own: a row with no tag was
+    /// written before tags were written, by this SDK, since a workflow is replayed only by the
+    /// SDK that wrote it.
+    pub(crate) fn of<E>(tag: Option<&str>, configured: &Serializer) -> Result<PayloadEncoding, E> {
         match tag {
             None | Some("") | Some(RUST_SERDE) => Ok(PayloadEncoding::Native),
             Some(PORTABLE_JSON) => Ok(PayloadEncoding::Portable),
-            Some(other) => Err(Error::UnknownSerialization {
-                name: other.to_owned(),
-            }),
+            Some(other) => match configured {
+                Serializer::Custom(custom) if custom.name() == other => {
+                    Ok(PayloadEncoding::Custom(Arc::clone(custom)))
+                }
+                _ => Err(Error::UnknownSerialization {
+                    name: other.to_owned(),
+                }),
+            },
         }
     }
 
@@ -187,21 +360,49 @@ pub(crate) fn decode<T: DeserializeOwned, E>(
     encoding: &PayloadEncoding,
     what: &'static str,
 ) -> Result<T, E> {
-    match encoding {
-        PayloadEncoding::Native | PayloadEncoding::Portable => {
-            serde_json::from_str(value.unwrap_or("null"))
-                .map_err(|source| Error::decode_failed(what, source))
+    match (value, encoding) {
+        (Some(text), PayloadEncoding::Custom(custom)) => {
+            decode_custom(&**custom, text).map_err(|message| Error::Deserialization {
+                what: what.into(),
+                message,
+                source: None,
+            })
         }
+        _ => serde_json::from_str(value.unwrap_or("null"))
+            .map_err(|source| Error::decode_failed(what, source)),
     }
 }
 
-/// [`decode`], for a value whose row says how it is encoded.
+/// Decodes `text` with `custom`, into the type the caller asked for.
+fn decode_custom<T: DeserializeOwned>(
+    custom: &dyn CustomSerializer,
+    text: &str,
+) -> std::result::Result<T, String> {
+    let mut decoded = None;
+    let mut visit = |deserializer: &mut dyn erased_serde::Deserializer<'_>| {
+        decoded = Some(erased_serde::deserialize::<T>(deserializer)?);
+        Ok(())
+    };
+    custom
+        .deserialize(text, PayloadSlot { visit: &mut visit })
+        .map_err(|error| error.to_string())?;
+    decoded.ok_or_else(|| {
+        format!(
+            "serializer {} returned without filling its PayloadSlot",
+            custom.name()
+        )
+    })
+}
+
+/// [`decode`], for a value whose row says how it is encoded, read by a process configured with
+/// `configured`.
 pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
     value: Option<&str>,
     tag: Option<&str>,
+    configured: &Serializer,
     what: &'static str,
 ) -> Result<T, E> {
-    decode(value, &PayloadEncoding::of(tag)?, what)
+    decode(value, &PayloadEncoding::of(tag, configured)?, what)
 }
 
 /// Encodes a value for the system database, in `encoding`.
@@ -219,6 +420,15 @@ pub(crate) fn encode<T: Serialize, E>(
     what: &'static str,
 ) -> Result<String, E> {
     match encoding {
+        PayloadEncoding::Custom(custom) => {
+            custom
+                .serialize(Payload(value))
+                .map_err(|error| Error::Serialization {
+                    what: what.into(),
+                    message: error.to_string(),
+                    source: None,
+                })
+        }
         PayloadEncoding::Native | PayloadEncoding::Portable => {
             serde_json::to_string(value).map_err(|source| Error::encode_failed(what, source))
         }
@@ -284,7 +494,7 @@ struct Envelope<'a, A: ?Sized> {
 
 /// Encodes a workflow's input in `encoding`.
 ///
-/// Native, it is the input alone. Portable, it is the envelope, and the input's shape
+/// Native or custom, it is the input alone. Portable, it is the envelope, and the input's shape
 /// decides what goes in it:
 ///
 /// | Input | `positionalArgs` |
@@ -667,7 +877,7 @@ struct PortableError {
 
 /// Encodes a workflow's error in `encoding`.
 ///
-/// Native, it is the whole [`Error`], application variant and all, which reads back as
+/// Native or custom, it is the whole [`Error`], application variant and all, which reads back as
 /// the same value. Portable, it is the `{name, message, code, data}` envelope:
 ///
 /// - **`name`** is the error's type, with its path so it cannot be mistaken for another: the
@@ -690,7 +900,7 @@ pub(crate) fn encode_error<E: DurableError, E2>(
                 to_portable(error).map_err(|source| Error::encode_failed("error", source))?;
             encode(&portable, encoding, "error")
         }
-        PayloadEncoding::Native => encode(error, encoding, "error"),
+        PayloadEncoding::Native | PayloadEncoding::Custom(_) => encode(error, encoding, "error"),
     }
 }
 
@@ -807,7 +1017,7 @@ fn rebuild<E: DurableError>(name: &str, data: Option<&RawValue>) -> Option<Error
 
 /// Decodes a workflow's error, stored in `encoding`, or `None` if it is not one.
 ///
-/// A native one is the [`Error`] it was written as. A portable one is the error it was
+/// A native or custom one is the [`Error`] it was written as. A portable one is the error it was
 /// written from where the envelope says what that was and the reader's types can hold it — see
 /// [`encode_error`] — and [`Error::Portable`] otherwise, which is how another language's error
 /// arrives. `None` is for the caller to report — what it reports depends on whose error it was.
@@ -816,7 +1026,7 @@ pub(crate) fn decode_error<E: DurableError>(
     encoding: &PayloadEncoding,
 ) -> Option<Error<E>> {
     match encoding {
-        PayloadEncoding::Native => {
+        PayloadEncoding::Native | PayloadEncoding::Custom(_) => {
             decode::<Error<E>, EngineOnly>(Some(encoded), encoding, "error").ok()
         }
         PayloadEncoding::Portable => {
@@ -841,9 +1051,9 @@ pub(crate) fn decode_error<E: DurableError>(
 
 /// A workflow's result as its row holds it, with the encoding that says how to read it.
 ///
-/// The encoding travels with the bytes, as it does with an
-/// [`EncodedError`](crate::error::EncodedError), so a reader decodes the result as it was written
-/// rather than as it would itself have written it.
+/// The encoding travels with the bytes for the reason it does with an
+/// [`EncodedError`](crate::error::EncodedError): a custom serializer's text is not JSON, so a
+/// reader that guessed would misread it.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedOutput {
     /// The encoded result, or `None` for a workflow that finished without one.
@@ -924,16 +1134,18 @@ mod tests {
     fn a_tag_names_its_format_and_an_unknown_one_is_refused() {
         for tag in [None, Some(""), Some("rust_serde")] {
             assert_eq!(
-                PayloadEncoding::of::<EngineOnly>(tag).unwrap(),
+                PayloadEncoding::of::<EngineOnly>(tag, &Serializer::RustSerde).unwrap(),
                 PayloadEncoding::Native,
                 "{tag:?}"
             );
         }
         assert_eq!(
-            PayloadEncoding::of::<EngineOnly>(Some("portable_json")).unwrap(),
+            PayloadEncoding::of::<EngineOnly>(Some("portable_json"), &Serializer::RustSerde)
+                .unwrap(),
             PayloadEncoding::Portable
         );
-        let err = PayloadEncoding::of::<EngineOnly>(Some("py_pickle")).unwrap_err();
+        let err = PayloadEncoding::of::<EngineOnly>(Some("py_pickle"), &Serializer::RustSerde)
+            .unwrap_err();
         assert!(
             matches!(&err, Error::UnknownSerialization { name } if name == "py_pickle"),
             "{err}"
@@ -1468,6 +1680,126 @@ mod tests {
         assert_eq!(
             encode::<_, EngineOnly>(&f64::NAN, &PayloadEncoding::Native, "value").unwrap(),
             "null"
+        );
+    }
+
+    /// JSON, reversed: text no built-in reader would accept.
+    #[derive(Debug)]
+    struct Backwards;
+
+    impl CustomSerializer for Backwards {
+        fn name(&self) -> &str {
+            "backwards_json"
+        }
+
+        fn serialize(&self, value: Payload<'_>) -> std::result::Result<String, BoxError> {
+            Ok(serde_json::to_string(&value)?.chars().rev().collect())
+        }
+
+        fn deserialize(
+            &self,
+            text: &str,
+            into: PayloadSlot<'_>,
+        ) -> std::result::Result<(), BoxError> {
+            let json: String = text.chars().rev().collect();
+            into.fill(&mut serde_json::Deserializer::from_str(&json))
+        }
+    }
+
+    fn backwards() -> (Serializer, PayloadEncoding) {
+        let serializer = Serializer::custom(Backwards);
+        let format = serializer.encoding();
+        (serializer, format)
+    }
+
+    /// The serializer sees the value's own type: `u128::MAX` is past what a JSON value holds.
+    #[test]
+    fn a_custom_serializer_sees_the_real_type() {
+        let (_, format) = backwards();
+        let value = (u128::MAX, "two".to_owned());
+        let encoded = encode::<_, EngineOnly>(&value, &format, "value").unwrap();
+        assert_eq!(
+            encoded,
+            r#"]"owt",554112867134706473364364839029663282043["#
+        );
+        assert_eq!(
+            decode::<(u128, String), EngineOnly>(Some(&encoded), &format, "value").unwrap(),
+            value
+        );
+        // An absent value is still `null`, whoever would have written it.
+        decode::<(), EngineOnly>(None, &format, "value").unwrap();
+    }
+
+    #[test]
+    fn a_custom_tag_is_readable_only_where_that_serializer_is_configured() {
+        let (serializer, format) = backwards();
+        assert_eq!(
+            PayloadEncoding::of::<EngineOnly>(Some("backwards_json"), &serializer).unwrap(),
+            format
+        );
+        // The built-ins stay readable alongside it.
+        assert_eq!(
+            PayloadEncoding::of::<EngineOnly>(Some("rust_serde"), &serializer).unwrap(),
+            PayloadEncoding::Native
+        );
+        let err = PayloadEncoding::of::<EngineOnly>(Some("backwards_json"), &Serializer::RustSerde)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::UnknownSerialization { name } if name == "backwards_json"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_custom_serializer_carries_an_input_and_an_error_whole() {
+        let (_, format) = backwards();
+        let order = Order {
+            sku: "tea".to_owned(),
+            quantity: 2,
+        };
+        let encoded = encode_input::<_, EngineOnly>(&order, &format).unwrap();
+        assert_eq!(encoded, r#"}2:"ytitnauq","aet":"uks"{"#);
+        assert_eq!(
+            decode_input::<Order, EngineOnly>(Some(&encoded), &format).unwrap(),
+            order
+        );
+
+        let error: Error<CardDeclined> = Error::Application(CardDeclined);
+        let encoded = encode_error::<_, EngineOnly>(&error, &format).unwrap();
+        assert!(matches!(
+            decode_error::<CardDeclined>(&encoded, &format),
+            Some(Error::Application(CardDeclined))
+        ));
+    }
+
+    #[test]
+    fn a_serializer_that_fills_nothing_is_an_error_not_a_value() {
+        #[derive(Debug)]
+        struct Forgetful;
+
+        impl CustomSerializer for Forgetful {
+            fn name(&self) -> &str {
+                "forgetful"
+            }
+
+            fn serialize(&self, _: Payload<'_>) -> std::result::Result<String, BoxError> {
+                Ok(String::new())
+            }
+
+            fn deserialize(
+                &self,
+                _: &str,
+                _: PayloadSlot<'_>,
+            ) -> std::result::Result<(), BoxError> {
+                Ok(())
+            }
+        }
+
+        let format = Serializer::custom(Forgetful).encoding();
+        let err = decode::<u32, EngineOnly>(Some("x"), &format, "result").unwrap_err();
+        assert!(
+            matches!(&err, Error::Deserialization { message, .. } if message.contains("forgetful")),
+            "{err}"
         );
     }
 

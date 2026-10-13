@@ -233,6 +233,7 @@ pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Rac
         let winner: usize = decode_tagged(
             recorded.output.as_deref(),
             recorded.serialization.as_deref(),
+            executor.serializer(),
             "the branch that won a select",
         )?;
         // **A workflow that changed how many branches it races has changed what this position of

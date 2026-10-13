@@ -737,12 +737,14 @@ impl Connection {
                 return Err(revive(
                     error,
                     recorded.serialization.as_deref(),
+                    self.serializer(),
                     step_names::SELECT_WORKFLOW,
                 ));
             }
             let winner: String = decode_tagged(
                 recorded.output.as_deref(),
                 recorded.serialization.as_deref(),
+                self.serializer(),
                 "the id that won a select_workflow",
             )?;
             tracing::debug!(

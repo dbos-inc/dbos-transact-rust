@@ -17,7 +17,7 @@ use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result};
-use crate::serialization::{EncodedOutput, PayloadEncoding, decode_tagged, encode};
+use crate::serialization::{EncodedOutput, PayloadEncoding, Serializer, decode_tagged, encode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 
 /// A running — or finished — workflow, by id.
@@ -223,7 +223,7 @@ where
                 workflow_id = self.workflow_id,
                 "the child's outcome was already recorded; the parent does not wait again"
             );
-            return Self::interpret(recorded, &self.workflow_id);
+            return Self::interpret(recorded, self.conn.serializer(), &self.workflow_id);
         }
 
         let started_at = Timestamp::now();
@@ -278,13 +278,13 @@ where
     ///
     /// Which workflow the row belongs to was settled by [`ChildResultPlacement::check`] before
     /// this sees it, so what is left here is the outcome alone.
-    fn interpret(recorded: StepRecord, workflow_id: &str) -> Result<R, E> {
+    fn interpret(recorded: StepRecord, configured: &Serializer, workflow_id: &str) -> Result<R, E> {
         let tag = recorded.serialization.as_deref();
         match recorded.error {
-            None => decode_tagged(recorded.output.as_deref(), tag, "result"),
+            None => decode_tagged(recorded.output.as_deref(), tag, configured, "result"),
             Some(encoded) => Err(EncodedError {
                 encoded,
-                encoding: PayloadEncoding::of(tag)?,
+                encoding: PayloadEncoding::of(tag, configured)?,
             }
             .decode(workflow_id)),
         }
