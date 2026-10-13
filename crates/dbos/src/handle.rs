@@ -120,10 +120,12 @@ where
     ///
     /// The same answer whoever asks: a local handle awaits the task, a polling handle reads the
     /// row another execution writes, and both decode the same recorded bytes — the output, or the
-    /// workflow's own error with the fidelity the type parameter exists for. A row in an encoding
-    /// this process cannot read is [`Error::UnknownSerialization`], and an error that does not
-    /// decode in an encoding it can read degrades to [`WorkflowFailed`](Error::WorkflowFailed)
-    /// carrying the stored text.
+    /// workflow's own error with the fidelity the type parameter exists for. A portable error comes
+    /// back as itself where this process wrote it and `E` is its type, and as [`Error::Portable`]
+    /// otherwise, which is how another language's error arrives. A row in an encoding this process
+    /// cannot read is [`Error::UnknownSerialization`], and an error that does not decode in an
+    /// encoding it can read degrades to [`WorkflowFailed`](Error::WorkflowFailed) carrying the
+    /// stored text.
     ///
     /// **Awaited from inside the workflow that started it, this is a durable step.** The parent
     /// records what the child returned, so a replayed parent continues from a value it already has

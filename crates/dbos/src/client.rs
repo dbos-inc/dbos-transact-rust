@@ -66,7 +66,8 @@ use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
-use crate::serialization::{Serializer, encode};
+use crate::serialization::Serializer;
+use crate::serialization::{Format, PortableWorkflowArgs, encode, encode_input};
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
@@ -133,11 +134,9 @@ pub struct ClientConfig {
     /// database rather than an error.
     pub schema: String,
 
-    /// How payloads are encoded.
+    /// How payloads are encoded, by default.
     ///
-    /// **Must match the application's**, or a workflow this client enqueues is handed arguments its
-    /// executor cannot read. There is one encoding today, so nothing can currently disagree; the
-    /// field is here because the day there are two, this is the knob that has to say which.
+    /// The built-in encodings are readable by both sides whatever each is configured with.
     pub serializer: Serializer,
 
     /// Whether to use LISTEN/NOTIFY rather than polling.
@@ -365,7 +364,15 @@ impl Client {
     /// [`enqueue`](Self::enqueue), with something to say about how.
     ///
     /// See [`EnqueueOptions`] for what may be said, and [`Enqueue`] for the queue-shaped half of
-    /// it — a deduplication id, a priority, a partition key, a delay.
+    /// it — a deduplication id, a priority, a partition key, a delay, and how the input is encoded.
+    ///
+    /// **For a workflow in another language, enqueue it
+    /// [portable](crate::Serialization::Portable)**: the input then goes into the envelope every
+    /// SDK reads, a tuple of two or more as that many positional arguments, `()` as none, and
+    /// anything else as the one argument. A client has no registration to defer to, so
+    /// [`Serialization::Default`](crate::Serialization::Default) is this client's
+    /// [`serializer`](ClientConfig::serializer) here. A callee that takes named arguments needs
+    /// [`enqueue_portable`](Self::enqueue_portable).
     pub async fn enqueue_with<P, R, E>(
         &self,
         workflow: &str,
@@ -375,11 +382,56 @@ impl Client {
     where
         P: Serialize,
     {
+        let format = Format::resolve(
+            options.queue.serialization,
+            self.connection().serializer().format(),
+        );
+        let input = encode_input(&input, &format)?;
+        self.enqueue_encoded(workflow, &input, format, options)
+            .await
+    }
+
+    /// Enqueues a workflow with its arguments as written: the portable envelope, as given.
+    ///
+    /// For a workflow in another language that takes arguments by name, which no Rust value is
+    /// written as: [`enqueue_with`](Self::enqueue_with) writes a tuple's elements by position.
+    /// Always portable, whatever [`Enqueue::serialization`] says.
+    ///
+    /// ```no_run
+    /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
+    /// use dbos::{EnqueueOptions, PortableWorkflowArgs};
+    /// let args = PortableWorkflowArgs {
+    ///     positional_args: vec![serde_json::json!("ada@example.com")],
+    ///     named_args: serde_json::Map::from_iter([("urgent".to_owned(), serde_json::json!(true))]),
+    /// };
+    /// let handle: dbos::WorkflowHandle<String> = client
+    ///     .enqueue_portable("send_email", args, EnqueueOptions::new("email-queue"))
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn enqueue_portable<R, E>(
+        &self,
+        workflow: &str,
+        args: PortableWorkflowArgs,
+        options: EnqueueOptions<'_>,
+    ) -> Result<WorkflowHandle<R, E>> {
+        let input = encode(&args, &Format::Portable, "argument")?;
+        self.enqueue_encoded(workflow, &input, Format::Portable, options)
+            .await
+    }
+
+    /// The enqueue both public forms share, from an input already encoded in `format`.
+    async fn enqueue_encoded<R, E>(
+        &self,
+        workflow: &str,
+        input: &str,
+        format: Format,
+        options: EnqueueOptions<'_>,
+    ) -> Result<WorkflowHandle<R, E>> {
         // Refused before anything is written, as `start_with` refuses it: an enqueue no queue could
         // honour should cost a round trip, not a row.
         options.queue.validate()?;
 
-        let input = encode(&input, &self.0.serializer().format(), "argument")?;
         let attributes = encode_attributes(options.attributes)?;
         // Generated once, outside the retry below: a second attempt under a fresh id would enqueue
         // a *second* workflow if the first insert had in fact landed.
@@ -396,8 +448,8 @@ impl Client {
             name: Some(workflow),
             class_name: options.class_name,
             config_name: options.config_name,
-            input: Some(&input),
-            serialization: Some(self.0.serializer().name()),
+            input: Some(input),
+            serialization: Some(format.name()),
             // **Nobody claims it.** A client runs nothing, and a queued row's executor is stamped
             // by whichever one dequeues it — writing a claimant here would name a process that is
             // never going to run it.

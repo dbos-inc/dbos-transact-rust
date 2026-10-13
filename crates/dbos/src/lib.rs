@@ -94,7 +94,7 @@ pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
-pub use event::{get_event, set_event};
+pub use event::{SetEventOptions, get_event, set_event, set_event_with};
 #[cfg(feature = "engine")]
 pub use handle::WorkflowHandle;
 #[cfg(feature = "engine")]
@@ -110,11 +110,11 @@ pub use message::{
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
-pub use registry::{WorkflowKey, WorkflowRef};
+pub use registry::{WorkflowKey, WorkflowOptions, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
-pub use serialization::Serializer;
+pub use serialization::{PortableWorkflowArgs, Serialization, Serializer};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]
@@ -122,7 +122,8 @@ pub use step::{ShouldRetry, StepOptions, step, step_with};
 #[cfg(feature = "engine")]
 pub use stream::{
     DEFAULT_STREAM_POLLING_INTERVAL, MIN_STREAM_POLLING_INTERVAL, ReadStreamOptions, StreamReader,
-    close_stream, read_stream, read_stream_from, read_stream_value, write_stream,
+    WriteStreamOptions, close_stream, read_stream, read_stream_from, read_stream_value,
+    write_stream, write_stream_with,
 };
 #[cfg(feature = "engine")]
 pub use sysdb::types::{Change, RateLimit, ScheduleFilter, ScheduleStatus, WorkflowDelay};

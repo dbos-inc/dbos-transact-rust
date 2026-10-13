@@ -72,7 +72,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
-use crate::serialization::{Format, decode_tagged, encode};
+use crate::serialization::{Format, Serialization, decode_tagged, encode};
 use crate::sysdb::types::Message as EncodedMessage;
 use crate::sysdb::types::step_names;
 
@@ -146,7 +146,7 @@ where
     // steps around it.
     let built = StepPlacement::ambient_connection("send")
         .and_then(|conn| {
-            let format = conn.serializer().format();
+            let format = Format::resolve_ambient(options.serialization, conn.serializer());
             let encoded = encode_one(destination_id, message, options, format)?;
             Ok((encoded, conn))
         })
@@ -204,7 +204,7 @@ where
 {
     let built = StepPlacement::ambient_connection("send_bulk")
         .and_then(|conn| {
-            let format = conn.serializer().format();
+            let format = Format::resolve_ambient(options.serialization, conn.serializer());
             Ok((encode_all(messages, &format)?, conn))
         })
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send_bulk"));
@@ -355,7 +355,7 @@ impl DBOS {
         let built = self
             .executor("send")
             .and_then(|executor| {
-                let format = executor.serializer().format();
+                let format = Format::resolve_ambient(options.serialization, executor.serializer());
                 let encoded = encode_one(destination_id, message, options, format)?;
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send")?))
             })
@@ -386,7 +386,7 @@ impl DBOS {
         let built = self
             .executor("send_bulk")
             .and_then(|executor| {
-                let format = executor.serializer().format();
+                let format = Format::resolve_ambient(options.serialization, executor.serializer());
                 let encoded = encode_all(messages, &format)?;
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send_bulk")?))
             })
@@ -629,7 +629,12 @@ impl crate::Client {
         // the two checkpointed surfaces do. They have to encode at the call, ahead of the step id;
         // a client has no id to be ahead of, but one encoding path for all three is worth more
         // than the one it saved.
-        let format = self.connection().serializer().format();
+        // The client's own serializer, never a surrounding workflow's: a client called from a
+        // workflow body is still a client, and writes as one.
+        let format = Format::resolve(
+            options.serialization,
+            self.connection().serializer().format(),
+        );
         let encoded = encode_one(destination_id, message, options, format)?;
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
@@ -668,7 +673,10 @@ impl crate::Client {
         // Encoded up front, so nothing is sent when one payload cannot be: the batch is one
         // transaction, and failing halfway through the encoding would be the prefix a batch exists
         // to avoid.
-        let format = self.connection().serializer().format();
+        let format = Format::resolve(
+            options.serialization,
+            self.connection().serializer().format(),
+        );
         let encoded = encode_all(messages, &format)?;
         let messages: Vec<EncodedMessage<'_>> = encoded.iter().map(Encoded::as_message).collect();
         // No caller: a client is never inside a workflow, so there is no step to record the batch
@@ -784,6 +792,13 @@ pub struct SendOptions<'a> {
     ///
     /// Defaults to [`Forks::Skip`]: the destination named, and nothing else.
     pub forks: Forks,
+    /// How the message is encoded.
+    ///
+    /// [`Serialization::Default`] takes the sending workflow's format, or the configured
+    /// [`Serializer`](crate::Serializer) outside one. A [`Client`](crate::Client)'s send takes the
+    /// client's own serializer, wherever it is called from.
+    /// [`Serialization::Portable`] is for a message a workflow in another language receives.
+    pub serialization: Serialization,
 }
 
 /// What a batch send may ask for, beyond the messages themselves.
@@ -804,6 +819,8 @@ pub struct SendBulkOptions {
     ///
     /// Defaults to [`Forks::Skip`]: the destinations named, and nothing else.
     pub forks: Forks,
+    /// How every message in the batch is encoded — see [`SendOptions::serialization`].
+    pub serialization: Serialization,
 }
 
 /// Whether a message also reaches the workflows forked from its destination.

@@ -852,7 +852,12 @@ mod tests {
             ..crate::Config::new("placement-test", db.url())
         });
         dbos.launch().await.expect("launch failed");
-        let proper = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
+        let proper = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            "wf",
+            None,
+            crate::serialization::Format::Native,
+        );
         // The only way to hold one: the marker is bound by the scope, so the body reads it back
         // out. What a step body's own calls see.
         let body = || {
@@ -909,11 +914,21 @@ mod tests {
     #[tokio::test]
     async fn a_call_is_durable_only_where_its_id_means_something() {
         let (proper, in_step, sibling, dbos, _db) = contexts().await;
-        let other = Ctx::new(dbos.executor("test").expect("launched"), "wf-other", None);
+        let other = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            "wf-other",
+            None,
+            crate::serialization::Format::Native,
+        );
         // The same workflow *id* under a second context, which is what a recovery re-run is. Its
         // step counter starts from zero again, so an id from the first execution means nothing in
         // it — and comparing ids rather than execution identity is exactly what would miss that.
-        let rerun = Ctx::new(dbos.executor("test").expect("launched"), "wf", None);
+        let rerun = Ctx::new(
+            dbos.executor("test").expect("launched"),
+            "wf",
+            None,
+            crate::serialization::Format::Native,
+        );
         let recorded = StepPlacement::Recorded {
             ctx: proper.clone(),
             step_id: 0,

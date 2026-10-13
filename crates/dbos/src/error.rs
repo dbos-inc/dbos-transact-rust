@@ -18,7 +18,7 @@
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
 //! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
-use crate::serialization::{Format, decode};
+use crate::serialization::{Format, decode_error};
 use std::borrow::Cow;
 
 /// The error type of a workflow or step with no failure of its own.
@@ -254,8 +254,8 @@ pub enum Error<E = EngineOnly> {
 
     /// A row is tagged with an encoding this process cannot read.
     ///
-    /// `rust_serde` is always readable. Any other tag is another SDK's encoding, and a value in it
-    /// is reported rather than guessed at.
+    /// `rust_serde` and `portable_json` are always readable. Any other tag is another SDK's
+    /// native encoding, and a value in it is reported rather than guessed at.
     #[error("serialization {name} is not available")]
     UnknownSerialization {
         /// The tag the row carries.
@@ -305,14 +305,38 @@ pub enum Error<E = EngineOnly> {
     ///
     /// The workflow-level twin of [`StepFailed`](Self::StepFailed). The row's tag names an
     /// encoding this process reads, but the error in it is not one it can rebuild: written by
-    /// another build whose error type has since changed shape. The stored text is what survives.
-    /// A workflow error that decodes comes back as the error itself.
+    /// another build whose error type has since changed shape, or a malformed portable envelope.
+    /// The stored text is what survives. A workflow error that decodes comes back as the error
+    /// itself, and a portable one as [`Portable`](Self::Portable).
     #[error("the workflow {workflow_id} failed: {message}")]
     WorkflowFailed {
         /// The workflow that failed.
         workflow_id: String,
         /// What it reported.
         message: String,
+    },
+
+    /// A workflow failed with an error stored portably: `{name, message, code, data}`.
+    ///
+    /// The shape every DBOS SDK writes a portable workflow's error in, so this is how an error
+    /// raised in another language arrives. A portable Rust workflow's own error does not: its
+    /// envelope carries the error's fields as `data`, and a reader whose error type it is gets the
+    /// error itself back — [`Application`](Self::Application), or the DBOS variant it was. This is
+    /// what is left when the envelope names a type the reader does not have.
+    ///
+    /// `name` is the writer's name for the error's type, which is not spelt the same by every
+    /// writer — a type name, a symbolic error code — so match on it knowing who wrote the error.
+    /// `code` and `data` are whatever the writer put there, often nothing.
+    #[error("{name}: {message}")]
+    Portable {
+        /// What kind of error it was, in the writer's terms.
+        name: String,
+        /// What it said.
+        message: String,
+        /// The writer's error code, if it gave one: a number or a string.
+        code: Option<serde_json::Value>,
+        /// Anything else the writer attached.
+        data: Option<serde_json::Value>,
     },
 
     /// The workflow was cancelled.
@@ -544,6 +568,17 @@ impl<E> Error<E> {
                 workflow_id,
                 message,
             },
+            Error::Portable {
+                name,
+                message,
+                code,
+                data,
+            } => Error::Portable {
+                name,
+                message,
+                code,
+                data,
+            },
             Error::WorkflowCancelled { workflow_id } => Error::WorkflowCancelled { workflow_id },
             Error::AwaitedWorkflowCancelled { workflow_id } => {
                 Error::AwaitedWorkflowCancelled { workflow_id }
@@ -682,8 +717,9 @@ pub(crate) enum Failure {
 
 /// A workflow's error as its row holds it, with the format that says how to read it.
 ///
-/// **The format travels with the bytes** so a reader decodes the error as it was written rather
-/// than as it would itself have written it.
+/// **The format travels with the bytes** because the formats encode an error differently — the
+/// whole [`Error`] natively, a `{name, message, code, data}` envelope portably — and a reader
+/// that guessed would read one as the other.
 #[derive(Debug, Clone)]
 pub(crate) struct EncodedError {
     /// The encoded error.
@@ -695,16 +731,14 @@ pub(crate) struct EncodedError {
 impl EncodedError {
     /// The error this records, in the caller's error type.
     ///
-    /// An error that does not decode — one some other build wrote in a shape this one cannot read
-    /// — is reported as [`Error::WorkflowFailed`] with the bytes as its message, which is what
-    /// survives.
+    /// An error that does not decode — a native one some other build wrote in a shape this one
+    /// cannot read — is reported as [`Error::WorkflowFailed`] with the bytes as its message, which
+    /// is what survives.
     pub(crate) fn decode<E: DurableError>(&self, workflow_id: &str) -> Error<E> {
-        decode::<Error<E>, EngineOnly>(Some(&self.encoded), &self.format, "error").unwrap_or_else(
-            |_| Error::WorkflowFailed {
-                workflow_id: workflow_id.to_owned(),
-                message: self.encoded.clone(),
-            },
-        )
+        decode_error(&self.encoded, &self.format).unwrap_or_else(|| Error::WorkflowFailed {
+            workflow_id: workflow_id.to_owned(),
+            message: self.encoded.clone(),
+        })
     }
 }
 

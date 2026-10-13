@@ -77,7 +77,7 @@ pub struct Config {
     /// applies only where the field is `None`. On DBOS Cloud the deployment wins either way.
     pub app_version: Option<String>,
 
-    /// How payloads are encoded.
+    /// How payloads are encoded, by default.
     pub serializer: Serializer,
 
     /// Whether to use LISTEN/NOTIFY rather than polling.

@@ -33,7 +33,8 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
-use crate::serialization::{decode_tagged, encode};
+use crate::serialization::Serialization;
+use crate::serialization::{Format, decode_tagged, encode};
 use crate::sysdb::types::{
     AwaitedStream, EncodedValue, Outcome, StepTiming, Timestamp, WrittenBy, step_names,
 };
@@ -85,7 +86,31 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    pending_write(key, StreamWrite::Value(value))
+    write_stream_with(key, value, WriteStreamOptions::default())
+}
+
+/// [`write_stream`], with [`WriteStreamOptions`].
+pub fn write_stream_with<'a, T, E>(
+    key: &'a str,
+    value: &T,
+    options: WriteStreamOptions,
+) -> PendingStep<'a, (), E>
+where
+    T: Serialize,
+    E: DurableError + 'a,
+{
+    pending_write(key, StreamWrite::Value(value, options.serialization))
+}
+
+/// What [`write_stream_with`] may ask for, beyond the key and the value.
+///
+/// Built by functional update from [`Default`], as [`SendOptions`](crate::SendOptions) is, and
+/// deliberately not `#[non_exhaustive]` for the reason given there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WriteStreamOptions {
+    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own format;
+    /// [`Serialization::Portable`] is for a stream a reader in another language consumes.
+    pub serialization: Serialization,
 }
 
 /// Closes stream `key` of the current workflow, so its readers end once they reach the close.
@@ -106,7 +131,9 @@ where
 /// The one thing that tells a write from a close, so the step name, the call a refusal names and
 /// the `sysdb` call all follow from it rather than being passed alongside each other.
 enum StreamWrite<'v, T> {
-    Value(&'v T),
+    /// A value, and the encoding asked for it.
+    Value(&'v T, Serialization),
+    /// The close, whose encoding is fixed — see [`STREAM_CLOSED_SERIALIZATION`].
     Close,
 }
 
@@ -114,7 +141,7 @@ impl<T> StreamWrite<'_, T> {
     /// The step name the append records.
     fn name(&self) -> &'static str {
         match self {
-            StreamWrite::Value(_) => step_names::WRITE_STREAM,
+            StreamWrite::Value(..) => step_names::WRITE_STREAM,
             StreamWrite::Close => step_names::CLOSE_STREAM,
         }
     }
@@ -122,7 +149,7 @@ impl<T> StreamWrite<'_, T> {
     /// The call a refusal names.
     fn operation(&self) -> &'static str {
         match self {
-            StreamWrite::Value(_) => "write_stream",
+            StreamWrite::Value(..) => "write_stream",
             StreamWrite::Close => "close_stream",
         }
     }
@@ -145,8 +172,8 @@ where
         .and_then(|ctx| {
             // `None` is the close, and is only ever made here, from the write it stands for.
             let encoded = match write {
-                StreamWrite::Value(value) => {
-                    let format = ctx.executor().serializer().format();
+                StreamWrite::Value(value, serialization) => {
+                    let format = Format::resolve(serialization, ctx.format());
                     Some((encode(value, &format, "stream value")?, format))
                 }
                 StreamWrite::Close => None,

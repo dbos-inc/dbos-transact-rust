@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 use crate::instance::Executor;
+use crate::serialization::Format;
 use crate::sysdb::types::Timestamp;
 
 tokio::task_local! {
@@ -200,6 +201,12 @@ struct WorkflowState {
     /// parent is not itself running, and the child's `select!` fires on the same instant with no
     /// signal passing between them.
     deadline: Option<Timestamp>,
+    /// How this workflow's input, output and error are encoded, as its row's tag says.
+    ///
+    /// Here because a send, an event or a stream write made inside the workflow takes the same
+    /// format unless it asks for another — so a portable workflow's writes are readable by whoever
+    /// can read the workflow.
+    format: Format,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
     /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
@@ -225,12 +232,14 @@ impl Ctx {
         executor: Arc<Executor>,
         workflow_id: impl Into<String>,
         deadline: Option<Timestamp>,
+        format: Format,
     ) -> Self {
         Self {
             executor,
             workflow: Arc::new(WorkflowState {
                 workflow_id: workflow_id.into(),
                 deadline,
+                format,
                 next_step_id: AtomicI32::new(0),
             }),
             step: None,
@@ -303,6 +312,11 @@ impl Ctx {
     /// When this workflow must stop, if it has a deadline at all.
     pub(crate) fn deadline(&self) -> Option<Timestamp> {
         self.workflow.deadline
+    }
+
+    /// How this workflow's own payloads are encoded, which its writes inherit.
+    pub(crate) fn format(&self) -> Format {
+        self.workflow.format.clone()
     }
 
     /// Runs `future` with `ctx` ambient.
@@ -578,6 +592,7 @@ mod tests {
         WorkflowState {
             workflow_id: "wf-1".to_owned(),
             deadline: None,
+            format: Format::Native,
             next_step_id: AtomicI32::new(0),
         }
     }
@@ -643,6 +658,7 @@ mod tests {
             dbos.executor("test").expect("launched"),
             workflow_id,
             deadline,
+            Format::Native,
         );
         (ctx, dbos, db)
     }

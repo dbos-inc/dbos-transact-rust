@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
-use crate::serialization::{Format, decode, encode};
+use crate::serialization::{Format, Serialization, decode_input, encode, encode_error};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -29,7 +29,8 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// holding only a row, keeps none.
 ///
 /// The [`Format`] is the row's: how the input was encoded, and so how the outcome is encoded
-/// back.
+/// back. It comes from the row rather than from the registration, so a workflow another language
+/// enqueued portably runs portably here whatever this registration would have chosen.
 pub(crate) type ErasedWorkflow = Arc<
     dyn Fn(
             Option<String>,
@@ -38,6 +39,27 @@ pub(crate) type ErasedWorkflow = Arc<
         + Send
         + Sync,
 >;
+
+/// How a workflow is registered, beyond its name and its body.
+///
+/// Built by functional update from [`Default`], as [`Config`](crate::Config) is:
+///
+/// ```no_run
+/// # use dbos::{Serialization, WorkflowOptions};
+/// let options = WorkflowOptions { serialization: Serialization::Portable, ..Default::default() };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkflowOptions {
+    /// How a start of this workflow encodes its input, output and error, unless the start
+    /// chooses otherwise.
+    ///
+    /// [`Serialization::Portable`] for a workflow other languages start or await;
+    /// [`Serialization::Default`] takes the configured [`Serializer`](crate::Serializer), and
+    /// [`Serialization::Native`] is `rust_serde` whatever is configured. Whatever this says, a
+    /// start another language enqueued portably runs portably: the row's tag decides how its
+    /// input is read.
+    pub serialization: Serialization,
+}
 
 /// What identifies a workflow, as the `workflow_status` row stores it.
 ///
@@ -210,6 +232,8 @@ impl Registry {
 pub struct WorkflowRef<P, R, E = EngineOnly> {
     dbos: DBOS,
     key: Arc<WorkflowKey>,
+    /// How a start writes this workflow unless it chooses otherwise.
+    serialization: Serialization,
     /// `E` is the *application's* error type, the one inside [`Error::Application`], so a workflow
     /// that only fails in DBOS's own terms leaves it at [`EngineOnly`].
     ///
@@ -233,6 +257,11 @@ impl<P, R, E> WorkflowRef<P, R, E> {
     pub(crate) fn dbos(&self) -> &DBOS {
         &self.dbos
     }
+
+    /// How a start writes this workflow when it does not choose.
+    pub(crate) fn serialization(&self) -> Serialization {
+        self.serialization
+    }
 }
 
 /// Hand-written: the derive would demand `P: Clone, R: Clone`, which a reference that holds
@@ -242,6 +271,7 @@ impl<P, R, E> Clone for WorkflowRef<P, R, E> {
         Self {
             dbos: self.dbos.clone(),
             key: Arc::clone(&self.key),
+            serialization: self.serialization,
             types: PhantomData,
         }
     }
@@ -303,23 +333,56 @@ impl DBOS {
         R: Serialize + DeserializeOwned + Send + 'static,
         E: DurableError,
     {
+        self.register_workflow_with(key, WorkflowOptions::default(), workflow)
+    }
+
+    /// [`register_workflow_as`](DBOS::register_workflow_as), with [`WorkflowOptions`].
+    ///
+    /// For a workflow other languages start or await, register it
+    /// [portable](crate::Serialization::Portable):
+    ///
+    /// ```no_run
+    /// # use dbos::{DBOS, Serialization, WorkflowKey, WorkflowOptions};
+    /// # fn example(dbos: &DBOS) -> dbos::Result<()> {
+    /// let greet = dbos.register_workflow_with(
+    ///     WorkflowKey::new("greet"),
+    ///     WorkflowOptions { serialization: Serialization::Portable, ..Default::default() },
+    ///     |name: String| async move { Ok::<_, dbos::Error>(format!("hello, {name}")) },
+    /// )?;
+    /// # Ok(()) }
+    /// ```
+    pub fn register_workflow_with<P, R, E, F, Fut>(
+        &self,
+        key: WorkflowKey,
+        options: WorkflowOptions,
+        workflow: F,
+    ) -> Result<WorkflowRef<P, R, E>>
+    where
+        F: Fn(P) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+        P: Serialize + DeserializeOwned + Send + 'static,
+        R: Serialize + DeserializeOwned + Send + 'static,
+        E: DurableError,
+    {
         let workflow = Arc::new(workflow);
         let erased: ErasedWorkflow = Arc::new(move |input: Option<String>, format: Format| {
             let workflow = Arc::clone(&workflow);
             Box::pin(async move {
-                let input = decode::<P, EngineOnly>(input.as_deref(), &format, "argument")
+                let input = decode_input::<P, EngineOnly>(input.as_deref(), &format)
                     .map_err(Failure::Control)?;
                 match workflow(input).await {
+                    // A plain value, in any format: only an input and an error have an envelope.
                     Ok(output) => encode(&output, &format, "result")
                         .map(Some)
                         .map_err(Failure::Control),
-                    // The whole `Error<E>` is what gets recorded, application variant and all, so
-                    // the column is self-describing: a reader knows the envelope without having to
-                    // guess whether the payload is one of ours or one of the workflow's.
+                    // Natively the whole `Error<E>` is what gets recorded, application variant and
+                    // all, so the column is self-describing: a reader knows the envelope without
+                    // having to guess whether the payload is one of ours or one of the workflow's.
+                    // Portably it is the envelope every SDK reads.
                     Err(error) => Err(match error.control() {
                         Some(control) => Failure::Control(control),
                         None => Failure::Recorded(EncodedError {
-                            encoded: encode(&error, &format, "error").map_err(Failure::Control)?,
+                            encoded: encode_error(&error, &format).map_err(Failure::Control)?,
                             format,
                         }),
                     }),
@@ -332,6 +395,7 @@ impl DBOS {
         Ok(WorkflowRef {
             dbos: self.clone(),
             key: Arc::new(key),
+            serialization: options.serialization,
             types: PhantomData,
         })
     }

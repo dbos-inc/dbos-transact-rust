@@ -831,7 +831,12 @@ mod tests {
     }
 
     fn ctx(dbos: &DBOS, id: &str) -> Ctx {
-        Ctx::new(dbos.executor("test").expect("launched"), id, None)
+        Ctx::new(
+            dbos.executor("test").expect("launched"),
+            id,
+            None,
+            crate::serialization::Format::Native,
+        )
     }
 
     /// The step rows a workflow recorded, in id order.
