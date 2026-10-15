@@ -517,6 +517,26 @@ impl<E> From<E> for Error<E> {
 }
 
 impl<E> Error<E> {
+    /// A value that could not be encoded for its column; `what` names it, as `"argument"` or
+    /// `"result"` does.
+    pub(crate) fn encode_failed(what: &'static str, source: serde_json::Error) -> Self {
+        Error::Serialization {
+            what: what.into(),
+            message: source.to_string(),
+            source: Some(source),
+        }
+    }
+
+    /// A value that could not be decoded from its column; `what` names it, as `"argument"` or
+    /// `"result"` does.
+    pub(crate) fn decode_failed(what: &'static str, source: serde_json::Error) -> Self {
+        Error::Deserialization {
+            what: what.into(),
+            message: source.to_string(),
+            source: Some(source),
+        }
+    }
+
     /// Re-targets this error at another application error type.
     ///
     /// One match over the engine's variants, kept in a single place so [`lift`](Self::lift) and

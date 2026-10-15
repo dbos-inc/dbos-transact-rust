@@ -185,7 +185,7 @@ pub(crate) fn decode<T: DeserializeOwned, E>(
     match encoding {
         PayloadEncoding::Native | PayloadEncoding::Portable => {
             serde_json::from_str(value.unwrap_or("null"))
-                .map_err(|source| deserialization(what, source))
+                .map_err(|source| Error::decode_failed(what, source))
         }
     }
 }
@@ -214,20 +214,9 @@ pub(crate) fn encode<T: Serialize, E>(
     what: &'static str,
 ) -> Result<String, E> {
     match encoding {
-        PayloadEncoding::Native | PayloadEncoding::Portable => serde_json::to_string(value)
-            .map_err(|source| Error::Serialization {
-                what: what.into(),
-                message: source.to_string(),
-                source: Some(source),
-            }),
-    }
-}
-
-fn deserialization<E>(what: &'static str, source: serde_json::Error) -> Error<E> {
-    Error::Deserialization {
-        what: what.into(),
-        message: source.to_string(),
-        source: Some(source),
+        PayloadEncoding::Native | PayloadEncoding::Portable => {
+            serde_json::to_string(value).map_err(|source| Error::encode_failed(what, source))
+        }
     }
 }
 
@@ -558,7 +547,7 @@ pub(crate) fn decode_input<P: DeserializeOwned + 'static, E>(
             });
         }
     };
-    serde_json::from_value(from).map_err(|source| deserialization(WHAT, source))
+    serde_json::from_value(from).map_err(|source| Error::decode_failed(WHAT, source))
 }
 
 /// A workflow's error, as every DBOS SDK writes it portably.

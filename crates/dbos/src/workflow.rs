@@ -710,11 +710,7 @@ pub(crate) fn encode_attributes(
     attributes
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|error| Error::Serialization {
-            what: "attributes".into(),
-            message: error.to_string(),
-            source: Some(error),
-        })
+        .map_err(|source| Error::encode_failed("attributes", source))
 }
 
 impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
