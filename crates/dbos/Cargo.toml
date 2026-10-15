@@ -59,8 +59,9 @@ tokio-util = { version = "0.7", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 # Columns whose shape this layer owns rather than passes through: `authenticated_roles` is always
 # a JSON array of strings, unlike `input`/`output`/`error`, which are opaque caller-encoded
-# payloads.
-serde_json = "1"
+# payloads. `raw_value` for the portable envelopes, whose arguments and error data are read as the
+# exact text written rather than through a `Value`, which would round an integer past 64 bits.
+serde_json = { version = "1", features = ["raw_value"] }
 # Derives only, for the payloads this layer puts in a step's `output` column. Nothing here is a
 # wire format — a step is replayed by the SDK that wrote it — so the derived shape is ours to
 # choose.

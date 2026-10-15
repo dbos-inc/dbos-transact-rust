@@ -15,10 +15,11 @@
 //! this process cannot read — another SDK's native encoding — is [`Error::UnknownSerialization`],
 //! never a guess.
 
-use std::any::TypeId;
+use std::collections::BTreeMap;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 use crate::error::{DurableError, EngineOnly, Error, Result};
@@ -28,6 +29,10 @@ pub(crate) const RUST_SERDE: &str = "rust_serde";
 
 /// The tag a [`PayloadEncoding::Portable`] row carries, the one every DBOS SDK reads.
 pub(crate) const PORTABLE_JSON: &str = "portable_json";
+
+/// The struct name [`PortableWorkflowArgs`] gives `serde`: how an envelope is recognized, writing
+/// it and reading it, through whatever wraps it.
+const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 
 /// How payloads are encoded on their way into the system database, by default.
 ///
@@ -236,6 +241,7 @@ pub(crate) fn encode<T: Serialize, E>(
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 // The name `serde` hands a serializer, never written to the wire: it is how `encode_input`
 // recognises an envelope it must not wrap in another.
+// Spelt out because an attribute takes no constant: it must stay equal to `ENVELOPE`.
 #[serde(rename = "dbos::PortableWorkflowArgs")]
 pub struct PortableWorkflowArgs {
     /// The arguments by position, `positionalArgs` on the wire.
@@ -337,13 +343,10 @@ enum Shape {
 
 impl Shape {
     fn of<P: Serialize + ?Sized>(input: &P) -> Shape {
+        // A unit is no arguments however it is reached: `()`, `&()`, `Box<()>`, and a JSON `null`
+        // too, which `serde` writes the same way. One `null` argument is `None`, which writes
+        // `serialize_none` and so is one argument.
         match input.serialize(Probe) {
-            // `()` and a JSON `null` — a `serde_json::Value` input — both write a unit. Only the
-            // first is no arguments: a caller passing `null` means the one argument `None`, and
-            // `()` is the one of the two that takes no space.
-            Err(Probed(Shape::NoArguments)) if std::mem::size_of_val(input) != 0 => {
-                Shape::OneArgument
-            }
             Err(Probed(shape)) => shape,
             Ok(()) => Shape::OneArgument,
         }
@@ -482,7 +485,7 @@ impl serde::Serializer for Probe {
         name: &'static str,
         _: usize,
     ) -> std::result::Result<Self::SerializeStruct, Probed> {
-        Err(Probed(if name == "dbos::PortableWorkflowArgs" {
+        Err(Probed(if name == ENVELOPE {
             Shape::Envelope
         } else {
             Shape::OneArgument
@@ -512,8 +515,12 @@ impl serde::Serializer for Probe {
 /// | no arguments at all | `null`, which `()` and `Option` read |
 /// | both positional and named arguments | nothing: an error |
 ///
-/// A workflow whose input type is [`PortableWorkflowArgs`] receives the envelope itself. A
-/// one-element tuple is the one input type the table reads ambiguously: one positional argument
+/// Each argument is decoded from the exact text written for it, never through a
+/// [`serde_json::Value`], so an integer past 64 bits reads back as written.
+///
+/// A workflow whose input type is [`PortableWorkflowArgs`] — or a `Box` of it, or a
+/// `#[serde(transparent)]` wrapper around it, which [`encode_input`] also writes as the envelope —
+/// receives the envelope itself. A one-element tuple is the one input type the table reads ambiguously: one positional argument
 /// is decoded into it, not wrapped in it. [`encode_input`] writes `(x,)` as the one argument
 /// `[x]`, which reads back as itself; another SDK calling with the one argument `x` needs `x` to
 /// be an array.
@@ -526,23 +533,30 @@ pub(crate) fn decode_input<P: DeserializeOwned + 'static, E>(
         return decode(value, encoding, WHAT);
     }
     // An absent or `null` input is an envelope with no arguments, whoever reads it.
-    let args: Option<PortableWorkflowArgs> = decode(value, encoding, WHAT)?;
-    let args = args.unwrap_or_default();
-    if TypeId::of::<P>() == TypeId::of::<PortableWorkflowArgs>() {
-        let whole: Box<dyn std::any::Any> = Box::new(args);
-        return Ok(*whole
-            .downcast::<P>()
-            .expect("P is PortableWorkflowArgs, by the check above"));
+    let stored = value.filter(|value| *value != "null").unwrap_or("{}");
+    if takes_the_envelope::<P>() {
+        return decode(Some(stored), encoding, WHAT);
     }
-    let PortableWorkflowArgs {
-        mut positional_args,
-        named_args,
-    } = args;
-    let from = match (positional_args.len(), named_args.is_empty()) {
-        (0, true) => Value::Null,
-        (1, true) => positional_args.remove(0),
-        (_, true) => Value::Array(positional_args),
-        (0, false) => Value::Object(named_args),
+    let RawEnvelope { positional, named } =
+        serde_json::from_str(stored).map_err(|source| Error::decode_failed(WHAT, source))?;
+    // Reassembled as text from the arguments' own text, which is what keeps every number exact.
+    let from = match (positional.len(), named.is_empty()) {
+        (0, true) => "null".to_owned(),
+        (1, true) => positional[0].get().to_owned(),
+        (_, true) => {
+            let elements: Vec<&str> = positional.iter().map(|arg| arg.get()).collect();
+            format!("[{}]", elements.join(","))
+        }
+        (0, false) => {
+            let fields: Vec<String> = named
+                .iter()
+                .map(|(name, arg)| {
+                    let name = serde_json::to_string(name).expect("a string is JSON");
+                    format!("{name}:{}", arg.get())
+                })
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
         (_, false) => {
             return Err(Error::Deserialization {
                 what: WHAT.into(),
@@ -553,7 +567,83 @@ pub(crate) fn decode_input<P: DeserializeOwned + 'static, E>(
             });
         }
     };
-    serde_json::from_value(from).map_err(|source| Error::decode_failed(WHAT, source))
+    serde_json::from_str(&from).map_err(|source| Error::decode_failed(WHAT, source))
+}
+
+/// The input envelope with each argument kept as the text it was written as.
+#[derive(Deserialize)]
+struct RawEnvelope<'a> {
+    #[serde(
+        rename = "positionalArgs",
+        default,
+        borrow,
+        deserialize_with = "null_as_default"
+    )]
+    positional: Vec<&'a RawValue>,
+    #[serde(
+        rename = "namedArgs",
+        default,
+        borrow,
+        deserialize_with = "null_as_default"
+    )]
+    named: BTreeMap<String, &'a RawValue>,
+}
+
+/// Whether `P` reads the input envelope whole: whether deserializing it starts by asking for
+/// [`PortableWorkflowArgs`]'s struct, as [`encode_input`] recognizes one by the struct `serde`
+/// is asked to write.
+///
+/// The same test in both directions, so what is written as the envelope is read as it: a `Box` or
+/// a `#[serde(transparent)]` wrapper forwards the request to the struct inside, and is the
+/// envelope both ways.
+fn takes_the_envelope<P: DeserializeOwned>() -> bool {
+    matches!(P::deserialize(NameProbe), Err(Named(true)))
+}
+
+/// A deserializer that reads nothing: it answers the first request with whether it was for the
+/// envelope's struct, as an error, so deserializing stops there.
+struct NameProbe;
+
+#[derive(Debug)]
+struct Named(bool);
+
+impl std::fmt::Display for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Named {}
+
+impl serde::de::Error for Named {
+    fn custom<T: std::fmt::Display>(_: T) -> Self {
+        Named(false)
+    }
+}
+
+impl<'de> Deserializer<'de> for NameProbe {
+    type Error = Named;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        _: V,
+    ) -> std::result::Result<V::Value, Named> {
+        Err(Named(false))
+    }
+
+    fn deserialize_struct<V: serde::de::Visitor<'de>>(
+        self,
+        name: &'static str,
+        _: &'static [&'static str],
+        _: V,
+    ) -> std::result::Result<V::Value, Named> {
+        Err(Named(name == ENVELOPE))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
+        unit unit_struct newtype_struct seq tuple tuple_struct map enum identifier ignored_any
+    }
 }
 
 /// A workflow's error, as every DBOS SDK writes it portably.
@@ -569,8 +659,10 @@ struct PortableError {
     message: String,
     #[serde(default)]
     code: Option<Value>,
+    /// Kept as the text written, so an application error's fields read back exactly — a `Value`
+    /// would round an integer past 64 bits.
     #[serde(default)]
-    data: Option<Value>,
+    data: Option<Box<RawValue>>,
 }
 
 /// Encodes a workflow's error in `encoding`.
@@ -615,7 +707,7 @@ fn to_portable<E: DurableError>(
             name: type_name::<E>().to_owned(),
             message: application.to_string(),
             code: None,
-            data: present(Some(serde_json::to_value(application)?)),
+            data: present(serde_json::value::to_raw_value(application)?),
         },
         Error::Portable {
             name,
@@ -626,7 +718,10 @@ fn to_portable<E: DurableError>(
             name: name.clone(),
             message: message.clone(),
             code: code.clone(),
-            data: data.clone(),
+            data: data
+                .as_ref()
+                .map(serde_json::value::to_raw_value)
+                .transpose()?,
         },
         engine => {
             let (name, data) = variant(engine)?;
@@ -634,15 +729,18 @@ fn to_portable<E: DurableError>(
                 name,
                 message: engine.to_string(),
                 code: None,
-                data: present(data),
+                data: data
+                    .map(|data| serde_json::value::to_raw_value(&data))
+                    .transpose()?
+                    .and_then(present),
             }
         }
     })
 }
 
 /// `None` for a JSON `null`, so an error with nothing in it writes `"data":null` either way.
-fn present(data: Option<Value>) -> Option<Value> {
-    data.filter(|data| !data.is_null())
+fn present(data: Box<RawValue>) -> Option<Box<RawValue>> {
+    (data.get() != "null").then_some(data)
 }
 
 /// The namespace one of DBOS's own errors is named under in a portable envelope:
@@ -689,23 +787,22 @@ fn variant<E: DurableError>(
 /// A row says nothing about which language wrote it, so the name and the shape of `data` together
 /// are what recognize an error. Anything else — another language's error, an application error of
 /// a type the reader does not have — is `None`, and stays portable.
-fn rebuild<E: DurableError>(name: &str, data: Option<&Value>) -> Option<Error<E>> {
-    // Read through a borrow — `&Value` is itself a deserializer — so an application error's fields
-    // are copied only into the error they rebuild.
-    let data = data.unwrap_or(&Value::Null);
+fn rebuild<E: DurableError>(name: &str, data: Option<&RawValue>) -> Option<Error<E>> {
+    // From the text written, so the fields read back exactly as they were.
+    let data = data.map_or("null", RawValue::get);
     if name == type_name::<E>()
-        && let Ok(application) = E::deserialize(data)
+        && let Ok(application) = serde_json::from_str::<E>(data)
     {
         return Some(Error::Application(application));
     }
-    let variant = name.strip_prefix(DBOS_ERRORS)?.to_owned();
-    // The externally tagged form serde reads a variant from, which needs a `Value` to read it as
-    // an enum: the bare name for a unit variant, `{"Variant": fields}` otherwise.
+    let variant = serde_json::to_string(name.strip_prefix(DBOS_ERRORS)?).expect("a string is JSON");
+    // The externally tagged form serde reads a variant from: the bare name for a unit variant,
+    // `{"Variant": fields}` otherwise.
     let tagged = match data {
-        Value::Null => Value::String(variant),
-        fields => Value::Object(Map::from_iter([(variant, fields.clone())])),
+        "null" => variant,
+        fields => format!("{{{variant}:{fields}}}"),
     };
-    Error::deserialize(&tagged).ok()
+    serde_json::from_str(&tagged).ok()
 }
 
 /// Decodes a workflow's error, stored in `encoding`, or `None` if it is not one.
@@ -729,14 +826,14 @@ pub(crate) fn decode_error<E: DurableError>(
                 code,
                 data,
             } = serde_json::from_str(encoded).ok()?;
-            if let Some(rebuilt) = rebuild(&name, data.as_ref()) {
+            if let Some(rebuilt) = rebuild(&name, data.as_deref()) {
                 return Some(rebuilt);
             }
             Some(Error::Portable {
                 name,
                 message,
                 code,
-                data,
+                data: data.and_then(|data| serde_json::from_str(data.get()).ok()),
             })
         }
     }
@@ -891,11 +988,27 @@ mod tests {
         portable_round_trip((), r#"{"positionalArgs":[],"namedArgs":{}}"#);
     }
 
-    /// A JSON `null` writes a unit as `()` does, but it is a value: the one argument `None`, which a
-    /// callee in another language takes as its parameter rather than being called with none.
+    /// A unit is no arguments through a reference or a box, as it is bare: what decides is what
+    /// `serde` is asked to write, not how the value is held.
     #[test]
-    fn a_null_value_is_one_argument() {
-        portable_round_trip(Value::Null, r#"{"positionalArgs":[null],"namedArgs":{}}"#);
+    fn a_borrowed_or_boxed_unit_is_no_arguments() {
+        const NONE: &str = r#"{"positionalArgs":[],"namedArgs":{}}"#;
+        let portable = PayloadEncoding::Portable;
+        assert_eq!(
+            encode_input::<_, EngineOnly>(&&(), &portable).unwrap(),
+            NONE
+        );
+        assert_eq!(
+            encode_input::<_, EngineOnly>(&Box::new(()), &portable).unwrap(),
+            NONE
+        );
+    }
+
+    /// One `null` argument is `None`: it writes `serialize_none`, not a unit, so a callee in
+    /// another language is called with `null` rather than with nothing.
+    #[test]
+    fn none_is_one_null_argument() {
+        portable_round_trip(None::<u32>, r#"{"positionalArgs":[null],"namedArgs":{}}"#);
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -1044,6 +1157,67 @@ mod tests {
         assert_eq!(
             portable_input::<PortableWorkflowArgs>(r#"{"positionalArgs":null}"#).unwrap(),
             PortableWorkflowArgs::default()
+        );
+    }
+
+    /// The envelope is recognized reading it as it is writing it: through a `Box`, or a
+    /// `#[serde(transparent)]` wrapper, it is read whole rather than as a struct's fields.
+    #[test]
+    fn a_wrapped_envelope_is_read_as_it_is_written() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(transparent)]
+        struct Args(PortableWorkflowArgs);
+
+        let args = PortableWorkflowArgs {
+            positional_args: vec![serde_json::json!(1)],
+            named_args: Map::from_iter([("x".to_owned(), serde_json::json!(2))]),
+        };
+        let written = r#"{"positionalArgs":[1],"namedArgs":{"x":2}}"#;
+        portable_round_trip(Box::new(args.clone()), written);
+        portable_round_trip(Args(args), written);
+    }
+
+    /// An argument is read from the text written for it, so an integer past 64 bits survives the
+    /// envelope, in whichever of its shapes it travels.
+    #[test]
+    fn an_integer_past_64_bits_survives_the_envelope() {
+        let big = (1u128 << 64) + 7;
+        let small = i128::MIN + 7;
+        portable_round_trip(
+            big,
+            &format!(r#"{{"positionalArgs":[{big}],"namedArgs":{{}}}}"#),
+        );
+        portable_round_trip(
+            (big, small),
+            &format!(r#"{{"positionalArgs":[{big},{small}],"namedArgs":{{}}}}"#),
+        );
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct Named {
+            big: u128,
+        }
+        assert_eq!(
+            portable_input::<Named>(&format!(r#"{{"namedArgs":{{"big":{big}}}}}"#)).unwrap(),
+            Named { big }
+        );
+    }
+
+    /// An application error's fields travel as the text written, so one holding an integer past
+    /// 64 bits encodes and reads back as itself, as it does natively.
+    #[test]
+    fn an_application_error_with_a_large_integer_round_trips() {
+        #[derive(Debug, PartialEq, thiserror::Error, Serialize, Deserialize)]
+        #[error("over by {0}")]
+        struct Over(u128);
+
+        let error: Error<Over> = Over((1u128 << 64) + 7).into();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
+        assert!(
+            matches!(
+                decode_error::<Over>(&encoded, &PayloadEncoding::Portable),
+                Some(Error::Application(Over(n))) if n == (1u128 << 64) + 7
+            ),
+            "{encoded}"
         );
     }
 
