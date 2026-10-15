@@ -94,13 +94,8 @@ pub(crate) fn decode<T: DeserializeOwned, E>(
     what: &'static str,
 ) -> Result<T, E> {
     match encoding {
-        PayloadEncoding::Native => {
-            serde_json::from_str(value.unwrap_or("null")).map_err(|source| Error::Deserialization {
-                what: what.into(),
-                message: source.to_string(),
-                source: Some(source),
-            })
-        }
+        PayloadEncoding::Native => serde_json::from_str(value.unwrap_or("null"))
+            .map_err(|source| Error::decode_failed(what, source)),
     }
 }
 
@@ -125,11 +120,7 @@ pub(crate) fn encode<T: Serialize, E>(
 ) -> Result<String, E> {
     match encoding {
         PayloadEncoding::Native => {
-            serde_json::to_string(value).map_err(|source| Error::Serialization {
-                what: what.into(),
-                message: source.to_string(),
-                source: Some(source),
-            })
+            serde_json::to_string(value).map_err(|source| Error::encode_failed(what, source))
         }
     }
 }
