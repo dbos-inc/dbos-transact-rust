@@ -46,7 +46,7 @@ pub(crate) type ErasedWorkflow = Arc<
 #[derive(Clone)]
 pub(crate) struct RegisteredWorkflow {
     /// The body, with its types erased.
-    pub(crate) run: ErasedWorkflow,
+    pub(crate) body: ErasedWorkflow,
     /// How a start of this workflow encodes when the start does not choose, as
     /// [`WorkflowOptions::serialization`] said. Kept here for the starts that hold no
     /// [`WorkflowRef`] — a schedule's runs — so they encode as one that did would.
@@ -412,7 +412,7 @@ impl DBOS {
         self.registry().insert(
             key.clone(),
             RegisteredWorkflow {
-                run: erased,
+                body: erased,
                 serialization: options.serialization,
             },
         )?;
@@ -471,7 +471,7 @@ mod tests {
         let erased = &snapshot
             .get(&WorkflowKey::new("double"))
             .expect("registered")
-            .run;
+            .body;
         assert_eq!(
             erased(Some("21".to_owned()), PayloadEncoding::Native)
                 .await
@@ -489,7 +489,7 @@ mod tests {
         let erased = &snapshot
             .get(&WorkflowKey::new("nothing"))
             .expect("registered")
-            .run;
+            .body;
         // The row for a zero-argument workflow has a NULL input; it must not need a `"null"`.
         assert_eq!(
             erased(None, PayloadEncoding::Native).await.unwrap(),
@@ -506,7 +506,7 @@ mod tests {
         let erased = &snapshot
             .get(&WorkflowKey::new("double"))
             .expect("registered")
-            .run;
+            .body;
         let err = erased(Some("\"not a number\"".to_owned()), PayloadEncoding::Native)
             .await
             .unwrap_err();
