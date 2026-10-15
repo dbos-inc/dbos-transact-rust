@@ -72,7 +72,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
-use crate::serialization::{PayloadEncoding, Serialization, decode_tagged, encode};
+use crate::serialization::{PayloadEncoding, SerializationFormat, decode_tagged, encode};
 use crate::sysdb::types::Message as EncodedMessage;
 use crate::sysdb::types::step_names;
 
@@ -803,11 +803,11 @@ pub struct SendOptions<'a> {
     pub forks: Forks,
     /// How the message is encoded.
     ///
-    /// [`Serialization::Default`] takes the sending workflow's encoding, or the configured
+    /// [`SerializationFormat::Default`] takes the sending workflow's encoding, or the configured
     /// [`Serializer`](crate::Serializer) outside one. A [`Client`](crate::Client)'s send takes the
     /// client's own serializer, wherever it is called from.
-    /// [`Serialization::Portable`] is for a message a workflow in another language receives.
-    pub serialization: Serialization,
+    /// [`SerializationFormat::Portable`] is for a message a workflow in another language receives.
+    pub serialization: SerializationFormat,
 }
 
 /// What a batch send may ask for, beyond the messages themselves.
@@ -829,7 +829,7 @@ pub struct SendBulkOptions {
     /// Defaults to [`Forks::Skip`]: the destinations named, and nothing else.
     pub forks: Forks,
     /// How every message in the batch is encoded — see [`SendOptions::serialization`].
-    pub serialization: Serialization,
+    pub serialization: SerializationFormat,
 }
 
 /// Whether a message also reaches the workflows forked from its destination.

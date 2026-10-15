@@ -33,7 +33,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement, revive};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
-use crate::serialization::Serialization;
+use crate::serialization::SerializationFormat;
 use crate::serialization::{PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{
     AwaitedStream, EncodedValue, Outcome, StepTiming, Timestamp, WrittenBy, step_names,
@@ -108,9 +108,10 @@ where
 /// deliberately not `#[non_exhaustive]` for the reason given there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WriteStreamOptions {
-    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own encoding;
-    /// [`Serialization::Portable`] is for a stream a reader in another language consumes.
-    pub serialization: Serialization,
+    /// How the value is encoded. [`SerializationFormat::Default`] takes the workflow's own
+    /// encoding; [`SerializationFormat::Portable`] is for a stream a reader in another language
+    /// consumes.
+    pub serialization: SerializationFormat,
 }
 
 /// Closes stream `key` of the current workflow, so its readers end once they reach the close.
@@ -132,7 +133,7 @@ where
 /// the `sysdb` call all follow from it rather than being passed alongside each other.
 enum StreamWrite<'v, T> {
     /// A value, and the encoding asked for it.
-    Value(&'v T, Serialization),
+    Value(&'v T, SerializationFormat),
     /// The close, whose encoding is fixed — see [`STREAM_CLOSED_SERIALIZATION`].
     Close,
 }

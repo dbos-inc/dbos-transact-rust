@@ -114,7 +114,7 @@ pub use registry::{WorkflowKey, WorkflowOptions, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
-pub use serialization::{PortableWorkflowArgs, Serialization, Serializer};
+pub use serialization::{PortableWorkflowArgs, SerializationFormat, Serializer};
 #[cfg(feature = "engine")]
 pub use sleep::sleep;
 #[cfg(feature = "engine")]

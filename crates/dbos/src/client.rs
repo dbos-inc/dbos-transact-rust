@@ -367,10 +367,10 @@ impl Client {
     /// it — a deduplication id, a priority, a partition key, a delay, and how the input is encoded.
     ///
     /// **For a workflow in another language, enqueue it
-    /// [portable](crate::Serialization::Portable)**: the input then goes into the envelope every
-    /// SDK reads, a tuple of two or more as that many positional arguments, `()` as none, and
+    /// [portable](crate::SerializationFormat::Portable)**: the input then goes into the envelope
+    /// every SDK reads, a tuple of two or more as that many positional arguments, `()` as none, and
     /// anything else as the one argument. A client has no registration to defer to, so
-    /// [`Serialization::Default`](crate::Serialization::Default) is this client's
+    /// [`SerializationFormat::Default`](crate::SerializationFormat::Default) is this client's
     /// [`serializer`](ClientConfig::serializer) here. A callee that takes named arguments needs
     /// [`enqueue_portable`](Self::enqueue_portable).
     pub async fn enqueue_with<P, R, E>(

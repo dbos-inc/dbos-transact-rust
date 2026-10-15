@@ -19,7 +19,7 @@ use crate::error::{DurableError, EncodedError, Error, Failure, Result};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::{EncodedOutput, PayloadEncoding, Serialization, encode_input};
+use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
     WorkflowInitResult,
@@ -405,10 +405,11 @@ pub struct Enqueue<'a> {
     pub duplication_policy: DuplicationPolicy,
     /// How the enqueued workflow's input, output and error are encoded.
     ///
-    /// [`Serialization::Default`] takes the workflow's registration —
+    /// [`SerializationFormat::Default`] takes the workflow's registration —
     /// [`WorkflowOptions::serialization`](crate::WorkflowOptions::serialization) — and
-    /// [`Serialization::Portable`] or [`Serialization::Native`] overrides it for this one enqueue.
-    pub serialization: Serialization,
+    /// [`SerializationFormat::Portable`] or [`SerializationFormat::Native`] overrides it for this
+    /// one enqueue.
+    pub serialization: SerializationFormat,
 }
 
 /// What an enqueue does when its [`deduplication_id`](Enqueue::deduplication_id) is already held.
@@ -471,7 +472,7 @@ impl<'a> Enqueue<'a> {
             // The enum's `#[default]`, not a second copy of it: "reject unless asked" is stated
             // once, where the variants are.
             duplication_policy: DuplicationPolicy::default(),
-            serialization: Serialization::Default,
+            serialization: SerializationFormat::Default,
         }
     }
 
@@ -592,7 +593,7 @@ struct OwnedEnqueue {
     partition_key: Option<String>,
     delay: Option<Duration>,
     duplication_policy: DuplicationPolicy,
-    serialization: Serialization,
+    serialization: SerializationFormat,
 }
 
 impl From<&Enqueue<'_>> for OwnedEnqueue {

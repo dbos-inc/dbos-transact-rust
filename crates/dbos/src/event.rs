@@ -30,7 +30,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
-use crate::serialization::Serialization;
+use crate::serialization::SerializationFormat;
 use crate::serialization::{PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{GetEventCaller, step_names};
 
@@ -68,8 +68,8 @@ where
 ///
 /// ```no_run
 /// # async fn body() -> dbos::Result<()> {
-/// use dbos::{Serialization, SetEventOptions};
-/// let options = SetEventOptions { serialization: Serialization::Portable };
+/// use dbos::{SerializationFormat, SetEventOptions};
+/// let options = SetEventOptions { serialization: SerializationFormat::Portable };
 /// dbos::set_event_with::<_, dbos::EngineOnly>("progress", &42, options).await?;
 /// # Ok(()) }
 /// ```
@@ -109,8 +109,9 @@ where
 /// deliberately not `#[non_exhaustive]` for the reason given there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SetEventOptions {
-    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own encoding.
-    pub serialization: Serialization,
+    /// How the value is encoded. [`SerializationFormat::Default`] takes the workflow's own
+    /// encoding.
+    pub serialization: SerializationFormat,
 }
 
 /// Everything [`set_event`] does before it has run anything: the two refusals, the encoding, and
@@ -121,7 +122,7 @@ pub struct SetEventOptions {
 /// they are the engine's and [`PendingStep::placed`] lifts them at the poll.
 fn place_set_event<T: Serialize>(
     value: &T,
-    serialization: Serialization,
+    serialization: SerializationFormat,
 ) -> Built<(Arc<crate::Executor>, String, PayloadEncoding)> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {

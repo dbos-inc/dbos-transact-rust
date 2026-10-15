@@ -12,8 +12,8 @@ use serde_json::{Map, Value, json};
 
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
-    PortableWorkflowArgs, QueueConflict, QueueOptions, SendOptions, Serialization, SetEventOptions,
-    StartOptions, WorkflowKey, WorkflowOptions, WriteStreamOptions,
+    PortableWorkflowArgs, QueueConflict, QueueOptions, SendOptions, SerializationFormat,
+    SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions, WriteStreamOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -54,7 +54,7 @@ async fn client(db: &TestDatabase) -> Client {
 
 fn portable() -> WorkflowOptions {
     WorkflowOptions {
-        serialization: Serialization::Portable,
+        serialization: SerializationFormat::Portable,
     }
 }
 
@@ -191,7 +191,7 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
             },
             SendOptions {
                 topic: Some("interop_topic"),
-                serialization: Serialization::Portable,
+                serialization: SerializationFormat::Portable,
                 ..Default::default()
             },
         )
@@ -539,7 +539,7 @@ async fn a_write_takes_its_workflows_format_unless_it_names_one() {
                 "chosen",
                 &2,
                 SetEventOptions {
-                    serialization: Serialization::Portable,
+                    serialization: SerializationFormat::Portable,
                 },
             )
             .await?;
@@ -554,7 +554,7 @@ async fn a_write_takes_its_workflows_format_unless_it_names_one() {
                 "chosen",
                 &5,
                 WriteStreamOptions {
-                    serialization: Serialization::Native,
+                    serialization: SerializationFormat::Native,
                 },
             )
             .await?;
@@ -637,7 +637,7 @@ async fn a_client_enqueues_another_languages_workflow() {
                 quantity: 2,
             },
             elsewhere(Enqueue {
-                serialization: Serialization::Portable,
+                serialization: SerializationFormat::Portable,
                 ..Enqueue::new(QUEUE)
             }),
         )
@@ -646,7 +646,7 @@ async fn a_client_enqueues_another_languages_workflow() {
 
     let portable = || {
         elsewhere(Enqueue {
-            serialization: Serialization::Portable,
+            serialization: SerializationFormat::Portable,
             ..Enqueue::new(QUEUE)
         })
     };

@@ -31,12 +31,12 @@ pub(crate) const PORTABLE_JSON: &str = "portable_json";
 
 /// How payloads are encoded on their way into the system database, by default.
 ///
-/// This is what a workflow writes unless it, or the call, asks for [`Serialization::Portable`] or
-/// [`Serialization::Native`], and what a step's result and the engine's record of a checkpointed
-/// call are written in. A workflow is only ever replayed by the SDK that wrote it — workflows
-/// cross languages by enqueue, not by execution — so the default is this application's own to
-/// choose. What matters is that the choice is *recorded* in the `serialization` column of every
-/// row, so a later reader knows how to read what it finds.
+/// This is what a workflow writes unless it, or the call, asks for
+/// [`SerializationFormat::Portable`] or [`SerializationFormat::Native`], and what a step's result
+/// and the engine's record of a checkpointed call are written in. A workflow is only ever replayed
+/// by the SDK that wrote it — workflows cross languages by enqueue, not by execution — so the
+/// default is this application's own to choose. What matters is that the choice is *recorded* in
+/// the `serialization` column of every row, so a later reader knows how to read what it finds.
 ///
 /// The built-in encodings, `rust_serde` and `portable_json`, are always readable, whichever this
 /// is.
@@ -89,7 +89,7 @@ impl Serializer {
 /// portable, and its steps' outputs and errors are in the configured serializer, since only this
 /// SDK replays them. Its record of a child it awaited keeps the child's own encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Serialization {
+pub enum SerializationFormat {
     /// Whatever the context says: the registration's choice for a workflow, the enclosing
     /// workflow's encoding for a write.
     #[default]
@@ -102,8 +102,8 @@ pub enum Serialization {
 
 /// How one payload is encoded, as its row's `serialization` column records it.
 ///
-/// What a caller *asks for* is a [`Serialization`], which may defer to its context; this is what
-/// that request resolves to, and what a row says it holds.
+/// What a caller *asks for* is a [`SerializationFormat`], which may defer to its context; this is
+/// what that request resolves to, and what a row says it holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum PayloadEncoding {
     /// `rust_serde`: this SDK's own encoding.
@@ -138,21 +138,24 @@ impl PayloadEncoding {
     }
 
     /// What a request resolves to, given the encoding it defers to.
-    pub(crate) fn resolve(requested: Serialization, inherited: PayloadEncoding) -> PayloadEncoding {
+    pub(crate) fn resolve(
+        requested: SerializationFormat,
+        inherited: PayloadEncoding,
+    ) -> PayloadEncoding {
         match requested {
-            Serialization::Default => inherited,
-            Serialization::Portable => PayloadEncoding::Portable,
-            Serialization::Native => PayloadEncoding::Native,
+            SerializationFormat::Default => inherited,
+            SerializationFormat::Portable => PayloadEncoding::Portable,
+            SerializationFormat::Native => PayloadEncoding::Native,
         }
     }
 
     /// What a request resolves to where the encoding it defers to is the ambient workflow's.
     ///
-    /// Inside a workflow — its body or one of its steps — a [`Serialization::Default`] takes that
-    /// workflow's encoding, so a portable workflow's events, messages and stream values are
+    /// Inside a workflow — its body or one of its steps — a [`SerializationFormat::Default`] takes
+    /// that workflow's encoding, so a portable workflow's events, messages and stream values are
     /// portable too. Outside one there is nothing to inherit, and it is the `configured` default.
     pub(crate) fn resolve_ambient(
-        requested: Serialization,
+        requested: SerializationFormat,
         configured: &Serializer,
     ) -> PayloadEncoding {
         let inherited = crate::context::Ctx::with_current(|ctx| {

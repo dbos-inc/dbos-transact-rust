@@ -15,7 +15,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
-use crate::serialization::{PayloadEncoding, Serialization, decode_input, encode, encode_error};
+use crate::serialization::{
+    PayloadEncoding, SerializationFormat, decode_input, encode, encode_error,
+};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -45,20 +47,23 @@ pub(crate) type ErasedWorkflow = Arc<
 /// Built by functional update from [`Default`], as [`Config`](crate::Config) is:
 ///
 /// ```no_run
-/// # use dbos::{Serialization, WorkflowOptions};
-/// let options = WorkflowOptions { serialization: Serialization::Portable, ..Default::default() };
+/// # use dbos::{SerializationFormat, WorkflowOptions};
+/// let options = WorkflowOptions {
+///     serialization: SerializationFormat::Portable,
+///     ..Default::default()
+/// };
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkflowOptions {
     /// How a start of this workflow encodes its input, output and error, unless the start
     /// chooses otherwise.
     ///
-    /// [`Serialization::Portable`] for a workflow other languages start or await;
-    /// [`Serialization::Default`] takes the configured [`Serializer`](crate::Serializer), and
-    /// [`Serialization::Native`] is `rust_serde` whatever is configured. Whatever this says, a
-    /// start another language enqueued portably runs portably: the row's tag decides how its
+    /// [`SerializationFormat::Portable`] for a workflow other languages start or await;
+    /// [`SerializationFormat::Default`] takes the configured [`Serializer`](crate::Serializer), and
+    /// [`SerializationFormat::Native`] is `rust_serde` whatever is configured. Whatever this says,
+    /// a start another language enqueued portably runs portably: the row's tag decides how its
     /// input is read.
-    pub serialization: Serialization,
+    pub serialization: SerializationFormat,
 }
 
 /// What identifies a workflow, as the `workflow_status` row stores it.
@@ -233,7 +238,7 @@ pub struct WorkflowRef<P, R, E = EngineOnly> {
     dbos: DBOS,
     key: Arc<WorkflowKey>,
     /// How a start writes this workflow unless it chooses otherwise.
-    serialization: Serialization,
+    serialization: SerializationFormat,
     /// `E` is the *application's* error type, the one inside [`Error::Application`], so a workflow
     /// that only fails in DBOS's own terms leaves it at [`EngineOnly`].
     ///
@@ -259,7 +264,7 @@ impl<P, R, E> WorkflowRef<P, R, E> {
     }
 
     /// How a start writes this workflow when it does not choose.
-    pub(crate) fn serialization(&self) -> Serialization {
+    pub(crate) fn serialization(&self) -> SerializationFormat {
         self.serialization
     }
 }
@@ -339,14 +344,14 @@ impl DBOS {
     /// [`register_workflow_as`](DBOS::register_workflow_as), with [`WorkflowOptions`].
     ///
     /// For a workflow other languages start or await, register it
-    /// [portable](crate::Serialization::Portable):
+    /// [portable](crate::SerializationFormat::Portable):
     ///
     /// ```no_run
-    /// # use dbos::{DBOS, Serialization, WorkflowKey, WorkflowOptions};
+    /// # use dbos::{DBOS, SerializationFormat, WorkflowKey, WorkflowOptions};
     /// # fn example(dbos: &DBOS) -> dbos::Result<()> {
     /// let greet = dbos.register_workflow_with(
     ///     WorkflowKey::new("greet"),
-    ///     WorkflowOptions { serialization: Serialization::Portable, ..Default::default() },
+    ///     WorkflowOptions { serialization: SerializationFormat::Portable, ..Default::default() },
     ///     |name: String| async move { Ok::<_, dbos::Error>(format!("hello, {name}")) },
     /// )?;
     /// # Ok(()) }
