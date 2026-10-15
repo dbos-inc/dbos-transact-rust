@@ -205,8 +205,9 @@ pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
 /// encodes to `"null"` rather than to no value at all. Nullability belongs to the column, so a
 /// caller writing into a nullable one wraps this in `Some` at that point.
 ///
-/// Native and portable are the same JSON for a plain value: what they change is the envelope
-/// around a workflow's input or error, which [`encode_input`] and [`encode_error`] add.
+/// Native and portable are the same JSON for a plain value — a workflow's output, an event, a
+/// message, a stream value. What they change is the envelope around a workflow's input or error,
+/// which [`encode_input`] and [`encode_error`] add.
 pub(crate) fn encode<T: Serialize, E>(
     value: &T,
     encoding: &PayloadEncoding,
