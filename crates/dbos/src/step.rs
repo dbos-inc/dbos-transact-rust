@@ -964,10 +964,10 @@ mod tests {
 
     /// The one case full fidelity cannot cover: a row this SDK did not write.
     ///
-    /// A portable invocation leaves an error encoded in somebody else's shape, and no type
-    /// parameter reconstructs a type that was never Rust's. The replay degrades to the message
-    /// rather than failing to decode, so the workflow reports what happened instead of reporting
-    /// that it could not read what happened.
+    /// A portable invocation leaves an error in somebody else's shape, in an encoding this SDK
+    /// reads, and no type parameter reconstructs a type that was never Rust's. The replay degrades
+    /// to the message rather than failing to decode, so the workflow reports what happened instead
+    /// of reporting that it could not read what happened.
     #[tokio::test]
     async fn a_step_recorded_in_a_foreign_shape_degrades_to_its_message() {
         let (dbos, _db) = workflow("wf-foreign").await;
@@ -980,7 +980,7 @@ mod tests {
                 0,
                 "charge",
                 Outcome::Error(r#"{"pythonModule":"app.errors","type":"CardDeclined"}"#),
-                Some("pickle"),
+                Some("rust_serde"),
                 None,
             )
             .await
