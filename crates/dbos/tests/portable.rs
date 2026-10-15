@@ -486,13 +486,19 @@ async fn another_sdks_error_reads_as_portable() {
 
 /// A parent's record of a child it awaited holds the child's bytes under the child's tag, so the
 /// parent reads back the child's error as itself on a replay too.
+///
+/// The replay is a fork of the parent after its await: the fork inherits the recorded start and
+/// await, so its body gets the child's error from the record, and the child does not run again.
 #[tokio::test]
 async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
     let db = test_database().await;
     let dbos = DBOS::new(config("portable-parent", &db));
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&runs);
     let declines = dbos
-        .register_workflow_with(WorkflowKey::new("declines"), portable(), |(): ()| async {
-            Err::<(), _>(Error::Application(CardDeclined { attempts: 3 }))
+        .register_workflow_with(WorkflowKey::new("declines"), portable(), move |(): ()| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<(), _>(Error::Application(CardDeclined { attempts: 3 })) }
         })
         .unwrap();
     let parent = dbos
@@ -501,7 +507,9 @@ async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
             async move {
                 match declines.run(()).await {
                     Err(Error::Application(declined)) => Ok::<_, Error>(declined.attempts),
-                    other => panic!("the child's error should arrive as itself: {other:?}"),
+                    // Anything else finishes as 0, which the assertions below refuse. A panic
+                    // would leave the workflow without an outcome, and its result waiting forever.
+                    _ => Ok(0),
                 }
             }
         })
@@ -512,8 +520,8 @@ async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
     let id = handle.workflow_id().to_owned();
     assert_eq!(handle.result().await.unwrap(), 3);
 
-    let (serialization, error): (String, String) = sqlx::query_as(
-        r#"SELECT serialization, error FROM "dbos"."operation_outputs"
+    let (awaited_at, serialization, error): (i32, String, String) = sqlx::query_as(
+        r#"SELECT function_id, serialization, error FROM "dbos"."operation_outputs"
            WHERE workflow_uuid = $1 AND function_name = 'DBOS.get_result'"#,
     )
     .bind(&id)
@@ -523,6 +531,19 @@ async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
     assert_eq!(serialization, "portable_json");
     let recorded: Value = serde_json::from_str(&error).unwrap();
     assert_eq!(recorded["name"], "portable::CardDeclined", "{error}");
+
+    let replayed: dbos::WorkflowHandle<u32> =
+        dbos.fork(&id, awaited_at + 1).await.expect("fork failed");
+    assert_eq!(
+        replayed.result().await.unwrap(),
+        3,
+        "the replayed await gives back the child's error as itself"
+    );
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the replay read the record rather than running the child again"
+    );
     dbos.shutdown().await;
 }
 
