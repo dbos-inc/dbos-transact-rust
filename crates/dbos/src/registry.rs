@@ -44,7 +44,7 @@ pub(crate) type ErasedWorkflow = Arc<
 
 /// A registration as the registry keeps it: the erased body, and what it was registered with.
 #[derive(Clone)]
-pub(crate) struct Registered {
+pub(crate) struct RegisteredWorkflow {
     /// The body, with its types erased.
     pub(crate) run: ErasedWorkflow,
     /// How a start of this workflow encodes when the start does not choose, as
@@ -177,13 +177,13 @@ pub(crate) struct Registry {
 /// window, because the slot is not what registration races.
 #[derive(Default)]
 struct State {
-    workflows: HashMap<WorkflowKey, Registered>,
+    workflows: HashMap<WorkflowKey, RegisteredWorkflow>,
     /// Set when a snapshot is taken, cleared when the executor it was taken for goes away.
     frozen: bool,
 }
 
 /// A registry frozen at launch.
-pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, Registered>>;
+pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, RegisteredWorkflow>>;
 
 impl Registry {
     /// Registers `workflow` under `key`, refusing a second registration of the same identity.
@@ -193,7 +193,7 @@ impl Registry {
     ///
     /// Refuses outright once frozen. The operation is named here rather than passed in because
     /// registration is the only thing that inserts.
-    fn insert(&self, key: WorkflowKey, workflow: Registered) -> Result<()> {
+    fn insert(&self, key: WorkflowKey, workflow: RegisteredWorkflow) -> Result<()> {
         let mut state = self.write();
         if state.frozen {
             return Err(Error::AlreadyLaunched {
@@ -411,7 +411,7 @@ impl DBOS {
 
         self.registry().insert(
             key.clone(),
-            Registered {
+            RegisteredWorkflow {
                 run: erased,
                 serialization: options.serialization,
             },
