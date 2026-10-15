@@ -379,7 +379,7 @@ impl Client {
         // honour should cost a round trip, not a row.
         options.queue.validate()?;
 
-        let input = encode(&input, &self.0.serializer().format(), "argument")?;
+        let input = encode(&input, &self.0.serializer().encoding(), "argument")?;
         let attributes = encode_attributes(options.attributes)?;
         // Generated once, outside the retry below: a second attempt under a fresh id would enqueue
         // a *second* workflow if the first insert had in fact landed.

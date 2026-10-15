@@ -517,12 +517,12 @@ where
         started_at,
         completed_at: Timestamp::now(),
     });
-    let format = executor.serializer().format();
-    let serialization = Some(format.name());
+    let encoding = executor.serializer().encoding();
+    let serialization = Some(encoding.name());
 
     match &outcome {
         Ok(value) => {
-            let output = encode(value, &format, "step result")?;
+            let output = encode(value, &encoding, "step result")?;
             executor
                 .sysdb()
                 .record_step(
@@ -548,7 +548,7 @@ where
             debug_assert!(error.control().is_none());
             // The error itself, encoded, not a description of it: a replay gives back the error
             // that failed exactly as it gives back the value that succeeded.
-            let encoded = encode(error, &format, "step error")?;
+            let encoded = encode(error, &encoding, "step error")?;
             executor
                 .sysdb()
                 .record_step(

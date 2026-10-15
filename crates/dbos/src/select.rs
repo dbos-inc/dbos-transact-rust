@@ -290,7 +290,7 @@ pub async fn record_select<E: DurableError>(recording: Recording, winner: usize)
 
     let encoded = encode(
         &winner,
-        &executor.serializer().format(),
+        &executor.serializer().encoding(),
         "the branch that won a select",
     )?;
     placement
@@ -584,7 +584,7 @@ mod tests {
                 Outcome::Output(Some(
                     &encode::<_, crate::Error>(
                         &"hello".to_owned(),
-                        &crate::serialization::Format::Native,
+                        &crate::serialization::PayloadEncoding::Native,
                         "the winner",
                     )
                     .expect("encodes"),

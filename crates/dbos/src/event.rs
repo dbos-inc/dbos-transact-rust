@@ -102,7 +102,11 @@ fn place_set_event<T: Serialize>(value: &T) -> Built<(Arc<crate::Executor>, Stri
             operation: "set_event".into(),
         });
     }
-    let encoded = encode(value, &ctx.executor().serializer().format(), "event value")?;
+    let encoded = encode(
+        value,
+        &ctx.executor().serializer().encoding(),
+        "event value",
+    )?;
     // The refusals above already settled that this stands at a step boundary of its own workflow,
     // served by its own executor, so the placement has no second connection to disagree with and
     // cannot fail. It takes the context those refusals read rather than reading it again, so the
