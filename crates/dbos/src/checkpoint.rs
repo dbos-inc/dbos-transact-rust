@@ -410,20 +410,21 @@ pub(crate) enum StepDurability<'a> {
 /// with its own fields, and an engine failure as the variant it was. The only payloads that do not
 /// survive are the `serde_json::Error` sources, which arrive absent rather than different.
 ///
-/// Read in the encoding its `tag` names.
+/// Read in the encoding its `tag` names. A tag this SDK cannot read is
+/// [`Error::UnknownSerialization`], as it is for every other payload.
 ///
-/// Falls back to a plain message when the column does not hold one of ours, which is what a row
-/// written by another SDK looks like — its serializer chose its own shape, and the `serialization`
-/// column says so. A readable message beats a decode failure standing in for somebody else's
-/// error.
+/// Falls back to a plain message when the bytes, in an encoding this SDK reads, are not one of
+/// ours — an error some other build wrote in a shape this one does not know. A readable message
+/// beats a decode failure standing in for somebody else's error.
 pub(crate) fn revive<E: DurableError>(recorded: &str, tag: Option<&str>, step: &str) -> Error<E> {
-    Format::of::<EngineOnly>(tag)
-        .ok()
-        .and_then(|format| decode::<Error<E>, EngineOnly>(Some(recorded), &format, "error").ok())
-        .unwrap_or_else(|| Error::StepFailed {
-            step: step.to_owned(),
-            message: recorded.to_owned(),
-        })
+    match Format::of(tag) {
+        Err(unknown) => unknown,
+        Ok(format) => decode::<Error<E>, EngineOnly>(Some(recorded), &format, "error")
+            .unwrap_or_else(|_| Error::StepFailed {
+                step: step.to_owned(),
+                message: recorded.to_owned(),
+            }),
+    }
 }
 
 /// Where a durable call stands: which of the workflow's step ids it occupies, if any.
@@ -869,13 +870,24 @@ mod tests {
         (proper, in_step, sibling, dbos, db)
     }
 
-    /// A recorded error in an encoding this process cannot read degrades to its text, rather than
-    /// failing the replay on a decode.
+    /// A recorded error that is not one of ours degrades to its text, rather than failing the
+    /// replay on a decode.
     #[test]
-    fn a_step_error_in_an_unreadable_encoding_revives_as_its_text() {
-        let revived = revive::<EngineOnly>("sealed", Some("backwards_json"), "charge");
+    fn a_step_error_that_does_not_decode_revives_as_its_text() {
+        let revived = revive::<EngineOnly>("sealed", Some("rust_serde"), "charge");
         assert!(
             matches!(&revived, Error::StepFailed { step, message } if step == "charge" && message == "sealed"),
+            "{revived:?}"
+        );
+    }
+
+    /// A recorded error in an encoding this SDK cannot read is reported as that, as any other
+    /// payload's is, rather than passed off as the step's failure.
+    #[test]
+    fn a_step_error_in_an_unknown_encoding_is_reported() {
+        let revived = revive::<EngineOnly>("sealed", Some("backwards_json"), "charge");
+        assert!(
+            matches!(&revived, Error::UnknownSerialization { name } if name == "backwards_json"),
             "{revived:?}"
         );
     }
