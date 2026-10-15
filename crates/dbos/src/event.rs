@@ -31,7 +31,7 @@ use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::Serialization;
-use crate::serialization::{Format, decode_tagged, encode};
+use crate::serialization::{PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{GetEventCaller, step_names};
 
 /// Publishes a key/value on the current workflow, for anyone to read.
@@ -86,7 +86,7 @@ where
     PendingStep::placed(
         step_names::SET_EVENT,
         built,
-        move |(executor, encoded, format), placement| async move {
+        move |(executor, encoded, encoding), placement| async move {
             // `set_event` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — the `else` is unreachable and says so rather than inventing a
             // second meaning for a write with no id.
@@ -95,7 +95,7 @@ where
             };
             executor
                 .sysdb()
-                .set_event(workflow_id, step_id, key, &encoded, Some(format.name()))
+                .set_event(workflow_id, step_id, key, &encoded, Some(encoding.name()))
                 .await
                 .map_err(Error::SystemDatabase)?;
             Ok(())
@@ -109,7 +109,7 @@ where
 /// deliberately not `#[non_exhaustive]` for the reason given there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SetEventOptions {
-    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own format.
+    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own encoding.
     pub serialization: Serialization,
 }
 
@@ -122,7 +122,7 @@ pub struct SetEventOptions {
 fn place_set_event<T: Serialize>(
     value: &T,
     serialization: Serialization,
-) -> Built<(Arc<crate::Executor>, String, Format)> {
+) -> Built<(Arc<crate::Executor>, String, PayloadEncoding)> {
     let Some(ctx) = Ctx::current() else {
         return Err(Error::NotInWorkflow {
             operation: "set_event".into(),
@@ -133,14 +133,14 @@ fn place_set_event<T: Serialize>(
             operation: "set_event".into(),
         });
     }
-    let format = Format::resolve(serialization, ctx.format());
-    let encoded = encode(value, &format, "event value")?;
+    let encoding = PayloadEncoding::resolve(serialization, ctx.encoding());
+    let encoded = encode(value, &encoding, "event value")?;
     // The refusals above already settled that this stands at a step boundary of its own workflow,
     // served by its own executor, so the placement has no second connection to disagree with and
     // cannot fail. It takes the context those refusals read rather than reading it again, so the
     // one that refused and the one that places are the same value.
     let executor = Arc::clone(ctx.executor());
-    Ok(((executor, encoded, format), StepPlacement::at(ctx)))
+    Ok(((executor, encoded, encoding), StepPlacement::at(ctx)))
 }
 
 /// Reads a key a workflow published, waiting up to `timeout` for it to appear.

@@ -34,7 +34,7 @@ use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::Serialization;
-use crate::serialization::{Format, decode_tagged, encode};
+use crate::serialization::{PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{
     AwaitedStream, EncodedValue, Outcome, StepTiming, Timestamp, WrittenBy, step_names,
 };
@@ -108,7 +108,7 @@ where
 /// deliberately not `#[non_exhaustive]` for the reason given there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WriteStreamOptions {
-    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own format;
+    /// How the value is encoded. [`Serialization::Default`] takes the workflow's own encoding;
     /// [`Serialization::Portable`] is for a stream a reader in another language consumes.
     pub serialization: Serialization,
 }
@@ -173,8 +173,8 @@ where
             // `None` is the close, and is only ever made here, from the write it stands for.
             let encoded = match write {
                 StreamWrite::Value(value, serialization) => {
-                    let format = Format::resolve(serialization, ctx.format());
-                    Some((encode(value, &format, "stream value")?, format))
+                    let encoding = PayloadEncoding::resolve(serialization, ctx.encoding());
+                    Some((encode(value, &encoding, "stream value")?, encoding))
                 }
                 StreamWrite::Close => None,
             };
@@ -202,14 +202,14 @@ where
         };
         let sysdb = conn.sysdb();
         match &encoded {
-            Some((value, format)) => {
+            Some((value, encoding)) => {
                 sysdb
                     .write_stream(
                         workflow_id,
                         step_id,
                         key,
                         value,
-                        Some(format.name()),
+                        Some(encoding.name()),
                         written_by,
                     )
                     .await
@@ -829,14 +829,14 @@ impl ReadOf {
         match awaited {
             Err(refused) if refused.should_record() => {
                 let refused = Error::SystemDatabase(refused);
-                let format = conn.serializer().format();
-                let encoded = encode(&refused, &format, "stream read refusal")?;
+                let encoding = conn.serializer().encoding();
+                let encoded = encode(&refused, &encoding, "stream read refusal")?;
                 record(
                     conn,
                     placement,
                     name,
                     Outcome::Error(&encoded),
-                    Some(format.name()),
+                    Some(encoding.name()),
                     started_at,
                 )
                 .await?;
@@ -862,14 +862,14 @@ impl ReadOf {
             key: self.key.clone(),
             timeout: self.timeout,
         };
-        let format = conn.serializer().format();
-        let encoded = encode(&timed_out, &format, "stream timeout")?;
+        let encoding = conn.serializer().encoding();
+        let encoded = encode(&timed_out, &encoding, "stream timeout")?;
         record(
             conn,
             placement,
             name,
             Outcome::Error(&encoded),
-            Some(format.name()),
+            Some(encoding.name()),
             started_at,
         )
         .await?;

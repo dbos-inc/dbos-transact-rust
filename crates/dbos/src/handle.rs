@@ -17,7 +17,7 @@ use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result};
-use crate::serialization::{EncodedOutput, Format, decode_tagged, encode};
+use crate::serialization::{EncodedOutput, PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 
 /// A running — or finished — workflow, by id.
@@ -284,7 +284,7 @@ where
             None => decode_tagged(recorded.output.as_deref(), tag, "result"),
             Some(encoded) => Err(EncodedError {
                 encoded,
-                format: Format::of(tag)?,
+                encoding: PayloadEncoding::of(tag)?,
             }
             .decode(workflow_id)),
         }
@@ -423,16 +423,16 @@ impl ChildResultPlacement {
         let configured;
         // Under the child's own tag, whatever this executor would write: the bytes are the child's,
         // and the tag is what says how to read them.
-        let (outcome, format) = match settled {
-            Ok(output) => (Outcome::Output(output.encoded.as_deref()), &output.format),
+        let (outcome, encoding) = match settled {
+            Ok(output) => (Outcome::Output(output.encoded.as_deref()), &output.encoding),
             Err(Failure::Recorded(recorded)) => {
-                (Outcome::Error(&recorded.encoded), &recorded.format)
+                (Outcome::Error(&recorded.encoded), &recorded.encoding)
             }
             // Cancellation is the one control-shaped signal that *is* a decided outcome, and it is
             // rewritten on the way in for the same reason it is rewritten on the way out: the row
             // has to say the awaited workflow was cancelled, not this one.
             Err(Failure::Control(Error::WorkflowCancelled { workflow_id })) => {
-                configured = conn.serializer().format();
+                configured = conn.serializer().encoding();
                 cancelled = encode(
                     &Error::<EngineOnly>::AwaitedWorkflowCancelled {
                         workflow_id: workflow_id.clone(),
@@ -450,7 +450,7 @@ impl ChildResultPlacement {
                 step_id,
                 child_workflow_id,
                 outcome,
-                Some(format.name()),
+                Some(encoding.name()),
                 Some(StepTiming {
                     started_at,
                     completed_at: Timestamp::now(),

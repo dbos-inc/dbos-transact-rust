@@ -73,7 +73,7 @@ use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error};
 use crate::instance::Executor;
-use crate::serialization::{Format, decode};
+use crate::serialization::{PayloadEncoding, decode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// What a durable call works out at the call, before anything of it has run.
@@ -417,9 +417,9 @@ pub(crate) enum StepDurability<'a> {
 /// ours — an error some other build wrote in a shape this one does not know. A readable message
 /// beats a decode failure standing in for somebody else's error.
 pub(crate) fn revive<E: DurableError>(recorded: &str, tag: Option<&str>, step: &str) -> Error<E> {
-    match Format::of(tag) {
+    match PayloadEncoding::of(tag) {
         Err(unknown) => unknown,
-        Ok(format) => decode::<Error<E>, EngineOnly>(Some(recorded), &format, "error")
+        Ok(encoding) => decode::<Error<E>, EngineOnly>(Some(recorded), &encoding, "error")
             .unwrap_or_else(|_| Error::StepFailed {
                 step: step.to_owned(),
                 message: recorded.to_owned(),
@@ -856,7 +856,7 @@ mod tests {
             dbos.executor("test").expect("launched"),
             "wf",
             None,
-            crate::serialization::Format::Native,
+            crate::serialization::PayloadEncoding::Native,
         );
         // The only way to hold one: the marker is bound by the scope, so the body reads it back
         // out. What a step body's own calls see.
@@ -918,7 +918,7 @@ mod tests {
             dbos.executor("test").expect("launched"),
             "wf-other",
             None,
-            crate::serialization::Format::Native,
+            crate::serialization::PayloadEncoding::Native,
         );
         // The same workflow *id* under a second context, which is what a recovery re-run is. Its
         // step counter starts from zero again, so an id from the first execution means nothing in
@@ -927,7 +927,7 @@ mod tests {
             dbos.executor("test").expect("launched"),
             "wf",
             None,
-            crate::serialization::Format::Native,
+            crate::serialization::PayloadEncoding::Native,
         );
         let recorded = StepPlacement::Recorded {
             ctx: proper.clone(),

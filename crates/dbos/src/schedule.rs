@@ -60,7 +60,7 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
 use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::{Format, decode, encode};
+use crate::serialization::{PayloadEncoding, decode, encode};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     Change, NewSchedule, NewWorkflow, ScheduleFilter, ScheduleRecord, ScheduleStatus,
@@ -208,7 +208,7 @@ impl ScheduleSpec {
             schedule_name: schedule_name.into(),
             schedule: schedule.into(),
             workflow,
-            context: encode(context, &Format::Native, "schedule context")?,
+            context: encode(context, &PayloadEncoding::Native, "schedule context")?,
             automatic_backfill: false,
             cron_timezone: None,
             queue_name: None,
@@ -305,7 +305,11 @@ impl ScheduleChange<'_> {
             Change::Leave => {}
         }
         match &self.context {
-            Change::Set(context) => Ok(Some(encode(context, &Format::Native, "schedule context")?)),
+            Change::Set(context) => Ok(Some(encode(
+                context,
+                &PayloadEncoding::Native,
+                "schedule context",
+            )?)),
             Change::Leave => Ok(None),
         }
     }
@@ -391,7 +395,11 @@ impl Schedule {
 
     /// The context each tick is called with, decoded as `C`.
     pub fn decode_context<C: DeserializeOwned>(&self) -> Result<C> {
-        decode(Some(&self.context), &Format::Native, "schedule context")
+        decode(
+            Some(&self.context),
+            &PayloadEncoding::Native,
+            "schedule context",
+        )
     }
 
     /// The tick the schedule last fired for, or `None` if it has not fired.
@@ -1011,13 +1019,13 @@ impl Connection {
         scheduled_time: SystemTime,
         workflow_id: &str,
     ) -> Result<()> {
-        let format = self.serializer().format();
+        let encoding = self.serializer().encoding();
         let input = encode(
             &ScheduledWorkflowInput {
                 scheduled_time,
                 context: &firing.context,
             },
-            &format,
+            &encoding,
             "argument",
         )?;
         let queue = Enqueue::new(record.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE));
@@ -1025,7 +1033,7 @@ impl Connection {
             name: Some(&record.workflow_name),
             class_name: record.workflow_class_name.as_deref(),
             input: Some(&input),
-            serialization: Some(format.name()),
+            serialization: Some(encoding.name()),
             executor_id: None,
             application_name: firing.owner.as_deref(),
             application_version: firing.version.as_deref(),
@@ -1077,7 +1085,11 @@ impl Connection {
             .map(|version| version.version_name);
         // Decoded to a value and encoded again inside each input, rather than spliced in as text,
         // so a context that is not JSON fails here rather than in every run.
-        let context = decode(Some(&record.context), &Format::Native, "schedule context")?;
+        let context = decode(
+            Some(&record.context),
+            &PayloadEncoding::Native,
+            "schedule context",
+        )?;
         Ok(Firing {
             owner,
             version,
@@ -1107,13 +1119,14 @@ mod tests {
             scheduled_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_665_600),
             context: "emea",
         };
-        let encoded = encode::<_, EngineOnly>(&input, &Format::Native, "argument").unwrap();
+        let encoded =
+            encode::<_, EngineOnly>(&input, &PayloadEncoding::Native, "argument").unwrap();
         assert_eq!(
             encoded,
             r#"{"scheduled_time":"2025-10-05T12:00:00Z","context":"emea"}"#
         );
         let decoded: ScheduledWorkflowInput<String> =
-            decode::<_, EngineOnly>(Some(&encoded), &Format::Native, "argument").unwrap();
+            decode::<_, EngineOnly>(Some(&encoded), &PayloadEncoding::Native, "argument").unwrap();
         assert_eq!(decoded.scheduled_time, input.scheduled_time);
         assert_eq!(decoded.context, "emea");
     }

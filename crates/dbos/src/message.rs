@@ -35,7 +35,7 @@
 //!
 //! **Every send in the crate is here, and they meet at one place per surface.**
 //! `Connection::send_message` and `Connection::send_messages` are the shared paths — each encodes
-//! the payloads, names the format, and hands `sysdb` the matching call — so the surfaces above
+//! the payloads, names the encoding, and hands `sysdb` the matching call — so the surfaces above
 //! them differ only in what they can say before they reach one: which ambient context to read,
 //! whether the send is checkpointed, and whether a handle's executor has to be reconciled with it.
 //! That is [`event`](crate::event)'s shape too, where `Connection::get_event` is the one read under
@@ -72,7 +72,7 @@ use crate::checkpoint::{Built, PendingStep, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
-use crate::serialization::{Format, Serialization, decode_tagged, encode};
+use crate::serialization::{PayloadEncoding, Serialization, decode_tagged, encode};
 use crate::sysdb::types::Message as EncodedMessage;
 use crate::sysdb::types::step_names;
 
@@ -146,8 +146,9 @@ where
     // steps around it.
     let built = StepPlacement::ambient_connection("send")
         .and_then(|conn| {
-            let format = Format::resolve_ambient(options.serialization, conn.serializer());
-            let encoded = encode_one(destination_id, message, options, format)?;
+            let encoding =
+                PayloadEncoding::resolve_ambient(options.serialization, conn.serializer());
+            let encoded = encode_one(destination_id, message, options, encoding)?;
             Ok((encoded, conn))
         })
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send"));
@@ -204,8 +205,9 @@ where
 {
     let built = StepPlacement::ambient_connection("send_bulk")
         .and_then(|conn| {
-            let format = Format::resolve_ambient(options.serialization, conn.serializer());
-            Ok((encode_all(messages, &format)?, conn))
+            let encoding =
+                PayloadEncoding::resolve_ambient(options.serialization, conn.serializer());
+            Ok((encode_all(messages, &encoding)?, conn))
         })
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send_bulk"));
     pending_send_bulk(built, options.forks)
@@ -355,8 +357,9 @@ impl DBOS {
         let built = self
             .executor("send")
             .and_then(|executor| {
-                let format = Format::resolve_ambient(options.serialization, executor.serializer());
-                let encoded = encode_one(destination_id, message, options, format)?;
+                let encoding =
+                    PayloadEncoding::resolve_ambient(options.serialization, executor.serializer());
+                let encoded = encode_one(destination_id, message, options, encoding)?;
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send")?))
             })
             .map(|(encoded, (executor, placement))| {
@@ -386,8 +389,9 @@ impl DBOS {
         let built = self
             .executor("send_bulk")
             .and_then(|executor| {
-                let format = Format::resolve_ambient(options.serialization, executor.serializer());
-                let encoded = encode_all(messages, &format)?;
+                let encoding =
+                    PayloadEncoding::resolve_ambient(options.serialization, executor.serializer());
+                let encoded = encode_all(messages, &encoding)?;
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send_bulk")?))
             })
             .map(|(encoded, (executor, placement))| {
@@ -425,7 +429,7 @@ struct Encoded<'a> {
     idempotency_key: Option<&'a str>,
     message: String,
     /// How `message` is encoded, resolved when it was.
-    format: Format,
+    encoding: PayloadEncoding,
 }
 
 impl<'a> Encoded<'a> {
@@ -440,21 +444,21 @@ impl<'a> Encoded<'a> {
     }
 }
 
-/// One message, encoded in `format`, which the caller has resolved.
+/// One message, encoded in `encoding`, which the caller has resolved.
 ///
 /// Encoded before the step id is taken, for the reason [`place_send`] gives.
 fn encode_one<'a, T: Serialize>(
     destination_id: &'a str,
     message: &T,
     options: SendOptions<'a>,
-    format: Format,
+    encoding: PayloadEncoding,
 ) -> Result<Encoded<'a>> {
     Ok(Encoded {
         destination_id,
         topic: options.topic,
         idempotency_key: options.idempotency_key,
-        message: encode(message, &format, "message")?,
-        format,
+        message: encode(message, &encoding, "message")?,
+        encoding,
     })
 }
 
@@ -465,7 +469,7 @@ fn encode_one<'a, T: Serialize>(
 /// avoid. Ahead of the step id for the reason [`place_send`] gives.
 fn encode_all<'a, T: Serialize>(
     messages: &'a [Message<'a, T>],
-    format: &Format,
+    encoding: &PayloadEncoding,
 ) -> Result<Vec<Encoded<'a>>> {
     messages
         .iter()
@@ -474,8 +478,8 @@ fn encode_all<'a, T: Serialize>(
                 destination_id: message.destination_id,
                 topic: message.topic,
                 idempotency_key: message.idempotency_key,
-                message: encode(message.message, format, "message")?,
-                format: format.clone(),
+                message: encode(message.message, encoding, "message")?,
+                encoding: encoding.clone(),
             })
         })
         .collect()
@@ -497,7 +501,7 @@ fn pending_send<'a, E: DurableError + 'a>(
         move |(conn, encoded), placement| async move {
             conn.send_encoded(
                 &encoded.as_message(),
-                &encoded.format,
+                &encoded.encoding,
                 placement.step(),
                 forks,
             )
@@ -516,15 +520,15 @@ fn pending_send_bulk<'a, E: DurableError + 'a>(
         step_names::SEND_BULK,
         built,
         move |(conn, encoded), placement| async move {
-            // One format for the whole batch, which `encode_all` gave every message; an empty
+            // One encoding for the whole batch, which `encode_all` gave every message; an empty
             // batch writes nothing for it to label.
-            let format = encoded
+            let encoding = encoded
                 .first()
-                .map(|one| one.format.clone())
+                .map(|one| one.encoding.clone())
                 .unwrap_or_default();
             let messages: Vec<EncodedMessage<'_>> =
                 encoded.iter().map(Encoded::as_message).collect();
-            conn.send_all_encoded(&messages, &format, placement.step(), forks)
+            conn.send_all_encoded(&messages, &encoding, placement.step(), forks)
                 .await
                 .map_err(Error::lift)
         },
@@ -552,7 +556,7 @@ impl Connection {
     pub(crate) async fn send_encoded<E>(
         &self,
         message: &EncodedMessage<'_>,
-        format: &Format,
+        encoding: &PayloadEncoding,
         caller: Option<(&str, i32)>,
         forks: Forks,
     ) -> Result<(), E>
@@ -562,7 +566,7 @@ impl Connection {
         self.sysdb()
             .send_message(
                 message,
-                Some(format.name()),
+                Some(encoding.name()),
                 caller,
                 forks == Forks::Include,
             )
@@ -579,7 +583,7 @@ impl Connection {
     pub(crate) async fn send_all_encoded<E>(
         &self,
         messages: &[EncodedMessage<'_>],
-        format: &Format,
+        encoding: &PayloadEncoding,
         caller: Option<(&str, i32)>,
         forks: Forks,
     ) -> Result<(), E>
@@ -589,7 +593,7 @@ impl Connection {
         self.sysdb()
             .send_messages(
                 messages,
-                Some(format.name()),
+                Some(encoding.name()),
                 caller,
                 forks == Forks::Include,
             )
@@ -631,15 +635,20 @@ impl crate::Client {
         // than the one it saved.
         // The client's own serializer, never a surrounding workflow's: a client called from a
         // workflow body is still a client, and writes as one.
-        let format = Format::resolve(
+        let encoding = PayloadEncoding::resolve(
             options.serialization,
-            self.connection().serializer().format(),
+            self.connection().serializer().encoding(),
         );
-        let encoded = encode_one(destination_id, message, options, format)?;
+        let encoded = encode_one(destination_id, message, options, encoding)?;
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
         self.connection()
-            .send_encoded(&encoded.as_message(), &encoded.format, None, options.forks)
+            .send_encoded(
+                &encoded.as_message(),
+                &encoded.encoding,
+                None,
+                options.forks,
+            )
             .await
     }
 
@@ -673,16 +682,16 @@ impl crate::Client {
         // Encoded up front, so nothing is sent when one payload cannot be: the batch is one
         // transaction, and failing halfway through the encoding would be the prefix a batch exists
         // to avoid.
-        let format = Format::resolve(
+        let encoding = PayloadEncoding::resolve(
             options.serialization,
-            self.connection().serializer().format(),
+            self.connection().serializer().encoding(),
         );
-        let encoded = encode_all(messages, &format)?;
+        let encoded = encode_all(messages, &encoding)?;
         let messages: Vec<EncodedMessage<'_>> = encoded.iter().map(Encoded::as_message).collect();
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
         self.connection()
-            .send_all_encoded(&messages, &format, None, options.forks)
+            .send_all_encoded(&messages, &encoding, None, options.forks)
             .await
     }
 }
@@ -794,7 +803,7 @@ pub struct SendOptions<'a> {
     pub forks: Forks,
     /// How the message is encoded.
     ///
-    /// [`Serialization::Default`] takes the sending workflow's format, or the configured
+    /// [`Serialization::Default`] takes the sending workflow's encoding, or the configured
     /// [`Serializer`](crate::Serializer) outside one. A [`Client`](crate::Client)'s send takes the
     /// client's own serializer, wherever it is called from.
     /// [`Serialization::Portable`] is for a message a workflow in another language receives.

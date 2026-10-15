@@ -794,7 +794,7 @@ impl Connection {
             };
             let encoded = encode(
                 &refused,
-                &self.serializer().format(),
+                &self.serializer().encoding(),
                 "select_workflow error",
             )?;
             placement
@@ -815,7 +815,7 @@ impl Connection {
 
         let encoded = encode(
             &winner,
-            &self.serializer().format(),
+            &self.serializer().encoding(),
             "the id that won a select_workflow",
         )?;
         placement

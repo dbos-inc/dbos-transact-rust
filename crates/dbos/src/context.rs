@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 use crate::instance::Executor;
-use crate::serialization::Format;
+use crate::serialization::PayloadEncoding;
 use crate::sysdb::types::Timestamp;
 
 tokio::task_local! {
@@ -204,9 +204,9 @@ struct WorkflowState {
     /// How this workflow's input, output and error are encoded, as its row's tag says.
     ///
     /// Here because a send, an event or a stream write made inside the workflow takes the same
-    /// format unless it asks for another — so a portable workflow's writes are readable by whoever
-    /// can read the workflow.
-    format: Format,
+    /// encoding unless it asks for another — so a portable workflow's writes are readable by
+    /// whoever can read the workflow.
+    encoding: PayloadEncoding,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
     /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
@@ -232,14 +232,14 @@ impl Ctx {
         executor: Arc<Executor>,
         workflow_id: impl Into<String>,
         deadline: Option<Timestamp>,
-        format: Format,
+        encoding: PayloadEncoding,
     ) -> Self {
         Self {
             executor,
             workflow: Arc::new(WorkflowState {
                 workflow_id: workflow_id.into(),
                 deadline,
-                format,
+                encoding,
                 next_step_id: AtomicI32::new(0),
             }),
             step: None,
@@ -315,8 +315,8 @@ impl Ctx {
     }
 
     /// How this workflow's own payloads are encoded, which its writes inherit.
-    pub(crate) fn format(&self) -> Format {
-        self.workflow.format.clone()
+    pub(crate) fn encoding(&self) -> PayloadEncoding {
+        self.workflow.encoding.clone()
     }
 
     /// Runs `future` with `ctx` ambient.
@@ -592,7 +592,7 @@ mod tests {
         WorkflowState {
             workflow_id: "wf-1".to_owned(),
             deadline: None,
-            format: Format::Native,
+            encoding: PayloadEncoding::Native,
             next_step_id: AtomicI32::new(0),
         }
     }
@@ -658,7 +658,7 @@ mod tests {
             dbos.executor("test").expect("launched"),
             workflow_id,
             deadline,
-            Format::Native,
+            PayloadEncoding::Native,
         );
         (ctx, dbos, db)
     }

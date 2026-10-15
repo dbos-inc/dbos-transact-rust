@@ -18,7 +18,7 @@
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
 //! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
-use crate::serialization::{Format, decode_error};
+use crate::serialization::{PayloadEncoding, decode_error};
 use std::borrow::Cow;
 
 /// The error type of a workflow or step with no failure of its own.
@@ -715,9 +715,9 @@ pub(crate) enum Failure {
     Control(Error<EngineOnly>),
 }
 
-/// A workflow's error as its row holds it, with the format that says how to read it.
+/// A workflow's error as its row holds it, with the encoding that says how to read it.
 ///
-/// **The format travels with the bytes** because the formats encode an error differently — the
+/// **The encoding travels with the bytes** because the formats encode an error differently — the
 /// whole [`Error`] natively, a `{name, message, code, data}` envelope portably — and a reader
 /// that guessed would read one as the other.
 #[derive(Debug, Clone)]
@@ -725,7 +725,7 @@ pub(crate) struct EncodedError {
     /// The encoded error.
     pub(crate) encoded: String,
     /// How it is encoded.
-    pub(crate) format: Format,
+    pub(crate) encoding: PayloadEncoding,
 }
 
 impl EncodedError {
@@ -735,7 +735,7 @@ impl EncodedError {
     /// cannot read — is reported as [`Error::WorkflowFailed`] with the bytes as its message, which
     /// is what survives.
     pub(crate) fn decode<E: DurableError>(&self, workflow_id: &str) -> Error<E> {
-        decode_error(&self.encoded, &self.format).unwrap_or_else(|| Error::WorkflowFailed {
+        decode_error(&self.encoded, &self.encoding).unwrap_or_else(|| Error::WorkflowFailed {
             workflow_id: workflow_id.to_owned(),
             message: self.encoded.clone(),
         })

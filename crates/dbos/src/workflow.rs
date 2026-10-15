@@ -19,7 +19,7 @@ use crate::error::{DurableError, EncodedError, Error, Failure, Result};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::{EncodedOutput, Format, Serialization, encode_input};
+use crate::serialization::{EncodedOutput, PayloadEncoding, Serialization, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
     WorkflowInitResult,
@@ -577,7 +577,7 @@ struct OwnedStart {
     queue: Option<OwnedEnqueue>,
     input: Option<String>,
     /// How `input` is encoded, and so how the workflow's outcome will be.
-    format: Format,
+    encoding: PayloadEncoding,
     attributes: Option<String>,
     /// When the start began, which the parent's record of it is stamped with. Read here rather
     /// than in the task so that it measures the call and not the wait for a runtime thread.
@@ -1101,17 +1101,18 @@ where
         // The registration's choice, unless an enqueue makes its own, and the configured
         // serializer where neither does. A child does not inherit its parent's: what it is encoded
         // in is a property of the workflow, not of who started it.
-        let registered = Format::resolve(self.serialization(), executor.serializer().format());
-        let format = match &options.queue {
-            Some(enqueue) => Format::resolve(enqueue.serialization, registered),
+        let registered =
+            PayloadEncoding::resolve(self.serialization(), executor.serializer().encoding());
+        let encoding = match &options.queue {
+            Some(enqueue) => PayloadEncoding::resolve(enqueue.serialization, registered),
             None => registered,
         };
         let request = OwnedStart {
             workflow_id: workflow_id.clone(),
             timeout: options.timeout,
             queue: options.queue.as_ref().map(OwnedEnqueue::from),
-            input: Some(encode_input(&input, &format)?),
-            format,
+            input: Some(encode_input(&input, &encoding)?),
+            encoding,
             attributes: encode_attributes(options.attributes)?,
             started_at: Timestamp::now(),
         };
@@ -1191,7 +1192,7 @@ async fn create<R, E>(
         timeout,
         queue,
         input,
-        format,
+        encoding,
         attributes,
         // The caller's reading, taken before this task existed: the step spans the start as the
         // *caller* saw it, not the wait for a runtime thread to pick the task up.
@@ -1272,7 +1273,7 @@ async fn create<R, E>(
         class_name: key.class_name.as_deref(),
         config_name: key.config_name.as_deref(),
         input: input.as_deref(),
-        serialization: Some(format.name()),
+        serialization: Some(encoding.name()),
         executor_id: Some(executor.executor_id()),
         application_name: Some(executor.app_name()),
         application_version: Some(executor.app_version()),
@@ -1751,7 +1752,7 @@ pub(crate) fn spawn_execution(
                 // The row's tag, which says how its input was written and so how the outcome is
                 // written back. A tag this SDK cannot read is an input it cannot decode, and ends
                 // the execution as an undecodable input does: with nothing recorded.
-                let format = Format::of(serialization.as_deref()).map_err(|error| {
+                let encoding = PayloadEncoding::of(serialization.as_deref()).map_err(|error| {
                     tracing::warn!(
                         %error,
                         "the workflow's input is in an encoding this SDK cannot read; it records \
@@ -1759,11 +1760,16 @@ pub(crate) fn spawn_execution(
                     );
                     Failure::Control(error)
                 })?;
-                let ctx = Ctx::new(Arc::clone(&executor), &workflow_id, deadline, format.clone());
+                let ctx = Ctx::new(
+                    Arc::clone(&executor),
+                    &workflow_id,
+                    deadline,
+                    encoding.clone(),
+                );
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, format, ctx, slot).await
+                execute(&executor, &key, &workflow_id, input, encoding, ctx, slot).await
             }
         }
         .instrument(span),
@@ -1884,7 +1890,7 @@ async fn execute(
     key: &WorkflowKey,
     workflow_id: &str,
     input: Option<String>,
-    format: Format,
+    encoding: PayloadEncoding,
     ctx: Ctx,
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
@@ -1908,8 +1914,8 @@ async fn execute(
         workflow_id,
         deadline,
         Ctx::scope(ctx, async move {
-            let encoded = workflow(input, format.clone()).await?;
-            Ok(EncodedOutput { encoded, format })
+            let encoded = workflow(input, encoding.clone()).await?;
+            Ok(EncodedOutput { encoded, encoding })
         }),
     )
     .await
@@ -2045,8 +2051,8 @@ impl Connection {
             })?;
         // The row's tag says how to read the outcome, whoever wrote it; one this SDK cannot read is
         // reported rather than handed on to be misread.
-        let format = |serialization: Option<String>| {
-            Format::of(serialization.as_deref()).map_err(Failure::Control)
+        let encoding = |serialization: Option<String>| {
+            PayloadEncoding::of(serialization.as_deref()).map_err(Failure::Control)
         };
         match outcome {
             AwaitedOutcome::Succeeded {
@@ -2054,7 +2060,7 @@ impl Connection {
                 serialization,
             } => Ok(EncodedOutput {
                 encoded: output,
-                format: format(serialization)?,
+                encoding: encoding(serialization)?,
             }),
             // Handed back encoded, for the caller to decode into its own error type — the adopting
             // caller knows what that is and this function does not.
@@ -2063,7 +2069,7 @@ impl Connection {
                 serialization,
             } => Err(Failure::Recorded(EncodedError {
                 encoded: error,
-                format: format(serialization)?,
+                encoding: encoding(serialization)?,
             })),
             AwaitedOutcome::Cancelled => Err(Failure::Control(Error::WorkflowCancelled {
                 workflow_id: workflow_id.to_owned(),
@@ -2248,7 +2254,7 @@ mod tests {
                 Arc::clone(&executor),
                 "wf-donor",
                 None,
-                crate::serialization::Format::Native,
+                crate::serialization::PayloadEncoding::Native,
             ),
             async { child.start(1) },
         )
@@ -2259,7 +2265,7 @@ mod tests {
             Arc::clone(&executor),
             "wf-thief",
             None,
-            crate::serialization::Format::Native,
+            crate::serialization::PayloadEncoding::Native,
         );
         match Ctx::scope(thief, smuggled).await {
             Err(Error::StepBuiltElsewhere {

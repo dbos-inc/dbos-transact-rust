@@ -67,7 +67,7 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::serialization::Serializer;
-use crate::serialization::{Format, PortableWorkflowArgs, encode, encode_input};
+use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode_input};
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
@@ -382,12 +382,12 @@ impl Client {
     where
         P: Serialize,
     {
-        let format = Format::resolve(
+        let encoding = PayloadEncoding::resolve(
             options.queue.serialization,
-            self.connection().serializer().format(),
+            self.connection().serializer().encoding(),
         );
-        let input = encode_input(&input, &format)?;
-        self.enqueue_encoded(workflow, &input, format, options)
+        let input = encode_input(&input, &encoding)?;
+        self.enqueue_encoded(workflow, &input, encoding, options)
             .await
     }
 
@@ -415,17 +415,17 @@ impl Client {
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        let input = encode(&args, &Format::Portable, "argument")?;
-        self.enqueue_encoded(workflow, &input, Format::Portable, options)
+        let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
+        self.enqueue_encoded(workflow, &input, PayloadEncoding::Portable, options)
             .await
     }
 
-    /// The enqueue both public forms share, from an input already encoded in `format`.
+    /// The enqueue both public forms share, from an input already encoded in `encoding`.
     async fn enqueue_encoded<R, E>(
         &self,
         workflow: &str,
         input: &str,
-        format: Format,
+        encoding: PayloadEncoding,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         // Refused before anything is written, as `start_with` refuses it: an enqueue no queue could
@@ -449,7 +449,7 @@ impl Client {
             class_name: options.class_name,
             config_name: options.config_name,
             input: Some(input),
-            serialization: Some(format.name()),
+            serialization: Some(encoding.name()),
             // **Nobody claims it.** A client runs nothing, and a queued row's executor is stamped
             // by whichever one dequeues it — writing a claimant here would name a process that is
             // never going to run it.

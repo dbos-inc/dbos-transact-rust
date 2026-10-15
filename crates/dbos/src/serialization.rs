@@ -4,11 +4,11 @@
 //! `serialization` column on each row records which encoding produced it. That is what lets a
 //! reader interpret what it finds without the two sides having agreed in advance.
 //!
-//! **Two encodings.** [`Format::Native`] (`rust_serde`) is `serde_json` with the application's
-//! own derives, and is read only by this SDK. [`Format::Portable`] (`portable_json`) is the
-//! encoding every DBOS SDK reads and writes: the same JSON for a plain value, but a workflow input
-//! travels in a `{"positionalArgs", "namedArgs"}` envelope and an error in a
-//! `{"name", "message", "code", "data"}` one, because those are the shapes a workflow or an
+//! **Two encodings.** [`PayloadEncoding::Native`] (`rust_serde`) is `serde_json` with the
+//! application's own derives, and is read only by this SDK. [`PayloadEncoding::Portable`]
+//! (`portable_json`) is the encoding every DBOS SDK reads and writes: the same JSON for a plain
+//! value, but a workflow input travels in a `{"positionalArgs", "namedArgs"}` envelope and an error
+//! in a `{"name", "message", "code", "data"}` one, because those are the shapes a workflow or an
 //! exception has in a language with neither a single typed argument nor a typed error.
 //!
 //! **Every read honours the row's tag**, whatever the reader would itself have written. A tag
@@ -23,10 +23,10 @@ use serde_json::{Map, Value};
 
 use crate::error::{DurableError, EngineOnly, Error, Result};
 
-/// The tag a [`Format::Native`] row carries.
+/// The tag a [`PayloadEncoding::Native`] row carries.
 pub(crate) const RUST_SERDE: &str = "rust_serde";
 
-/// The tag a [`Format::Portable`] row carries, the one every DBOS SDK reads.
+/// The tag a [`PayloadEncoding::Portable`] row carries, the one every DBOS SDK reads.
 pub(crate) const PORTABLE_JSON: &str = "portable_json";
 
 /// How payloads are encoded on their way into the system database, by default.
@@ -56,10 +56,10 @@ impl Serializer {
         }
     }
 
-    /// The format this writes in.
-    pub(crate) fn format(&self) -> Format {
+    /// The encoding this writes in.
+    pub(crate) fn encoding(&self) -> PayloadEncoding {
         match self {
-            Serializer::RustSerde => Format::Native,
+            Serializer::RustSerde => PayloadEncoding::Native,
         }
     }
 }
@@ -79,7 +79,7 @@ impl Serializer {
 ///   [`Enqueue`](crate::Enqueue) makes its own, and a registration that made none takes the
 ///   configured [`Serializer`]. A [`Client`](crate::Client), with no registration, takes its own
 ///   configured serializer unless its enqueue says otherwise.
-/// - A send, event or stream write made inside a workflow takes that workflow's format; one made
+/// - A send, event or stream write made inside a workflow takes that workflow's encoding; one made
 ///   outside a workflow takes the configured serializer.
 ///
 /// Reading never needs this: every read decodes by what the row says it holds, whatever the
@@ -91,7 +91,7 @@ impl Serializer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Serialization {
     /// Whatever the context says: the registration's choice for a workflow, the enclosing
-    /// workflow's format for a write.
+    /// workflow's encoding for a write.
     #[default]
     Default,
     /// `portable_json`, readable by every DBOS SDK.
@@ -105,7 +105,7 @@ pub enum Serialization {
 /// What a caller *asks for* is a [`Serialization`], which may defer to its context; this is what
 /// that request resolves to, and what a row says it holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) enum Format {
+pub(crate) enum PayloadEncoding {
     /// `rust_serde`: this SDK's own encoding.
     #[default]
     Native,
@@ -113,55 +113,58 @@ pub(crate) enum Format {
     Portable,
 }
 
-impl Format {
+impl PayloadEncoding {
     /// The tag written to the `serialization` column.
     pub(crate) fn name(&self) -> &str {
         match self {
-            Format::Native => RUST_SERDE,
-            Format::Portable => PORTABLE_JSON,
+            PayloadEncoding::Native => RUST_SERDE,
+            PayloadEncoding::Portable => PORTABLE_JSON,
         }
     }
 
-    /// The format a row's tag names.
+    /// The encoding a row's tag names.
     ///
     /// The built-in names are always readable, and no other is. An absent or empty tag is this
     /// SDK's own: a row with no tag was written before tags were written, by this SDK, since a
     /// workflow is replayed only by the SDK that wrote it.
-    pub(crate) fn of<E>(tag: Option<&str>) -> Result<Format, E> {
+    pub(crate) fn of<E>(tag: Option<&str>) -> Result<PayloadEncoding, E> {
         match tag {
-            None | Some("") | Some(RUST_SERDE) => Ok(Format::Native),
-            Some(PORTABLE_JSON) => Ok(Format::Portable),
+            None | Some("") | Some(RUST_SERDE) => Ok(PayloadEncoding::Native),
+            Some(PORTABLE_JSON) => Ok(PayloadEncoding::Portable),
             Some(other) => Err(Error::UnknownSerialization {
                 name: other.to_owned(),
             }),
         }
     }
 
-    /// What a request resolves to, given the format it defers to.
-    pub(crate) fn resolve(requested: Serialization, inherited: Format) -> Format {
+    /// What a request resolves to, given the encoding it defers to.
+    pub(crate) fn resolve(requested: Serialization, inherited: PayloadEncoding) -> PayloadEncoding {
         match requested {
             Serialization::Default => inherited,
-            Serialization::Portable => Format::Portable,
-            Serialization::Native => Format::Native,
+            Serialization::Portable => PayloadEncoding::Portable,
+            Serialization::Native => PayloadEncoding::Native,
         }
     }
 
-    /// What a request resolves to where the format it defers to is the ambient workflow's.
+    /// What a request resolves to where the encoding it defers to is the ambient workflow's.
     ///
     /// Inside a workflow — its body or one of its steps — a [`Serialization::Default`] takes that
-    /// workflow's format, so a portable workflow's events, messages and stream values are portable
-    /// too. Outside one there is nothing to inherit, and it is the `configured` default.
-    pub(crate) fn resolve_ambient(requested: Serialization, configured: &Serializer) -> Format {
+    /// workflow's encoding, so a portable workflow's events, messages and stream values are
+    /// portable too. Outside one there is nothing to inherit, and it is the `configured` default.
+    pub(crate) fn resolve_ambient(
+        requested: Serialization,
+        configured: &Serializer,
+    ) -> PayloadEncoding {
         let inherited = crate::context::Ctx::with_current(|ctx| {
-            ctx.map_or_else(|| configured.format(), crate::context::Ctx::format)
+            ctx.map_or_else(|| configured.encoding(), crate::context::Ctx::encoding)
         });
-        Format::resolve(requested, inherited)
+        PayloadEncoding::resolve(requested, inherited)
     }
 }
 
-/// Decodes a value stored by [`encode`] in `format`.
+/// Decodes a value stored by [`encode`] in `encoding`.
 ///
-/// An absent value reads as JSON `null`, whatever the format, which is what `()` decodes from.
+/// An absent value reads as JSON `null`, whatever the encoding, which is what `()` decodes from.
 /// That is what lets a zero-argument workflow share one erased signature with a one-argument one:
 /// its row has no input, and it must not need a literal `"null"` written into the column to run.
 ///
@@ -173,12 +176,14 @@ impl Format {
 /// either way, and `E` only says which channel it travels in.
 pub(crate) fn decode<T: DeserializeOwned, E>(
     value: Option<&str>,
-    format: &Format,
+    encoding: &PayloadEncoding,
     what: &'static str,
 ) -> Result<T, E> {
-    match format {
-        Format::Native | Format::Portable => serde_json::from_str(value.unwrap_or("null"))
-            .map_err(|source| deserialization(what, source)),
+    match encoding {
+        PayloadEncoding::Native | PayloadEncoding::Portable => {
+            serde_json::from_str(value.unwrap_or("null"))
+                .map_err(|source| deserialization(what, source))
+        }
     }
 }
 
@@ -188,10 +193,10 @@ pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
     tag: Option<&str>,
     what: &'static str,
 ) -> Result<T, E> {
-    decode(value, &Format::of(tag)?, what)
+    decode(value, &PayloadEncoding::of(tag)?, what)
 }
 
-/// Encodes a value for the system database, in `format`.
+/// Encodes a value for the system database, in `encoding`.
 ///
 /// Always a string, never an absence — a value that encodes to nothing does not exist, and `()`
 /// encodes to `"null"` rather than to no value at all. Nullability belongs to the column, so a
@@ -201,17 +206,16 @@ pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
 /// around a workflow's input or error, which [`encode_input`] and [`encode_error`] add.
 pub(crate) fn encode<T: Serialize, E>(
     value: &T,
-    format: &Format,
+    encoding: &PayloadEncoding,
     what: &'static str,
 ) -> Result<String, E> {
-    match format {
-        Format::Native | Format::Portable => {
-            serde_json::to_string(value).map_err(|source| Error::Serialization {
+    match encoding {
+        PayloadEncoding::Native | PayloadEncoding::Portable => serde_json::to_string(value)
+            .map_err(|source| Error::Serialization {
                 what: what.into(),
                 message: source.to_string(),
                 source: Some(source),
-            })
-        }
+            }),
     }
 }
 
@@ -279,7 +283,7 @@ struct Envelope<'a, A: ?Sized> {
     named_args: Map<String, Value>,
 }
 
-/// Encodes a workflow's input in `format`.
+/// Encodes a workflow's input in `encoding`.
 ///
 /// Native, it is the input alone. Portable, it is the envelope, and the input's shape
 /// decides what goes in it:
@@ -294,30 +298,33 @@ struct Envelope<'a, A: ?Sized> {
 /// So a tuple calls a workflow in another language with that many arguments, and every shape reads
 /// back as itself through [`decode_input`]. **A fixed-size array is spread like a tuple**, because
 /// `serde` writes the two identically; a list meant as one argument is a `Vec` or a slice.
-pub(crate) fn encode_input<P: Serialize, E>(input: &P, format: &Format) -> Result<String, E> {
+pub(crate) fn encode_input<P: Serialize, E>(
+    input: &P,
+    encoding: &PayloadEncoding,
+) -> Result<String, E> {
     const WHAT: &str = "argument";
-    if !matches!(format, Format::Portable) {
-        return encode(input, format, WHAT);
+    if !matches!(encoding, PayloadEncoding::Portable) {
+        return encode(input, encoding, WHAT);
     }
     match Shape::of(input) {
-        Shape::Arguments => encode_envelope(input, format),
-        Shape::NoArguments => encode_envelope(&[(); 0], format),
-        Shape::Envelope => encode(input, format, WHAT),
-        Shape::OneArgument => encode_envelope(&[input], format),
+        Shape::Arguments => encode_envelope(input, encoding),
+        Shape::NoArguments => encode_envelope(&[(); 0], encoding),
+        Shape::Envelope => encode(input, encoding, WHAT),
+        Shape::OneArgument => encode_envelope(&[input], encoding),
     }
 }
 
 /// An envelope whose positional arguments are what `positional_args` serializes as, a sequence.
 fn encode_envelope<A: Serialize + ?Sized, E>(
     positional_args: &A,
-    format: &Format,
+    encoding: &PayloadEncoding,
 ) -> Result<String, E> {
     encode(
         &Envelope {
             positional_args,
             named_args: Map::new(),
         },
-        format,
+        encoding,
         "argument",
     )
 }
@@ -494,7 +501,7 @@ impl serde::Serializer for Probe {
     }
 }
 
-/// Decodes a workflow's input, stored in `format`, into the workflow's input type.
+/// Decodes a workflow's input, stored in `encoding`, into the workflow's input type.
 ///
 /// Portable, the envelope's shape decides what `P` is decoded from:
 ///
@@ -513,14 +520,14 @@ impl serde::Serializer for Probe {
 /// be an array.
 pub(crate) fn decode_input<P: DeserializeOwned + 'static, E>(
     value: Option<&str>,
-    format: &Format,
+    encoding: &PayloadEncoding,
 ) -> Result<P, E> {
     const WHAT: &str = "argument";
-    if !matches!(format, Format::Portable) {
-        return decode(value, format, WHAT);
+    if !matches!(encoding, PayloadEncoding::Portable) {
+        return decode(value, encoding, WHAT);
     }
     // An absent or `null` input is an envelope with no arguments, whoever reads it.
-    let args: Option<PortableWorkflowArgs> = decode(value, format, WHAT)?;
+    let args: Option<PortableWorkflowArgs> = decode(value, encoding, WHAT)?;
     let args = args.unwrap_or_default();
     if TypeId::of::<P>() == TypeId::of::<PortableWorkflowArgs>() {
         let whole: Box<dyn std::any::Any> = Box::new(args);
@@ -566,7 +573,7 @@ struct PortableError {
     data: Option<Value>,
 }
 
-/// Encodes a workflow's error in `format`.
+/// Encodes a workflow's error in `encoding`.
 ///
 /// Native, it is the whole [`Error`], application variant and all, which reads back as
 /// the same value. Portable, it is the `{name, message, code, data}` envelope:
@@ -583,11 +590,11 @@ struct PortableError {
 /// An error that was already portable keeps all four fields it came with.
 pub(crate) fn encode_error<E: DurableError, E2>(
     error: &Error<E>,
-    format: &Format,
+    encoding: &PayloadEncoding,
 ) -> Result<String, E2> {
-    match format {
-        Format::Portable => encode(&to_portable(error), format, "error"),
-        Format::Native => encode(error, format, "error"),
+    match encoding {
+        PayloadEncoding::Portable => encode(&to_portable(error), encoding, "error"),
+        PayloadEncoding::Native => encode(error, encoding, "error"),
     }
 }
 
@@ -684,16 +691,21 @@ fn rebuild<E: DurableError>(name: &str, data: Option<&Value>) -> Option<Error<E>
     serde_json::from_value(tagged).ok()
 }
 
-/// Decodes a workflow's error, stored in `format`, or `None` if it is not one.
+/// Decodes a workflow's error, stored in `encoding`, or `None` if it is not one.
 ///
 /// A native one is the [`Error`] it was written as. A portable one is the error it was
 /// written from where the envelope says what that was and the reader's types can hold it — see
 /// [`encode_error`] — and [`Error::Portable`] otherwise, which is how another language's error
 /// arrives. `None` is for the caller to report — what it reports depends on whose error it was.
-pub(crate) fn decode_error<E: DurableError>(encoded: &str, format: &Format) -> Option<Error<E>> {
-    match format {
-        Format::Native => decode::<Error<E>, EngineOnly>(Some(encoded), format, "error").ok(),
-        Format::Portable => {
+pub(crate) fn decode_error<E: DurableError>(
+    encoded: &str,
+    encoding: &PayloadEncoding,
+) -> Option<Error<E>> {
+    match encoding {
+        PayloadEncoding::Native => {
+            decode::<Error<E>, EngineOnly>(Some(encoded), encoding, "error").ok()
+        }
+        PayloadEncoding::Portable => {
             let PortableError {
                 name,
                 message,
@@ -713,9 +725,9 @@ pub(crate) fn decode_error<E: DurableError>(encoded: &str, format: &Format) -> O
     }
 }
 
-/// A workflow's result as its row holds it, with the format that says how to read it.
+/// A workflow's result as its row holds it, with the encoding that says how to read it.
 ///
-/// The format travels with the bytes, as it does with an
+/// The encoding travels with the bytes, as it does with an
 /// [`EncodedError`](crate::error::EncodedError), so a reader decodes the result as it was written
 /// rather than as it would itself have written it.
 #[derive(Debug, Clone)]
@@ -723,7 +735,7 @@ pub(crate) struct EncodedOutput {
     /// The encoded result, or `None` for a workflow that finished without one.
     pub(crate) encoded: Option<String>,
     /// How it is encoded.
-    pub(crate) format: Format,
+    pub(crate) encoding: PayloadEncoding,
 }
 
 impl EncodedOutput {
@@ -732,7 +744,7 @@ impl EncodedOutput {
     /// A result that does not decode is [`Error::Deserialization`]: unlike an error, a value has
     /// nothing to stand in for it.
     pub(crate) fn decode<R: DeserializeOwned, E>(&self) -> Result<R, E> {
-        decode(self.encoded.as_deref(), &self.format, "result")
+        decode(self.encoded.as_deref(), &self.encoding, "result")
     }
 }
 
@@ -746,22 +758,27 @@ mod tests {
     #[test]
     fn an_absent_value_decodes_as_the_unit() {
         assert_eq!(
-            decode::<(), EngineOnly>(None, &Format::Native, "argument").unwrap(),
+            decode::<(), EngineOnly>(None, &PayloadEncoding::Native, "argument").unwrap(),
             ()
         );
         assert_eq!(
-            decode::<Option<u32>, EngineOnly>(None, &Format::Native, "argument").unwrap(),
+            decode::<Option<u32>, EngineOnly>(None, &PayloadEncoding::Native, "argument").unwrap(),
             None
         );
     }
 
     #[test]
     fn a_value_round_trips() {
-        let encoded = encode::<_, EngineOnly>(&(1u32, "two"), &Format::Native, "argument").unwrap();
+        let encoded =
+            encode::<_, EngineOnly>(&(1u32, "two"), &PayloadEncoding::Native, "argument").unwrap();
         assert_eq!(encoded, r#"[1,"two"]"#);
         assert_eq!(
-            decode::<(u32, String), EngineOnly>(Some(&encoded), &Format::Native, "argument")
-                .unwrap(),
+            decode::<(u32, String), EngineOnly>(
+                Some(&encoded),
+                &PayloadEncoding::Native,
+                "argument"
+            )
+            .unwrap(),
             (1, "two".to_owned())
         );
     }
@@ -769,7 +786,7 @@ mod tests {
     #[test]
     fn the_unit_encodes_as_a_value_rather_than_an_absence() {
         assert_eq!(
-            encode::<_, EngineOnly>(&(), &Format::Native, "argument").unwrap(),
+            encode::<_, EngineOnly>(&(), &PayloadEncoding::Native, "argument").unwrap(),
             "null"
         );
     }
@@ -781,7 +798,7 @@ mod tests {
     }
 
     fn portable_input<P: DeserializeOwned + 'static>(stored: &str) -> Result<P> {
-        decode_input(Some(stored), &Format::Portable)
+        decode_input(Some(stored), &PayloadEncoding::Portable)
     }
 
     #[test]
@@ -793,16 +810,16 @@ mod tests {
     fn a_tag_names_its_format_and_an_unknown_one_is_refused() {
         for tag in [None, Some(""), Some("rust_serde")] {
             assert_eq!(
-                Format::of::<EngineOnly>(tag).unwrap(),
-                Format::Native,
+                PayloadEncoding::of::<EngineOnly>(tag).unwrap(),
+                PayloadEncoding::Native,
                 "{tag:?}"
             );
         }
         assert_eq!(
-            Format::of::<EngineOnly>(Some("portable_json")).unwrap(),
-            Format::Portable
+            PayloadEncoding::of::<EngineOnly>(Some("portable_json")).unwrap(),
+            PayloadEncoding::Portable
         );
-        let err = Format::of::<EngineOnly>(Some("py_pickle")).unwrap_err();
+        let err = PayloadEncoding::of::<EngineOnly>(Some("py_pickle")).unwrap_err();
         assert!(
             matches!(&err, Error::UnknownSerialization { name } if name == "py_pickle"),
             "{err}"
@@ -816,7 +833,7 @@ mod tests {
             sku: "tea".to_owned(),
             quantity: 2,
         };
-        let encoded = encode_input::<_, EngineOnly>(&order, &Format::Portable).unwrap();
+        let encoded = encode_input::<_, EngineOnly>(&order, &PayloadEncoding::Portable).unwrap();
         // Field order is the struct's, not a sorted map's.
         assert_eq!(
             encoded,
@@ -825,7 +842,7 @@ mod tests {
         assert_eq!(portable_input::<Order>(&encoded).unwrap(), order);
         // Native, the input is the value alone.
         assert_eq!(
-            encode_input::<_, EngineOnly>(&order, &Format::Native).unwrap(),
+            encode_input::<_, EngineOnly>(&order, &PayloadEncoding::Native).unwrap(),
             r#"{"sku":"tea","quantity":2}"#
         );
     }
@@ -835,7 +852,7 @@ mod tests {
     where
         P: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug + 'static,
     {
-        let encoded = encode_input::<_, EngineOnly>(&input, &Format::Portable).unwrap();
+        let encoded = encode_input::<_, EngineOnly>(&input, &PayloadEncoding::Portable).unwrap();
         assert_eq!(encoded, expected);
         assert_eq!(portable_input::<P>(&encoded).unwrap(), input);
     }
@@ -898,7 +915,8 @@ mod tests {
     #[test]
     fn an_absent_input_is_an_empty_envelope() {
         assert_eq!(
-            decode_input::<PortableWorkflowArgs, EngineOnly>(None, &Format::Portable).unwrap(),
+            decode_input::<PortableWorkflowArgs, EngineOnly>(None, &PayloadEncoding::Portable)
+                .unwrap(),
             PortableWorkflowArgs::default()
         );
         assert_eq!(
@@ -948,7 +966,7 @@ mod tests {
         portable_input::<()>("{}").unwrap();
         portable_input::<()>("null").unwrap();
         assert_eq!(
-            decode_input::<(), EngineOnly>(None, &Format::Portable).unwrap(),
+            decode_input::<(), EngineOnly>(None, &PayloadEncoding::Portable).unwrap(),
             ()
         );
         assert_eq!(portable_input::<Option<u32>>("{}").unwrap(), None);
@@ -1016,7 +1034,7 @@ mod tests {
     #[test]
     fn an_application_error_is_written_under_its_type_name() {
         let error: Error<CardDeclined> = Error::Application(CardDeclined);
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
         assert_eq!(
             encoded,
             r#"{"name":"dbos::serialization::tests::CardDeclined","message":"the card was declined","code":null,"data":null}"#
@@ -1029,7 +1047,8 @@ mod tests {
             step: "charge".to_owned(),
             timeout: std::time::Duration::from_millis(1500),
         };
-        let encoded = envelope(&encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap());
+        let encoded =
+            envelope(&encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap());
         assert_eq!(encoded["name"], "dbos::StepTimeout");
         assert_eq!(encoded["message"], error.to_string());
         assert!(encoded["code"].is_null());
@@ -1049,7 +1068,7 @@ mod tests {
     #[test]
     fn an_application_errors_fields_are_its_data() {
         let error: Error<Checkout> = Error::Application(Checkout::Declined { attempts: 3 });
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
         assert_eq!(
             encoded,
             r#"{"name":"dbos::serialization::tests::Checkout","message":"declined after 3 attempts","code":null,"data":{"Declined":{"attempts":3}}}"#
@@ -1064,7 +1083,7 @@ mod tests {
             code: Some(serde_json::json!(42)),
             data: Some(serde_json::json!({"field": "x"})),
         };
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
         assert_eq!(
             encoded,
             r#"{"name":"ValueError","message":"bad","code":42,"data":{"field":"x"}}"#
@@ -1074,19 +1093,21 @@ mod tests {
     #[test]
     fn an_application_error_reads_back_as_itself() {
         let error: Error<Checkout> = Error::Application(Checkout::Declined { attempts: 3 });
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap();
-        let read = decode_error::<Checkout>(&encoded, &Format::Portable).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
+        let read = decode_error::<Checkout>(&encoded, &PayloadEncoding::Portable).unwrap();
         assert!(
             matches!(read, Error::Application(Checkout::Declined { attempts: 3 })),
             "{read:?}"
         );
 
         // A unit struct has no fields to write, and comes back all the same.
-        let encoded =
-            encode_error::<_, EngineOnly>(&Error::Application(CardDeclined), &Format::Portable)
-                .unwrap();
+        let encoded = encode_error::<_, EngineOnly>(
+            &Error::Application(CardDeclined),
+            &PayloadEncoding::Portable,
+        )
+        .unwrap();
         assert!(matches!(
-            decode_error::<CardDeclined>(&encoded, &Format::Portable),
+            decode_error::<CardDeclined>(&encoded, &PayloadEncoding::Portable),
             Some(Error::Application(CardDeclined))
         ));
     }
@@ -1097,8 +1118,8 @@ mod tests {
             step: "charge".to_owned(),
             timeout: std::time::Duration::from_millis(1500),
         };
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap();
-        let read = decode_error::<Checkout>(&encoded, &Format::Portable).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
+        let read = decode_error::<Checkout>(&encoded, &PayloadEncoding::Portable).unwrap();
         assert!(
             matches!(&read, Error::StepTimeout { step, timeout }
                 if step == "charge" && *timeout == std::time::Duration::from_millis(1500)),
@@ -1109,16 +1130,16 @@ mod tests {
     #[test]
     fn an_error_the_reader_cannot_hold_stays_portable() {
         let error: Error<Checkout> = Error::Application(Checkout::Declined { attempts: 3 });
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Portable).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap();
         // Another error type: the name does not match.
-        let read = decode_error::<CardDeclined>(&encoded, &Format::Portable).unwrap();
+        let read = decode_error::<CardDeclined>(&encoded, &PayloadEncoding::Portable).unwrap();
         assert!(
             matches!(&read, Error::Portable { name, data: Some(_), .. }
                 if name == "dbos::serialization::tests::Checkout"),
             "{read:?}"
         );
         let stays_portable = |envelope: &str| {
-            let read = decode_error::<Checkout>(envelope, &Format::Portable).unwrap();
+            let read = decode_error::<Checkout>(envelope, &PayloadEncoding::Portable).unwrap();
             assert!(
                 matches!(read, Error::Portable { .. }),
                 "{envelope}: {read:?}"
@@ -1146,16 +1167,18 @@ mod tests {
         // A writer may leave the message null, or leave code and data out.
         let java = decode_error::<EngineOnly>(
             r#"{"name":"IllegalStateException","message":null,"code":null,"data":null}"#,
-            &Format::Portable,
+            &PayloadEncoding::Portable,
         )
         .unwrap();
         assert!(
             matches!(&java, Error::Portable { name, message, .. } if name == "IllegalStateException" && message.is_empty()),
             "{java:?}"
         );
-        let ts =
-            decode_error::<EngineOnly>(r#"{"name":"Error","message":"boom"}"#, &Format::Portable)
-                .unwrap();
+        let ts = decode_error::<EngineOnly>(
+            r#"{"name":"Error","message":"boom"}"#,
+            &PayloadEncoding::Portable,
+        )
+        .unwrap();
         assert!(
             matches!(
                 &ts,
@@ -1170,22 +1193,22 @@ mod tests {
         // A string code survives as one.
         let go = decode_error::<EngineOnly>(
             r#"{"name":"WorkflowExecution","message":"x","code":"E1"}"#,
-            &Format::Portable,
+            &PayloadEncoding::Portable,
         )
         .unwrap();
         assert!(
             matches!(&go, Error::Portable { code: Some(code), .. } if code == "E1"),
             "{go:?}"
         );
-        assert!(decode_error::<EngineOnly>("not json", &Format::Portable).is_none());
+        assert!(decode_error::<EngineOnly>("not json", &PayloadEncoding::Portable).is_none());
     }
 
     #[test]
     fn a_native_error_still_round_trips_as_itself() {
         let error: Error<CardDeclined> = Error::Application(CardDeclined);
-        let encoded = encode_error::<_, EngineOnly>(&error, &Format::Native).unwrap();
+        let encoded = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Native).unwrap();
         assert!(matches!(
-            decode_error::<CardDeclined>(&encoded, &Format::Native),
+            decode_error::<CardDeclined>(&encoded, &PayloadEncoding::Native),
             Some(Error::Application(CardDeclined))
         ));
     }
@@ -1206,21 +1229,25 @@ mod tests {
     fn values_follow_serde_json() {
         let map = std::collections::BTreeMap::from([(1u32, "one")]);
         assert_eq!(
-            encode::<_, EngineOnly>(&map, &Format::Native, "value").unwrap(),
+            encode::<_, EngineOnly>(&map, &PayloadEncoding::Native, "value").unwrap(),
             r#"{"1":"one"}"#
         );
         let tuple_keys = std::collections::BTreeMap::from([((1u32, 2u32), "pair")]);
-        assert!(encode::<_, EngineOnly>(&tuple_keys, &Format::Native, "value").is_err());
+        assert!(encode::<_, EngineOnly>(&tuple_keys, &PayloadEncoding::Native, "value").is_err());
         assert_eq!(
-            encode::<_, EngineOnly>(&f64::NAN, &Format::Native, "value").unwrap(),
+            encode::<_, EngineOnly>(&f64::NAN, &PayloadEncoding::Native, "value").unwrap(),
             "null"
         );
     }
 
     #[test]
     fn a_mismatch_names_the_half_that_failed() {
-        let err = decode::<u32, EngineOnly>(Some(r#""not a number""#), &Format::Native, "result")
-            .unwrap_err();
+        let err = decode::<u32, EngineOnly>(
+            Some(r#""not a number""#),
+            &PayloadEncoding::Native,
+            "result",
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
