@@ -382,6 +382,9 @@ impl Client {
     where
         P: Serialize,
     {
+        // Refused before the input is encoded, as before anything is written: an enqueue no queue
+        // could honour should not spend the encoding either.
+        options.queue.validate()?;
         let encoding = PayloadEncoding::resolve(
             options.queue.serialization,
             self.connection().serializer().encoding(),
@@ -415,12 +418,16 @@ impl Client {
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
+        options.queue.validate()?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
         self.enqueue_encoded(workflow, &input, PayloadEncoding::Portable, options)
             .await
     }
 
     /// The enqueue both public forms share, from an input already encoded in `encoding`.
+    ///
+    /// The queue options are validated by the caller, before it encodes the input: an enqueue no
+    /// queue could honour should cost a round trip, not a row, and not an encoding either.
     async fn enqueue_encoded<R, E>(
         &self,
         workflow: &str,
@@ -428,10 +435,6 @@ impl Client {
         encoding: PayloadEncoding,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        // Refused before anything is written, as `start_with` refuses it: an enqueue no queue could
-        // honour should cost a round trip, not a row.
-        options.queue.validate()?;
-
         let attributes = encode_attributes(options.attributes)?;
         // Generated once, outside the retry below: a second attempt under a fresh id would enqueue
         // a *second* workflow if the first insert had in fact landed.

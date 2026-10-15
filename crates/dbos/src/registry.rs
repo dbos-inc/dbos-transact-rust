@@ -42,6 +42,17 @@ pub(crate) type ErasedWorkflow = Arc<
         + Sync,
 >;
 
+/// A registration as the registry keeps it: the erased body, and what it was registered with.
+#[derive(Clone)]
+pub(crate) struct Registered {
+    /// The body, with its types erased.
+    pub(crate) run: ErasedWorkflow,
+    /// How a start of this workflow encodes when the start does not choose, as
+    /// [`WorkflowOptions::serialization`] said. Kept here for the starts that hold no
+    /// [`WorkflowRef`] — a schedule's runs — so they encode as one that did would.
+    pub(crate) serialization: SerializationFormat,
+}
+
 /// How a workflow is registered, beyond its name and its body.
 ///
 /// Built by functional update from [`Default`], as [`Config`](crate::Config) is:
@@ -166,13 +177,13 @@ pub(crate) struct Registry {
 /// window, because the slot is not what registration races.
 #[derive(Default)]
 struct State {
-    workflows: HashMap<WorkflowKey, ErasedWorkflow>,
+    workflows: HashMap<WorkflowKey, Registered>,
     /// Set when a snapshot is taken, cleared when the executor it was taken for goes away.
     frozen: bool,
 }
 
 /// A registry frozen at launch.
-pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, ErasedWorkflow>>;
+pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, Registered>>;
 
 impl Registry {
     /// Registers `workflow` under `key`, refusing a second registration of the same identity.
@@ -182,7 +193,7 @@ impl Registry {
     ///
     /// Refuses outright once frozen. The operation is named here rather than passed in because
     /// registration is the only thing that inserts.
-    fn insert(&self, key: WorkflowKey, workflow: ErasedWorkflow) -> Result<()> {
+    fn insert(&self, key: WorkflowKey, workflow: Registered) -> Result<()> {
         let mut state = self.write();
         if state.frozen {
             return Err(Error::AlreadyLaunched {
@@ -398,7 +409,13 @@ impl DBOS {
                 })
             });
 
-        self.registry().insert(key.clone(), erased)?;
+        self.registry().insert(
+            key.clone(),
+            Registered {
+                run: erased,
+                serialization: options.serialization,
+            },
+        )?;
         tracing::debug!(workflow = %key, "registered a workflow");
         Ok(WorkflowRef {
             dbos: self.clone(),
@@ -451,9 +468,10 @@ mod tests {
         dbos.register_workflow("double", takes_one).unwrap();
 
         let snapshot = dbos.registry().snapshot();
-        let erased = snapshot
+        let erased = &snapshot
             .get(&WorkflowKey::new("double"))
-            .expect("registered");
+            .expect("registered")
+            .run;
         assert_eq!(
             erased(Some("21".to_owned()), PayloadEncoding::Native)
                 .await
@@ -468,9 +486,10 @@ mod tests {
         dbos.register_workflow("nothing", takes_nothing).unwrap();
 
         let snapshot = dbos.registry().snapshot();
-        let erased = snapshot
+        let erased = &snapshot
             .get(&WorkflowKey::new("nothing"))
-            .expect("registered");
+            .expect("registered")
+            .run;
         // The row for a zero-argument workflow has a NULL input; it must not need a `"null"`.
         assert_eq!(
             erased(None, PayloadEncoding::Native).await.unwrap(),
@@ -484,9 +503,10 @@ mod tests {
         dbos.register_workflow("double", takes_one).unwrap();
 
         let snapshot = dbos.registry().snapshot();
-        let erased = snapshot
+        let erased = &snapshot
             .get(&WorkflowKey::new("double"))
-            .expect("registered");
+            .expect("registered")
+            .run;
         let err = erased(Some("\"not a number\"".to_owned()), PayloadEncoding::Native)
             .await
             .unwrap_err();

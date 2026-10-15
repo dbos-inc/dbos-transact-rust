@@ -470,7 +470,10 @@ async fn attempt_tick(
             }
             // From the row as it is now: the definition is the same, but the owner may have
             // claimed an unclaimed schedule since.
-            let prepared = match conn.prepare_firing(&current).await {
+            let prepared = match conn
+                .prepare_firing(&current, Some(executor.workflows()))
+                .await
+            {
                 Ok(prepared) => prepared,
                 // A context that cannot be decoded will not become readable by trying again.
                 Err(crate::Error::Deserialization { message, .. }) => {

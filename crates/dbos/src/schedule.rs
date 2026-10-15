@@ -59,8 +59,8 @@ use crate::cron::{CronSchedule, firing_id, trigger_id};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
-use crate::registry::{WorkflowKey, WorkflowRef};
-use crate::serialization::{PayloadEncoding, decode, encode};
+use crate::registry::{Snapshot, WorkflowKey, WorkflowRef};
+use crate::serialization::{PayloadEncoding, SerializationFormat, decode, encode, encode_input};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     Change, NewSchedule, NewWorkflow, ScheduleFilter, ScheduleRecord, ScheduleStatus,
@@ -654,7 +654,7 @@ impl DBOS {
         refuse_inside_workflow(OPERATION)?;
         executor
             .connection()
-            .backfill_schedule(name, start, end)
+            .backfill_schedule(name, start, end, Some(executor.workflows()))
             .await
     }
 
@@ -667,7 +667,10 @@ impl DBOS {
         const OPERATION: &str = "trigger a schedule";
         let executor = self.executor(OPERATION)?;
         refuse_inside_workflow(OPERATION)?;
-        executor.connection().trigger_schedule(name).await
+        executor
+            .connection()
+            .trigger_schedule(name, Some(executor.workflows()))
+            .await
     }
 }
 
@@ -785,12 +788,14 @@ impl Client {
         start: SystemTime,
         end: SystemTime,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        self.connection().backfill_schedule(name, start, end).await
+        self.connection()
+            .backfill_schedule(name, start, end, None)
+            .await
     }
 
     /// Enqueues one run of a schedule's workflow now. See [`DBOS::trigger_schedule`].
     pub async fn trigger_schedule<R, E>(&self, name: &str) -> Result<WorkflowHandle<R, E>> {
-        self.connection().trigger_schedule(name).await
+        self.connection().trigger_schedule(name, None).await
     }
 }
 
@@ -896,12 +901,14 @@ impl Connection {
 
     /// Enqueues every tick strictly between `start` and `end` that has not already run.
     ///
-    /// `self: &Arc<Self>` because the handles poll through this connection.
+    /// `self: &Arc<Self>` because the handles poll through this connection. `workflows` is the
+    /// caller's registry, which [`prepare_firing`](Self::prepare_firing) reads; a client has none.
     pub(crate) async fn backfill_schedule<R, E>(
         self: &Arc<Self>,
         name: &str,
         start: SystemTime,
         end: SystemTime,
+        workflows: Option<&Snapshot>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let record = self.get_schedule_or_not_found(name).await?;
         let cron = CronSchedule::parse(&record.schedule, record.cron_timezone.as_deref()).map_err(
@@ -914,7 +921,7 @@ impl Connection {
         let mut cursor = to_jiff(start)?;
         // Once for the whole window: the owner's version and the context are the same for every
         // tick, and a long window would otherwise read them once per tick.
-        let firing = self.prepare_firing(&record).await?;
+        let firing = self.prepare_firing(&record, workflows).await?;
         let mut handles = Vec::new();
         let mut first_failure = None;
         while let Some(tick) = cron.next_after(cursor) {
@@ -952,11 +959,12 @@ impl Connection {
     pub(crate) async fn trigger_schedule<R, E>(
         self: &Arc<Self>,
         name: &str,
+        workflows: Option<&Snapshot>,
     ) -> Result<WorkflowHandle<R, E>> {
         let record = self.get_schedule_or_not_found(name).await?;
         let now = jiff::Timestamp::now();
         let workflow_id = trigger_id(name, now);
-        let firing = self.prepare_firing(&record).await?;
+        let firing = self.prepare_firing(&record, workflows).await?;
         self.enqueue_run(&record, &firing, SystemTime::from(now), &workflow_id)
             .await?;
         tracing::info!(schedule = name, workflow_id, "triggered a schedule");
@@ -1019,14 +1027,15 @@ impl Connection {
         scheduled_time: SystemTime,
         workflow_id: &str,
     ) -> Result<()> {
-        let encoding = self.serializer().encoding();
-        let input = encode(
+        // As a start through the workflow's own reference would: its registration's choice, or the
+        // configured serializer for one it did not make.
+        let encoding = PayloadEncoding::resolve(firing.serialization, self.serializer().encoding());
+        let input = encode_input(
             &ScheduledWorkflowInput {
                 scheduled_time,
                 context: &firing.context,
             },
             &encoding,
-            "argument",
         )?;
         let queue = Enqueue::new(record.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE));
         let new = NewWorkflow {
@@ -1059,6 +1068,9 @@ pub(crate) struct Firing {
     version: Option<String>,
     /// The schedule's context, decoded.
     context: serde_json::Value,
+    /// How the workflow is registered to encode, or [`SerializationFormat::Default`] where the
+    /// firing handle has no registration to read: a client, or an executor without the workflow.
+    serialization: SerializationFormat,
 }
 
 impl Connection {
@@ -1068,7 +1080,14 @@ impl Connection {
     /// loaded: a deploy that lands while a schedule is running should get that schedule's next
     /// tick. The loop refreshes this at most once a second, so a long catch-up does not read it
     /// once per tick either.
-    pub(crate) async fn prepare_firing(&self, record: &ScheduleRecord) -> Result<Firing> {
+    ///
+    /// `workflows` is the firing executor's registry, which says how the workflow is registered to
+    /// encode; a client passes `None`, and its runs take the configured serializer.
+    pub(crate) async fn prepare_firing(
+        &self,
+        record: &ScheduleRecord,
+        workflows: Option<&Snapshot>,
+    ) -> Result<Firing> {
         let owner = record
             .application_name
             .as_deref()
@@ -1090,10 +1109,21 @@ impl Connection {
             &PayloadEncoding::Native,
             "schedule context",
         )?;
+        let key = WorkflowKey::from_row(
+            record.workflow_name.as_str(),
+            record.workflow_class_name.as_deref(),
+            None,
+        );
+        let serialization = workflows
+            .and_then(|workflows| workflows.get(&key))
+            .map_or(SerializationFormat::Default, |registered| {
+                registered.serialization
+            });
         Ok(Firing {
             owner,
             version,
             context,
+            serialization,
         })
     }
 }

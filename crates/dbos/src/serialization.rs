@@ -338,6 +338,12 @@ enum Shape {
 impl Shape {
     fn of<P: Serialize + ?Sized>(input: &P) -> Shape {
         match input.serialize(Probe) {
+            // `()` and a JSON `null` — a `serde_json::Value` input — both write a unit. Only the
+            // first is no arguments: a caller passing `null` means the one argument `None`, and
+            // `()` is the one of the two that takes no space.
+            Err(Probed(Shape::NoArguments)) if std::mem::size_of_val(input) != 0 => {
+                Shape::OneArgument
+            }
             Err(Probed(shape)) => shape,
             Ok(()) => Shape::OneArgument,
         }
@@ -552,11 +558,12 @@ pub(crate) fn decode_input<P: DeserializeOwned + 'static, E>(
 
 /// A workflow's error, as every DBOS SDK writes it portably.
 ///
-/// All four fields are always written, `null` where there is nothing to say. On the way in, a
-/// missing `name` or `message` reads as empty, since not every SDK writes both.
+/// All four fields are always written, `null` where there is nothing to say. On the way in,
+/// `name` is required — every SDK writes it, and it is what makes an object an envelope rather
+/// than some other JSON — while a missing or `null` `message` reads as empty, since a Java
+/// exception may have none.
 #[derive(Debug, Serialize, Deserialize)]
 struct PortableError {
-    #[serde(default, deserialize_with = "null_as_default")]
     name: String,
     #[serde(default, deserialize_with = "null_as_default")]
     message: String,
@@ -586,18 +593,29 @@ pub(crate) fn encode_error<E: DurableError, E2>(
     encoding: &PayloadEncoding,
 ) -> Result<String, E2> {
     match encoding {
-        PayloadEncoding::Portable => encode(&to_portable(error), encoding, "error"),
+        PayloadEncoding::Portable => {
+            let portable =
+                to_portable(error).map_err(|source| Error::encode_failed("error", source))?;
+            encode(&portable, encoding, "error")
+        }
         PayloadEncoding::Native => encode(error, encoding, "error"),
     }
 }
 
-fn to_portable<E: DurableError>(error: &Error<E>) -> PortableError {
-    match error {
+/// The envelope for `error`, or why the application error's fields could not be written.
+///
+/// A failure is reported rather than written as `"data": null`: the error would then be recorded
+/// in a shape no reader could rebuild it from, which is the same failure as the native encoding's,
+/// only silent.
+fn to_portable<E: DurableError>(
+    error: &Error<E>,
+) -> std::result::Result<PortableError, serde_json::Error> {
+    Ok(match error {
         Error::Application(application) => PortableError {
             name: type_name::<E>().to_owned(),
             message: application.to_string(),
             code: None,
-            data: present(serde_json::to_value(application).ok()),
+            data: present(Some(serde_json::to_value(application)?)),
         },
         Error::Portable {
             name,
@@ -611,7 +629,7 @@ fn to_portable<E: DurableError>(error: &Error<E>) -> PortableError {
             data: data.clone(),
         },
         engine => {
-            let (name, data) = variant(engine);
+            let (name, data) = variant(engine)?;
             PortableError {
                 name,
                 message: engine.to_string(),
@@ -619,7 +637,7 @@ fn to_portable<E: DurableError>(error: &Error<E>) -> PortableError {
                 data: present(data),
             }
         }
-    }
+    })
 }
 
 /// `None` for a JSON `null`, so an error with nothing in it writes `"data":null` either way.
@@ -648,16 +666,18 @@ fn type_name<E>() -> &'static str {
 }
 
 /// The variant one of DBOS's own errors is, under [`DBOS_ERRORS`], and its fields.
-fn variant<E: DurableError>(error: &Error<E>) -> (String, Option<Value>) {
-    let (name, fields) = match serde_json::to_value(error) {
-        Ok(Value::String(unit)) => (unit, None),
-        Ok(Value::Object(tagged)) if tagged.len() == 1 => {
+fn variant<E: DurableError>(
+    error: &Error<E>,
+) -> std::result::Result<(String, Option<Value>), serde_json::Error> {
+    let (name, fields) = match serde_json::to_value(error)? {
+        Value::String(unit) => (unit, None),
+        Value::Object(tagged) if tagged.len() == 1 => {
             let (name, fields) = tagged.into_iter().next().expect("one entry");
             (name, Some(fields))
         }
         _ => ("Error".to_owned(), None),
     };
-    (format!("{DBOS_ERRORS}{name}"), fields)
+    Ok((format!("{DBOS_ERRORS}{name}"), fields))
 }
 
 /// Rebuilds the error a portable envelope was written from, if the reader's types can hold it.
@@ -670,18 +690,22 @@ fn variant<E: DurableError>(error: &Error<E>) -> (String, Option<Value>) {
 /// are what recognize an error. Anything else — another language's error, an application error of
 /// a type the reader does not have — is `None`, and stays portable.
 fn rebuild<E: DurableError>(name: &str, data: Option<&Value>) -> Option<Error<E>> {
-    let data = data.cloned().unwrap_or(Value::Null);
+    // Read through a borrow — `&Value` is itself a deserializer — so an application error's fields
+    // are copied only into the error they rebuild.
+    let data = data.unwrap_or(&Value::Null);
     if name == type_name::<E>()
-        && let Ok(application) = serde_json::from_value::<E>(data.clone())
+        && let Ok(application) = E::deserialize(data)
     {
         return Some(Error::Application(application));
     }
-    let variant = name.strip_prefix(DBOS_ERRORS)?;
+    let variant = name.strip_prefix(DBOS_ERRORS)?.to_owned();
+    // The externally tagged form serde reads a variant from, which needs a `Value` to read it as
+    // an enum: the bare name for a unit variant, `{"Variant": fields}` otherwise.
     let tagged = match data {
-        Value::Null => Value::String(variant.to_owned()),
-        fields => Value::Object([(variant.to_owned(), fields)].into_iter().collect()),
+        Value::Null => Value::String(variant),
+        fields => Value::Object(Map::from_iter([(variant, fields.clone())])),
     };
-    serde_json::from_value(tagged).ok()
+    Error::deserialize(&tagged).ok()
 }
 
 /// Decodes a workflow's error, stored in `encoding`, or `None` if it is not one.
@@ -865,6 +889,13 @@ mod tests {
     #[test]
     fn the_unit_is_written_as_no_arguments() {
         portable_round_trip((), r#"{"positionalArgs":[],"namedArgs":{}}"#);
+    }
+
+    /// A JSON `null` writes a unit as `()` does, but it is a value: the one argument `None`, which a
+    /// callee in another language takes as its parameter rather than being called with none.
+    #[test]
+    fn a_null_value_is_one_argument() {
+        portable_round_trip(Value::Null, r#"{"positionalArgs":[null],"namedArgs":{}}"#);
     }
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -1153,6 +1184,39 @@ mod tests {
         stays_portable(
             r#"{"name":"StepTimeout","message":"x","data":{"step":"charge","timeout":{"secs":1,"nanos":0}}}"#,
         );
+    }
+
+    /// An application error whose fields cannot be written as JSON is a failure to encode, as it
+    /// is natively, rather than an envelope with its `data` quietly left out.
+    #[test]
+    fn an_application_error_that_cannot_be_written_is_refused() {
+        #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+        #[error("no keys fit")]
+        struct BadKeys {
+            by_pair: std::collections::HashMap<(u8, u8), u8>,
+        }
+        let error: Error<BadKeys> = BadKeys {
+            by_pair: [((1, 2), 3)].into_iter().collect(),
+        }
+        .into();
+        let refused =
+            encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).unwrap_err();
+        assert!(
+            matches!(&refused, Error::Serialization { what, .. } if what == "error"),
+            "{refused:?}"
+        );
+    }
+
+    /// An object with no `name` is not an envelope, so it is not passed off as an empty one: the
+    /// caller gets `None`, and keeps the stored text.
+    #[test]
+    fn an_object_without_a_name_is_not_an_error_envelope() {
+        for stored in [r#"{"error":"boom"}"#, r#"{"name":null,"message":"boom"}"#] {
+            assert!(
+                decode_error::<EngineOnly>(stored, &PayloadEncoding::Portable).is_none(),
+                "{stored}"
+            );
+        }
     }
 
     #[test]

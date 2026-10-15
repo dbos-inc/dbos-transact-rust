@@ -12,8 +12,9 @@ use serde_json::{Map, Value, json};
 
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
-    PortableWorkflowArgs, QueueConflict, QueueOptions, SendOptions, SerializationFormat,
-    SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions, WriteStreamOptions,
+    PortableWorkflowArgs, QueueConflict, QueueOptions, ScheduleSpec, ScheduledWorkflowInput,
+    SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
+    WriteStreamOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -543,6 +544,63 @@ async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
         runs.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "the replay read the record rather than running the child again"
+    );
+    dbos.shutdown().await;
+}
+
+/// A scheduled run of a workflow registered portable is written portable, as a start through its
+/// reference would be. The schedule starts it by name, so the registration's choice has to come
+/// from the registry rather than from a reference the scheduler does not hold.
+#[tokio::test]
+async fn a_scheduled_run_takes_its_workflows_registered_format() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("portable-schedule", &db));
+    let ticks = dbos
+        .register_workflow_with(
+            WorkflowKey::new("ticks"),
+            portable(),
+            |input: ScheduledWorkflowInput<String>| async move { Ok::<_, Error>(input.context) },
+        )
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // Far from now, so the loop fires nothing on its own while the test runs.
+    let hour = (jiff::Timestamp::now().as_second() / 3600 + 12) % 24;
+    let spec = ScheduleSpec::new(
+        "portable-ticks",
+        &ticks,
+        format!("0 0 {hour} * * *"),
+        &"emea".to_owned(),
+    )
+    .unwrap();
+    dbos.create_schedule(&spec).await.unwrap();
+    let handle = dbos
+        .trigger_schedule::<String, EngineOnly>("portable-ticks")
+        .await
+        .unwrap();
+    let id = handle.workflow_id().to_owned();
+    assert_eq!(handle.result().await.unwrap(), "emea");
+
+    let serialization = scalar(
+        &db,
+        r#"SELECT serialization FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+        &id,
+    )
+    .await;
+    assert_eq!(serialization.as_deref(), Some("portable_json"));
+    let input: Value = serde_json::from_str(
+        &scalar(
+            &db,
+            r#"SELECT inputs FROM "dbos"."workflow_input" WHERE workflow_uuid = $1"#,
+            &id,
+        )
+        .await
+        .expect("the run has an input"),
+    )
+    .unwrap();
+    assert_eq!(
+        input["positionalArgs"][0]["context"], "emea",
+        "the input is the envelope: {input}"
     );
     dbos.shutdown().await;
 }

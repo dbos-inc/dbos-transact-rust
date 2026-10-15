@@ -71,9 +71,9 @@ use std::task::Poll;
 
 use crate::connection::{Connection, Owner};
 use crate::context::Ctx;
-use crate::error::{DurableError, EngineOnly, Error};
+use crate::error::{DurableError, Error};
 use crate::instance::Executor;
-use crate::serialization::{PayloadEncoding, decode};
+use crate::serialization::{PayloadEncoding, decode_error};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
 
 /// What a durable call works out at the call, before anything of it has run.
@@ -410,7 +410,8 @@ pub(crate) enum StepDurability<'a> {
 /// with its own fields, and an engine failure as the variant it was. The only payloads that do not
 /// survive are the `serde_json::Error` sources, which arrive absent rather than different.
 ///
-/// Read in the encoding its `tag` names. A tag this SDK cannot read is
+/// Read in the encoding its `tag` names, as a workflow's error is: [`decode_error`], so a portable
+/// one is rebuilt from its envelope. A tag this SDK cannot read is
 /// [`Error::UnknownSerialization`], as it is for every other payload.
 ///
 /// Falls back to a plain message when the bytes, in an encoding this SDK reads, are not one of
@@ -419,11 +420,10 @@ pub(crate) enum StepDurability<'a> {
 pub(crate) fn revive<E: DurableError>(recorded: &str, tag: Option<&str>, step: &str) -> Error<E> {
     match PayloadEncoding::of(tag) {
         Err(unknown) => unknown,
-        Ok(encoding) => decode::<Error<E>, EngineOnly>(Some(recorded), &encoding, "error")
-            .unwrap_or_else(|_| Error::StepFailed {
-                step: step.to_owned(),
-                message: recorded.to_owned(),
-            }),
+        Ok(encoding) => decode_error(recorded, &encoding).unwrap_or_else(|| Error::StepFailed {
+            step: step.to_owned(),
+            message: recorded.to_owned(),
+        }),
     }
 }
 
@@ -893,6 +893,25 @@ mod tests {
         let revived = revive::<EngineOnly>("sealed", Some("backwards_json"), "charge");
         assert!(
             matches!(&revived, Error::UnknownSerialization { name } if name == "backwards_json"),
+            "{revived:?}"
+        );
+    }
+
+    /// A step error recorded portably is rebuilt from its envelope, as a workflow's is, rather than
+    /// read as native bytes that do not fit and degraded to its text.
+    #[test]
+    fn a_portable_step_error_revives_as_itself() {
+        let recorded = crate::serialization::encode_error::<EngineOnly, EngineOnly>(
+            &Error::StepFailed {
+                step: "charge".to_owned(),
+                message: "declined".to_owned(),
+            },
+            &PayloadEncoding::Portable,
+        )
+        .unwrap();
+        let revived = revive::<EngineOnly>(&recorded, Some("portable_json"), "other");
+        assert!(
+            matches!(&revived, Error::StepFailed { step, message } if step == "charge" && message == "declined"),
             "{revived:?}"
         );
     }
