@@ -142,18 +142,22 @@ pub struct ClientConfig {
     /// sides whatever each is configured with.
     pub serializer: Serializer,
 
-    /// Whether to use LISTEN/NOTIFY rather than polling.
+    /// Whether to listen for notifications rather than poll.
     ///
-    /// On, so [`get_event`](crate::Client::get_event) is woken rather than polling. That is the one
-    /// wait it serves here: a workflow's *outcome* is announced on no channel, in this
-    /// implementation or any other — Python's `await_workflow_result` polls too — so a result wait
-    /// looks again every [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this is
-    /// set to.
+    /// **Off by default.** With it off, [`get_event`](crate::Client::get_event) looks again every
+    /// second, which finds the event promptly whatever the application is configured with.
     ///
-    /// Go's client starts its listener for the same reason. Python defaults its client's off — a
-    /// client there is often a short-lived script, and the listener is a thread and a held
-    /// connection — and this differs from Python deliberately: an event wait is the operation most
-    /// worth making cheap, and a client that never waits on one pays only the connection.
+    /// Turn it on only when the application's executors run on PostgreSQL with their own
+    /// `use_listen_notify` on. Then an event wait is woken as soon as the event is written, rather
+    /// than on the next poll. Against an application whose executors don't push notifications, an
+    /// opted-in client hears nothing, and each event wait falls back to re-reading once a minute.
+    /// The listener's startup check can't catch this: it proves this client can receive a
+    /// notification, not that the application sends any.
+    ///
+    /// It makes no difference to a wait on a workflow's outcome. An outcome is announced on no
+    /// channel, so a result wait looks again every
+    /// [`outcome_poll_interval`](field@Self::outcome_poll_interval) whatever this is set to.
+    /// CockroachDB has no LISTEN/NOTIFY, so there the client polls whatever this says.
     pub use_listen_notify: bool,
 
     /// How many polling reads may run at once.
@@ -188,7 +192,7 @@ impl ClientConfig {
             max_connections: 5,
             schema: DEFAULT_SCHEMA.to_owned(),
             serializer: Serializer::default(),
-            use_listen_notify: true,
+            use_listen_notify: false,
             polling_concurrency: None,
             outcome_poll_interval: None,
             notification_coalesce: None,
@@ -878,8 +882,8 @@ mod tests {
         );
         assert_eq!(config.schema, DEFAULT_SCHEMA);
         assert!(
-            config.use_listen_notify,
-            "a client's waits are woken rather than polled, as Go's are"
+            !config.use_listen_notify,
+            "a client polls unless told the application pushes notifications"
         );
         assert_eq!(config.outcome_poll_interval(), Duration::from_secs(1));
     }

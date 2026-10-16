@@ -243,8 +243,9 @@ impl crate::Client {
     /// `Ok(None)` means the key was not there when the deadline passed — absence is a value, not
     /// an error, and `Duration::ZERO` makes this a poll: look once, do not wait.
     ///
-    /// The wait is woken by a notification rather than polled, when the client was connected with
-    /// [`ClientConfig::use_listen_notify`](crate::ClientConfig::use_listen_notify) left on.
+    /// The wait polls every second, unless the client was connected with
+    /// [`ClientConfig::use_listen_notify`](crate::ClientConfig::use_listen_notify) turned on, when
+    /// it is woken by a notification instead.
     pub async fn get_event<T: DeserializeOwned>(
         &self,
         workflow_id: &str,
