@@ -9,10 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use dbos::{
-    BoxError, Client, ClientConfig, Config, CustomSerializer, DBOS, EngineOnly, Error, Payload,
-    PayloadSlot, QueueConflict, QueueOptions, ReadStreamOptions, ScheduleSpec,
-    ScheduledWorkflowInput, SerializationFormat, Serializer, SetEventOptions, WorkflowKey,
-    WorkflowOptions,
+    Client, ClientConfig, Config, CustomSerializer, DBOS, EngineOnly, Error, Payload, PayloadSlot,
+    QueueConflict, QueueOptions, ReadStreamOptions, ScheduleSpec, ScheduledWorkflowInput,
+    SerializationFormat, Serializer, SetEventOptions, WorkflowKey, WorkflowOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -30,11 +29,18 @@ impl CustomSerializer for Backwards {
         NAME
     }
 
-    fn serialize(&self, value: Payload<'_>) -> Result<String, BoxError> {
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         Ok(serde_json::to_string(&value)?.chars().rev().collect())
     }
 
-    fn deserialize(&self, text: &str, into: PayloadSlot<'_>) -> Result<(), BoxError> {
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json: String = text.chars().rev().collect();
         into.fill(&mut serde_json::Deserializer::from_str(&json))
     }
@@ -375,11 +381,18 @@ async fn a_built_in_or_empty_name_is_refused() {
             self.0
         }
 
-        fn serialize(&self, _: Payload<'_>) -> Result<String, BoxError> {
+        fn serialize(
+            &self,
+            _: Payload<'_>,
+        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
             unreachable!("never configured")
         }
 
-        fn deserialize(&self, _: &str, _: PayloadSlot<'_>) -> Result<(), BoxError> {
+        fn deserialize(
+            &self,
+            _: &str,
+            _: PayloadSlot<'_>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             unreachable!("never configured")
         }
     }

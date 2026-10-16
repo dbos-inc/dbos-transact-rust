@@ -115,8 +115,7 @@ pub use registry::{WorkflowKey, WorkflowOptions, WorkflowRef};
 pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
 pub use serialization::{
-    BoxError, CustomSerializer, Payload, PayloadSlot, PortableWorkflowArgs, SerializationFormat,
-    Serializer,
+    CustomSerializer, Payload, PayloadSlot, PortableWorkflowArgs, SerializationFormat, Serializer,
 };
 #[cfg(feature = "engine")]
 pub use sleep::sleep;

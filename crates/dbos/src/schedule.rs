@@ -292,17 +292,11 @@ pub struct ScheduleChange<'a> {
 }
 
 impl ScheduleChange<'_> {
-    /// Refuses a change that would leave a schedule no executor could fire, and encodes the
-    /// context with `configured`.
+    /// Refuses a change that would leave a schedule no executor could fire.
     ///
     /// **A new expression is checked against the new timezone or UTC**, not the stored one: the
     /// stored row is not read, and an expression that fires somewhere fires everywhere.
-    fn validate(
-        &self,
-        name: &str,
-        operation: &'static str,
-        configured: &Serializer,
-    ) -> Result<Option<String>> {
+    fn validate(&self, name: &str, operation: &'static str) -> Result<()> {
         let refuse = |detail: String| Error::InvalidArgument {
             operation: operation.into(),
             detail: format!("schedule `{name}`: {detail}"),
@@ -320,6 +314,11 @@ impl ScheduleChange<'_> {
             }
             Change::Leave => {}
         }
+        Ok(())
+    }
+
+    /// The new context, encoded with `configured` as the row stores it, or `None` to leave it.
+    fn encode_context(&self, configured: &Serializer) -> Result<Option<String>> {
         match &self.context {
             Change::Set(context) => Ok(Some(encode(
                 context,
@@ -588,7 +587,8 @@ impl DBOS {
     ) -> PendingStep<'a, ()> {
         const OPERATION: &str = "update a schedule";
         let built = self.executor(OPERATION).and_then(|executor| {
-            let context = change.validate(name, OPERATION, executor.serializer())?;
+            change.validate(name, OPERATION)?;
+            let context = change.encode_context(executor.serializer())?;
             let placement = StepPlacement::of(executor.connection(), OPERATION)?;
             Ok(((executor, context), placement))
         });
@@ -784,7 +784,8 @@ impl Client {
 
     /// Changes a schedule's definition. See [`DBOS::update_schedule`].
     pub async fn update_schedule(&self, name: &str, change: &ScheduleChange<'_>) -> Result<()> {
-        let context = change.validate(name, "update a schedule", self.connection().serializer())?;
+        change.validate(name, "update a schedule")?;
+        let context = change.encode_context(self.connection().serializer())?;
         self.connection()
             .update_schedule(name, change, context.as_deref(), None)
             .await
@@ -1273,7 +1274,7 @@ mod tests {
         fn serialize(
             &self,
             value: crate::Payload<'_>,
-        ) -> std::result::Result<String, crate::BoxError> {
+        ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
             Ok(serde_json::to_string(&value)?.chars().rev().collect())
         }
 
@@ -1281,7 +1282,7 @@ mod tests {
             &self,
             text: &str,
             into: crate::PayloadSlot<'_>,
-        ) -> std::result::Result<(), crate::BoxError> {
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let json: String = text.chars().rev().collect();
             into.fill(&mut serde_json::Deserializer::from_str(&json))
         }

@@ -37,9 +37,6 @@ pub(crate) const PORTABLE_JSON: &str = "portable_json";
 /// it and reading it, through whatever wraps it.
 const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 
-/// The error a [`CustomSerializer`] reports.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
 /// An application's own serializer, configured with [`Serializer::Custom`].
 ///
 /// It sees every value with its real type, through `serde`: [`serialize`](Self::serialize) gets a
@@ -49,7 +46,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// writes.
 ///
 /// ```
-/// use dbos::{BoxError, CustomSerializer, Payload, PayloadSlot};
+/// use dbos::{CustomSerializer, Payload, PayloadSlot};
 ///
 /// /// JSON, reversed: a stand-in for an encrypting serializer.
 /// #[derive(Debug)]
@@ -60,11 +57,18 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///         "backwards_json"
 ///     }
 ///
-///     fn serialize(&self, value: Payload<'_>) -> Result<String, BoxError> {
+///     fn serialize(
+///         &self,
+///         value: Payload<'_>,
+///     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
 ///         Ok(serde_json::to_string(&value)?.chars().rev().collect())
 ///     }
 ///
-///     fn deserialize(&self, text: &str, into: PayloadSlot<'_>) -> Result<(), BoxError> {
+///     fn deserialize(
+///         &self,
+///         text: &str,
+///         into: PayloadSlot<'_>,
+///     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///         let json: String = text.chars().rev().collect();
 ///         into.fill(&mut serde_json::Deserializer::from_str(&json))
 ///     }
@@ -98,10 +102,17 @@ pub trait CustomSerializer: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
 
     /// Encodes one value.
-    fn serialize(&self, value: Payload<'_>) -> std::result::Result<String, BoxError>;
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Decodes `text`, which this serializer wrote, by handing a deserializer for it to `into`.
-    fn deserialize(&self, text: &str, into: PayloadSlot<'_>) -> std::result::Result<(), BoxError>;
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// A value for a [`CustomSerializer`] to encode: whatever the application handed the engine, seen
@@ -139,7 +150,7 @@ impl PayloadSlot<'_> {
     pub fn fill<'de, D: Deserializer<'de>>(
         self,
         deserializer: D,
-    ) -> std::result::Result<(), BoxError> {
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut erased = <dyn erased_serde::Deserializer>::erase(deserializer);
         (self.visit)(&mut erased).map_err(|error| error.to_string().into())
     }
@@ -1692,7 +1703,10 @@ mod tests {
             "backwards_json"
         }
 
-        fn serialize(&self, value: Payload<'_>) -> std::result::Result<String, BoxError> {
+        fn serialize(
+            &self,
+            value: Payload<'_>,
+        ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
             Ok(serde_json::to_string(&value)?.chars().rev().collect())
         }
 
@@ -1700,7 +1714,7 @@ mod tests {
             &self,
             text: &str,
             into: PayloadSlot<'_>,
-        ) -> std::result::Result<(), BoxError> {
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let json: String = text.chars().rev().collect();
             into.fill(&mut serde_json::Deserializer::from_str(&json))
         }
@@ -1782,7 +1796,10 @@ mod tests {
                 "forgetful"
             }
 
-            fn serialize(&self, _: Payload<'_>) -> std::result::Result<String, BoxError> {
+            fn serialize(
+                &self,
+                _: Payload<'_>,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
                 Ok(String::new())
             }
 
@@ -1790,7 +1807,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: PayloadSlot<'_>,
-            ) -> std::result::Result<(), BoxError> {
+            ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
         }
