@@ -137,10 +137,11 @@ impl Connection {
     ///   own the schema"*); Python's, TypeScript's and Java's neither migrate nor check.
     /// - **The application name may be absent**, which no application's may be. A nameless client
     ///   writes unclaimed rows and reads across every application.
-    ///
-    /// What it does *not* differ in is the connection itself: the listener and notifier start the
-    /// same way, so a client's blocking reads are woken rather than polled. Go's `NewClient` calls
-    /// the same `Launch` on its system database for the same reason.
+    /// - **Notifications are opt-in.** The listener and notifier start only when
+    ///   [`ClientConfig::use_listen_notify`] is on, and it is off by default. A client can't tell
+    ///   whether the application's executors push notifications, and a listening client's event
+    ///   waits re-read only once a minute, so against executors that don't push they stall.
+    ///   Polling every second is correct against any application.
     pub(crate) async fn for_client(config: &ClientConfig) -> Result<Self> {
         config.validate()?;
 

@@ -875,6 +875,20 @@ pub trait SystemDatabase: Send + Sync {
     /// both expose the same.
     async fn close(&self);
 
+    /// Whether this handle started its notification tasks and pushes its own writes. For tests
+    /// that reach a backend only through this trait.
+    #[cfg(test)]
+    fn is_pushing(&self) -> bool {
+        false
+    }
+
+    /// Whether a notification listener has proved it delivers to this handle. For tests that reach
+    /// a backend only through this trait.
+    #[cfg(test)]
+    fn is_delivering(&self) -> bool {
+        false
+    }
+
     /// Reads a recorded step, or `None` if it has not run.
     ///
     /// `check` rather than `get`, following all three references, because this is a replay gate

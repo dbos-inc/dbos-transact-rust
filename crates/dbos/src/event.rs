@@ -243,9 +243,11 @@ impl crate::Client {
     /// `Ok(None)` means the key was not there when the deadline passed — absence is a value, not
     /// an error, and `Duration::ZERO` makes this a poll: look once, do not wait.
     ///
-    /// The wait polls every second, unless the client was connected with
-    /// [`ClientConfig::use_listen_notify`](crate::ClientConfig::use_listen_notify) turned on, when
-    /// it is woken by a notification instead.
+    /// The wait looks again every second, unless the client was connected with
+    /// [`ClientConfig::use_listen_notify`](crate::ClientConfig::use_listen_notify) turned on. Then
+    /// it is woken by the application's notification, and looks again only once a minute, so
+    /// against executors that don't push notifications each wait can take up to a minute. On
+    /// CockroachDB it looks every second whatever the setting.
     pub async fn get_event<T: DeserializeOwned>(
         &self,
         workflow_id: &str,

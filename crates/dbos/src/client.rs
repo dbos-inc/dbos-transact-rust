@@ -145,14 +145,21 @@ pub struct ClientConfig {
     /// Whether to listen for notifications rather than poll.
     ///
     /// **Off by default.** With it off, [`get_event`](crate::Client::get_event) looks again every
-    /// second, which finds the event promptly whatever the application is configured with.
+    /// second, and [`read_stream`](crate::Client::read_stream) every
+    /// [`polling_interval`](crate::ReadStreamOptions::polling_interval). Both find a value
+    /// promptly whatever the application is configured with.
     ///
-    /// Turn it on only when the application's executors run on PostgreSQL with their own
-    /// `use_listen_notify` on. Then an event wait is woken as soon as the event is written, rather
-    /// than on the next poll. Against an application whose executors don't push notifications, an
+    /// On, a listener wakes those waits as soon as the value is written, provided the
+    /// application's executors push notifications: they run on PostgreSQL with their own
+    /// `use_listen_notify` on. Turn it on only when they do. Against executors that don't push, an
     /// opted-in client hears nothing, and each event wait falls back to re-reading once a minute.
     /// The listener's startup check can't catch this: it proves this client can receive a
-    /// notification, not that the application sends any.
+    /// notification, not that the application sends any. A stream read is safe either way: it
+    /// keeps re-reading on its own interval, because it also watches for the producer to finish,
+    /// which nothing announces.
+    ///
+    /// On also starts the notifier that pushes this process's own writes to other processes. A
+    /// client writes no events or stream values, so it has nothing to send.
     ///
     /// It makes no difference to a wait on a workflow's outcome. An outcome is announced on no
     /// channel, so a result wait looks again every
@@ -886,6 +893,107 @@ mod tests {
             "a client polls unless told the application pushes notifications"
         );
         assert_eq!(config.outcome_poll_interval(), Duration::from_secs(1));
+    }
+
+    /// `use_listen_notify` decides whether a client starts its notification tasks. Off by
+    /// default, so a client polls unless told the application pushes. CockroachDB declines them
+    /// whatever the setting.
+    #[tokio::test]
+    async fn a_client_starts_notifications_only_when_asked() {
+        let db = dbos_test_support::test_database().await;
+        let default = Client::connect(ClientConfig::new(db.url()))
+            .await
+            .expect("connect failed");
+        let opted_in = Client::connect(ClientConfig {
+            use_listen_notify: true,
+            ..ClientConfig::new(db.url())
+        })
+        .await
+        .expect("connect failed");
+
+        let started = (
+            default.connection().sysdb().is_pushing(),
+            opted_in.connection().sysdb().is_pushing(),
+        );
+        default.close().await;
+        opted_in.close().await;
+        assert_eq!(
+            started,
+            (false, db.backend() == dbos_test_support::Backend::Postgres),
+            "(default, opted in)"
+        );
+    }
+
+    /// An opted-in client's `get_event` is woken by the application's notification.
+    ///
+    /// Once the client's listener delivers, its event waits look again only once a minute, so a
+    /// wait that sees the event within the bound below was woken by a notification. The wait
+    /// starts before the event is written; one that started after would find it on its first
+    /// look and pass without proving anything, which the head start makes unlikely.
+    #[tokio::test]
+    async fn an_opted_in_client_is_woken_by_the_application() {
+        let db = dbos_test_support::test_database().await;
+        if db.backend() == dbos_test_support::Backend::Cockroach {
+            return; // No LISTEN/NOTIFY, so nothing to be woken by.
+        }
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..crate::Config::new("client-wake-app", db.url())
+        });
+        let release = Arc::new(tokio::sync::Notify::new());
+        let workflow = dbos
+            .register_workflow("publish-later", {
+                let release = Arc::clone(&release);
+                move |()| {
+                    let release = Arc::clone(&release);
+                    async move {
+                        release.notified().await;
+                        crate::set_event("ready", &1u32).await?;
+                        Ok::<(), Error>(())
+                    }
+                }
+            })
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+
+        let client = Client::connect(ClientConfig {
+            use_listen_notify: true,
+            ..ClientConfig::new(db.url())
+        })
+        .await
+        .expect("connect failed");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !client.connection().sysdb().is_delivering() && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let delivering = client.connection().sysdb().is_delivering();
+
+        let handle = workflow.start(()).await.expect("start failed");
+        let id = handle.workflow_id().to_owned();
+        let waiting = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let started = tokio::time::Instant::now();
+                let value = client
+                    .get_event::<u32>(&id, "ready", Duration::from_secs(50))
+                    .await;
+                (value, started.elapsed())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release.notify_one();
+        let (value, elapsed) = waiting.await.expect("the wait panicked");
+
+        client.close().await;
+        dbos.shutdown().await;
+        assert!(delivering, "the client's listener never proved it delivers");
+        assert_eq!(value.expect("read failed"), Some(1));
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "took {elapsed:?}: the wait fell back to its re-read rather than being woken"
+        );
     }
 
     #[test]

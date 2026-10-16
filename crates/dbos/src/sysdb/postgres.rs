@@ -4856,6 +4856,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    #[cfg(test)]
+    fn is_pushing(&self) -> bool {
+        PostgresSystemDatabase::is_pushing(self)
+    }
+
+    #[cfg(test)]
+    fn is_delivering(&self) -> bool {
+        PostgresSystemDatabase::is_delivering(self)
+    }
+
     async fn close(&self) {
         // **Before the pool closes**, because the notifier's last act is a database write: whatever
         // it was still holding in its coalescing window goes out, so a value written a moment ago

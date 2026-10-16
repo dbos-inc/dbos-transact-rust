@@ -19,7 +19,7 @@ use dbos::{
     EnqueueOptions, Error, ForkOptions, Message, QueueChange, QueueConflict, QueueOptions,
     SendOptions, StartOptions, WorkflowHandle,
 };
-use dbos_test_support::{Backend, TestDatabase, raw_database, test_database};
+use dbos_test_support::{TestDatabase, raw_database, test_database};
 
 /// A client for `db`, acting for `app_name`.
 async fn client(app_name: &str, db: &TestDatabase) -> Client {
@@ -773,67 +773,6 @@ async fn a_dropped_client_releases_its_connections() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-/// A client's `use_listen_notify` decides whether it holds a `LISTEN` connection.
-///
-/// Off by default, so a client polls unless told the application pushes notifications. Counted on
-/// the server, because the listener is a background task with nothing to observe on the client.
-/// PostgreSQL only: CockroachDB has no `LISTEN`, so no client there ever starts a listener.
-#[tokio::test]
-async fn a_client_listens_only_when_asked() {
-    const ON: &str = "dbos-client-listen-on";
-    const OFF: &str = "dbos-client-listen-off";
-
-    let db = test_database().await;
-    if db.backend() == Backend::Cockroach {
-        return;
-    }
-    let listening = |tag: &'static str| {
-        let db = &db;
-        async move {
-            let mut admin = db.admin_connection().await;
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM pg_stat_activity \
-                 WHERE application_name = $1 AND query ILIKE 'LISTEN%'",
-            )
-            .bind(tag)
-            .fetch_one(&mut admin)
-            .await
-            .expect("failed to count listeners")
-        }
-    };
-    let connect = |tag: &'static str, use_listen_notify: Option<bool>| {
-        let mut config = ClientConfig::new(format!("{}?application_name={tag}", db.url()));
-        if let Some(on) = use_listen_notify {
-            config.use_listen_notify = on;
-        }
-        Client::connect(config)
-    };
-
-    let on = connect(ON, Some(true)).await.expect("connect failed");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while listening(ON).await == 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a client asked to listen never issued LISTEN"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // Left at the default. The opted-in client above started listening within its first moments,
-    // so a short wait is long enough to see a listener here, if one were started.
-    let off = connect(OFF, None).await.expect("connect failed");
-    assert!(off.queue("nothing").await.expect("read failed").is_none());
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        listening(OFF).await,
-        0,
-        "a default client should not listen"
-    );
-
-    on.close().await;
-    off.close().await;
 }
 
 /// A client is refused the conflict policy that needs an application version.
