@@ -564,6 +564,40 @@ async fn only_the_notifications_trigger_survives() {
     );
 }
 
+/// Migrations 43 and 44 drop their triggers even when the process running them doesn't listen.
+///
+/// A database migrated up to 42 with notifications on has the workflow-events and streams
+/// triggers. A process that later takes it past 44 with notifications off must still drop them;
+/// otherwise 43 and 44 are recorded as applied and the triggers stay forever.
+#[tokio::test]
+async fn the_trigger_drops_run_without_listen_notify() {
+    let db = raw_database().await;
+    if db.backend() == Backend::Cockroach {
+        return; // CockroachDB installs none of them.
+    }
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let with_notify = build_migrations(schema, Dialect::Postgres, true);
+    let without = build_migrations(schema, Dialect::Postgres, false);
+    assert_eq!(with_notify[41].version, 42);
+    apply_all(&pool, schema, &with_notify[..42]).await;
+    apply_all(&pool, schema, &without[42..]).await;
+
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT trigger_name FROM information_schema.triggers \
+         WHERE trigger_schema = $1 ORDER BY 1",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .expect("failed to list triggers");
+    assert_eq!(names, vec!["dbos_notifications_trigger".to_owned()]);
+}
+
 /// Migration 10 is skipped, because migration 1 already created the primary key.
 ///
 /// Its guard is the only conditional in the corpus, and the branch it protects is one this

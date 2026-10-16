@@ -310,12 +310,8 @@ sources![
     (40, "40_add_attributes.sql", Applies::Always),
     (41, "41_add_schedule_name.sql", Applies::Always),
     (42, "42_add_debounce_columns.sql", Applies::Always),
-    (43, "43_drop_streams_trigger.sql", Applies::WhenNotify),
-    (
-        44,
-        "44_drop_workflow_events_trigger.sql",
-        Applies::WhenNotify
-    ),
+    (43, "43_drop_streams_trigger.sql", Applies::Postgres),
+    (44, "44_drop_workflow_events_trigger.sql", Applies::Postgres),
     (45, "45_add_partition_dequeue_index.sql", Applies::Always),
     (46, "46_add_partition_dequeue_index_v2.sql", Applies::Always),
     (47, "47_drop_partition_dequeue_index.sql", Applies::Always),
@@ -642,15 +638,22 @@ mod tests {
             );
         }
 
-        // 39, 43 and 44 install and drop triggers that exist only under LISTEN/NOTIFY.
-        for version in [39, 43, 44] {
+        // 39 installs a trigger that exists only under LISTEN/NOTIFY.
+        assert!(!pg_notify[&39].is_empty(), "39 applies with notify");
+        assert!(pg_plain[&39].is_empty(), "39 is a no-op without");
+
+        // 43 and 44 drop triggers a database may have gained while notify was on, so they run on
+        // every PostgreSQL database whether or not this process listens. CockroachDB never had
+        // the triggers.
+        for version in [43, 44] {
             assert!(
-                !pg_notify[&version].is_empty(),
-                "{version} applies with notify"
+                pg_plain[&version].contains("DROP TRIGGER"),
+                "{version} applies without notify"
             );
+            assert_eq!(pg_plain[&version], pg_notify[&version]);
             assert!(
-                pg_plain[&version].is_empty(),
-                "{version} is a no-op without"
+                crdb[&version].is_empty(),
+                "{version} is a no-op on CockroachDB"
             );
         }
 
