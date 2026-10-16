@@ -7811,6 +7811,7 @@ mod tests {
 
     /// Plain JSON under [`UNIT_TAG`]: a codec whose tag no built-in encoding shares, so a row
     /// carrying it was tagged by the caller's codec rather than by this layer.
+    #[derive(Debug)]
     struct UnitCodec;
 
     impl StepCodec for UnitCodec {

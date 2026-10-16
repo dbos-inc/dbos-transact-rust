@@ -1938,7 +1938,7 @@ pub struct NotificationRecord {
 /// implement: JSON in, text and a tag out. Every value that crosses is a plain record — strings,
 /// integers, enums, epoch-millisecond times — so nothing depends on a format being
 /// human-readable.
-pub trait StepCodec: Send + Sync {
+pub trait StepCodec: Send + Sync + fmt::Debug {
     /// Encodes `value`, and names the encoding for the row's `serialization` column.
     fn encode(&self, value: serde_json::Value) -> Result<EncodedValue, Error>;
 
@@ -1957,7 +1957,7 @@ pub trait StepCodec: Send + Sync {
 ///
 /// Given one, the call's work and its step checkpoint **commit together**: see
 /// [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct StepCaller<'a> {
     /// The workflow making the call.
     pub workflow_id: &'a str,
@@ -1965,15 +1965,6 @@ pub struct StepCaller<'a> {
     pub step_id: i32,
     /// How the recorded result is encoded and decoded.
     pub codec: &'a dyn StepCodec,
-}
-
-impl fmt::Debug for StepCaller<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StepCaller")
-            .field("workflow_id", &self.workflow_id)
-            .field("step_id", &self.step_id)
-            .finish_non_exhaustive()
-    }
 }
 
 /// The workflow a [`get_event`](crate::sysdb::SystemDatabase::get_event) runs on behalf of, and the
