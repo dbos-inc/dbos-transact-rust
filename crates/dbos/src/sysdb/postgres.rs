@@ -7585,7 +7585,7 @@ impl PostgresSystemDatabase {
 mod tests {
     use super::{
         AssertSqlSafe, PostgresSystemDatabase, Settings, classify_sqlstate, is_transport_failure,
-        polling_limit, split_database, with_retry,
+        polling_limit, split_database, step_payloads, with_retry,
     };
     use crate::sysdb::types::{NewWorkflow, Submission, Timestamp};
     use crate::sysdb::{BackendError, BackendErrorKind, Error, SystemDatabase};
@@ -7638,6 +7638,20 @@ mod tests {
             classify_sqlstate("23505", None),
             BackendErrorKind::Permanent
         );
+    }
+
+    /// A listing that doesn't load outputs never reads the payload columns, so large step
+    /// outputs cost it nothing. Only the aliases name them.
+    #[test]
+    fn a_step_listing_without_outputs_reads_no_payload_column() {
+        let columns = step_payloads(false)
+            .replace("AS output", "")
+            .replace("AS error", "");
+        assert!(
+            !columns.contains("output") && !columns.contains("error"),
+            "{columns}"
+        );
+        assert_eq!(step_payloads(true), "output, error");
     }
 
     /// The message CockroachDB attaches to `XXUUU` when a client's connection dies mid-read,

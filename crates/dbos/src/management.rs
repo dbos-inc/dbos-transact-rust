@@ -243,6 +243,28 @@ pub struct RewindOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
 }
 
+/// What a step listing reads.
+///
+/// Constructed with `..Default::default()`, which reads everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListWorkflowStepsOptions {
+    /// Whether to read each step's [`output`](StepRecord::output) and
+    /// [`error`](StepRecord::error). On by default.
+    ///
+    /// Off, the listing reads only the steps' metadata — id, name, child workflow, serialization
+    /// and timings — and leaves both `None`. The payload columns are left out of the query, so a
+    /// workflow whose steps returned large values costs no more to list than one whose steps
+    /// returned nothing. A step that returned nothing and a step whose output wasn't read look the
+    /// same.
+    pub load_output: bool,
+}
+
+impl Default for ListWorkflowStepsOptions {
+    fn default() -> Self {
+        Self { load_output: true }
+    }
+}
+
 impl DBOS {
     /// This instance, refused if it is not the one running the calling workflow — and where the
     /// call stands in that workflow.
@@ -966,8 +988,10 @@ impl DBOS {
 
     /// Reads one workflow's steps, in execution order.
     ///
-    /// Outputs and errors come with them. This is a single workflow's own history, bounded by what
-    /// that workflow did, so there is no paging here as there is on
+    /// Outputs and errors come with them, unless
+    /// [`list_workflow_steps_with`](Self::list_workflow_steps_with) leaves them out. This is a
+    /// single workflow's own history, bounded by what that workflow did, so there is no paging here
+    /// as there is on
     /// [`list_workflows`](Self::list_workflows) — the system database layer carries limit and
     /// offset for the caller that has a workflow long enough to need them.
     ///
@@ -980,13 +1004,26 @@ impl DBOS {
         &self,
         workflow_id: &'a str,
     ) -> PendingStep<'a, Vec<StepRecord>> {
+        self.list_workflow_steps_with(workflow_id, ListWorkflowStepsOptions::default())
+    }
+
+    /// Reads one workflow's steps, choosing what each step carries.
+    ///
+    /// See [`list_workflow_steps`](Self::list_workflow_steps).
+    /// [`load_output`](ListWorkflowStepsOptions::load_output) off reads only the steps' metadata,
+    /// for a listing of a workflow whose step outputs are large.
+    pub fn list_workflow_steps_with<'a>(
+        &self,
+        workflow_id: &'a str,
+        options: ListWorkflowStepsOptions,
+    ) -> PendingStep<'a, Vec<StepRecord>> {
         PendingStep::placed(
             step_names::LIST_WORKFLOW_STEPS,
             self.placed("list a workflow's steps"),
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .list_workflow_steps(workflow_id, placement.step())
+                    .list_workflow_steps(workflow_id, options.load_output, placement.step())
                     .await
             },
         )
@@ -1241,8 +1278,20 @@ impl crate::Client {
 
     /// Reads the steps a workflow has recorded, in the order it recorded them.
     pub async fn list_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
+        self.list_workflow_steps_with(workflow_id, ListWorkflowStepsOptions::default())
+            .await
+    }
+
+    /// Reads the steps a workflow has recorded, choosing what each step carries.
+    ///
+    /// See [`DBOS::list_workflow_steps_with`].
+    pub async fn list_workflow_steps_with(
+        &self,
+        workflow_id: &str,
+        options: ListWorkflowStepsOptions,
+    ) -> Result<Vec<StepRecord>> {
         self.connection()
-            .list_workflow_steps(workflow_id, None)
+            .list_workflow_steps(workflow_id, options.load_output, None)
             .await
     }
 }
@@ -1451,10 +1500,11 @@ impl Connection {
     pub(crate) async fn list_workflow_steps(
         &self,
         workflow_id: &str,
+        load_output: bool,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<StepRecord>> {
         self.sysdb()
-            .list_workflow_steps(workflow_id, true, None, None, caller)
+            .list_workflow_steps(workflow_id, load_output, None, None, caller)
             .await
             .map_err(Error::SystemDatabase)
     }

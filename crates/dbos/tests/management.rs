@@ -13,7 +13,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
 use dbos::{
-    Children, Config, DBOS, EngineOnly, Enqueue, Error, ForkOptions, ResumeOptions, StartOptions,
+    Children, Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, Error, ForkOptions,
+    ListWorkflowStepsOptions, ResumeOptions, StartOptions,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -767,6 +768,96 @@ async fn listing_a_workflows_steps_reports_them_in_execution_order() {
             .is_empty()
     );
 
+    dbos.shutdown().await;
+}
+
+/// A step listing with `load_output` off reads each step's metadata and leaves its output and
+/// error out, on both the instance and a client. Left on, the default, both come back.
+#[tokio::test]
+async fn a_step_listing_can_leave_the_outputs_out() {
+    const BIG: usize = 1 << 20;
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("steps-no-output-app", &db));
+    let workflow = dbos
+        .register_workflow("big-then-fails", |()| async move {
+            dbos::step("big", || async { Ok::<String, Error>("x".repeat(BIG)) }).await?;
+            dbos::step("fails", || async {
+                Err::<(), Error>(Error::Portable {
+                    name: "Declined".to_owned(),
+                    message: "declined".to_owned(),
+                    code: None,
+                    data: None,
+                })
+            })
+            .await?;
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "big-then-fails";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the second step fails the workflow");
+
+    let client = Client::connect(ClientConfig {
+        app_name: Some("steps-no-output-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+    let without = ListWorkflowStepsOptions { load_output: false };
+
+    for steps in [
+        dbos.list_workflow_steps_with(id, without)
+            .await
+            .expect("listing failed"),
+        client
+            .list_workflow_steps_with(id, without)
+            .await
+            .expect("listing failed"),
+    ] {
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| (s.step_id, s.step_name.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, "big"), (1, "fails")],
+        );
+        for step in &steps {
+            assert_eq!(step.output, None, "{} was read", step.step_name);
+            assert_eq!(step.error, None, "{} was read", step.step_name);
+            assert!(step.started_at.is_some() && step.completed_at.is_some());
+            assert!(step.serialization.is_some());
+        }
+    }
+
+    for steps in [
+        dbos.list_workflow_steps(id).await.expect("listing failed"),
+        client
+            .list_workflow_steps(id)
+            .await
+            .expect("listing failed"),
+    ] {
+        assert!(
+            steps[0].output.as_ref().is_some_and(|o| o.len() > BIG),
+            "the big step's output is read by default"
+        );
+        assert!(
+            steps[1].error.is_some(),
+            "the failed step's error is read by default"
+        );
+    }
+
+    client.close().await;
     dbos.shutdown().await;
 }
 
