@@ -88,8 +88,8 @@ use super::types::{
     GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
     NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord,
-    Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
+    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
     is_valid_application_name, validate_attributes,
 };
@@ -749,32 +749,39 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     let StepCaller {
         workflow_id,
         step_id,
-        codec,
+        ..
     } = caller;
     tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
-    let serialization = step.serialization.as_deref();
     if let Some(recorded) = step.error.as_deref() {
-        let error: Error = decode_recorded(codec, recorded, serialization)
-            .map_err(|e| unreadable(e, workflow_id, step_id, step_name, "an error"))?;
-        return Err(error);
+        return Err(decode_recorded(
+            step, recorded, caller, step_name, "an error",
+        )?);
     }
     let recorded = step.output.as_deref().ok_or_else(|| {
         Error::Malformed(format!(
             "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
         ))
     })?;
-    decode_recorded(codec, recorded, serialization)
-        .map_err(|e| unreadable(e, workflow_id, step_id, step_name, "an output"))
+    decode_recorded(step, recorded, caller, step_name, "an output")
 }
 
-/// Reads a recorded value back through `codec`, by the tag it was stored under.
+/// Reads one of `step`'s recorded values back through the caller's codec, by the tag the row was
+/// stored under, and says which step it came from if it cannot. `what` names the value for that
+/// message: `an error` or `an output`.
 fn decode_recorded<T: serde::de::DeserializeOwned>(
-    codec: &dyn StepCodec,
+    step: &StepRecord,
     recorded: &str,
-    serialization: Option<&str>,
+    caller: StepCaller<'_>,
+    step_name: &str,
+    what: &str,
 ) -> Result<T, Error> {
-    let value = codec.decode(recorded, serialization)?;
-    serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
+    caller
+        .codec
+        .decode(recorded, step.serialization.as_deref())
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
+        })
+        .map_err(|e| unreadable(e, caller.workflow_id, caller.step_id, step_name, what))
 }
 
 /// Says which step a recorded value could not be read from.
