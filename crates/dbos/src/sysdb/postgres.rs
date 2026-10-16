@@ -88,10 +88,10 @@ use super::types::{
     GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
     NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepRecord, StepTiming, StreamRead, StreamRecord, Submission, Timestamp,
-    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs, is_valid_application_name,
-    validate_attributes,
+    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
+    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
+    is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -732,25 +732,34 @@ impl std::ops::DerefMut for StepConn {
 /// run took. The step runners record a failure only when [`Error::should_record`] says to, so none
 /// of them is one [`with_retry`] would retry.
 ///
-/// A void method reaches here too, and does not trip the missing-output check: `()` serialises to
-/// the four-character string `null`, so the column holds a value rather than SQL NULL. Whether a
-/// step ran is answered by the row existing, never by its output being empty — which is also why
-/// `Option<T>` round-trips correctly, a recorded `None` and an absent step being the same JSON and
-/// different answers.
+/// **Decoded by the row's tag, through the caller's codec**, whatever that codec would itself
+/// write — so a checkpoint written under an earlier configuration still replays, and one under a
+/// tag the codec cannot read is [`Error::UnknownSerialization`] rather than a guess.
+///
+/// A void method reaches here too, and does not trip the missing-output check: `()` encodes to
+/// JSON `null`, so the column holds a value rather than SQL NULL. Whether a step ran is answered
+/// by the row existing, never by its output being empty — which is also why `Option<T>`
+/// round-trips correctly, a recorded `None` and an absent step being the same JSON and different
+/// answers.
 fn replayed_output<T: serde::de::DeserializeOwned>(
     step: &StepRecord,
-    workflow_id: &str,
-    step_id: i32,
+    caller: StepCaller<'_>,
     step_name: &str,
 ) -> Result<T, Error> {
+    let StepCaller {
+        workflow_id,
+        step_id,
+        codec,
+    } = caller;
     tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
+    let serialization = step.serialization.as_deref();
     if let Some(recorded) = step.error.as_deref() {
-        let error: Error = serde_json::from_str(recorded).map_err(|e| {
-            Error::Malformed(format!(
-                "workflow {workflow_id} step {step_id} ({step_name}) has an error this build \
-                 cannot read: {e}"
-            ))
-        })?;
+        let error: Error = codec
+            .decode(recorded, serialization)
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
+            })
+            .map_err(|e| unreadable(e, workflow_id, step_id, step_name, "an error"))?;
         return Err(error);
     }
     let recorded = step.output.as_deref().ok_or_else(|| {
@@ -758,12 +767,27 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
             "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
         ))
     })?;
-    serde_json::from_str(recorded).map_err(|e| {
-        Error::Malformed(format!(
-            "workflow {workflow_id} step {step_id} ({step_name}) has an output this build cannot \
-             read: {e}"
-        ))
-    })
+    codec
+        .decode(recorded, serialization)
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
+        })
+        .map_err(|e| unreadable(e, workflow_id, step_id, step_name, "an output"))
+}
+
+/// Says which step a recorded value could not be read from.
+///
+/// An unknown tag stays [`Error::UnknownSerialization`], which already names what is missing;
+/// anything else becomes [`Error::Malformed`], with the step that holds it.
+fn unreadable(error: Error, workflow_id: &str, step_id: i32, step_name: &str, what: &str) -> Error {
+    match error {
+        Error::UnknownSerialization { .. } => error,
+        Error::Malformed(detail) => Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} ({step_name}) has {what} this build cannot \
+             read: {detail}"
+        )),
+        other => other,
+    }
 }
 
 impl PostgresSystemDatabase {
@@ -803,7 +827,7 @@ impl PostgresSystemDatabase {
     /// there a differing completion is the right answer.
     async fn run_transactional_step<T, F, Fut>(
         &self,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
         step_name: &str,
         started_at: Timestamp,
         work: F,
@@ -815,13 +839,13 @@ impl PostgresSystemDatabase {
     {
         let mut tx = self.pool.begin().await?;
 
-        if let Some((workflow_id, step_id)) = caller
+        if let Some(caller) = caller
             && let Some(step) = self
-                .check_step_on(&mut tx, workflow_id, step_id, step_name)
+                .check_step_on(&mut tx, caller.workflow_id, caller.step_id, step_name)
                 .await?
         {
             tx.commit().await?;
-            return replayed_output(&step, workflow_id, step_id, step_name);
+            return replayed_output(&step, caller, step_name);
         }
 
         // A failure drops the transaction inside `work`, which rolls it back.
@@ -829,16 +853,16 @@ impl PostgresSystemDatabase {
             Ok(done) => done,
             Err(error) => {
                 return match caller {
-                    Some((workflow_id, step_id)) => Err(self
-                        .record_step_failure(workflow_id, step_id, step_name, error, started_at)
+                    Some(caller) => Err(self
+                        .record_step_failure(caller, step_name, error, started_at)
                         .await),
                     None => Err(error),
                 };
             }
         };
 
-        if let Some((workflow_id, step_id)) = caller {
-            self.record_step_output(&mut tx, workflow_id, step_id, step_name, &value, started_at)
+        if let Some(caller) = caller {
+            self.record_step_output(&mut tx, caller, step_name, &value, started_at)
                 .await?;
         }
         tx.commit().await?;
@@ -918,26 +942,30 @@ impl PostgresSystemDatabase {
     /// Shared by [`run_transactional_step`](Self::run_transactional_step) and
     /// [`run_single_statement_step`](Self::run_single_statement_step), which differ in what they
     /// run the work on and not in what they record.
+    ///
+    /// The value is this layer's own, but its encoding is the caller's: it goes to the caller's
+    /// [`StepCodec`](super::types::StepCodec) as JSON data, and the row is tagged with whatever
+    /// the codec names.
     async fn record_step_output<T: serde::Serialize>(
         &self,
         conn: &mut sqlx::PgConnection,
-        workflow_id: &str,
-        step_id: i32,
+        caller: StepCaller<'_>,
         step_name: &str,
         value: &T,
         started_at: Timestamp,
     ) -> Result<(), Error> {
         // `serde_json` only fails here on a type that cannot be JSON — a non-string map key, a
         // NaN — and every payload this takes is a plain record.
-        let recorded = serde_json::to_string(value)
+        let value = serde_json::to_value(value)
             .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
+        let recorded = caller.codec.encode(value)?;
         self.record_step_on(
             conn,
-            workflow_id,
-            step_id,
+            caller.workflow_id,
+            caller.step_id,
             step_name,
-            Outcome::Output(Some(&recorded)),
-            Some(PORTABLE_JSON),
+            Outcome::Output(Some(&recorded.value)),
+            recorded.serialization.as_deref(),
             // Read here rather than taken from the caller: the work above has run, so this is
             // when the step finished rather than when it was about to start.
             Some(StepTiming {
@@ -977,10 +1005,12 @@ impl PostgresSystemDatabase {
     ///
     /// The dropped transaction's `ROLLBACK` is sent when its connection goes back to the pool, so
     /// a record that needs a row the work had locked waits until it is sent, and no longer.
+    ///
+    /// The error is encoded by the caller's [`StepCodec`](super::types::StepCodec), as a
+    /// successful result is.
     async fn record_step_failure(
         &self,
-        workflow_id: &str,
-        step_id: i32,
+        caller: StepCaller<'_>,
         step_name: &str,
         error: Error,
         started_at: Timestamp,
@@ -988,10 +1018,18 @@ impl PostgresSystemDatabase {
         if !error.should_record() {
             return error;
         }
+        let StepCaller {
+            workflow_id,
+            step_id,
+            codec,
+        } = caller;
         // `Error` is a plain serde enum, so this cannot fail on anything it holds.
-        let recorded = match serde_json::to_string(&error) {
+        let recorded = match serde_json::to_value(&error)
+            .map_err(|e| Error::Malformed(format!("step error is not JSON: {e}")))
+            .and_then(|value| codec.encode(value))
+        {
             Ok(recorded) => recorded,
-            Err(e) => return Error::Malformed(format!("step error is not JSON: {e}")),
+            Err(e) => return e,
         };
         let record = async {
             let mut tx = self.pool.begin().await?;
@@ -1000,8 +1038,8 @@ impl PostgresSystemDatabase {
                 workflow_id,
                 step_id,
                 step_name,
-                Outcome::Error(&recorded),
-                Some(RUST_SERDE),
+                Outcome::Error(&recorded.value),
+                recorded.serialization.as_deref(),
                 Some(StepTiming {
                     started_at,
                     completed_at: Timestamp::now(),
@@ -1044,7 +1082,7 @@ impl PostgresSystemDatabase {
     /// safe answer when the count is not obvious.
     async fn run_single_statement_step<T, F, Fut>(
         &self,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
         step_name: &str,
         started_at: Timestamp,
         work: F,
@@ -1054,7 +1092,7 @@ impl PostgresSystemDatabase {
         F: Fn(StepConn) -> Fut + Send + Sync,
         Fut: Future<Output = Result<(StepConn, T), Error>> + Send,
     {
-        let Some((workflow_id, step_id)) = caller else {
+        let Some(caller) = caller else {
             // Nothing to commit on the way out either: the statement committed itself, and the
             // connection goes back to the pool as it drops.
             let (_conn, value) = work(StepConn::Pooled(self.pool.acquire().await?)).await?;
@@ -1063,10 +1101,10 @@ impl PostgresSystemDatabase {
 
         let mut conn = StepConn::Transactional(Box::new(self.pool.begin().await?));
         if let Some(step) = self
-            .check_step_on(&mut conn, workflow_id, step_id, step_name)
+            .check_step_on(&mut conn, caller.workflow_id, caller.step_id, step_name)
             .await?
         {
-            return replayed_output(&step, workflow_id, step_id, step_name);
+            return replayed_output(&step, caller, step_name);
         }
 
         // A failure drops the transaction inside `work`, which rolls it back.
@@ -1074,19 +1112,12 @@ impl PostgresSystemDatabase {
             Ok(done) => done,
             Err(error) => {
                 return Err(self
-                    .record_step_failure(workflow_id, step_id, step_name, error, started_at)
+                    .record_step_failure(caller, step_name, error, started_at)
                     .await);
             }
         };
-        self.record_step_output(
-            &mut conn,
-            workflow_id,
-            step_id,
-            step_name,
-            &value,
-            started_at,
-        )
-        .await?;
+        self.record_step_output(&mut conn, caller, step_name, &value, started_at)
+            .await?;
         match conn {
             StepConn::Transactional(tx) => (*tx).commit().await?,
             // Unreachable: this arm of the function built a `Transactional` above, and `work`
@@ -1348,7 +1379,7 @@ impl PostgresSystemDatabase {
         forked_ids: &[String],
         steps: StartSteps<'_>,
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         let started_at = Timestamp::now();
 
@@ -1727,24 +1758,14 @@ enum SleepKind {
     Deadline,
 }
 
-/// The encoding this layer uses for values it produces itself.
+/// The encoding of the one value this layer writes and reads back on its own: a sleep's wake
+/// time.
 ///
-/// Distinct from the workflow's own format: a sleep's wake time is a plain number written and
-/// read by the system database, so it is stored legibly rather than in whatever the workflow
-/// chose. Python does the same for the same value; Java uses the workflow's serializer.
+/// Distinct from the workflow's own format, and from the [`StepCodec`](super::types::StepCodec) a
+/// management call brings: the wake time is a plain number that
+/// [`record_sleep`](SystemDatabase::record_sleep) reads back itself, with no caller codec to hand,
+/// so it is stored legibly rather than in whatever the application chose.
 const PORTABLE_JSON: &str = "portable_json";
-
-/// The encoding of an error this layer records for a failed step.
-///
-/// The crate's serde encoding rather than [`PORTABLE_JSON`], because the payload is this layer's
-/// [`Error`] and a replay of the step decodes it back into the same variant. Only the step runners
-/// read it back.
-///
-/// The name is shared with the engine's default serializer, which writes the engine's own `Error`
-/// under it, and the two enums have variants of the same name. The step name says which one a
-/// row holds: these are the internal steps, and an ordinary step never records this layer's
-/// error.
-const RUST_SERDE: &str = "rust_serde";
 
 /// How many times a stream write retries onto a fresh offset before giving up.
 ///
@@ -3214,7 +3235,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn list_workflows(
         &self,
         filter: &WorkflowFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<WorkflowRecord>, Error> {
         let workflow_table = &self.tables.workflow_status;
         // `status` is the one filter whose values are not already strings.
@@ -3751,7 +3772,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let workflow_table = &self.tables.workflow_status;
         // Resolved once, outside the retry, so a relative delay does not creep further out with
@@ -3817,7 +3838,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         attributes: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         validate_attributes(attributes)?;
         let workflow_table = self.tables.workflow_status.as_str();
@@ -3948,7 +3969,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // An empty batch still has to reach `run_transactional_step` when there is a caller: the
         // step id was taken where the call was written, so returning here would leave a workflow
@@ -4024,7 +4045,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
         // `cancel_workflows` for why the caller decides this.
@@ -4095,7 +4116,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         delete_children: bool,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<u64, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
         // `cancel_workflows` for why the caller decides this.
@@ -4143,7 +4164,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // checkpoint failing behind it — and without it, it succeeds and leaves the orphan.
         // Whether a workflow may delete itself at all is the cross-implementation question; this
         // refusal is the conservative reading, and is Rust alone until the four agree.
-        if let Some((caller_id, _)) = caller
+        if let Some(StepCaller {
+            workflow_id: caller_id,
+            ..
+        }) = caller
             && targets.contains(&caller_id)
         {
             return Err(Error::InvalidInput {
@@ -4203,7 +4227,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         forks: &[Fork<'_>],
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
         // `cancel_workflows` for why the caller decides this.
@@ -4243,7 +4267,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_ids: &[&str],
         point: ForkPoint<'_>,
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
         // `cancel_workflows` for why the caller decides this.
@@ -4312,7 +4336,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         start_step: i32,
         options: &RewindOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         if start_step < 0 {
             return Err(Error::InvalidInput {
@@ -5001,7 +5025,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         load_output: bool,
         limit: Option<i64>,
         offset: Option<i64>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<StepRecord>, Error> {
         let steps_table = self.tables.operation_outputs.as_str();
         let started_at = Timestamp::now();
@@ -6687,7 +6711,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn debounce_delayed_workflow(
         &self,
         request: &DebounceRequest<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Debounce, Error> {
         request.validate()?;
         let workflow_table = self.tables.workflow_status.as_str();
@@ -6853,7 +6877,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn create_schedule(
         &self,
         schedule: &NewSchedule<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
         let application_name = schedule
@@ -6947,7 +6971,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn upsert_schedule(
         &self,
         schedule: &NewSchedule<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let schedule_id = schedule
             .schedule_id
@@ -6974,7 +6998,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn get_schedule(
         &self,
         name: &str,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Option<ScheduleRecord>, Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
         let started_at = Timestamp::now();
@@ -7031,7 +7055,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn list_schedules(
         &self,
         filter: &ScheduleFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<ScheduleRecord>, Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
         let application_name = self.application_name.as_deref();
@@ -7106,7 +7130,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         name: &str,
         update: &ScheduleUpdate<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
         let started_at = Timestamp::now();
@@ -7177,7 +7201,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         name: &str,
         status: ScheduleStatus,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
         // Pause and resume are two API calls in the references and two step names with them, so a
@@ -7244,7 +7268,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error> {
+    async fn delete_schedule(
+        &self,
+        name: &str,
+        caller: Option<StepCaller<'_>>,
+    ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
         let started_at = Timestamp::now();
 
@@ -7603,7 +7631,9 @@ mod tests {
         AssertSqlSafe, PostgresSystemDatabase, Settings, classify_sqlstate, is_transport_failure,
         polling_limit, split_database, step_listing_query, with_retry,
     };
-    use crate::sysdb::types::{NewWorkflow, Submission, Timestamp};
+    use crate::sysdb::types::{
+        EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Submission, Timestamp,
+    };
     use crate::sysdb::{BackendError, BackendErrorKind, Error, SystemDatabase};
     use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::sync::Semaphore;
@@ -7776,6 +7806,46 @@ mod tests {
 
     const STEP: &str = "test.transactionalStep";
 
+    /// The tag [`UnitCodec`] writes, and the only one it reads.
+    const UNIT_TAG: &str = "unit_json";
+
+    /// Plain JSON under [`UNIT_TAG`]: a codec whose tag no built-in encoding shares, so a row
+    /// carrying it was tagged by the caller's codec rather than by this layer.
+    struct UnitCodec;
+
+    impl StepCodec for UnitCodec {
+        fn encode(&self, value: serde_json::Value) -> Result<EncodedValue, Error> {
+            Ok(EncodedValue {
+                value: value.to_string(),
+                serialization: Some(UNIT_TAG.to_owned()),
+            })
+        }
+
+        fn decode(
+            &self,
+            value: &str,
+            serialization: Option<&str>,
+        ) -> Result<serde_json::Value, Error> {
+            match serialization {
+                Some(UNIT_TAG) => {
+                    serde_json::from_str(value).map_err(|e| Error::Malformed(e.to_string()))
+                }
+                other => Err(Error::UnknownSerialization {
+                    name: other.unwrap_or_default().to_owned(),
+                }),
+            }
+        }
+    }
+
+    /// Step 0 of `wf-caller`, recorded through [`UnitCodec`].
+    fn unit_caller() -> Option<StepCaller<'static>> {
+        Some(StepCaller {
+            workflow_id: "wf-caller",
+            step_id: 0,
+            codec: &UnitCodec,
+        })
+    }
+
     /// A migrated database holding one `PENDING` workflow, `wf-caller`, for the runner to record
     /// steps against.
     async fn caller() -> (PostgresSystemDatabase, dbos_test_support::TestDatabase) {
@@ -7828,18 +7898,13 @@ mod tests {
         let sys = &sys;
 
         let outcome = sys
-            .run_transactional_step(
-                Some(("wf-caller", 0)),
-                STEP,
-                Timestamp::now(),
-                |mut tx| async move {
-                    touch(sys, &mut tx).await?;
-                    let quotient: i64 = sqlx::query_scalar("SELECT 1::BIGINT / 0::BIGINT")
-                        .fetch_one(&mut *tx)
-                        .await?;
-                    Ok((tx, quotient))
-                },
-            )
+            .run_transactional_step(unit_caller(), STEP, Timestamp::now(), |mut tx| async move {
+                touch(sys, &mut tx).await?;
+                let quotient: i64 = sqlx::query_scalar("SELECT 1::BIGINT / 0::BIGINT")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                Ok((tx, quotient))
+            })
             .await;
 
         match outcome {
@@ -7870,23 +7935,18 @@ mod tests {
 
         let run = || {
             with_retry(&sys.retry, STEP, move || async move {
-                sys.run_transactional_step(
-                    Some(("wf-caller", 0)),
-                    STEP,
-                    started_at,
-                    |mut tx| async move {
-                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
-                        touch(sys, &mut tx).await?;
-                        if attempt == 0 {
-                            return Err(Error::Backend(BackendError {
-                                message: "could not serialize access".to_owned(),
-                                sqlstate: Some("40001".to_owned()),
-                                kind: BackendErrorKind::Conflict,
-                            }));
-                        }
-                        Ok((tx, attempt))
-                    },
-                )
+                sys.run_transactional_step(unit_caller(), STEP, started_at, |mut tx| async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    touch(sys, &mut tx).await?;
+                    if attempt == 0 {
+                        return Err(Error::Backend(BackendError {
+                            message: "could not serialize access".to_owned(),
+                            sqlstate: Some("40001".to_owned()),
+                            kind: BackendErrorKind::Conflict,
+                        }));
+                    }
+                    Ok((tx, attempt))
+                })
                 .await
             })
         };
@@ -7899,6 +7959,11 @@ mod tests {
             .unwrap()
             .expect("the success is recorded");
         assert_eq!(step.output.as_deref(), Some("1"), "{step:?}");
+        assert_eq!(
+            step.serialization.as_deref(),
+            Some(UNIT_TAG),
+            "tagged by the caller's codec: {step:?}"
+        );
         assert!(step.error.is_none(), "{step:?}");
         assert_eq!(name_of_caller(sys).await.as_deref(), Some("touched"));
 
@@ -7912,5 +7977,68 @@ mod tests {
             2,
             "the replay runs no work"
         );
+    }
+
+    /// A recorded refusal is encoded by the caller's codec, and a replay raises it again.
+    #[tokio::test]
+    async fn a_recorded_refusal_goes_through_the_callers_codec() {
+        let (sys, _db) = caller().await;
+        let sys = &sys;
+        let refusal = || Error::InvalidInput {
+            field: "workflow_ids".into(),
+            detail: "refused".to_owned(),
+        };
+        let run = || {
+            sys.run_transactional_step(unit_caller(), STEP, Timestamp::now(), |_tx| async move {
+                Err::<(sqlx::Transaction<'static, sqlx::Postgres>, i64), _>(refusal())
+            })
+        };
+
+        assert_eq!(run().await.unwrap_err(), refusal());
+        let step = sys
+            .check_step("wf-caller", 0, STEP)
+            .await
+            .unwrap()
+            .expect("the refusal is recorded");
+        assert_eq!(step.serialization.as_deref(), Some(UNIT_TAG), "{step:?}");
+        assert_eq!(
+            run().await.unwrap_err(),
+            refusal(),
+            "the replay raises the recorded refusal"
+        );
+    }
+
+    /// A checkpoint under a tag the caller's codec cannot read is refused on replay, not guessed
+    /// at, and the work does not run again.
+    #[tokio::test]
+    async fn a_checkpoint_under_an_unreadable_tag_is_refused() {
+        let (sys, _db) = caller().await;
+        let sys = &sys;
+        sys.record_step(
+            "wf-caller",
+            0,
+            STEP,
+            Outcome::Output(Some("1")),
+            Some("pickle"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ran = &AtomicU32::new(0);
+        let outcome = sys
+            .run_transactional_step(unit_caller(), STEP, Timestamp::now(), |tx| async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok((tx, 2_i64))
+            })
+            .await;
+
+        assert_eq!(
+            outcome,
+            Err(Error::UnknownSerialization {
+                name: "pickle".to_owned()
+            })
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "the replay runs no work");
     }
 }

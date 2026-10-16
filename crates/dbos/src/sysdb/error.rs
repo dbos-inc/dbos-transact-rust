@@ -26,6 +26,15 @@ pub enum Error {
     /// Usually means the database was written by an implementation that knows something this
     /// one does not.
     Malformed(String),
+    /// A recorded value carries a `serialization` tag the caller's
+    /// [`StepCodec`](super::types::StepCodec) cannot read.
+    ///
+    /// Reported rather than guessed at: decoding bytes as an encoding they were not written in
+    /// would hand a replay a value the first run never saw.
+    UnknownSerialization {
+        /// The tag the row carries.
+        name: String,
+    },
     /// A workflow with this id already exists, running a different function.
     ///
     /// Reusing an id for different work is a programming error, not a race: the id is how
@@ -204,6 +213,9 @@ impl std::fmt::Display for Error {
         match self {
             Error::Backend(e) => write!(f, "system database error: {e}"),
             Error::Malformed(m) => write!(f, "unexpected value in the system database: {m}"),
+            Error::UnknownSerialization { name } => {
+                write!(f, "serialization {name} is not available")
+            }
             Error::ConflictingWorkflow {
                 workflow_id,
                 detail,
@@ -341,6 +353,7 @@ impl Error {
         match self {
             Error::Backend(_)
             | Error::Malformed(_)
+            | Error::UnknownSerialization { .. }
             | Error::WorkflowCancelled { .. }
             | Error::StepAlreadyRecorded { .. }
             | Error::UnexpectedStep { .. }
@@ -455,6 +468,12 @@ mod tests {
         assert!(!backend(BackendErrorKind::Connection).should_record());
         assert!(!backend(BackendErrorKind::Conflict).should_record());
         assert!(!Error::Malformed("unreadable".to_owned()).should_record());
+        assert!(
+            !Error::UnknownSerialization {
+                name: "pickle".to_owned(),
+            }
+            .should_record()
+        );
         assert!(
             !Error::WorkflowCancelled {
                 workflow_id: "wf".to_owned(),

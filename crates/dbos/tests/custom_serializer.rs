@@ -192,6 +192,79 @@ async fn every_payload_goes_through_the_custom_serializer() {
     dbos.shutdown().await;
 }
 
+/// A management call made from a workflow records its result through the custom serializer, and
+/// a replay reads it back through it.
+///
+/// The listing is the system database's own value, which it hands over as JSON data, so the
+/// serializer sees a JSON value here rather than an application type.
+#[tokio::test]
+async fn a_management_checkpoint_goes_through_the_custom_serializer() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config(
+        "custom-management",
+        &db,
+        Serializer::custom(Backwards),
+    ));
+    let lister = dbos
+        .register_workflow("lister", {
+            let dbos = dbos.clone();
+            move |id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let rows = dbos
+                        .list_workflows(&dbos::sysdb::types::WorkflowFilter {
+                            workflow_ids: vec![&id],
+                            ..Default::default()
+                        })
+                        .await?;
+                    Ok::<Vec<String>, Error>(
+                        rows.into_iter()
+                            .map(|r| r.status.as_str().to_owned())
+                            .collect(),
+                    )
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "custom-lister";
+    let seen = lister
+        .run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(seen, ["PENDING"]);
+
+    let (output, tag) = row(
+        &db,
+        r#"SELECT output, serialization FROM "dbos"."operation_outputs"
+           WHERE workflow_uuid = $1 AND function_name = 'DBOS.list_workflows'"#,
+        id,
+    )
+    .await;
+    assert_eq!(tag.as_deref(), Some(NAME));
+    let listed: Vec<serde_json::Value> = forwards(&output.unwrap());
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["workflow_id"], json!(id));
+
+    // A fork replays the listing from its copy, which a re-run would see as SUCCESS.
+    let forked = dbos.fork::<Vec<String>, EngineOnly>(id, 1).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, forked.result())
+            .await
+            .expect("the fork finishes")
+            .unwrap(),
+        ["PENDING"]
+    );
+    dbos.shutdown().await;
+}
+
 /// A workflow's error, and a step's, are encoded whole and come back as the application's own type.
 #[tokio::test]
 async fn an_error_round_trips_through_the_custom_serializer() {

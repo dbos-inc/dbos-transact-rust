@@ -42,6 +42,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::serialization::Serializer;
+use crate::sysdb::types::StepCaller;
 use crate::sysdb::{SystemDatabase, postgres};
 use crate::{ClientConfig, Error, Result};
 
@@ -184,6 +185,22 @@ impl Connection {
     /// How payloads are encoded on their way in and out.
     pub(crate) fn serializer(&self) -> &Serializer {
         &self.serializer
+    }
+
+    /// The system database's view of a call recorded as step `step_id` of `workflow_id`: the ids,
+    /// and this connection's serializer to record the call's result in.
+    ///
+    /// The result is a checkpoint only this SDK replays, so it is written in the configured
+    /// serializer, as a step's output is.
+    pub(crate) fn step_caller<'a>(
+        &'a self,
+        caller: Option<(&'a str, i32)>,
+    ) -> Option<StepCaller<'a>> {
+        caller.map(|(workflow_id, step_id)| StepCaller {
+            workflow_id,
+            step_id,
+            codec: &self.serializer,
+        })
     }
 
     /// The application whose rows this handle owns, or `None` for a nameless one.

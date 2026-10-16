@@ -1544,6 +1544,87 @@ async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
     dbos.shutdown().await;
 }
 
+/// **A management call's checkpoint is in the configured serializer, and replays by its tag.**
+///
+/// A listing is the system database's own value, but only this SDK replays it, so it is written
+/// the way a step's output is: `rust_serde` by default, under that tag. A checkpoint tagged
+/// `portable_json`, as listings were before, still replays, because the built-in encodings are
+/// always readable.
+///
+/// The fork is what replays it, and the status in the result is what tells a replay from a re-run:
+/// the first run listed itself while `PENDING`, and a re-run would find it `SUCCESS`.
+#[tokio::test]
+async fn a_management_checkpoint_is_in_the_configured_serializer_and_replays_by_its_tag() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("management-codec-app", &db));
+    let lister = dbos
+        .register_workflow("lister", {
+            let dbos = dbos.clone();
+            move |id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let rows = dbos
+                        .list_workflows(&WorkflowFilter {
+                            workflow_ids: vec![&id],
+                            ..WorkflowFilter::default()
+                        })
+                        .await?;
+                    Ok::<Vec<WorkflowStatus>, Error>(rows.into_iter().map(|r| r.status).collect())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-lister";
+    let seen = lister
+        .run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the lister failed");
+    assert_eq!(seen, [WorkflowStatus::Pending]);
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "DBOS.list_workflows");
+    assert_eq!(
+        steps[0].serialization.as_deref(),
+        Some("rust_serde"),
+        "the listing was not written in the configured serializer"
+    );
+
+    // As a listing was tagged before it went through the configured serializer.
+    sqlx::query(
+        r#"UPDATE "dbos"."operation_outputs" SET serialization = 'portable_json'
+           WHERE workflow_uuid = $1 AND function_id = 0"#,
+    )
+    .bind(id)
+    .execute(&db.pool().await)
+    .await
+    .expect("retag failed");
+
+    let forked = dbos
+        .fork::<Vec<WorkflowStatus>, EngineOnly>(id, 1)
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        forked.result().await.expect("the fork failed"),
+        [WorkflowStatus::Pending],
+        "the fork re-ran the listing instead of replaying the portable_json checkpoint"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **A replayed fork hands back the id it recorded rather than forking again.**
 ///
 /// The case that makes this more than bookkeeping: a fork generates a new workflow id, so a

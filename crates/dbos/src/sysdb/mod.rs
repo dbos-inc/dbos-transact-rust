@@ -78,9 +78,9 @@ use types::{
     EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
     Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
     OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepRecord, StepTiming,
-    StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
+    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -92,9 +92,13 @@ use types::{
 ///
 /// Payloads cross as already-encoded strings; see [`types`].
 ///
-/// The methods that must be atomic with the step recording them take a `caller: Option<(&str,
-/// i32)>` — a workflow id and step id — and own the transaction internally, rather than taking a
-/// caller's connection the way Python and TypeScript do. [`get_event`](SystemDatabase::get_event)
+/// The methods that must be atomic with the step recording them take their caller — a workflow id
+/// and step id — and own the transaction internally, rather than taking a caller's connection the
+/// way Python and TypeScript do. **The methods that record a result of their own** — the
+/// management calls: listings, cancels, forks, rewinds, schedule changes, a debounce — take a
+/// [`StepCaller`], whose [`StepCodec`](types::StepCodec) encodes that result, so this layer
+/// chooses no encoding even for its own values; the rest take `caller: Option<(&str, i32)>`.
+/// [`get_event`](SystemDatabase::get_event)
 /// takes a [`GetEventCaller`] instead — the same thing plus the step its deadline is recorded
 /// under — because there the caller is optional and a wrapped `Option` is what reads. It is named
 /// for its one method rather than for blocking in general: `recv` blocks too and takes plain
@@ -171,7 +175,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn list_workflows(
         &self,
         filter: &WorkflowFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<WorkflowRecord>, Error>;
 
     /// Every workflow descended from this one, at any depth.
@@ -398,7 +402,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Puts a running workflow back on its queue, reporting whether it moved.
@@ -419,7 +423,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_id: &str,
         attributes: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Returns this executor's abandoned workflows to a queue, so any peer may run them.
@@ -508,7 +512,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
     /// Re-enqueues workflows, returning the ids that actually moved.
@@ -540,7 +544,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
     /// Deletes workflows and everything hanging off them.
@@ -592,7 +596,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         delete_children: bool,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<u64, Error>;
 
     /// Forks workflows, each resuming from its own start step.
@@ -642,7 +646,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         forks: &[Fork<'_>],
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
     /// Forks workflows from a step this works out for each of them.
@@ -671,7 +675,7 @@ pub trait SystemDatabase: Send + Sync {
         workflow_ids: &[&str],
         point: ForkPoint<'_>,
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
     /// Discards a finished workflow's history from `start_step` on and re-enqueues it under the
@@ -725,7 +729,7 @@ pub trait SystemDatabase: Send + Sync {
         workflow_id: &str,
         start_step: i32,
         options: &RewindOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Delivers one message to a workflow.
@@ -961,7 +965,7 @@ pub trait SystemDatabase: Send + Sync {
         load_output: bool,
         limit: Option<i64>,
         offset: Option<i64>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<StepRecord>, Error>;
 
     /// Checkpoints a durable sleep, returning the instant to wake at.
@@ -1436,7 +1440,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn debounce_delayed_workflow(
         &self,
         request: &DebounceRequest<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Debounce, Error>;
 
     /// The workflow currently holding a deduplication key, if any.
@@ -1494,7 +1498,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn create_schedule(
         &self,
         schedule: &NewSchedule<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Registers a schedule, updating its definition if the name is already registered.
@@ -1519,7 +1523,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn upsert_schedule(
         &self,
         schedule: &NewSchedule<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Registers a whole set of schedules in one transaction.
@@ -1557,7 +1561,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn get_schedule(
         &self,
         name: &str,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Option<ScheduleRecord>, Error>;
 
     /// Reads the schedules matching a filter.
@@ -1572,7 +1576,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn list_schedules(
         &self,
         filter: &ScheduleFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<ScheduleRecord>, Error>;
 
     /// Changes a registered schedule's definition.
@@ -1589,7 +1593,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         name: &str,
         update: &ScheduleUpdate<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Pauses or resumes a schedule.
@@ -1617,7 +1621,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         name: &str,
         status: ScheduleStatus,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
     /// Records when a schedule last fired.
@@ -1669,7 +1673,11 @@ pub trait SystemDatabase: Send + Sync {
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
     /// decided rather than doing it again — see [`create_schedule`](Self::create_schedule) for
     /// the shape.
-    async fn delete_schedule(&self, name: &str, caller: Option<(&str, i32)>) -> Result<(), Error>;
+    async fn delete_schedule(
+        &self,
+        name: &str,
+        caller: Option<StepCaller<'_>>,
+    ) -> Result<(), Error>;
 
     /// Gives `new_name` ownership of the rows a [`RenameFrom`] selects.
     ///

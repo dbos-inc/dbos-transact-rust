@@ -1331,7 +1331,11 @@ impl Connection {
     ) -> Result<Vec<String>> {
         let cancelled = self
             .sysdb()
-            .cancel_workflows(workflow_ids, children == Children::Include, caller)
+            .cancel_workflows(
+                workflow_ids,
+                children == Children::Include,
+                self.step_caller(caller),
+            )
             .await
             .map_err(Error::SystemDatabase)?;
         if !cancelled.is_empty() {
@@ -1352,7 +1356,7 @@ impl Connection {
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let resumed = self
             .sysdb()
-            .resume_workflows(workflow_ids, options.queue, caller)
+            .resume_workflows(workflow_ids, options.queue, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         // What moved, not what was asked for: an id that had already finished is not
@@ -1397,7 +1401,7 @@ impl Connection {
             .collect();
         let forked = self
             .sysdb()
-            .fork_workflows(&forks, &sys_options, caller)
+            .fork_workflows(&forks, &sys_options, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
 
@@ -1425,7 +1429,12 @@ impl Connection {
             queue_partition_key: options.queue_partition_key,
         };
         self.sysdb()
-            .rewind_workflow(workflow_id, options.start_step, &sys_options, caller)
+            .rewind_workflow(
+                workflow_id,
+                options.start_step,
+                &sys_options,
+                self.step_caller(caller),
+            )
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(
@@ -1450,7 +1459,11 @@ impl Connection {
     ) -> Result<u64> {
         let deleted = self
             .sysdb()
-            .delete_workflows(workflow_ids, children == Children::Include, caller)
+            .delete_workflows(
+                workflow_ids,
+                children == Children::Include,
+                self.step_caller(caller),
+            )
             .await
             .map_err(Error::SystemDatabase)?;
         if deleted > 0 {
@@ -1467,7 +1480,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
         self.sysdb()
-            .set_workflow_delay(workflow_id, delay, caller)
+            .set_workflow_delay(workflow_id, delay, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         // Phrased as the request rather than the effect. The statement is guarded on the row
@@ -1491,7 +1504,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
         self.sysdb()
-            .update_workflow_attributes(workflow_id, encoded, caller)
+            .update_workflow_attributes(workflow_id, encoded, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
@@ -1507,7 +1520,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<WorkflowRecord>> {
         self.sysdb()
-            .list_workflows(filter, caller)
+            .list_workflows(filter, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)
     }
@@ -1525,7 +1538,7 @@ impl Connection {
                 options.load_output,
                 options.limit,
                 options.offset,
-                caller,
+                self.step_caller(caller),
             )
             .await
             .map_err(Error::SystemDatabase)

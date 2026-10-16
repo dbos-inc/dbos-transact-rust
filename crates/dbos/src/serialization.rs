@@ -26,6 +26,7 @@ use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 use crate::error::{DurableError, EngineOnly, Error, Result};
+use crate::sysdb::types::EncodedValue;
 
 /// The tag a [`PayloadEncoding::Native`] row carries.
 pub(crate) const RUST_SERDE: &str = "rust_serde";
@@ -243,6 +244,42 @@ impl Serializer {
             ))),
             _ => Ok(()),
         }
+    }
+}
+
+/// The configured serializer is how a management call made from a workflow records its result.
+///
+/// That result is a checkpoint like any step's output, and only this SDK replays it, so it is
+/// written in what the application configured — `rust_serde` by default, its own serializer
+/// otherwise — and tagged with that name. Reads honour the row's tag, as every other read does.
+impl crate::sysdb::types::StepCodec for Serializer {
+    fn encode(&self, value: Value) -> std::result::Result<EncodedValue, crate::sysdb::Error> {
+        let encoding = self.encoding();
+        let text = encode::<_, EngineOnly>(&value, &encoding, "step output").map_err(to_sysdb)?;
+        Ok(EncodedValue {
+            value: text,
+            serialization: Some(encoding.name().to_owned()),
+        })
+    }
+
+    fn decode(
+        &self,
+        value: &str,
+        serialization: Option<&str>,
+    ) -> std::result::Result<Value, crate::sysdb::Error> {
+        decode_tagged::<Value, EngineOnly>(Some(value), serialization, self, "step output")
+            .map_err(to_sysdb)
+    }
+}
+
+/// An engine encoding failure, in the system database's terms.
+///
+/// An unknown tag keeps its meaning; anything else is a value that could not be written or read,
+/// which the system database calls [`Malformed`](crate::sysdb::Error::Malformed).
+fn to_sysdb(error: Error) -> crate::sysdb::Error {
+    match error {
+        Error::UnknownSerialization { name } => crate::sysdb::Error::UnknownSerialization { name },
+        other => crate::sysdb::Error::Malformed(other.to_string()),
     }
 }
 

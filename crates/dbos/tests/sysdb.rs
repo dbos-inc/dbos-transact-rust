@@ -5371,7 +5371,7 @@ async fn a_fork_records_its_step_and_replays_from_it() {
         .await
         .unwrap();
 
-    let caller = Some(("wf-operator", 0));
+    let caller = Some(support::step_caller("wf-operator", 0));
     let first = sys
         .fork_workflows(&[Fork::new("wf-forked")], &ForkOptions::default(), caller)
         .await
@@ -5427,7 +5427,7 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
         .await
         .unwrap();
 
-    let caller = Some(("wf-operator", 0));
+    let caller = Some(support::step_caller("wf-operator", 0));
     let first = sys
         .cancel_workflows(&["wf-target"], false, caller)
         .await
@@ -5478,7 +5478,7 @@ async fn a_listing_replays_the_rows_it_recorded() {
         .await
         .unwrap();
 
-    let caller = Some(("wf-operator", 0));
+    let caller = Some(support::step_caller("wf-operator", 0));
     let filter = WorkflowFilter {
         workflow_ids: vec!["wf-first", "wf-later"],
         ..WorkflowFilter::default()
@@ -5525,7 +5525,7 @@ async fn a_replayed_fork_from_does_not_resolve_the_fork_point_again() {
     .await
     .unwrap();
 
-    let caller = Some(("wf-operator", 0));
+    let caller = Some(support::step_caller("wf-operator", 0));
     let first = sys
         .fork_from(
             &["wf-resolved"],
@@ -10697,7 +10697,7 @@ async fn a_schedule_step_replays_rather_than_repeating() {
 
     sys.create_schedule(
         &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-        Some(("wf-caller", 0)),
+        Some(support::step_caller("wf-caller", 0)),
     )
     .await
     .unwrap();
@@ -10719,7 +10719,7 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     // `AlreadyRegistered` — the name is taken, by the first run.
     sys.create_schedule(
         &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-        Some(("wf-caller", 0)),
+        Some(support::step_caller("wf-caller", 0)),
     )
     .await
     .unwrap();
@@ -10727,7 +10727,7 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     // A read replays its recorded answer rather than the current row, so a workflow branching on
     // a schedule sees the same one however an operator has since changed it.
     let first = sys
-        .get_schedule("nightly", Some(("wf-caller", 1)))
+        .get_schedule("nightly", Some(support::step_caller("wf-caller", 1)))
         .await
         .unwrap()
         .unwrap();
@@ -10742,7 +10742,7 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     .await
     .unwrap();
     assert_eq!(
-        sys.get_schedule("nightly", Some(("wf-caller", 1)))
+        sys.get_schedule("nightly", Some(support::step_caller("wf-caller", 1)))
             .await
             .unwrap()
             .unwrap(),
@@ -10762,7 +10762,7 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     // A read that found nothing records `null` too, and replays as the `None` it was — not as an
     // absent step, which is the same JSON and a different meaning.
     assert_eq!(
-        sys.get_schedule("no-such", Some(("wf-caller", 4)))
+        sys.get_schedule("no-such", Some(support::step_caller("wf-caller", 4)))
             .await
             .unwrap(),
         None
@@ -10771,7 +10771,7 @@ async fn a_schedule_step_replays_rather_than_repeating() {
         .await
         .unwrap();
     assert_eq!(
-        sys.get_schedule("no-such", Some(("wf-caller", 4)))
+        sys.get_schedule("no-such", Some(support::step_caller("wf-caller", 4)))
             .await
             .unwrap(),
         None,
@@ -10781,21 +10781,30 @@ async fn a_schedule_step_replays_rather_than_repeating() {
 
     // A listing replays as a whole, empty included.
     let listed = sys
-        .list_schedules(&ScheduleFilter::default(), Some(("wf-caller", 2)))
+        .list_schedules(
+            &ScheduleFilter::default(),
+            Some(support::step_caller("wf-caller", 2)),
+        )
         .await
         .unwrap();
     sys.delete_schedule("nightly", None).await.unwrap();
     assert_eq!(
-        sys.list_schedules(&ScheduleFilter::default(), Some(("wf-caller", 2)))
-            .await
-            .unwrap(),
+        sys.list_schedules(
+            &ScheduleFilter::default(),
+            Some(support::step_caller("wf-caller", 2))
+        )
+        .await
+        .unwrap(),
         listed
     );
     assert!(
-        sys.list_schedules(&ScheduleFilter::default(), Some(("wf-caller", 3)))
-            .await
-            .unwrap()
-            .is_empty(),
+        sys.list_schedules(
+            &ScheduleFilter::default(),
+            Some(support::step_caller("wf-caller", 3))
+        )
+        .await
+        .unwrap()
+        .is_empty(),
         "a fresh step sees the deletion"
     );
 }
@@ -10814,12 +10823,20 @@ async fn pausing_and_resuming_are_distinct_steps() {
     .await
     .unwrap();
 
-    sys.set_schedule_status("nightly", ScheduleStatus::Paused, Some(("wf-caller", 0)))
-        .await
-        .unwrap();
-    sys.set_schedule_status("nightly", ScheduleStatus::Active, Some(("wf-caller", 1)))
-        .await
-        .unwrap();
+    sys.set_schedule_status(
+        "nightly",
+        ScheduleStatus::Paused,
+        Some(support::step_caller("wf-caller", 0)),
+    )
+    .await
+    .unwrap();
+    sys.set_schedule_status(
+        "nightly",
+        ScheduleStatus::Active,
+        Some(support::step_caller("wf-caller", 1)),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         sys.check_step("wf-caller", 0, "DBOS.pause_schedule")
@@ -10857,9 +10874,12 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     };
 
     // Upsert. The replay must not put the definition back.
-    sys.upsert_schedule(&schedule("0 0 * * *"), Some(("wf-caller", 0)))
-        .await
-        .unwrap();
+    sys.upsert_schedule(
+        &schedule("0 0 * * *"),
+        Some(support::step_caller("wf-caller", 0)),
+    )
+    .await
+    .unwrap();
     sys.update_schedule(
         "nightly",
         &ScheduleUpdate {
@@ -10870,9 +10890,12 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     )
     .await
     .unwrap();
-    sys.upsert_schedule(&schedule("0 0 * * *"), Some(("wf-caller", 0)))
-        .await
-        .unwrap();
+    sys.upsert_schedule(
+        &schedule("0 0 * * *"),
+        Some(support::step_caller("wf-caller", 0)),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         cron(&sys).await.as_deref(),
         Some("*/5 * * * *"),
@@ -10887,7 +10910,7 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
             schedule: Change::Set("*/10 * * * *"),
             ..Default::default()
         },
-        Some(("wf-caller", 1)),
+        Some(support::step_caller("wf-caller", 1)),
     )
     .await
     .unwrap();
@@ -10899,7 +10922,7 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
             schedule: Change::Set("*/10 * * * *"),
             ..Default::default()
         },
-        Some(("wf-caller", 1)),
+        Some(support::step_caller("wf-caller", 1)),
     )
     .await
     .unwrap();
@@ -10908,15 +10931,23 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     sys.create_schedule(&schedule("0 0 * * *"), None)
         .await
         .unwrap();
-    sys.set_schedule_status("nightly", ScheduleStatus::Paused, Some(("wf-caller", 2)))
-        .await
-        .unwrap();
+    sys.set_schedule_status(
+        "nightly",
+        ScheduleStatus::Paused,
+        Some(support::step_caller("wf-caller", 2)),
+    )
+    .await
+    .unwrap();
     sys.set_schedule_status("nightly", ScheduleStatus::Active, None)
         .await
         .unwrap();
-    sys.set_schedule_status("nightly", ScheduleStatus::Paused, Some(("wf-caller", 2)))
-        .await
-        .unwrap();
+    sys.set_schedule_status(
+        "nightly",
+        ScheduleStatus::Paused,
+        Some(support::step_caller("wf-caller", 2)),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sys.get_schedule("nightly", None)
             .await
@@ -10928,13 +10959,13 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     );
 
     // Delete. The replay must not remove the schedule registered since.
-    sys.delete_schedule("nightly", Some(("wf-caller", 3)))
+    sys.delete_schedule("nightly", Some(support::step_caller("wf-caller", 3)))
         .await
         .unwrap();
     sys.create_schedule(&schedule("0 0 * * *"), None)
         .await
         .unwrap();
-    sys.delete_schedule("nightly", Some(("wf-caller", 3)))
+    sys.delete_schedule("nightly", Some(support::step_caller("wf-caller", 3)))
         .await
         .unwrap();
     assert!(
@@ -10981,7 +11012,7 @@ async fn a_refused_schedule_step_records_its_refusal() {
     assert!(matches!(
         sys.create_schedule(
             &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-            Some(("wf-caller", 0))
+            Some(support::step_caller("wf-caller", 0))
         )
         .await,
         Err(Error::AlreadyRegistered { .. })
@@ -11000,7 +11031,7 @@ async fn a_refused_schedule_step_records_its_refusal() {
     assert!(matches!(
         sys.create_schedule(
             &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-            Some(("wf-caller", 0)),
+            Some(support::step_caller("wf-caller", 0)),
         )
         .await,
         Err(Error::AlreadyRegistered { .. })
@@ -11370,7 +11401,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
     let first = sys
         .debounce_delayed_workflow(
             &bounce("checkout", "cart-1", pushed_to),
-            Some(("wf-caller", 0)),
+            Some(support::step_caller("wf-caller", 0)),
         )
         .await
         .unwrap();
@@ -11410,7 +11441,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
                 "cart-1",
                 Timestamp::from_epoch_ms(7_000_000_000),
             ),
-            Some(("wf-caller", 0)),
+            Some(support::step_caller("wf-caller", 0)),
         )
         .await
         .unwrap();
@@ -11446,7 +11477,7 @@ async fn a_replayed_bounce_reports_the_original_holder() {
     let first = sys
         .debounce_delayed_workflow(
             &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
-            Some(("wf-caller", 0)),
+            Some(support::step_caller("wf-caller", 0)),
         )
         .await
         .unwrap();
@@ -11460,7 +11491,7 @@ async fn a_replayed_bounce_reports_the_original_holder() {
     let replayed = sys
         .debounce_delayed_workflow(
             &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
-            Some(("wf-caller", 0)),
+            Some(support::step_caller("wf-caller", 0)),
         )
         .await
         .unwrap();

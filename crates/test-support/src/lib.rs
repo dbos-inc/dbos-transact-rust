@@ -1134,3 +1134,52 @@ mod baseline_cache_tests {
         std::fs::remove_dir_all(&dir).expect("failed to clean up the test directory");
     }
 }
+
+/// The tag [`TestCodec`] writes, and the only one it reads.
+///
+/// Not a real encoding's name, so a test that finds it on a row knows the row's tag came from the
+/// caller's codec rather than from the system database.
+pub const TEST_CODEC_TAG: &str = "test_json";
+
+/// A [`StepCodec`](dbos::sysdb::types::StepCodec) for system-database tests: plain JSON under
+/// [`TEST_CODEC_TAG`], and nothing else readable.
+///
+/// The engine's codec is its configured serializer, which a test of the system database alone
+/// cannot reach — this crate builds without the engine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TestCodec;
+
+impl dbos::sysdb::types::StepCodec for TestCodec {
+    fn encode(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<dbos::sysdb::types::EncodedValue, dbos::sysdb::Error> {
+        Ok(dbos::sysdb::types::EncodedValue {
+            value: value.to_string(),
+            serialization: Some(TEST_CODEC_TAG.to_owned()),
+        })
+    }
+
+    fn decode(
+        &self,
+        value: &str,
+        serialization: Option<&str>,
+    ) -> Result<serde_json::Value, dbos::sysdb::Error> {
+        match serialization {
+            Some(TEST_CODEC_TAG) => serde_json::from_str(value)
+                .map_err(|e| dbos::sysdb::Error::Malformed(e.to_string())),
+            other => Err(dbos::sysdb::Error::UnknownSerialization {
+                name: other.unwrap_or_default().to_owned(),
+            }),
+        }
+    }
+}
+
+/// Step `step_id` of `workflow_id`, recorded through [`TestCodec`].
+pub fn step_caller(workflow_id: &str, step_id: i32) -> dbos::sysdb::types::StepCaller<'_> {
+    dbos::sysdb::types::StepCaller {
+        workflow_id,
+        step_id,
+        codec: &TestCodec,
+    }
+}

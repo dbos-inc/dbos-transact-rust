@@ -9,6 +9,11 @@
 //! another's `portable_json` sit in the same table, and what keeps this layer usable from a
 //! language that does not share Rust's idea of a value.
 //!
+//! The one value this layer does put into a column itself is the result a management call
+//! records as its caller's step — a listing, a forked id, a recorded refusal. Even that is
+//! encoded by the caller: it goes to the [`StepCaller`]'s [`StepCodec`] as JSON data, and the
+//! row is tagged with whatever the codec names.
+//!
 //! **Times are typed, because the columns come in three shapes that a bare integer conflates.**
 //! Some are instants ([`Timestamp`]); some are durations ([`std::time::Duration`]); one, in the
 //! same table as both, is neither — `recovery_attempts` is a count. Worse, the durations do not
@@ -293,8 +298,9 @@ impl fmt::Display for WorkflowStatus {
 /// Every payload field holds encoded text — see the module documentation.
 ///
 /// `Serialize`/`Deserialize` because a listing made from inside a workflow is checkpointed and
-/// replays from what it recorded, so the rows have to round-trip. No other implementation reads
-/// that encoding — it is the engine talking to its own replay.
+/// replays from what it recorded, so the rows have to round-trip. The derives give the record its
+/// JSON shape, and the caller's [`StepCodec`] encodes that. No other implementation reads it — it
+/// is the engine talking to its own replay.
 ///
 /// **It is still a stored format, and the build that reads it is rarely the one that wrote it.**
 /// A workflow checkpoints a listing on one deployment and replays it on the next, which is the
@@ -1916,10 +1922,64 @@ pub struct NotificationRecord {
     pub consumed: bool,
 }
 
+/// How a [`StepCaller`] encodes the result this layer records for it, and decodes it on replay.
+///
+/// **This layer owns the value but not its encoding.** A management call made from a workflow —
+/// a listing, a cancel, a fork, a schedule change — records its own result as the caller's step,
+/// in the transaction that does the work, so a replay reads back exactly what the first run saw.
+/// The value is this layer's ([`WorkflowRecord`]s, [`StepRecord`]s, a [`Debounce`], an id list,
+/// a recorded [`Error`]), but how it is written is the application's choice, the same one that
+/// governs its own steps' outputs. The caller supplies it here, and the row's `serialization`
+/// column records the tag it gives.
+///
+/// **The value crosses as JSON data, not as a Rust type.** This layer turns its value into a
+/// [`serde_json::Value`] and hands that over, and gets one back on replay. That keeps it free of
+/// any serializer machinery of its own, and leaves something a host in another language can
+/// implement: JSON in, text and a tag out. Every value that crosses is a plain record — strings,
+/// integers, enums, epoch-millisecond times — so nothing depends on a format being
+/// human-readable.
+pub trait StepCodec: Send + Sync {
+    /// Encodes `value`, and names the encoding for the row's `serialization` column.
+    fn encode(&self, value: serde_json::Value) -> Result<EncodedValue, Error>;
+
+    /// Decodes `value`, stored under the tag `serialization`, back into JSON data.
+    ///
+    /// A tag this codec cannot read is [`Error::UnknownSerialization`], never a guess. An absent
+    /// tag is the codec's to interpret.
+    fn decode(&self, value: &str, serialization: Option<&str>) -> Result<serde_json::Value, Error>;
+}
+
+/// The workflow step a management call runs as, and how its result is recorded.
+///
+/// What the methods that record their own result take, where the plain-id methods take `caller:
+/// Option<(&str, i32)>`. `None` at the call site is a caller outside a workflow: nothing is
+/// checked and nothing is recorded, so it needs no codec either.
+///
+/// Given one, the call's work and its step checkpoint **commit together**: see
+/// [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+#[derive(Clone, Copy)]
+pub struct StepCaller<'a> {
+    /// The workflow making the call.
+    pub workflow_id: &'a str,
+    /// The step the call is recorded under.
+    pub step_id: i32,
+    /// How the recorded result is encoded and decoded.
+    pub codec: &'a dyn StepCodec,
+}
+
+impl fmt::Debug for StepCaller<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StepCaller")
+            .field("workflow_id", &self.workflow_id)
+            .field("step_id", &self.step_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The workflow a [`get_event`](crate::sysdb::SystemDatabase::get_event) runs on behalf of, and the
 /// steps it records against.
 ///
-/// A struct where every other method here takes `caller: Option<(&str, i32)>`, because this one
+/// A struct where the plain-id methods here take `caller: Option<(&str, i32)>`, because this one
 /// carries **two** step ids and they are not interchangeable: one records the read itself, the
 /// other the deadline it waits until. `Some(("wf", 4, 5))` says nothing about which is which, and
 /// transposing them is a mistake nothing catches until a recovery replays the wrong step under the

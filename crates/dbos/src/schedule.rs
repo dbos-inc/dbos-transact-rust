@@ -906,7 +906,7 @@ impl Connection {
     ) -> Result<()> {
         let context = spec.encode_context(self.serializer())?;
         self.sysdb()
-            .create_schedule(&spec.as_new(&context), caller)
+            .create_schedule(&spec.as_new(&context), self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(schedule = spec.schedule_name, "created a schedule");
@@ -937,7 +937,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<ScheduleRecord>> {
         self.sysdb()
-            .list_schedules(filter, caller)
+            .list_schedules(filter, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)
     }
@@ -948,7 +948,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<Option<ScheduleRecord>> {
         self.sysdb()
-            .get_schedule(name, caller)
+            .get_schedule(name, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)
     }
@@ -969,7 +969,7 @@ impl Connection {
             queue_name: change.queue_name,
         };
         self.sysdb()
-            .update_schedule(name, &update, caller)
+            .update_schedule(name, &update, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(schedule = name, "updated a schedule");
@@ -983,7 +983,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
         self.sysdb()
-            .set_schedule_status(name, status, caller)
+            .set_schedule_status(name, status, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(
@@ -1000,7 +1000,7 @@ impl Connection {
         caller: Option<(&str, i32)>,
     ) -> Result<()> {
         self.sysdb()
-            .delete_schedule(name, caller)
+            .delete_schedule(name, self.step_caller(caller))
             .await
             .map_err(Error::SystemDatabase)?;
         tracing::info!(schedule = name, "deleted a schedule");
