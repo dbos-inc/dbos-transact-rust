@@ -88,7 +88,9 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 ///
 /// **What it encodes.** Everything this process writes in its default encoding: workflow inputs,
 /// results and errors, step results and errors, events, messages and stream values, and what the
-/// engine records about the calls it checkpoints, and schedules' contexts. Not what is asked to be
+/// engine records about the calls it checkpoints, and schedules' contexts, which it carries as the
+/// JSON data they were given as, so a context reads back the same in a binary format as in JSON.
+/// Not what is asked to be
 /// [`Portable`](crate::SerializationFormat::Portable) or
 /// [`Native`](crate::SerializationFormat::Native), and not what a transactional step records about
 /// itself, which the system database writes as JSON under a built-in tag.

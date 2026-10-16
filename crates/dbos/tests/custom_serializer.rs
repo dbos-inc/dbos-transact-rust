@@ -639,3 +639,76 @@ async fn a_schedules_context_goes_through_the_serializer() {
     assert!(schedule.decode_context::<Vec<String>>().is_err());
     dbos.shutdown().await;
 }
+
+/// MessagePack, as hex: a format that is not human-readable, in which serde types such as
+/// `Ipv4Addr` take a different shape than in JSON.
+#[derive(Debug)]
+struct MessagePack;
+
+impl CustomSerializer for MessagePack {
+    fn name(&self) -> &str {
+        "msgpack_hex"
+    }
+
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let bytes = rmp_serde::to_vec(&value)?;
+        Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bytes = (0..text.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&text[at..at + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()?;
+        into.fill(&mut rmp_serde::Deserializer::new(bytes.as_slice()))
+    }
+}
+
+/// A context whose type serializes differently in a binary format reads back as itself, both
+/// listed and in the run a tick starts.
+#[tokio::test]
+async fn a_schedules_context_survives_a_format_that_is_not_human_readable() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config(
+        "binary-schedule",
+        &db,
+        Serializer::custom(MessagePack),
+    ));
+    let ping = dbos
+        .register_workflow(
+            "ping",
+            |input: ScheduledWorkflowInput<std::net::Ipv4Addr>| async move {
+                Ok::<_, Error>(input.context)
+            },
+        )
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let address = std::net::Ipv4Addr::new(10, 0, 0, 1);
+
+    dbos.create_schedule(&ScheduleSpec::new("ping", &ping, "0 0 1 1 *", &address).unwrap())
+        .await
+        .unwrap();
+    let schedule = dbos.get_schedule("ping").await.unwrap().expect("it exists");
+    assert_eq!(
+        schedule.decode_context::<std::net::Ipv4Addr>().unwrap(),
+        address
+    );
+
+    let run = dbos
+        .trigger_schedule::<std::net::Ipv4Addr, EngineOnly>("ping")
+        .await
+        .unwrap();
+    let ran = tokio::time::timeout(DEADLINE, run.result())
+        .await
+        .expect("the run finishes")
+        .unwrap();
+    assert_eq!(ran, address);
+    dbos.shutdown().await;
+}

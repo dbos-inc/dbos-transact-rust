@@ -94,6 +94,10 @@ jiff = { version = "0.2", optional = true }
 erased-serde = { version = "0.4", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+# A format that is not human-readable, which serde types such as `Ipv4Addr` serialize differently
+# in: what tests a custom serializer against a binary format, as an application's MessagePack one
+# would be.
+rmp-serde = "1"
 # Tests define application error types to check that a workflow's *own* failures round-trip, which
 # is the case that matters; the crate already depends on `thiserror` for its own error channel.
 thiserror = "2"

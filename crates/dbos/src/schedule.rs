@@ -76,15 +76,23 @@ use crate::workflow::{DuplicationPolicy, Enqueue, init_or_join, new_row};
 /// A struct because a workflow takes one argument. Encoded as `{"scheduled_time": <RFC 3339 text>,
 /// "context": <the stored context>}`.
 ///
+/// **The context travels as JSON data**, in whatever format carries the input: it is turned into a
+/// `serde_json::Value` on the way in and read back from one, as a schedule's stored context is. A
+/// type that serializes differently in a format that is not human-readable — an IP address, a UUID
+/// — therefore reads back the same through a binary [`CustomSerializer`](crate::CustomSerializer)
+/// as through JSON.
+///
 /// `scheduled_time` is the **tick**, not the moment the workflow started: a workflow that waited
 /// in a queue, or one enqueued by a backfill, still reports the time it was scheduled for. A
 /// manual [`trigger`](DBOS::trigger_schedule) reports the time it was triggered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound(serialize = "C: Serialize", deserialize = "C: DeserializeOwned"))]
 pub struct ScheduledWorkflowInput<C = ()> {
     /// The cron tick this run is for.
     #[serde(with = "rfc3339")]
     pub scheduled_time: SystemTime,
     /// The schedule's context.
+    #[serde(with = "json_data")]
     pub context: C,
 }
 
@@ -110,6 +118,33 @@ mod rfc3339 {
         let text = String::deserialize(deserializer)?;
         let timestamp: jiff::Timestamp = text.parse().map_err(de::Error::custom)?;
         Ok(SystemTime::from(timestamp))
+    }
+}
+
+/// A context as the JSON data it is stored as, whatever format carries it.
+///
+/// The stored context is a `serde_json::Value`, which a format that is not human-readable carries
+/// as JSON data: an `Ipv4Addr` stored as `"10.0.0.1"` stays a string in CBOR. Reading `C` straight
+/// from such a format would expect `C`'s binary form — four octets — and fail, so `C` is read from
+/// the JSON data instead, and written as it, so that both directions agree.
+mod json_data {
+    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
+
+    pub(super) fn serialize<C: Serialize, S: Serializer>(
+        context: &C,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde_json::to_value(context)
+            .map_err(ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, C: DeserializeOwned, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<C, D::Error> {
+        serde_json::from_value(serde_json::Value::deserialize(deserializer)?)
+            .map_err(de::Error::custom)
     }
 }
 
@@ -1201,8 +1236,13 @@ impl Connection {
 ///
 /// The column carries no tag to say how the context was encoded, so it is read as the configured
 /// serializer would have written it, whoever did.
+///
+/// **Read as the JSON data it was written as**, a `serde_json::Value`, and only then as `C`, so a
+/// type whose form depends on whether the format is human-readable reads back as it was written.
 fn decode_context<C: DeserializeOwned>(context: &str, configured: &Serializer) -> Result<C> {
-    decode(Some(context), &configured.encoding(), "schedule context")
+    const WHAT: &str = "schedule context";
+    let value: serde_json::Value = decode(Some(context), &configured.encoding(), WHAT)?;
+    serde_json::from_value(value).map_err(|source| Error::decode_failed(WHAT, source))
 }
 
 /// A `SystemTime` as the calendar library's instant.
@@ -1307,6 +1347,92 @@ mod tests {
             into.fill(&mut deserializer)?;
             Ok(deserializer.end()?)
         }
+    }
+
+    /// MessagePack, as hex: a format that is not human-readable, as an application's binary
+    /// serializer would be.
+    #[derive(Debug)]
+    struct MessagePack;
+
+    impl crate::CustomSerializer for MessagePack {
+        fn name(&self) -> &str {
+            "msgpack_hex"
+        }
+
+        fn serialize(
+            &self,
+            value: crate::Payload<'_>,
+        ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+            let bytes = rmp_serde::to_vec(&value)?;
+            Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+
+        fn deserialize(
+            &self,
+            text: &str,
+            into: crate::PayloadSlot<'_>,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let bytes = (0..text.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&text[at..at + 2], 16))
+                .collect::<std::result::Result<Vec<u8>, _>>()?;
+            into.fill(&mut rmp_serde::Deserializer::new(bytes.as_slice()))
+        }
+    }
+
+    /// An `Ipv4Addr` is a string in JSON and four octets in MessagePack. The context is stored as its
+    /// JSON data, so it is read back as that, directly and inside a scheduled run's input, rather
+    /// than as the octets a MessagePack reader of `Ipv4Addr` would expect.
+    #[test]
+    fn a_context_reads_back_through_a_format_that_is_not_human_readable() {
+        let binary = Serializer::custom(MessagePack);
+        let address = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        let spec =
+            ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), "* * * * *", &address).unwrap();
+        let stored = spec.encode_context(&binary).unwrap();
+
+        // Read as `Ipv4Addr` straight from MessagePack, the stored string is not what it expects.
+        assert!(
+            decode::<std::net::Ipv4Addr, crate::error::EngineOnly>(
+                Some(&stored),
+                &binary.encoding(),
+                "context"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_context::<std::net::Ipv4Addr>(&stored, &binary).unwrap(),
+            address
+        );
+
+        // A run is called with the context the tick read, as a value, encoded in its input.
+        let fired: serde_json::Value = decode_context(&stored, &binary).unwrap();
+        let input = crate::serialization::encode_input::<_, crate::error::EngineOnly>(
+            &ScheduledWorkflowInput {
+                scheduled_time: SystemTime::UNIX_EPOCH,
+                context: fired,
+            },
+            &binary.encoding(),
+        )
+        .unwrap();
+        let read: ScheduledWorkflowInput<std::net::Ipv4Addr> =
+            crate::serialization::decode_input::<_, crate::error::EngineOnly>(
+                Some(&input),
+                &binary.encoding(),
+            )
+            .unwrap();
+        assert_eq!(read.context, address);
+
+        // And an input built with the typed context reads back the same.
+        let typed = crate::serialization::encode_input::<_, crate::error::EngineOnly>(
+            &ScheduledWorkflowInput {
+                scheduled_time: SystemTime::UNIX_EPOCH,
+                context: address,
+            },
+            &binary.encoding(),
+        )
+        .unwrap();
+        assert_eq!(typed, input);
     }
 
     /// A context carries no tag, so it is read only by the serializer that wrote it.
