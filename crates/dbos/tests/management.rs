@@ -814,7 +814,10 @@ async fn a_step_listing_can_leave_the_outputs_out() {
     })
     .await
     .expect("connect failed");
-    let without = ListWorkflowStepsOptions { load_output: false };
+    let without = ListWorkflowStepsOptions {
+        load_output: false,
+        ..ListWorkflowStepsOptions::default()
+    };
 
     for steps in [
         dbos.list_workflow_steps_with(id, without)
@@ -854,6 +857,79 @@ async fn a_step_listing_can_leave_the_outputs_out() {
         assert!(
             steps[1].error.is_some(),
             "the failed step's error is read by default"
+        );
+    }
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// A step listing pages with `limit` and `offset`, in step order, on both the instance and a
+/// client.
+#[tokio::test]
+async fn a_step_listing_reads_one_page_at_a_time() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("steps-paging-app", &db));
+    let workflow = dbos
+        .register_workflow("five-steps", |()| async move {
+            for name in ["a", "b", "c", "d", "e"] {
+                dbos::step(name, || async { Ok::<u32, Error>(0) }).await?;
+            }
+            Ok::<(), Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "paged";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    let client = Client::connect(ClientConfig {
+        app_name: Some("steps-paging-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+
+    let page = |limit, offset| ListWorkflowStepsOptions {
+        limit,
+        offset,
+        ..ListWorkflowStepsOptions::default()
+    };
+    let names = |steps: Vec<dbos::sysdb::types::StepRecord>| {
+        steps.into_iter().map(|s| s.step_name).collect::<Vec<_>>()
+    };
+    for (limit, offset, expected) in [
+        (Some(2), None, vec!["a", "b"]),
+        (Some(2), Some(2), vec!["c", "d"]),
+        (None, Some(3), vec!["d", "e"]),
+        (Some(10), Some(4), vec!["e"]),
+        (None, Some(5), vec![]),
+    ] {
+        let by_instance = dbos
+            .list_workflow_steps_with(id, page(limit, offset))
+            .await
+            .expect("listing failed");
+        let by_client = client
+            .list_workflow_steps_with(id, page(limit, offset))
+            .await
+            .expect("listing failed");
+        assert_eq!(
+            names(by_instance),
+            expected,
+            "limit {limit:?}, offset {offset:?}"
+        );
+        assert_eq!(
+            names(by_client),
+            expected,
+            "limit {limit:?}, offset {offset:?}"
         );
     }
 

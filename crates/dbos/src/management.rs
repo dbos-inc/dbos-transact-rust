@@ -243,9 +243,9 @@ pub struct RewindOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
 }
 
-/// What a step listing reads.
+/// What a step listing reads, and which page of it.
 ///
-/// Constructed with `..Default::default()`, which reads everything.
+/// Constructed with `..Default::default()`, which reads every step, outputs included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListWorkflowStepsOptions {
     /// Whether to read each step's [`output`](StepRecord::output) and
@@ -255,13 +255,25 @@ pub struct ListWorkflowStepsOptions {
     /// and timings — and leaves both `None`. The payload columns are left out of the query, so a
     /// workflow whose steps returned large values costs no more to list than one whose steps
     /// returned nothing. A step that returned nothing and a step whose output wasn't read look the
-    /// same.
+    /// same, and so do a failed step and a successful one: to find the step that failed, list with
+    /// this on.
+    ///
+    /// Called from inside a workflow, the listing is checkpointed, and a replay returns what the
+    /// first execution recorded, whatever this says on the replay.
     pub load_output: bool,
+    /// The most steps to return, counting from [`offset`](Self::offset). `None` returns them all.
+    pub limit: Option<i64>,
+    /// How many steps to skip, in step order. `None` skips none.
+    pub offset: Option<i64>,
 }
 
 impl Default for ListWorkflowStepsOptions {
     fn default() -> Self {
-        Self { load_output: true }
+        Self {
+            load_output: true,
+            limit: None,
+            offset: None,
+        }
     }
 }
 
@@ -988,12 +1000,9 @@ impl DBOS {
 
     /// Reads one workflow's steps, in execution order.
     ///
-    /// Outputs and errors come with them, unless
-    /// [`list_workflow_steps_with`](Self::list_workflow_steps_with) leaves them out. This is a
-    /// single workflow's own history, bounded by what that workflow did, so there is no paging here
-    /// as there is on
-    /// [`list_workflows`](Self::list_workflows) — the system database layer carries limit and
-    /// offset for the caller that has a workflow long enough to need them.
+    /// Every step, with its output or error.
+    /// [`list_workflow_steps_with`](Self::list_workflow_steps_with) can leave the outputs out, or
+    /// read one page of a long workflow's steps.
     ///
     /// A step whose [`child_workflow_id`](StepRecord::child_workflow_id) is set was a child
     /// workflow call rather than a step body, which is how a tree is walked from a listing.
@@ -1007,11 +1016,13 @@ impl DBOS {
         self.list_workflow_steps_with(workflow_id, ListWorkflowStepsOptions::default())
     }
 
-    /// Reads one workflow's steps, choosing what each step carries.
+    /// Reads one workflow's steps, choosing what each step carries and which page to read.
     ///
     /// See [`list_workflow_steps`](Self::list_workflow_steps).
     /// [`load_output`](ListWorkflowStepsOptions::load_output) off reads only the steps' metadata,
-    /// for a listing of a workflow whose step outputs are large.
+    /// for a listing of a workflow whose step outputs are large;
+    /// [`limit`](ListWorkflowStepsOptions::limit) and [`offset`](ListWorkflowStepsOptions::offset)
+    /// page through a workflow with many steps.
     pub fn list_workflow_steps_with<'a>(
         &self,
         workflow_id: &'a str,
@@ -1023,7 +1034,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .list_workflow_steps(workflow_id, options.load_output, placement.step())
+                    .list_workflow_steps(workflow_id, options, placement.step())
                     .await
             },
         )
@@ -1276,13 +1287,18 @@ impl crate::Client {
         self.connection().list_workflows(filter, None).await
     }
 
-    /// Reads the steps a workflow has recorded, in the order it recorded them.
+    /// Reads the steps a workflow has recorded, in the order it recorded them, each with its output
+    /// or error.
+    ///
+    /// [`list_workflow_steps_with`](Self::list_workflow_steps_with) can leave the outputs out, or
+    /// read one page of a long workflow's steps.
     pub async fn list_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
         self.list_workflow_steps_with(workflow_id, ListWorkflowStepsOptions::default())
             .await
     }
 
-    /// Reads the steps a workflow has recorded, choosing what each step carries.
+    /// Reads the steps a workflow has recorded, choosing what each step carries and which page to
+    /// read.
     ///
     /// See [`DBOS::list_workflow_steps_with`].
     pub async fn list_workflow_steps_with(
@@ -1291,7 +1307,7 @@ impl crate::Client {
         options: ListWorkflowStepsOptions,
     ) -> Result<Vec<StepRecord>> {
         self.connection()
-            .list_workflow_steps(workflow_id, options.load_output, None)
+            .list_workflow_steps(workflow_id, options, None)
             .await
     }
 }
@@ -1500,11 +1516,17 @@ impl Connection {
     pub(crate) async fn list_workflow_steps(
         &self,
         workflow_id: &str,
-        load_output: bool,
+        options: ListWorkflowStepsOptions,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<StepRecord>> {
         self.sysdb()
-            .list_workflow_steps(workflow_id, load_output, None, None, caller)
+            .list_workflow_steps(
+                workflow_id,
+                options.load_output,
+                options.limit,
+                options.offset,
+                caller,
+            )
             .await
             .map_err(Error::SystemDatabase)
     }

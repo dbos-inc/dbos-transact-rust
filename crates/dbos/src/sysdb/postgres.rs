@@ -2419,6 +2419,36 @@ fn step_payloads(load_output: bool) -> &'static str {
     }
 }
 
+/// The statement that lists a workflow's steps, in step order.
+///
+/// Built here rather than inline so a test can check what is sent: with `load_output` off it must
+/// not read the payload columns at all, which is the whole saving.
+fn step_listing_query(
+    steps_table: &str,
+    workflow_id: &str,
+    load_output: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> sqlx::QueryBuilder<sqlx::Postgres> {
+    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
+    q.push(STEP_COLUMNS)
+        .push(", ")
+        .push(step_payloads(load_output))
+        .push(" FROM ")
+        .push(steps_table)
+        // `function_id` is the step order, so ordering by it replays the workflow.
+        .push(" WHERE workflow_uuid = ")
+        .push_bind(workflow_id)
+        .push(" ORDER BY function_id");
+    if let Some(limit) = limit {
+        q.push(" LIMIT ").push_bind(limit);
+    }
+    if let Some(offset) = offset {
+        q.push(" OFFSET ").push_bind(offset);
+    }
+    q
+}
+
 /// The same columns qualified for a join, derived from [`STEP_COLUMNS`] so the two cannot drift.
 ///
 /// `output`, `error`, and `started_at_epoch_ms` exist on *both* tables, so the qualification is
@@ -4982,22 +5012,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::LIST_WORKFLOW_STEPS,
                 started_at,
                 |mut conn| async move {
-                    let mut q = sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT ");
-                    q.push(STEP_COLUMNS)
-                        .push(", ")
-                        .push(step_payloads(load_output))
-                        .push(" FROM ")
-                        .push(steps_table)
-                        // `function_id` is the step order, so ordering by it replays the workflow.
-                        .push(" WHERE workflow_uuid = ")
-                        .push_bind(workflow_id)
-                        .push(" ORDER BY function_id");
-                    if let Some(limit) = limit {
-                        q.push(" LIMIT ").push_bind(limit);
-                    }
-                    if let Some(offset) = offset {
-                        q.push(" OFFSET ").push_bind(offset);
-                    }
+                    let mut q =
+                        step_listing_query(steps_table, workflow_id, load_output, limit, offset);
                     let rows = q.build().fetch_all(&mut *conn).await?;
                     let steps: Vec<StepRecord> = rows
                         .iter()
@@ -7585,7 +7601,7 @@ impl PostgresSystemDatabase {
 mod tests {
     use super::{
         AssertSqlSafe, PostgresSystemDatabase, Settings, classify_sqlstate, is_transport_failure,
-        polling_limit, split_database, step_payloads, with_retry,
+        polling_limit, split_database, step_listing_query, with_retry,
     };
     use crate::sysdb::types::{NewWorkflow, Submission, Timestamp};
     use crate::sysdb::{BackendError, BackendErrorKind, Error, SystemDatabase};
@@ -7641,17 +7657,28 @@ mod tests {
     }
 
     /// A listing that doesn't load outputs never reads the payload columns, so large step
-    /// outputs cost it nothing. Only the aliases name them.
+    /// outputs cost it nothing: they appear in the statement only as the names of nulls. With
+    /// outputs on, both columns are read.
     #[test]
     fn a_step_listing_without_outputs_reads_no_payload_column() {
-        let columns = step_payloads(false)
-            .replace("AS output", "")
-            .replace("AS error", "");
+        let without = step_listing_query("steps", "wf", false, Some(10), Some(5))
+            .sql()
+            .as_str()
+            .to_owned();
+        let rest = without
+            .replace("NULL::text AS output", "")
+            .replace("NULL::text AS error", "");
         assert!(
-            !columns.contains("output") && !columns.contains("error"),
-            "{columns}"
+            !rest.contains("output") && !rest.contains("error"),
+            "{without}"
         );
-        assert_eq!(step_payloads(true), "output, error");
+        assert!(without.contains(" LIMIT $2 OFFSET $3"), "{without}");
+
+        let with = step_listing_query("steps", "wf", true, None, None)
+            .sql()
+            .as_str()
+            .to_owned();
+        assert!(with.contains(", output, error FROM steps"), "{with}");
     }
 
     /// The message CockroachDB attaches to `XXUUU` when a client's connection dies mid-read,
