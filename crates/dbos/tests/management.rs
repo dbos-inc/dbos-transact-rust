@@ -5,7 +5,7 @@
 //! the two listings are reads and writes against the row itself, and are checked against the
 //! system database directly.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -419,6 +419,157 @@ async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
         ["one", "two", "three"],
     );
 
+    dbos.shutdown().await;
+}
+
+/// **A fork can adopt a replacement for a child that failed.**
+///
+/// The parent runs a child, which fails, failing the parent. The child is re-run as a fork of
+/// itself, which succeeds. The parent is then forked from the step that awaits the child, mapping
+/// the failed child to its replacement: the copied start step names the replacement, so the fork
+/// waits on it and finishes with its result. Neither the parent's earlier step nor either child
+/// runs again.
+///
+/// Without the map, or with a map naming a child the parent never started, the same fork waits
+/// on the original child and fails with it. The client's fork takes the map too.
+#[tokio::test]
+async fn a_fork_adopts_the_replacement_for_a_failed_child() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("fork-replace-child-app", &db));
+    let broken = Arc::new(AtomicBool::new(true));
+    let (child_runs, before_runs) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let child = dbos
+        .register_workflow("child", {
+            let (broken, child_runs) = (Arc::clone(&broken), Arc::clone(&child_runs));
+            move |()| {
+                let (broken, child_runs) = (Arc::clone(&broken), Arc::clone(&child_runs));
+                async move {
+                    child_runs.fetch_add(1, Ordering::SeqCst);
+                    if broken.load(Ordering::SeqCst) {
+                        return Err(Error::Portable {
+                            name: "Broken".to_owned(),
+                            message: "the child is broken".to_owned(),
+                            code: None,
+                            data: None,
+                        });
+                    }
+                    Ok::<u32, Error>(42)
+                }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let before_runs = Arc::clone(&before_runs);
+            move |()| {
+                let (child, before_runs) = (child.clone(), Arc::clone(&before_runs));
+                async move {
+                    dbos::step("before", || async {
+                        before_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), Error>(())
+                    })
+                    .await?;
+                    // Step 1 starts the child, step 2 awaits it.
+                    let value = child.run(()).await?;
+                    Ok::<u32, Error>(value + 1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "replace-parent";
+    let original_child = "replace-parent-1";
+    parent
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the child fails the parent");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 1);
+
+    broken.store(false, Ordering::SeqCst);
+    let replacement = dbos
+        .fork_with::<u32, EngineOnly>(
+            original_child,
+            0,
+            ForkOptions {
+                forked_id: Some("replacement-child"),
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        replacement.result().await.expect("the replacement failed"),
+        42
+    );
+    assert_eq!(child_runs.load(Ordering::SeqCst), 2);
+
+    let map = [(original_child, "replacement-child")];
+    let adopted = dbos
+        .fork_with::<u32, EngineOnly>(
+            id,
+            2,
+            ForkOptions {
+                replacement_children: &map,
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(adopted.result().await.expect("the fork failed"), 43);
+
+    let client = Client::connect(ClientConfig {
+        app_name: Some("fork-replace-child-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+    let by_client = client
+        .fork_with::<u32, EngineOnly>(
+            id,
+            2,
+            ForkOptions {
+                replacement_children: &map,
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork failed");
+    assert_eq!(by_client.result().await.expect("the fork failed"), 43);
+
+    assert_eq!(before_runs.load(Ordering::SeqCst), 1, "step 0 ran again");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 2, "a child ran again");
+
+    // Without the map, and with a map naming a child that was never started, the fork waits on
+    // the original child and fails with it.
+    let unrelated = [("never-started", "replacement-child")];
+    for replacement_children in [&[][..], &unrelated[..]] {
+        let plain = dbos
+            .fork_with::<u32, EngineOnly>(
+                id,
+                2,
+                ForkOptions {
+                    replacement_children,
+                    ..ForkOptions::default()
+                },
+            )
+            .await
+            .expect("fork failed");
+        let error = plain
+            .result()
+            .await
+            .expect_err("the original child's failure");
+        assert!(error.to_string().contains("broken"), "{error}");
+    }
+    assert_eq!(child_runs.load(Ordering::SeqCst), 2, "a child ran again");
+
+    client.close().await;
     dbos.shutdown().await;
 }
 

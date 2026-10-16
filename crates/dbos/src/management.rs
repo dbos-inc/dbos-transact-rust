@@ -212,6 +212,22 @@ pub struct ForkOptions<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run once it starts. `None` is unbounded, not the source's bound.
     pub timeout: Option<Duration>,
+    /// Children to swap in as the fork's steps are copied, as `(original, replacement)` pairs.
+    ///
+    /// A copied step that started child `original` is rewritten to name `replacement`, so the
+    /// fork, replaying that step, adopts the replacement: it waits on and returns the
+    /// replacement's result instead of the original's. This is how a fork picks up a corrected
+    /// child — re-run the failed child (often by forking it), then fork the parent from the step
+    /// that awaits it, mapping the old child to the new one. The steps in between don't run again.
+    ///
+    /// Only steps below the start step are copied, so only those are rewritten; from the start
+    /// step on, the fork starts its children as usual. An `original` the copied steps never
+    /// started changes nothing. The fork doesn't create `replacement`: it must exist by the time
+    /// the fork waits on it. [`fork_all`](DBOS::fork_all) applies the pairs to every fork.
+    ///
+    /// Each `original` may appear once. Naming one twice, or naming an empty one, fails with
+    /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is forked.
+    pub replacement_children: &'a [(&'a str, &'a str)],
 }
 
 /// Where a rewind cuts a workflow's history, and where the rewound workflow goes.
@@ -1388,7 +1404,7 @@ impl Connection {
             queue_name: options.queue,
             queue_partition_key: options.queue_partition_key,
             timeout: options.timeout,
-            replacement_children: &[],
+            replacement_children: options.replacement_children,
         };
 
         let forks: Vec<Fork<'_>> = workflow_ids
