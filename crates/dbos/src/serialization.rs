@@ -70,7 +70,10 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 ///         into: PayloadSlot<'_>,
 ///     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 ///         let json: String = text.chars().rev().collect();
-///         into.fill(&mut serde_json::Deserializer::from_str(&json))
+///         let mut deserializer = serde_json::Deserializer::from_str(&json);
+///         into.fill(&mut deserializer)?;
+///         // Refuses anything after the value, which the slot does not look at.
+///         Ok(deserializer.end()?)
 ///     }
 /// }
 /// ```
@@ -93,7 +96,11 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 /// **Keep it configured while its rows exist.** A row records the name it was written under, and
 /// is readable only by a process configured with a serializer of that name: one without it reports
 /// [`Error::UnknownSerialization`] rather than guess. The built-in encodings stay readable either
-/// way, so adding a serializer to an application that already has rows is safe.
+/// way, so adding a serializer to an application that already has rows is safe — except for
+/// schedules: a schedule's context records no name, and is read with whatever serializer is
+/// configured, so a schedule created before the serializer was configured has to be written again,
+/// with [`update_schedule`](crate::DBOS::update_schedule) or
+/// [`apply_schedules`](crate::DBOS::apply_schedules).
 pub trait CustomSerializer: Send + Sync + std::fmt::Debug {
     /// The name written to each row's `serialization` column.
     ///
@@ -1032,13 +1039,21 @@ fn rebuild<E: DurableError>(name: &str, data: Option<&RawValue>) -> Option<Error
 /// written from where the envelope says what that was and the reader's types can hold it — see
 /// [`encode_error`] — and [`Error::Portable`] otherwise, which is how another language's error
 /// arrives. `None` is for the caller to report — what it reports depends on whose error it was.
+///
+/// **A custom one is never `None`**: one the serializer cannot decode is
+/// [`Error::Deserialization`], since its text is no message to pass on.
 pub(crate) fn decode_error<E: DurableError>(
     encoded: &str,
     encoding: &PayloadEncoding,
 ) -> Option<Error<E>> {
     match encoding {
-        PayloadEncoding::Native | PayloadEncoding::Custom(_) => {
+        PayloadEncoding::Native => {
             decode::<Error<E>, EngineOnly>(Some(encoded), encoding, "error").ok()
+        }
+        // The text is the serializer's, not a message anyone could read, so a failure to decode
+        // it is reported as that.
+        PayloadEncoding::Custom(_) => {
+            Some(decode::<Error<E>, E>(Some(encoded), encoding, "error").unwrap_or_else(|e| e))
         }
         PayloadEncoding::Portable => {
             let PortableError {
@@ -1716,7 +1731,9 @@ mod tests {
             into: PayloadSlot<'_>,
         ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let json: String = text.chars().rev().collect();
-            into.fill(&mut serde_json::Deserializer::from_str(&json))
+            let mut deserializer = serde_json::Deserializer::from_str(&json);
+            into.fill(&mut deserializer)?;
+            Ok(deserializer.end()?)
         }
     }
 
@@ -1784,6 +1801,26 @@ mod tests {
             decode_error::<CardDeclined>(&encoded, &format),
             Some(Error::Application(CardDeclined))
         ));
+    }
+
+    /// A custom serializer's text is no message, so an error it cannot read is reported as a
+    /// failure to decode rather than passed off as the error itself.
+    #[test]
+    fn an_error_a_custom_serializer_cannot_read_is_a_decode_failure() {
+        let (_, format) = backwards();
+        let decoded = decode_error::<CardDeclined>("sealed", &format);
+        assert!(
+            matches!(&decoded, Some(Error::Deserialization { what, .. }) if what == "error"),
+            "{decoded:?}"
+        );
+    }
+
+    /// Text after the value is refused, as the documented pattern ends the deserializer.
+    #[test]
+    fn a_custom_serializer_refuses_trailing_text() {
+        let (_, format) = backwards();
+        let err = decode::<u32, EngineOnly>(Some("x 7"), &format, "result").unwrap_err();
+        assert!(matches!(&err, Error::Deserialization { .. }), "{err}");
     }
 
     #[test]

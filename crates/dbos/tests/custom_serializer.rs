@@ -42,7 +42,9 @@ impl CustomSerializer for Backwards {
         into: PayloadSlot<'_>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json: String = text.chars().rev().collect();
-        into.fill(&mut serde_json::Deserializer::from_str(&json))
+        let mut deserializer = serde_json::Deserializer::from_str(&json);
+        into.fill(&mut deserializer)?;
+        Ok(deserializer.end()?)
     }
 }
 
@@ -553,7 +555,8 @@ async fn a_recovered_workflow_replays_what_it_recorded() {
 }
 
 /// A schedule's context is written by the configured serializer, and a scheduled run is called
-/// with it. A context written before the serializer was configured is still read.
+/// with it. The column carries no tag, so a context written before the serializer was configured
+/// is read with it too, and does not decode.
 #[tokio::test]
 async fn a_schedules_context_goes_through_the_serializer() {
     let db = test_database().await;
@@ -596,23 +599,35 @@ async fn a_schedules_context_goes_through_the_serializer() {
     assert_eq!(forwards::<Vec<String>>(&stored("sealed").await), regions);
     assert_eq!(stored("plain").await, r#"["emea","apac"]"#);
 
-    for name in ["sealed", "plain"] {
-        let schedule = dbos.get_schedule(name).await.unwrap().expect("it exists");
-        assert_eq!(
-            schedule.decode_context::<Vec<String>>().unwrap(),
-            regions,
-            "{name}"
-        );
-        let run = dbos
-            .trigger_schedule::<Vec<String>, EngineOnly>(name)
-            .await
-            .unwrap();
-        let ran = tokio::time::timeout(DEADLINE, run.result())
-            .await
-            .expect("the run finishes")
-            .unwrap();
-        assert_eq!(ran, regions, "{name}");
-    }
+    let schedule = dbos
+        .get_schedule("sealed")
+        .await
+        .unwrap()
+        .expect("it exists");
+    assert_eq!(schedule.decode_context::<Vec<String>>().unwrap(), regions);
+    let run = dbos
+        .trigger_schedule::<Vec<String>, EngineOnly>("sealed")
+        .await
+        .unwrap();
+    let ran = tokio::time::timeout(DEADLINE, run.result())
+        .await
+        .expect("the run finishes")
+        .unwrap();
+    assert_eq!(ran, regions);
+
+    // The plain context is read with the custom serializer, which cannot make sense of it.
+    let plain = dbos
+        .get_schedule("plain")
+        .await
+        .unwrap()
+        .expect("it exists");
+    let err = plain.decode_context::<Vec<String>>().unwrap_err();
+    assert!(matches!(&err, Error::Deserialization { .. }), "{err}");
+    let err = dbos
+        .trigger_schedule::<Vec<String>, EngineOnly>("plain")
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Deserialization { .. }), "{err}");
 
     // Without the serializer, its own context cannot be read.
     let without = client(&db, Serializer::RustSerde).await;

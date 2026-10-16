@@ -414,9 +414,10 @@ pub(crate) enum StepDurability<'a> {
 /// one is rebuilt from its envelope. A tag this SDK cannot read is
 /// [`Error::UnknownSerialization`], as it is for every other payload.
 ///
-/// Falls back to a plain message when the bytes, in an encoding this SDK reads, are not one of
-/// ours — an error some other build wrote in a shape this one does not know. A readable message
-/// beats a decode failure standing in for somebody else's error.
+/// Falls back to a plain message when the bytes, in a built-in encoding, are not one of ours — an
+/// error some other build wrote in a shape this one does not know. A readable message beats a
+/// decode failure standing in for somebody else's error. A custom serializer's text is no
+/// readable message, so one it cannot decode is reported as [`Error::Deserialization`].
 pub(crate) fn revive<E: DurableError>(
     recorded: &str,
     tag: Option<&str>,

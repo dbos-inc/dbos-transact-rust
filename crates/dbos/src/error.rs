@@ -755,7 +755,8 @@ impl EncodedError {
     ///
     /// An error that does not decode — a native one some other build wrote in a shape this one
     /// cannot read — is reported as [`Error::WorkflowFailed`] with the bytes as its message, which
-    /// is what survives.
+    /// is what survives. One a custom serializer cannot decode is [`Error::Deserialization`]: its
+    /// bytes are no message.
     pub(crate) fn decode<E: DurableError>(&self, workflow_id: &str) -> Error<E> {
         decode_error(&self.encoded, &self.encoding).unwrap_or_else(|| Error::WorkflowFailed {
             workflow_id: workflow_id.to_owned(),

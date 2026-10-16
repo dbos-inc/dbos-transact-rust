@@ -339,7 +339,7 @@ impl ScheduleChange<'_> {
 /// The context is kept encoded, and [`decode_context`](Self::decode_context) decodes it on request:
 /// a schedule written by another SDK, or under another serializer, may hold a context this one
 /// cannot read, and listing it should not fail for that.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Schedule {
     id: String,
     name: String,
@@ -355,6 +355,40 @@ pub struct Schedule {
     queue_name: Option<String>,
     application_name: Option<String>,
 }
+
+/// Two views are equal when they read the same row: which serializer reads the context is not
+/// part of the schedule.
+impl PartialEq for Schedule {
+    fn eq(&self, other: &Self) -> bool {
+        let Schedule {
+            id,
+            name,
+            workflow,
+            schedule,
+            status,
+            context,
+            serializer: _,
+            last_fired_at,
+            automatic_backfill,
+            cron_timezone,
+            queue_name,
+            application_name,
+        } = self;
+        *id == other.id
+            && *name == other.name
+            && *workflow == other.workflow
+            && *schedule == other.schedule
+            && *status == other.status
+            && *context == other.context
+            && *last_fired_at == other.last_fired_at
+            && *automatic_backfill == other.automatic_backfill
+            && *cron_timezone == other.cron_timezone
+            && *queue_name == other.queue_name
+            && *application_name == other.application_name
+    }
+}
+
+impl Eq for Schedule {}
 
 impl Schedule {
     /// Builds the read view from a row, read by a handle configured with `serializer`.
@@ -413,10 +447,10 @@ impl Schedule {
 
     /// The context each tick is called with, decoded as `C`.
     ///
-    /// Read with the configured [`Serializer`](crate::Serializer), and, where that is a custom
-    /// one that cannot read it, as `rust_serde`, which is what a context written before the
-    /// serializer was configured holds. The column carries no tag, so this is a guess: a custom
-    /// serializer that also accepts plain JSON can misread a `rust_serde` context as its own.
+    /// Read with the configured [`Serializer`](crate::Serializer). The column carries no tag, so
+    /// a context written under another serializer — including one written before a
+    /// [`CustomSerializer`](crate::CustomSerializer) was configured — is read as if this one had
+    /// written it: it fails to decode, or decodes to something else.
     pub fn decode_context<C: DeserializeOwned>(&self) -> Result<C> {
         decode_context(&self.context, &self.serializer)
     }
@@ -1163,27 +1197,12 @@ impl Connection {
     }
 }
 
-/// Decodes a schedule's context, which carries no tag to say how it was encoded.
+/// Decodes a schedule's context with the configured serializer.
 ///
-/// It was written by whichever serializer its writer was configured with, so this tries the
-/// configured one first. Where that is a custom serializer that cannot read it, it tries
-/// `rust_serde`, which is what a context written before the serializer was configured holds. A
-/// context written by a custom serializer this process is not configured with is unreadable, and
-/// the custom serializer's error is the one reported.
-///
-/// **Without a tag this is a guess**, and a custom serializer that also accepts plain JSON can
-/// take a `rust_serde` context for one of its own and read it differently. One that encrypts or
-/// writes a binary format refuses JSON, and the guess is then always right.
+/// The column carries no tag to say how the context was encoded, so it is read as the configured
+/// serializer would have written it, whoever did.
 fn decode_context<C: DeserializeOwned>(context: &str, configured: &Serializer) -> Result<C> {
-    const WHAT: &str = "schedule context";
-    let encoding = configured.encoding();
-    match decode(Some(context), &encoding, WHAT) {
-        Err(error) if matches!(encoding, PayloadEncoding::Custom(_)) => {
-            decode::<C, crate::error::EngineOnly>(Some(context), &PayloadEncoding::Native, WHAT)
-                .map_err(|_| error)
-        }
-        decoded => decoded,
-    }
+    decode(Some(context), &configured.encoding(), "schedule context")
 }
 
 /// A `SystemTime` as the calendar library's instant.
@@ -1284,15 +1303,15 @@ mod tests {
             into: crate::PayloadSlot<'_>,
         ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let json: String = text.chars().rev().collect();
-            into.fill(&mut serde_json::Deserializer::from_str(&json))
+            let mut deserializer = serde_json::Deserializer::from_str(&json);
+            into.fill(&mut deserializer)?;
+            Ok(deserializer.end()?)
         }
     }
 
-    /// A context carries no tag, so a custom serializer's process reads its own contexts and the
-    /// `rust_serde` ones written before it was configured; a process without it reads only the
-    /// latter.
+    /// A context carries no tag, so it is read only by the serializer that wrote it.
     #[test]
-    fn a_context_is_read_by_the_configured_serializer_or_as_rust_serde() {
+    fn a_context_is_read_by_the_configured_serializer_alone() {
         let custom = Serializer::custom(Backwards);
         let spec =
             ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), "* * * * *", &[1, 2]).unwrap();
@@ -1302,7 +1321,11 @@ mod tests {
         assert_eq!(plain, "[1,2]");
 
         assert_eq!(decode_context::<Vec<u8>>(&sealed, &custom).unwrap(), [1, 2]);
-        assert_eq!(decode_context::<Vec<u8>>(&plain, &custom).unwrap(), [1, 2]);
+        assert!(decode_context::<Vec<u8>>(&plain, &custom).is_err());
+        assert_eq!(
+            decode_context::<Vec<u8>>(&plain, &Serializer::RustSerde).unwrap(),
+            [1, 2]
+        );
         assert!(decode_context::<Vec<u8>>(&sealed, &Serializer::RustSerde).is_err());
     }
 
@@ -1327,6 +1350,37 @@ mod tests {
         );
         assert_eq!(schedule.workflow(), &WorkflowKey::new("w"));
         assert_eq!(schedule.last_fired_at(), None);
+    }
+
+    /// Two handles, each with its own instance of a serializer, see the same schedule.
+    #[test]
+    fn views_of_one_row_are_equal_whatever_reads_them() {
+        let record = ScheduleRecord {
+            schedule_id: "id".into(),
+            schedule_name: "s".into(),
+            workflow_name: "w".into(),
+            workflow_class_name: None,
+            schedule: "* * * * *".into(),
+            status: ScheduleStatus::Active,
+            context: "null".into(),
+            last_fired_at: None,
+            automatic_backfill: false,
+            cron_timezone: None,
+            queue_name: None,
+            application_name: None,
+        };
+        let one = Schedule::from_record(record.clone(), &Serializer::custom(Backwards));
+        let other = Schedule::from_record(record.clone(), &Serializer::custom(Backwards));
+        assert_eq!(one, other);
+        assert_eq!(
+            one,
+            Schedule::from_record(record.clone(), &Serializer::RustSerde)
+        );
+        let changed = ScheduleRecord {
+            context: "1".into(),
+            ..record
+        };
+        assert_ne!(one, Schedule::from_record(changed, &Serializer::RustSerde));
     }
 
     #[test]
