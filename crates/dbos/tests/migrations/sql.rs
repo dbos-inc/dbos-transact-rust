@@ -72,6 +72,28 @@ async fn columns_of(pool: &PgPool, schema: &str, table: &str) -> Vec<String> {
     rows.iter().map(|r| r.get::<String, _>(0)).collect()
 }
 
+async fn trigger_names(pool: &PgPool, schema: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT trigger_name FROM information_schema.triggers \
+         WHERE trigger_schema = $1 ORDER BY 1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .expect("failed to list triggers")
+}
+
+async fn function_names(pool: &PgPool, schema: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = $1 ORDER BY 1",
+    )
+    .bind(schema)
+    .fetch_all(pool)
+    .await
+    .expect("failed to list functions")
+}
+
 /// The whole corpus applies cleanly and produces the expected tables.
 #[tokio::test]
 async fn the_corpus_applies_to_a_real_database() {
@@ -538,15 +560,10 @@ async fn only_the_notifications_trigger_survives() {
     )
     .await;
 
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT trigger_name FROM information_schema.triggers \
-         WHERE trigger_schema = $1 ORDER BY 1",
-    )
-    .bind(schema)
-    .fetch_all(&pool)
-    .await
-    .expect("failed to list triggers");
-    assert_eq!(names, vec!["dbos_notifications_trigger".to_owned()]);
+    assert_eq!(
+        trigger_names(&pool, schema).await,
+        ["dbos_notifications_trigger"]
+    );
 
     // The v1 partition index is created by 45 and dropped by 47, v2 is created by 46 and dropped
     // by 118; only 117's v3 survives.
@@ -564,7 +581,8 @@ async fn only_the_notifications_trigger_survives() {
     );
 }
 
-/// Migrations 43 and 44 drop their triggers even when the process running them doesn't listen.
+/// Migrations 43 and 44 drop their triggers and functions even when the process running them
+/// doesn't listen.
 ///
 /// A database migrated up to 42 with notifications on has the workflow-events and streams
 /// triggers. A process that later takes it past 44 with notifications off must still drop them;
@@ -587,15 +605,17 @@ async fn the_trigger_drops_run_without_listen_notify() {
     apply_all(&pool, schema, &with_notify[..42]).await;
     apply_all(&pool, schema, &without[42..]).await;
 
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT trigger_name FROM information_schema.triggers \
-         WHERE trigger_schema = $1 ORDER BY 1",
-    )
-    .bind(schema)
-    .fetch_all(&pool)
-    .await
-    .expect("failed to list triggers");
-    assert_eq!(names, vec!["dbos_notifications_trigger".to_owned()]);
+    assert_eq!(
+        trigger_names(&pool, schema).await,
+        ["dbos_notifications_trigger"]
+    );
+    let functions = function_names(&pool, schema).await;
+    for dropped in ["workflow_events_function", "streams_function"] {
+        assert!(
+            !functions.iter().any(|f| f == dropped),
+            "{dropped} should have been dropped, got {functions:?}",
+        );
+    }
 }
 
 /// Migration 10 is skipped, because migration 1 already created the primary key.
@@ -715,14 +735,7 @@ async fn the_corpus_applies_without_listen_notify() {
     // The *functions* go too — migration 20 must not try to harden what migration 1 never
     // installed — while the SQL-client functions, which have nothing to do with notifications,
     // must still be there.
-    let functions: Vec<String> = sqlx::query_scalar(
-        "SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = $1 ORDER BY 1",
-    )
-    .bind(schema)
-    .fetch_all(&pool)
-    .await
-    .expect("failed to list functions");
+    let functions = function_names(&pool, schema).await;
     for absent in [
         "notifications_function",
         "workflow_events_function",

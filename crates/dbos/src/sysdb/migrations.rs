@@ -524,7 +524,8 @@ pub struct Migration {
 
 /// Assembles the ordered migration list for a dialect and configuration.
 ///
-/// Seven migrations vary, and the variance lives here rather than in the files:
+/// Ten migrations vary. The variance is declared with each file, as its [`Applies`], or added
+/// here:
 ///
 /// - **1** gains its LISTEN/NOTIFY half only when notifications are on and supported.
 /// - **10** carries a guard ([`MIGRATION_10_PK_PROBE`]) instead of being conditional.
@@ -534,7 +535,11 @@ pub struct Migration {
 /// - **28** drops a constraint PostgreSQL exposes as a constraint and CockroachDB as an index.
 /// - **38** appends a PostgreSQL-only `search_path` tail.
 /// - **39** installs a trigger, so it follows the same gate as 1's notify half.
-/// - **105** replaces the function 38 defined, and appends the same `search_path` tail.
+/// - **43** and **44** drop the triggers 39 and 1 installed, on every PostgreSQL database. Not
+///   gated on notifications: a database migrated while they were on has the triggers even if
+///   this process has them off.
+/// - **105** and **113** each replace the function 38 defined, and append the same `search_path`
+///   tail.
 ///
 /// A migration that does not apply renders empty rather than being dropped: versions are
 /// positional, so removing one would renumber everything after it.
@@ -542,8 +547,8 @@ pub struct Migration {
 /// TODO(dbos-team): UPSTREAM item 15. `use_listen_notify` decides both how *this process* waits and
 /// whether the *database* gets its NOTIFY triggers — and the second is permanent and shared. A
 /// database migrated with it off has no triggers, so a Go peer, which has no such config and always
-/// LISTENs on Postgres (`dialect.go`), waits out every `recv` timeout in silence. Rust gates here
-/// because Python and Java do; whether any of them should is the question.
+/// LISTENs on Postgres (`dialect.go`), waits out every `recv` timeout in silence. 1, 20 and 39 are
+/// still gated; whether any migration should be is the question.
 pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool) -> Vec<Migration> {
     let quoted = quote_identifier(schema);
     // CockroachDB has no LISTEN/NOTIFY, so asking for it there is asking for nothing.

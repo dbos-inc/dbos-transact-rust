@@ -188,7 +188,7 @@ async fn verify_accepts_a_fully_migrated_database() {
 
 /// Empty migrations consume their version numbers.
 ///
-/// With notifications off, migrations 39, 43, and 44 do nothing — but the final version must
+/// With notifications off, migration 39 does nothing — but the final version must
 /// still be the full count, or another implementation reading this database would think it
 /// had further to go.
 #[tokio::test]
