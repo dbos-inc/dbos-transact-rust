@@ -9,10 +9,11 @@
 //! another's `portable_json` sit in the same table, and what keeps this layer usable from a
 //! language that does not share Rust's idea of a value.
 //!
-//! The one value this layer does put into a column itself is the result a management call
-//! records as its caller's step — a listing, a forked id, a recorded refusal. Even that is
-//! encoded by the caller: it goes to the [`StepCaller`]'s [`StepCodec`] as JSON data, and the
-//! row is tagged with whatever the codec names.
+//! Besides two fixed values in a fixed encoding — a sleep's wake time and the stream-close
+//! sentinel, both `portable_json` — the one value this layer puts into a column itself is the
+//! result a management call records as its caller's step: a listing, a forked id, a recorded
+//! refusal. Even that is encoded by the caller: it goes to the [`StepCaller`]'s [`StepCodec`] as
+//! JSON data, and the row is tagged with whatever the codec names.
 //!
 //! **Times are typed, because the columns come in three shapes that a bare integer conflates.**
 //! Some are instants ([`Timestamp`]); some are durations ([`std::time::Duration`]); one, in the

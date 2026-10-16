@@ -908,7 +908,7 @@ impl Connection {
         self.sysdb()
             .create_schedule(&spec.as_new(&context), self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(schedule = spec.schedule_name, "created a schedule");
         Ok(())
     }
@@ -926,7 +926,7 @@ impl Connection {
         self.sysdb()
             .apply_schedules(&rows)
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(schedules = specs.len(), "applied schedules");
         Ok(())
     }
@@ -939,7 +939,7 @@ impl Connection {
         self.sysdb()
             .list_schedules(filter, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_sysdb)
     }
 
     pub(crate) async fn get_schedule(
@@ -950,7 +950,7 @@ impl Connection {
         self.sysdb()
             .get_schedule(name, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_sysdb)
     }
 
     /// Writes a validated change. `context` is the change's context, already encoded.
@@ -971,7 +971,7 @@ impl Connection {
         self.sysdb()
             .update_schedule(name, &update, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(schedule = name, "updated a schedule");
         Ok(())
     }
@@ -985,7 +985,7 @@ impl Connection {
         self.sysdb()
             .set_schedule_status(name, status, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(
             schedule = name,
             status = status.as_str(),
@@ -1002,7 +1002,7 @@ impl Connection {
         self.sysdb()
             .delete_schedule(name, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(schedule = name, "deleted a schedule");
         Ok(())
     }
@@ -1108,7 +1108,7 @@ impl Connection {
             .sysdb()
             .get_workflow(workflow_id)
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         if existing.is_some() {
             return Ok(false);
         }
@@ -1208,7 +1208,7 @@ impl Connection {
             .sysdb()
             .get_latest_application_version(owner.as_deref())
             .await
-            .map_err(Error::SystemDatabase)?
+            .map_err(Error::from_sysdb)?
             .map(|version| version.version_name);
         // Decoded to a value and encoded again inside each input, rather than spliced in as text,
         // so a context that cannot be read fails here rather than in every run.

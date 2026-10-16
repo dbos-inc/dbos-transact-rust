@@ -93,8 +93,9 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 /// JSON data they were given as, so a context reads back the same in a binary format as in JSON.
 /// Not what is asked to be
 /// [`Portable`](crate::SerializationFormat::Portable) or
-/// [`Native`](crate::SerializationFormat::Native), and not what a transactional step records about
-/// itself, which the system database writes as JSON under a built-in tag.
+/// [`Native`](crate::SerializationFormat::Native). That includes the result a management call made
+/// from a workflow records as its step — a listing, a forked id, a refused change — which the
+/// system database hands over as JSON data and this serializer encodes.
 ///
 /// **Keep it configured while its rows exist.** A row records the name it was written under, and
 /// is readable only by a process configured with a serializer of that name: one without it reports
@@ -255,7 +256,7 @@ impl Serializer {
 impl crate::sysdb::types::StepCodec for Serializer {
     fn encode(&self, value: Value) -> std::result::Result<EncodedValue, crate::sysdb::Error> {
         let encoding = self.encoding();
-        let text = encode::<_, EngineOnly>(&value, &encoding, "step output").map_err(to_sysdb)?;
+        let text = encode::<_, EngineOnly>(&value, &encoding, "checkpoint").map_err(to_sysdb)?;
         Ok(EncodedValue {
             value: text,
             serialization: Some(encoding.name().to_owned()),
@@ -267,7 +268,7 @@ impl crate::sysdb::types::StepCodec for Serializer {
         value: &str,
         serialization: Option<&str>,
     ) -> std::result::Result<Value, crate::sysdb::Error> {
-        decode_tagged::<Value, EngineOnly>(Some(value), serialization, self, "step output")
+        decode_tagged::<Value, EngineOnly>(Some(value), serialization, self, "checkpoint")
             .map_err(to_sysdb)
     }
 }

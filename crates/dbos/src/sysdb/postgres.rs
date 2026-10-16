@@ -88,8 +88,8 @@ use super::types::{
     GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
     NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord,
+    Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
     is_valid_application_name, validate_attributes,
 };
@@ -754,11 +754,7 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
     let serialization = step.serialization.as_deref();
     if let Some(recorded) = step.error.as_deref() {
-        let error: Error = codec
-            .decode(recorded, serialization)
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
-            })
+        let error: Error = decode_recorded(codec, recorded, serialization)
             .map_err(|e| unreadable(e, workflow_id, step_id, step_name, "an error"))?;
         return Err(error);
     }
@@ -767,21 +763,37 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
             "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
         ))
     })?;
-    codec
-        .decode(recorded, serialization)
-        .and_then(|value| {
-            serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
-        })
+    decode_recorded(codec, recorded, serialization)
         .map_err(|e| unreadable(e, workflow_id, step_id, step_name, "an output"))
+}
+
+/// Reads a recorded value back through `codec`, by the tag it was stored under.
+fn decode_recorded<T: serde::de::DeserializeOwned>(
+    codec: &dyn StepCodec,
+    recorded: &str,
+    serialization: Option<&str>,
+) -> Result<T, Error> {
+    let value = codec.decode(recorded, serialization)?;
+    serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
 }
 
 /// Says which step a recorded value could not be read from.
 ///
-/// An unknown tag stays [`Error::UnknownSerialization`], which already names what is missing;
-/// anything else becomes [`Error::Malformed`], with the step that holds it.
+/// An unknown tag stays [`Error::UnknownSerialization`], which callers match on and which names
+/// only the tag, so the step that holds it is logged rather than folded into the error. Anything
+/// else becomes [`Error::Malformed`], with the step in its message.
 fn unreadable(error: Error, workflow_id: &str, step_id: i32, step_name: &str, what: &str) -> Error {
     match error {
-        Error::UnknownSerialization { .. } => error,
+        Error::UnknownSerialization { ref name } => {
+            tracing::warn!(
+                workflow_id,
+                step_id,
+                step_name,
+                serialization = %name,
+                "a recorded step holds {what} under a serialization this process cannot read"
+            );
+            error
+        }
         Error::Malformed(detail) => Error::Malformed(format!(
             "workflow {workflow_id} step {step_id} ({step_name}) has {what} this build cannot \
              read: {detail}"
@@ -1023,13 +1035,27 @@ impl PostgresSystemDatabase {
             step_id,
             codec,
         } = caller;
-        // `Error` is a plain serde enum, so this cannot fail on anything it holds.
+        // `Error` is a plain serde enum, so turning it into JSON cannot fail on anything it holds.
+        // The codec can: a custom serializer may fail for its own reasons. Then the refusal stays
+        // unrecorded and the encoding failure is what the caller sees — not a recordable answer,
+        // so the step runs again rather than the workflow failing with a reply nothing recorded.
+        // The refusal itself is logged, since the error returned no longer carries it.
         let recorded = match serde_json::to_value(&error)
             .map_err(|e| Error::Malformed(format!("step error is not JSON: {e}")))
             .and_then(|value| codec.encode(value))
         {
             Ok(recorded) => recorded,
-            Err(e) => return e,
+            Err(encode_error) => {
+                tracing::warn!(
+                    workflow_id,
+                    step_id,
+                    step_name,
+                    error = %error,
+                    encode_error = %encode_error,
+                    "the step was refused, but the refusal could not be encoded to record it"
+                );
+                return encode_error;
+            }
         };
         let record = async {
             let mut tx = self.pool.begin().await?;

@@ -519,6 +519,22 @@ impl<E> From<E> for Error<E> {
 }
 
 impl<E> Error<E> {
+    /// A system-database failure, in the engine's terms.
+    ///
+    /// An unknown tag on a checkpoint the system database read back through this process's
+    /// serializer is [`UnknownSerialization`](Self::UnknownSerialization), exactly as it is on any
+    /// other checkpoint, so a caller matching on it sees one variant and a workflow that hits it
+    /// fails the same way wherever the row was. Everything else stays
+    /// [`SystemDatabase`](Self::SystemDatabase).
+    pub(crate) fn from_sysdb(error: crate::sysdb::Error) -> Self {
+        match error {
+            crate::sysdb::Error::UnknownSerialization { name } => {
+                Error::UnknownSerialization { name }
+            }
+            other => Error::SystemDatabase(other),
+        }
+    }
+
     /// A value that could not be encoded for its column; `what` names it, as `"argument"` or
     /// `"result"` does.
     pub(crate) fn encode_failed(what: &'static str, source: serde_json::Error) -> Self {

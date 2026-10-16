@@ -1337,7 +1337,7 @@ impl Connection {
                 self.step_caller(caller),
             )
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         if !cancelled.is_empty() {
             tracing::info!(cancelled = cancelled.len(), "cancelled workflows");
         }
@@ -1358,7 +1358,7 @@ impl Connection {
             .sysdb()
             .resume_workflows(workflow_ids, options.queue, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         // What moved, not what was asked for: an id that had already finished is not
         // re-enqueued, and it still gets a handle below.
         tracing::info!(
@@ -1403,7 +1403,7 @@ impl Connection {
             .sysdb()
             .fork_workflows(&forks, &sys_options, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
 
         match forked.as_slice() {
             [only] => tracing::info!(forked_id = only, "forked the workflow onto its queue"),
@@ -1436,7 +1436,7 @@ impl Connection {
                 self.step_caller(caller),
             )
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         tracing::info!(
             workflow_id,
             start_step = options.start_step,
@@ -1465,7 +1465,7 @@ impl Connection {
                 self.step_caller(caller),
             )
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         if deleted > 0 {
             tracing::info!(deleted, "deleted workflows");
         }
@@ -1482,7 +1482,7 @@ impl Connection {
         self.sysdb()
             .set_workflow_delay(workflow_id, delay, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         // Phrased as the request rather than the effect. The statement is guarded on the row
         // still being `DELAYED` and reports no count, so this call cannot tell a workflow that
         // was rescheduled from one that had already been released — unlike `cancel_all` and
@@ -1506,7 +1506,7 @@ impl Connection {
         self.sysdb()
             .update_workflow_attributes(workflow_id, encoded, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)?;
+            .map_err(Error::from_sysdb)?;
         // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
         // reaches here indistinguishable from one whose attributes were replaced.
         tracing::info!(workflow_id, "asked to replace the workflow's attributes");
@@ -1522,7 +1522,7 @@ impl Connection {
         self.sysdb()
             .list_workflows(filter, self.step_caller(caller))
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_sysdb)
     }
 
     /// Reads the steps one workflow has recorded, in the order it recorded them.
@@ -1541,7 +1541,7 @@ impl Connection {
                 self.step_caller(caller),
             )
             .await
-            .map_err(Error::SystemDatabase)
+            .map_err(Error::from_sysdb)
     }
 }
 

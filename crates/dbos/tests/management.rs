@@ -1622,6 +1622,24 @@ async fn a_management_checkpoint_is_in_the_configured_serializer_and_replays_by_
         "the fork re-ran the listing instead of replaying the portable_json checkpoint"
     );
 
+    // A tag this process cannot read fails the replay as it would on any step's checkpoint.
+    sqlx::query(
+        r#"UPDATE "dbos"."operation_outputs" SET serialization = 'pickle'
+           WHERE workflow_uuid = $1 AND function_id = 0"#,
+    )
+    .bind(id)
+    .execute(&db.pool().await)
+    .await
+    .expect("retag failed");
+    let unreadable = dbos
+        .fork::<Vec<WorkflowStatus>, EngineOnly>(id, 1)
+        .await
+        .expect("fork failed");
+    match tokio::time::timeout(Duration::from_secs(60), unreadable.result()).await {
+        Ok(Err(Error::UnknownSerialization { name })) => assert_eq!(name, "pickle"),
+        other => panic!("expected UnknownSerialization, got {other:?}"),
+    }
+
     dbos.shutdown().await;
 }
 
