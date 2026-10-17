@@ -185,3 +185,68 @@ async fn a_start_of_an_existing_row_runs_the_rows_input() {
     }
     dbos.shutdown().await;
 }
+
+/// Non-finite floats survive the database natively: a step's output and a workflow's input and
+/// result are written as their names, and a replay and a client both read them back as floats.
+#[tokio::test]
+async fn non_finite_floats_round_trip_through_the_database() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("non-finite-app", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("extremes", {
+            let runs = Arc::clone(&runs);
+            move |low: f64| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let high = dbos::step("high", || async {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        Ok::<f32, Error>(f32::INFINITY)
+                    })
+                    .await?;
+                    Ok::<(f64, f32, f64), Error>((low, high, f64::NAN))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow
+        .start(f64::NEG_INFINITY)
+        .await
+        .expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let (low, high, nan) = handle.result().await.expect("the workflow failed");
+    assert_eq!((low, high), (f64::NEG_INFINITY, f32::INFINITY));
+    assert!(nan.is_nan());
+
+    let stored: Option<String> = sqlx::query_scalar(
+        r#"SELECT output FROM "dbos"."workflow_output" WHERE workflow_uuid = $1"#,
+    )
+    .bind(&id)
+    .fetch_one(&db.pool().await)
+    .await
+    .unwrap();
+    assert_eq!(stored.as_deref(), Some(r#"["-Infinity","Infinity","NaN"]"#));
+
+    // A fork from step 1 replays the step's recorded output rather than running it.
+    let forked = dbos
+        .fork::<(f64, f32, f64), EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let (_, replayed, _) = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, f32::INFINITY);
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+
+    let client = client(&db).await;
+    let (low, _, nan) = client
+        .retrieve_workflow::<(f64, f32, f64), EngineOnly>(&id)
+        .result()
+        .await
+        .expect("the result did not read back");
+    assert_eq!(low, f64::NEG_INFINITY);
+    assert!(nan.is_nan());
+
+    client.close().await;
+    dbos.shutdown().await;
+}

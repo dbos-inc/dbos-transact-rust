@@ -61,7 +61,8 @@ use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
 use crate::registry::{Snapshot, WorkflowKey, WorkflowRef};
 use crate::serialization::{
-    PayloadEncoding, SerializationFormat, Serializer, decode, encode, encode_input,
+    Floats, NonFinite, PayloadEncoding, SerializationFormat, Serializer, decode, encode,
+    encode_input,
 };
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
@@ -129,13 +130,15 @@ mod rfc3339 {
 /// the JSON data instead, and written as it, so that both directions agree.
 mod json_data {
     use serde::de::DeserializeOwned;
+
+    use crate::serialization::{Floats, NonFinite};
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 
     pub(super) fn serialize<C: Serialize, S: Serializer>(
         context: &C,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serde_json::to_value(context)
+        serde_json::to_value(Floats::new(context, NonFinite::Refuse))
             .map_err(ser::Error::custom)?
             .serialize(serializer)
     }
@@ -247,7 +250,7 @@ impl ScheduleSpec {
             schedule_name: schedule_name.into(),
             schedule: schedule.into(),
             workflow,
-            context: serde_json::to_value(context)
+            context: serde_json::to_value(Floats::new(context, NonFinite::Refuse))
                 .map_err(|source| Error::encode_failed("schedule context", source))?,
             automatic_backfill: false,
             cron_timezone: None,
@@ -1276,6 +1279,21 @@ mod tests {
             decode::<_, EngineOnly>(Some(&encoded), &PayloadEncoding::Native, "argument").unwrap();
         assert_eq!(decoded.scheduled_time, input.scheduled_time);
         assert_eq!(decoded.context, "emea");
+    }
+
+    /// A schedule's context goes through a `serde_json::Value`, which can't hold a non-finite
+    /// float, so one is refused rather than stored as `null`, whichever way the context is written.
+    #[test]
+    fn a_non_finite_float_in_a_context_is_refused() {
+        let key = WorkflowKey::new("report");
+        assert!(ScheduleSpec::for_workflow("nan", key.clone(), "0 * * * * *", &f64::NAN).is_err());
+        assert!(ScheduleSpec::for_workflow("ok", key, "0 * * * * *", &1.5f64).is_ok());
+
+        let input = ScheduledWorkflowInput {
+            scheduled_time: SystemTime::UNIX_EPOCH,
+            context: f64::INFINITY,
+        };
+        assert!(encode::<_, EngineOnly>(&input, &PayloadEncoding::Native, "argument").is_err());
     }
 
     #[test]

@@ -16,6 +16,15 @@
 //! **Every read honours the row's tag**, whatever the reader would itself have written. A tag
 //! this process cannot read — neither built-in, nor the name of the serializer it is configured
 //! with — is [`Error::UnknownSerialization`], never a guess.
+//!
+//! **Non-finite floats round-trip natively and are refused portably.** JSON has no way to write
+//! `NaN` or an infinity, and `serde_json` would write `null` in its place, which reads back as
+//! something else. The native encoding writes them as the strings `"NaN"`, `"Infinity"` and
+//! `"-Infinity"` and reads those back as floats wherever a float is asked for. The portable one
+//! refuses them with [`Error::Serialization`] naming the value, since the SDKs that read it agree
+//! on no form for them. A target that buffers its input before deciding what it is — a
+//! `#[serde(untagged)]` or tagged enum, a `#[serde(flatten)]` field, a [`serde_json::Value`] —
+//! reads the native strings as strings.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,6 +36,11 @@ use serde_json::{Map, Value};
 
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::sysdb::types::EncodedValue;
+
+mod non_finite;
+mod shape;
+pub(crate) use non_finite::{Floats, NonFinite};
+use shape::{Shape, takes_the_envelope};
 
 /// The tag a [`PayloadEncoding::Native`] row carries.
 pub(crate) const RUST_SERDE: &str = "rust_serde";
@@ -426,6 +440,8 @@ pub(crate) fn decode<T: DeserializeOwned, E>(
                 source: None,
             })
         }
+        (_, PayloadEncoding::Native) => non_finite::from_str(value.unwrap_or("null"))
+            .map_err(|source| Error::decode_failed(what, source)),
         _ => serde_json::from_str(value.unwrap_or("null"))
             .map_err(|source| Error::decode_failed(what, source)),
     }
@@ -471,7 +487,8 @@ pub(crate) fn decode_tagged<T: DeserializeOwned, E>(
 ///
 /// Native and portable are the same JSON for a plain value — a workflow's output, an event, a
 /// message, a stream value. What they change is the envelope around a workflow's input or error,
-/// which [`encode_input`] and [`encode_error`] add.
+/// which [`encode_input`] and [`encode_error`] add. They also differ on a non-finite float, which
+/// `serde_json` would write as `null`: native writes it as its name, and portable refuses it.
 pub(crate) fn encode<T: Serialize, E>(
     value: &T,
     encoding: &PayloadEncoding,
@@ -488,7 +505,13 @@ pub(crate) fn encode<T: Serialize, E>(
                 })
         }
         PayloadEncoding::Native | PayloadEncoding::Portable => {
-            serde_json::to_string(value).map_err(|source| Error::encode_failed(what, source))
+            let mode = if matches!(encoding, PayloadEncoding::Native) {
+                NonFinite::Name
+            } else {
+                NonFinite::Refuse
+            };
+            serde_json::to_string(&Floats::new(value, mode))
+                .map_err(|source| Error::encode_failed(what, source))
         }
     }
 }
@@ -596,181 +619,6 @@ fn encode_envelope<A: Serialize + ?Sized, E>(
     )
 }
 
-/// How an input goes into the portable envelope, by the first thing it asks `serde` to write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
-    /// A tuple, or a fixed-size array, of two or more: each element is an argument.
-    Arguments,
-    /// The unit: no arguments.
-    NoArguments,
-    /// A [`PortableWorkflowArgs`]: already the envelope.
-    Envelope,
-    /// Anything else: the one argument.
-    OneArgument,
-}
-
-impl Shape {
-    fn of<P: Serialize + ?Sized>(input: &P) -> Shape {
-        // A unit is no arguments however it is reached: `()`, `&()`, `Box<()>`, and a JSON `null`
-        // too, which `serde` writes the same way. One `null` argument is `None`, which writes
-        // `serialize_none` and so is one argument.
-        match input.serialize(Probe) {
-            Err(Probed(shape)) => shape,
-            Ok(()) => Shape::OneArgument,
-        }
-    }
-}
-
-/// A serializer that writes nothing: it answers the input's first call with the [`Shape`] that
-/// call implies, as an error, so serializing stops there.
-///
-/// `serde` tells a tuple from a sequence — `serialize_tuple` against `serialize_seq` — where the
-/// JSON both become does not, which is why this asks `serde` rather than looking at a [`Value`].
-struct Probe;
-
-#[derive(Debug)]
-struct Probed(Shape);
-
-impl std::fmt::Display for Probed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
-}
-
-impl std::error::Error for Probed {}
-
-impl serde::ser::Error for Probed {
-    fn custom<T: std::fmt::Display>(_: T) -> Self {
-        Probed(Shape::OneArgument)
-    }
-}
-
-/// Every call but the three that matter is one argument.
-macro_rules! one_argument {
-    ($($method:ident($($arg:ty),*);)*) => {
-        $(fn $method(self, $(_: $arg),*) -> std::result::Result<(), Probed> {
-            Err(Probed(Shape::OneArgument))
-        })*
-    };
-}
-
-impl serde::Serializer for Probe {
-    type Ok = ();
-    type Error = Probed;
-    type SerializeSeq = serde::ser::Impossible<(), Probed>;
-    type SerializeTuple = serde::ser::Impossible<(), Probed>;
-    type SerializeTupleStruct = serde::ser::Impossible<(), Probed>;
-    type SerializeTupleVariant = serde::ser::Impossible<(), Probed>;
-    type SerializeMap = serde::ser::Impossible<(), Probed>;
-    type SerializeStruct = serde::ser::Impossible<(), Probed>;
-    type SerializeStructVariant = serde::ser::Impossible<(), Probed>;
-
-    one_argument! {
-        serialize_bool(bool);
-        serialize_i8(i8);
-        serialize_i16(i16);
-        serialize_i32(i32);
-        serialize_i64(i64);
-        serialize_i128(i128);
-        serialize_u8(u8);
-        serialize_u16(u16);
-        serialize_u32(u32);
-        serialize_u64(u64);
-        serialize_u128(u128);
-        serialize_f32(f32);
-        serialize_f64(f64);
-        serialize_char(char);
-        serialize_str(&str);
-        serialize_bytes(&[u8]);
-        serialize_none();
-        serialize_unit_struct(&'static str);
-        serialize_unit_variant(&'static str, u32, &'static str);
-    }
-
-    fn serialize_unit(self) -> std::result::Result<(), Probed> {
-        Err(Probed(Shape::NoArguments))
-    }
-
-    fn serialize_some<T: Serialize + ?Sized>(self, _: &T) -> std::result::Result<(), Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_newtype_struct<T: Serialize + ?Sized>(
-        self,
-        _: &'static str,
-        _: &T,
-    ) -> std::result::Result<(), Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_newtype_variant<T: Serialize + ?Sized>(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: &T,
-    ) -> std::result::Result<(), Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_seq(self, _: Option<usize>) -> std::result::Result<Self::SerializeSeq, Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_tuple(self, len: usize) -> std::result::Result<Self::SerializeTuple, Probed> {
-        // One element stays one argument, so `(x,)` reads back as itself rather than as `x`.
-        Err(Probed(if len >= 2 {
-            Shape::Arguments
-        } else {
-            Shape::OneArgument
-        }))
-    }
-
-    fn serialize_tuple_struct(
-        self,
-        _: &'static str,
-        _: usize,
-    ) -> std::result::Result<Self::SerializeTupleStruct, Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_tuple_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> std::result::Result<Self::SerializeTupleVariant, Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_map(self, _: Option<usize>) -> std::result::Result<Self::SerializeMap, Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-
-    fn serialize_struct(
-        self,
-        name: &'static str,
-        _: usize,
-    ) -> std::result::Result<Self::SerializeStruct, Probed> {
-        Err(Probed(if name == ENVELOPE {
-            Shape::Envelope
-        } else {
-            Shape::OneArgument
-        }))
-    }
-
-    fn serialize_struct_variant(
-        self,
-        _: &'static str,
-        _: u32,
-        _: &'static str,
-        _: usize,
-    ) -> std::result::Result<Self::SerializeStructVariant, Probed> {
-        Err(Probed(Shape::OneArgument))
-    }
-}
-
 /// Decodes a workflow's input, stored in `encoding`, into the workflow's input type.
 ///
 /// Portable, the envelope's shape decides what `P` is decoded from:
@@ -857,63 +705,6 @@ struct RawEnvelope<'a> {
     named: BTreeMap<String, &'a RawValue>,
 }
 
-/// Whether `P` reads the input envelope whole: whether deserializing it starts by asking for
-/// [`PortableWorkflowArgs`]'s struct, as [`encode_input`] recognizes one by the struct `serde`
-/// is asked to write.
-///
-/// The same test in both directions, so what is written as the envelope is read as it: a `Box` or
-/// a `#[serde(transparent)]` wrapper forwards the request to the struct inside, and is the
-/// envelope both ways.
-fn takes_the_envelope<P: DeserializeOwned>() -> bool {
-    matches!(P::deserialize(NameProbe), Err(Named(true)))
-}
-
-/// A deserializer that reads nothing: it answers the first request with whether it was for the
-/// envelope's struct, as an error, so deserializing stops there.
-struct NameProbe;
-
-#[derive(Debug)]
-struct Named(bool);
-
-impl std::fmt::Display for Named {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for Named {}
-
-impl serde::de::Error for Named {
-    fn custom<T: std::fmt::Display>(_: T) -> Self {
-        Named(false)
-    }
-}
-
-impl<'de> Deserializer<'de> for NameProbe {
-    type Error = Named;
-
-    fn deserialize_any<V: serde::de::Visitor<'de>>(
-        self,
-        _: V,
-    ) -> std::result::Result<V::Value, Named> {
-        Err(Named(false))
-    }
-
-    fn deserialize_struct<V: serde::de::Visitor<'de>>(
-        self,
-        name: &'static str,
-        _: &'static [&'static str],
-        _: V,
-    ) -> std::result::Result<V::Value, Named> {
-        Err(Named(name == ENVELOPE))
-    }
-
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
-        unit unit_struct newtype_struct seq tuple tuple_struct map enum identifier ignored_any
-    }
-}
-
 /// A workflow's error, as every DBOS SDK writes it portably.
 ///
 /// All four fields are always written, `null` where there is nothing to say. On the way in,
@@ -975,7 +766,10 @@ fn to_portable<E: DurableError>(
             name: type_name::<E>().to_owned(),
             message: application.to_string(),
             code: None,
-            data: present(serde_json::value::to_raw_value(application)?),
+            data: present(serde_json::value::to_raw_value(&Floats::new(
+                application,
+                NonFinite::Refuse,
+            ))?),
         },
         Error::Portable {
             name,
@@ -1035,7 +829,7 @@ fn type_name<E>() -> &'static str {
 fn variant<E: DurableError>(
     error: &Error<E>,
 ) -> std::result::Result<(String, Option<Value>), serde_json::Error> {
-    let (name, fields) = match serde_json::to_value(error)? {
+    let (name, fields) = match serde_json::to_value(Floats::new(error, NonFinite::Refuse))? {
         Value::String(unit) => (unit, None),
         Value::Object(tagged) if tagged.len() == 1 => {
             let (name, fields) = tagged.into_iter().next().expect("one entry");
@@ -1731,9 +1525,8 @@ mod tests {
         assert_eq!(type_name::<Vec<String>>(), "alloc::vec::Vec");
     }
 
-    /// What `serde_json` does with the portable value rules, which this crate documents rather than
-    /// enforces: an integer key becomes a string, any other non-string key is refused, and a
-    /// non-finite float is `null`.
+    /// What `serde_json` does with the portable value rules: an integer key becomes a string, and
+    /// any other non-string key is refused.
     #[test]
     fn values_follow_serde_json() {
         let map = std::collections::BTreeMap::from([(1u32, "one")]);
@@ -1743,10 +1536,198 @@ mod tests {
         );
         let tuple_keys = std::collections::BTreeMap::from([((1u32, 2u32), "pair")]);
         assert!(encode::<_, EngineOnly>(&tuple_keys, &PayloadEncoding::Native, "value").is_err());
+    }
+
+    /// A non-finite float round-trips through the native encoding, wherever it is in the value, and
+    /// is refused by the portable one with an error naming the value. Finite floats, and everything
+    /// around them, are written the same way by both.
+    #[test]
+    fn non_finite_floats_round_trip_natively_and_are_refused_portably() {
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Reading {
+            name: String,
+            value: Option<f64>,
+            many: Vec<f32>,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        enum Sample {
+            Point(f32),
+            Pair(f64, f64),
+            Range { low: f64, high: f64 },
+        }
+
+        fn round_trip<T: Serialize + DeserializeOwned>(value: &T) -> (String, T) {
+            let text = encode::<_, EngineOnly>(value, &PayloadEncoding::Native, "result")
+                .expect("a native write");
+            let back = decode::<T, EngineOnly>(Some(&text), &PayloadEncoding::Native, "result")
+                .unwrap_or_else(|e| panic!("{text} did not read back: {e}"));
+            (text, back)
+        }
+        fn same(a: f64, b: f64) -> bool {
+            a == b || (a.is_nan() && b.is_nan())
+        }
+
+        let (text, back) = round_trip(&f64::NAN);
+        assert_eq!(text, r#""NaN""#);
+        assert!(back.is_nan());
         assert_eq!(
-            encode::<_, EngineOnly>(&f64::NAN, &PayloadEncoding::Native, "value").unwrap(),
-            "null"
+            round_trip(&f64::INFINITY),
+            (r#""Infinity""#.to_owned(), f64::INFINITY)
         );
+        assert_eq!(
+            round_trip(&f64::NEG_INFINITY),
+            (r#""-Infinity""#.to_owned(), f64::NEG_INFINITY)
+        );
+        assert!(round_trip(&f32::NAN).1.is_nan());
+        assert_eq!(round_trip(&f32::NEG_INFINITY).1, f32::NEG_INFINITY);
+
+        let reading = Reading {
+            name: "NaN".to_owned(),
+            value: Some(f64::INFINITY),
+            many: vec![1.5, f32::NAN, f32::NEG_INFINITY],
+        };
+        let (text, back) = round_trip(&reading);
+        assert_eq!(
+            text,
+            r#"{"name":"NaN","value":"Infinity","many":[1.5,"NaN","-Infinity"]}"#
+        );
+        assert_eq!(back.name, "NaN", "a string field keeps the string");
+        assert_eq!(back.value, Some(f64::INFINITY));
+        assert_eq!(back.many[0], 1.5);
+        assert!(back.many[1].is_nan());
+        assert_eq!(back.many[2], f32::NEG_INFINITY);
+
+        let map = BTreeMap::from([("k".to_owned(), f64::NAN)]);
+        assert!(round_trip(&map).1["k"].is_nan());
+        let (_, tuple) = round_trip(&(1u32, f64::INFINITY));
+        assert_eq!(tuple, (1, f64::INFINITY));
+        for sample in [
+            Sample::Point(f32::INFINITY),
+            Sample::Pair(f64::NAN, 2.0),
+            Sample::Range {
+                low: f64::NEG_INFINITY,
+                high: 0.0,
+            },
+        ] {
+            let (_, back) = round_trip(&sample);
+            let ok = match (&sample, &back) {
+                (Sample::Point(a), Sample::Point(b)) => same(f64::from(*a), f64::from(*b)),
+                (Sample::Pair(a, b), Sample::Pair(c, d)) => same(*a, *c) && same(*b, *d),
+                (Sample::Range { low: a, high: b }, Sample::Range { low: c, high: d }) => {
+                    same(*a, *c) && same(*b, *d)
+                }
+                _ => false,
+            };
+            assert!(ok, "{sample:?} read back as {back:?}");
+        }
+
+        // A name is read as a float only where a float is asked for; elsewhere it is refused as
+        // any other string would be.
+        assert!(
+            decode::<u32, EngineOnly>(Some(r#""NaN""#), &PayloadEncoding::Native, "result")
+                .is_err()
+        );
+        assert!(
+            decode::<f64, EngineOnly>(Some(r#""nan""#), &PayloadEncoding::Native, "result")
+                .is_err(),
+            "only the exact names are floats"
+        );
+
+        fn refused<T: Serialize>(value: &T) {
+            let error = encode::<_, EngineOnly>(value, &PayloadEncoding::Portable, "result")
+                .expect_err("a non-finite float was written portably");
+            let Error::Serialization { what, message, .. } = &error else {
+                panic!("not a serialization error: {error}");
+            };
+            assert_eq!(what, "result");
+            assert!(message.contains("not a finite number"), "{message}");
+        }
+        refused(&f64::NAN);
+        refused(&f64::INFINITY);
+        refused(&f32::NEG_INFINITY);
+        refused(&reading);
+        refused(&map);
+        refused(&Sample::Pair(1.0, f64::NAN));
+
+        for encoding in [PayloadEncoding::Native, PayloadEncoding::Portable] {
+            assert_eq!(
+                encode::<_, EngineOnly>(
+                    &Sample::Range {
+                        low: -1.0,
+                        high: 2.0
+                    },
+                    &encoding,
+                    "r"
+                )
+                .unwrap(),
+                r#"{"Range":{"low":-1.0,"high":2.0}}"#
+            );
+            assert_eq!(
+                encode::<_, EngineOnly>(&f64::MAX, &encoding, "result").unwrap(),
+                serde_json::to_string(&f64::MAX).unwrap()
+            );
+        }
+
+        // A float map key is written as a quoted number, as `serde_json` always writes keys, and
+        // read back as the number it spells; so is a string holding a number where a float is
+        // asked for.
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+        struct Key(f64);
+        impl PartialEq for Key {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.total_cmp(&other.0).is_eq()
+            }
+        }
+        impl Eq for Key {}
+        impl PartialOrd for Key {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Key {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.total_cmp(&other.0)
+            }
+        }
+        let keyed = BTreeMap::from([(Key(1.5), 7u32), (Key(-2.0), 8)]);
+        let (text, back) = round_trip(&keyed);
+        assert_eq!(text, r#"{"-2.0":8,"1.5":7}"#);
+        assert_eq!(back, keyed);
+        assert_eq!(
+            decode::<f32, EngineOnly>(Some(r#""2.5""#), &PayloadEncoding::Native, "result")
+                .unwrap(),
+            2.5
+        );
+
+        // A portable error's fields go through a `Value`, which can't hold a non-finite float.
+        #[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+        #[error("insufficient funds")]
+        struct Insufficient {
+            balance: f64,
+        }
+        let error: Error<Insufficient> = Error::Application(Insufficient { balance: f64::NAN });
+        assert!(
+            encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Portable).is_err(),
+            "a portable error wrote a non-finite float"
+        );
+        let native = encode_error::<_, EngineOnly>(&error, &PayloadEncoding::Native)
+            .expect("a native error");
+        let Some(Error::Application(Insufficient { balance })) =
+            decode_error::<Insufficient>(&native, &PayloadEncoding::Native)
+        else {
+            panic!("{native} did not read back as the application error");
+        };
+        assert!(balance.is_nan());
+
+        // A workflow input is checked inside the portable envelope too, and round-trips natively.
+        assert!(
+            encode_input::<_, EngineOnly>(&(1u32, f64::NAN), &PayloadEncoding::Portable).is_err()
+        );
+        let input = encode_input::<_, EngineOnly>(&(1u32, f64::NAN), &PayloadEncoding::Native)
+            .expect("a native input");
+        let (n, x) = decode_input::<(u32, f64), EngineOnly>(Some(&input), &PayloadEncoding::Native)
+            .expect("the input read back");
+        assert!(n == 1 && x.is_nan(), "{input}");
     }
 
     /// JSON, reversed: text no built-in reader would accept.

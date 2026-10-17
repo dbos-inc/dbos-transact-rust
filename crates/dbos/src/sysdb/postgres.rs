@@ -973,8 +973,9 @@ impl PostgresSystemDatabase {
         value: &T,
         started_at: Timestamp,
     ) -> Result<(), Error> {
-        // `serde_json` only fails here on a type that cannot be JSON — a non-string map key, a
-        // NaN — and every payload this takes is a plain record.
+        // `serde_json` only fails here on a type that cannot be JSON, such as a non-string map
+        // key. It turns a non-finite float into `null` without failing, so a payload here must
+        // hold none; every payload this takes is one of the engine's own plain records.
         let value = serde_json::to_value(value)
             .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
         let recorded = caller.codec.encode(value)?;
