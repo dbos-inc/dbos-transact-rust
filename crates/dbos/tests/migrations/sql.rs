@@ -761,3 +761,40 @@ async fn the_corpus_applies_without_listen_notify() {
             .any(|t| t == "workflow_status")
     );
 }
+
+#[tokio::test]
+async fn application_version_indexes_have_the_shared_keys() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    sqlx::raw_sql(r#"CREATE SCHEMA IF NOT EXISTS "dbos""#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let migrations = build_migrations(schema, dialect_for(db.backend()), true);
+    apply_all(&pool, schema, &migrations).await;
+    let late: Vec<Migration> = migrations
+        .into_iter()
+        .filter(|m| m.version >= 124)
+        .collect();
+    apply_all(&pool, schema, &late).await;
+    let definitions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = $1 \
+         AND indexname IN ('idx_application_versions_timestamp', 'idx_application_versions_owner_timestamp')",
+    )
+    .bind(schema)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(definitions.len(), 2);
+    for (name, definition) in definitions {
+        let (keys, included) = index_columns(&definition);
+        let expected = if name == "idx_application_versions_timestamp" {
+            vec!["version_timestamp DESC"]
+        } else {
+            vec!["application_name", "version_timestamp DESC"]
+        };
+        assert_eq!(keys, expected, "{name}");
+        assert!(included.is_empty(), "{name} must use plain key columns");
+    }
+}
