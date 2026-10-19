@@ -1950,6 +1950,48 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
     fn decode(&self, value: &str, serialization: Option<&str>) -> Result<serde_json::Value, Error>;
 }
 
+/// Encodes a refusal to record as a step's error, through the caller's codec.
+///
+/// Shared by every writer of a recorded refusal, so a replay reads them all back the same way.
+/// `Error` is a plain serde enum, so turning it into JSON cannot fail on anything it holds; the
+/// codec can, since a custom serializer may fail for its own reasons.
+pub(crate) fn encode_refusal(error: &Error, codec: &dyn StepCodec) -> Result<EncodedValue, Error> {
+    let value = serde_json::to_value(error)
+        .map_err(|e| Error::Malformed(format!("step error is not JSON: {e}")))?;
+    codec.encode(value)
+}
+
+/// Says which step a recorded value could not be read from.
+///
+/// An unknown tag stays [`Error::UnknownSerialization`], which callers match on and which names
+/// only the tag, so the step that holds it is logged rather than folded into the error. Anything
+/// else becomes [`Error::Malformed`], with the step in its message.
+pub(crate) fn unreadable(
+    error: Error,
+    workflow_id: &str,
+    step_id: i32,
+    step_name: &str,
+    what: &str,
+) -> Error {
+    match error {
+        Error::UnknownSerialization { ref name } => {
+            tracing::warn!(
+                workflow_id,
+                step_id,
+                step_name,
+                serialization = %name,
+                "a recorded step holds {what} under a serialization this process cannot read"
+            );
+            error
+        }
+        Error::Malformed(detail) => Error::Malformed(format!(
+            "workflow {workflow_id} step {step_id} ({step_name}) has {what} this build cannot \
+             read: {detail}"
+        )),
+        other => other,
+    }
+}
+
 /// The workflow step a management call runs as, and how its result is recorded.
 ///
 /// What the methods that record their own result take, where the plain-id methods take `caller:

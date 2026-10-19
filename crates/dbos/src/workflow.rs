@@ -22,7 +22,7 @@ use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCodec, StepTiming,
-    Submission, Timestamp, WorkflowInitResult,
+    Submission, Timestamp, WorkflowInitResult, encode_refusal, unreadable,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -1314,12 +1314,9 @@ async fn create<R, E>(
     .await
     {
         Ok(Submitted::Created(initialized)) => initialized,
-        // **A refused start is recorded at the parent's step**, so a replay is refused too. The
-        // key is held only while its holder waits, so a replay after the holder has finished
-        // would otherwise start the child, and the parent would take the other branch from the
-        // one it took after the refusal. Only this refusal is recorded: every other error an
-        // insert can return either replays the same without a record or is database trouble.
-        Err(Error::SystemDatabase(refusal @ crate::sysdb::Error::QueueDeduplicated { .. })) => {
+        // **A refused start is recorded at the parent's step**, so a replay is refused too.
+        // See [`is_child_refusal`] for which refusals, and why each one needs the record.
+        Err(Error::SystemDatabase(refusal)) if is_child_refusal(&refusal) => {
             return Err(match &parent {
                 Some(parent) => {
                     parent
@@ -1639,6 +1636,28 @@ impl StartPlacement {
     }
 }
 
+/// Whether `error` is a refused child start that the parent's step records, so a replay is
+/// refused the same way rather than trying the start again.
+///
+/// Each of these depends on another workflow's row, which can be gone by the time of a replay:
+///
+/// - [`QueueDeduplicated`](crate::sysdb::Error::QueueDeduplicated): the key is held only while its
+///   holder waits, so once the holder finishes the same start would go ahead.
+/// - [`ConflictingWorkflow`](crate::sysdb::Error::ConflictingWorkflow): the chosen child id names a
+///   workflow of another function, and once that row is deleted the same start would go ahead.
+///
+/// Without the record, the replay would start the child and the parent would take the other branch
+/// from the one it took after the refusal. Every other error a start can return either depends only
+/// on the start's own arguments, and so replays the same without a record, or is database trouble,
+/// which a replay should meet afresh.
+fn is_child_refusal(error: &crate::sysdb::Error) -> bool {
+    matches!(
+        error,
+        crate::sysdb::Error::QueueDeduplicated { .. }
+            | crate::sysdb::Error::ConflictingWorkflow { .. }
+    )
+}
+
 /// The workflow a child is being started from: the context it runs in, and the step id the start
 /// occupies.
 ///
@@ -1671,7 +1690,7 @@ impl Parent<'_> {
     /// - **a child id**: the start went ahead, and the replay joins that child;
     /// - **a recorded refusal**: the start was refused, and the replay is refused the same way,
     ///   without trying the start again. See [`record_child_refusal`](Self::record_child_refusal);
-    /// - **neither**, or an error that is not one of this layer's refusals: a plain step wrote the
+    /// - **neither**, or an error that [`is_child_refusal`] doesn't name: a plain step wrote the
     ///   row, which means the parent's code changed (`step("charge")` became a child workflow
     ///   named `charge`), and starting a child now would give this position two meanings across
     ///   two runs.
@@ -1691,8 +1710,18 @@ impl Parent<'_> {
             let value = executor
                 .serializer()
                 .decode(error, recorded.serialization.as_deref())
-                .map_err(Error::SystemDatabase)?;
-            if let Ok(refusal) = serde_json::from_value::<crate::sysdb::Error>(value) {
+                .map_err(|error| {
+                    Error::SystemDatabase(unreadable(
+                        error,
+                        self.workflow_id(),
+                        self.step_id,
+                        step_name,
+                        "an error",
+                    ))
+                })?;
+            if let Ok(refusal) = serde_json::from_value::<crate::sysdb::Error>(value)
+                && is_child_refusal(&refusal)
+            {
                 tracing::debug!(
                     parent_workflow_id = self.workflow_id(),
                     step_id = self.step_id,
@@ -1733,10 +1762,7 @@ impl Parent<'_> {
         step_name: &str,
         started_at: Timestamp,
     ) -> Error {
-        let recorded = match serde_json::to_value(&refusal)
-            .map_err(|e| crate::sysdb::Error::Malformed(format!("step error is not JSON: {e}")))
-            .and_then(|value| executor.serializer().encode(value))
-        {
+        let recorded = match encode_refusal(&refusal, executor.serializer()) {
             Ok(recorded) => recorded,
             Err(encode_error) => {
                 tracing::warn!(
