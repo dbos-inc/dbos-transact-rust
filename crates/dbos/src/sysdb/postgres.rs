@@ -90,7 +90,7 @@ use super::types::{
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
     Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_error_at_step, duration_from_ms,
+    WorkflowRecord, WorkflowStatus, WrittenBy, decode_recorded, duration_from_ms,
     duration_from_secs, encode_step_error, is_valid_application_name, validate_attributes,
 };
 use super::{
@@ -763,25 +763,6 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
         ))
     })?;
     decode_recorded(step, recorded, caller, step_name, "an output")
-}
-
-/// Reads one of `step`'s recorded values back through the caller's codec, by the tag the row was
-/// stored under, and says which step it came from if it cannot. `what` names the value for that
-/// message: `an error` or `an output`.
-fn decode_recorded<T: serde::de::DeserializeOwned>(
-    step: &StepRecord,
-    recorded: &str,
-    caller: StepCaller<'_>,
-    step_name: &str,
-    what: &str,
-) -> Result<T, Error> {
-    caller
-        .codec
-        .decode(recorded, step.serialization.as_deref())
-        .and_then(|value| {
-            serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
-        })
-        .map_err(|e| decode_error_at_step(e, caller.workflow_id, caller.step_id, step_name, what))
 }
 
 impl PostgresSystemDatabase {
