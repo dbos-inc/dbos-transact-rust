@@ -22,7 +22,7 @@ use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCaller, StepTiming,
-    Submission, Timestamp, WorkflowInitResult, decode_recorded, encode_step_error,
+    Submission, Timestamp, WorkflowInitResult, decode_recorded, encode_recorded,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -1758,7 +1758,7 @@ impl Parent<'_> {
         step_name: &str,
         started_at: Timestamp,
     ) -> Error {
-        let recorded = match encode_step_error(&error, executor.serializer()) {
+        let recorded = match encode_recorded(&error, executor.serializer(), "an error") {
             Ok(recorded) => recorded,
             Err(encode_error) => {
                 tracing::warn!(

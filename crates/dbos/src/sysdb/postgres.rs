@@ -91,7 +91,7 @@ use super::types::{
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
     Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, decode_recorded, duration_from_ms,
-    duration_from_secs, encode_step_error, is_valid_application_name, validate_attributes,
+    duration_from_secs, encode_recorded, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -929,12 +929,7 @@ impl PostgresSystemDatabase {
         value: &T,
         started_at: Timestamp,
     ) -> Result<(), Error> {
-        // `serde_json` only fails here on a type that cannot be JSON, such as a non-string map
-        // key. It turns a non-finite float into `null` without failing, so a payload here must
-        // hold none; every payload this takes is one of the engine's own plain records.
-        let value = serde_json::to_value(value)
-            .map_err(|e| Error::Malformed(format!("step output is not JSON: {e}")))?;
-        let recorded = caller.codec.encode(value)?;
+        let recorded = encode_recorded(value, caller.codec, "an output")?;
         self.record_step_on(
             conn,
             caller.workflow_id,
@@ -1003,7 +998,7 @@ impl PostgresSystemDatabase {
         // the encoding failure is what the caller sees — not a recordable answer, so the step runs
         // again rather than the workflow failing with a reply nothing recorded. The error itself
         // is logged, since the one returned no longer carries it.
-        let recorded = match encode_step_error(&error, codec) {
+        let recorded = match encode_recorded(&error, codec, "an error") {
             Ok(recorded) => recorded,
             Err(encode_error) => {
                 tracing::warn!(

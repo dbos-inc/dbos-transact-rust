@@ -1950,17 +1950,22 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
     fn decode(&self, value: &str, serialization: Option<&str>) -> Result<serde_json::Value, Error>;
 }
 
-/// Encodes an error to record as a step's error, through the caller's codec.
+/// Encodes a value to record as a step's output or error, through the caller's codec. `what` names
+/// the value for the failure message: `an output` or `an error`. The reverse of
+/// [`decode_recorded`].
 ///
-/// Shared by every writer of a recorded error, so a replay reads them all back the same way.
-/// `Error` is a plain serde enum, so turning it into JSON cannot fail on anything it holds; the
-/// codec can, since a custom serializer may fail for its own reasons.
-pub(crate) fn encode_step_error(
-    error: &Error,
+/// Every writer of a recorded step value goes through here, so a replay reads them all back the
+/// same way. `serde_json` fails only on a type that cannot be JSON, such as a non-string map key,
+/// and turns a non-finite float into `null` without failing, so a value here must hold none; every
+/// value this takes is one of the engine's own plain records or an [`Error`]. The codec can fail
+/// too, since a custom serializer may fail for its own reasons.
+pub(crate) fn encode_recorded<T: serde::Serialize + ?Sized>(
+    value: &T,
     codec: &dyn StepCodec,
+    what: &str,
 ) -> Result<EncodedValue, Error> {
-    let value = serde_json::to_value(error)
-        .map_err(|e| Error::Malformed(format!("step error is not JSON: {e}")))?;
+    let value = serde_json::to_value(value)
+        .map_err(|e| Error::Malformed(format!("{what} to record is not JSON: {e}")))?;
     codec.encode(value)
 }
 
