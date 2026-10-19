@@ -425,9 +425,9 @@ pub enum DuplicationPolicy {
     /// collisions should hear that the key was taken, rather than silently joining a workflow
     /// whose arguments are somebody else's.
     ///
-    /// **Started from inside a workflow, the refusal is recorded at the parent's step**, so a
-    /// replay of the parent is refused the same way and starts nothing, even once the holder has
-    /// finished and the key is free.
+    /// **Started from inside a workflow, the error is recorded at the parent's step**, so a replay
+    /// of the parent gets the same error and starts nothing, even once the holder has finished and
+    /// the key is free.
     #[default]
     Reject,
     /// Hand back a handle to the workflow already holding the key.
@@ -1314,16 +1314,16 @@ async fn create<R, E>(
     .await
     {
         Ok(Submitted::Created(initialized)) => initialized,
-        // **A refused start is recorded at the parent's step**, so a replay is refused too.
-        // See [`should_record_start_error`] for which refusals, and why each one needs the record.
-        Err(Error::SystemDatabase(refusal)) if should_record_start_error(&refusal) => {
+        // **The start's error is recorded at the parent's step**, so a replay gets it too. See
+        // [`should_record_start_error`] for which errors, and why each one needs the record.
+        Err(Error::SystemDatabase(error)) if should_record_start_error(&error) => {
             return Err(match &parent {
                 Some(parent) => {
                     parent
-                        .record_start_error(executor, refusal, &key.name, started_at)
+                        .record_start_error(executor, error, &key.name, started_at)
                         .await
                 }
-                None => Error::SystemDatabase(refusal),
+                None => Error::SystemDatabase(error),
             });
         }
         Err(error) => return Err(error),
@@ -1636,8 +1636,8 @@ impl StartPlacement {
     }
 }
 
-/// Whether `error` is a refused child start that the parent's step records, so a replay is
-/// refused the same way rather than trying the start again.
+/// Whether a child start's `error` is recorded at the parent's step, so a replay gets the same
+/// error rather than trying the start again.
 ///
 /// Each of these depends on another workflow's row, which can be gone by the time of a replay:
 ///
@@ -1647,7 +1647,7 @@ impl StartPlacement {
 ///   workflow of another function, and once that row is deleted the same start would go ahead.
 ///
 /// Without the record, the replay would start the child and the parent would take the other branch
-/// from the one it took after the refusal. Every other error a start can return either depends only
+/// from the one it took after the error. Every other error a start can return either depends only
 /// on the start's own arguments, and so replays the same without a record, or is database trouble,
 /// which a replay should meet afresh.
 fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
@@ -1688,8 +1688,8 @@ impl Parent<'_> {
     /// is what the row holds:
     ///
     /// - **a child id**: the start went ahead, and the replay joins that child;
-    /// - **a recorded refusal**: the start was refused, and the replay is refused the same way,
-    ///   without trying the start again. See [`record_start_error`](Self::record_start_error);
+    /// - **a recorded error**: the start failed, and the replay returns the same error without
+    ///   trying the start again. See [`record_start_error`](Self::record_start_error);
     /// - **neither**, or an error that [`should_record_start_error`] doesn't name: a plain step
     ///   wrote the row, which means the parent's code changed (`step("charge")` became a child
     ///   workflow named `charge`), and starting a child now would give this position two meanings
@@ -1706,10 +1706,10 @@ impl Parent<'_> {
         if let Some(child) = recorded.child_workflow_id {
             return Ok(Some(child));
         }
-        if let Some(error) = recorded.error.as_deref() {
+        if let Some(encoded) = recorded.error.as_deref() {
             let value = executor
                 .serializer()
-                .decode(error, recorded.serialization.as_deref())
+                .decode(encoded, recorded.serialization.as_deref())
                 .map_err(|error| {
                     Error::SystemDatabase(unreadable(
                         error,
@@ -1719,16 +1719,16 @@ impl Parent<'_> {
                         "an error",
                     ))
                 })?;
-            if let Ok(refusal) = serde_json::from_value::<crate::sysdb::Error>(value)
-                && should_record_start_error(&refusal)
+            if let Ok(error) = serde_json::from_value::<crate::sysdb::Error>(value)
+                && should_record_start_error(&error)
             {
                 tracing::debug!(
                     parent_workflow_id = self.workflow_id(),
                     step_id = self.step_id,
-                    error = %refusal,
-                    "the child workflow start was refused; the replay is refused the same way"
+                    %error,
+                    "the child workflow start failed; the replay returns the same error"
                 );
-                return Err(Error::SystemDatabase(refusal));
+                return Err(Error::SystemDatabase(error));
             }
         }
         Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
@@ -1739,38 +1739,38 @@ impl Parent<'_> {
         }))
     }
 
-    /// Records a refused start as this position's error, and gives back the error the caller
+    /// Records a failed start's error at this position, and gives back the error the caller
     /// should see.
     ///
-    /// The insert that was refused wrote nothing, so the record goes in on its own. A crash before
+    /// The insert that failed wrote nothing, so the record goes in on its own. A crash before
     /// it leaves nothing recorded and nothing observed, and the replay tries the start again as a
     /// first run would.
     ///
-    /// - **Recorded**: the refusal is returned, and [`check_child`](Self::check_child)
+    /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
     ///   returns it again on a replay.
     /// - **The record fails**: that failure is returned instead, and the position stays
     ///   unrecorded. A rival that recorded it first is
     ///   [`StepAlreadyRecorded`](crate::sysdb::Error::StepAlreadyRecorded): this execution is
     ///   superseded.
-    /// - **The refusal can't be encoded**: a custom serializer can fail for its own reasons. The
-    ///   encoding failure is returned and the refusal logged, so the position stays unrecorded
+    /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
+    ///   encoding failure is returned and the error logged, so the position stays unrecorded
     ///   rather than the parent acting on an answer nothing recorded.
     async fn record_start_error(
         &self,
         executor: &Executor,
-        refusal: crate::sysdb::Error,
+        error: crate::sysdb::Error,
         step_name: &str,
         started_at: Timestamp,
     ) -> Error {
-        let recorded = match encode_step_error(&refusal, executor.serializer()) {
+        let recorded = match encode_step_error(&error, executor.serializer()) {
             Ok(recorded) => recorded,
             Err(encode_error) => {
                 tracing::warn!(
                     parent_workflow_id = self.workflow_id(),
                     step_id = self.step_id,
-                    error = %refusal,
+                    %error,
                     %encode_error,
-                    "the child workflow start was refused, but the refusal could not be encoded \
+                    "the child workflow start failed, but its error could not be encoded \
                      to record it"
                 );
                 return Error::SystemDatabase(encode_error);
@@ -1794,7 +1794,7 @@ impl Parent<'_> {
             )
             .await
         {
-            Ok(()) => Error::SystemDatabase(refusal),
+            Ok(()) => Error::SystemDatabase(error),
             Err(record_error) => Error::SystemDatabase(record_error),
         }
     }

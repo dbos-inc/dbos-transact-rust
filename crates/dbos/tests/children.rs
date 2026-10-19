@@ -387,17 +387,17 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
     dbos.shutdown().await;
 }
 
-/// **A refused child start is recorded at the parent's step, and replays as the same refusal.**
+/// **A deduplicated child start's error is recorded at the parent's step, and replays the same.**
 ///
 /// The key is held only while its holder waits, so a replay after the holder has finished would
 /// otherwise start the child and take the branch the first run didn't. The parent handles the
-/// refusal; the holder then finishes; a fork that copies the start's checkpoint still takes the
-/// refused branch and creates no child. A fork that runs the start again, as a control, starts the
+/// error; the holder then finishes; a fork that copies the start's checkpoint still takes the
+/// error branch and creates no child. A fork that runs the start again, as a control, starts the
 /// child, which shows the key really is free by then.
 #[tokio::test]
-async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
+async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("child-refused-app", &db));
+    let dbos = DBOS::new(config("child-dedup-error-app", &db));
     let child = dbos
         .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
         .unwrap();
@@ -413,7 +413,7 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
                             StartOptions {
                                 queue: Some(Enqueue {
                                     deduplication_id: Some("order-7"),
-                                    ..Enqueue::new("refused-queue")
+                                    ..Enqueue::new("dedup-error-queue")
                                 }),
                                 ..StartOptions::default()
                             },
@@ -425,7 +425,7 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
                             e @ Error::SystemDatabase(dbos::sysdb::Error::QueueDeduplicated {
                                 ..
                             }),
-                        ) => Ok(format!("refused: {e}")),
+                        ) => Ok(format!("deduplicated: {e}")),
                         Err(e) => Err(e),
                     }
                 }
@@ -434,7 +434,7 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
         .unwrap();
     dbos.launch().await.expect("launch failed");
     dbos.register_queue(
-        "refused-queue",
+        "dedup-error-queue",
         QueueOptions::default(),
         QueueConflict::UpdateIfLatestVersion,
     )
@@ -445,11 +445,11 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
         .start_with(
             (),
             StartOptions {
-                workflow_id: Some("the-refusing-holder"),
+                workflow_id: Some("the-dedup-holder"),
                 queue: Some(Enqueue {
                     deduplication_id: Some("order-7"),
                     delay: Some(Duration::from_secs(3)),
-                    ..Enqueue::new("refused-queue")
+                    ..Enqueue::new("dedup-error-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -457,7 +457,7 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
         .await
         .expect("the holder was not enqueued");
 
-    let id = "the-refused-parent";
+    let id = "the-deduplicated-parent";
     let first = parent
         .run_with(
             (),
@@ -468,7 +468,7 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
         )
         .await
         .expect("the parent failed");
-    assert!(first.starts_with("refused: "), "{first}");
+    assert!(first.starts_with("deduplicated: "), "{first}");
 
     let reader = reader(&db).await;
     let steps = reader
@@ -479,7 +479,7 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
     assert_eq!(steps[0].step_name, "child");
     assert!(
         steps[0].error.is_some() && steps[0].child_workflow_id.is_none(),
-        "the refusal is recorded as the start's error, with no child: {:?}",
+        "the error is recorded as the start's, with no child: {:?}",
         steps[0]
     );
 
@@ -492,8 +492,8 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
     );
 
     // The key is free now. A fork from step 1 copies the start's checkpoint, so the start replays
-    // and must be refused again rather than start the child, with the refusal the first run got:
-    // the same variant and fields, so it still names the first run's derived child id.
+    // and must return the first run's error again rather than start the child: the same variant
+    // and fields, so it still names the first run's derived child id.
     let replayed = dbos
         .fork::<String, Error>(id, 1)
         .await
@@ -529,14 +529,14 @@ async fn a_refused_child_start_replays_its_refusal_after_the_key_is_freed() {
     dbos.shutdown().await;
 }
 
-/// **A child id taken by another function is a recorded refusal too**, and a parent that returns it
+/// **A child id taken by another function is a recorded error too**, and a parent that returns it
 /// with `?` ends `ERROR` with it, on the first run and on the replay.
 ///
 /// The conflict lasts only as long as the other workflow's row. Once that row is deleted the same
-/// start would go ahead, so a replay that isn't refused by the record would start the child and
+/// start would go ahead, so a replay that didn't read the record would start the child and
 /// end in success.
 #[tokio::test]
-async fn a_child_id_taken_by_another_function_replays_its_refusal_after_the_row_is_deleted() {
+async fn a_child_id_taken_by_another_function_replays_its_error_after_the_row_is_deleted() {
     let db = test_database().await;
     let dbos = DBOS::new(config("child-conflict-app", &db));
     let child = dbos
@@ -592,7 +592,7 @@ async fn a_child_id_taken_by_another_function_replays_its_refusal_after_the_row_
         .expect("the parent did not start")
         .result()
         .await
-        .expect_err("the parent should end with the refusal");
+        .expect_err("the parent should end with the error");
     assert!(
         matches!(
             first,
@@ -609,10 +609,10 @@ async fn a_child_id_taken_by_another_function_replays_its_refusal_after_the_row_
             .expect("the parent is missing")
             .status,
         WorkflowStatus::Error,
-        "a recorded refusal returned with `?` is the workflow's outcome"
+        "a recorded start error returned with `?` is the workflow's outcome"
     );
 
-    // With the squatter gone the id is free, so only the record keeps the replay refused.
+    // With the squatter gone the id is free, so only the record keeps the replay failing.
     dbos.delete("the-taken-child-id")
         .await
         .expect("delete failed");
@@ -622,7 +622,7 @@ async fn a_child_id_taken_by_another_function_replays_its_refusal_after_the_row_
         .expect("fork failed")
         .result()
         .await
-        .expect_err("the replay should end with the refusal");
+        .expect_err("the replay should end with the error");
     assert_eq!(
         replayed.to_string(),
         first.to_string(),

@@ -1018,10 +1018,10 @@ impl PostgresSystemDatabase {
             step_id,
             codec,
         } = caller;
-        // A custom serializer may fail to encode the refusal. Then the refusal stays unrecorded
-        // and the encoding failure is what the caller sees — not a recordable answer, so the step
-        // runs again rather than the workflow failing with a reply nothing recorded. The refusal
-        // itself is logged, since the error returned no longer carries it.
+        // A custom serializer may fail to encode the error. Then the error stays unrecorded and
+        // the encoding failure is what the caller sees — not a recordable answer, so the step runs
+        // again rather than the workflow failing with a reply nothing recorded. The error itself
+        // is logged, since the one returned no longer carries it.
         let recorded = match encode_step_error(&error, codec) {
             Ok(recorded) => recorded,
             Err(encode_error) => {
@@ -1031,7 +1031,7 @@ impl PostgresSystemDatabase {
                     step_name,
                     error = %error,
                     encode_error = %encode_error,
-                    "the step was refused, but the refusal could not be encoded to record it"
+                    "the step failed, but its error could not be encoded to record it"
                 );
                 return encode_error;
             }
