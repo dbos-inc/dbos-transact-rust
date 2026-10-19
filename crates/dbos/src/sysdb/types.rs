@@ -1954,11 +1954,15 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
 /// the value for the failure message: `an output` or `an error`. The reverse of
 /// [`decode_step_value`].
 ///
-/// Every writer of a recorded step value goes through here, so a replay reads them all back the
-/// same way. `serde_json` fails only on a type that cannot be JSON, such as a non-string map key,
-/// and turns a non-finite float into `null` without failing, so a value here must hold none; every
-/// value this takes is one of the engine's own plain records or an [`Error`]. The codec can fail
-/// too, since a custom serializer may fail for its own reasons.
+/// Every value this crate records through a [`StepCodec`] goes through here (a management call's
+/// result, an internal step's output, a recorded system-database error), so a replay reads them all
+/// back the same way. An ordinary step's output and error are the application's own types, and go
+/// through the payload encoding instead.
+///
+/// `serde_json` fails only on a type that cannot be JSON, such as a non-string map key, and turns a
+/// non-finite float into `null` without failing, so a value here must hold none; every value this
+/// takes is one of the engine's own plain records or an [`Error`]. The codec can fail too, since a
+/// custom serializer may fail for its own reasons.
 pub(crate) fn encode_step_value<T: serde::Serialize + ?Sized>(
     value: &T,
     codec: &dyn StepCodec,

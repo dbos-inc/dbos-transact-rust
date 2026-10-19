@@ -616,10 +616,9 @@ async fn a_child_id_taken_by_another_function_replays_its_error_after_the_row_is
     dbos.delete("the-taken-child-id")
         .await
         .expect("delete failed");
-    let replayed = dbos
-        .fork::<u32, Error>(id, 1)
-        .await
-        .expect("fork failed")
+    let fork = dbos.fork::<u32, Error>(id, 1).await.expect("fork failed");
+    let fork_id = fork.workflow_id().to_owned();
+    let replayed = fork
         .result()
         .await
         .expect_err("the replay should end with the error");
@@ -627,6 +626,16 @@ async fn a_child_id_taken_by_another_function_replays_its_error_after_the_row_is
         replayed.to_string(),
         first.to_string(),
         "the replay ended differently from the run it replayed"
+    );
+    assert_eq!(
+        reader
+            .get_workflow(&fork_id)
+            .await
+            .expect("read failed")
+            .expect("the fork is missing")
+            .status,
+        WorkflowStatus::Error,
+        "the replay's recorded start error is its outcome too"
     );
     assert!(
         reader

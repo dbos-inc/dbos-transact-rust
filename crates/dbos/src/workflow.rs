@@ -1207,8 +1207,8 @@ async fn create<R, E>(
     // outside one is unaffected by everything below.
     let parent = placed.parent();
 
-    // The launch is recorded against the parent before anything is created, so a replay of
-    // this position finds the child it already started instead of starting a second one.
+    // A replay of this position finds the child it already started, or the error its start
+    // returned, instead of trying the start again.
     if let Some(parent) = &parent
         && let Some(child) = parent.check_child(executor, &key.name).await?
     {
@@ -1644,12 +1644,23 @@ impl StartPlacement {
 /// - [`QueueDeduplicated`](crate::sysdb::Error::QueueDeduplicated): the key is held only while its
 ///   holder waits, so once the holder finishes the same start would go ahead.
 /// - [`ConflictingWorkflow`](crate::sysdb::Error::ConflictingWorkflow): the chosen child id names a
-///   workflow of another function, and once that row is deleted the same start would go ahead.
+///   workflow of another function, class or config, and once that row is deleted the same start
+///   would go ahead.
 ///
 /// Without the record, the replay would start the child and the parent would take the other branch
-/// from the one it took after the error. Every other error a start can return either depends only
-/// on the start's own arguments, and so replays the same without a record, or is database trouble,
-/// which a replay should meet afresh.
+/// from the one it took after the error. Every other error a start can return is one of:
+///
+/// - an error that depends only on the start's own arguments, and so replays the same without a
+///   record;
+/// - database trouble, which a replay should meet afresh;
+/// - a signal about this execution (cancelled, superseded, replaying changed code), which ends the
+///   run rather than answering the start.
+///
+/// [`MaxRecoveryAttemptsExceeded`](crate::sysdb::Error::MaxRecoveryAttemptsExceeded) is the one
+/// exception: a chosen child id naming an unfinished row that another attempt owns and that is
+/// already over its recovery limit parks that row and returns this error, and a replay then finds
+/// the row parked and joins it. It is not recorded, because a start that is not a dequeue should
+/// not count recovery attempts at all.
 fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
     matches!(
         error,
@@ -1690,6 +1701,7 @@ impl Parent<'_> {
     /// - **a child id**: the start went ahead, and the replay joins that child;
     /// - **a recorded error**: the start failed, and the replay returns the same error without
     ///   trying the start again. See [`record_start_error`](Self::record_start_error);
+    /// - **a recorded error this build can't decode**: the decode error, naming this step;
     /// - **neither**, or an error that [`should_record_start_error`] doesn't name: a plain step
     ///   wrote the row, which means the parent's code changed (`step("charge")` became a child
     ///   workflow named `charge`), and starting a child now would give this position two meanings
@@ -1744,10 +1756,13 @@ impl Parent<'_> {
     ///
     /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
     ///   returns it again on a replay.
-    /// - **The record fails**: that failure is returned instead, and the position stays
+    /// - **The record fails**: that failure is returned instead, and the position usually stays
     ///   unrecorded. A rival that recorded it first is
     ///   [`StepAlreadyRecorded`](crate::sysdb::Error::StepAlreadyRecorded): this execution is
-    ///   superseded.
+    ///   superseded. The record is the step row and then the executor claim, as for any step; if
+    ///   the claim fails after the row lands, the caller gets the claim's error but the row stays,
+    ///   so a replay returns the recorded error. The claim's error is database trouble, which
+    ///   leaves the parent `PENDING` rather than ending it.
     /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
     ///   encoding failure is returned and the error logged, so the position stays unrecorded
     ///   rather than the parent acting on an answer nothing recorded.
