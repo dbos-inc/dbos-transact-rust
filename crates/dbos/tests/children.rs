@@ -433,14 +433,10 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
-    dbos.register_queue(
-        "dedup-error-queue",
-        QueueOptions::default(),
-        QueueConflict::UpdateIfLatestVersion,
-    )
-    .await
-    .expect("registration failed");
 
+    // **Enqueued before the queue is registered, which is what keeps the key held.** Nothing polls
+    // a queue until it is registered, so the holder waits, holding the key, for as long as the
+    // parent's first run takes.
     let holder = child
         .start_with(
             (),
@@ -448,7 +444,6 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
                 workflow_id: Some("the-dedup-holder"),
                 queue: Some(Enqueue {
                     deduplication_id: Some("order-7"),
-                    delay: Some(Duration::from_secs(3)),
                     ..Enqueue::new("dedup-error-queue")
                 }),
                 ..StartOptions::default()
@@ -483,6 +478,14 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
         steps[0]
     );
 
+    // Registering the queue lets the holder run, and its finishing frees the key.
+    dbos.register_queue(
+        "dedup-error-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(20), holder.result())
             .await

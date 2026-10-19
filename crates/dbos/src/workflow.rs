@@ -1669,6 +1669,24 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
     )
 }
 
+/// The variants [`should_record_start_error`] accepts, by the name a recorded one is stored under.
+///
+/// A [`sysdb::Error`](crate::sysdb::Error) is stored as an object whose one key is its variant's
+/// name, so [`check_child`](Parent::check_child) can tell a recorded start error from a plain
+/// step's error by that key, before reading it as the type. A unit test keeps this list and the
+/// predicate in step.
+const RECORDED_START_ERRORS: [&str; 2] = ["QueueDeduplicated", "ConflictingWorkflow"];
+
+/// Whether `value`, a recorded step error, has the shape of a recorded start error.
+fn is_recorded_start_error(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object
+                .keys()
+                .all(|key| RECORDED_START_ERRORS.contains(&key.as_str()))
+    })
+}
+
 /// The workflow a child is being started from: the context it runs in, and the step id the start
 /// occupies.
 ///
@@ -1701,7 +1719,8 @@ impl Parent<'_> {
     /// - **a child id**: the start went ahead, and the replay joins that child;
     /// - **a recorded error**: the start failed, and the replay returns the same error without
     ///   trying the start again. See [`record_start_error`](Self::record_start_error);
-    /// - **a recorded error this build can't decode**: the decode error, naming this step;
+    /// - **a recorded error this build can't decode**, or a recorded start error it can't read
+    ///   as one: the decode error, naming this step;
     /// - **neither**, or an error that [`should_record_start_error`] doesn't name: a plain step
     ///   wrote the row, which means the parent's code changed (`step("charge")` became a child
     ///   workflow named `charge`), and starting a child now would give this position two meanings
@@ -1727,9 +1746,17 @@ impl Parent<'_> {
             let value: serde_json::Value =
                 decode_step_value(&recorded, encoded, caller, step_name, "an error")
                     .map_err(Error::SystemDatabase)?;
-            if let Ok(error) = serde_json::from_value::<crate::sysdb::Error>(value)
-                && should_record_start_error(&error)
-            {
+            // Told apart by shape before the typed read, so a start error this build can't read
+            // is reported as that, naming the step, rather than as a plain step's row.
+            if is_recorded_start_error(&value) {
+                let error = serde_json::from_value::<crate::sysdb::Error>(value).map_err(|e| {
+                    Error::SystemDatabase(crate::sysdb::Error::Malformed(format!(
+                        "workflow {} step {} ({step_name}) has an error this build cannot read: \
+                         {e}",
+                        self.workflow_id(),
+                        self.step_id,
+                    )))
+                })?;
                 tracing::debug!(
                     parent_workflow_id = self.workflow_id(),
                     step_id = self.step_id,
@@ -2226,6 +2253,43 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The names [`check_child`](Parent::check_child) recognises a recorded start error by are the
+    /// variants [`should_record_start_error`] records, and no others.
+    #[test]
+    fn the_recorded_start_error_names_match_the_errors_that_are_recorded() {
+        let errors = [
+            crate::sysdb::Error::QueueDeduplicated {
+                workflow_id: "w".to_owned(),
+                queue_name: "q".to_owned(),
+                deduplication_id: "d".to_owned(),
+            },
+            crate::sysdb::Error::ConflictingWorkflow {
+                workflow_id: "w".to_owned(),
+                detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::InvalidInput {
+                field: "f".into(),
+                detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::NonExistentWorkflow {
+                workflow_ids: vec!["w".to_owned()],
+            },
+        ];
+        for error in &errors {
+            let value = serde_json::to_value(error).unwrap();
+            assert_eq!(
+                is_recorded_start_error(&value),
+                should_record_start_error(error),
+                "{value}"
+            );
+        }
+        let recorded = errors
+            .iter()
+            .filter(|error| should_record_start_error(error))
+            .count();
+        assert_eq!(recorded, RECORDED_START_ERRORS.len());
+    }
 
     /// A subscriber that keeps every event's level and message, and nothing else.
     ///
