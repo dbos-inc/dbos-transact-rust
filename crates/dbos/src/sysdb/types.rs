@@ -1964,12 +1964,12 @@ pub(crate) fn encode_step_error(
     codec.encode(value)
 }
 
-/// Says which step a recorded value could not be read from.
+/// Adds the step a recorded value could not be read from to the error that decoding it gave.
 ///
 /// An unknown tag stays [`Error::UnknownSerialization`], which callers match on and which names
 /// only the tag, so the step that holds it is logged rather than folded into the error. Anything
 /// else becomes [`Error::Malformed`], with the step in its message.
-pub(crate) fn unreadable(
+pub(crate) fn decode_error_at_step(
     error: Error,
     workflow_id: &str,
     step_id: i32,

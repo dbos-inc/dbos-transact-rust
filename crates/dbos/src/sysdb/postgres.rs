@@ -90,8 +90,8 @@ use super::types::{
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
     Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
-    encode_step_error, is_valid_application_name, unreadable, validate_attributes,
+    WorkflowRecord, WorkflowStatus, WrittenBy, decode_error_at_step, duration_from_ms,
+    duration_from_secs, encode_step_error, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -781,7 +781,7 @@ fn decode_recorded<T: serde::de::DeserializeOwned>(
         .and_then(|value| {
             serde_json::from_value(value).map_err(|e| Error::Malformed(e.to_string()))
         })
-        .map_err(|e| unreadable(e, caller.workflow_id, caller.step_id, step_name, what))
+        .map_err(|e| decode_error_at_step(e, caller.workflow_id, caller.step_id, step_name, what))
 }
 
 impl PostgresSystemDatabase {
