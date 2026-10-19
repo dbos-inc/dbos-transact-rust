@@ -21,8 +21,8 @@ use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
-    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, Submission, Timestamp,
-    WorkflowInitResult,
+    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCodec, StepTiming,
+    Submission, Timestamp, WorkflowInitResult,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -424,6 +424,10 @@ pub enum DuplicationPolicy {
     /// The default, and what every implementation defaults to. A caller who did not think about
     /// collisions should hear that the key was taken, rather than silently joining a workflow
     /// whose arguments are somebody else's.
+    ///
+    /// **Started from inside a workflow, the refusal is recorded at the parent's step**, so a
+    /// replay of the parent is refused the same way and starts nothing, even once the holder has
+    /// finished and the key is free.
     #[default]
     Reject,
     /// Hand back a handle to the workflow already holding the key.
@@ -1206,7 +1210,7 @@ async fn create<R, E>(
     // The launch is recorded against the parent before anything is created, so a replay of
     // this position finds the child it already started instead of starting a second one.
     if let Some(parent) = &parent
-        && let Some(child) = parent.recorded_child(executor, &key.name).await?
+        && let Some(child) = parent.check_child(executor, &key.name).await?
     {
         tracing::debug!(
             parent_workflow_id = parent.workflow_id(),
@@ -1307,9 +1311,25 @@ async fn create<R, E>(
             started_at,
         }),
     )
-    .await?
+    .await
     {
-        Submitted::Created(initialized) => initialized,
+        Ok(Submitted::Created(initialized)) => initialized,
+        // **A refused start is recorded at the parent's step**, so a replay is refused too. The
+        // key is held only while its holder waits, so a replay after the holder has finished
+        // would otherwise start the child, and the parent would take the other branch from the
+        // one it took after the refusal. Only this refusal is recorded: every other error an
+        // insert can return either replays the same without a record or is database trouble.
+        Err(Error::SystemDatabase(refusal @ crate::sysdb::Error::QueueDeduplicated { .. })) => {
+            return Err(match &parent {
+                Some(parent) => {
+                    parent
+                        .record_child_refusal(executor, refusal, &key.name, started_at)
+                        .await
+                }
+                None => Error::SystemDatabase(refusal),
+            });
+        }
+        Err(error) => return Err(error),
         // **The start records the workflow that was joined**, not the id this call derived,
         // so a replay of this position resolves to the same workflow instead of trying to
         // start a child that was never created. Go records the same mapping at the same
@@ -1324,7 +1344,7 @@ async fn create<R, E>(
         // again. It joins the same holder if the key is still held, and starts a workflow of
         // its own if the holder has since finished — which is what the policy means at that
         // moment, since the key deduplicates a backlog rather than a history.
-        Submitted::Joined(holder) => {
+        Ok(Submitted::Joined(holder)) => {
             if let Some(parent) = &parent {
                 parent
                     .record_child(executor, &holder, &key.name, started_at)
@@ -1646,16 +1666,16 @@ impl Parent<'_> {
     ///
     /// `check_step` compares the recorded name, so a mismatch here is already
     /// [`UnexpectedStep`](crate::sysdb::Error::UnexpectedStep) before this sees it. What is left
-    /// to check is the child id: a row under the right name carrying none was written by a plain
-    /// step, which means the parent's code changed — `step("charge")` became a child workflow
-    /// named `charge` — and starting a child now would give this position two meanings across
-    /// two runs.
+    /// is what the row holds:
     ///
-    /// **Stricter than the references here.** Python falls through to a fresh start when the
-    /// recorded row has no child id, and Go's `CheckChildWorkflow` returns nothing for it. Both end
-    /// up loud rather than wrong — the write conflicts a moment later — but only after a child row
-    /// has been created and orphaned, which is a worse thing to leave behind than an error.
-    async fn recorded_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
+    /// - **a child id**: the start went ahead, and the replay joins that child;
+    /// - **a recorded refusal**: the start was refused, and the replay is refused the same way,
+    ///   without trying the start again. See [`record_child_refusal`](Self::record_child_refusal);
+    /// - **neither**, or an error that is not one of this layer's refusals: a plain step wrote the
+    ///   row, which means the parent's code changed (`step("charge")` became a child workflow
+    ///   named `charge`), and starting a child now would give this position two meanings across
+    ///   two runs.
+    async fn check_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
         let Some(recorded) = executor
             .sysdb()
             .check_step(self.workflow_id(), self.step_id, step_name)
@@ -1664,14 +1684,93 @@ impl Parent<'_> {
         else {
             return Ok(None);
         };
-        recorded.child_workflow_id.map(Some).ok_or_else(|| {
-            Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
-                workflow_id: self.workflow_id().to_owned(),
-                step_id: self.step_id,
-                expected: format!("a child workflow start of {step_name}"),
-                recorded: format!("a plain step named {step_name}"),
-            })
-        })
+        if let Some(child) = recorded.child_workflow_id {
+            return Ok(Some(child));
+        }
+        if let Some(error) = recorded.error.as_deref() {
+            let value = executor
+                .serializer()
+                .decode(error, recorded.serialization.as_deref())
+                .map_err(Error::SystemDatabase)?;
+            if let Ok(refusal) = serde_json::from_value::<crate::sysdb::Error>(value) {
+                tracing::debug!(
+                    parent_workflow_id = self.workflow_id(),
+                    step_id = self.step_id,
+                    error = %refusal,
+                    "the child workflow start was refused; the replay is refused the same way"
+                );
+                return Err(Error::SystemDatabase(refusal));
+            }
+        }
+        Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
+            workflow_id: self.workflow_id().to_owned(),
+            step_id: self.step_id,
+            expected: format!("a child workflow start of {step_name}"),
+            recorded: format!("a plain step named {step_name}"),
+        }))
+    }
+
+    /// Records a refused start as this position's error, and gives back the error the caller
+    /// should see.
+    ///
+    /// The insert that was refused wrote nothing, so the record goes in on its own. A crash before
+    /// it leaves nothing recorded and nothing observed, and the replay tries the start again as a
+    /// first run would.
+    ///
+    /// - **Recorded**: the refusal is returned, and [`check_child`](Self::check_child)
+    ///   returns it again on a replay.
+    /// - **The record fails**: that failure is returned instead, and the position stays
+    ///   unrecorded. A rival that recorded it first is
+    ///   [`StepAlreadyRecorded`](crate::sysdb::Error::StepAlreadyRecorded): this execution is
+    ///   superseded.
+    /// - **The refusal can't be encoded**: a custom serializer can fail for its own reasons. The
+    ///   encoding failure is returned and the refusal logged, so the position stays unrecorded
+    ///   rather than the parent acting on an answer nothing recorded.
+    async fn record_child_refusal(
+        &self,
+        executor: &Executor,
+        refusal: crate::sysdb::Error,
+        step_name: &str,
+        started_at: Timestamp,
+    ) -> Error {
+        let recorded = match serde_json::to_value(&refusal)
+            .map_err(|e| crate::sysdb::Error::Malformed(format!("step error is not JSON: {e}")))
+            .and_then(|value| executor.serializer().encode(value))
+        {
+            Ok(recorded) => recorded,
+            Err(encode_error) => {
+                tracing::warn!(
+                    parent_workflow_id = self.workflow_id(),
+                    step_id = self.step_id,
+                    error = %refusal,
+                    %encode_error,
+                    "the child workflow start was refused, but the refusal could not be encoded \
+                     to record it"
+                );
+                return Error::SystemDatabase(encode_error);
+            }
+        };
+        // Read once, outside the retry inside `record_step`, so a retried write carries the same
+        // completion time and is recognised as this call's own.
+        let timing = StepTiming {
+            started_at,
+            completed_at: Timestamp::now(),
+        };
+        match executor
+            .sysdb()
+            .record_step(
+                self.workflow_id(),
+                self.step_id,
+                step_name,
+                Outcome::Error(&recorded.value),
+                recorded.serialization.as_deref(),
+                Some(timing),
+            )
+            .await
+        {
+            Ok(()) => Error::SystemDatabase(refusal),
+            Err(record_error) => Error::SystemDatabase(record_error),
+        }
     }
 
     /// Records the start, so the replay above finds it — for the **joined** case alone.
