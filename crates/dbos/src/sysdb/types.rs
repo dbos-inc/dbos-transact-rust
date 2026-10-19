@@ -1950,12 +1950,15 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
     fn decode(&self, value: &str, serialization: Option<&str>) -> Result<serde_json::Value, Error>;
 }
 
-/// Encodes a refusal to record as a step's error, through the caller's codec.
+/// Encodes an error to record as a step's error, through the caller's codec.
 ///
-/// Shared by every writer of a recorded refusal, so a replay reads them all back the same way.
+/// Shared by every writer of a recorded error, so a replay reads them all back the same way.
 /// `Error` is a plain serde enum, so turning it into JSON cannot fail on anything it holds; the
 /// codec can, since a custom serializer may fail for its own reasons.
-pub(crate) fn encode_refusal(error: &Error, codec: &dyn StepCodec) -> Result<EncodedValue, Error> {
+pub(crate) fn encode_step_error(
+    error: &Error,
+    codec: &dyn StepCodec,
+) -> Result<EncodedValue, Error> {
     let value = serde_json::to_value(error)
         .map_err(|e| Error::Malformed(format!("step error is not JSON: {e}")))?;
     codec.encode(value)

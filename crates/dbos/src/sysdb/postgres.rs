@@ -91,7 +91,7 @@ use super::types::{
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
     Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, duration_from_ms, duration_from_secs,
-    encode_refusal, is_valid_application_name, unreadable, validate_attributes,
+    encode_step_error, is_valid_application_name, unreadable, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -1022,7 +1022,7 @@ impl PostgresSystemDatabase {
         // and the encoding failure is what the caller sees — not a recordable answer, so the step
         // runs again rather than the workflow failing with a reply nothing recorded. The refusal
         // itself is logged, since the error returned no longer carries it.
-        let recorded = match encode_refusal(&error, codec) {
+        let recorded = match encode_step_error(&error, codec) {
             Ok(recorded) => recorded,
             Err(encode_error) => {
                 tracing::warn!(
