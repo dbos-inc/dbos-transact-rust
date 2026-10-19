@@ -1315,12 +1315,12 @@ async fn create<R, E>(
     {
         Ok(Submitted::Created(initialized)) => initialized,
         // **A refused start is recorded at the parent's step**, so a replay is refused too.
-        // See [`is_child_refusal`] for which refusals, and why each one needs the record.
-        Err(Error::SystemDatabase(refusal)) if is_child_refusal(&refusal) => {
+        // See [`should_record_start_error`] for which refusals, and why each one needs the record.
+        Err(Error::SystemDatabase(refusal)) if should_record_start_error(&refusal) => {
             return Err(match &parent {
                 Some(parent) => {
                     parent
-                        .record_child_refusal(executor, refusal, &key.name, started_at)
+                        .record_start_error(executor, refusal, &key.name, started_at)
                         .await
                 }
                 None => Error::SystemDatabase(refusal),
@@ -1650,7 +1650,7 @@ impl StartPlacement {
 /// from the one it took after the refusal. Every other error a start can return either depends only
 /// on the start's own arguments, and so replays the same without a record, or is database trouble,
 /// which a replay should meet afresh.
-fn is_child_refusal(error: &crate::sysdb::Error) -> bool {
+fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
     matches!(
         error,
         crate::sysdb::Error::QueueDeduplicated { .. }
@@ -1689,11 +1689,11 @@ impl Parent<'_> {
     ///
     /// - **a child id**: the start went ahead, and the replay joins that child;
     /// - **a recorded refusal**: the start was refused, and the replay is refused the same way,
-    ///   without trying the start again. See [`record_child_refusal`](Self::record_child_refusal);
-    /// - **neither**, or an error that [`is_child_refusal`] doesn't name: a plain step wrote the
-    ///   row, which means the parent's code changed (`step("charge")` became a child workflow
-    ///   named `charge`), and starting a child now would give this position two meanings across
-    ///   two runs.
+    ///   without trying the start again. See [`record_start_error`](Self::record_start_error);
+    /// - **neither**, or an error that [`should_record_start_error`] doesn't name: a plain step
+    ///   wrote the row, which means the parent's code changed (`step("charge")` became a child
+    ///   workflow named `charge`), and starting a child now would give this position two meanings
+    ///   across two runs.
     async fn check_child(&self, executor: &Executor, step_name: &str) -> Result<Option<String>> {
         let Some(recorded) = executor
             .sysdb()
@@ -1720,7 +1720,7 @@ impl Parent<'_> {
                     ))
                 })?;
             if let Ok(refusal) = serde_json::from_value::<crate::sysdb::Error>(value)
-                && is_child_refusal(&refusal)
+                && should_record_start_error(&refusal)
             {
                 tracing::debug!(
                     parent_workflow_id = self.workflow_id(),
@@ -1755,7 +1755,7 @@ impl Parent<'_> {
     /// - **The refusal can't be encoded**: a custom serializer can fail for its own reasons. The
     ///   encoding failure is returned and the refusal logged, so the position stays unrecorded
     ///   rather than the parent acting on an answer nothing recorded.
-    async fn record_child_refusal(
+    async fn record_start_error(
         &self,
         executor: &Executor,
         refusal: crate::sysdb::Error,
