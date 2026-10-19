@@ -9,7 +9,7 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewWorkflow, Outcome, Submission, Timestamp, WorkflowStatus};
 use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
 
-use dbos_test_support::{Backend, TestDatabase, test_database};
+use dbos_test_support::{Backend, TestDatabase, raw_database, test_database};
 
 /// The version every instance in this file launches with: DBOS computes none, so a launch without
 /// one fails — and sharing it is what lets a relaunch recover what the previous launch left.
@@ -248,9 +248,9 @@ async fn shutdown_does_not_durably_cancel_a_workflow_that_has_a_deadline() {
 /// A deadline that fires after another execution has already finished the workflow reports **that
 /// outcome**, not a cancellation.
 ///
-/// `cancel_batch` leaves a finished row alone, so the cancellation this execution attempts moves
-/// nothing. Reporting `WorkflowCancelled` anyway would hand this caller an answer no other caller
-/// can see: the row says `SUCCESS`, and so does `handle.status()` on the very same handle.
+/// A timeout cancels only an unsettled row, so the one this execution attempts moves nothing.
+/// Reporting `WorkflowCancelled` anyway would hand this caller an answer no other caller can see:
+/// the row says `SUCCESS`, and so does `handle.status()` on the very same handle.
 #[tokio::test]
 async fn a_deadline_that_loses_to_a_recorded_outcome_reports_that_outcome() {
     let db = test_database().await;
@@ -408,13 +408,18 @@ async fn the_sweep_cancels_expired_workflows_nobody_is_running() {
 /// away; once it is back, the next pass cancels as before.
 #[tokio::test]
 async fn a_failed_sweep_pass_does_not_stop_the_sweep() {
-    let db = test_database().await;
+    // A database of its own, never pooled: the test renames a column, and one left renamed by a
+    // failure part-way would break whichever test drew the database next.
+    let db = raw_database().await;
     if db.backend() == Backend::Cockroach {
         // CockroachDB won't rename a column a SQL function (`enqueue_workflow`) depends on, and
         // what this checks is the loop, which is the same on both backends.
         return;
     }
-    let dbos = DBOS::new(sweeping_config("sweep-failure-app", &db));
+    let dbos = DBOS::new(Config {
+        migrate: true,
+        ..sweeping_config("sweep-failure-app", &db)
+    });
     dbos.launch().await.expect("launch failed");
 
     let pool = db.pool().await;
@@ -475,5 +480,74 @@ async fn the_sweep_stops_at_shutdown_and_restarts_on_relaunch() {
 
     dbos.launch().await.expect("relaunch failed");
     wait_for_status(&reader, "while-down", WorkflowStatus::Cancelled).await;
+    dbos.shutdown().await;
+}
+
+/// **A run whose deadline passes records its own timeout**, so it doesn't depend on the sweep
+/// reaching the row.
+///
+/// The row is recorded under another application's name with no owner, which this process will
+/// run when started under the same id, and which its sweep, scoped to its own application's rows,
+/// never cancels. The run still ends `CANCELLED` soon after its deadline.
+#[tokio::test]
+async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
+    let db = test_database().await;
+    let dbos = DBOS::new(sweeping_config("deadline-scope-app", &db));
+    let workflow = dbos
+        .register_workflow("runs_forever", |()| async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<u32, dbos::Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "out-of-scope";
+    writer(&db, "another-app")
+        .await
+        .init_workflow(
+            &NewWorkflow {
+                name: Some("runs_forever"),
+                input: Some("null"),
+                serialization: Some("rust_serde"),
+                deadline: Timestamp::now().checked_add(Duration::from_millis(300)),
+                ..NewWorkflow::new(id)
+            },
+            None,
+            Submission::Fresh,
+            None,
+        )
+        .await
+        .expect("insert failed");
+    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = NULL WHERE workflow_uuid = $1"#)
+        .bind(id)
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the timed-out run never ended")
+    .expect_err("the workflow succeeded");
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "expected a cancellation, got {error:?}"
+    );
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        row.application_name.as_deref(),
+        Some("another-app"),
+        "the row stayed outside this application's sweep"
+    );
+
     dbos.shutdown().await;
 }

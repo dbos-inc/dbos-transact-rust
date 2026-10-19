@@ -1,14 +1,14 @@
-//! The workflow-timeout sweep: the one place a workflow's deadline is made durable.
+//! The workflow-timeout sweep, which records the timeout of workflows nobody is running.
 //!
 //! Every executor of an application runs this loop. Each pass cancels the application's unsettled
-//! workflows whose deadline has passed, whoever owns them and whatever their status, so a workflow
-//! nobody is running still times out: an `ENQUEUED` or `DELAYED` child that inherited its parent's
-//! deadline, or a `PENDING` workflow whose executor died. See
+//! workflows whose deadline has passed, whoever owns them and whichever unsettled status they are
+//! in, so a workflow nobody is running still times out: an `ENQUEUED` or `DELAYED` child that
+//! inherited its parent's deadline, or a `PENDING` workflow whose executor died. See
 //! [`cancel_timed_out_workflows`](crate::sysdb::SystemDatabase::cancel_timed_out_workflows).
 //!
-//! A workflow running in this process doesn't wait for the sweep to stop: its own timer ends the
-//! body at the deadline, and the execution then waits for the row to settle, which the sweep's
-//! cancel is what does. See `run_until_deadline` in the workflow module.
+//! A workflow running in this process doesn't wait for the sweep: its own timer ends the body at
+//! the deadline, and the execution records the timeout itself, on the same database clock. See
+//! `run_until_deadline` and `time_out` in the workflow module.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

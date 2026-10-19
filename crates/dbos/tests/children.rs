@@ -1736,8 +1736,8 @@ async fn a_child_can_decline_the_inherited_deadline() {
 /// **The propagated deadline is the cascade.** A parent that runs out of time and the child that
 /// inherited its deadline are cancelled at the same instant, independently.
 ///
-/// Nothing signals the child. It holds the same instant, its own `select!` fires on it, and it
-/// writes its own `CANCELLED`. That is why deadlines need no cancellation cascade: there is
+/// Nothing signals the child. It holds the same instant, its own timer fires on it, and it records
+/// its own timeout. That is why deadlines need no cancellation cascade: there is
 /// nothing left for one to do. (An explicit `cancel` with children is a different question, and
 /// belongs to the management surface.)
 #[tokio::test]

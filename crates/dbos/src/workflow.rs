@@ -22,7 +22,8 @@ use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCaller, StepTiming,
-    Submission, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
+    Submission, Timestamp, WorkflowInitResult, WorkflowStatus, decode_step_value,
+    encode_step_value,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -1939,15 +1940,10 @@ pub(crate) fn spawn_execution(
     )
 }
 
-/// Runs `body` until it finishes or its deadline passes, and when the deadline wins, waits for the
-/// row to settle.
+/// Runs `body` until it finishes or its deadline passes.
 ///
-/// **The local timer stops the body; it doesn't record the timeout.** The workflow-timeout sweep
-/// is what writes `CANCELLED` (see the `timeout_sweep` module), so one clock, the database's,
-/// decides when every deadline has passed, wherever the workflow runs. The timer is still needed:
-/// it is what interrupts a body blocked outside any step, which no durable check would reach. Once
-/// it fires, the body is dropped and this waits on the row, which the sweep cancels within its
-/// interval. If another execution recorded an outcome first, that outcome is what comes back.
+/// The local timer is what interrupts a body blocked outside any step, which no durable check would
+/// reach. When it wins, the body is dropped and [`time_out`] records the timeout.
 ///
 /// **Shutdown deliberately doesn't go through here.** It aborts the task outright, so no code of
 /// ours runs and no row is written, and the workflow is recovered. The deadline and shutdown use
@@ -1955,14 +1951,9 @@ pub(crate) fn spawn_execution(
 ///
 /// The deadline is an *instant* rather than a budget, and that is what makes it survive a crash: a
 /// workflow recovered with two minutes left waits two minutes, not the whole timeout again. A
-/// deadline already in the past yields a zero wait, and the run goes straight to waiting for the
-/// sweep, which is the correct reading of a workflow recovered after its expiry.
-async fn run_until_deadline<F>(
-    executor: &Executor,
-    workflow_id: &str,
-    deadline: Option<Timestamp>,
-    body: F,
-) -> Ended
+/// deadline already in the past yields a zero wait, which is the correct reading of a workflow
+/// recovered after its expiry.
+async fn run_until_deadline<F>(deadline: Option<Timestamp>, body: F) -> Ended
 where
     F: Future<Output = std::result::Result<EncodedOutput, Failure>>,
 {
@@ -1978,14 +1969,7 @@ where
     tokio::select! {
         biased;
         outcome = body => Ended::Body(outcome),
-        () = tokio::time::sleep(remaining) => {
-            tracing::info!(
-                workflow_id,
-                "the workflow exceeded its deadline; waiting for it to be cancelled"
-            );
-            // This execution read the row to run it, so an absence now is a delete, not a race.
-            Ended::Terminal(executor.connection().adopt(workflow_id, true).await)
-        }
+        () = tokio::time::sleep(remaining) => Ended::DeadlinePassed,
     }
 }
 
@@ -1993,10 +1977,55 @@ where
 enum Ended {
     /// The body ran to a conclusion. That conclusion is this execution's outcome and is written.
     Body(std::result::Result<EncodedOutput, Failure>),
-    /// The deadline fired and the row has settled: cancelled by the timeout sweep, or finished by
-    /// another execution while this one was working. What it holds is the answer; nothing more is
-    /// written.
-    Terminal(std::result::Result<EncodedOutput, Failure>),
+    /// The local timer fired and the body was dropped. What is left is to record the timeout.
+    DeadlinePassed,
+}
+
+/// Records the timeout of a workflow whose local timer fired, and settles on what the row holds.
+///
+/// **Cancelled only once the database's clock says the deadline has passed**, the same test the
+/// timeout sweep makes, so a process clock running ahead doesn't cancel a workflow early. Until
+/// then, and while a write fails, this asks again every outcome-poll interval. It stops as soon as
+/// the row has settled, whoever settled it: this cancel, the sweep, an explicit cancel, or another
+/// execution that recorded an outcome first, which is then this caller's answer.
+///
+/// The queue slot is given up first: the body is gone, and waiting here does no work a queue's
+/// concurrency limit should count.
+async fn time_out(
+    executor: &Executor,
+    workflow_id: &str,
+    slot: Option<crate::dequeue::Slot>,
+) -> std::result::Result<EncodedOutput, Failure> {
+    drop(slot);
+    tracing::info!(
+        workflow_id,
+        "the workflow exceeded its deadline and is cancelled"
+    );
+    loop {
+        match executor.sysdb().cancel_if_timed_out(workflow_id).await {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(workflow_id, %error, "could not record the deadline cancellation");
+            }
+        }
+        match executor.sysdb().get_workflow(workflow_id).await {
+            Ok(Some(row))
+                if !matches!(
+                    row.status,
+                    WorkflowStatus::Pending | WorkflowStatus::Enqueued | WorkflowStatus::Delayed
+                ) =>
+            {
+                break;
+            }
+            // Deleted mid-run: the adopt below reports it.
+            Ok(None) => break,
+            Ok(Some(_)) | Err(_) => {}
+        }
+        tokio::time::sleep(executor.connection().outcome_poll_interval()).await;
+    }
+    // This execution read the row to run it, so an absence now is a delete, not a race.
+    executor.connection().adopt(workflow_id, true).await
 }
 
 /// Runs the body with a context ambient and records what it did.
@@ -2028,8 +2057,6 @@ async fn execute(
     // the two halves different instants.
     let deadline = ctx.deadline();
     let outcome = match run_until_deadline(
-        executor,
-        workflow_id,
         deadline,
         Ctx::scope(ctx, async move {
             let encoded = workflow(input, encoding.clone()).await?;
@@ -2039,9 +2066,7 @@ async fn execute(
     .await
     {
         Ended::Body(outcome) => outcome,
-        // The row is terminal already — this execution has no outcome of its own to write, and a
-        // write behind the one that is there would be refused anyway.
-        Ended::Terminal(settled) => return settled,
+        Ended::DeadlinePassed => return time_out(executor, workflow_id, slot).await,
     };
 
     let write = match &outcome {

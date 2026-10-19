@@ -1779,31 +1779,43 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// compared against is the dequeue's own.
 const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 
+/// What a timeout writes: a cancel's columns plus `owner_xid`, so no execution holds the row.
+fn timed_out_set_sql() -> String {
+    format!(
+        "status = 'CANCELLED', owner_xid = NULL, queue_name = NULL, deduplication_id = NULL, \
+         started_at_epoch_ms = NULL, updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}"
+    )
+}
+
+/// Which rows have timed out: unsettled, with a deadline the database's clock has passed.
+///
+/// The database's clock, so every executor deciding on the same rows agrees on when a deadline has
+/// passed; with process clocks, the executor whose clock ran fastest would decide for all of them.
+/// This is the one place that choice is made. The statuses are spelled into the SQL, not bound:
+/// with a bound list a generic plan cannot prove the partial deadline index's predicate (migration
+/// 122), and the sweep would scan the table.
+fn timed_out_where_sql() -> String {
+    format!(
+        "status IN ({UNSETTLED}) AND workflow_deadline_epoch_ms IS NOT NULL \
+         AND workflow_deadline_epoch_ms <= {NOW_MS_SQL}"
+    )
+}
+
 /// The timeout sweep's statement, against `workflow_table`: `$1` is the application name or NULL
 /// for every application, `$2` the batch limit.
-///
-/// The statuses are spelled into the SQL, not bound: with a bound list a generic plan cannot prove
-/// the partial deadline index's predicate (migration 122), and the sweep would scan the table.
-///
-/// Deadlines are compared against the database's clock, so every executor sweeping an
-/// application's rows agrees on when a deadline has passed; with process clocks, the executor whose
-/// clock ran fastest would decide for all of them. Which clock should decide a timeout is still an
-/// open question across the SDKs, and this is the one place to change it.
 fn timed_out_sweep_sql(workflow_table: &str) -> String {
     format!(
-        "UPDATE {workflow_table} SET status = 'CANCELLED', owner_xid = NULL, \
-         queue_name = NULL, deduplication_id = NULL, started_at_epoch_ms = NULL, \
-         updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
+        "UPDATE {workflow_table} SET {set} \
          WHERE workflow_uuid IN ( \
            SELECT workflow_uuid FROM {workflow_table} \
-           WHERE status IN ({UNSETTLED}) \
-             AND workflow_deadline_epoch_ms IS NOT NULL \
-             AND workflow_deadline_epoch_ms <= {NOW_MS_SQL} \
+           WHERE {timed_out} \
              AND ($1::text IS NULL OR application_name = $1 OR application_name IS NULL) \
            ORDER BY workflow_deadline_epoch_ms \
            LIMIT $2 \
            FOR UPDATE SKIP LOCKED) \
-         RETURNING workflow_uuid"
+         RETURNING workflow_uuid",
+        set = timed_out_set_sql(),
+        timed_out = timed_out_where_sql(),
     )
 }
 
@@ -3921,6 +3933,24 @@ impl SystemDatabase for PostgresSystemDatabase {
             .fetch_all(pool)
             .await?;
             Ok(ids)
+        })
+        .await
+    }
+
+    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error> {
+        let workflow_table = &self.tables.workflow_status;
+        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
+        with_retry(&self.retry, "cancel_if_timed_out", move || async move {
+            let moved = sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {workflow_table} SET {set} WHERE workflow_uuid = $1 AND {timed_out}",
+                set = timed_out_set_sql(),
+                timed_out = timed_out_where_sql(),
+            )))
+            .bind(workflow_id)
+            .execute(pool)
+            .await?
+            .rows_affected();
+            Ok(moved > 0)
         })
         .await
     }
@@ -8080,9 +8110,14 @@ mod tests {
     /// Finished workflows keep their past deadlines, so the planner expects many rows to match the
     /// deadline alone; the index's status predicate is what keeps the sweep off them. A batch
     /// smaller than that tempts the planner into a scan that stops early, and deadlines that don't
-    /// follow the heap's order make index fetches look costly, so both are set up here. The plan
-    /// is checked both as the sweep's first executions see it, with the values, and as a generic
-    /// plan, without them, where only the literal statuses let the planner prove the predicate.
+    /// follow the heap's order make index fetches look costly, so both are set up here.
+    ///
+    /// The plan with the values bound, as the sweep's executions are planned, must use the index
+    /// and scan nothing. The generic plan (`EXPLAIN (GENERIC_PLAN)`, Postgres 16 and later) must
+    /// still reach the expired rows through the index: with no values, only the literal statuses
+    /// let the planner prove the index's predicate. It isn't held to no scan: with the batch
+    /// limit unknown, the planner may join the chosen ids back to this small table by scanning it,
+    /// a plan that costs more than the custom one on any table large enough to matter.
     #[tokio::test]
     async fn the_timeout_sweep_plans_through_the_deadline_index() {
         let db = dbos_test_support::test_database().await;
@@ -8110,32 +8145,40 @@ mod tests {
             .await
             .unwrap();
 
-        let mut conn = pool.acquire().await.unwrap();
-        for setting in ["auto", "force_generic_plan"] {
-            sqlx::query(AssertSqlSafe(format!("SET plan_cache_mode = {setting}")))
-                .execute(&mut *conn)
-                .await
-                .unwrap();
-            let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "EXPLAIN {}",
-                timed_out_sweep_sql(table)
-            )))
-            .bind(None::<&str>)
-            .bind(10_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .expect("EXPLAIN failed");
+        // Bound values are folded into the plan, so this is the custom plan.
+        let custom: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "EXPLAIN {}",
+            timed_out_sweep_sql(table)
+        )))
+        .bind(None::<&str>)
+        .bind(10_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("EXPLAIN failed");
+        // A generic plan keeps `$1` and `$2` as placeholders, so it is sent unprepared.
+        let generic: Vec<String> = sqlx::raw_sql(AssertSqlSafe(format!(
+            "EXPLAIN (GENERIC_PLAN) {}",
+            timed_out_sweep_sql(table)
+        )))
+        .fetch_all(&pool)
+        .await
+        .expect("EXPLAIN (GENERIC_PLAN) failed")
+        .iter()
+        .map(|row| sqlx::Row::get::<String, _>(row, 0))
+        .collect();
+        for (kind, plan) in [("custom", &custom), ("generic", &generic)] {
             let plan = plan.join("\n");
             assert!(
                 plan.contains("idx_workflow_status_deadline"),
-                "{setting}: {plan}"
+                "{kind}: {plan}"
             );
             assert!(
                 plan.lines().any(|line| line.contains("Index Cond")
                     && line.contains("workflow_deadline_epoch_ms")),
-                "{setting}: the deadline is an index condition: {plan}"
+                "{kind}: the deadline is an index condition: {plan}"
             );
-            assert!(!plan.contains("Seq Scan"), "{setting}: {plan}");
         }
+        let custom = custom.join("\n");
+        assert!(!custom.contains("Seq Scan"), "custom: {custom}");
     }
 }
