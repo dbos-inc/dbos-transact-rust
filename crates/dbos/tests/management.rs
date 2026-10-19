@@ -431,7 +431,9 @@ async fn forking_from_a_chosen_step_replays_the_steps_below_it() {
 /// runs again.
 ///
 /// Without the map, or with a map naming a child the parent never started, the same fork waits
-/// on the original child and fails with it. The client's fork takes the map too.
+/// on the original child and fails with it. The client's fork takes the map too, and `fork_all`
+/// applies it to every fork in the batch. A map naming a child twice, or holding an empty id, is
+/// refused.
 #[tokio::test]
 async fn a_fork_adopts_the_replacement_for_a_failed_child() {
     let db = test_database().await;
@@ -491,6 +493,20 @@ async fn a_fork_adopts_the_replacement_for_a_failed_child() {
         .await
         .expect_err("the child fails the parent");
     assert_eq!(child_runs.load(Ordering::SeqCst), 1);
+    // A second parent, whose child fails the same way, for `fork_all` below.
+    let other_id = "replace-other-parent";
+    let other_child = "replace-other-parent-1";
+    parent
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(other_id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the child fails the parent");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 2);
 
     broken.store(false, Ordering::SeqCst);
     let replacement = dbos
@@ -508,7 +524,7 @@ async fn a_fork_adopts_the_replacement_for_a_failed_child() {
         replacement.result().await.expect("the replacement failed"),
         42
     );
-    assert_eq!(child_runs.load(Ordering::SeqCst), 2);
+    assert_eq!(child_runs.load(Ordering::SeqCst), 3);
 
     let map = [(original_child, "replacement-child")];
     let adopted = dbos
@@ -543,8 +559,76 @@ async fn a_fork_adopts_the_replacement_for_a_failed_child() {
         .expect("fork failed");
     assert_eq!(by_client.result().await.expect("the fork failed"), 43);
 
-    assert_eq!(before_runs.load(Ordering::SeqCst), 1, "step 0 ran again");
-    assert_eq!(child_runs.load(Ordering::SeqCst), 2, "a child ran again");
+    // One map for the whole batch: each parent adopts the replacement for its own child.
+    let both = [
+        (original_child, "replacement-child"),
+        (other_child, "replacement-child"),
+    ];
+    let batch = dbos
+        .fork_all::<u32, EngineOnly>(
+            &[id, other_id],
+            2,
+            ForkOptions {
+                replacement_children: &both,
+                ..ForkOptions::default()
+            },
+        )
+        .await
+        .expect("fork_all failed");
+    assert_eq!(batch.len(), 2);
+    for fork in batch {
+        assert_eq!(fork.result().await.expect("a fork in the batch failed"), 43);
+    }
+
+    assert_eq!(before_runs.load(Ordering::SeqCst), 2, "step 0 ran again");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 3, "a child ran again");
+
+    // A child named twice, or an empty id on either side, is refused before anything is forked.
+    let twice = [
+        (original_child, "replacement-child"),
+        (original_child, "replace-other-parent-1"),
+    ];
+    let no_original = [("", "replacement-child")];
+    let no_replacement = [(original_child, "")];
+    for replacement_children in [&twice[..], &no_original[..], &no_replacement[..]] {
+        let options = || ForkOptions {
+            forked_id: Some("refused-fork"),
+            replacement_children,
+            ..ForkOptions::default()
+        };
+        let refused = |result: dbos::Result<_>| {
+            matches!(
+                result,
+                Err(Error::SystemDatabase(dbos::sysdb::Error::InvalidInput { ref field, .. }))
+                    if field == "replacement_children"
+            )
+        };
+        assert!(
+            refused(
+                dbos.fork_with::<u32, EngineOnly>(id, 2, options())
+                    .await
+                    .map(drop)
+            ),
+            "{replacement_children:?}"
+        );
+        assert!(
+            refused(
+                client
+                    .fork_with::<u32, EngineOnly>(id, 2, options())
+                    .await
+                    .map(drop)
+            ),
+            "{replacement_children:?}"
+        );
+    }
+    assert!(
+        client
+            .workflow_status("refused-fork")
+            .await
+            .expect("status read failed")
+            .is_none(),
+        "a refused fork was written"
+    );
 
     // Without the map, and with a map naming a child that was never started, the fork waits on
     // the original child and fails with it.
@@ -567,7 +651,7 @@ async fn a_fork_adopts_the_replacement_for_a_failed_child() {
             .expect_err("the original child's failure");
         assert!(error.to_string().contains("broken"), "{error}");
     }
-    assert_eq!(child_runs.load(Ordering::SeqCst), 2, "a child ran again");
+    assert_eq!(child_runs.load(Ordering::SeqCst), 3, "a child ran again");
 
     client.close().await;
     dbos.shutdown().await;

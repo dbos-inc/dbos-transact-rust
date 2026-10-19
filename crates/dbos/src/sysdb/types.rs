@@ -2278,11 +2278,18 @@ impl ForkOptions<'_> {
         // TypeScript build a `CASE` instead, which silently takes the first match — but two
         // replacements for one child is a caller that does not know which it wants, and picking
         // for them is worse than saying so.
-        for (index, (original, _)) in self.replacement_children.iter().enumerate() {
+        for (index, (original, replacement)) in self.replacement_children.iter().enumerate() {
             if original.is_empty() {
                 return Err(Error::InvalidInput {
                     field: "replacement_children".into(),
                     detail: "a replaced child id must not be empty".to_owned(),
+                });
+            }
+            // A fork rewritten to wait on `""` waits on a workflow that can never exist.
+            if replacement.is_empty() {
+                return Err(Error::InvalidInput {
+                    field: "replacement_children".into(),
+                    detail: format!("the replacement for {original} must not be empty"),
                 });
             }
             if self.replacement_children[..index]
