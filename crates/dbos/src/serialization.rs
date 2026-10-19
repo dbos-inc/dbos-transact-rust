@@ -1689,6 +1689,24 @@ mod tests {
                 self.0.total_cmp(&other.0)
             }
         }
+        #[derive(Debug, Clone, Copy, Deserialize)]
+        struct Key32(f32);
+        impl PartialEq for Key32 {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.total_cmp(&other.0).is_eq()
+            }
+        }
+        impl Eq for Key32 {}
+        impl PartialOrd for Key32 {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Key32 {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.total_cmp(&other.0)
+            }
+        }
         let keyed = BTreeMap::from([(Key(1.5), 7u32), (Key(-2.0), 8)]);
         let (text, back) = round_trip(&keyed);
         assert_eq!(text, r#"{"-2.0":8,"1.5":7}"#);
@@ -1698,6 +1716,31 @@ mod tests {
                 .unwrap(),
             2.5
         );
+
+        // A finite `f32` reads back as `serde_json` reads it, whichever of its float features are
+        // on. Parsed as an `f64` and narrowed, both of these round to a different `f32` when
+        // `float_roundtrip` is on; the first is how `serde_json` writes an `f32`.
+        for text in ["7.038531e-26", "1.0000000596046448"] {
+            let read =
+                decode::<f32, EngineOnly>(Some(text), &PayloadEncoding::Native, "result").unwrap();
+            assert_eq!(
+                read.to_bits(),
+                serde_json::from_str::<f32>(text).unwrap().to_bits(),
+                "{text}"
+            );
+            let key = format!(r#"{{"{text}":1}}"#);
+            let keyed = decode::<BTreeMap<Key32, u32>, EngineOnly>(
+                Some(&key),
+                &PayloadEncoding::Native,
+                "result",
+            )
+            .unwrap();
+            assert_eq!(
+                keyed.keys().next().unwrap().0.to_bits(),
+                read.to_bits(),
+                "{key}"
+            );
+        }
 
         // A portable error's fields go through a `Value`, which can't hold a non-finite float.
         #[derive(Debug, thiserror::Error, Serialize, Deserialize)]

@@ -18,16 +18,16 @@
 //!   non-finite float either.
 //!
 //! **How a float request is answered.** `serde_json` refuses a string where a float is asked for,
-//! so [`Lenient`] asks for whatever is there instead (`deserialize_any`) and decides itself. That
-//! changes three things beyond reading the names:
+//! so [`Lenient`] asks for whatever is there instead and decides itself: `deserialize_any` for an
+//! `f64`, and the value's raw text for an `f32`, whose number `serde_json` then parses as an `f32`
+//! exactly as it would have. That changes two things beyond reading the names:
 //!
 //! - A map key is always a string in JSON, so a float key is read as the number its text spells,
 //!   as `serde_json` reads one. So is any other string that spells a number where a float is
 //!   asked for, which `serde_json` would refuse.
 //! - With `serde_json`'s `arbitrary_precision` feature, which any crate in an application can turn
-//!   on, a number arrives as a map holding its text; it is read through [`serde_json::Number`].
-//! - An `f32` is parsed as an `f64` and narrowed, as `serde_json` does unless its `float_roundtrip`
-//!   feature is on.
+//!   on, a number asked for as an `f64` arrives as a map holding its text; it is read through
+//!   [`serde_json::Number`].
 //!
 //! **What doesn't read a name back as a float:** a target that buffers its input before deciding
 //! what it is — an untagged, internally tagged or adjacently tagged enum, a `#[serde(flatten)]`
@@ -39,6 +39,7 @@ use std::fmt::{self, Display};
 use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, DeserializeSeed, Deserializer, Visitor};
 use serde::ser::{self, Serialize, Serializer};
+use serde_json::value::RawValue;
 
 /// How the native encoding writes `f64::NAN` (and `f32::NAN`).
 pub(super) const NAN: &str = "NaN";
@@ -496,11 +497,37 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Lenient<D> {
         deserialize_ignored_any,
     );
 
+    /// An `f32` is read from the value's text rather than through `deserialize_any`, which would
+    /// parse a number as an `f64` and narrow it: with `serde_json`'s `float_roundtrip` feature on,
+    /// that rounds some numbers to a different `f32` than `serde_json` reads them as.
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
-        self.0.deserialize_any(FloatVisitor {
-            inner: visitor,
-            asked_for: FloatType::F32,
-        })
+        let raw = Box::<RawValue>::deserialize(self.0)?;
+        let text = raw.get();
+        match text.as_bytes().first() {
+            Some(b'"') => {
+                let string = serde_json::from_str::<String>(text).map_err(de::Error::custom)?;
+                FloatVisitor {
+                    inner: visitor,
+                    asked_for: FloatType::F32,
+                }
+                .visit_str(&string)
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                visitor.visit_f32(serde_json::from_str::<f32>(text).map_err(de::Error::custom)?)
+            }
+            // What `serde_json` reports for anything else where a float is asked for.
+            Some(b'n') => Err(de::Error::invalid_type(de::Unexpected::Unit, &visitor)),
+            Some(b't') => Err(de::Error::invalid_type(
+                de::Unexpected::Bool(true),
+                &visitor,
+            )),
+            Some(b'f') => Err(de::Error::invalid_type(
+                de::Unexpected::Bool(false),
+                &visitor,
+            )),
+            Some(b'[') => Err(de::Error::invalid_type(de::Unexpected::Seq, &visitor)),
+            _ => Err(de::Error::invalid_type(de::Unexpected::Map, &visitor)),
+        }
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
@@ -643,7 +670,7 @@ impl<V> FloatVisitor<V> {
         V: Visitor<'de>,
     {
         match self.asked_for {
-            // Narrowed only as `serde_json` narrows an `f64` it parsed for an `f32` request.
+            // Exact: an `f32` request reaches here only with a name or a key parsed as an `f32`.
             FloatType::F32 => self.inner.visit_f32(float as f32),
             FloatType::F64 => self.inner.visit_f64(float),
         }
