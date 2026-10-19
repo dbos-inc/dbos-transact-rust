@@ -90,8 +90,8 @@ use super::types::{
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
     Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_recorded, duration_from_ms,
-    duration_from_secs, encode_recorded, is_valid_application_name, validate_attributes,
+    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -753,7 +753,7 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     } = caller;
     tracing::debug!(workflow_id, step_id, step_name, "replaying a step");
     if let Some(recorded) = step.error.as_deref() {
-        return Err(decode_recorded(
+        return Err(decode_step_value(
             step, recorded, caller, step_name, "an error",
         )?);
     }
@@ -762,7 +762,7 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
             "workflow {workflow_id} step {step_id} ({step_name}) has no recorded output"
         ))
     })?;
-    decode_recorded(step, recorded, caller, step_name, "an output")
+    decode_step_value(step, recorded, caller, step_name, "an output")
 }
 
 impl PostgresSystemDatabase {
@@ -929,7 +929,7 @@ impl PostgresSystemDatabase {
         value: &T,
         started_at: Timestamp,
     ) -> Result<(), Error> {
-        let recorded = encode_recorded(value, caller.codec, "an output")?;
+        let recorded = encode_step_value(value, caller.codec, "an output")?;
         self.record_step_on(
             conn,
             caller.workflow_id,
@@ -998,7 +998,7 @@ impl PostgresSystemDatabase {
         // the encoding failure is what the caller sees — not a recordable answer, so the step runs
         // again rather than the workflow failing with a reply nothing recorded. The error itself
         // is logged, since the one returned no longer carries it.
-        let recorded = match encode_recorded(&error, codec, "an error") {
+        let recorded = match encode_step_value(&error, codec, "an error") {
             Ok(recorded) => recorded,
             Err(encode_error) => {
                 tracing::warn!(

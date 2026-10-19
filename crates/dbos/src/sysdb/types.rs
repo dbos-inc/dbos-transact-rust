@@ -1952,14 +1952,14 @@ pub trait StepCodec: Send + Sync + fmt::Debug {
 
 /// Encodes a value to record as a step's output or error, through the caller's codec. `what` names
 /// the value for the failure message: `an output` or `an error`. The reverse of
-/// [`decode_recorded`].
+/// [`decode_step_value`].
 ///
 /// Every writer of a recorded step value goes through here, so a replay reads them all back the
 /// same way. `serde_json` fails only on a type that cannot be JSON, such as a non-string map key,
 /// and turns a non-finite float into `null` without failing, so a value here must hold none; every
 /// value this takes is one of the engine's own plain records or an [`Error`]. The codec can fail
 /// too, since a custom serializer may fail for its own reasons.
-pub(crate) fn encode_recorded<T: serde::Serialize + ?Sized>(
+pub(crate) fn encode_step_value<T: serde::Serialize + ?Sized>(
     value: &T,
     codec: &dyn StepCodec,
     what: &str,
@@ -1979,7 +1979,7 @@ pub(crate) fn encode_recorded<T: serde::Serialize + ?Sized>(
 ///   only the tag. The step that holds it is logged instead.
 /// - [`Error::Malformed`] gets the step in its message.
 /// - Any other error, such as one a custom serializer's decode returns, is returned unchanged.
-pub(crate) fn decode_recorded<T: serde::de::DeserializeOwned>(
+pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
     step: &StepRecord,
     recorded: &str,
     caller: StepCaller<'_>,
