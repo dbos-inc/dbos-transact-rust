@@ -236,7 +236,9 @@ pub struct RunOptions<'a> {
     /// wall-clock deadline stored on the row, so it survives a crash: a workflow recovered with
     /// two minutes left has two minutes, not the whole budget again. On expiry the row goes
     /// `CANCELLED` and callers awaiting it get [`Error::WorkflowCancelled`], which is what all four
-    /// references do.
+    /// references do. Every executor of the application sweeps for expired deadlines, so the row is
+    /// cancelled whether or not anything is running it: a queued workflow nobody has dequeued, or
+    /// one whose executor died, times out too.
     ///
     /// A step's [`timeout`](crate::StepOptions::timeout) bounds one attempt and is recorded as a
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
@@ -1937,21 +1939,24 @@ pub(crate) fn spawn_execution(
     )
 }
 
-/// Runs `body` until it finishes or its deadline passes, cancelling it durably if the deadline wins.
+/// Runs `body` until it finishes or its deadline passes, and when the deadline wins, waits for the
+/// row to settle.
 ///
-/// **This is the engine's only durable-cancellation path, and shutdown deliberately does not go
-/// through it.** Go #426 had to fix exactly that confusion: its shutdown cancelled a context, the
-/// context fired the durable cancel hook, and workflows that should have stayed `PENDING` for
-/// recovery were written `CANCELLED` — inverting what shutdown means. Here the two use different
-/// mechanisms rather than a shared hook. A deadline is a branch of this `select!` that writes
-/// `CANCELLED` before returning; shutdown aborts the task outright, so no code of ours runs, no
-/// row is written, and the workflow is recovered. There is no cause to inspect because there is no
-/// single hook both reach, which is why this carries no cancellation-cause enum.
+/// **The local timer stops the body; it doesn't record the timeout.** The workflow-timeout sweep
+/// is what writes `CANCELLED` (see the `timeout_sweep` module), so one clock, the database's,
+/// decides when every deadline has passed, wherever the workflow runs. The timer is still needed:
+/// it is what interrupts a body blocked outside any step, which no durable check would reach. Once
+/// it fires, the body is dropped and this waits on the row, which the sweep cancels within its
+/// interval. If another execution recorded an outcome first, that outcome is what comes back.
+///
+/// **Shutdown deliberately doesn't go through here.** It aborts the task outright, so no code of
+/// ours runs and no row is written, and the workflow is recovered. The deadline and shutdown use
+/// different mechanisms rather than a shared hook, so there is no cancellation cause to inspect.
 ///
 /// The deadline is an *instant* rather than a budget, and that is what makes it survive a crash: a
 /// workflow recovered with two minutes left waits two minutes, not the whole timeout again. A
-/// deadline already in the past yields a zero wait and cancels at once, which is the correct
-/// reading of a workflow recovered after its expiry.
+/// deadline already in the past yields a zero wait, and the run goes straight to waiting for the
+/// sweep, which is the correct reading of a workflow recovered after its expiry.
 async fn run_until_deadline<F>(
     executor: &Executor,
     workflow_id: &str,
@@ -1974,7 +1979,12 @@ where
         biased;
         outcome = body => Ended::Body(outcome),
         () = tokio::time::sleep(remaining) => {
-            Ended::Terminal(cancel_at_deadline(executor, workflow_id).await)
+            tracing::info!(
+                workflow_id,
+                "the workflow exceeded its deadline; waiting for it to be cancelled"
+            );
+            // This execution read the row to run it, so an absence now is a delete, not a race.
+            Ended::Terminal(executor.connection().adopt(workflow_id, true).await)
         }
     }
 }
@@ -1983,64 +1993,10 @@ where
 enum Ended {
     /// The body ran to a conclusion. That conclusion is this execution's outcome and is written.
     Body(std::result::Result<EncodedOutput, Failure>),
-    /// The deadline fired and the row is already terminal — cancelled here, or finished by another
-    /// execution while this one was working. What it holds is the answer; nothing more is written.
+    /// The deadline fired and the row has settled: cancelled by the timeout sweep, or finished by
+    /// another execution while this one was working. What it holds is the answer; nothing more is
+    /// written.
     Terminal(std::result::Result<EncodedOutput, Failure>),
-}
-
-/// Cancels a workflow whose deadline has passed, and settles on what the row ends up holding.
-///
-/// **`cancel_workflows` reports which ids actually moved, and that is the whole reason to read
-/// it.** `cancel_batch` leaves a workflow that has already finished alone, so an empty result here
-/// means a rival execution recorded an outcome first — recovery after this process was presumed
-/// dead, or another SDK sharing the system database. That outcome is the workflow's, and this
-/// caller must be told the same thing every other caller reads, not a cancellation that the row
-/// does not record and that `handle.status()` would immediately contradict.
-async fn cancel_at_deadline(
-    executor: &Executor,
-    workflow_id: &str,
-) -> std::result::Result<EncodedOutput, Failure> {
-    let cancelled = || {
-        Err(Failure::Control(Error::WorkflowCancelled {
-            workflow_id: workflow_id.to_owned(),
-        }))
-    };
-    tracing::info!(
-        workflow_id,
-        "the workflow exceeded its deadline and is cancelled"
-    );
-    // Durable, unlike every other stop this engine performs. Failing to write it is not fatal —
-    // the row stays PENDING and is recovered, where the expired deadline is read again and cancels
-    // immediately — so this logs rather than propagating, and still reports the cancellation it
-    // was unable to record.
-    // No caller, though this cancels a workflow that is running right here: the checkpoint
-    // argument records the cancel as a *step of the workflow that asked for it*, and the engine is
-    // not one. Spending a step id from this workflow's own counter would shift every step after it
-    // onto the wrong replay slot.
-    match executor
-        .sysdb()
-        .cancel_workflows(&[workflow_id], false, None)
-        .await
-    {
-        Ok(moved) if moved.iter().any(|id| id == workflow_id) => cancelled(),
-        Ok(_) => {
-            tracing::warn!(
-                workflow_id,
-                "the deadline fired on a workflow another execution had already finished; its \
-                 recorded outcome stands"
-            );
-            // The cancel just read this row, so an absence now is a delete, not a race.
-            executor.connection().adopt(workflow_id, true).await
-        }
-        Err(error) => {
-            tracing::error!(
-                workflow_id,
-                %error,
-                "could not record the deadline cancellation; the row stays PENDING for recovery"
-            );
-            cancelled()
-        }
-    }
 }
 
 /// Runs the body with a context ambient and records what it did.

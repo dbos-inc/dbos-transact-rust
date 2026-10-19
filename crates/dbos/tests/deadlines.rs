@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::{Outcome, WorkflowStatus};
+use dbos::sysdb::types::{NewWorkflow, Outcome, Submission, Timestamp, WorkflowStatus};
 use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
 
-use dbos_test_support::{TestDatabase, test_database};
+use dbos_test_support::{Backend, TestDatabase, test_database};
 
 /// The version every instance in this file launches with: DBOS computes none, so a launch without
 /// one fails — and sharing it is what lets a relaunch recover what the previous launch left.
@@ -305,5 +305,175 @@ async fn a_deadline_that_loses_to_a_recorded_outcome_reports_that_outcome() {
         "the deadline overwrote a terminal row"
     );
 
+    dbos.shutdown().await;
+}
+
+/// A configuration for a test that waits on the timeout sweep, which then runs every 100
+/// milliseconds rather than every second. The interval is process-wide, so every launch in this
+/// binary from then on sweeps that often, which only makes the other tests' timeouts land sooner.
+fn sweeping_config(app_name: &str, db: &TestDatabase) -> Config {
+    dbos::__private::set_workflow_timeout_sweep_interval(Duration::from_millis(100));
+    config(app_name, db)
+}
+
+/// A system database handle that writes rows as `app_name` does, for rows no workflow of this
+/// process will run.
+async fn writer(db: &TestDatabase, app_name: &'static str) -> PostgresSystemDatabase {
+    PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings {
+            application_name: Some(app_name),
+            ..Settings::default()
+        },
+    )
+}
+
+/// Inserts an unsettled workflow whose deadline is long past, owned by an executor that isn't
+/// running, and queued on `queue` when one is given.
+async fn insert_expired(sys: &PostgresSystemDatabase, id: &str, queue: Option<&str>) {
+    sys.init_workflow(
+        &NewWorkflow {
+            name: Some("never-registered"),
+            executor_id: Some("dead-executor"),
+            queue_name: queue,
+            deadline: Some(Timestamp::from_epoch_ms(1_000)),
+            ..NewWorkflow::new(id)
+        },
+        None,
+        Submission::Fresh,
+        None,
+    )
+    .await
+    .expect("insert failed");
+}
+
+/// Waits up to five seconds for `id` to reach `status`, and says what it held if it never does.
+async fn wait_for_status(reader: &PostgresSystemDatabase, id: &str, status: WorkflowStatus) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = reader.get_workflow(id).await.unwrap().expect("row missing");
+        if row.status == status {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{id} is still {} rather than {status}",
+            row.status
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// **The sweep cancels an expired workflow nobody is running**: one queued where no worker
+/// polls, and a `PENDING` one whose executor is gone. Another application's is left alone.
+#[tokio::test]
+async fn the_sweep_cancels_expired_workflows_nobody_is_running() {
+    let db = test_database().await;
+    let dbos = DBOS::new(sweeping_config("sweep-app", &db));
+    dbos.launch().await.expect("launch failed");
+
+    let ours = writer(&db, "sweep-app").await;
+    insert_expired(&ours, "queued-nowhere", Some("unpolled-queue")).await;
+    insert_expired(&ours, "orphaned", None).await;
+    insert_expired(&writer(&db, "another-app").await, "not-ours", None).await;
+
+    let reader = reader(&db).await;
+    for id in ["queued-nowhere", "orphaned"] {
+        wait_for_status(&reader, id, WorkflowStatus::Cancelled).await;
+    }
+    let queued = reader
+        .get_workflow("queued-nowhere")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        queued.queue_name, None,
+        "a cancelled workflow leaves its queue"
+    );
+    assert_eq!(
+        reader
+            .get_workflow("not-ours")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Pending,
+        "another application's workflow is its own sweep's to cancel"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A failed pass doesn't stop the sweep.** Passes fail while the deadline column is renamed
+/// away; once it is back, the next pass cancels as before.
+#[tokio::test]
+async fn a_failed_sweep_pass_does_not_stop_the_sweep() {
+    let db = test_database().await;
+    if db.backend() == Backend::Cockroach {
+        // CockroachDB won't rename a column a SQL function (`enqueue_workflow`) depends on, and
+        // what this checks is the loop, which is the same on both backends.
+        return;
+    }
+    let dbos = DBOS::new(sweeping_config("sweep-failure-app", &db));
+    dbos.launch().await.expect("launch failed");
+
+    let pool = db.pool().await;
+    let rename = |from: &'static str, to: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                r#"ALTER TABLE "dbos"."workflow_status" RENAME COLUMN {from} TO {to}"#
+            )))
+            .execute(&pool)
+            .await
+            .expect("rename failed");
+        }
+    };
+    rename("workflow_deadline_epoch_ms", "deadline_hidden").await;
+    // Several passes' worth, every one of which fails.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    rename("deadline_hidden", "workflow_deadline_epoch_ms").await;
+
+    insert_expired(
+        &writer(&db, "sweep-failure-app").await,
+        "after-the-failure",
+        None,
+    )
+    .await;
+    wait_for_status(
+        &reader(&db).await,
+        "after-the-failure",
+        WorkflowStatus::Cancelled,
+    )
+    .await;
+
+    dbos.shutdown().await;
+}
+
+/// **The sweep stops at shutdown, and a relaunch starts a fresh one.**
+#[tokio::test]
+async fn the_sweep_stops_at_shutdown_and_restarts_on_relaunch() {
+    let db = test_database().await;
+    let dbos = DBOS::new(sweeping_config("sweep-relaunch-app", &db));
+    dbos.launch().await.expect("launch failed");
+    dbos.shutdown().await;
+
+    insert_expired(&writer(&db, "sweep-relaunch-app").await, "while-down", None).await;
+    // Several passes' worth, none of which runs.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow("while-down")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Pending,
+        "nothing sweeps once the executor is shut down"
+    );
+
+    dbos.launch().await.expect("relaunch failed");
+    wait_for_status(&reader, "while-down", WorkflowStatus::Cancelled).await;
     dbos.shutdown().await;
 }

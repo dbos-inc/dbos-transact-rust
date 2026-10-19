@@ -370,6 +370,9 @@ impl DBOS {
         // never taken. Sharing a backlog is what a fleet of one application does; reaching into
         // another's would be the same redirection that makes registering over its queue name an
         // error.
+        // Every executor sweeps every deadline of its application, so a workflow nobody is running
+        // still times out.
+        crate::timeout_sweep::spawn(Arc::clone(&executor));
         crate::dequeue::spawn(executor);
         Ok(())
     }

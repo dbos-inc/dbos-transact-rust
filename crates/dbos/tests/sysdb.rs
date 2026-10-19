@@ -11953,3 +11953,174 @@ async fn a_bounce_writes_the_inputs_to_the_payload_table() {
     assert_eq!(stored.as_deref(), Some("\"later\""));
     assert_eq!(legacy_payloads(&pool, "wf-held").await.0, None);
 }
+
+/// **The timeout sweep cancels every expired unsettled workflow of its application, whoever runs
+/// it, and nothing else.**
+///
+/// The rows it must reach are the ones nothing else would time out: a queued workflow no worker
+/// polls for, a delayed one whose release is still ahead, and a `PENDING` one whose executor died,
+/// both claimed by this application and unclaimed. The rows it must leave are another
+/// application's, an unexpired one, one with no deadline, and a finished one.
+#[tokio::test]
+async fn the_timeout_sweep_cancels_expired_workflows_nobody_is_running() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: Option<&'static str>| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: name,
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta, anonymous) = (named(Some("alpha")), named(Some("beta")), named(None));
+    let expired = Some(Timestamp::from_epoch_ms(1_000));
+    let unexpired = Some(Timestamp::from_epoch_ms(i64::MAX / 2));
+
+    let rows: [(&PostgresSystemDatabase, NewWorkflow); 8] = [
+        (
+            &alpha,
+            NewWorkflow {
+                queue_name: Some("unpolled"),
+                deadline: expired,
+                ..workflow("wf-queued")
+            },
+        ),
+        (
+            &alpha,
+            NewWorkflow {
+                queue_name: Some("unpolled"),
+                delay: Some(std::time::Duration::from_secs(3600)),
+                deadline: expired,
+                ..workflow("wf-delayed")
+            },
+        ),
+        (
+            &alpha,
+            NewWorkflow {
+                executor_id: Some("dead-executor"),
+                deadline: expired,
+                ..workflow("wf-orphan")
+            },
+        ),
+        (
+            &anonymous,
+            NewWorkflow {
+                executor_id: Some("dead-executor"),
+                deadline: expired,
+                ..workflow("wf-orphan-unclaimed")
+            },
+        ),
+        (
+            &beta,
+            NewWorkflow {
+                deadline: expired,
+                ..workflow("wf-peer")
+            },
+        ),
+        (
+            &alpha,
+            NewWorkflow {
+                deadline: unexpired,
+                ..workflow("wf-unexpired")
+            },
+        ),
+        (&alpha, workflow("wf-no-deadline")),
+        (
+            &alpha,
+            NewWorkflow {
+                deadline: expired,
+                ..workflow("wf-done")
+            },
+        ),
+    ];
+    for (sys, wf) in &rows {
+        sys.init_workflow(wf, None, Submission::Fresh, None)
+            .await
+            .unwrap();
+    }
+    alpha
+        .record_workflow_outcome("wf-done", Outcome::Output(Some("1")))
+        .await
+        .unwrap();
+    assert_eq!(
+        alpha
+            .get_workflow("wf-delayed")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Delayed
+    );
+
+    let mut cancelled = alpha.cancel_timed_out_workflows(1000).await.unwrap();
+    cancelled.sort();
+    assert_eq!(
+        cancelled,
+        [
+            "wf-delayed",
+            "wf-orphan",
+            "wf-orphan-unclaimed",
+            "wf-queued"
+        ]
+    );
+    for id in &cancelled {
+        let row = alpha.get_workflow(id).await.unwrap().unwrap();
+        assert_eq!(row.status, WorkflowStatus::Cancelled, "{id}");
+        assert_eq!(row.queue_name, None, "{id} leaves its queue");
+        assert_eq!(row.owner_xid, None, "{id} has no owner left");
+        assert!(row.completed_at.is_some(), "{id} is stamped complete");
+    }
+    for (id, status) in [
+        ("wf-peer", WorkflowStatus::Pending),
+        ("wf-unexpired", WorkflowStatus::Pending),
+        ("wf-no-deadline", WorkflowStatus::Pending),
+        ("wf-done", WorkflowStatus::Success),
+    ] {
+        assert_eq!(
+            alpha.get_workflow(id).await.unwrap().unwrap().status,
+            status,
+            "{id} is left alone"
+        );
+    }
+    assert!(
+        alpha
+            .cancel_timed_out_workflows(1000)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a second pass finds nothing"
+    );
+}
+
+/// The timeout sweep takes the oldest deadlines first, and no more than its limit in one pass.
+#[tokio::test]
+async fn the_timeout_sweep_takes_the_oldest_deadlines_first_up_to_its_limit() {
+    let (sys, _db) = sysdb().await;
+    for (id, deadline) in [
+        ("wf-third", 3_000),
+        ("wf-first", 1_000),
+        ("wf-second", 2_000),
+    ] {
+        sys.init_workflow(
+            &NewWorkflow {
+                deadline: Some(Timestamp::from_epoch_ms(deadline)),
+                ..workflow(id)
+            },
+            None,
+            Submission::Fresh,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut first = sys.cancel_timed_out_workflows(2).await.unwrap();
+    first.sort();
+    assert_eq!(first, ["wf-first", "wf-second"]);
+    assert_eq!(
+        sys.cancel_timed_out_workflows(2).await.unwrap(),
+        ["wf-third"]
+    );
+}

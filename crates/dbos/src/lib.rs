@@ -76,6 +76,8 @@ mod step;
 #[cfg(feature = "engine")]
 mod stream;
 #[cfg(feature = "engine")]
+mod timeout_sweep;
+#[cfg(feature = "engine")]
 mod wait;
 #[cfg(feature = "engine")]
 mod workflow;
@@ -291,6 +293,10 @@ pub use workflow::{
 /// The durable race itself is documented on [`select_step!`](crate::select_step); the reasoning
 /// behind what it records is in `select.rs`.
 ///
+/// It also holds `set_workflow_timeout_sweep_interval`, which this crate's tests use to make the
+/// workflow-timeout sweep run more often. It is here for the same reason: `pub` because a test
+/// binary is another crate, and not API.
+///
 /// Gated on `engine` rather than on `macros`, which is what actually reaches it: these are the
 /// only paths into the race's core, and without them an engine-only build has a module of `pub`
 /// items nothing can call.
@@ -300,4 +306,6 @@ pub mod __private {
     pub use crate::select::{
         Branches, Racing, Recording, check_select, control_error, record_select,
     };
+    // Not for a macro: the one knob tests need that applications shouldn't have.
+    pub use crate::timeout_sweep::set_interval as set_workflow_timeout_sweep_interval;
 }
