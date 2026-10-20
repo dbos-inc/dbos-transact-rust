@@ -2221,6 +2221,112 @@ async fn a_workflow_cannot_delete_an_ancestors_tree() {
     dbos.shutdown().await;
 }
 
+/// **A workflow can't cancel or resume itself, and is told so before anything runs.** Both
+/// would clear its own owner token, so its next write would be refused and it would wait for an
+/// outcome nobody computes. Refused, the workflow can catch the error and go on, and finishes.
+#[tokio::test]
+async fn a_workflow_cannot_cancel_or_resume_itself() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("self-cancel-app", &db));
+    let workflow = dbos
+        .register_workflow("self-targeting", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let cancelled = dbos
+                        .cancel(&own_id)
+                        .await
+                        .expect_err("the workflow cancelled itself")
+                        .to_string();
+                    let resumed = dbos
+                        .resume::<(), Error>(&own_id)
+                        .await
+                        .err()
+                        .expect("the workflow resumed itself")
+                        .to_string();
+                    Ok::<_, Error>((cancelled, resumed))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "targets-itself";
+    let (cancelled, resumed) = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    assert!(cancelled.contains("cannot cancel itself"), "{cancelled}");
+    assert!(resumed.contains("cannot resume itself"), "{resumed}");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
+/// **Nor cancel an ancestor's tree it is inside**, which reaches it through the cascade rather
+/// than by name.
+#[tokio::test]
+async fn a_workflow_cannot_cancel_an_ancestors_tree() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("ancestor-cancel-app", &db));
+    let child = dbos
+        .register_workflow("cancelling-child", {
+            let dbos = dbos.clone();
+            move |root: String| {
+                let dbos = dbos.clone();
+                async move {
+                    Ok::<_, Error>(
+                        dbos.cancel_all(&[&root], Children::Include)
+                            .await
+                            .expect_err("the child cancelled the tree it was in")
+                            .to_string(),
+                    )
+                }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("cancelled-parent", {
+            move |root: String| {
+                let child = child.clone();
+                async move { child.run(root).await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let root = "the-cancelled-ancestor";
+    let message = tokio::time::timeout(
+        Duration::from_secs(10),
+        parent.run_with(
+            root.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(root),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    assert!(message.contains("cannot cancel itself"), "{message}");
+    let row = reader(&db).await.get_workflow(root).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
 /// A management call through another instance, from inside a workflow, is refused.
 ///
 /// The third place [`Error::WrongInstance`] is reachable from, and it is here for the reason the
