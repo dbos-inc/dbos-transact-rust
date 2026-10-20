@@ -96,6 +96,11 @@ impl Connection {
             url: &config.database_url,
             max_connections: config.max_connections,
             use_listen_notify: config.use_listen_notify,
+            idle_transaction_timeout: Some(
+                config
+                    .idle_transaction_timeout
+                    .unwrap_or(postgres::DEFAULT_IDLE_TRANSACTION_TIMEOUT),
+            ),
             migrate: config.migrate,
             settings: postgres::Settings {
                 schema: &config.schema,
@@ -150,6 +155,11 @@ impl Connection {
             url: &config.database_url,
             max_connections: config.max_connections,
             use_listen_notify: config.use_listen_notify,
+            idle_transaction_timeout: Some(
+                config
+                    .idle_transaction_timeout
+                    .unwrap_or(postgres::DEFAULT_IDLE_TRANSACTION_TIMEOUT),
+            ),
             migrate: false,
             settings: postgres::Settings {
                 schema: &config.schema,
