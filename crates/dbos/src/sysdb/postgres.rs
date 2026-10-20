@@ -4777,13 +4777,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // would miss a message that landed in between, and a second receiver has to be refused
         // before it starts waiting rather than after it has waited out a timeout for a message it
         // was never going to get.
-        let mut subscription = self
-            .notify
-            .subscribe_exclusive(message_key(workflow_id, topic))
-            .ok_or_else(|| Error::ConcurrentRecv {
-                workflow_id: workflow_id.to_owned(),
-                topic: topic.map(str::to_owned),
-            })?;
+        // Shared, not exclusive: an execution whose workflow was handed to a new one may still be
+        // waiting here beside the new owner. Both wake, and the stale one's consume is refused by
+        // the owner check.
+        let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
         // sixty seconds and crashed has ten left rather than sixty.

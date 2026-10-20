@@ -2242,8 +2242,7 @@ async fn a_workflow_cannot_cancel_or_resume_itself() {
                     let resumed = dbos
                         .resume::<(), Error>(&own_id)
                         .await
-                        .err()
-                        .expect("the workflow resumed itself")
+                        .expect_err("the workflow resumed itself")
                         .to_string();
                     Ok::<_, Error>((cancelled, resumed))
                 }

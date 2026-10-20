@@ -45,22 +45,6 @@ pub enum Error {
         /// Which part disagreed, and how.
         detail: String,
     },
-    /// A second `recv` on a (workflow, topic) another is already waiting on.
-    ///
-    /// One message goes to one receiver, so a second waiter can only wait out its timeout and
-    /// report that nothing arrived — indistinguishable, to the workflow that sent it, from nothing
-    /// having been sent. Python and Go reject it too; both reuse their generic workflow-conflict
-    /// error, which this crate's [`ConflictingWorkflow`](Error::ConflictingWorkflow) is not — that
-    /// one says the workflow already exists, and here it existing is the premise.
-    ///
-    /// **In-process only.** Two receivers in different processes never meet, and are arbitrated at
-    /// the database instead, by the consuming `UPDATE` in `recv`.
-    ConcurrentRecv {
-        /// The workflow being received on, which is also the workflow calling.
-        workflow_id: String,
-        /// The topic, or `None` for the default one.
-        topic: Option<String>,
-    },
     /// A caller supplied a value the layer will not store.
     ///
     /// Distinct from [`Error::Malformed`], which is about values already *in* the database.
@@ -232,13 +216,6 @@ impl std::fmt::Display for Error {
                 workflow_id,
                 detail,
             } => write!(f, "workflow {workflow_id} already exists: {detail}"),
-            Error::ConcurrentRecv { workflow_id, topic } => match topic {
-                Some(topic) => write!(
-                    f,
-                    "workflow {workflow_id} is already receiving on topic {topic}"
-                ),
-                None => write!(f, "workflow {workflow_id} is already receiving"),
-            },
             Error::InvalidInput { field, detail } => write!(f, "invalid {field}: {detail}"),
             Error::QueueDeduplicated {
                 workflow_id,
@@ -365,7 +342,6 @@ impl Error {
     ///   data; a later build may read it, and a recorded failure would outlive the fix.
     /// - **Signals about the calling execution** — cancelled, superseded by a rival, or replaying
     ///   code that has changed — which end the run rather than answer the call.
-    /// - **A second in-process receiver**, which is about this process, not the database.
     ///
     /// Exhaustive, so a new variant has to be placed on one side or the other.
     pub(crate) fn should_record(&self) -> bool {
@@ -376,8 +352,7 @@ impl Error {
             | Error::WorkflowCancelled { .. }
             | Error::StepNondeterminism { .. }
             | Error::WorkflowConflict { .. }
-            | Error::UnexpectedStep { .. }
-            | Error::ConcurrentRecv { .. } => false,
+            | Error::UnexpectedStep { .. } => false,
             Error::ConflictingWorkflow { .. }
             | Error::InvalidInput { .. }
             | Error::QueueDeduplicated { .. }

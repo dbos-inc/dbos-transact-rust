@@ -4440,13 +4440,11 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
     );
 }
 
-/// A second receiver on one (workflow, topic) is refused rather than left to time out.
-///
-/// One message goes to one of them, so the loser would wait out its whole timeout and report that
-/// nothing arrived — which the sender cannot tell apart from not having sent. Python and Go refuse
-/// it too; TypeScript and Java allow it.
+/// **Two receivers on one (workflow, topic) in one process both wait**, and one message goes to
+/// one of them: the other times out with nothing. The case that produces two is a workflow handed
+/// to a new execution while the old one waits, where the old one's consume is refused anyway.
 #[tokio::test]
-async fn a_second_receiver_on_one_topic_is_refused() {
+async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
@@ -4456,50 +4454,37 @@ async fn a_second_receiver_on_one_topic_is_refused() {
         .await
         .unwrap();
 
-    let waiting = {
+    let first = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 20, None)
+                .await
+        })
+    };
+    let second = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 20, None)
                 .await
         })
     };
     tokio::time::sleep(BRIEFLY).await;
+    send_to_receiver(&sys, Some("orders"), "\"only\"").await;
 
-    // Bounded, because the regression is that it *waits*: a second receiver that is admitted
-    // rather than refused sits out its whole ten minutes for a message it was never going to get,
-    // which is exactly the behaviour being ruled out.
-    let err = tokio::time::timeout(
-        RECHECK * 10,
-        sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 600, None),
-    )
-    .await
-    .expect("a second receiver was admitted and left to wait rather than refused")
-    .expect_err("a second receiver on one topic is a bug in the caller, and is told so");
-    assert!(
-        matches!(
-            err,
-            Error::ConcurrentRecv { ref workflow_id, ref topic }
-                if workflow_id == "wf-receiver" && topic.as_deref() == Some("orders")
-        ),
-        "unexpected error: {err:?}",
+    let answers = [
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    ];
+    assert_eq!(
+        answers.iter().filter(|answer| answer.is_some()).count(),
+        1,
+        "one message, one receiver: {answers:?}"
     );
-
-    // Another topic on the same workflow is a different wait, and is not refused.
-    send_to_receiver(&sys, Some("refunds"), "\"other\"").await;
-    assert!(
-        sys.recv("wf-receiver", 4, 5, Some("refunds"), RECHECK * 600, None)
-            .await
-            .unwrap()
-            .is_some(),
-    );
-
-    waiting.abort();
 }
 
 /// Two receivers racing at the database consume one message between them, not two.
 ///
-/// **The cross-process case, which the in-process guard cannot see** — two handles have two
-/// registries, so both get past `subscribe_exclusive` exactly as two executors recovering one
+/// **The cross-process case** — two handles have two registries, as two executors recovering one
 /// workflow would. What arbitrates here is the database: the consuming `UPDATE` re-evaluates
 /// `consumed = FALSE` against the winner's committed row, and the losing transaction rolls back
 /// whatever it took when its step write conflicts. Two messages are queued so that a loser going
@@ -4527,7 +4512,7 @@ async fn a_second_receiver_on_one_topic_is_refused() {
 #[tokio::test]
 async fn two_receivers_cannot_take_the_same_message() {
     let db = test_database().await;
-    // Two handles over one pool: separate registries, so the in-process exclusivity does not apply
+    // Two handles over one pool: separate registries, as two processes would have,
     // and both reach the database — which is the situation this test is about.
     let first = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
@@ -12206,4 +12191,329 @@ async fn workflow_owner(sys: &PostgresSystemDatabase, workflow_id: &str) -> Opti
         .unwrap()
         .unwrap()
         .owner_xid
+}
+
+/// Whether `result` is the fence refusing `workflow_id`.
+fn refused<T: std::fmt::Debug>(result: Result<T, Error>, workflow_id: &str) -> bool {
+    matches!(result, Err(Error::WorkflowConflict { workflow_id: ref id }) if id == workflow_id)
+}
+
+/// **Every write a workflow makes is refused once its execution no longer owns it**, and writes
+/// nothing: steps, child starts and their records, sends (from the workflow and from inside a
+/// step), a consume, events, stream writes and closes, sleeps, a checkpointed management call and
+/// a checkpointed read. The current owner's token goes on writing.
+#[tokio::test]
+async fn a_stale_execution_writes_nothing() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    let id = "wf-stale";
+    sys.init_workflow(&workflow(id), None).await.unwrap();
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET owner_xid = 'current' WHERE workflow_uuid = $1"#,
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sys.init_workflow(&workflow("wf-mailbox"), None)
+        .await
+        .unwrap();
+    sys.init_workflow(&workflow("wf-bystander"), None)
+        .await
+        .unwrap();
+    // A message waiting for the stale execution's recv, which must stay unconsumed.
+    sys.send_message(
+        &Message {
+            destination_id: id,
+            topic: None,
+            message: "\"waiting\"",
+            idempotency_key: None,
+        },
+        Some("portable_json"),
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let stale = Some("stale");
+    let timing = Some(StepTiming {
+        started_at: Timestamp::now(),
+        completed_at: Timestamp::now(),
+    });
+    assert!(refused(
+        sys.record_step(
+            id,
+            0,
+            "step",
+            Outcome::Output(Some("1")),
+            None,
+            timing,
+            stale
+        )
+        .await,
+        id
+    ));
+    assert!(refused(
+        sys.record_child_result(
+            id,
+            1,
+            "wf-child",
+            Outcome::Output(Some("1")),
+            None,
+            timing,
+            stale
+        )
+        .await,
+        id
+    ));
+    assert!(refused(
+        sys.record_child_workflow(id, "wf-child", 2, "child", None, stale)
+            .await,
+        id
+    ));
+    assert!(refused(
+        sys.init_workflow(
+            &workflow("wf-child"),
+            Some(InitWorkflowCaller {
+                parent_workflow_id: id,
+                step_id: 3,
+                step_name: "child",
+                started_at: Timestamp::now(),
+                owner_xid: stale,
+            }),
+        )
+        .await,
+        id
+    ));
+    let message = Message {
+        destination_id: "wf-mailbox",
+        topic: None,
+        message: "\"hello\"",
+        idempotency_key: None,
+    };
+    let stale_owner = Some(dbos::sysdb::types::WorkflowOwner {
+        workflow_id: id,
+        owner_xid: "stale",
+    });
+    assert!(refused(
+        sys.send_message(
+            &message,
+            Some("portable_json"),
+            Some((id, 4)),
+            false,
+            stale_owner
+        )
+        .await,
+        id
+    ));
+    // From inside a step: nothing is recorded, but the sender is still checked.
+    assert!(refused(
+        sys.send_messages(&[message], Some("portable_json"), None, false, stale_owner)
+            .await,
+        id
+    ));
+    assert!(refused(
+        sys.recv(id, 5, 6, None, std::time::Duration::from_millis(10), stale)
+            .await,
+        id
+    ));
+    assert!(refused(
+        sys.set_event(id, 7, "key", "1", Some("portable_json"), stale)
+            .await,
+        id
+    ));
+    assert!(refused(
+        sys.write_stream(
+            id,
+            8,
+            "key",
+            "1",
+            Some("portable_json"),
+            WrittenBy::Workflow,
+            stale
+        )
+        .await,
+        id
+    ));
+    assert!(refused(
+        sys.close_stream(id, 9, "key", WrittenBy::Step, stale).await,
+        id
+    ));
+    assert!(refused(
+        sys.record_sleep(id, 10, std::time::Duration::ZERO, stale)
+            .await,
+        id
+    ));
+    assert!(refused(
+        sys.cancel_workflows(
+            &["wf-bystander"],
+            false,
+            Some(dbos::sysdb::types::StepCaller {
+                owner_xid: stale,
+                ..support::step_caller(id, 11)
+            }),
+        )
+        .await,
+        id
+    ));
+    assert!(refused(
+        sys.get_event(
+            "wf-bystander",
+            "key",
+            std::time::Duration::from_millis(10),
+            Some(GetEventCaller {
+                workflow_id: id,
+                step_id: 12,
+                timeout_step_id: 13,
+                owner_xid: stale,
+            }),
+        )
+        .await,
+        id
+    ));
+
+    let count = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        count(
+            r#"SELECT COUNT(*) FROM "dbos"."operation_outputs" WHERE workflow_uuid = 'wf-stale'"#
+        )
+        .await,
+        0,
+        "no step was recorded"
+    );
+    assert!(
+        sys.get_workflow("wf-child").await.unwrap().is_none(),
+        "no child was created"
+    );
+    assert_eq!(
+        count(
+            r#"SELECT COUNT(*) FROM "dbos"."notifications" WHERE destination_uuid = 'wf-mailbox'"#
+        )
+        .await,
+        0,
+        "nothing was sent"
+    );
+    assert_eq!(
+        count(
+            r#"SELECT COUNT(*) FROM "dbos"."notifications"
+               WHERE destination_uuid = 'wf-stale' AND consumed_by_function_id IS NULL"#
+        )
+        .await,
+        1,
+        "the waiting message is still there for the new owner"
+    );
+    assert_eq!(
+        count(r#"SELECT COUNT(*) FROM "dbos"."workflow_events" WHERE workflow_uuid = 'wf-stale'"#)
+            .await,
+        0,
+        "no event was set"
+    );
+    assert_eq!(
+        count(r#"SELECT COUNT(*) FROM "dbos"."streams" WHERE workflow_uuid = 'wf-stale'"#).await,
+        0,
+        "nothing was streamed"
+    );
+    assert_eq!(
+        sys.get_workflow("wf-bystander")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Pending,
+        "the management call didn't run"
+    );
+
+    // The current owner writes as before, and an unowned row refuses everyone.
+    sys.record_step(
+        id,
+        0,
+        "step",
+        Outcome::Output(Some("1")),
+        None,
+        timing,
+        Some("current"),
+    )
+    .await
+    .expect("the owner's write is refused");
+    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = NULL WHERE workflow_uuid = $1"#)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(refused(
+        sys.record_step(
+            id,
+            14,
+            "step",
+            Outcome::Output(Some("1")),
+            None,
+            timing,
+            Some("current")
+        )
+        .await,
+        id
+    ));
+    assert!(refused(
+        sys.record_step(
+            "wf-missing",
+            0,
+            "step",
+            Outcome::Output(None),
+            None,
+            timing,
+            Some("x")
+        )
+        .await,
+        "wf-missing"
+    ));
+}
+
+/// **The owner check holds its lock until the write commits**, so a hand-off issued meanwhile
+/// waits behind it rather than landing between the check and the write.
+#[tokio::test]
+async fn a_hand_off_waits_for_an_owner_checked_write_to_commit() {
+    let (sys, db) = sysdb().await;
+    if db.backend() == Backend::Cockroach {
+        // The lock is the same there (`FOR NO KEY UPDATE` is taken as `FOR UPDATE`), but a
+        // conflicting transaction is aborted and retried rather than made to wait, so there is no
+        // wait to observe.
+        return;
+    }
+    sys.init_workflow(&workflow("wf-locked"), None)
+        .await
+        .unwrap();
+    let pool = db.pool().await;
+    let mut checked = pool.begin().await.unwrap();
+    sqlx::query(
+        r#"SELECT owner_xid FROM "dbos"."workflow_status" WHERE workflow_uuid = 'wf-locked'
+           FOR NO KEY UPDATE"#,
+    )
+    .execute(&mut *checked)
+    .await
+    .unwrap();
+
+    let cancel = sys.cancel_workflows(&["wf-locked"], false, None);
+    let mut cancel = std::pin::pin!(cancel);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut cancel)
+            .await
+            .is_err(),
+        "the cancel didn't wait for the lock"
+    );
+    checked.commit().await.unwrap();
+    let cancelled = tokio::time::timeout(std::time::Duration::from_secs(5), cancel)
+        .await
+        .expect("the cancel never ran")
+        .unwrap();
+    assert_eq!(cancelled, ["wf-locked"]);
 }
