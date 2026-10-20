@@ -95,7 +95,14 @@ where
             };
             executor
                 .sysdb()
-                .set_event(workflow_id, step_id, key, &encoded, Some(encoding.name()))
+                .set_event(
+                    workflow_id,
+                    step_id,
+                    key,
+                    &encoded,
+                    Some(encoding.name()),
+                    placement.owner().map(|owner| owner.owner_xid),
+                )
                 .await
                 .map_err(Error::SystemDatabase)?;
             Ok(())
@@ -287,13 +294,16 @@ where
             // `caller_id` is the workflow *making* the read, which is what the checkpoint hangs
             // off; `workflow_id` above is the one being read from, and the two are rarely the
             // same.
-            let caller = placement.step().zip(timeout_step_id).map(
-                |((caller_id, step_id), timeout_step_id)| GetEventCaller {
-                    workflow_id: caller_id,
-                    step_id,
-                    timeout_step_id,
-                },
-            );
+            let caller =
+                placement
+                    .step_call()
+                    .zip(timeout_step_id)
+                    .map(|(caller, timeout_step_id)| GetEventCaller {
+                        workflow_id: caller.workflow_id,
+                        step_id: caller.step_id,
+                        timeout_step_id,
+                        owner_xid: Some(caller.owner_xid),
+                    });
             executor
                 .connection()
                 .get_event(workflow_id, key, timeout, caller)

@@ -864,7 +864,7 @@ mod tests {
             crate::sysdb::Error::WorkflowCancelled {
                 workflow_id: "wf-1".to_owned(),
             },
-            crate::sysdb::Error::StepAlreadyRecorded {
+            crate::sysdb::Error::StepNondeterminism {
                 workflow_id: "wf-1".to_owned(),
                 step_id: 0,
             },

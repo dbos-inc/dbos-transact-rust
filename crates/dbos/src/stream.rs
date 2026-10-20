@@ -201,6 +201,7 @@ where
                 unreachable!("a stream write is placed from the ambient workflow's own context")
             }
         };
+        let owner_xid = placement.owner().map(|owner| owner.owner_xid);
         let sysdb = conn.sysdb();
         match &encoded {
             Some((value, encoding)) => {
@@ -212,12 +213,13 @@ where
                         value,
                         Some(encoding.name()),
                         written_by,
+                        owner_xid,
                     )
                     .await
             }
             None => {
                 sysdb
-                    .close_stream(workflow_id, step_id, key, written_by)
+                    .close_stream(workflow_id, step_id, key, written_by, owner_xid)
                     .await
             }
         }
@@ -1009,6 +1011,7 @@ async fn record(
                 started_at,
                 completed_at: Timestamp::now(),
             }),
+            placement.owner().map(|owner| owner.owner_xid),
         )
         .await
         .map_err(Error::SystemDatabase)

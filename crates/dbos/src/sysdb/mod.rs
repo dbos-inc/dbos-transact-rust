@@ -80,7 +80,7 @@ use types::{
     OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
     ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
     StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowOwner, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -787,6 +787,7 @@ pub trait SystemDatabase: Send + Sync {
         serialization: Option<&str>,
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error>;
 
     /// Delivers many messages to workflows, in one transaction.
@@ -816,6 +817,7 @@ pub trait SystemDatabase: Send + Sync {
         serialization: Option<&str>,
         caller: Option<(&str, i32)>,
         send_to_forks: bool,
+        owner: Option<WorkflowOwner<'_>>,
     ) -> Result<(), Error>;
 
     /// Takes the oldest message sent to a workflow, waiting up to `timeout` for one to arrive.
@@ -869,6 +871,7 @@ pub trait SystemDatabase: Send + Sync {
         timeout_step_id: i32,
         topic: Option<&str>,
         timeout: Duration,
+        owner_xid: Option<&str>,
     ) -> Result<Option<EncodedValue>, Error>;
 
     /// Appends a value to a workflow's stream.
@@ -889,6 +892,7 @@ pub trait SystemDatabase: Send + Sync {
     /// the cost of a query per write. A reader stops at the sentinel, so an entry appended after
     /// it is invisible rather than corrupting — and a workflow that writes after closing has a
     /// bug this layer cannot fix by refusing one of the two writes.
+    #[allow(clippy::too_many_arguments)]
     async fn write_stream(
         &self,
         workflow_id: &str,
@@ -897,6 +901,7 @@ pub trait SystemDatabase: Send + Sync {
         value: &str,
         serialization: Option<&str>,
         written_by: WrittenBy,
+        owner_xid: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Marks a stream closed, so a reader knows no more values are coming.
@@ -910,6 +915,7 @@ pub trait SystemDatabase: Send + Sync {
         step_id: i32,
         key: &str,
         written_by: WrittenBy,
+        owner_xid: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
@@ -966,8 +972,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// - **the same time** — this caller's own write, acknowledged but not observed. Retrying it
     ///   is correct and the call succeeds.
-    /// - **a different time** — another execution got there first, which is
-    ///   [`Error::StepAlreadyRecorded`].
+    /// - **a different time** — this execution recorded the step already, which is
+    ///   [`Error::StepNondeterminism`]. No other execution can have: the owner check runs first.
     ///
     /// So a caller that retries must pass the same `timing` both times — hold it in a variable
     /// rather than building it at the call site inside a retry loop. Python spells the rule out
@@ -980,6 +986,11 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Recording also **re-stamps the workflow's executor id**, because an executor that runs a
     /// step is by definition the one running the workflow.
+    ///
+    /// `owner_xid` is the recording execution's token: given one, the record lands only while the
+    /// workflow is still that execution's (see [`WorkflowOwner`](types::WorkflowOwner)). `None` is a caller that
+    /// is not an execution.
+    #[allow(clippy::too_many_arguments)]
     async fn record_step(
         &self,
         workflow_id: &str,
@@ -988,6 +999,7 @@ pub trait SystemDatabase: Send + Sync {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        owner_xid: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Reads a workflow's steps in execution order.
@@ -1038,6 +1050,7 @@ pub trait SystemDatabase: Send + Sync {
         workflow_id: &str,
         step_id: i32,
         duration: Duration,
+        owner_xid: Option<&str>,
     ) -> Result<Timestamp, Error>;
 
     /// Publishes a key/value on a workflow, for another workflow to read.
@@ -1054,6 +1067,7 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Setting the same key twice replaces the current value and adds a history row, so the
     /// history is what a fork copies forward and the current value is what a reader sees.
+    #[allow(clippy::too_many_arguments)]
     async fn set_event(
         &self,
         workflow_id: &str,
@@ -1061,6 +1075,7 @@ pub trait SystemDatabase: Send + Sync {
         key: &str,
         value: &str,
         serialization: Option<&str>,
+        owner_xid: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Reads a key another workflow published, waiting up to `timeout` for it to appear.
@@ -1759,7 +1774,7 @@ pub trait SystemDatabase: Send + Sync {
     /// compares the **child id**, since the timestamp here spans only the launch and a retry
     /// would stamp a new one — while the child id it is recording is necessarily the same. A
     /// *different* child at the same position is nondeterminism in the parent, and is reported
-    /// as [`Error::StepAlreadyRecorded`]. Python splits the two for exactly this reason; Java
+    /// as [`Error::StepNondeterminism`]. Python splits the two for exactly this reason; Java
     /// reaches it by passing null timestamps and skipping the comparison.
     async fn record_child_workflow(
         &self,
@@ -1768,6 +1783,7 @@ pub trait SystemDatabase: Send + Sync {
         step_id: i32,
         step_name: &str,
         started_at: Option<Timestamp>,
+        owner_xid: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Reads back a recorded child-workflow await, or `None` if the parent has not got this far.
@@ -1806,6 +1822,7 @@ pub trait SystemDatabase: Send + Sync {
     /// [`GET_RESULT`](crate::sysdb::types::step_names::GET_RESULT), which is the name
     /// [`check_child_result`](Self::check_child_result) reads back, so a caller that could choose
     /// would only be choosing wrong.
+    #[allow(clippy::too_many_arguments)]
     async fn record_child_result(
         &self,
         parent_workflow_id: &str,
@@ -1814,5 +1831,6 @@ pub trait SystemDatabase: Send + Sync {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
+        owner_xid: Option<&str>,
     ) -> Result<(), Error>;
 }

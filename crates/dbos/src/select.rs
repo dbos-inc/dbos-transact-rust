@@ -599,6 +599,7 @@ mod tests {
                 )),
                 Some(executor.connection().serializer().name()),
                 None,
+                None,
             )
             .await
             .expect("could not plant the winner's row");

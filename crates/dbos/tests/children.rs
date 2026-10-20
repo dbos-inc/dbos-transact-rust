@@ -1864,7 +1864,7 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
     // The row exists as soon as `start_with` returns, which is what this write needs.
     let reader = reader(&db).await;
     reader
-        .record_step(id, 0, "child", Outcome::Output(Some("1")), None, None)
+        .record_step(id, 0, "child", Outcome::Output(Some("1")), None, None, None)
         .await
         .expect("planting the step failed");
     tx.send(()).expect("the parent is waiting on the gate");
@@ -2119,6 +2119,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
             1,
             "somebody-elses-workflow",
             Outcome::Output(Some("7")),
+            None,
             None,
             None,
         )

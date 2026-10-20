@@ -74,7 +74,16 @@ use crate::context::Ctx;
 use crate::error::{DurableError, Error};
 use crate::instance::Executor;
 use crate::serialization::{PayloadEncoding, Serializer, decode_error};
-use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp};
+use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowOwner};
+
+/// A call recorded as a step of a workflow: the step, and the token of the execution making it,
+/// which the call presents so it lands only while that execution still owns the workflow.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StepCall<'a> {
+    pub(crate) workflow_id: &'a str,
+    pub(crate) step_id: i32,
+    pub(crate) owner_xid: &'a str,
+}
 
 /// What a durable call works out at the call, before anything of it has run.
 ///
@@ -750,6 +759,27 @@ impl StepPlacement {
         }
     }
 
+    /// The step this call is recorded under and the execution making it, if it is recorded.
+    pub(crate) fn step_call(&self) -> Option<StepCall<'_>> {
+        match self {
+            Self::Recorded { ctx, step_id } => Some(StepCall {
+                workflow_id: ctx.workflow_id(),
+                step_id: *step_id,
+                owner_xid: ctx.owner_xid(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The execution this call is made by, wherever there is one: in the workflow proper, and
+    /// inside one of its steps. Its writes land only while it still owns its workflow.
+    pub(crate) fn owner(&self) -> Option<WorkflowOwner<'_>> {
+        match self {
+            Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Some(ctx.owner()),
+            _ => None,
+        }
+    }
+
     /// The executor serving this call, where the placement knows one.
     ///
     /// **`Some` wherever there is a workflow**, including inside a step body, where the call is
@@ -826,6 +856,7 @@ impl StepPlacement {
                     started_at,
                     completed_at: Timestamp::now(),
                 }),
+                self.owner().map(|owner| owner.owner_xid),
             )
             .await
             .map_err(Error::SystemDatabase)

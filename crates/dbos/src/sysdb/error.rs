@@ -113,15 +113,27 @@ pub enum Error {
         /// The step recorded there.
         recorded: String,
     },
-    /// Another execution recorded this step first.
+    /// This execution recorded the step already, with a different result.
     ///
-    /// Two executors believed they owned one workflow. Distinguished from this caller's own
-    /// retry by the completion timestamp, which a retry repeats and a rival does not.
-    StepAlreadyRecorded {
-        /// The workflow whose step was taken.
+    /// The owner check runs before every step record, in the same transaction, so no other
+    /// execution can have recorded it: the workflow asked for the same step twice, which means
+    /// its code isn't deterministic. Distinguished from this caller's own retry by the completion
+    /// timestamp, which a retry repeats.
+    StepNondeterminism {
+        /// The workflow whose step was recorded twice.
         workflow_id: String,
         /// The position that was already filled.
         step_id: i32,
+    },
+    /// This execution no longer owns its workflow, so it must stop and wait for the owner's
+    /// outcome.
+    ///
+    /// The workflow was handed to another execution (cancelled, resumed, or recovered) and the
+    /// write that found out rolled back. Every write a workflow makes from inside its execution
+    /// checks first.
+    WorkflowConflict {
+        /// The workflow this execution no longer owns.
+        workflow_id: String,
     },
     /// A workflow has no step to fork from.
     ///
@@ -250,13 +262,20 @@ impl std::fmt::Display for Error {
                 "workflow {workflow_id} step {step_id} was recorded as {recorded:?}, \
                  but {expected:?} was expected"
             ),
-            Error::StepAlreadyRecorded {
+            Error::StepNondeterminism {
                 workflow_id,
                 step_id,
             } => write!(
                 f,
-                "workflow {workflow_id} step {step_id} was already recorded by another execution"
+                "step {step_id} of workflow {workflow_id} was recorded twice by the same \
+                 execution with different results; check that the workflow is deterministic"
             ),
+            Error::WorkflowConflict { workflow_id } => {
+                write!(
+                    f,
+                    "workflow {workflow_id} is no longer owned by this execution"
+                )
+            }
             Error::NoForkPoint {
                 workflow_ids,
                 step_name,
@@ -355,7 +374,8 @@ impl Error {
             | Error::Malformed(_)
             | Error::UnknownSerialization { .. }
             | Error::WorkflowCancelled { .. }
-            | Error::StepAlreadyRecorded { .. }
+            | Error::StepNondeterminism { .. }
+            | Error::WorkflowConflict { .. }
             | Error::UnexpectedStep { .. }
             | Error::ConcurrentRecv { .. } => false,
             Error::ConflictingWorkflow { .. }
@@ -481,9 +501,15 @@ mod tests {
             .should_record()
         );
         assert!(
-            !Error::StepAlreadyRecorded {
+            !Error::StepNondeterminism {
                 workflow_id: "wf".to_owned(),
                 step_id: 0,
+            }
+            .should_record()
+        );
+        assert!(
+            !Error::WorkflowConflict {
+                workflow_id: "wf".to_owned(),
             }
             .should_record()
         );

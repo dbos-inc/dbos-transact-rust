@@ -571,7 +571,7 @@ impl DBOS {
                     )
                     .await?;
                 }
-                conn.create_schedule(spec, placement.step()).await
+                conn.create_schedule(spec, placement.step_call()).await
             },
         )
     }
@@ -621,7 +621,7 @@ impl DBOS {
             move |executor, placement| async move {
                 let records = executor
                     .connection()
-                    .list_schedules(filter, placement.step())
+                    .list_schedules(filter, placement.step_call())
                     .await?;
                 let serializer = executor.serializer();
                 Ok(records
@@ -640,7 +640,7 @@ impl DBOS {
             move |executor, placement| async move {
                 let record = executor
                     .connection()
-                    .get_schedule(name, placement.step())
+                    .get_schedule(name, placement.step_call())
                     .await?;
                 Ok(record.map(|record| Schedule::from_record(record, executor.serializer())))
             },
@@ -678,7 +678,7 @@ impl DBOS {
                 {
                     refuse_unknown_queue(conn, name, queue, OPERATION).await?;
                 }
-                conn.update_schedule(name, change, context.as_deref(), placement.step())
+                conn.update_schedule(name, change, context.as_deref(), placement.step_call())
                     .await
             },
         )
@@ -697,7 +697,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .set_schedule_status(name, ScheduleStatus::Paused, placement.step())
+                    .set_schedule_status(name, ScheduleStatus::Paused, placement.step_call())
                     .await
             },
         )
@@ -711,7 +711,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .set_schedule_status(name, ScheduleStatus::Active, placement.step())
+                    .set_schedule_status(name, ScheduleStatus::Active, placement.step_call())
                     .await
             },
         )
@@ -727,7 +727,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .delete_schedule(name, placement.step())
+                    .delete_schedule(name, placement.step_call())
                     .await
             },
         )
@@ -905,7 +905,7 @@ impl Connection {
     pub(crate) async fn create_schedule(
         &self,
         spec: &ScheduleSpec,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<()> {
         let context = spec.encode_context(self.serializer())?;
         self.sysdb()
@@ -937,7 +937,7 @@ impl Connection {
     pub(crate) async fn list_schedules(
         &self,
         filter: &ScheduleFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<ScheduleRecord>> {
         self.sysdb()
             .list_schedules(filter, self.step_caller(caller))
@@ -948,7 +948,7 @@ impl Connection {
     pub(crate) async fn get_schedule(
         &self,
         name: &str,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Option<ScheduleRecord>> {
         self.sysdb()
             .get_schedule(name, self.step_caller(caller))
@@ -962,7 +962,7 @@ impl Connection {
         name: &str,
         change: &ScheduleChange<'_>,
         context: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<()> {
         let update = ScheduleUpdate {
             schedule: change.schedule,
@@ -983,7 +983,7 @@ impl Connection {
         &self,
         name: &str,
         status: ScheduleStatus,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .set_schedule_status(name, status, self.step_caller(caller))
@@ -1000,7 +1000,7 @@ impl Connection {
     pub(crate) async fn delete_schedule(
         &self,
         name: &str,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .delete_schedule(name, self.step_caller(caller))

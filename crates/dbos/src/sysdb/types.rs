@@ -1965,6 +1965,7 @@ pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
         workflow_id,
         step_id,
         codec,
+        ..
     } = caller;
     codec
         .decode(recorded, step.serialization.as_deref())
@@ -1990,6 +1991,22 @@ pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
         })
 }
 
+/// The execution a write is made by: the workflow it runs, and the token it owns it by.
+///
+/// A write that carries one lands only while the workflow's row still holds that token, checked
+/// in the write's own transaction before anything else and locking the row until it commits. Once
+/// the workflow has been handed to another execution (a cancel, a resume, a recovery), the write
+/// is refused with [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict) and rolls back.
+/// `None` where a method takes an `Option<WorkflowOwner>` is a caller that is not an execution, a client
+/// say, and is not checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowOwner<'a> {
+    /// The workflow the execution runs.
+    pub workflow_id: &'a str,
+    /// The token it owns the workflow by.
+    pub owner_xid: &'a str,
+}
+
 /// The workflow step a management call runs as, and how its result is recorded.
 ///
 /// What the methods that record their own result take, where the plain-id methods take `caller:
@@ -2006,6 +2023,19 @@ pub struct StepCaller<'a> {
     pub step_id: i32,
     /// How the recorded result is encoded and decoded.
     pub codec: &'a dyn StepCodec,
+    /// The token the calling execution owns its workflow by: the call and its record land only
+    /// while the workflow is still that execution's. `None` is not checked.
+    pub owner_xid: Option<&'a str>,
+}
+
+impl<'a> StepCaller<'a> {
+    /// The execution making the call, if it is to be checked.
+    pub fn owner(&self) -> Option<WorkflowOwner<'a>> {
+        self.owner_xid.map(|owner_xid| WorkflowOwner {
+            workflow_id: self.workflow_id,
+            owner_xid,
+        })
+    }
 }
 
 /// The workflow a [`get_event`](crate::sysdb::SystemDatabase::get_event) runs on behalf of, and the
@@ -2037,6 +2067,9 @@ pub struct GetEventCaller<'a> {
     /// start the timeout again — a read that waited fifty of its sixty seconds and crashed has ten
     /// left.
     pub timeout_step_id: i32,
+    /// The token the reading execution owns its workflow by, which both records present. `None` is
+    /// not checked.
+    pub owner_xid: Option<&'a str>,
 }
 
 /// The workflow an [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) creates a child
@@ -2075,6 +2108,10 @@ pub struct InitWorkflowCaller<'a> {
     /// When the start began, for the row's `started_at`. The completion is stamped by the write
     /// itself, since the step spans the launch alone.
     pub started_at: Timestamp,
+    /// The token the parent's execution owns it by. The child is created, and the start
+    /// recorded, only while the parent is still that execution's: a stale parent starts nothing.
+    /// `None` is not checked.
+    pub owner_xid: Option<&'a str>,
 }
 
 /// An encoded payload and the format it is encoded in.

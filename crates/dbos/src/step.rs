@@ -537,6 +537,7 @@ where
                     Outcome::Output(Some(&output)),
                     serialization,
                     timing,
+                    Some(ctx.owner_xid()),
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
@@ -563,6 +564,7 @@ where
                     Outcome::Error(&encoded),
                     serialization,
                     timing,
+                    Some(ctx.owner_xid()),
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
@@ -993,6 +995,7 @@ mod tests {
                 "charge",
                 Outcome::Error(r#"{"pythonModule":"app.errors","type":"CardDeclined"}"#),
                 Some("rust_serde"),
+                None,
                 None,
             )
             .await

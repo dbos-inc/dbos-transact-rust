@@ -700,6 +700,7 @@ async fn a_workflows_timed_out_read_replays_as_a_timeout() {
             "\"late\"",
             Some("rust_serde"),
             WrittenBy::Step,
+            None,
         )
         .await
         .expect("write failed");

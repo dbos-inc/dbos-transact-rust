@@ -295,6 +295,14 @@ impl Ctx {
         &self.workflow.owner_xid
     }
 
+    /// This execution, as the writes it makes present it.
+    pub(crate) fn owner(&self) -> crate::sysdb::types::WorkflowOwner<'_> {
+        crate::sysdb::types::WorkflowOwner {
+            workflow_id: self.workflow_id(),
+            owner_xid: self.owner_xid(),
+        }
+    }
+
     /// The id of the step body this context is inside, or `None` in the workflow proper.
     pub(crate) fn step_id(&self) -> Option<i32> {
         self.step.as_ref().map(|step| step.status.step_id)

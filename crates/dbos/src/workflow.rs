@@ -1307,6 +1307,7 @@ async fn create<R, E>(
             // which records the joined case under the same one.
             step_name: &key.name,
             started_at,
+            owner_xid: Some(parent.owner_xid()),
         }),
     )
     .await
@@ -1701,6 +1702,12 @@ impl Parent<'_> {
         self.ctx.workflow_id()
     }
 
+    /// The token the parent's execution owns it by, which every write recording the start
+    /// presents: a parent that has been handed off starts nothing.
+    fn owner_xid(&self) -> &str {
+        self.ctx.owner_xid()
+    }
+
     /// The parent's own deadline, for the child to inherit when it asks for no budget of its own.
     fn deadline(&self) -> Option<Timestamp> {
         self.ctx.deadline()
@@ -1738,6 +1745,7 @@ impl Parent<'_> {
                 workflow_id: self.workflow_id(),
                 step_id: self.step_id,
                 codec: executor.serializer(),
+                owner_xid: Some(self.owner_xid()),
             };
             let value: serde_json::Value =
                 decode_step_value(&recorded, encoded, caller, step_name, "an error")
@@ -1780,9 +1788,8 @@ impl Parent<'_> {
     /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
     ///   returns it again on a replay.
     /// - **The record fails**: that failure is returned instead, and the position usually stays
-    ///   unrecorded. A rival that recorded it first is
-    ///   [`StepAlreadyRecorded`](crate::sysdb::Error::StepAlreadyRecorded): this execution is
-    ///   superseded. The record is the step row and then the executor claim, as for any step; if
+    ///   unrecorded. A position recorded already is
+    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism). The record is the step row and then the executor claim, as for any step; if
     ///   the claim fails after the row lands, the caller gets the claim's error but the row stays,
     ///   so a replay returns the recorded error. The claim's error is database trouble, which
     ///   leaves the parent `PENDING` rather than ending it.
@@ -1825,6 +1832,7 @@ impl Parent<'_> {
                 Outcome::Error(&recorded.value),
                 recorded.serialization.as_deref(),
                 Some(timing),
+                Some(self.owner_xid()),
             )
             .await
         {
@@ -1870,6 +1878,7 @@ impl Parent<'_> {
                 self.step_id,
                 step_name,
                 Some(started_at),
+                Some(self.owner_xid()),
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -2067,21 +2076,17 @@ async fn execute(
                 )
                 .await
         }
-        // Another execution checkpointed a step this one was about to, so it is ahead and this
-        // one is superseded — the same position as `OutcomeWrite::AlreadyFinished` below, one
-        // level down. The conflict is a fact about ownership, not a failure of the workflow, so
-        // the caller gets the outcome the winner records rather than an error for a workflow
-        // that may well succeed.
-        Err(Failure::Control(Error::SystemDatabase(
-            crate::sysdb::Error::StepAlreadyRecorded {
-                workflow_id: conflicted,
-                step_id,
-            },
-        ))) if conflicted == workflow_id => {
+        // A write was refused because the workflow was handed to another execution (cancelled,
+        // resumed, or recovered), so this one is superseded: the same position as
+        // `OutcomeWrite::AlreadyFinished` below, one level down. It is a fact about ownership,
+        // not a failure of the workflow, so the caller gets the outcome the owner records rather
+        // than an error for a workflow that may well succeed.
+        Err(Failure::Control(Error::SystemDatabase(crate::sysdb::Error::WorkflowConflict {
+            workflow_id: conflicted,
+        }))) if conflicted == workflow_id => {
             tracing::warn!(
                 workflow_id,
-                step_id,
-                "another execution recorded this workflow's step first; waiting for its outcome"
+                "the workflow is no longer owned by this execution; waiting for the owner's outcome"
             );
             return adopt_superseded(executor, workflow_id, slot).await;
         }

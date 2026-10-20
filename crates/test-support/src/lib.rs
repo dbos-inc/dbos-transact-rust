@@ -1181,5 +1181,6 @@ pub fn step_caller(workflow_id: &str, step_id: i32) -> dbos::sysdb::types::StepC
         workflow_id,
         step_id,
         codec: &TestCodec,
+        owner_xid: None,
     }
 }

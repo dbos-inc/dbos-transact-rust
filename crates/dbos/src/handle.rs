@@ -455,6 +455,7 @@ impl ChildResultPlacement {
                     started_at,
                     completed_at: Timestamp::now(),
                 }),
+                self.0.owner().map(|owner| owner.owner_xid),
             )
             .await
             .map_err(Error::SystemDatabase)

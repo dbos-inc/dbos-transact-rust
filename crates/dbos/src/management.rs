@@ -422,7 +422,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .cancel_all(&[workflow_id], Children::Skip, placement.step())
+                    .cancel_all(&[workflow_id], Children::Skip, placement.step_call())
                     .await?;
                 Ok(())
             },
@@ -459,7 +459,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .cancel_all(workflow_ids, children, placement.step())
+                    .cancel_all(workflow_ids, children, placement.step_call())
                     .await
             },
         )
@@ -539,7 +539,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .resume_all(&[workflow_id], options, placement.step())
+                    .resume_all(&[workflow_id], options, placement.step_call())
                     .await?
                     .pop()
                     .ok_or_else(|| {
@@ -573,7 +573,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .resume_all(workflow_ids, options, placement.step())
+                    .resume_all(workflow_ids, options, placement.step_call())
                     .await
             },
         )
@@ -653,7 +653,7 @@ impl DBOS {
                         start_step,
                         options.forked_id,
                         &options,
-                        placement.step(),
+                        placement.step_call(),
                     )
                     .await?
                     .pop()
@@ -701,7 +701,13 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .fork_all(workflow_ids, start_step, None, &options, placement.step())
+                    .fork_all(
+                        workflow_ids,
+                        start_step,
+                        None,
+                        &options,
+                        placement.step_call(),
+                    )
                     .await
             },
         )
@@ -796,7 +802,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .rewind(workflow_id, options, placement.step())
+                    .rewind(workflow_id, options, placement.step_call())
                     .await
             },
         )
@@ -829,7 +835,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .delete_all(&[workflow_id], Children::Skip, placement.step())
+                    .delete_all(&[workflow_id], Children::Skip, placement.step_call())
                     .await?;
                 Ok(())
             },
@@ -868,7 +874,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .delete_all(workflow_ids, children, placement.step())
+                    .delete_all(workflow_ids, children, placement.step_call())
                     .await
             },
         )
@@ -913,7 +919,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .set_workflow_delay(workflow_id, delay, placement.step())
+                    .set_workflow_delay(workflow_id, delay, placement.step_call())
                     .await
             },
         )
@@ -968,7 +974,11 @@ impl DBOS {
             move |(executor, encoded), placement| async move {
                 executor
                     .connection()
-                    .update_workflow_attributes(workflow_id, encoded.as_deref(), placement.step())
+                    .update_workflow_attributes(
+                        workflow_id,
+                        encoded.as_deref(),
+                        placement.step_call(),
+                    )
                     .await
             },
         )
@@ -1014,7 +1024,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .list_workflows(filter, placement.step())
+                    .list_workflows(filter, placement.step_call())
                     .await
             },
         )
@@ -1056,7 +1066,7 @@ impl DBOS {
             move |executor, placement| async move {
                 executor
                     .connection()
-                    .list_workflow_steps(workflow_id, options, placement.step())
+                    .list_workflow_steps(workflow_id, options, placement.step_call())
                     .await
             },
         )
@@ -1350,7 +1360,7 @@ impl Connection {
         &self,
         workflow_ids: &[&str],
         children: Children,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<String>> {
         let cancelled = self
             .sysdb()
@@ -1375,7 +1385,7 @@ impl Connection {
         self: &Arc<Self>,
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let resumed = self
             .sysdb()
@@ -1404,7 +1414,7 @@ impl Connection {
         start_step: i32,
         forked_id: Option<&str>,
         options: &ForkOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let sys_options = SysForkOptions {
             application_version: options.app_version,
@@ -1444,7 +1454,7 @@ impl Connection {
         self: &Arc<Self>,
         workflow_id: &str,
         options: RewindOptions<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<WorkflowHandle<R, E>> {
         let sys_options = SysRewindOptions {
             application_version: options.app_version,
@@ -1478,7 +1488,7 @@ impl Connection {
         &self,
         workflow_ids: &[&str],
         children: Children,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<u64> {
         let deleted = self
             .sysdb()
@@ -1500,7 +1510,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         delay: WorkflowDelay,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .set_workflow_delay(workflow_id, delay, self.step_caller(caller))
@@ -1524,7 +1534,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         encoded: Option<&str>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<()> {
         self.sysdb()
             .update_workflow_attributes(workflow_id, encoded, self.step_caller(caller))
@@ -1540,7 +1550,7 @@ impl Connection {
     pub(crate) async fn list_workflows(
         &self,
         filter: &WorkflowFilter<'_>,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<WorkflowRecord>> {
         self.sysdb()
             .list_workflows(filter, self.step_caller(caller))
@@ -1553,7 +1563,7 @@ impl Connection {
         &self,
         workflow_id: &str,
         options: ListWorkflowStepsOptions,
-        caller: Option<(&str, i32)>,
+        caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<StepRecord>> {
         self.sysdb()
             .list_workflow_steps(

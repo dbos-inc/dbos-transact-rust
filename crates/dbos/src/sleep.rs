@@ -70,7 +70,12 @@ where
 
             let wake_at = executor
                 .sysdb()
-                .record_sleep(workflow_id, step_id, duration)
+                .record_sleep(
+                    workflow_id,
+                    step_id,
+                    duration,
+                    placement.owner().map(|owner| owner.owner_xid),
+                )
                 .await
                 .map_err(Error::SystemDatabase)?;
 

@@ -275,7 +275,14 @@ where
             };
             let found = executor
                 .sysdb()
-                .recv(workflow_id, step_id, timeout_step_id, topic, timeout)
+                .recv(
+                    workflow_id,
+                    step_id,
+                    timeout_step_id,
+                    topic,
+                    timeout,
+                    placement.owner().map(|owner| owner.owner_xid),
+                )
                 .await
                 .map_err(Error::SystemDatabase)?;
             match found {
@@ -505,6 +512,7 @@ fn pending_send<'a, E: DurableError + 'a>(
                 &encoded.encoding,
                 placement.step(),
                 forks,
+                placement.owner(),
             )
             .await
             .map_err(Error::lift)
@@ -529,9 +537,15 @@ fn pending_send_bulk<'a, E: DurableError + 'a>(
                 .unwrap_or_default();
             let messages: Vec<EncodedMessage<'_>> =
                 encoded.iter().map(Encoded::as_message).collect();
-            conn.send_all_encoded(&messages, &encoding, placement.step(), forks)
-                .await
-                .map_err(Error::lift)
+            conn.send_all_encoded(
+                &messages,
+                &encoding,
+                placement.step(),
+                forks,
+                placement.owner(),
+            )
+            .await
+            .map_err(Error::lift)
         },
     )
 }
@@ -560,6 +574,7 @@ impl Connection {
         encoding: &PayloadEncoding,
         caller: Option<(&str, i32)>,
         forks: Forks,
+        owner: Option<crate::sysdb::types::WorkflowOwner<'_>>,
     ) -> Result<(), E>
     where
         E: DurableError,
@@ -570,6 +585,7 @@ impl Connection {
                 Some(encoding.name()),
                 caller,
                 forks == Forks::Include,
+                owner,
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -587,6 +603,7 @@ impl Connection {
         encoding: &PayloadEncoding,
         caller: Option<(&str, i32)>,
         forks: Forks,
+        owner: Option<crate::sysdb::types::WorkflowOwner<'_>>,
     ) -> Result<(), E>
     where
         E: DurableError,
@@ -597,6 +614,7 @@ impl Connection {
                 Some(encoding.name()),
                 caller,
                 forks == Forks::Include,
+                owner,
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -649,6 +667,7 @@ impl crate::Client {
                 &encoded.encoding,
                 None,
                 options.forks,
+                None,
             )
             .await
     }
@@ -692,7 +711,7 @@ impl crate::Client {
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
         self.connection()
-            .send_all_encoded(&messages, &encoding, None, options.forks)
+            .send_all_encoded(&messages, &encoding, None, options.forks, None)
             .await
     }
 }
