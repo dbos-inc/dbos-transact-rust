@@ -188,12 +188,13 @@ pub struct ClientConfig {
     /// How long a system-database connection may sit idle inside an open transaction before the
     /// server ends its session.
     ///
-    /// `None` is sixty seconds; `Some(Duration::ZERO)`, or anything under a millisecond, leaves the
-    /// server's own setting, as does a database URL that already sets
-    /// `idle_in_transaction_session_timeout`. The server takes at most `i32::MAX` milliseconds,
-    /// about 24.8 days, and longer is refused. A process that stalls
-    /// mid-transaction would otherwise hold the transaction's row locks, and the connection, for as
-    /// long as the stall lasts.
+    /// `None` is sixty seconds. `Some(Duration::ZERO)` leaves the server's own setting, as do
+    /// connection options that already set `idle_in_transaction_session_timeout` (the database
+    /// URL's `options` parameter, or `PGOPTIONS`); anything else replaces it, a setting made with
+    /// `ALTER ROLE` or `ALTER DATABASE` included. A positive value under a millisecond is a
+    /// millisecond. The server takes at most `i32::MAX` milliseconds, about 24.8 days, and longer
+    /// is refused. A process that stalls mid-transaction would otherwise hold the transaction's row
+    /// locks, and the connection, for as long as the stall lasts.
     pub idle_transaction_timeout: Option<Duration>,
 }
 

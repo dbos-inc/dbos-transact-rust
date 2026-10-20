@@ -331,10 +331,12 @@ pub struct Config<'a> {
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
-    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None`, or less
-    /// than a millisecond, leaves the server's own setting, as does a URL that already sets
-    /// `idle_in_transaction_session_timeout`. Longer than [`MAX_IDLE_TRANSACTION_TIMEOUT`] is
-    /// refused.
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None` or zero
+    /// leaves the server's own setting, as do connection options that already set
+    /// `idle_in_transaction_session_timeout` (the URL's `options` parameter, or `PGOPTIONS`).
+    /// Anything else replaces the server's setting, one made with `ALTER ROLE` or `ALTER DATABASE`
+    /// included. A positive value under a millisecond is a millisecond, and longer than
+    /// [`MAX_IDLE_TRANSACTION_TIMEOUT`] is refused.
     ///
     /// A process that stalls mid-transaction (a frozen container, a network partition) would
     /// otherwise hold the transaction's row locks, and the connection, for as long as the stall
@@ -370,6 +372,23 @@ pub const DEFAULT_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest [`Config::idle_transaction_timeout`] the server takes: the parameter is a 32-bit
 /// count of milliseconds.
 pub const MAX_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(i32::MAX as u64);
+
+/// Whether the connection options `url` resolves to already set
+/// `idle_in_transaction_session_timeout`: the URL's `options` parameter, in either of its forms,
+/// or `PGOPTIONS`, decoded and compared without case as the server compares parameter names. A
+/// URL that does not parse sets nothing here, and fails at connect.
+fn options_set_idle_transaction_timeout(url: &str) -> bool {
+    url.parse::<sqlx::postgres::PgConnectOptions>()
+        .ok()
+        .and_then(|options| {
+            options.get_options().map(|options| {
+                options
+                    .to_ascii_lowercase()
+                    .contains("idle_in_transaction_session_timeout")
+            })
+        })
+        .unwrap_or(false)
+}
 
 /// The polling cap for a pool of `pool_size` connections.
 ///
@@ -486,9 +505,10 @@ impl PostgresSystemDatabase {
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
         if let Some(millis) = config
             .idle_transaction_timeout
-            .map(|timeout| timeout.as_millis())
-            .filter(|millis| *millis > 0)
-            && !config.url.contains("idle_in_transaction_session_timeout")
+            .filter(|timeout| !timeout.is_zero())
+            // The server reads zero as no timeout, so a positive value under a millisecond is one.
+            .map(|timeout| timeout.as_millis().max(1))
+            && !options_set_idle_transaction_timeout(config.url)
         {
             pool = pool.after_connect(move |conn, _| {
                 Box::pin(async move {
@@ -8260,14 +8280,75 @@ mod tests {
         );
     }
 
+    /// **`connect` sets the idle-transaction timeout on its connections**, a positive value under a
+    /// millisecond as a millisecond. Connection options that set it themselves keep their own,
+    /// however they spell it, and a pool the caller built is left alone.
+    #[tokio::test]
+    async fn connect_sets_the_idle_transaction_timeout() {
+        async fn show(pool: &sqlx::PgPool) -> String {
+            sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn connected(url: &str, timeout: std::time::Duration) -> String {
+            let sys = PostgresSystemDatabase::connect(&super::Config {
+                idle_transaction_timeout: Some(timeout),
+                migrate: false,
+                ..super::Config::new(url)
+            })
+            .await
+            .expect("connect failed");
+            show(&sys.pool).await
+        }
+        let db = dbos_test_support::test_database().await;
+        let with = |query: &str| {
+            let separator = if db.url().contains('?') { '&' } else { '?' };
+            format!("{}{separator}{query}", db.url())
+        };
+        let ms = std::time::Duration::from_millis;
+        let server = show(&db.pool().await).await;
+
+        let set = connected(db.url(), ms(300)).await;
+        assert_ne!(set, server, "the timeout was set");
+        let tiny = connected(db.url(), std::time::Duration::from_micros(500)).await;
+        assert_ne!(
+            tiny, server,
+            "under a millisecond is a millisecond, not the server's"
+        );
+
+        let own = connected(
+            &with("options=-c%20idle_in_transaction_session_timeout%3D1234"),
+            ms(300),
+        )
+        .await;
+        assert_ne!(own, set, "the URL's own setting is kept");
+        let shouted = connected(
+            &with("options=-c%20IDLE%5FIN%5FTRANSACTION%5FSESSION%5FTIMEOUT%3D1234"),
+            ms(300),
+        )
+        .await;
+        assert_eq!(shouted, own, "however it is spelled");
+        // A bare query parameter is not a connection option and sets nothing, so the timeout is.
+        let bare = connected(&with("idle_in_transaction_session_timeout=1234"), ms(300)).await;
+        assert_eq!(bare, set);
+
+        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        assert_eq!(
+            show(&supplied.pool).await,
+            server,
+            "a pool the caller built is left alone"
+        );
+    }
+
     /// **A transaction left idle is ended by the server**, after the timeout `connect` sets on its
-    /// connections, and the row lock it held goes with it. A URL that sets the timeout itself
-    /// keeps its own, and a pool the caller built is left alone.
+    /// connections, and the row lock it held goes with it. Checked on PostgreSQL; the setting
+    /// itself is checked on both backends above.
     #[tokio::test]
     async fn connect_ends_transactions_left_idle() {
         let db = dbos_test_support::test_database().await;
         if db.backend() == dbos_test_support::Backend::Cockroach {
-            return; // The setting is the same there; ending the session is what this pins.
+            return;
         }
         let sys = PostgresSystemDatabase::connect(&super::Config {
             idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
@@ -8276,11 +8357,6 @@ mod tests {
         })
         .await
         .expect("connect failed");
-        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&sys.pool)
-            .await
-            .unwrap();
-        assert_eq!(setting, "300ms");
 
         sys.init_workflow(&NewWorkflow::new("wf-idle"), None, Submission::Fresh, None)
             .await
@@ -8310,35 +8386,5 @@ mod tests {
             sqlx::query("SELECT 1").execute(&mut *idle).await.is_err(),
             "the idle transaction's session was ended"
         );
-        drop(idle);
-
-        let url = format!(
-            "{}{}options=-c%20idle_in_transaction_session_timeout%3D1234",
-            db.url(),
-            if db.url().contains('?') { '&' } else { '?' }
-        );
-        let own = PostgresSystemDatabase::connect(&super::Config {
-            idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
-            migrate: false,
-            ..super::Config::new(&url)
-        })
-        .await
-        .expect("connect failed");
-        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&own.pool)
-            .await
-            .unwrap();
-        assert_eq!(setting, "1234ms", "the URL's own setting is kept");
-
-        let server: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&other)
-            .await
-            .unwrap();
-        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
-        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&supplied.pool)
-            .await
-            .unwrap();
-        assert_eq!(setting, server, "a pool the caller built is left alone");
     }
 }
