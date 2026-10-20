@@ -151,6 +151,7 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `57…` | operator intervention — shutdown, cannot connect now | connection |
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
+/// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -197,6 +198,12 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
 fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
     if matches!(code, "40001" | "40P01") {
         return BackendErrorKind::Conflict;
+    }
+    // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
+    // transaction. The transaction rolled back with it, so asking again on a new connection is
+    // what a lost connection would ask for.
+    if code == "25P03" {
+        return BackendErrorKind::Connection;
     }
     match &code[..2.min(code.len())] {
         "08" | "53" | "57" => BackendErrorKind::Connection,
@@ -323,6 +330,15 @@ pub struct Config<'a> {
     /// permanent and affects every application sharing the database — see the note on
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
+    /// How long a connection may sit idle inside an open transaction before the server ends its
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None` or zero
+    /// leaves the server's own setting, as does a URL that already sets
+    /// `idle_in_transaction_session_timeout`.
+    ///
+    /// The owner check locks a workflow's row until the write it guards commits, so a process that
+    /// stalls mid-transaction (a frozen container, a network partition) would otherwise hold that
+    /// row, and with it every hand-off of the workflow, for as long as the stall lasts.
+    pub idle_transaction_timeout: Option<Duration>,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
     /// On by default. Turning it off suits an application whose database is migrated by something
@@ -340,11 +356,15 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
+            idle_transaction_timeout: Some(DEFAULT_IDLE_TRANSACTION_TIMEOUT),
             migrate: true,
             settings: Settings::default(),
         }
     }
 }
+
+/// What [`Config::idle_transaction_timeout`] is unless told otherwise.
+pub const DEFAULT_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The polling cap for a pool of `pool_size` connections.
 ///
@@ -449,10 +469,23 @@ impl PostgresSystemDatabase {
             ensure_database_exists(config.url).await?;
         }
 
-        let pool = PgPoolOptions::new()
-            .max_connections(config.max_connections)
-            .connect(config.url)
-            .await?;
+        let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
+        if let Some(timeout) = config.idle_transaction_timeout.filter(|t| !t.is_zero())
+            && !config.url.contains("idle_in_transaction_session_timeout")
+        {
+            let millis = timeout.as_millis();
+            pool = pool.after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "SET idle_in_transaction_session_timeout = {millis}"
+                    )))
+                    .execute(conn)
+                    .await?;
+                    Ok(())
+                })
+            });
+        }
+        let pool = pool.connect(config.url).await?;
 
         // Either bring the schema up, or check that whoever was supposed to has. Connecting to a
         // schema this build's queries do not fit is a failure either way; the only question is
@@ -8386,5 +8419,92 @@ mod tests {
             let plan = plan.join("\n");
             assert!(!plan.contains("Seq Scan"), "{kind}: {plan}");
         }
+    }
+
+    /// An idle session ending inside a transaction is a lost connection, and asked again.
+    #[test]
+    fn an_idle_transaction_timeout_is_retried_as_a_lost_connection() {
+        assert_eq!(
+            classify_sqlstate("25P03", None),
+            BackendErrorKind::Connection
+        );
+    }
+
+    /// **A transaction left idle is ended by the server**, after the timeout `connect` sets on its
+    /// connections, and the row lock it held goes with it. A URL that sets the timeout itself
+    /// keeps its own, and a pool the caller built is left alone.
+    #[tokio::test]
+    async fn connect_ends_transactions_left_idle() {
+        let db = dbos_test_support::test_database().await;
+        if db.backend() == dbos_test_support::Backend::Cockroach {
+            return; // The setting is the same there; ending the session is what this pins.
+        }
+        let sys = PostgresSystemDatabase::connect(&super::Config {
+            idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
+            migrate: false,
+            ..super::Config::new(db.url())
+        })
+        .await
+        .expect("connect failed");
+        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&sys.pool)
+            .await
+            .unwrap();
+        assert_eq!(setting, "300ms");
+
+        sys.init_workflow(&NewWorkflow::new("wf-idle"), None)
+            .await
+            .unwrap();
+        let table = sys.tables.workflow_status.as_str();
+        let mut idle = sys.pool.begin().await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "SELECT owner_xid FROM {table} WHERE workflow_uuid = 'wf-idle' FOR NO KEY UPDATE"
+        )))
+        .execute(&mut *idle)
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The lock went with the session, so a hand-off goes through at once.
+        let other = db.pool().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET owner_xid = NULL WHERE workflow_uuid = 'wf-idle'"
+            )))
+            .execute(&other),
+        )
+        .await
+        .expect("the idle transaction still holds its lock")
+        .unwrap();
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut *idle).await.is_err(),
+            "the idle transaction's session was ended"
+        );
+        drop(idle);
+
+        let url = format!(
+            "{}{}options=-c%20idle_in_transaction_session_timeout%3D1234",
+            db.url(),
+            if db.url().contains('?') { '&' } else { '?' }
+        );
+        let own = PostgresSystemDatabase::connect(&super::Config {
+            idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
+            migrate: false,
+            ..super::Config::new(&url)
+        })
+        .await
+        .expect("connect failed");
+        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&own.pool)
+            .await
+            .unwrap();
+        assert_eq!(setting, "1234ms", "the URL's own setting is kept");
+
+        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&supplied.pool)
+            .await
+            .unwrap();
+        assert_eq!(setting, "0", "a pool the caller built is left alone");
     }
 }

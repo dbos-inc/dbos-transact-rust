@@ -184,6 +184,15 @@ pub struct ClientConfig {
     ///
     /// `None` is ten milliseconds; `Some(Duration::ZERO)` turns coalescing off.
     pub notification_coalesce: Option<Duration>,
+
+    /// How long a system-database connection may sit idle inside an open transaction before the
+    /// server ends its session.
+    ///
+    /// `None` is sixty seconds; `Some(Duration::ZERO)` leaves the server's own setting, as does a
+    /// database URL that already sets `idle_in_transaction_session_timeout`. Every write a workflow
+    /// makes locks the workflow's row until it commits, so a process that stalls mid-transaction
+    /// would otherwise hold that row for as long as the stall lasts.
+    pub idle_transaction_timeout: Option<Duration>,
 }
 
 impl ClientConfig {
@@ -203,6 +212,7 @@ impl ClientConfig {
             polling_concurrency: None,
             outcome_poll_interval: None,
             notification_coalesce: None,
+            idle_transaction_timeout: None,
         }
     }
 

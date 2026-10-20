@@ -135,6 +135,15 @@ pub struct Config {
     /// the one duration here where zero is a setting rather than a mistake.
     pub notification_coalesce: Option<Duration>,
 
+    /// How long a system-database connection may sit idle inside an open transaction before the
+    /// server ends its session.
+    ///
+    /// `None` is sixty seconds; `Some(Duration::ZERO)` leaves the server's own setting, as does a
+    /// database URL that already sets `idle_in_transaction_session_timeout`. Every write a workflow
+    /// makes locks the workflow's row until it commits, so a process that stalls mid-transaction
+    /// would otherwise hold that row for as long as the stall lasts.
+    pub idle_transaction_timeout: Option<Duration>,
+
     /// How often the scheduler re-reads the schedules table for schedules created, changed,
     /// paused or deleted since its last look.
     ///
@@ -165,6 +174,7 @@ impl Config {
             outcome_poll_interval: None,
             listen_queues: None,
             notification_coalesce: None,
+            idle_transaction_timeout: None,
             scheduler_polling_interval: None,
         }
     }
