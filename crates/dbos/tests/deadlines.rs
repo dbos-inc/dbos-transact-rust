@@ -1,12 +1,14 @@
 //! Workflow timeouts: the durable deadline, against real databases.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewWorkflow, Outcome, Timestamp, WorkflowStatus};
-use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
+use dbos::{
+    Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout,
+};
 
 use dbos_test_support::{Backend, TestDatabase, raw_database, test_database};
 
@@ -632,4 +634,195 @@ async fn starting_a_timed_out_workflow_again_does_not_rerun_it() {
         "neither start ran the body again"
     );
     dbos.shutdown().await;
+}
+
+/// A database whose clock runs `seconds` ahead of this process's (behind, when negative), or `None`
+/// on CockroachDB, whose built-ins can't be shadowed.
+///
+/// A `now()` and a `clock_timestamp()` of the database's own shadow the built-ins, because the
+/// database's `search_path` names `pg_catalog` after them: every unqualified call this SDK's
+/// statements make reads the offset clock, and nothing in the SDK is told.
+async fn skewed_database(seconds: i64) -> Option<TestDatabase> {
+    let db = raw_database().await;
+    if db.backend() == Backend::Cockroach {
+        return None;
+    }
+    let pool = db.pool().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA skew; \
+         CREATE FUNCTION skew.now() RETURNS timestamptz LANGUAGE sql STABLE \
+           AS $$ SELECT pg_catalog.now() + interval '{seconds} seconds' $$; \
+         CREATE FUNCTION skew.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE \
+           AS $$ SELECT pg_catalog.clock_timestamp() + interval '{seconds} seconds' $$; \
+         DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = skew, pg_catalog, public', \
+           current_database()); END $$;"
+    )))
+    .execute(&pool)
+    .await
+    .expect("skewing the clock failed");
+    pool.close().await;
+
+    // A connection opened from here on reads the offset clock.
+    let skewed: i64 = sqlx::query_scalar("SELECT (EXTRACT(epoch FROM now()) * 1000)::bigint")
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap();
+    let off = skewed - Timestamp::now().as_epoch_ms();
+    assert!(
+        (off - seconds * 1000).abs() < 5_000,
+        "the database's clock is {off}ms off, not {seconds}s"
+    );
+    Some(db)
+}
+
+/// How long each workflow's body ran before it ended or was dropped, by label.
+type Lifetimes = Arc<Mutex<Vec<(String, Duration)>>>;
+
+/// Records how long a body lived, when it is dropped.
+struct Lifetime {
+    label: String,
+    started: Instant,
+    lifetimes: Lifetimes,
+}
+
+impl Drop for Lifetime {
+    fn drop(&mut self) {
+        self.lifetimes
+            .lock()
+            .unwrap()
+            .push((self.label.clone(), self.started.elapsed()));
+    }
+}
+
+/// **A timeout holds however far the database's clock is from this process's**, for a direct start
+/// and a queued workflow alike: the body runs for its budget, not less, and is cancelled soon after
+/// it, not when the process's clock would say. The offset is far larger than the budget, so a
+/// deadline set or timed on the process's clock would cancel at once or run long past it.
+async fn timeouts_hold_with_the_database_clock_off_by(seconds: i64) {
+    const BUDGET: Duration = Duration::from_millis(600);
+    let Some(db) = skewed_database(seconds).await else {
+        return;
+    };
+    let dbos = DBOS::new(Config {
+        migrate: true,
+        ..sweeping_config("deadline-skew-app", &db)
+    });
+    let lifetimes = Lifetimes::default();
+    let dbos_lifetimes = Arc::clone(&lifetimes);
+    let workflow = dbos
+        .register_workflow("bounded", move |label: String| {
+            let lifetimes = Arc::clone(&dbos_lifetimes);
+            async move {
+                let _lifetime = Lifetime {
+                    label,
+                    started: Instant::now(),
+                    lifetimes,
+                };
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                Ok::<u32, dbos::Error>(1)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "skew-queue",
+        QueueOptions {
+            polling_interval: Duration::from_millis(100),
+            ..QueueOptions::default()
+        },
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("queue registration failed");
+
+    for (label, queue) in [
+        ("direct", None),
+        ("queued", Some(Enqueue::new("skew-queue"))),
+    ] {
+        let direct = queue.is_none();
+        let began = Instant::now();
+        let handle = workflow
+            .start_with(
+                label.to_owned(),
+                StartOptions {
+                    workflow_id: Some(label),
+                    timeout: Timeout::Explicit(BUDGET),
+                    queue,
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("start failed");
+        let error = tokio::time::timeout(Duration::from_secs(10), handle.result())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: still running 10s after it started"))
+            .expect_err("the workflow succeeded");
+        assert!(
+            matches!(error, Error::WorkflowCancelled { .. }),
+            "{label}: expected a cancellation, got {error:?}"
+        );
+        let ended = began.elapsed();
+
+        // The sweep may report the cancel a moment before this process's timer drops the body.
+        let lived = loop {
+            let lived = lifetimes
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(of, _)| of == label)
+                .map(|(_, lived)| *lived);
+            if let Some(lived) = lived {
+                break lived;
+            }
+            assert!(
+                began.elapsed() < ended + Duration::from_secs(1),
+                "{label}: the body was still running a second after the cancel was reported"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            // Loose: the body starts a little after the budget does, once the start or claim has
+            // committed. A deadline on the wrong clock is off by about a minute either way.
+            lived >= BUDGET / 2,
+            "{label}: the body was stopped after {lived:?}, inside its budget"
+        );
+        assert!(
+            ended < Duration::from_secs(4),
+            "{label}: cancelled after {ended:?}, long past its budget"
+        );
+
+        let row = reader(&db)
+            .await
+            .get_workflow(label)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkflowStatus::Cancelled, "{label}");
+        let deadline = row.deadline.expect("the deadline is on the row");
+        if direct {
+            // Set by the insert, on the clock that stamped the row.
+            assert_eq!(
+                deadline.as_epoch_ms(),
+                row.created_at.as_epoch_ms() + BUDGET.as_millis() as i64,
+                "{label}: the deadline is the database's clock at the insert plus the budget"
+            );
+        }
+        let completed = row.completed_at.expect("a cancel stamps completed_at");
+        assert!(
+            completed >= deadline,
+            "{label}: cancelled at {completed:?}, before its deadline {deadline:?}"
+        );
+    }
+
+    dbos.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_timeout_holds_when_the_database_clock_runs_ahead() {
+    timeouts_hold_with_the_database_clock_off_by(60).await;
+}
+
+#[tokio::test]
+async fn a_timeout_holds_when_the_database_clock_runs_behind() {
+    timeouts_hold_with_the_database_clock_off_by(-60).await;
 }

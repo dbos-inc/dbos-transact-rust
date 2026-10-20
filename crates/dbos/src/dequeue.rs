@@ -33,7 +33,7 @@ use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    Applications, QueueRecord, WorkflowFilter, WorkflowRecord, WorkflowStatus,
+    Applications, DatabaseTime, QueueRecord, WorkflowFilter, WorkflowRecord, WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
@@ -581,6 +581,27 @@ async fn dispatch_claimed(
 
     tracing::debug!(workflows = rows.len(), "dequeued workflows");
 
+    // **A reading of the database's clock, for timing the claimed deadlines.** The claim set each
+    // one on that clock, and a wait for it is measured from a reading of it rather than this
+    // host's wall clock. One per batch, and none for a batch with no deadline in it. Taken after
+    // the claim, so a wait measured from it ends late by the round trips between, never early.
+    let clock = if rows.iter().any(|row| row.deadline.is_some()) {
+        match executor.sysdb().database_time().await {
+            Ok(clock) => Some(clock),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    claimed = claimed.len(),
+                    "could not read the database's clock; the claimed workflows stay PENDING for \
+                     recovery"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // **Dispatched in claim order, not in the order the read came back.** The claim sorts its
     // batch into dequeue order and says so, because that order is what `priority` is for; the
     // read that follows is a `list_workflows`, which sorts by `created_at`. Walking the rows as
@@ -603,7 +624,7 @@ async fn dispatch_claimed(
         // Claimed before the dispatch, so the next iteration's counts include it even if this one
         // is still starting. `dispatch` drops the slot itself if it does not spawn.
         let slot = running.claim(&queue.name, partition);
-        if let Err(error) = dispatch(executor, row, owner_xid, Some(slot)).await {
+        if let Err(error) = dispatch(executor, row, owner_xid, clock, Some(slot)).await {
             tracing::warn!(
                 workflow_id,
                 error = %error,
@@ -644,6 +665,7 @@ async fn dispatch(
     executor: &Arc<Executor>,
     row: WorkflowRecord,
     owner_xid: &str,
+    clock: Option<DatabaseTime>,
     slot: Option<Slot>,
 ) -> crate::Result<()> {
     let workflow_id = row.workflow_id;
@@ -730,7 +752,7 @@ async fn dispatch(
         row.input,
         // The row's own tag, which is how its input was written — by this SDK or another.
         row.serialization,
-        row.deadline,
+        clock.and_then(|clock| crate::workflow::Deadline::of(row.deadline, clock)),
         slot,
     );
     Ok(())

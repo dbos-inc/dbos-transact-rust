@@ -74,13 +74,14 @@ use std::time::Duration;
 
 use types::step_names;
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Debounce, DebounceRequest,
-    EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
-    StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
-    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowOwner, WorkflowRecord, WrittenBy,
+    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
+    DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
+    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom,
+    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
+    StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowOwner, WorkflowRecord,
+    WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -153,6 +154,10 @@ pub trait SystemDatabase: Send + Sync {
         workflow: &NewWorkflow,
         caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error>;
+
+    /// The database's clock as of this call, paired with the moment the answer arrived: what a
+    /// wait for a deadline the database set is measured from.
+    async fn database_time(&self) -> Result<DatabaseTime, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error>;
