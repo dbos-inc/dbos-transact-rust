@@ -699,14 +699,26 @@ async fn dispatch(
     // **Only a `PENDING` row can own its outcome.** A row that moved on since the claim
     // (cancelled, resumed, or finished by another execution) would run for nothing, and a resumed
     // one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`, so
-    // running it here while the next sweep claims it again is one workflow executing twice. The
-    // claim's token closes the rest of the window: an execution whose row was handed off after
-    // this read is refused at its first write.
+    // running it here while the next sweep claims it again is one workflow executing twice.
     if row.status != WorkflowStatus::Pending {
         tracing::warn!(
             workflow_id,
             status = %row.status,
             "the dequeued workflow is no longer pending; it is not started"
+        );
+        return Ok(());
+    }
+
+    // **And only while this claim still owns it.** `PENDING` is not enough: between the claim and
+    // the read, the workflow can be resumed or re-enqueued and claimed again, by another executor
+    // or by this one, and is `PENDING` under that claim's token. Running it here would be refused
+    // at its first write, but only after its first step's body had run. Checked before parking
+    // too, so this never parks a workflow another claim is running. A hand-off after this read
+    // is still caught by the owner check at the first write.
+    if row.owner_xid.as_deref() != Some(owner_xid) {
+        tracing::debug!(
+            workflow_id,
+            "the dequeued workflow has been claimed again since; it is not started"
         );
         return Ok(());
     }
@@ -860,5 +872,73 @@ mod tests {
             contention(&sysdb::Error::Malformed("bad row".to_owned())),
             None
         );
+    }
+
+    /// **A claimed row that has been claimed again since is not started.** It is `PENDING`, but
+    /// under another claim's token; running it would execute its first step's body before the
+    /// owner check refused its first write. The same row under its own token starts.
+    #[tokio::test]
+    async fn a_row_claimed_again_since_is_not_started() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            ..crate::Config::new("dispatch-test", db.url())
+        });
+        let runs = Arc::new(AtomicU32::new(0));
+        let dbos_runs = Arc::clone(&runs);
+        dbos.register_workflow("counted", move |()| {
+            let runs = Arc::clone(&dbos_runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, crate::Error>(())
+            }
+        })
+        .unwrap();
+        dbos.launch().await.expect("launch failed");
+        let executor = dbos.executor("test").expect("launched");
+        executor
+            .sysdb()
+            .init_workflow(
+                &crate::sysdb::types::NewWorkflow {
+                    name: Some("counted"),
+                    input: Some("null"),
+                    serialization: Some("rust_serde"),
+                    ..crate::sysdb::types::NewWorkflow::new("wf-reclaimed")
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let row = || async {
+            executor
+                .sysdb()
+                .get_workflow("wf-reclaimed")
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let owner = row().await.owner_xid.expect("a started row is owned");
+
+        dispatch(&executor, row().await, "an-earlier-claim", None, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "a stale claim started it");
+
+        dispatch(&executor, row().await, &owner, None, None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while runs.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the owner's claim never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        dbos.shutdown().await;
     }
 }
