@@ -99,9 +99,9 @@ pub enum Error {
     },
     /// This execution recorded the step already, with a different result.
     ///
-    /// The owner check runs before every step record, in the same transaction, so no other
-    /// execution can have recorded it: the workflow asked for the same step twice, which means
-    /// its code isn't deterministic. Distinguished from this caller's own retry by the completion
+    /// When the recording execution presents its owner token, the check runs before the record in
+    /// the same transaction, so no other execution can have recorded it: the workflow asked for
+    /// the same step twice, which means its code isn't deterministic. Distinguished from this caller's own retry by the completion
     /// timestamp, which a retry repeats.
     StepNondeterminism {
         /// The workflow whose step was recorded twice.
@@ -340,7 +340,7 @@ impl Error {
     ///   the fact, and a recorded failure would outlive the fix.
     /// - **A value this build cannot read.** That says something about the build rather than the
     ///   data; a later build may read it, and a recorded failure would outlive the fix.
-    /// - **Signals about the calling execution** — cancelled, superseded by a rival, or replaying
+    /// - **Signals about the calling execution** — cancelled, no longer the workflow's owner, or replaying
     ///   code that has changed — which end the run rather than answer the call.
     ///
     /// Exhaustive, so a new variant has to be placed on one side or the other.

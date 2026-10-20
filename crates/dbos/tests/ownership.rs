@@ -284,8 +284,17 @@ async fn a_hand_off_during_recv_leaves_the_message_for_the_new_owner() {
         .await
         .expect("start failed");
     gate.entered.notified().await;
-    // Let the first receive record its deadline and start waiting.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Until the first receive has recorded its deadline and is waiting: resumed any earlier, it
+    // would be refused at that record, and its consume never reached.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while step_rows(&db, id).await < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the receive never recorded its deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     dbos.resume::<u32, Error>(id).await.expect("resume failed");
     // Until the new owner is running and waiting too.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

@@ -1788,11 +1788,11 @@ impl Parent<'_> {
     /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
     ///   returns it again on a replay.
     /// - **The record fails**: that failure is returned instead, and the position usually stays
-    ///   unrecorded. A position recorded already is
-    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism). The record is the step row and then the executor claim, as for any step; if
-    ///   the claim fails after the row lands, the caller gets the claim's error but the row stays,
-    ///   so a replay returns the recorded error. The claim's error is database trouble, which
-    ///   leaves the parent `PENDING` rather than ending it.
+    ///   unrecorded: the record is one transaction, so a failure part-way leaves nothing. A position
+    ///   recorded already is [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
+    ///   a parent no longer this execution's is
+    ///   [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict). Database trouble leaves the
+    ///   parent `PENDING` rather than ending it.
     /// - **The error can't be encoded**: a custom serializer can fail for its own reasons. The
     ///   encoding failure is returned and the error logged, so the position stays unrecorded
     ///   rather than the parent acting on an answer nothing recorded.

@@ -331,9 +331,10 @@ pub struct Config<'a> {
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
-    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None` or zero
-    /// leaves the server's own setting, as does a URL that already sets
-    /// `idle_in_transaction_session_timeout`.
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None`, or less
+    /// than a millisecond, leaves the server's own setting, as does a URL that already sets
+    /// `idle_in_transaction_session_timeout`. Longer than [`MAX_IDLE_TRANSACTION_TIMEOUT`] is
+    /// refused.
     ///
     /// The owner check locks a workflow's row until the write it guards commits, so a process that
     /// stalls mid-transaction (a frozen container, a network partition) would otherwise hold that
@@ -365,6 +366,10 @@ impl<'a> Config<'a> {
 
 /// What [`Config::idle_transaction_timeout`] is unless told otherwise.
 pub const DEFAULT_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The longest [`Config::idle_transaction_timeout`] the server takes: the parameter is a 32-bit
+/// count of milliseconds.
+pub const MAX_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(i32::MAX as u64);
 
 /// The polling cap for a pool of `pool_size` connections.
 ///
@@ -469,11 +474,22 @@ impl PostgresSystemDatabase {
             ensure_database_exists(config.url).await?;
         }
 
+        if config
+            .idle_transaction_timeout
+            .is_some_and(|timeout| timeout > MAX_IDLE_TRANSACTION_TIMEOUT)
+        {
+            return Err(Error::InvalidInput {
+                field: "idle_transaction_timeout".into(),
+                detail: format!("must be at most {MAX_IDLE_TRANSACTION_TIMEOUT:?}"),
+            });
+        }
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
-        if let Some(timeout) = config.idle_transaction_timeout.filter(|t| !t.is_zero())
+        if let Some(millis) = config
+            .idle_transaction_timeout
+            .map(|timeout| timeout.as_millis())
+            .filter(|millis| *millis > 0)
             && !config.url.contains("idle_in_transaction_session_timeout")
         {
-            let millis = timeout.as_millis();
             pool = pool.after_connect(move |conn, _| {
                 Box::pin(async move {
                     sqlx::query(AssertSqlSafe(format!(
@@ -831,8 +847,8 @@ impl PostgresSystemDatabase {
     /// a lost acknowledgement, and stamping it per attempt would break that — everywhere but
     /// here. The check and the insert share one transaction, so an attempt that committed and
     /// lost its acknowledgement is caught by `check_step_on` on the next attempt and replayed,
-    /// never reaching the insert. What survives to compare timestamps is a genuine rival, and
-    /// there a differing completion is the right answer.
+    /// never reaching the insert. Nothing that survives to compare timestamps is a lost
+    /// acknowledgement, so there a differing completion is the right answer.
     async fn run_transactional_step<T, F, Fut>(
         &self,
         caller: Option<StepCaller<'_>>,
@@ -2026,8 +2042,8 @@ const VERSION_COLUMNS: &str =
 
 /// The application a row keyed by name should end up owned by, having read which holds it now.
 ///
-/// Not to be confused with `owner_xid`, the other ownership in this schema: that names an
-/// execution attempt, this names an application.
+/// Not to be confused with `owner_xid`, the other ownership in this schema: that names the
+/// execution running a workflow, this names an application.
 ///
 /// A nameless writer leaves an existing owner intact; one whose name already matches proceeds;
 /// one with a *different* name is refused, because taking the row would redirect the holder's
@@ -2290,62 +2306,6 @@ impl PostgresSystemDatabase {
         }
     }
 
-    /// Refuses a cancel or a resume a workflow makes of itself, directly or, with `children`,
-    /// through an ancestor whose tree it is inside.
-    ///
-    /// Both clear the targets' `owner_xid`, and the call is checkpointed as a step of the calling
-    /// workflow in the same transaction, after the owner check: so the caller's own row would no
-    /// longer be its own when its next write came, and it would wait for an outcome nobody is
-    /// computing. A workflow that wants to stop returns or fails instead. Refused before anything
-    /// runs, as a delete of itself is, so the caller hears why and can go on.
-    async fn refuse_self_target(
-        &self,
-        caller_id: &str,
-        targets: &[&str],
-        children: bool,
-        action: &str,
-    ) -> Result<(), Error> {
-        let refused = || Error::InvalidInput {
-            field: "workflow_ids".into(),
-            detail: format!("workflow {caller_id} cannot {action} itself"),
-        };
-        if targets.contains(&caller_id) {
-            return Err(refused());
-        }
-        if !children {
-            return Ok(());
-        }
-        // Up the caller's ancestry, which is short, rather than down every target's tree.
-        let workflow_table = self.tables.workflow_status.as_str();
-        let pool = &self.pool;
-        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
-        let mut current = caller_id.to_owned();
-        loop {
-            let parent: Option<Option<String>> = {
-                let current = current.as_str();
-                with_retry(&self.retry, "refuse_self_target", move || async move {
-                    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
-                        "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
-                    )))
-                    .bind(current)
-                    .fetch_optional(pool)
-                    .await?)
-                })
-                .await?
-            };
-            let Some(parent) = parent.flatten() else {
-                return Ok(());
-            };
-            if targets.contains(&parent.as_str()) {
-                return Err(refused());
-            }
-            if !seen.insert(parent.clone()) {
-                return Ok(());
-            }
-            current = parent;
-        }
-    }
-
     /// Refuses the write this transaction is about to make unless `owner` still owns its
     /// workflow, and locks the workflow's row until the transaction ends, so a hand-off (a cancel,
     /// a resume, a recovery, a claim) can't land between this check and the write. A row with no
@@ -2424,21 +2384,13 @@ impl PostgresSystemDatabase {
             // reverse order — claim, then record — leaves a workflow attributed to an executor
             // with no step to show for it, and nothing later fixes that.
             //
-            // And it is why this is not a transaction, which the ordering makes unnecessary. The
-            // references split on exactly this line: Python claims before inserting and so wraps
-            // both in `engine.begin()`; Java and TypeScript claim after winning and use a plain
-            // connection, as here. A transaction would only hold a `workflow_status` row lock
-            // across two round trips.
-            //
-            // The gap it would close is already covered. A *retryable* failure on the second
-            // statement re-runs this closure, the insert returns our own completion time, and
-            // the claim runs again. A *permanent* one returns an error with the step recorded —
-            // and a caller retrying with the same `StepTiming` is recognised as its own write.
+            // Every caller runs this inside a transaction that opened with the owner check, so the
+            // two statements commit together, and a failure on the second rolls the first back.
             //
             // `DO UPDATE` setting a column to itself rather than `DO NOTHING`: the point is to
             // make `RETURNING` fire on conflict, so the stored completion comes back and can be
-            // compared. `DO NOTHING` returns no row, which cannot tell a rival execution from
-            // this caller's own retry. Python and TypeScript use the same trick; Java uses
+            // compared. `DO NOTHING` returns no row, which cannot tell a step recorded already
+            // from this caller's own retry. Python and TypeScript use the same trick; Java uses
             // `DO NOTHING` and so silently accepts a duplicate.
             //
             // `Option<Option<i64>>`: the outer is "was there a row", the inner is the column,
@@ -4129,6 +4081,54 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn refuse_self_target(
+        &self,
+        caller_id: &str,
+        targets: &[&str],
+        children: bool,
+        action: &str,
+    ) -> Result<(), Error> {
+        let refused = || Error::InvalidInput {
+            field: "workflow_ids".into(),
+            detail: format!("workflow {caller_id} cannot {action} itself"),
+        };
+        if targets.contains(&caller_id) {
+            return Err(refused());
+        }
+        if !children {
+            return Ok(());
+        }
+        // Up the caller's ancestry, which is short, rather than down every target's tree.
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
+        let mut current = caller_id.to_owned();
+        loop {
+            let parent: Option<Option<String>> = {
+                let current = current.as_str();
+                with_retry(&self.retry, "refuse_self_target", move || async move {
+                    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
+                    )))
+                    .bind(current)
+                    .fetch_optional(pool)
+                    .await?)
+                })
+                .await?
+            };
+            let Some(parent) = parent.flatten() else {
+                return Ok(());
+            };
+            if targets.contains(&parent.as_str()) {
+                return Err(refused());
+            }
+            if !seen.insert(parent.clone()) {
+                return Ok(());
+            }
+            current = parent;
+        }
+    }
+
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
@@ -4869,8 +4869,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // holding the topic through it would keep the next `recv` out for no reason.
         drop(subscription);
 
-        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
-        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        // Fixed here rather than inside the retry: `completed_at` is also what recognises this
+        // caller's own re-attempt after a lost acknowledgement, so it must not move between attempts.
         let timing = StepTiming {
             started_at,
             completed_at: Timestamp::now(),
@@ -4910,11 +4910,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?
             {
                 tx.commit().await?;
-                tracing::debug!(
-                    workflow_id,
-                    step_id = step_id,
-                    "adopting a rival execution's recv"
-                );
+                tracing::debug!(workflow_id, step_id = step_id, "replaying recv");
                 return Ok(step.output.map(|value| EncodedValue {
                     value,
                     serialization: step.serialization,
@@ -4938,15 +4934,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // The sender's own payload under the sender's own format, as `get_event` records the
             // publisher's. A timeout records a NULL output.
             //
-            // **A conflict here is reported, and the rollback is what makes that safe.** It means
-            // another execution recorded this step between the check above and this write — at READ
-            // COMMITTED the check ran on an earlier snapshot than the `UPDATE`, so this attempt may
-            // have taken a message. Dropping the transaction un-takes it, so the message stays
-            // available and exactly one execution's `recv` is recorded. Adopting the rival's answer
-            // instead would be defensible, but nothing in this crate does that: the same conflict
-            // from `run_transactional_step` and from `get_event` reaches the caller, and two
-            // executors believing they own one workflow is worth reporting rather than smoothing
-            // over.
+            // **A conflict here is reported, and the rollback is what makes that safe.** With the
+            // owner check first it can only be this execution recording the step twice, which is
+            // nondeterminism; dropping the transaction un-takes whatever this attempt took, so the
+            // message stays available.
             self.record_step_on(
                 &mut tx,
                 workflow_id,
@@ -5317,7 +5308,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         let history = &self.tables.workflow_events_history;
         let (events, history, pool) = (events.as_str(), history.as_str(), &self.pool);
         // Fixed before the retry, like every other step token: a second attempt is recording the
-        // same step, and a fresh clock reading would look like a rival execution.
+        // same step, and a fresh clock reading would look like a step recorded twice.
         let timing = StepTiming {
             started_at: Timestamp::now(),
             completed_at: Timestamp::now(),
@@ -5529,8 +5520,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             return Ok(found);
         };
 
-        // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
-        // caller's own re-attempt from a rival execution, so it must not move between attempts.
+        // Fixed here rather than inside the retry: `completed_at` is also what recognises this
+        // caller's own re-attempt after a lost acknowledgement, so it must not move between attempts.
         let timing = StepTiming {
             started_at,
             completed_at: Timestamp::now(),
@@ -5566,7 +5557,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     workflow_id = caller.workflow_id,
                     step_id = caller.step_id,
                     key,
-                    "adopting a rival execution's get_event"
+                    "replaying get_event"
                 );
                 return Ok(step.output.map(|value| EncodedValue {
                     value,
@@ -5847,7 +5838,7 @@ impl SystemDatabase for PostgresSystemDatabase {
     ) -> Result<(), Error> {
         let versions_table = &self.tables.application_versions;
         // Generated outside the retry, like every other identity here. It matters less than
-        // `owner_xid` does — a retry finds the row already there and claims nothing — but the
+        // `creator_xid` does — a retry finds the row already there and claims nothing — but the
         // rule is worth keeping uniform.
         let version_id = uuid::Uuid::new_v4().to_string();
         let (versions_table, pool, version_id) =
@@ -8500,11 +8491,15 @@ mod tests {
             .unwrap();
         assert_eq!(setting, "1234ms", "the URL's own setting is kept");
 
+        let server: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+            .fetch_one(&other)
+            .await
+            .unwrap();
         let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
         let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
             .fetch_one(&supplied.pool)
             .await
             .unwrap();
-        assert_eq!(setting, "0", "a pool the caller built is left alone");
+        assert_eq!(setting, server, "a pool the caller built is left alone");
     }
 }

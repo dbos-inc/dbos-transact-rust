@@ -2273,6 +2273,64 @@ async fn a_workflow_cannot_cancel_or_resume_itself() {
     dbos.shutdown().await;
 }
 
+/// **Nor from inside one of its steps**, where the call records nothing of its own: the step's
+/// record would be refused, and a resume would have every new execution run the step again and
+/// resume itself again, forever.
+#[tokio::test]
+async fn a_step_cannot_cancel_or_resume_its_own_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("step-self-cancel-app", &db));
+    let workflow = dbos
+        .register_workflow("step-self-targeting", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    dbos::step("kick", || {
+                        let (dbos, own_id) = (dbos.clone(), own_id.clone());
+                        async move {
+                            let cancelled = dbos
+                                .cancel(&own_id)
+                                .await
+                                .expect_err("the step cancelled its workflow")
+                                .to_string();
+                            let resumed = dbos
+                                .resume::<(), Error>(&own_id)
+                                .await
+                                .expect_err("the step resumed its workflow")
+                                .to_string();
+                            Ok::<_, Error>((cancelled, resumed))
+                        }
+                    })
+                    .await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "step-targets-its-workflow";
+    let (cancelled, resumed) = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    assert!(cancelled.contains("cannot cancel itself"), "{cancelled}");
+    assert!(resumed.contains("cannot resume itself"), "{resumed}");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
 /// **Nor cancel an ancestor's tree it is inside**, which reaches it through the cascade rather
 /// than by name.
 #[tokio::test]

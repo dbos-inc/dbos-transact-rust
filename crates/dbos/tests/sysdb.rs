@@ -12478,8 +12478,10 @@ async fn a_stale_execution_writes_nothing() {
     ));
 }
 
-/// **The owner check holds its lock until the write commits**, so a hand-off issued meanwhile
-/// waits behind it rather than landing between the check and the write.
+/// **The lock the owner check takes holds a hand-off back until the write commits**, so a hand-off
+/// issued meanwhile can't land between the check and the write. The lock is taken by hand here,
+/// with the check's own statement, because no write can be paused between its check and its
+/// commit from outside; that every fenced write takes it first is what the stale-write test shows.
 #[tokio::test]
 async fn a_hand_off_waits_for_an_owner_checked_write_to_commit() {
     let (sys, db) = sysdb().await;

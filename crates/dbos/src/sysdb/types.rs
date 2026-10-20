@@ -1207,18 +1207,18 @@ pub struct StepTiming {
     ///
     /// Fixed before the write and **it must not move between retries of the same logical
     /// record**. On a duplicate insert the stored value is compared against this one: equal means
-    /// this caller's own write whose acknowledgement was lost, different means another execution
-    /// recorded the step first. Re-stamping the clock per attempt would turn every lost
+    /// this caller's own write whose acknowledgement was lost, different means the step was
+    /// recorded already, by this execution, which is nondeterminism. Re-stamping the clock per attempt would turn every lost
     /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
     /// than building it at the call site inside a retry loop.
     ///
     /// **A step whose every attempt checks for it before writing is the exception**, and the
     /// internal step runners are the ones that do: a record acknowledged to nobody — a success
     /// committed with the work, or a failure recorded after the work rolled back — is caught by
-    /// the check on the next attempt and replayed, so it never reaches the insert. Only a genuine
-    /// rival survives to be compared there, and a completion that differs from this attempt's is
-    /// the right answer rather than a spurious one — which is why those paths stamp the clock
-    /// after their work rather than before it.
+    /// the check on the next attempt and replayed, so it never reaches the insert. Nothing that
+    /// reaches the comparison there is a lost acknowledgement, so a completion that differs from
+    /// this attempt's is the right answer rather than a spurious one — which is why those paths
+    /// stamp the clock after their work rather than before it.
     ///
     /// Omitting the timing altogether gives up that detection: with no recorded completion there
     /// is nothing to compare, so a duplicate write is accepted rather than reported. Java

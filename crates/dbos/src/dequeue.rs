@@ -675,7 +675,7 @@ async fn dispatch(
     }
 
     // **Only a `PENDING` row can own its outcome.** A row that moved on since the claim
-    // (cancelled, resumed, or finished by a rival execution) would run for nothing, and a resumed
+    // (cancelled, resumed, or finished by another execution) would run for nothing, and a resumed
     // one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`, so
     // running it here while the next sweep claims it again is one workflow executing twice. The
     // claim's token closes the rest of the window: an execution whose row was handed off after

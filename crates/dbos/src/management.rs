@@ -74,8 +74,8 @@
 //! its own, and there is no wrapper left to record one: the atomic version costs the same round
 //! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
 //! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
-//! a second id; and two executions of one workflow racing here both find no checkpoint, where the
-//! transaction lets only the one that wins the step row commit its write.
+//! a second id; and an execution that has been handed off is refused by the owner check before
+//! the write, in the same transaction, so its work never lands.
 //!
 //! **Go draws the same line, from the other side.** Its writes go through `runAsTxn` and its reads
 //! through the plain `RunAsStep`; Python, TypeScript and Java run the whole surface through their
@@ -420,6 +420,8 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "cancel")
+                    .await?;
                 executor
                     .connection()
                     .cancel_all(&[workflow_id], Children::Skip, placement.step_call())
@@ -457,6 +459,14 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(
+                    &executor,
+                    &placement,
+                    workflow_ids,
+                    children == Children::Include,
+                    "cancel",
+                )
+                .await?;
                 executor
                     .connection()
                     .cancel_all(workflow_ids, children, placement.step_call())
@@ -481,15 +491,13 @@ impl DBOS {
     ///
     /// # Resuming a workflow that is still running
     ///
-    /// **Nothing checks for one.** Not being terminal is the whole guard, so a `PENDING` row
-    /// passes — and `PENDING` means *some executor owns this*, not *this has stopped*. Resuming a
-    /// workflow that is executing right now re-enqueues it underneath its own execution: the next
-    /// sweep claims the row and dispatches it, and two executions of one id run concurrently.
-    /// Neither is told about the other, and the running one is not cancelled, so nothing stops it
-    /// at its next step — see the module documentation on why cancelling is the only thing step
-    /// preemption watches for. Both run to a conclusion, one records the outcome and the other's
-    /// write is refused; the row is then tidy, but any step neither had checkpointed is performed
-    /// twice, side effects included.
+    /// **Allowed, and it hands the workflow over.** Not being terminal is the whole guard, so a
+    /// `PENDING` row passes — and `PENDING` means *some executor owns this*, not *this has
+    /// stopped*. Resuming a workflow that is executing right now re-enqueues it and takes it from
+    /// its execution: the next sweep claims the row and dispatches a new one, and the old one's
+    /// next write is refused, so it stops there and its caller gets the new one's outcome. A step
+    /// the old one was running when the hand-off came runs again in the new one, side effects
+    /// included.
     ///
     /// **[`cancel`](Self::cancel) first if the workflow may be live.** That gives the running
     /// execution something to observe, so it abandons its attempt at the next preemptible step
@@ -537,6 +545,8 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "resume")
+                    .await?;
                 executor
                     .connection()
                     .resume_all(&[workflow_id], options, placement.step_call())
@@ -571,6 +581,8 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(&executor, &placement, workflow_ids, false, "resume")
+                    .await?;
                 executor
                     .connection()
                     .resume_all(workflow_ids, options, placement.step_call())
@@ -1347,6 +1359,30 @@ impl crate::Client {
 
 /// The operator surface, on the connection every caller reaches it through.
 ///
+/// Refuses a cancel or a resume of the workflow whose step body is making it.
+///
+/// A call from inside a step body records nothing and carries no caller, so the system database
+/// can't see whose workflow it is in; this asks it with the step's own workflow instead. See
+/// [`refuse_self_target`](crate::sysdb::SystemDatabase::refuse_self_target) for why: a step that
+/// resumed its own workflow would run again in every new execution, and resume it again. A
+/// recorded call is refused by the system database itself.
+async fn refuse_self_target_in_step(
+    executor: &Executor,
+    placement: &StepPlacement,
+    targets: &[&str],
+    children: bool,
+    action: &str,
+) -> Result<()> {
+    if let StepPlacement::InsideStep { ctx } = placement {
+        executor
+            .sysdb()
+            .refuse_self_target(ctx.workflow_id(), targets, children, action)
+            .await
+            .map_err(Error::from_sysdb)?;
+    }
+    Ok(())
+}
+
 /// Each method here is the whole operation — the system-database call, its logging, and the handles
 /// it hands back — and takes `caller` for the one thing the surfaces above it disagree about.
 /// [`DBOS`] passes the workflow it is being called from, so the call checkpoints as a step and a

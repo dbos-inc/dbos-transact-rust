@@ -828,8 +828,8 @@ impl StepPlacement {
     ///
     /// `started_at` is when the operation began rather than when it finished being written down,
     /// so a workflow's timeline shows the wait. It is paired with a completion stamped here, and
-    /// the pair is what makes the write idempotent for this caller and a conflict for a rival —
-    /// see [`StepTiming::completed_at`].
+    /// the pair is what makes the write idempotent for this caller's retry and a conflict for a
+    /// step recorded twice — see [`StepTiming::completed_at`].
     ///
     /// A no-op where nothing is checkpointed, so a caller need not branch: the placement already
     /// decided, and repeating the decision at every call site is how the two halves drift apart.

@@ -191,9 +191,9 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **Losing here is a value; losing in [`record_step`](Self::record_step) is an error.** The
     /// two look parallel and deliberately are not. A workflow whose outcome was recorded by someone
-    /// else has simply been superseded, and the right move is to adopt what is stored — routine
-    /// enough to be a return value. A step recorded by someone else means two executions of one
-    /// workflow are live at the same moment, which every implementation raises on.
+    /// else, or that has been handed to another execution, has simply been superseded, and the
+    /// right move is to adopt what is stored — routine enough to be a return value. A step
+    /// recorded twice is this execution's own nondeterminism, and is raised.
     ///
     /// `owner_xid` is the token of the execution recording it, which must still own the workflow:
     /// one that has been handed off gets `AlreadyFinished` too, and adopts the new owner's outcome.
@@ -506,6 +506,28 @@ pub trait SystemDatabase: Send + Sync {
     /// expiry on the same clock.
     async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
 
+    /// Refuses a cancel or a resume a workflow makes of itself, directly or, with `children`,
+    /// through an ancestor whose tree it is inside.
+    ///
+    /// Both clear the targets' `owner_xid`, so the calling execution's next write (the call's own
+    /// checkpoint, or the record of the step it was made in) would be refused, and the execution
+    /// would wait for an outcome. For a resume nobody ever computes one: each new execution
+    /// replays to the same point, resumes itself again, and the reset attempt count keeps it from
+    /// ever being parked. A workflow that wants to stop returns or fails instead. Refused before
+    /// anything runs, as a delete of itself is, so the caller hears why and can go on.
+    ///
+    /// [`cancel_workflows`](Self::cancel_workflows) and
+    /// [`resume_workflows`](Self::resume_workflows) make this check themselves for a recorded
+    /// caller; the engine calls it directly for a cancel or a resume made inside a step body,
+    /// which records nothing and so passes no caller.
+    async fn refuse_self_target(
+        &self,
+        caller_id: &str,
+        targets: &[&str],
+        children: bool,
+        action: &str,
+    ) -> Result<(), Error>;
+
     /// Cancels workflows, returning the ids that actually moved.
     ///
     /// A workflow that has already finished is left alone rather than reported as an error —
@@ -572,14 +594,13 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
-    /// TODO(dbos-team): UPSTREAM item 27. The only guard is that the row is not terminal, which is
-    /// the predicate all five share — so `PENDING` passes, and resuming a workflow that is
-    /// executing right now re-enqueues it underneath its own execution. The next sweep claims the
-    /// row and dispatches it, and two executions of one id run concurrently: neither is told about
-    /// the other, and the running one is not cancelled, so nothing stops it at its next step. It
-    /// cannot simply be tightened here, because `PENDING` means *owned*, not *running*, and the
-    /// row cannot say whether the owner is alive — a workflow left `PENDING` by a dead node is the
-    /// case an operator most wants to resume by hand.
+    /// The only guard is that the row is not terminal, so `PENDING` passes: resuming a workflow
+    /// that is executing right now re-enqueues it underneath its own execution, and the claim
+    /// that dequeues it starts a new one. Clearing `owner_xid` is what stops the old one: its next
+    /// write is refused, and it waits for the new one's outcome. It can't simply be refused here,
+    /// because `PENDING` means *owned*, not *running*, and the row can't say whether the owner is
+    /// alive — a workflow left `PENDING` by a dead node is the case an operator most wants to
+    /// resume by hand.
     async fn resume_workflows(
         &self,
         workflow_ids: &[&str],
@@ -985,7 +1006,7 @@ pub trait SystemDatabase: Send + Sync {
     /// step is by definition the one running the workflow.
     ///
     /// `owner_xid` is the recording execution's token: given one, the record lands only while the
-    /// workflow is still that execution's (see [`WorkflowOwner`](types::WorkflowOwner)). `None` is a caller that
+    /// workflow is still that execution's (see [`WorkflowOwner`]). `None` is a caller that
     /// is not an execution.
     #[allow(clippy::too_many_arguments)]
     async fn record_step(

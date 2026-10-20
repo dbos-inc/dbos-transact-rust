@@ -138,8 +138,10 @@ pub struct Config {
     /// How long a system-database connection may sit idle inside an open transaction before the
     /// server ends its session.
     ///
-    /// `None` is sixty seconds; `Some(Duration::ZERO)` leaves the server's own setting, as does a
-    /// database URL that already sets `idle_in_transaction_session_timeout`. Every write a workflow
+    /// `None` is sixty seconds; `Some(Duration::ZERO)`, or anything under a millisecond, leaves the
+    /// server's own setting, as does a database URL that already sets
+    /// `idle_in_transaction_session_timeout`. The server takes at most `i32::MAX` milliseconds,
+    /// about 24.8 days, and longer is refused. Every write a workflow
     /// makes locks the workflow's row until it commits, so a process that stalls mid-transaction
     /// would otherwise hold that row for as long as the stall lasts.
     pub idle_transaction_timeout: Option<Duration>,
@@ -230,6 +232,15 @@ impl Config {
                 "`scheduler_polling_interval` cannot be zero".to_owned(),
             ));
         }
+        if self
+            .idle_transaction_timeout
+            .is_some_and(|timeout| timeout > crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT)
+        {
+            return Err(crate::Error::Config(format!(
+                "`idle_transaction_timeout` must be at most {:?}",
+                crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT
+            )));
+        }
         self.serializer.validate()
     }
 
@@ -282,6 +293,30 @@ mod tests {
         assert!(
             err.to_string().contains("outcome_poll_interval"),
             "unlike `notification_coalesce`, zero here is not a setting: {err}"
+        );
+    }
+
+    /// The server takes a 32-bit count of milliseconds, so anything longer is refused here rather
+    /// than failing every connection; zero is a setting, leaving the server's own.
+    #[test]
+    fn an_idle_transaction_timeout_past_the_servers_range_is_refused() {
+        let config = |idle_transaction_timeout| Config {
+            idle_transaction_timeout,
+            app_version: Some("v1".to_owned()),
+            ..Config::new("app", "postgres://x")
+        };
+        assert!(config(Some(Duration::ZERO)).validate().is_ok());
+        assert!(
+            config(Some(crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT))
+                .validate()
+                .is_ok()
+        );
+        let err = config(Some(Duration::from_millis(i32::MAX as u64 + 1)))
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("idle_transaction_timeout"),
+            "{err}"
         );
     }
 
