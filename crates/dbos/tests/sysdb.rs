@@ -663,13 +663,13 @@ async fn only_the_first_outcome_is_recorded() {
     sys.init_workflow(&workflow("wf-race"), None).await.unwrap();
 
     let first = sys
-        .record_workflow_outcome("wf-race", Outcome::Output(Some("\"winner\"")))
+        .record_workflow_outcome("wf-race", Outcome::Output(Some("\"winner\"")), None)
         .await
         .expect("the first write should succeed");
     assert_eq!(first, OutcomeWrite::Recorded);
 
     let second = sys
-        .record_workflow_outcome("wf-race", Outcome::Error("\"loser\""))
+        .record_workflow_outcome("wf-race", Outcome::Error("\"loser\""), None)
         .await
         .expect("the second write should not error");
     assert_eq!(
@@ -690,7 +690,7 @@ async fn only_the_first_outcome_is_recorded() {
 async fn recording_an_outcome_for_a_missing_workflow_is_not_an_error() {
     let (sys, _db) = sysdb().await;
     let result = sys
-        .record_workflow_outcome("never-existed", Outcome::Output(None))
+        .record_workflow_outcome("never-existed", Outcome::Output(None), None)
         .await
         .expect("a missing row should not be an error");
     assert_eq!(result, OutcomeWrite::AlreadyFinished);
@@ -711,7 +711,7 @@ async fn an_await_returns_a_recorded_outcome() {
         sys.init_workflow(&workflow(id), None).await.unwrap();
     }
 
-    sys.record_workflow_outcome("wf-ok", Outcome::Output(Some("\"done\"")))
+    sys.record_workflow_outcome("wf-ok", Outcome::Output(Some("\"done\"")), None)
         .await
         .unwrap();
     assert_eq!(
@@ -726,7 +726,7 @@ async fn an_await_returns_a_recorded_outcome() {
     );
 
     // Not raised: this layer does not deserialize payloads, so a failure is data like any other.
-    sys.record_workflow_outcome("wf-bad", Outcome::Error("\"boom\""))
+    sys.record_workflow_outcome("wf-bad", Outcome::Error("\"boom\""), None)
         .await
         .unwrap();
     assert_eq!(
@@ -745,7 +745,7 @@ async fn an_await_returns_a_recorded_outcome() {
 async fn an_await_reports_a_void_return_as_a_success() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-void"), None).await.unwrap();
-    sys.record_workflow_outcome("wf-void", Outcome::Output(None))
+    sys.record_workflow_outcome("wf-void", Outcome::Output(None), None)
         .await
         .unwrap();
 
@@ -768,7 +768,7 @@ async fn an_await_waits_for_a_workflow_that_has_not_finished() {
     let finishing = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         finisher
-            .record_workflow_outcome("wf-slow", Outcome::Output(Some("\"late\"")))
+            .record_workflow_outcome("wf-slow", Outcome::Output(Some("\"late\"")), None)
             .await
             .unwrap();
     });
@@ -848,7 +848,7 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     let finisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
     for id in &ids {
         finisher
-            .record_workflow_outcome(id, Outcome::Output(Some("\"done\"")))
+            .record_workflow_outcome(id, Outcome::Output(Some("\"done\"")), None)
             .await
             .unwrap();
     }
@@ -996,7 +996,7 @@ async fn an_absent_row_is_waited_through_unless_the_caller_says_otherwise() {
             sys.init_workflow(&workflow("wf-later"), None)
                 .await
                 .unwrap();
-            sys.record_workflow_outcome("wf-later", Outcome::Output(Some("\"arrived\"")))
+            sys.record_workflow_outcome("wf-later", Outcome::Output(Some("\"arrived\"")), None)
                 .await
                 .unwrap();
         }
@@ -1666,7 +1666,7 @@ async fn payloads_can_be_left_unloaded() {
         ..NewWorkflow::new("wf-payload")
     };
     sys.init_workflow(&wf, None).await.unwrap();
-    sys.record_workflow_outcome("wf-payload", Outcome::Output(Some("42")))
+    sys.record_workflow_outcome("wf-payload", Outcome::Output(Some("42")), None)
         .await
         .unwrap();
 
@@ -1792,7 +1792,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
 async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-done"), None).await.unwrap();
-    sys.record_workflow_outcome("wf-done", Outcome::Output(Some("42")))
+    sys.record_workflow_outcome("wf-done", Outcome::Output(Some("42")), None)
         .await
         .unwrap();
 
@@ -2758,7 +2758,7 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
         ..NewWorkflow::new("wf-finished")
     };
     sys.init_workflow(&done, None).await.unwrap();
-    sys.record_workflow_outcome("wf-finished", Outcome::Output(None))
+    sys.record_workflow_outcome("wf-finished", Outcome::Output(None), None)
         .await
         .unwrap();
 
@@ -2904,7 +2904,7 @@ async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
         ..NewWorkflow::new("wf-finished")
     };
     sys.init_workflow(&done, None).await.unwrap();
-    sys.record_workflow_outcome("wf-finished", Outcome::Output(None))
+    sys.record_workflow_outcome("wf-finished", Outcome::Output(None), None)
         .await
         .unwrap();
 
@@ -6508,7 +6508,7 @@ async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
     }
 
     // And the status is the *current* one, so a reader sees the producer stop.
-    sys.record_workflow_outcome("wf-stream", Outcome::Output(Some("\"done\"")))
+    sys.record_workflow_outcome("wf-stream", Outcome::Output(Some("\"done\"")), None)
         .await
         .unwrap();
     let read = sys
@@ -6809,7 +6809,7 @@ async fn finished_stream_writer(
             .await
             .unwrap();
     }
-    sys.record_workflow_outcome(workflow_id, Outcome::Output(None))
+    sys.record_workflow_outcome(workflow_id, Outcome::Output(None), None)
         .await
         .unwrap();
 }
@@ -6921,7 +6921,7 @@ async fn a_rewind_deletes_only_a_close_labelled_as_one() {
     )
     .await
     .unwrap();
-    sys.record_workflow_outcome("wf-lookalike", Outcome::Output(None))
+    sys.record_workflow_outcome("wf-lookalike", Outcome::Output(None), None)
         .await
         .unwrap();
 
@@ -8096,7 +8096,7 @@ async fn a_rename_moves_every_kind_of_row() {
         .await
         .unwrap();
     alpha
-        .record_workflow_outcome("wf-done", Outcome::Output(Some("\"done\"")))
+        .record_workflow_outcome("wf-done", Outcome::Output(Some("\"done\"")), None)
         .await
         .unwrap();
 
@@ -8234,7 +8234,7 @@ async fn a_batched_rename_loses_no_rows() {
                 .unwrap();
         }
         alpha
-            .record_workflow_outcome(&id, Outcome::Output(Some("\"done\"")))
+            .record_workflow_outcome(&id, Outcome::Output(Some("\"done\"")), None)
             .await
             .unwrap();
     }
@@ -9327,7 +9327,7 @@ async fn a_sweep_takes_one_head_per_partition() {
     );
 
     // Once the head finishes, the next one becomes available.
-    sys.record_workflow_outcome("wf-alpha-0", Outcome::Output(Some("\"done\"")))
+    sys.record_workflow_outcome("wf-alpha-0", Outcome::Output(Some("\"done\"")), None)
         .await
         .unwrap();
     assert_eq!(
@@ -9736,7 +9736,7 @@ async fn finishing_releases_the_deduplication_key() {
         ["wf-first"],
     );
     assert_eq!(
-        sys.record_workflow_outcome("wf-first", Outcome::Output(Some("\"done\"")))
+        sys.record_workflow_outcome("wf-first", Outcome::Output(Some("\"done\"")), None)
             .await
             .unwrap(),
         OutcomeWrite::Recorded,
@@ -11295,7 +11295,7 @@ async fn a_replayed_bounce_reports_the_original_holder() {
     assert!(matches!(first, Debounce::Held(_)), "got {first:?}");
 
     // The holder finishes, so a fresh bounce would now report the key unheld.
-    sys.record_workflow_outcome("wf-held", Outcome::Output(Some("\"done\"")))
+    sys.record_workflow_outcome("wf-held", Outcome::Output(Some("\"done\"")), None)
         .await
         .unwrap();
 
@@ -11528,7 +11528,7 @@ async fn payloads_are_written_to_the_payload_tables() {
     assert_eq!(legacy_payloads(&pool, "wf-new").await, (None, None, None));
 
     let outcome = sys
-        .record_workflow_outcome("wf-new", Outcome::Output(Some("\"done\"")))
+        .record_workflow_outcome("wf-new", Outcome::Output(Some("\"done\"")), None)
         .await
         .unwrap();
     assert_eq!(outcome, OutcomeWrite::Recorded);
@@ -11545,7 +11545,7 @@ async fn payloads_are_written_to_the_payload_tables() {
     sys.init_workflow(&workflow("wf-new-failed"), None)
         .await
         .unwrap();
-    sys.record_workflow_outcome("wf-new-failed", Outcome::Error("\"boom\""))
+    sys.record_workflow_outcome("wf-new-failed", Outcome::Error("\"boom\""), None)
         .await
         .unwrap();
     let stored: (Option<String>, Option<String>) = sqlx::query_as(
@@ -11612,7 +11612,7 @@ async fn a_refused_outcome_writes_no_payload() {
         .unwrap();
 
     let outcome = sys
-        .record_workflow_outcome("wf-cancelled", Outcome::Output(Some("\"late\"")))
+        .record_workflow_outcome("wf-cancelled", Outcome::Output(Some("\"late\"")), None)
         .await
         .unwrap();
     assert_eq!(outcome, OutcomeWrite::AlreadyFinished);
@@ -11635,7 +11635,7 @@ async fn a_new_outcome_hides_a_legacy_one() {
     .await
     .unwrap();
 
-    sys.record_workflow_outcome("wf-retried", Outcome::Output(Some("\"second run\"")))
+    sys.record_workflow_outcome("wf-retried", Outcome::Output(Some("\"second run\"")), None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-retried").await.unwrap().unwrap();
@@ -11702,7 +11702,7 @@ async fn deleting_a_workflow_removes_its_payloads_and_steps() {
     )
     .await
     .unwrap();
-    sys.record_workflow_outcome("wf-doomed-payload", Outcome::Output(Some("1")))
+    sys.record_workflow_outcome("wf-doomed-payload", Outcome::Output(Some("1")), None)
         .await
         .unwrap();
 
@@ -11839,7 +11839,7 @@ async fn the_timeout_sweep_cancels_expired_workflows_nobody_is_running() {
         sys.init_workflow(wf, None).await.unwrap();
     }
     alpha
-        .record_workflow_outcome("wf-done", Outcome::Output(Some("1")))
+        .record_workflow_outcome("wf-done", Outcome::Output(Some("1")), None)
         .await
         .unwrap();
     assert_eq!(
@@ -11919,4 +11919,117 @@ async fn the_timeout_sweep_takes_the_oldest_deadlines_first_up_to_its_limit() {
         sys.cancel_timed_out_workflows(2).await.unwrap(),
         ["wf-third"]
     );
+}
+
+/// **The owner token through a workflow's life.** A claim writes its own token, a different one
+/// per claim; an outcome write lands only for the current owner; and every hand-off (a cancel, a
+/// resume, recovery's re-enqueue, and the outcome itself) clears it, so the execution that held
+/// it is refused at its next write.
+#[tokio::test]
+async fn the_owner_token_follows_claims_and_is_cleared_by_every_hand_off() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("owned"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let queue = sys.get_queue("owned").await.unwrap().unwrap();
+    let queued = NewWorkflow {
+        queue_name: Some("owned"),
+        executor_id: Some("local"),
+        application_version: Some("v1"),
+        ..workflow("wf-token")
+    };
+    sys.init_workflow(&queued, None).await.unwrap();
+    assert_eq!(
+        workflow_owner(&sys, "wf-token").await,
+        None,
+        "nobody owns a queued workflow"
+    );
+
+    sys.start_queued_workflows(&queue, "local", "v1", "claim-1", None, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        workflow_owner(&sys, "wf-token").await.as_deref(),
+        Some("claim-1")
+    );
+
+    sys.reenqueue_for_recovery(&["local"], "v1", INTERNAL_QUEUE)
+        .await
+        .unwrap();
+    assert_eq!(
+        workflow_owner(&sys, "wf-token").await,
+        None,
+        "recovery's re-enqueue clears it"
+    );
+
+    // Back on its own queue, which recovery keeps.
+    sys.start_queued_workflows(&queue, "local", "v1", "claim-2", None, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        workflow_owner(&sys, "wf-token").await.as_deref(),
+        Some("claim-2"),
+        "each claim writes its own token"
+    );
+
+    assert_eq!(
+        sys.record_workflow_outcome("wf-token", Outcome::Output(Some("1")), Some("claim-1"))
+            .await
+            .unwrap(),
+        OutcomeWrite::AlreadyFinished,
+        "a superseded execution's outcome is refused"
+    );
+    assert_eq!(
+        sys.get_workflow("wf-token").await.unwrap().unwrap().status,
+        WorkflowStatus::Pending
+    );
+
+    sys.resume_workflows(&["wf-token"], Some("owned"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        workflow_owner(&sys, "wf-token").await,
+        None,
+        "a resume clears it"
+    );
+
+    sys.start_queued_workflows(&queue, "local", "v1", "claim-3", None, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.record_workflow_outcome("wf-token", Outcome::Output(Some("1")), Some("claim-3"))
+            .await
+            .unwrap(),
+        OutcomeWrite::Recorded
+    );
+    assert_eq!(
+        workflow_owner(&sys, "wf-token").await,
+        None,
+        "the outcome clears it"
+    );
+
+    sys.init_workflow(&workflow("wf-token-cancel"), None)
+        .await
+        .unwrap();
+    sys.cancel_workflows(&["wf-token-cancel"], false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.get_workflow("wf-token-cancel")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_xid,
+        None,
+        "a cancel clears it"
+    );
+}
+
+/// The row's `owner_xid`.
+async fn workflow_owner(sys: &PostgresSystemDatabase, workflow_id: &str) -> Option<String> {
+    sys.get_workflow(workflow_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_xid
 }

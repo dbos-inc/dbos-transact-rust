@@ -2405,9 +2405,11 @@ impl PostgresSystemDatabase {
         // was cancelled *did* start, so clearing the column discards true information and hides the
         // row from `started_after`/`started_before`. Kept anyway — diverging from four
         // implementations on a durable column is the worse trade.
+        // `owner_xid` is cleared so the execution running a cancelled workflow, should it still
+        // be writing, is refused at its next write.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET status = 'CANCELLED', queue_name = NULL, \
-             deduplication_id = NULL, started_at_epoch_ms = NULL, \
+             deduplication_id = NULL, started_at_epoch_ms = NULL, owner_xid = NULL, \
              updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL} \
              WHERE workflow_uuid = ANY($1) \
                AND status NOT IN ('SUCCESS', 'ERROR', 'CANCELLED') \
@@ -3420,6 +3422,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         outcome: Outcome<'_>,
+        owner_xid: Option<&str>,
     ) -> Result<OutcomeWrite, Error> {
         let (workflow_table, output_table, pool) = (
             self.tables.workflow_status.as_str(),
@@ -3431,9 +3434,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "record_workflow_outcome", move || async move {
             let mut tx = pool.begin().await?;
 
-            // The `status = 'PENDING'` predicate is the whole mechanism: an executor that has
-            // been presumed dead and superseded finds zero rows updated, and learns it lost
-            // rather than clobbering the winner's result. It also makes this retry-safe — a
+            // The `status = 'PENDING'` and owner predicates are the whole mechanism: an execution
+            // that has been superseded (presumed dead and recovered, resumed, or cancelled and
+            // resumed) finds zero rows updated, and learns it lost rather than clobbering the
+            // winner's result. The owner is cleared with the write, since no execution holds a
+            // finished workflow. It also makes this retry-safe — a
             // retry after a lost acknowledgement finds its own write and reports
             // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
             // Finishing releases the deduplication key, as it does in all four implementations.
@@ -3447,11 +3452,13 @@ impl SystemDatabase for PostgresSystemDatabase {
             let updated = sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} SET status = $2, output = NULL, error = NULL, \
                  updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}, \
-                 deduplication_id = NULL \
-                 WHERE workflow_uuid = $1 AND status = 'PENDING'"
+                 deduplication_id = NULL, owner_xid = NULL \
+                 WHERE workflow_uuid = $1 AND status = 'PENDING' \
+                   AND ($3::text IS NULL OR owner_xid = $3)"
             )))
             .bind(workflow_id)
             .bind(outcome.status().as_str())
+            .bind(owner_xid)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -4086,10 +4093,12 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                     // `completed_at` and `started_at_epoch_ms` are cleared as well as the
                     // counters: the workflow is going to run again, and leaving them set would
-                    // date it to its last attempt.
+                    // date it to its last attempt. `owner_xid` is cleared because the claim that
+                    // dequeues it is the next owner: an execution still running a resumed `PENDING`
+                    // workflow is refused at its next write rather than running beside it.
                     let resumed: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                         "UPDATE {workflow_table} SET status = 'ENQUEUED', queue_name = $2, \
-                         recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, \
+                         recovery_attempts = 0, workflow_deadline_epoch_ms = NULL, owner_xid = NULL, \
                          deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL, \
                          updated_at = {NOW_MS_SQL} \
                          WHERE workflow_uuid = ANY($1) AND status NOT IN ('SUCCESS', 'ERROR') \

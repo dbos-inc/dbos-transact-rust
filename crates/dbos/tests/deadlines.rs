@@ -279,7 +279,7 @@ async fn a_deadline_that_loses_to_a_recorded_outcome_reports_that_outcome() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     let reader = reader(&db).await;
     reader
-        .record_workflow_outcome(id, Outcome::Output(Some("7")))
+        .record_workflow_outcome(id, Outcome::Output(Some("7")), None)
         .await
         .expect("the rival could not record its outcome");
 

@@ -2041,6 +2041,8 @@ async fn execute(
     // value this `select!` is watching — so one copy travels with the context and nothing can hand
     // the two halves different instants.
     let deadline = ctx.deadline();
+    // Kept for the outcome write, which only lands while this execution still owns the workflow.
+    let owner_xid = ctx.owner_xid().to_owned();
     let outcome = match run_until_deadline(
         deadline,
         Ctx::scope(ctx, async move {
@@ -2058,7 +2060,11 @@ async fn execute(
         Ok(output) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Output(output.encoded.as_deref()))
+                .record_workflow_outcome(
+                    workflow_id,
+                    Outcome::Output(output.encoded.as_deref()),
+                    Some(&owner_xid),
+                )
                 .await
         }
         // Another execution checkpointed a step this one was about to, so it is ahead and this
@@ -2096,7 +2102,11 @@ async fn execute(
         Err(Failure::Recorded(recorded)) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded))
+                .record_workflow_outcome(
+                    workflow_id,
+                    Outcome::Error(&recorded.encoded),
+                    Some(&owner_xid),
+                )
                 .await
         }
     }

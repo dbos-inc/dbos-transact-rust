@@ -194,10 +194,15 @@ pub trait SystemDatabase: Send + Sync {
     /// else has simply been superseded, and the right move is to adopt what is stored — routine
     /// enough to be a return value. A step recorded by someone else means two executions of one
     /// workflow are live at the same moment, which every implementation raises on.
+    ///
+    /// `owner_xid` is the token of the execution recording it, which must still own the workflow:
+    /// one that has been handed off gets `AlreadyFinished` too, and adopts the new owner's outcome.
+    /// `None` skips that check, for a caller that is not an execution. The write clears the owner.
     async fn record_workflow_outcome(
         &self,
         workflow_id: &str,
         outcome: Outcome<'_>,
+        owner_xid: Option<&str>,
     ) -> Result<OutcomeWrite, Error>;
 
     /// Waits for a workflow to finish and reports how it did.

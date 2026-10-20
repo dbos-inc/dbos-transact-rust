@@ -1287,7 +1287,8 @@ impl WorkflowDelay {
 pub enum OutcomeWrite {
     /// This process recorded the outcome.
     Recorded,
-    /// Another process got there first, and the row is already terminal.
+    /// Another execution got there first, and the row is already terminal, or this execution no
+    /// longer owns the workflow.
     ///
     /// Not an error: the caller has lost a race it was allowed to lose, and should adopt the
     /// recorded outcome rather than overwrite it.
