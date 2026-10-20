@@ -6,8 +6,9 @@
 //! inherited its parent's deadline, or a `PENDING` workflow whose executor died. See
 //! [`cancel_timed_out_workflows`](crate::sysdb::SystemDatabase::cancel_timed_out_workflows).
 //!
-//! A workflow running in this process doesn't wait for the sweep: its own timer ends the body at
-//! the deadline, and the execution records the timeout itself, on the same database clock. See
+//! A workflow running in this process usually doesn't wait for the sweep: its own timer ends the
+//! body at the deadline, and the execution records the timeout itself once the database's clock
+//! agrees it has passed. Only when that clock hasn't yet does the execution wait for the sweep. See
 //! `run_until_deadline` and `time_out` in the workflow module.
 
 use std::sync::Arc;

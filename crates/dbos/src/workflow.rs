@@ -22,7 +22,7 @@ use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCaller, StepTiming,
-    Submission, TimeoutCheck, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
+    Submission, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -1982,13 +1982,12 @@ enum Ended {
 
 /// Records the timeout of a workflow whose local timer fired, and settles on what the row holds.
 ///
-/// **Cancelled only once the database's clock says the deadline has passed**, the same test the
-/// timeout sweep makes, so a process clock running ahead doesn't cancel a workflow early. Until
-/// then this sleeps for as long as the database says is left, capped at the outcome-poll interval,
-/// and asks again; after a failed write it waits the full interval. It stops as soon as the row
-/// has settled, whoever settled it: this cancel, the sweep, an explicit cancel, or another
-/// execution that recorded an outcome first, which is then this caller's answer. That includes an
-/// execution resumed meanwhile, whose outcome this then waits for rather than overwrites.
+/// **Cancelled only if the database's clock says the deadline has passed**, the same test the
+/// timeout sweep makes, so a timer that fired early doesn't cancel a workflow early. Whatever the
+/// cancel finds, the outcome is what the row records: this cancel, or what settled the row first
+/// (the sweep, an explicit cancel, or another execution, including one resumed meanwhile, whose
+/// outcome this then waits for rather than overwrites). A row the cancel left unsettled is waited
+/// on until the sweep records its timeout.
 ///
 /// The queue slot is given up first: the body is gone, and waiting here does no work a queue's
 /// concurrency limit should count.
@@ -1998,25 +1997,17 @@ async fn time_out(
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
     drop(slot);
-    let poll = executor.connection().outcome_poll_interval();
-    loop {
-        let wait = match executor.sysdb().cancel_if_timed_out(workflow_id).await {
-            Ok(TimeoutCheck::Cancelled) => {
-                tracing::info!(
-                    workflow_id,
-                    "the workflow exceeded its deadline and is cancelled"
-                );
-                break;
-            }
-            // Deleted mid-run: the adopt below reports it.
-            Ok(TimeoutCheck::Settled | TimeoutCheck::Missing) => break,
-            Ok(TimeoutCheck::NotYet { remaining }) => remaining.map_or(poll, |left| left.min(poll)),
-            Err(error) => {
-                tracing::warn!(workflow_id, %error, "could not record the deadline cancellation");
-                poll
-            }
-        };
-        tokio::time::sleep(wait).await;
+    match executor.sysdb().cancel_if_timed_out(workflow_id).await {
+        Ok(true) => {
+            tracing::info!(
+                workflow_id,
+                "the workflow exceeded its deadline and is cancelled"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(workflow_id, %error, "could not record the deadline cancellation");
+        }
     }
     // This execution read the row to run it, so an absence now is a delete, not a race.
     executor.connection().adopt(workflow_id, true).await

@@ -79,9 +79,8 @@ use types::{
     Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
     OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
     ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
-    StepTiming, StreamRead, StreamRecord, Submission, TimeoutCheck, Timestamp, UpdatedQueue,
-    UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord,
-    WrittenBy,
+    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
+    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -487,14 +486,13 @@ pub trait SystemDatabase: Send + Sync {
     async fn cancel_timed_out_workflows(&self, limit: i64) -> Result<Vec<String>, Error>;
 
     /// Cancels one workflow if it is unsettled and the database's clock has passed its deadline,
-    /// and otherwise reports where the row stands.
+    /// reporting whether it did.
     ///
     /// What an execution whose local timer has fired uses, so its timeout doesn't depend on the
     /// sweep reaching the row. It writes what
     /// [`cancel_timed_out_workflows`](Self::cancel_timed_out_workflows) writes, and decides
-    /// expiry on the same clock. When that clock hasn't reached the deadline yet, it reports how
-    /// far off it is, so the caller can wait exactly that long rather than poll.
-    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<TimeoutCheck, Error>;
+    /// expiry on the same clock.
+    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
 
     /// Cancels workflows, returning the ids that actually moved.
     ///

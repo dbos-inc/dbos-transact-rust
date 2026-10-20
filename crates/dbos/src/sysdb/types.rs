@@ -1195,23 +1195,6 @@ pub enum AwaitedOutcome {
     },
 }
 
-/// What [`cancel_if_timed_out`](crate::sysdb::SystemDatabase::cancel_if_timed_out) found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimeoutCheck {
-    /// The deadline had passed on the database's clock, and this call cancelled the workflow.
-    Cancelled,
-    /// The workflow had already settled, whoever settled it.
-    Settled,
-    /// The workflow is unsettled and its deadline hasn't passed on the database's clock.
-    NotYet {
-        /// How long until it does, on that clock: zero if it passed between the cancel and the
-        /// read, `None` if the row has no deadline.
-        remaining: Option<Duration>,
-    },
-    /// No such workflow.
-    Missing,
-}
-
 /// When a step ran, start and finish together.
 ///
 /// A pair rather than two fields because the database records completed steps: a start with no

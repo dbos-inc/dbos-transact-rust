@@ -89,8 +89,8 @@ use super::types::{
     NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    TimeoutCheck, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
@@ -3937,7 +3937,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<TimeoutCheck, Error> {
+    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         with_retry(&self.retry, "cancel_if_timed_out", move || async move {
@@ -3950,27 +3950,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .execute(pool)
             .await?
             .rows_affected();
-            if moved > 0 {
-                return Ok(TimeoutCheck::Cancelled);
-            }
-            // The remaining time is taken on the database's clock, the one the cancel tests.
-            let row: Option<(String, Option<i64>)> = sqlx::query_as(AssertSqlSafe(format!(
-                "SELECT status, workflow_deadline_epoch_ms - {NOW_MS_SQL} \
-                 FROM {workflow_table} WHERE workflow_uuid = $1"
-            )))
-            .bind(workflow_id)
-            .fetch_optional(pool)
-            .await?;
-            let Some((status, remaining_ms)) = row else {
-                return Ok(TimeoutCheck::Missing);
-            };
-            if !parse_workflow_status(&status)?.is_active() {
-                return Ok(TimeoutCheck::Settled);
-            }
-            Ok(TimeoutCheck::NotYet {
-                // Negative once the deadline passed after the cancel above: none left.
-                remaining: remaining_ms.map(|ms| duration_from_ms(ms).unwrap_or(Duration::ZERO)),
-            })
+            Ok(moved > 0)
         })
         .await
     }
