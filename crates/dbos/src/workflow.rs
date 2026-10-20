@@ -1947,8 +1947,8 @@ pub(crate) struct Deadline {
 }
 
 impl Deadline {
-    /// The deadline `init_workflow` reported, timed from the reading of the database's clock that
-    /// came back with it.
+    /// A deadline the database set, timed from a reading of the database's clock: the one
+    /// `init_workflow` returned with it, or a dequeue's reading for its batch.
     pub(crate) fn of(at: Option<Timestamp>, clock: DatabaseTime) -> Option<Self> {
         at.map(|at| Self {
             at,

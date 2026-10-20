@@ -2892,7 +2892,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Derived, never supplied: a caller cannot enqueue a workflow and label it SUCCESS.
         let initial_status = workflow.initial_status();
         // Queued workflows are not running, so neither the attempt counter nor the executor
-        // stamp applies to them — both `CASE` expressions below turn on that distinction.
+        // stamp applies to them: a queued row starts at zero attempts, and the `executor_id`
+        // `CASE` below keeps the stored stamp for one.
         let queued = matches!(
             initial_status,
             WorkflowStatus::Enqueued | WorkflowStatus::Delayed
@@ -6262,13 +6263,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // **`recovery_attempts` is counted here, and only here.** This is the transition that
             // starts a workflow, and since recovery re-enqueues rather than re-invoking, it is the
             // transition every recovered workflow makes too — so a budget counted anywhere else is
-            // a budget never spent. `init_workflow`'s `ON CONFLICT` deliberately does not count it:
-            // that arm is Java's, and Java can own the count because Java re-invokes a `PENDING`
-            // row instead of re-enqueueing it, so its upsert sees the claim this statement sees.
-            // The three implementations that re-enqueue all count in their claim exactly here — go
-            // `system_database.go`, ts `system_database.ts` (in both of its claim paths), python
-            // `_sys_db.py`, whose comment says it outright: *"Count this dispatch against the DLQ
-            // limit; no later insert does it."*
+            // a budget never spent. The dispatch that follows reads the count this writes, and
+            // parks the row once it is past the limit.
             //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
             // already moved the row, so a loser matches nothing, charges the workflow nothing, and

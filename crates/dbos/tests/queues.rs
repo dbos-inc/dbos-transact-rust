@@ -625,6 +625,91 @@ async fn a_queued_workflow_with_a_legacy_input_runs_with_it() {
     dbos.shutdown().await;
 }
 
+/// **A dequeue parks a workflow past its recovery limit instead of running it**, and runs one
+/// at the limit. The claim counts the attempt it starts, and the dispatch reads that count: with
+/// the shared limit of 100, a row the claim takes to 102 is parked and one it takes to 101 runs.
+///
+/// The counts are written while the workflows sit on a queue nothing polls yet, then the queue is
+/// registered so the real dequeue takes both.
+#[tokio::test]
+async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-dead-letter-app", &db));
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let workflow = dbos
+        .register_workflow("counted", {
+            let ran = Arc::clone(&ran);
+            move |name: String| {
+                let ran = Arc::clone(&ran);
+                async move {
+                    ran.lock().unwrap().push(name);
+                    Ok::<_, Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let mut handles = Vec::new();
+    for id in ["at-the-limit", "past-the-limit"] {
+        handles.push(
+            workflow
+                .start_with(
+                    id.to_owned(),
+                    StartOptions {
+                        workflow_id: Some(id),
+                        queue: Some(Enqueue::new("dead-letter-queue")),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+                .expect("enqueue failed"),
+        );
+    }
+    let pool = db.pool().await;
+    for (id, attempts) in [("at-the-limit", 100), ("past-the-limit", 101)] {
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_status" SET recovery_attempts = $2 WHERE workflow_uuid = $1"#,
+        )
+        .bind(id)
+        .bind(attempts as i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    dbos.register_queue(
+        "dead-letter-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    let mut handles = handles.into_iter();
+    tokio::time::timeout(Duration::from_secs(10), handles.next().unwrap().result())
+        .await
+        .expect("the workflow at the limit never ran")
+        .expect("the workflow at the limit failed");
+
+    let sys = reader(&db).await;
+    let parked = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row = sys.get_workflow("past-the-limit").await.unwrap().unwrap();
+            if row.status != WorkflowStatus::Enqueued && row.status != WorkflowStatus::Pending {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the workflow past the limit was never dispatched");
+    assert_eq!(parked.status, WorkflowStatus::MaxRecoveryAttemptsExceeded);
+    assert_eq!(parked.recovery_attempts, 102);
+    assert_eq!(*ran.lock().unwrap(), ["at-the-limit"]);
+
+    dbos.shutdown().await;
+}
+
 /// **A queued workflow's budget becomes a deadline on dequeue, not at enqueue.**
 ///
 /// The timeout is recorded and the deadline left null, so a workflow that waits an hour in a queue

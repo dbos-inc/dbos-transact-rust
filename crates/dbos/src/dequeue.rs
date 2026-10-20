@@ -566,8 +566,9 @@ async fn dispatch_claimed(
 
     // **A reading of the database's clock, for timing the claimed deadlines.** The claim set each
     // one on that clock, and a wait for it is measured from a reading of it rather than this
-    // host's wall clock. One per batch, and none for a batch with no deadline in it. Taken after
-    // the claim, so a wait measured from it ends late by the round trips between, never early.
+    // host's wall clock. One per batch, and none for a batch with no deadline in it. A wait
+    // measured from it ends late by the reading's return trip, never early. Without one, the rows
+    // with a deadline stay `PENDING` for recovery, and the rest are dispatched.
     let clock = if rows.iter().any(|row| row.deadline.is_some()) {
         match executor.sysdb().database_time().await {
             Ok(clock) => Some(clock),
@@ -575,10 +576,10 @@ async fn dispatch_claimed(
                 tracing::warn!(
                     error = %error,
                     claimed = claimed.len(),
-                    "could not read the database's clock; the claimed workflows stay PENDING for \
-                     recovery"
+                    "could not read the database's clock; the claimed workflows with a deadline \
+                     stay PENDING for recovery"
                 );
-                return;
+                None
             }
         }
     } else {
@@ -600,6 +601,10 @@ async fn dispatch_claimed(
         let Some(row) = by_id.remove(id) else {
             continue;
         };
+        // Its deadline can't be timed, and was logged above with the clock's failure.
+        if row.deadline.is_some() && clock.is_none() {
+            continue;
+        }
         let workflow_id = row.workflow_id.clone();
         // The row's own key rather than the one being swept, so the batched path — which names no
         // partition and claims across all of them — still credits each tally correctly.
@@ -622,11 +627,10 @@ async fn dispatch_claimed(
 /// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
 /// describes — look the registration up by the row's own name, check the row is still `PENDING`,
 /// and spawn — and that is what this does. It takes the row rather than fetching it because the
-/// claim already read every row it took in one round trip, which is the shape Python's
-/// `start_dequeued_workflows` chose and the reason
+/// claim already read every row it took in one round trip, which is the reason
 /// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
 ///
-/// **The registry is consulted before the row is claimed, and that is harmless rather than
+/// **The registry is consulted after the row is claimed, and that is harmless rather than
 /// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
 /// stamped `executor_id` before this is reached, so there is nothing for the order to save. What
 /// it does mean is that a row this process cannot run is never parked, however many attempts it
