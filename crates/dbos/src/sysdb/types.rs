@@ -33,7 +33,7 @@
 
 use super::Error;
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// An instant, as epoch milliseconds.
@@ -516,11 +516,14 @@ pub struct NewWorkflow<'a> {
     pub debounce_deadline: Option<Timestamp>,
 
     /// Wall-clock budget for the whole workflow.
+    ///
+    /// A workflow inserted `PENDING` with no `deadline` gets one from this, on the database's
+    /// clock as the insert runs; a queued or delayed one gets it when a dequeue claims it.
     pub timeout: Option<Duration>,
     /// Absolute expiry, when the parent already fixed one.
     ///
     /// Distinct from `timeout` because a child inherits its parent's deadline rather than
-    /// restarting the clock.
+    /// restarting the clock. Kept as given, whatever `timeout` says.
     pub deadline: Option<Timestamp>,
 
     /// The executor claiming this workflow.
@@ -1322,6 +1325,38 @@ pub enum OutcomeWrite {
     AlreadyFinished,
 }
 
+/// A reading of the system database's clock, carried forward by this process's monotonic clock.
+///
+/// Workflow deadlines are set and compared on the database's clock, which every executor sharing
+/// the database shares. A wait for one is measured from a reading of that clock on
+/// [`Instant`], which no setting of this host's wall clock moves, so a host whose clock is far off
+/// the database's waits exactly as long as one whose clock agrees.
+///
+/// The reading is taken when the statement that returns it arrives, so it misses the trip back
+/// from the database: a wait measured from it ends that much late, never early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseTime {
+    epoch_ms: i64,
+    read_at: Instant,
+}
+
+impl DatabaseTime {
+    /// A reading of `epoch_ms`, taken now.
+    pub fn read(epoch_ms: i64) -> Self {
+        Self {
+            epoch_ms,
+            read_at: Instant::now(),
+        }
+    }
+
+    /// When, on this process's monotonic clock, the database's clock reaches `instant`: the
+    /// moment of the reading for an instant already behind it.
+    pub fn reaches(self, instant: Timestamp) -> Instant {
+        let ahead = instant.as_epoch_ms().saturating_sub(self.epoch_ms);
+        self.read_at + Duration::from_millis(u64::try_from(ahead).unwrap_or(0))
+    }
+}
+
 /// What the database said about a workflow after initialising it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowInitResult {
@@ -1332,8 +1367,11 @@ pub struct WorkflowInitResult {
     /// The workflow's absolute expiry, as the database now holds it.
     ///
     /// Reported back because it may not be the one offered: a timeout is turned into a deadline
-    /// against the database layer's clock, and an existing row keeps the deadline it already had.
+    /// against the database's clock, and an existing row keeps the deadline it already had.
     pub deadline: Option<Timestamp>,
+    /// The database's clock as the same statement saw it, which is what a wait for `deadline` is
+    /// measured from.
+    pub clock: DatabaseTime,
     /// The serialization format actually stored.
     ///
     /// May differ from what the caller offered: the first writer decides the format, and every

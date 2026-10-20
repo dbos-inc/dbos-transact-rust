@@ -742,7 +742,7 @@ async fn dispatch(
         row.input,
         // The row's own tag, which is how its input was written — by this SDK or another.
         row.serialization,
-        initialized.deadline,
+        crate::workflow::Deadline::of(initialized.deadline, initialized.clock),
         slot,
     );
     Ok(())

@@ -83,9 +83,9 @@ use std::time::Duration;
 
 use super::types::step_names;
 use super::types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, Debounce,
-    DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
-    GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
+    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
+    Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
+    ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
     NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
@@ -1768,8 +1768,10 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// with its payloads' stamps the same way. One clock, so these comparisons mean the same thing
 /// everywhere.
 ///
-/// Times a caller supplies or resolves still come from the process clock: delays, deadlines, step
-/// timings, durable sleep, and the `version_timestamp` a promotion writes.
+/// Workflow deadlines are on this clock too: a timeout becomes one at the insert or the claim, and
+/// the sweep and a run's own timeout compare against it. Times a caller supplies or resolves still
+/// come from the process clock: delays, step timings, durable sleep, and the `version_timestamp` a
+/// promotion writes.
 ///
 /// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
 /// and the stamp taken later in the same transaction agree on one instant.
@@ -2914,7 +2916,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         // run by any executor sharing this database relies on that: a payload stamped before its
         // workflow's `created_at` can be swept while the workflow is live, and a process clock
         // running ahead of the database's would do exactly that. A retry re-reads `now()`, which
-        // only moves the stamps later, and later is safe.
+        // only moves the stamps later, and later is safe. A deadline the insert computes from a
+        // timeout is read the same way, so a retried insert starts the budget when it lands, which
+        // is also when the workflow can first start.
         //
         // The delay is the exception. It is a duration resolved to an instant, so it is read once
         // here, outside the retry: re-reading it on every attempt would release the workflow late
@@ -2989,8 +2993,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                  parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
                  debounce_deadline_epoch_ms, is_debounced, application_name) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                 {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, $19, $20, $21, $22, $23::jsonb, $24, $25, \
-                 $26, $27) \
+                 {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, \
+                 COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {NOW_MS_SQL} + $18 END), \
+                 $20, $21, $22, $23::jsonb, $24, $25, $26, $27) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    recovery_attempts = CASE \
                        WHEN {workflow_table}.status != 'ENQUEUED' AND {workflow_table}.status != 'DELAYED' \
@@ -3008,7 +3013,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                        ELSE {workflow_table}.executor_id \
                    END \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
-                 workflow_deadline_epoch_ms, owner_xid, serialization"
+                 workflow_deadline_epoch_ms, owner_xid, serialization, {NOW_MS_SQL} AS db_now"
             )))
             .bind(workflow.workflow_id)
             .bind(initial_status.as_str())
@@ -3078,6 +3083,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 other => other,
             })?;
 
+            // First, so the reading is paired with the moment the row arrived.
+            let clock = DatabaseTime::read(row.try_get("db_now")?);
             let recovery_attempts: i64 = row.try_get("recovery_attempts")?;
             let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;
             let stored_owner: Option<String> = row.try_get("owner_xid")?;
@@ -3224,6 +3231,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 status,
                 recovery_attempts,
                 deadline: deadline.map(Timestamp::from_epoch_ms),
+                clock,
                 serialization,
                 existing_input,
                 should_execute,

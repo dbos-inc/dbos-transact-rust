@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -21,8 +21,9 @@ use crate::instance::Executor;
 use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
-    AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCaller, StepTiming,
-    Submission, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
+    AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
+    StepCaller, StepTiming, Submission, Timestamp, WorkflowInitResult, decode_step_value,
+    encode_step_value,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -1230,33 +1231,20 @@ async fn create<R, E>(
         ));
     }
 
-    // **A directly started workflow gets its deadline now, and the row carries it.** Python
-    // does the same (`_get_timeout_deadline`: *"Otherwise, compute the deadline immediately"*)
-    // and so does Go. Persisting it rather than recomputing on recovery is the whole point of a
-    // durable timeout: a workflow given an hour that crashes after fifty minutes has ten left,
-    // not another hour, and a crash loop cannot extend the budget indefinitely.
+    // **A deadline is written here only when it is inherited.** An explicit timeout is written as
+    // a budget, and the database turns it into a deadline on its own clock: the insert does, for a
+    // workflow that starts now, and the dequeue's claim does for a queued one, so the wait in the
+    // queue is not part of the budget. On the database's clock because every executor that later
+    // runs, recovers or sweeps the workflow compares against that clock, so a starter whose clock
+    // is off can neither shorten the budget nor stretch it. Persisting the deadline rather than
+    // recomputing it on recovery is the whole point of a durable timeout: a workflow given an hour
+    // that crashes after fifty minutes has ten left, not another hour.
     let deadline = match (timeout, &parent) {
-        // **A queued workflow's budget becomes a deadline on *dequeue*, not here**, so an
-        // explicit timeout records the budget and leaves the deadline null for the claim
-        // statement to fill in. The wait in the queue is not part of the budget — a workflow
-        // given five minutes that sits queued for an hour still gets five minutes. Python and
-        // TypeScript both branch on the queue in exactly this spot; the claim statement does
-        // the other half.
-        (Timeout::Explicit(_), _) if queue.is_some() => None,
-        // **An explicit timeout replaces an inherited deadline**, which is Python's and
-        // TypeScript's rule and their shared comment: *"If a timeout is explicitly specified,
-        // use it over any propagated deadline"*. So a child given longer than its parent has
-        // left outlives its parent — an explicit timeout on a specific child is a statement
-        // about that child, and the alternative would silently ignore what the caller asked
-        // for. Go differs by taking the earlier of the two, but not by design: its deadline
-        // rides on a `context`, and `context.WithTimeout` composes as a minimum. Java lets an
-        // explicitly *set* deadline win, and is not a model there — its user-facing `deadline`
-        // is Java's alone and Rust does not have one.
-        (Timeout::Explicit(timeout), _) => Timestamp::now().checked_add(timeout),
-        // **A deliberate refusal to inherit**, which is why the option is an enum: this is a
-        // caller who decided, and `Inherit` below is a caller who said nothing. Java's
-        // `Timeout.None` clears the propagated deadline in the same words.
-        (Timeout::None, _) => None,
+        // **An explicit timeout replaces an inherited deadline.** So a child given longer than its
+        // parent has left outlives its parent: an explicit timeout on a specific child is a
+        // statement about that child, and the alternative would silently ignore what the caller
+        // asked for. `Timeout::None` is a caller who decided not to inherit one either.
+        (Timeout::Explicit(_) | Timeout::None, _) => None,
         // **Inherited as an instant, not as a budget**, which is what makes it a deadline the
         // parent and the child genuinely share: both `select!`s fire at the same moment, in
         // different tasks and possibly in different processes, with no signal passing between
@@ -1414,7 +1402,7 @@ async fn create<R, E>(
         workflow_id.clone(),
         input,
         serialization,
-        initialized.deadline,
+        Deadline::of(initialized.deadline, initialized.clock),
         // A fresh start is not a dequeue, so it holds no queue's slot.
         None,
     );
@@ -1902,7 +1890,7 @@ pub(crate) fn spawn_execution(
     workflow_id: String,
     input: Option<String>,
     serialization: Option<String>,
-    deadline: Option<Timestamp>,
+    deadline: Option<Deadline>,
     slot: Option<crate::dequeue::Slot>,
 ) -> tokio::task::JoinHandle<std::result::Result<EncodedOutput, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
@@ -1926,17 +1914,48 @@ pub(crate) fn spawn_execution(
                 let ctx = Ctx::new(
                     Arc::clone(&executor),
                     &workflow_id,
-                    deadline,
+                    deadline.map(|deadline| deadline.at),
                     encoding.clone(),
                 );
                 let _panic_log = PanicLog {
                     workflow_id: &workflow_id,
                 };
-                execute(&executor, &key, &workflow_id, input, encoding, ctx, slot).await
+                execute(
+                    &executor,
+                    &key,
+                    &workflow_id,
+                    input,
+                    encoding,
+                    ctx,
+                    deadline.map(|deadline| deadline.expires),
+                    slot,
+                )
+                .await
             }
         }
         .instrument(span),
     )
+}
+
+/// A workflow's deadline, and when it passes on this process's monotonic clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    /// The instant the row holds, which the context carries for children to inherit.
+    at: Timestamp,
+    /// When the database's clock reaches `at`, measured from a reading of that clock, so the wait
+    /// doesn't depend on this host's wall clock agreeing with the database's.
+    expires: Instant,
+}
+
+impl Deadline {
+    /// The deadline `init_workflow` reported, timed from the reading of the database's clock that
+    /// came back with it.
+    pub(crate) fn of(at: Option<Timestamp>, clock: DatabaseTime) -> Option<Self> {
+        at.map(|at| Self {
+            at,
+            expires: clock.reaches(at),
+        })
+    }
 }
 
 /// Runs `body` until it finishes or its deadline passes.
@@ -1948,27 +1967,25 @@ pub(crate) fn spawn_execution(
 /// ours runs and no row is written, and the workflow is recovered. The deadline and shutdown use
 /// different mechanisms rather than a shared hook, so there is no cancellation cause to inspect.
 ///
-/// The deadline is an *instant* rather than a budget, and that is what makes it survive a crash: a
-/// workflow recovered with two minutes left waits two minutes, not the whole timeout again. A
-/// deadline already in the past yields a zero wait, which is the correct reading of a workflow
-/// recovered after its expiry.
-async fn run_until_deadline<F>(deadline: Option<Timestamp>, body: F) -> Ended
+/// `expires` is when the database's clock reaches the deadline, on this process's monotonic clock
+/// (see [`DatabaseTime`]). The deadline is an *instant* rather than a budget, and that is what
+/// makes it survive a crash: a workflow recovered with two minutes left waits two minutes, not the
+/// whole timeout again. A deadline already in the past yields a zero wait, which is the correct
+/// reading of a workflow recovered after its expiry.
+async fn run_until_deadline<F>(expires: Option<Instant>, body: F) -> Ended
 where
     F: Future<Output = std::result::Result<EncodedOutput, Failure>>,
 {
-    let Some(deadline) = deadline else {
+    let Some(expires) = expires else {
         return Ended::Body(body.await);
     };
-    let remaining = deadline
-        .duration_since(Timestamp::now())
-        .unwrap_or(Duration::ZERO);
 
     // Biased so a body that finished in the same instant keeps its outcome: it did complete, and
     // recording a completed workflow as cancelled would discard work that was actually done.
     tokio::select! {
         biased;
         outcome = body => Ended::Body(outcome),
-        () = tokio::time::sleep(remaining) => Ended::DeadlinePassed,
+        () = tokio::time::sleep_until(expires.into()) => Ended::DeadlinePassed,
     }
 }
 
@@ -1983,11 +2000,14 @@ enum Ended {
 /// Records the timeout of a workflow whose local timer fired, and settles on what the row holds.
 ///
 /// **Cancelled only if the database's clock says the deadline has passed**, the same test the
-/// timeout sweep makes, so a timer that fired early doesn't cancel a workflow early. Whatever the
-/// cancel finds, the outcome is what the row records: this cancel, or what settled the row first
-/// (the sweep, an explicit cancel, or another execution, including one resumed meanwhile, whose
-/// outcome this then waits for rather than overwrites). A row the cancel left unsettled is waited
-/// on until the sweep records its timeout.
+/// timeout sweep makes. The timer is measured on that clock, so the two normally agree; the test is
+/// what keeps a timer that fires a moment early, inside a reading's millisecond, from cancelling a
+/// workflow early.
+///
+/// Whatever the cancel finds, the outcome is what the row records: this cancel, or what settled the
+/// row first (the sweep, an explicit cancel, or another execution, including one resumed meanwhile,
+/// whose outcome this then waits for rather than overwrites). A row the cancel left unsettled is
+/// waited on until the sweep records its timeout.
 ///
 /// The queue slot is given up first: the body is gone, and waiting here does no work a queue's
 /// concurrency limit should count.
@@ -2015,7 +2035,11 @@ async fn time_out(
 
 /// Runs the body with a context ambient and records what it did.
 ///
-/// `slot` is the queue slot a dequeued execution holds, kept for as long as this runs.
+/// `expires` is when the context's deadline passes, on this process's monotonic clock: the
+/// deadline travels with the context, for the children it starts to inherit, and `expires` is the
+/// same instant measured from a reading of the database's clock. `slot` is the queue slot a
+/// dequeued execution holds, kept for as long as this runs.
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     executor: &Executor,
     key: &WorkflowKey,
@@ -2023,6 +2047,7 @@ async fn execute(
     input: Option<String>,
     encoding: PayloadEncoding,
     ctx: Ctx,
+    expires: Option<Instant>,
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
     let workflow = executor
@@ -2036,13 +2061,8 @@ async fn execute(
         .body
         .clone();
 
-    // From the context rather than from a parameter beside it: the deadline is part of what this
-    // workflow *is* for the whole of its run — a child launched halfway through reads the same
-    // value this `select!` is watching — so one copy travels with the context and nothing can hand
-    // the two halves different instants.
-    let deadline = ctx.deadline();
     let outcome = match run_until_deadline(
-        deadline,
+        expires,
         Ctx::scope(ctx, async move {
             let encoded = workflow(input, encoding.clone()).await?;
             Ok(EncodedOutput { encoded, encoding })
