@@ -1210,10 +1210,10 @@ pub struct StepTiming {
     ///
     /// Fixed before the write and **it must not move between retries of the same logical
     /// record**. On a duplicate insert the stored value is compared against this one: equal means
-    /// this caller's own write whose acknowledgement was lost, different means the step was
-    /// recorded already, by this execution, which is nondeterminism. Re-stamping the clock per attempt would turn every lost
-    /// acknowledgement into a spurious conflict — so hold the `StepTiming` in a variable rather
-    /// than building it at the call site inside a retry loop.
+    /// this caller's own write whose acknowledgement was lost, different means this execution
+    /// recorded the step already, which is nondeterminism. Re-stamping the clock per attempt
+    /// would turn every lost acknowledgement into a spurious conflict — so hold the `StepTiming`
+    /// in a variable rather than building it at the call site inside a retry loop.
     ///
     /// **A step whose every attempt checks for it before writing is the exception**, and the
     /// internal step runners are the ones that do: a record acknowledged to nobody — a success
@@ -2036,8 +2036,8 @@ pub(crate) fn decode_step_value<T: serde::de::DeserializeOwned>(
 /// in the write's own transaction before anything else and locking the row until it commits. Once
 /// the workflow has been handed to another execution (a cancel, a resume, a recovery), the write
 /// is refused with [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict) and rolls back.
-/// `None` where a method takes an `Option<WorkflowOwner>` is a caller that is not an execution, a client
-/// say, and is not checked.
+/// `None` where a method takes an `Option<WorkflowOwner>` is a caller that is not an execution, a
+/// client say, and is not checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkflowOwner<'a> {
     /// The workflow the execution runs.

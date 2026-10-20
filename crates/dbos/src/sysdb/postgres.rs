@@ -4895,7 +4895,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         drop(subscription);
 
         // Fixed here rather than inside the retry: `completed_at` is also what recognises this
-        // caller's own re-attempt after a lost acknowledgement, so it must not move between attempts.
+        // caller's own re-attempt after a lost acknowledgement, so it must not move between
+        // attempts.
         let timing = StepTiming {
             started_at,
             completed_at: Timestamp::now(),
@@ -5546,7 +5547,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         };
 
         // Fixed here rather than inside the retry: `completed_at` is also what recognises this
-        // caller's own re-attempt after a lost acknowledgement, so it must not move between attempts.
+        // caller's own re-attempt after a lost acknowledgement, so it must not move between
+        // attempts.
         let timing = StepTiming {
             started_at,
             completed_at: Timestamp::now(),

@@ -1774,9 +1774,9 @@ impl Parent<'_> {
     ///
     /// - **Recorded**: the error is returned, and [`check_child`](Self::check_child)
     ///   returns it again on a replay.
-    /// - **The record fails**: that failure is returned instead, and the position usually stays
-    ///   unrecorded: the record is one transaction, so a failure part-way leaves nothing. A position
-    ///   recorded already is [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
+    /// - **The record fails**: that failure is returned instead, and the position stays
+    ///   unrecorded, since the record is one transaction. A position recorded already is
+    ///   [`StepNondeterminism`](crate::sysdb::Error::StepNondeterminism), and
     ///   a parent no longer this execution's is
     ///   [`WorkflowConflict`](crate::sysdb::Error::WorkflowConflict). Database trouble leaves the
     ///   parent `PENDING` rather than ending it.
