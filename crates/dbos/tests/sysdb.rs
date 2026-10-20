@@ -4482,13 +4482,11 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
     );
 }
 
-/// A second receiver on one (workflow, topic) is refused rather than left to time out.
-///
-/// One message goes to one of them, so the loser would wait out its whole timeout and report that
-/// nothing arrived — which the sender cannot tell apart from not having sent. Python and Go refuse
-/// it too; TypeScript and Java allow it.
+/// **Two receivers on one (workflow, topic) in one process both wait**, and one message goes to
+/// one of them: the other times out with nothing. The case that produces two is a workflow
+/// resumed while its execution waits, which starts a second execution beside the first.
 #[tokio::test]
-async fn a_second_receiver_on_one_topic_is_refused() {
+async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
@@ -4498,50 +4496,37 @@ async fn a_second_receiver_on_one_topic_is_refused() {
         .await
         .unwrap();
 
-    let waiting = {
+    let first = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 20)
+                .await
+        })
+    };
+    let second = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 20)
                 .await
         })
     };
     tokio::time::sleep(BRIEFLY).await;
+    send_to_receiver(&sys, Some("orders"), "\"only\"").await;
 
-    // Bounded, because the regression is that it *waits*: a second receiver that is admitted
-    // rather than refused sits out its whole ten minutes for a message it was never going to get,
-    // which is exactly the behaviour being ruled out.
-    let err = tokio::time::timeout(
-        RECHECK * 10,
-        sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 600),
-    )
-    .await
-    .expect("a second receiver was admitted and left to wait rather than refused")
-    .expect_err("a second receiver on one topic is a bug in the caller, and is told so");
-    assert!(
-        matches!(
-            err,
-            Error::ConcurrentRecv { ref workflow_id, ref topic }
-                if workflow_id == "wf-receiver" && topic.as_deref() == Some("orders")
-        ),
-        "unexpected error: {err:?}",
+    let answers = [
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    ];
+    assert_eq!(
+        answers.iter().filter(|answer| answer.is_some()).count(),
+        1,
+        "one message, one receiver: {answers:?}"
     );
-
-    // Another topic on the same workflow is a different wait, and is not refused.
-    send_to_receiver(&sys, Some("refunds"), "\"other\"").await;
-    assert!(
-        sys.recv("wf-receiver", 4, 5, Some("refunds"), RECHECK * 600)
-            .await
-            .unwrap()
-            .is_some(),
-    );
-
-    waiting.abort();
 }
 
 /// Two receivers racing at the database consume one message between them, not two.
 ///
-/// **The cross-process case, which the in-process guard cannot see** — two handles have two
-/// registries, so both get past `subscribe_exclusive` exactly as two executors recovering one
+/// **The cross-process case** — two handles have two registries, as two executors recovering one
 /// workflow would. What arbitrates here is the database: the consuming `UPDATE` re-evaluates
 /// `consumed = FALSE` against the winner's committed row, and the losing transaction rolls back
 /// whatever it took when its step write conflicts. Two messages are queued so that a loser going

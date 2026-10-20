@@ -233,11 +233,6 @@ where
 /// The error is the *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no
 /// conversion.
 ///
-/// **Two concurrent receives on one topic in one workflow is an error**, surfaced as
-/// [`Error::SystemDatabase`] carrying `sysdb`'s `ConcurrentRecv`. One message can go to only one of
-/// them, so the other could only wait out its timeout and report nothing — which the sender cannot
-/// distinguish from never having sent. Python and Go reject it too; TypeScript and Java allow it.
-///
 /// # Why not from inside a step
 ///
 /// [`Error::InsideStep`], where [`get_event`](crate::get_event) reads plainly from inside a step
