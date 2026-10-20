@@ -73,7 +73,7 @@ async fn sweep(executor: Arc<Executor>, interval: Duration) {
         let full = match executor.sysdb().cancel_timed_out_workflows(BATCH).await {
             Ok(cancelled) => {
                 for workflow_id in &cancelled {
-                    tracing::info!(
+                    tracing::debug!(
                         workflow_id,
                         "the workflow exceeded its deadline and is cancelled"
                     );

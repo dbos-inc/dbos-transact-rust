@@ -1,7 +1,6 @@
 //! Workflow timeouts: the durable deadline, against real databases.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
@@ -106,8 +105,9 @@ async fn a_workflow_within_its_deadline_is_unaffected() {
 
 /// The deadline is an instant, so a recovery gets what is left of the budget, not the whole of it.
 ///
-/// The recovered run is given a body that would outlive a *fresh* budget but not the elapsed one:
-/// if the clock restarted, the workflow would finish; because it does not, it is cancelled.
+/// Checked on the row: the deadline the recovered workflow is cancelled with is the one the first
+/// launch stored. Its status alone can't tell, since a fresh budget would also run out inside the
+/// wait, and the sweep cancels an expired row whatever recovery does.
 #[tokio::test]
 async fn a_recovered_workflow_keeps_the_deadline_it_already_had() {
     let db = test_database().await;
@@ -149,27 +149,20 @@ async fn a_recovered_workflow_keeps_the_deadline_it_already_had() {
         WorkflowStatus::Pending,
         "shutdown left it PENDING"
     );
-    assert!(row.deadline.is_some(), "the deadline is stored on the row");
+    let stored = row.deadline.expect("the deadline is stored on the row");
 
     // Let the original deadline pass before the second process starts.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Second process: recovery reads the stored deadline, which is now in the past.
     let dbos = DBOS::new(config("recover-deadline-app", &db));
-    let runs = Arc::new(AtomicU32::new(0));
-    let dbos_runs = Arc::clone(&runs);
-    dbos.register_workflow("slow", move |()| {
-        let runs = Arc::clone(&dbos_runs);
-        async move {
-            runs.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok::<u32, dbos::Error>(1)
-        }
+    dbos.register_workflow("slow", |()| async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok::<u32, dbos::Error>(1)
     })
     .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    // The recovered run is cancelled almost at once rather than being given a fresh 400ms.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let row = reader
@@ -178,6 +171,11 @@ async fn a_recovered_workflow_keeps_the_deadline_it_already_had() {
             .expect("read failed")
             .expect("the row is missing");
         if row.status == WorkflowStatus::Cancelled {
+            assert_eq!(
+                row.deadline,
+                Some(stored),
+                "recovery kept the deadline it already had"
+            );
             break;
         }
         assert!(
@@ -547,6 +545,103 @@ async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
         row.application_name.as_deref(),
         Some("another-app"),
         "the row stayed outside this application's sweep"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A run whose timer fires before the database's clock reaches the deadline waits for that
+/// clock, and no longer.** The row's deadline is moved later while the run is going, as a database
+/// clock running behind this process's would leave it: the run isn't cancelled before the moved
+/// deadline, and is cancelled soon after it rather than an outcome-poll interval later.
+///
+/// The row is another application's, so this application's sweep can't be what cancels it.
+#[tokio::test]
+async fn a_timed_out_run_waits_for_the_database_clock_to_reach_its_deadline() {
+    let db = test_database().await;
+    let dbos = DBOS::new(Config {
+        // Long enough that a wait of one interval would fail the bound below.
+        outcome_poll_interval: Some(Duration::from_secs(5)),
+        ..sweeping_config("deadline-clock-app", &db)
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dbos_started = Arc::clone(&started);
+    let workflow = dbos
+        .register_workflow("runs_forever", move |()| {
+            let started = Arc::clone(&dbos_started);
+            async move {
+                started.notify_one();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<u32, dbos::Error>(1)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "behind-the-clock";
+    writer(&db, "another-app")
+        .await
+        .init_workflow(
+            &NewWorkflow {
+                name: Some("runs_forever"),
+                input: Some("null"),
+                serialization: Some("rust_serde"),
+                deadline: Timestamp::now().checked_add(Duration::from_millis(500)),
+                ..NewWorkflow::new(id)
+            },
+            None,
+            Submission::Fresh,
+            None,
+        )
+        .await
+        .expect("insert failed");
+    let pool = db.pool().await;
+    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = NULL WHERE workflow_uuid = $1"#)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let began = std::time::Instant::now();
+    let (outcome, ()) = tokio::join!(
+        workflow.run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+        async {
+            // The run has read its deadline; only the row's moves.
+            started.notified().await;
+            sqlx::query(
+                r#"UPDATE "dbos"."workflow_status"
+                   SET workflow_deadline_epoch_ms = workflow_deadline_epoch_ms + 400
+                   WHERE workflow_uuid = $1"#,
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        },
+    );
+    let error = outcome.expect_err("the workflow succeeded");
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "expected a cancellation, got {error:?}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "the run waited {:?}, an outcome-poll interval rather than the time left",
+        began.elapsed()
+    );
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Cancelled);
+    let completed = row.completed_at.expect("a cancel stamps completed_at");
+    let deadline = row.deadline.expect("the deadline stays on the row");
+    assert!(
+        completed >= deadline,
+        "cancelled at {completed:?}, before the database's clock reached {deadline:?}"
     );
 
     dbos.shutdown().await;

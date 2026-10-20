@@ -89,8 +89,8 @@ use super::types::{
     NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    TimeoutCheck, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
@@ -3937,7 +3937,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error> {
+    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<TimeoutCheck, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         with_retry(&self.retry, "cancel_if_timed_out", move || async move {
@@ -3950,7 +3950,27 @@ impl SystemDatabase for PostgresSystemDatabase {
             .execute(pool)
             .await?
             .rows_affected();
-            Ok(moved > 0)
+            if moved > 0 {
+                return Ok(TimeoutCheck::Cancelled);
+            }
+            // The remaining time is taken on the database's clock, the one the cancel tests.
+            let row: Option<(String, Option<i64>)> = sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT status, workflow_deadline_epoch_ms - {NOW_MS_SQL} \
+                 FROM {workflow_table} WHERE workflow_uuid = $1"
+            )))
+            .bind(workflow_id)
+            .fetch_optional(pool)
+            .await?;
+            let Some((status, remaining_ms)) = row else {
+                return Ok(TimeoutCheck::Missing);
+            };
+            if !parse_workflow_status(&status)?.is_active() {
+                return Ok(TimeoutCheck::Settled);
+            }
+            Ok(TimeoutCheck::NotYet {
+                // Negative once the deadline passed after the cancel above: none left.
+                remaining: remaining_ms.map(|ms| duration_from_ms(ms).unwrap_or(Duration::ZERO)),
+            })
         })
         .await
     }
@@ -8145,16 +8165,22 @@ mod tests {
             .await
             .unwrap();
 
-        // Bound values are folded into the plan, so this is the custom plan.
-        let custom: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "EXPLAIN {}",
-            timed_out_sweep_sql(table)
-        )))
-        .bind(None::<&str>)
-        .bind(10_i64)
-        .fetch_all(&pool)
-        .await
-        .expect("EXPLAIN failed");
+        // Bound values are folded into the plan, so these are custom plans: one for every
+        // application, and one with the name a launched executor always binds, which leaves the
+        // application filter on the scan.
+        let mut custom = Vec::new();
+        for application_name in [None, Some("plan-app")] {
+            let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "EXPLAIN {}",
+                timed_out_sweep_sql(table)
+            )))
+            .bind(application_name)
+            .bind(10_i64)
+            .fetch_all(&pool)
+            .await
+            .expect("EXPLAIN failed");
+            custom.push((format!("custom, application {application_name:?}"), plan));
+        }
         // A generic plan keeps `$1` and `$2` as placeholders, so it is sent unprepared.
         let generic: Vec<String> = sqlx::raw_sql(AssertSqlSafe(format!(
             "EXPLAIN (GENERIC_PLAN) {}",
@@ -8166,7 +8192,8 @@ mod tests {
         .iter()
         .map(|row| sqlx::Row::get::<String, _>(row, 0))
         .collect();
-        for (kind, plan) in [("custom", &custom), ("generic", &generic)] {
+        let generic = ("generic".to_owned(), generic);
+        for (kind, plan) in custom.iter().chain([&generic]) {
             let plan = plan.join("\n");
             assert!(
                 plan.contains("idx_workflow_status_deadline"),
@@ -8178,7 +8205,9 @@ mod tests {
                 "{kind}: the deadline is an index condition: {plan}"
             );
         }
-        let custom = custom.join("\n");
-        assert!(!custom.contains("Seq Scan"), "custom: {custom}");
+        for (kind, plan) in &custom {
+            let plan = plan.join("\n");
+            assert!(!plan.contains("Seq Scan"), "{kind}: {plan}");
+        }
     }
 }
