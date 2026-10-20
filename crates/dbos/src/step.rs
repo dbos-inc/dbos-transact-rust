@@ -810,7 +810,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::sysdb::types::{NewWorkflow, StepRecord, Submission};
+    use crate::sysdb::types::{NewWorkflow, StepRecord};
     use crate::{Config, DBOS};
 
     /// A launched instance and a workflow row to hang steps off.
@@ -829,7 +829,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
+            .init_workflow(&NewWorkflow::new(id), None, None)
             .await
             .expect("could not create the workflow row");
         (dbos, db)
@@ -1351,7 +1351,7 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new("wf-thief"), None, Submission::Fresh, None)
+            .init_workflow(&NewWorkflow::new("wf-thief"), None, None)
             .await
             .expect("could not create the second workflow row");
 

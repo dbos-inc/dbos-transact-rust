@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::{NewWorkflow, Outcome, Submission, Timestamp, WorkflowStatus};
+use dbos::sysdb::types::{NewWorkflow, Outcome, Timestamp, WorkflowStatus};
 use dbos::{
     Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout,
 };
@@ -340,7 +340,6 @@ async fn insert_expired(sys: &PostgresSystemDatabase, id: &str, queue: Option<&s
             ..NewWorkflow::new(id)
         },
         None,
-        Submission::Fresh,
         None,
     )
     .await
@@ -513,7 +512,6 @@ async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
                 ..NewWorkflow::new(id)
             },
             None,
-            Submission::Fresh,
             None,
         )
         .await

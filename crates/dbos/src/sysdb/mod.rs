@@ -74,12 +74,12 @@ use std::time::Duration;
 
 use types::step_names;
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Debounce, DebounceRequest,
-    EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
-    ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
-    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
+    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
+    DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
+    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom,
+    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
+    StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue,
     VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
@@ -115,16 +115,18 @@ pub trait SystemDatabase: Send + Sync {
     /// The same id submitted twice is one workflow, which is what makes a retried enqueue safe.
     /// Reconciling is not a no-op, though — three things happen on conflict:
     ///
-    /// - **Recovery attempts are counted**, but only when the existing row is not merely queued
-    ///   and only when the caller is recovering or dequeuing. Passing the limit parks the
-    ///   workflow as [`types::WorkflowStatus::MaxRecoveryAttemptsExceeded`] and errors.
+    /// - **A row past its recovery limit is parked**, as
+    ///   [`types::WorkflowStatus::MaxRecoveryAttemptsExceeded`], with an error. The count is the
+    ///   one the dequeue's claims recorded; submitting does not add to it.
     /// - **The executor is re-stamped**, unless this is an enqueue — a queued workflow has no
     ///   executor yet, and claiming one would be wrong.
     /// - **A different function under the same id is an error.** Name, class, and config must
     ///   match; a differing queue is only a warning, since requeueing elsewhere is legitimate.
     ///
-    /// `max_recovery_attempts` of `None` disables parking entirely. [`Submission`] says why the
-    /// workflow is being submitted, and so whether it may claim a row another owner holds.
+    /// `max_recovery_attempts` of `None` disables parking entirely. A row another owner holds is
+    /// never claimed here: a dequeue claims in
+    /// [`start_queued_workflows`](Self::start_queued_workflows), and runs what it claimed without
+    /// submitting it again.
     ///
     /// The owner identity behind the single-execution guard is generated in here rather than
     /// passed in, and generated once per call — before any retry the implementation makes. A
@@ -156,9 +158,12 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow: &NewWorkflow,
         max_recovery_attempts: Option<i64>,
-        submission: Submission,
         caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error>;
+
+    /// The database's clock as of this call, paired with the moment the answer arrived: what a
+    /// wait for a deadline the database set is measured from.
+    async fn database_time(&self) -> Result<DatabaseTime, Error>;
 
     /// Reads one workflow, or `None` if there is no such id.
     async fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>, Error>;
@@ -455,6 +460,18 @@ pub trait SystemDatabase: Send + Sync {
         executor_ids: &[&str],
         application_version: &str,
         recovery_queue: &str,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Parks workflows that have been dispatched too often, as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`,
+    /// returning the ids that moved.
+    ///
+    /// Only rows still `PENDING` with at least `min_recovery_attempts` recorded move: the caller
+    /// read that count from the row it claimed, so a row a resume reset, or another execution
+    /// settled, since then is left alone. Clears what leaving a queue clears.
+    async fn dead_letter_workflows(
+        &self,
+        workflow_ids: &[&str],
+        min_recovery_attempts: i64,
     ) -> Result<Vec<String>, Error>;
 
     /// Releases delayed workflows whose time has come, returning how many moved.
