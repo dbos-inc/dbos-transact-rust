@@ -1357,8 +1357,6 @@ impl crate::Client {
     }
 }
 
-/// The operator surface, on the connection every caller reaches it through.
-///
 /// Refuses a cancel or a resume of the workflow whose step body is making it.
 ///
 /// A call from inside a step body records nothing and carries no caller, so the system database
@@ -1383,6 +1381,8 @@ async fn refuse_self_target_in_step(
     Ok(())
 }
 
+/// The operator surface, on the connection every caller reaches it through.
+///
 /// Each method here is the whole operation — the system-database call, its logging, and the handles
 /// it hands back — and takes `caller` for the one thing the surfaces above it disagree about.
 /// [`DBOS`] passes the workflow it is being called from, so the call checkpoints as a step and a

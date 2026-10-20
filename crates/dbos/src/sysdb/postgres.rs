@@ -4831,13 +4831,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             }));
         }
 
-        // Exclusive, and before the first look for both reasons at once: registering after looking
-        // would miss a message that landed in between, and a second receiver has to be refused
-        // before it starts waiting rather than after it has waited out a timeout for a message it
-        // was never going to get.
-        // Shared, not exclusive: an execution whose workflow was handed to a new one may still be
-        // waiting here beside the new owner. Both wake, and the stale one's consume is refused by
-        // the owner check.
+        // Before the first look: registering after looking would miss a message that landed in
+        // between. Shared, not exclusive: an execution whose workflow was handed to a new one may
+        // still be waiting here beside the new owner. Both wake, and the stale one's consume is
+        // refused by the owner check.
         let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
