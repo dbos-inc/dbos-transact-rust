@@ -4482,9 +4482,9 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
     );
 }
 
-/// **Two receivers on one (workflow, topic) in one process both wait**, and one message goes to
-/// one of them: the other times out with nothing. The case that produces two is a workflow
-/// resumed while its execution waits, which starts a second execution beside the first.
+/// **Two receives on one (workflow, topic) in one process both wait**, and one message goes to
+/// one of them: the other times out with nothing. These are two receives of one execution, at
+/// different steps, as a receive joined with another would be; both are woken by the one send.
 #[tokio::test]
 async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
@@ -4522,6 +4522,72 @@ async fn two_receivers_in_one_process_share_one_message() {
         1,
         "one message, one receiver: {answers:?}"
     );
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "{notifications:?}"
+    );
+}
+
+/// **Two executions of one workflow waiting at the same receive, in one process**, as a workflow
+/// resumed while its execution waits produces. One handle, so one registry: both wait, both are
+/// woken by the one send, and the database gives the message to one of them. The other finds
+/// nothing left to take and waits out its timeout; then it adopts the step the winner recorded,
+/// and returns the same message, or loses on its own step write, with what it took rolled back.
+/// Either way one message is consumed.
+#[tokio::test]
+async fn two_executions_at_one_receive_in_one_process_take_one_message() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let waiting: Vec<_> = (0..2)
+        .map(|_| {
+            let sys = std::sync::Arc::clone(&sys);
+            tokio::spawn(async move {
+                sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 3)
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::sleep(BRIEFLY).await;
+    send_to_receiver(&sys, Some("orders"), "\"only\"").await;
+
+    let mut answers = Vec::new();
+    for handle in waiting {
+        answers.push(
+            tokio::time::timeout(RECHECK * 20, handle)
+                .await
+                .expect("a waiting receiver was never woken")
+                .unwrap(),
+        );
+    }
+    let (delivered, refused): (Vec<_>, Vec<_>) = answers.iter().partition(|answer| answer.is_ok());
+    assert!(
+        refused.len() <= 1
+            && refused
+                .iter()
+                .all(|answer| matches!(answer, Err(Error::StepAlreadyRecorded { step_id: 0, .. }))),
+        "only the loser may be refused, and only on its step write: {answers:?}",
+    );
+    assert!(
+        delivered
+            .iter()
+            .all(|answer| answer.as_ref().unwrap().is_some()),
+        "whoever returned holds the message: {answers:?}",
+    );
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "{notifications:?}"
+    );
 }
 
 /// Two receivers racing at the database consume one message between them, not two.
@@ -4554,8 +4620,8 @@ async fn two_receivers_in_one_process_share_one_message() {
 #[tokio::test]
 async fn two_receivers_cannot_take_the_same_message() {
     let db = test_database().await;
-    // Two handles over one pool: separate registries, so the in-process exclusivity does not apply
-    // and both reach the database — which is the situation this test is about.
+    // Two handles over one pool: separate registries, as two processes have, and both reach the
+    // database — which is the situation this test is about.
     let first = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings::default(),

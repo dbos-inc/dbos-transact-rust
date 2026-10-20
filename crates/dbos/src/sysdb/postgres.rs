@@ -4750,8 +4750,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await;
         }
-        // Released here rather than at the end of the call: the taking below does not wait, and
-        // holding the topic through it would keep the next `recv` out for no reason.
+        // Released here rather than at the end of the call: the taking below does not wait, so
+        // there is nothing left to be woken for.
         drop(subscription);
 
         // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this

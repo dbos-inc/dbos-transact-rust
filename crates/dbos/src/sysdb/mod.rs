@@ -835,9 +835,11 @@ pub trait SystemDatabase: Send + Sync {
     /// message.
     ///
     /// **Two concurrent receivers on one (workflow, topic) both wait**, and both are woken; the
-    /// consuming statement gives a message to one of them. The case that produces two is a
-    /// workflow resumed while its execution still waits, so that a second execution of it waits
-    /// too, in this process or another.
+    /// consuming statement gives a message to one of them, and the other waits on to its deadline.
+    /// Two receives of one execution produce two, and so does a workflow resumed while its
+    /// execution still waits, so that a second execution of it waits at the same step, in this
+    /// process or another. There the one that missed out adopts the winner's record once its
+    /// deadline passes.
     ///
     /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
     /// raises a timeout error, in its engine rather than at this layer.

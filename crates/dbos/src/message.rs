@@ -233,6 +233,10 @@ where
 /// The error is the *workflow's* channel, like [`step`](crate::step())'s, so `?` needs no
 /// conversion.
 ///
+/// **Two receives on one topic at once both wait**, and a message goes to one of them. Two in one
+/// execution (a receive joined with another) leave the one that missed out waiting out its timeout,
+/// and returning `None` unless a second message comes.
+///
 /// # Why not from inside a step
 ///
 /// [`Error::InsideStep`], where [`get_event`](crate::get_event) reads plainly from inside a step
