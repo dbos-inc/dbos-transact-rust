@@ -417,6 +417,11 @@ sources![
         "122_add_workflow_status_deadline_index.sql",
         Applies::Always
     ),
+    (
+        123,
+        "123_add_workflow_status_creator_xid.sql",
+        Applies::Always
+    ),
 ];
 
 /// Asks whether the `notifications` primary key already exists, so migration 10 can skip its
@@ -722,9 +727,9 @@ mod tests {
 
     #[test]
     fn corpus_matches_upstream_shape() {
-        // 77 files: 76 the runner applies, plus the migration-10 probe, which is bound
+        // 78 files: 77 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
-        assert_eq!(SOURCES.len(), 76);
+        assert_eq!(SOURCES.len(), 77);
 
         let mut versions: Vec<u32> = SOURCES.iter().map(|s| s.version).collect();
         versions.sort_unstable();
@@ -800,7 +805,7 @@ mod tests {
         }
         // Every file less migration 1's two, which open with a description rather than a
         // numbered header.
-        assert_eq!(checked, 75, "expected 75 files to carry a numbered header");
+        assert_eq!(checked, 76, "expected 76 files to carry a numbered header");
     }
 
     #[test]

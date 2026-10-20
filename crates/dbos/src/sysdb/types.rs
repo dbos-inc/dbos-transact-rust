@@ -1282,34 +1282,6 @@ impl WorkflowDelay {
     }
 }
 
-/// Why a workflow is being submitted, which decides whether it may claim a row someone holds.
-///
-/// Java models this as two booleans, `isRecoveryRequest` and `isDequeuedRequest`, but **no call
-/// site sets both** — its dispatcher branches on one or the other, never the pair. A three-way
-/// choice is what it has always been, and naming it removes an unreadable pair of adjacent
-/// `bool` arguments that would compile just as happily swapped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Submission {
-    /// A first attempt, which does not claim a workflow another owner already holds.
-    #[default]
-    Fresh,
-    /// Recovering a workflow a dead executor left behind.
-    Recovery,
-    /// Dequeuing, which claims a workflow that was enqueued.
-    Dequeue,
-}
-
-impl Submission {
-    /// Whether this submission is being told it owns the workflow.
-    ///
-    /// Recovery and dequeue are kept apart because the references keep them apart, even though
-    /// both answer this the same way: both count against the recovery budget, and both may claim
-    /// a row another owner holds, which from a fresh start would be theft.
-    pub(crate) fn claims_ownership(self) -> bool {
-        matches!(self, Submission::Recovery | Submission::Dequeue)
-    }
-}
-
 /// The result of trying to record a workflow's final outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeWrite {
@@ -1339,19 +1311,17 @@ pub struct WorkflowInitResult {
     /// May differ from what the caller offered: the first writer decides the format, and every
     /// later attempt has to read the payloads that are actually there.
     pub serialization: Option<String>,
-    /// The input the row already held, where a fresh start is to run a row it did not create — one
-    /// no attempt owns: `Some(None)` for a row with no input, and `None` otherwise.
+    /// Whether this caller should go on to run the workflow: whether it created the row, by this
+    /// call or by an earlier attempt of it whose acknowledgement was lost.
     ///
-    /// Only the attempt that creates a row writes its input, so a fresh start that runs an existing
-    /// one offered an input the row does not hold. The row is what a recovery runs, so the run has
-    /// to start from this, not from what the caller offered. A recovery or a dequeue gets `None`:
-    /// it read the input with the row it claimed.
-    pub existing_input: Option<Option<String>>,
-    /// Whether this caller should go on to run the workflow.
-    ///
-    /// `false` means another owner holds it and this attempt is not a recovery — so the row is
-    /// recorded, but running it would be a second execution.
+    /// `false` means another caller created it, so the row is recorded but running it would be a
+    /// second execution. The caller joins it instead, whatever has become of the row.
     pub should_execute: bool,
+    /// This call's creator token, which the row holds as `creator_xid` when `should_execute`.
+    ///
+    /// A row inserted `PENDING` is owned by its creator from the start, so this is also the
+    /// `owner_xid` the execution that runs it holds, and presents on every write it makes.
+    pub creator_xid: String,
 }
 
 /// Whether a name is usable as an application name.

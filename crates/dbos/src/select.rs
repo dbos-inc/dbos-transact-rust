@@ -345,7 +345,7 @@ mod tests {
     use super::*;
     use crate::context::Ctx;
     use crate::step::step;
-    use crate::sysdb::types::{NewWorkflow, Submission};
+    use crate::sysdb::types::NewWorkflow;
     use crate::{Config, DBOS};
 
     /// A launched instance and a workflow row for the race to record against.
@@ -364,9 +364,10 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, None)
+            .init_workflow(&NewWorkflow::new(id), None)
             .await
             .expect("could not create the workflow row");
+        crate::context::own_for_test(&db, id).await;
         (dbos, db)
     }
 
@@ -374,6 +375,7 @@ mod tests {
         Ctx::new(
             dbos.executor("test").expect("launched"),
             id,
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         )

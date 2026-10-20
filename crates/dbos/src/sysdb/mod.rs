@@ -79,8 +79,8 @@ use types::{
     Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
     OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom, RewindOptions,
     ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord,
-    StepTiming, StreamRead, StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
+    StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo,
+    WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -110,26 +110,22 @@ use types::{
 /// and an integer, not a connection. Nothing is broken either way; worth the team having seen it.
 #[async_trait]
 pub trait SystemDatabase: Send + Sync {
-    /// Records a workflow, reconciling with any row already under that id.
+    /// Records a workflow, or finds the row already under that id.
     ///
     /// The same id submitted twice is one workflow, which is what makes a retried enqueue safe.
-    /// Reconciling is not a no-op, though — three things happen on conflict:
+    /// **A row already there is left as it is**, and reported: its status, its deadline and how
+    /// its payloads are encoded. A different function under the same id is an error (name, class
+    /// and config must match); a differing queue is only a warning, since requeueing elsewhere is
+    /// legitimate.
     ///
-    /// - **Recovery attempts are counted**, but only when the existing row is not merely queued
-    ///   and only when the caller is recovering or dequeuing. Passing the limit parks the
-    ///   workflow as [`types::WorkflowStatus::MaxRecoveryAttemptsExceeded`] and errors.
-    /// - **The executor is re-stamped**, unless this is an enqueue — a queued workflow has no
-    ///   executor yet, and claiming one would be wrong.
-    /// - **A different function under the same id is an error.** Name, class, and config must
-    ///   match; a differing queue is only a warning, since requeueing elsewhere is legitimate.
-    ///
-    /// `max_recovery_attempts` of `None` disables parking entirely. [`Submission`] says why the
-    /// workflow is being submitted, and so whether it may claim a row another owner holds.
-    ///
-    /// The owner identity behind the single-execution guard is generated in here rather than
-    /// passed in, and generated once per call — before any retry the implementation makes. A
-    /// retry that generated a fresh identity after a lost commit acknowledgement would fail to
-    /// recognise its own write and conclude another executor owned the row.
+    /// **Two tokens.** Each call generates a creator token, once, before any retry the
+    /// implementation makes, and a new row records it as `creator_xid`. The caller should run the
+    /// workflow only if the row holds its token, which is what
+    /// [`should_execute`](types::WorkflowInitResult::should_execute) reports: a retry after a lost
+    /// commit acknowledgement still recognises its own insert, and any other caller joins. A row
+    /// inserted `PENDING` is also owned by its creator from the start (`owner_xid`, the token the
+    /// running execution presents on every write); a queued or delayed one is owned by nobody
+    /// until a dequeue claims it.
     ///
     /// **`caller` makes the child's row and the parent's record of it one write.** A start from
     /// inside a workflow is a step of that workflow, and as two statements the pair has a gap: a
@@ -155,8 +151,6 @@ pub trait SystemDatabase: Send + Sync {
     async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
-        max_recovery_attempts: Option<i64>,
-        submission: Submission,
         caller: Option<InitWorkflowCaller<'_>>,
     ) -> Result<WorkflowInitResult, Error>;
 
@@ -455,6 +449,19 @@ pub trait SystemDatabase: Send + Sync {
         executor_ids: &[&str],
         application_version: &str,
         recovery_queue: &str,
+    ) -> Result<Vec<String>, Error>;
+
+    /// Parks workflows that have been dispatched too often, as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`,
+    /// returning the ids that moved.
+    ///
+    /// Only rows still `PENDING` with at least `min_recovery_attempts` recorded move: the caller
+    /// read that count from the row it claimed, so a row a resume reset, or another execution
+    /// settled, since then is left alone. Clears what leaving a queue clears, and `owner_xid`, so
+    /// no execution still holds it.
+    async fn dead_letter_workflows(
+        &self,
+        workflow_ids: &[&str],
+        min_recovery_attempts: i64,
     ) -> Result<Vec<String>, Error>;
 
     /// Releases delayed workflows whose time has come, returning how many moved.
@@ -1324,11 +1331,16 @@ pub trait SystemDatabase: Send + Sync {
     /// `application_version` is this executor's. A workflow with no version recorded is eligible
     /// only when this executor is running the *latest* registered version, so a rolling deploy
     /// does not hand unversioned work to the code being replaced.
+    ///
+    /// `owner_xid` is this claim's token, one per call: every row it claims is owned by it, and
+    /// the executions dispatched from them present it on every write they make.
+    #[allow(clippy::too_many_arguments)]
     async fn start_queued_workflows(
         &self,
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        owner_xid: &str,
         partition_key: Option<&str>,
         local_running_count: i64,
         partition_local_running_count: i64,
@@ -1373,6 +1385,7 @@ pub trait SystemDatabase: Send + Sync {
         queue: &QueueRecord,
         executor_id: &str,
         application_version: &str,
+        owner_xid: &str,
         max_tasks: Option<i64>,
     ) -> Result<Vec<String>, Error>;
 

@@ -814,3 +814,47 @@ async fn the_corpus_applies_without_listen_notify() {
             .any(|t| t == "workflow_status")
     );
 }
+
+/// Migration 123 adds `creator_xid`, a nullable text column with no default value, and applying
+/// it twice is harmless.
+#[tokio::test]
+async fn migration_123_adds_the_creator_token_column() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    dbos::sysdb::migrations::runner::run(&pool, schema, true)
+        .await
+        .expect("migration failed");
+
+    let (data_type, nullable, default): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT data_type, is_nullable, column_default FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'workflow_status' \
+           AND column_name = 'creator_xid'",
+    )
+    .bind(schema)
+    .fetch_one(&pool)
+    .await
+    .expect("creator_xid is missing");
+    assert_eq!(data_type, "text");
+    assert_eq!(nullable, "YES");
+    assert!(
+        default
+            .as_deref()
+            .is_none_or(|default| default.eq_ignore_ascii_case("NULL")),
+        "creator_xid defaults to {default:?}"
+    );
+
+    let statement = dbos::sysdb::migrations::SOURCES
+        .iter()
+        .find(|source| source.version == 123)
+        .expect("migration 123 is registered")
+        .sql
+        .replace(
+            "{{schema}}",
+            &dbos::sysdb::migrations::quote_identifier(schema),
+        );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+        .execute(&pool)
+        .await
+        .expect("applying migration 123 again failed");
+}

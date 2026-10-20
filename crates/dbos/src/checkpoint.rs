@@ -861,6 +861,7 @@ mod tests {
         let proper = Ctx::new(
             dbos.executor("test").expect("launched"),
             "wf",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );
@@ -957,6 +958,7 @@ mod tests {
         let other = Ctx::new(
             dbos.executor("test").expect("launched"),
             "wf-other",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );
@@ -966,6 +968,7 @@ mod tests {
         let rerun = Ctx::new(
             dbos.executor("test").expect("launched"),
             "wf",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );

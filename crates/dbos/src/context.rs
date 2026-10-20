@@ -189,6 +189,12 @@ static NEXT_STEP_MARKER: AtomicU64 = AtomicU64::new(0);
 /// The parts of a workflow that outlive any one call within it.
 struct WorkflowState {
     workflow_id: String,
+    /// The token this execution owns the workflow by, which every write it makes presents.
+    ///
+    /// A direct start's creator token, or the token of the dequeue claim that dispatched it. When
+    /// the workflow is handed to another execution (a cancel, a resume, a recovery), the row's
+    /// `owner_xid` stops matching this, and this execution's next write is refused.
+    owner_xid: String,
     /// When this workflow must stop, if it was given a budget.
     ///
     /// **The instant the database holds, not the timeout its caller offered.** A recovered
@@ -231,6 +237,7 @@ impl Ctx {
     pub(crate) fn new(
         executor: Arc<Executor>,
         workflow_id: impl Into<String>,
+        owner_xid: impl Into<String>,
         deadline: Option<Timestamp>,
         encoding: PayloadEncoding,
     ) -> Self {
@@ -238,6 +245,7 @@ impl Ctx {
             executor,
             workflow: Arc::new(WorkflowState {
                 workflow_id: workflow_id.into(),
+                owner_xid: owner_xid.into(),
                 deadline,
                 encoding,
                 next_step_id: AtomicI32::new(0),
@@ -280,6 +288,11 @@ impl Ctx {
     /// The id of the workflow this context belongs to.
     pub(crate) fn workflow_id(&self) -> &str {
         &self.workflow.workflow_id
+    }
+
+    /// The token this execution owns its workflow by, which every write it makes presents.
+    pub(crate) fn owner_xid(&self) -> &str {
+        &self.workflow.owner_xid
     }
 
     /// The id of the step body this context is inside, or `None` in the workflow proper.
@@ -581,6 +594,23 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
+/// The owner token the crate's unit tests run their contexts under. A test that writes against a
+/// workflow row makes the row's `owner_xid` this, as a start or a claim would.
+#[cfg(test)]
+pub(crate) const TEST_OWNER: &str = "test-owner";
+
+/// Makes [`TEST_OWNER`] the owner of `workflow_id`'s row, as a start or a claim would make its own
+/// token.
+#[cfg(test)]
+pub(crate) async fn own_for_test(db: &dbos_test_support::TestDatabase, workflow_id: &str) {
+    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = $1 WHERE workflow_uuid = $2"#)
+        .bind(TEST_OWNER)
+        .bind(workflow_id)
+        .execute(&db.pool().await)
+        .await
+        .expect("could not take ownership of the workflow row");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +621,7 @@ mod tests {
     fn state() -> WorkflowState {
         WorkflowState {
             workflow_id: "wf-1".to_owned(),
+            owner_xid: TEST_OWNER.to_owned(),
             deadline: None,
             encoding: PayloadEncoding::Native,
             next_step_id: AtomicI32::new(0),
@@ -657,6 +688,7 @@ mod tests {
         let ctx = Ctx::new(
             dbos.executor("test").expect("launched"),
             workflow_id,
+            crate::context::TEST_OWNER,
             deadline,
             PayloadEncoding::Native,
         );

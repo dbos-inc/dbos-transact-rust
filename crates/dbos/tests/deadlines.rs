@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::{NewWorkflow, Outcome, Submission, Timestamp, WorkflowStatus};
+use dbos::sysdb::types::{NewWorkflow, Outcome, Timestamp, WorkflowStatus};
 use dbos::{Config, DBOS, Error, RunOptions, StartOptions, Timeout};
 
 use dbos_test_support::{Backend, TestDatabase, raw_database, test_database};
@@ -338,8 +338,6 @@ async fn insert_expired(sys: &PostgresSystemDatabase, id: &str, queue: Option<&s
             ..NewWorkflow::new(id)
         },
         None,
-        Submission::Fresh,
-        None,
     )
     .await
     .expect("insert failed");
@@ -484,57 +482,53 @@ async fn the_sweep_stops_at_shutdown_and_restarts_on_relaunch() {
 /// **A run whose deadline passes records its own timeout**, so it doesn't depend on the sweep
 /// reaching the row.
 ///
-/// The row is recorded under another application's name with no owner, which this process will
-/// run when started under the same id, and which its sweep, scoped to its own application's rows,
-/// never cancels. The run still ends `CANCELLED` soon after its deadline.
+/// Once the run has started, its row is moved under another application's name, which this
+/// process's sweep, scoped to its own application's rows, never cancels. The run still ends
+/// `CANCELLED` soon after its deadline.
 #[tokio::test]
 async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
     let db = test_database().await;
     let dbos = DBOS::new(sweeping_config("deadline-scope-app", &db));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dbos_started = Arc::clone(&started);
     let workflow = dbos
-        .register_workflow("runs_forever", |()| async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok::<u32, dbos::Error>(1)
+        .register_workflow("runs_forever", move |()| {
+            let started = Arc::clone(&dbos_started);
+            async move {
+                started.notify_one();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<u32, dbos::Error>(1)
+            }
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
 
     let id = "out-of-scope";
-    writer(&db, "another-app")
-        .await
-        .init_workflow(
-            &NewWorkflow {
-                name: Some("runs_forever"),
-                input: Some("null"),
-                serialization: Some("rust_serde"),
-                deadline: Timestamp::now().checked_add(Duration::from_millis(300)),
-                ..NewWorkflow::new(id)
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Timeout::Explicit(Duration::from_millis(500)),
+                ..StartOptions::default()
             },
-            None,
-            Submission::Fresh,
-            None,
         )
         .await
-        .expect("insert failed");
-    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = NULL WHERE workflow_uuid = $1"#)
-        .bind(id)
-        .execute(&db.pool().await)
-        .await
-        .unwrap();
-
-    let error = tokio::time::timeout(
-        Duration::from_secs(10),
-        workflow.run_with(
-            (),
-            RunOptions {
-                workflow_id: Some(id),
-                ..Default::default()
-            },
-        ),
+        .expect("start failed");
+    started.notified().await;
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET application_name = 'another-app'
+           WHERE workflow_uuid = $1"#,
     )
+    .bind(id)
+    .execute(&db.pool().await)
     .await
-    .expect("the timed-out run never ended")
-    .expect_err("the workflow succeeded");
+    .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(10), handle.result())
+        .await
+        .expect("the timed-out run never ended")
+        .expect_err("the workflow succeeded");
     assert!(
         matches!(error, Error::WorkflowCancelled { .. }),
         "expected a cancellation, got {error:?}"
@@ -547,5 +541,95 @@ async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
         "the row stayed outside this application's sweep"
     );
 
+    dbos.shutdown().await;
+}
+
+/// **Starting a timed-out workflow's id again doesn't run its body again**, whether the run
+/// recorded its own timeout or the sweep did. A timeout leaves the row with no owner, and a start
+/// runs a workflow only if it created the row: it joins this one, and reports the cancellation.
+#[tokio::test]
+async fn starting_a_timed_out_workflow_again_does_not_rerun_it() {
+    let db = test_database().await;
+    let dbos = DBOS::new(sweeping_config("deadline-rerun-app", &db));
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let dbos_runs = Arc::clone(&runs);
+    let workflow = dbos
+        .register_workflow("counted", move |()| {
+            let runs = Arc::clone(&dbos_runs);
+            async move {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok::<u32, dbos::Error>(1)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let rerun = |id: &'static str| {
+        let workflow = workflow.clone();
+        async move {
+            workflow
+                .run_with(
+                    (),
+                    RunOptions {
+                        workflow_id: Some(id),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("the workflow succeeded")
+        }
+    };
+
+    // Cancelled by its own run's timeout.
+    let error = workflow
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("self-timed-out"),
+                timeout: Timeout::Explicit(Duration::from_millis(200)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the workflow succeeded");
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "{error:?}"
+    );
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let error = rerun("self-timed-out").await;
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "{error:?}"
+    );
+
+    // Cancelled by the sweep, with nothing running it.
+    let reader = reader(&db).await;
+    writer(&db, "deadline-rerun-app")
+        .await
+        .init_workflow(
+            &NewWorkflow {
+                name: Some("counted"),
+                input: Some("null"),
+                serialization: Some("rust_serde"),
+                deadline: Some(Timestamp::from_epoch_ms(1_000)),
+                ..NewWorkflow::new("swept")
+            },
+            None,
+        )
+        .await
+        .expect("insert failed");
+    wait_for_status(&reader, "swept", WorkflowStatus::Cancelled).await;
+    let error = rerun("swept").await;
+    assert!(
+        matches!(error, Error::WorkflowCancelled { .. }),
+        "{error:?}"
+    );
+
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "neither start ran the body again"
+    );
     dbos.shutdown().await;
 }

@@ -22,7 +22,7 @@ use crate::registry::{WorkflowKey, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite, StepCaller, StepTiming,
-    Submission, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
+    Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -664,11 +664,7 @@ pub(crate) async fn init_or_join(
     caller: Option<InitWorkflowCaller<'_>>,
 ) -> Result<Submitted> {
     loop {
-        match conn
-            .sysdb()
-            .init_workflow(new, Some(MAX_RECOVERY_ATTEMPTS), Submission::Fresh, caller)
-            .await
-        {
+        match conn.sysdb().init_workflow(new, caller).await {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
             // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
@@ -1381,13 +1377,12 @@ async fn create<R, E>(
         ));
     }
 
-    // Someone else owns this row — the id was supplied and a previous run has it, or another
-    // executor claimed it first. Joining rather than erroring is what makes a retried request
-    // idempotent, and it is where Python waits too.
+    // Someone else created this row: the id was supplied and a previous call made it. Joining
+    // rather than erroring is what makes a retried request idempotent.
     if !initialized.should_execute {
         tracing::debug!(
             workflow_id,
-            "the workflow is already owned; the handle joins the existing run"
+            "another caller created the workflow; the handle joins it"
         );
         // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read this
         // row, and it is the case the references pass their own flag on — Python parks its unowned
@@ -1400,10 +1395,7 @@ async fn create<R, E>(
         ));
     }
 
-    // **The row's input and encoding, not this caller's.** A row this call found rather than
-    // created keeps the input and the tag it was written with, and a recovery of it would run
-    // those — so the run does too, rather than the input this caller offered and never wrote.
-    let input = initialized.existing_input.unwrap_or(input);
+    // The row's encoding, which is this caller's own: it created the row.
     let serialization = initialized.serialization;
     // The deadline the *database* holds, not the one this caller offered: `init_workflow`
     // turns a budget into an instant against its own clock, and an existing row keeps the
@@ -1412,6 +1404,8 @@ async fn create<R, E>(
         executor,
         key.clone(),
         workflow_id.clone(),
+        // The row was inserted `PENDING`, so its creator owns it from the start.
+        initialized.creator_xid,
         input,
         serialization,
         initialized.deadline,
@@ -1896,10 +1890,15 @@ impl Parent<'_> {
 /// aborting it, without anything having to watch for the end. The one earlier release is an
 /// execution another one has overtaken, which [`adopt_superseded`] gives up before it waits. Every
 /// other submitter passes `None`.
+///
+/// `owner_xid` is the token the execution owns the workflow by: the creator token of a direct
+/// start that inserted the row, or the token of the claim that dequeued it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
     key: WorkflowKey,
     workflow_id: String,
+    owner_xid: String,
     input: Option<String>,
     serialization: Option<String>,
     deadline: Option<Timestamp>,
@@ -1926,6 +1925,7 @@ pub(crate) fn spawn_execution(
                 let ctx = Ctx::new(
                     Arc::clone(&executor),
                     &workflow_id,
+                    owner_xid,
                     deadline,
                     encoding.clone(),
                 );
@@ -2419,6 +2419,7 @@ mod tests {
             Ctx::new(
                 Arc::clone(&executor),
                 "wf-donor",
+                crate::context::TEST_OWNER,
                 None,
                 crate::serialization::PayloadEncoding::Native,
             ),
@@ -2430,6 +2431,7 @@ mod tests {
         let thief = Ctx::new(
             Arc::clone(&executor),
             "wf-thief",
+            crate::context::TEST_OWNER,
             None,
             crate::serialization::PayloadEncoding::Native,
         );
