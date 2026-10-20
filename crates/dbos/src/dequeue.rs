@@ -621,8 +621,8 @@ async fn dispatch_claimed(
 ///
 /// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
 /// describes — look the registration up by the row's own name, check the row is still `PENDING`,
-/// and spawn — and that is what this does. It takes the row rather than fetching it because the claim already
-/// read every row it took in one round trip, which is the shape Python's
+/// and spawn — and that is what this does. It takes the row rather than fetching it because the
+/// claim already read every row it took in one round trip, which is the shape Python's
 /// `start_dequeued_workflows` chose and the reason
 /// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
 ///
