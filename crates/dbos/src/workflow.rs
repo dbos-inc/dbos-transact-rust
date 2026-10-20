@@ -802,9 +802,9 @@ impl Timeout {
     /// The budget to record on the row, which only [`Explicit`](Self::Explicit) has.
     ///
     /// Neither of the others is a budget: `Inherit` takes an *instant* from its parent and
-    /// `None` takes nothing, and a row's `workflow_timeout_ms` is what a **queue** recomputes
-    /// a deadline from on dequeue. Writing one for either would hand that path a budget the caller
-    /// never asked for.
+    /// `None` takes nothing, and a row's `workflow_timeout_ms` is what the database turns into a
+    /// deadline: the insert, for a workflow that starts now, and the dequeue's claim, for a queued
+    /// one. Writing one for either would hand those a budget the caller never asked for.
     fn budget(self) -> Option<Duration> {
         match self {
             Self::Explicit(timeout) => Some(timeout),
@@ -1269,9 +1269,9 @@ async fn create<R, E>(
         application_name: Some(executor.app_name()),
         application_version: Some(executor.app_version()),
         // Only a budget is written: an inherited deadline is an *instant* and has no
-        // budget behind it, and `Timeout::None` has neither. The column is what a
-        // queue recomputes a deadline from on dequeue, so filling it in for either
-        // would hand that path a budget nobody asked for.
+        // budget behind it, and `Timeout::None` has neither. The column is what the insert
+        // and a dequeue's claim compute a deadline from, so filling it in for either would
+        // hand them a budget nobody asked for.
         timeout: timeout.budget(),
         deadline,
         attributes: attributes.as_deref(),

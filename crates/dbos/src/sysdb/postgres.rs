@@ -3013,7 +3013,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                        ELSE {workflow_table}.executor_id \
                    END \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
-                 workflow_deadline_epoch_ms, owner_xid, serialization, {NOW_MS_SQL} AS db_now"
+                 workflow_deadline_epoch_ms, owner_xid, serialization, \
+                 (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint AS db_now"
             )))
             .bind(workflow.workflow_id)
             .bind(initial_status.as_str())
@@ -3083,7 +3084,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 other => other,
             })?;
 
-            // First, so the reading is paired with the moment the row arrived.
+            // First, so the reading is paired with the moment the row arrived. The statement's
+            // clock rather than `now()`, the transaction's start, which would be older by the
+            // `BEGIN` round trip and any wait on the row's lock, and so time the deadline late.
             let clock = DatabaseTime::read(row.try_get("db_now")?);
             let recovery_attempts: i64 = row.try_get("recovery_attempts")?;
             let status = parse_workflow_status(&row.try_get::<String, _>("status")?)?;

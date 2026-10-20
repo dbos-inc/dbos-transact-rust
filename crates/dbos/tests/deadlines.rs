@@ -555,9 +555,9 @@ async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
 /// A database whose clock runs `seconds` ahead of this process's (behind, when negative), or `None`
 /// on CockroachDB, whose built-ins can't be shadowed.
 ///
-/// A `now()` of the database's own shadows the built-in, because the database's `search_path` names
-/// `pg_catalog` after it: every unqualified `now()` this SDK's statements make reads the offset
-/// clock, and nothing in the SDK is told.
+/// A `now()` and a `clock_timestamp()` of the database's own shadow the built-ins, because the
+/// database's `search_path` names `pg_catalog` after them: every unqualified call this SDK's
+/// statements make reads the offset clock, and nothing in the SDK is told.
 async fn skewed_database(seconds: i64) -> Option<TestDatabase> {
     let db = raw_database().await;
     if db.backend() == Backend::Cockroach {
@@ -568,6 +568,8 @@ async fn skewed_database(seconds: i64) -> Option<TestDatabase> {
         "CREATE SCHEMA skew; \
          CREATE FUNCTION skew.now() RETURNS timestamptz LANGUAGE sql STABLE \
            AS $$ SELECT pg_catalog.now() + interval '{seconds} seconds' $$; \
+         CREATE FUNCTION skew.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE \
+           AS $$ SELECT pg_catalog.clock_timestamp() + interval '{seconds} seconds' $$; \
          DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = skew, pg_catalog, public', \
            current_database()); END $$;"
     )))
@@ -695,7 +697,9 @@ async fn timeouts_hold_with_the_database_clock_off_by(seconds: i64) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert!(
-            lived >= BUDGET - Duration::from_millis(50),
+            // Loose: the body starts a little after the budget does, once the start or claim has
+            // committed. A deadline on the wrong clock is off by about a minute either way.
+            lived >= BUDGET / 2,
             "{label}: the body was stopped after {lived:?}, inside its budget"
         );
         assert!(

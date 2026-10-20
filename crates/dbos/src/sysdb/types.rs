@@ -1332,8 +1332,9 @@ pub enum OutcomeWrite {
 /// [`Instant`], which no setting of this host's wall clock moves, so a host whose clock is far off
 /// the database's waits exactly as long as one whose clock agrees.
 ///
-/// The reading is taken when the statement that returns it arrives, so it misses the trip back
-/// from the database: a wait measured from it ends that much late, never early.
+/// The reading is the database's clock as the statement that returns it runs, paired with the
+/// moment its row arrives here, so it misses the trip back: a wait measured from it ends that
+/// much late, never early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseTime {
     epoch_ms: i64,
