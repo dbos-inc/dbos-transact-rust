@@ -420,6 +420,8 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "cancel")
+                    .await?;
                 executor
                     .connection()
                     .cancel_all(&[workflow_id], Children::Skip, placement.step())
@@ -457,6 +459,14 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(
+                    &executor,
+                    &placement,
+                    workflow_ids,
+                    children == Children::Include,
+                    "cancel",
+                )
+                .await?;
                 executor
                     .connection()
                     .cancel_all(workflow_ids, children, placement.step())
@@ -537,6 +547,8 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "resume")
+                    .await?;
                 executor
                     .connection()
                     .resume_all(&[workflow_id], options, placement.step())
@@ -571,6 +583,8 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
+                refuse_self_target_in_step(&executor, &placement, workflow_ids, false, "resume")
+                    .await?;
                 executor
                     .connection()
                     .resume_all(workflow_ids, options, placement.step())
@@ -1333,6 +1347,29 @@ impl crate::Client {
             .list_workflow_steps(workflow_id, options, None)
             .await
     }
+}
+
+/// Refuses a cancel or a resume of the workflow whose step body is making it.
+///
+/// A call from inside a step body records nothing and carries no caller, so the system database
+/// can't see whose workflow it is in; this asks it with the step's own workflow instead. See
+/// [`refuse_self_target`](crate::sysdb::SystemDatabase::refuse_self_target) for why. A recorded
+/// call is refused by the system database itself.
+async fn refuse_self_target_in_step(
+    executor: &Executor,
+    placement: &StepPlacement,
+    targets: &[&str],
+    children: bool,
+    action: &str,
+) -> Result<()> {
+    if let StepPlacement::InsideStep { ctx } = placement {
+        executor
+            .sysdb()
+            .refuse_self_target(ctx.workflow_id(), targets, children, action)
+            .await
+            .map_err(Error::from_sysdb)?;
+    }
+    Ok(())
 }
 
 /// The operator surface, on the connection every caller reaches it through.

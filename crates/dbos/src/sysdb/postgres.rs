@@ -4037,6 +4037,54 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn refuse_self_target(
+        &self,
+        caller_id: &str,
+        targets: &[&str],
+        children: bool,
+        action: &str,
+    ) -> Result<(), Error> {
+        let refused = || Error::InvalidInput {
+            field: "workflow_ids".into(),
+            detail: format!("workflow {caller_id} cannot {action} itself"),
+        };
+        if targets.contains(&caller_id) {
+            return Err(refused());
+        }
+        if !children {
+            return Ok(());
+        }
+        // Up the caller's ancestry, which is short, rather than down every target's tree.
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
+        let mut current = caller_id.to_owned();
+        loop {
+            let parent: Option<Option<String>> = {
+                let current = current.as_str();
+                with_retry(&self.retry, "refuse_self_target", move || async move {
+                    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
+                    )))
+                    .bind(current)
+                    .fetch_optional(pool)
+                    .await?)
+                })
+                .await?
+            };
+            let Some(parent) = parent.flatten() else {
+                return Ok(());
+            };
+            if targets.contains(&parent.as_str()) {
+                return Err(refused());
+            }
+            if !seen.insert(parent.clone()) {
+                return Ok(());
+            }
+            current = parent;
+        }
+    }
+
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
@@ -4052,6 +4100,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // stands there and spares a client a transaction that would do nothing.
         if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
+        }
+        if let Some(caller) = caller {
+            self.refuse_self_target(caller.workflow_id, workflow_ids, cancel_children, "cancel")
+                .await?;
         }
         let started_at = Timestamp::now();
 
@@ -4123,6 +4175,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // `cancel_workflows` for why the caller decides this.
         if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
+        }
+        if let Some(caller) = caller {
+            self.refuse_self_target(caller.workflow_id, workflow_ids, false, "resume")
+                .await?;
         }
         let workflow_table = self.tables.workflow_status.as_str();
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);

@@ -494,6 +494,26 @@ pub trait SystemDatabase: Send + Sync {
     /// expiry on the same clock.
     async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
 
+    /// Refuses a cancel or a resume a workflow makes of itself, directly or, with `children`,
+    /// through an ancestor whose tree it is inside.
+    ///
+    /// A resume would re-enqueue the workflow underneath its own execution, so the claim that
+    /// dequeues it starts a second execution beside the first. A workflow that wants to stop
+    /// returns or fails instead. Refused before anything runs, as a delete of itself is, so the
+    /// caller hears why and can go on.
+    ///
+    /// [`cancel_workflows`](Self::cancel_workflows) and
+    /// [`resume_workflows`](Self::resume_workflows) make this check themselves for a recorded
+    /// caller; the engine calls it directly for a cancel or a resume made inside a step body,
+    /// which records nothing and so passes no caller.
+    async fn refuse_self_target(
+        &self,
+        caller_id: &str,
+        targets: &[&str],
+        children: bool,
+        action: &str,
+    ) -> Result<(), Error>;
+
     /// Cancels workflows, returning the ids that actually moved.
     ///
     /// A workflow that has already finished is left alone rather than reported as an error —
