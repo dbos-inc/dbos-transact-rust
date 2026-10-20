@@ -766,6 +766,56 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
 }
 
 impl PostgresSystemDatabase {
+    /// [`refuse_self_target`](SystemDatabase::refuse_self_target), on a connection of the caller's:
+    /// for a recorded caller, the transaction that records the call, so the refusal is recorded
+    /// with it and a replay raises it again from the checkpoint rather than deciding it afresh.
+    async fn refuse_self_target_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        caller_id: &str,
+        targets: &[&str],
+        children: bool,
+        action: &str,
+    ) -> Result<(), Error> {
+        if targets.contains(&caller_id) {
+            return Err(Error::InvalidInput {
+                field: "workflow_ids".into(),
+                detail: format!("workflow {caller_id} cannot {action} itself"),
+            });
+        }
+        if !children || targets.is_empty() {
+            return Ok(());
+        }
+        // Up the caller's ancestry, which is short, rather than down every target's tree.
+        let workflow_table = self.tables.workflow_status.as_str();
+        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
+        let mut current = caller_id.to_owned();
+        loop {
+            let parent: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
+            )))
+            .bind(&current)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(parent) = parent.flatten() else {
+                return Ok(());
+            };
+            if targets.contains(&parent.as_str()) {
+                return Err(Error::InvalidInput {
+                    field: "workflow_ids".into(),
+                    detail: format!(
+                        "workflow {caller_id} cannot {action} the tree of {parent}, which \
+                         contains it"
+                    ),
+                });
+            }
+            if !seen.insert(parent.clone()) {
+                return Ok(());
+            }
+            current = parent;
+        }
+    }
+
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
     /// The shape every system-database call needs when it must be atomic with the step recording
@@ -4044,45 +4094,16 @@ impl SystemDatabase for PostgresSystemDatabase {
         children: bool,
         action: &str,
     ) -> Result<(), Error> {
-        let refused = || Error::InvalidInput {
-            field: "workflow_ids".into(),
-            detail: format!("workflow {caller_id} cannot {action} itself"),
-        };
-        if targets.contains(&caller_id) {
-            return Err(refused());
-        }
-        if !children {
+        if targets.is_empty() {
             return Ok(());
         }
-        // Up the caller's ancestry, which is short, rather than down every target's tree.
-        let workflow_table = self.tables.workflow_status.as_str();
         let pool = &self.pool;
-        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
-        let mut current = caller_id.to_owned();
-        loop {
-            let parent: Option<Option<String>> = {
-                let current = current.as_str();
-                with_retry(&self.retry, "refuse_self_target", move || async move {
-                    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
-                        "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
-                    )))
-                    .bind(current)
-                    .fetch_optional(pool)
-                    .await?)
-                })
-                .await?
-            };
-            let Some(parent) = parent.flatten() else {
-                return Ok(());
-            };
-            if targets.contains(&parent.as_str()) {
-                return Err(refused());
-            }
-            if !seen.insert(parent.clone()) {
-                return Ok(());
-            }
-            current = parent;
-        }
+        with_retry(&self.retry, "refuse_self_target", move || async move {
+            let mut conn = pool.acquire().await?;
+            self.refuse_self_target_on(&mut conn, caller_id, targets, children, action)
+                .await
+        })
+        .await
     }
 
     async fn cancel_workflows(
@@ -4101,10 +4122,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
-        if let Some(caller) = caller {
-            self.refuse_self_target(caller.workflow_id, workflow_ids, cancel_children, "cancel")
-                .await?;
-        }
         let started_at = Timestamp::now();
 
         // The retry wraps the whole cascade, and the cascade is one transaction: a failure
@@ -4118,6 +4135,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::CANCEL_WORKFLOW,
                 started_at,
                 |mut tx| async move {
+                    if let Some(caller) = caller {
+                        self.refuse_self_target_on(
+                            &mut tx,
+                            caller.workflow_id,
+                            workflow_ids,
+                            cancel_children,
+                            "cancel",
+                        )
+                        .await?;
+                    }
                     // One statement per *level*, not per workflow: `cancel_batch` takes the whole
                     // frontier and matches it with `= ANY($1)`, so the round trips scale with the
                     // depth of the tree rather than its size.
@@ -4176,10 +4203,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
         }
-        if let Some(caller) = caller {
-            self.refuse_self_target(caller.workflow_id, workflow_ids, false, "resume")
-                .await?;
-        }
         let workflow_table = self.tables.workflow_status.as_str();
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
         let started_at = Timestamp::now();
@@ -4190,6 +4213,16 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::RESUME_WORKFLOW,
                 started_at,
                 |mut tx| async move {
+                    if let Some(caller) = caller {
+                        self.refuse_self_target_on(
+                            &mut tx,
+                            caller.workflow_id,
+                            workflow_ids,
+                            false,
+                            "resume",
+                        )
+                        .await?;
+                    }
                     // Existence is asked separately because a zero-row update conflates "already
                     // finished" — which is legal — with "no such workflow", which is not. In the
                     // same transaction as the update, so a workflow deleted between the two

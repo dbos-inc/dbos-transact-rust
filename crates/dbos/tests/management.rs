@@ -2376,9 +2376,190 @@ async fn a_workflow_cannot_cancel_an_ancestors_tree() {
     .await
     .expect("the workflow never finished")
     .expect("the workflow failed");
-    assert!(message.contains("cannot cancel itself"), "{message}");
+    assert!(
+        message.contains("cannot cancel the tree of the-cancelled-ancestor"),
+        "{message}"
+    );
     let row = reader(&db).await.get_workflow(root).await.unwrap().unwrap();
     assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
+/// **A refusal is the call's recorded answer**, so a replay raises it again from the checkpoint
+/// rather than deciding it afresh. A fork from the step after the refused cancel replays it: the
+/// fork is a different workflow, so deciding afresh would let it cancel the original.
+#[tokio::test]
+async fn a_refused_self_cancel_is_recorded_and_replayed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refusal-replay-app", &db));
+    let workflow = dbos
+        .register_workflow("refused-then-on", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let refused = dbos
+                        .cancel(&own_id)
+                        .await
+                        .expect_err("the workflow cancelled itself")
+                        .to_string();
+                    let after = dbos::step("after", || async { Ok::<_, Error>(7u32) }).await?;
+                    Ok::<_, Error>((refused, after))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "refused-and-recorded";
+    let original = workflow
+        .run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    let steps = dbos.list_workflow_steps(id).await.unwrap();
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(
+        steps[0].error.is_some(),
+        "the refusal is recorded: {steps:?}"
+    );
+    assert_eq!(
+        (steps[1].step_id, steps[1].step_name.as_str()),
+        (1, "after")
+    );
+
+    let forked = dbos
+        .fork::<(String, u32), Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(Duration::from_secs(10), forked.result())
+        .await
+        .expect("the fork never finished")
+        .expect("the fork failed");
+    assert_eq!(replayed, original, "the fork replays the recorded refusal");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success, "nothing cancelled it");
+
+    dbos.shutdown().await;
+}
+
+/// **The cascade is refused from further down too**, through a grandparent, from inside a step,
+/// and when the caller is one of several ids named. Each refusal comes before anything moves, so
+/// the other ids named alongside are left as they were.
+#[tokio::test]
+async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("self-target-cases-app", &db));
+    let bystander = dbos
+        .register_workflow("bystander", |(): ()| async { Ok::<_, Error>(()) })
+        .unwrap();
+    let grandchild = dbos
+        .register_workflow("targeting-grandchild", {
+            let dbos = dbos.clone();
+            move |(own_id, root, other): (String, String, String)| {
+                let dbos = dbos.clone();
+                async move {
+                    let tree = dbos
+                        .cancel_all(&[&root], Children::Include)
+                        .await
+                        .expect_err("the grandchild cancelled its grandparent's tree")
+                        .to_string();
+                    let in_step = dbos::step("kick", || {
+                        let (dbos, root) = (dbos.clone(), root.clone());
+                        async move {
+                            Ok::<_, Error>(
+                                dbos.cancel_all(&[&root], Children::Include)
+                                    .await
+                                    .expect_err("a step cancelled its grandparent's tree")
+                                    .to_string(),
+                            )
+                        }
+                    })
+                    .await?;
+                    let among = dbos
+                        .cancel_all(&[&other, &own_id], Children::Skip)
+                        .await
+                        .expect_err("the grandchild cancelled itself among others")
+                        .to_string();
+                    let resumed = dbos
+                        .resume_all::<(), Error>(&[&other, &own_id], ResumeOptions::default())
+                        .await
+                        .expect_err("the grandchild resumed itself among others")
+                        .to_string();
+                    Ok::<_, Error>(vec![tree, in_step, among, resumed])
+                }
+            }
+        })
+        .unwrap();
+    let child = dbos
+        .register_workflow("middle-child", {
+            move |(root, other): (String, String)| {
+                let grandchild = grandchild.clone();
+                async move {
+                    let own = format!("{root}-grandchild");
+                    grandchild
+                        .run_with(
+                            (own.clone(), root, other),
+                            dbos::RunOptions {
+                                workflow_id: Some(&own),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    let root_workflow = dbos
+        .register_workflow("the-grandparent", {
+            move |(root, other): (String, String)| {
+                let child = child.clone();
+                async move { child.run((root, other)).await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let other = "a-bystander";
+    bystander
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(other),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let root = "the-grandparent-root";
+    let messages = tokio::time::timeout(
+        Duration::from_secs(10),
+        root_workflow.run_with(
+            (root.to_owned(), other.to_owned()),
+            dbos::RunOptions {
+                workflow_id: Some(root),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    let tree = format!("cannot cancel the tree of {root}");
+    assert!(messages[0].contains(&tree), "{messages:?}");
+    assert!(messages[1].contains(&tree), "{messages:?}");
+    assert!(messages[2].contains("cannot cancel itself"), "{messages:?}");
+    assert!(messages[3].contains("cannot resume itself"), "{messages:?}");
+    for id in [root, other] {
+        let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+        assert_eq!(row.status, WorkflowStatus::Success, "{id} was moved");
+    }
 
     dbos.shutdown().await;
 }

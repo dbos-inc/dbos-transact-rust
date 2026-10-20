@@ -504,8 +504,11 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// [`cancel_workflows`](Self::cancel_workflows) and
     /// [`resume_workflows`](Self::resume_workflows) make this check themselves for a recorded
-    /// caller; the engine calls it directly for a cancel or a resume made inside a step body,
-    /// which records nothing and so passes no caller.
+    /// caller, in the transaction that records the call: the refusal is the call's recorded
+    /// answer, so a replay raises it again rather than deciding it afresh. The engine calls this
+    /// directly for a cancel or a resume made inside a step body, which records nothing and so
+    /// passes no caller. A call through a [`Client`](crate::Client) passes no caller either and is
+    /// not checked: a client is outside every workflow, even one made inside a workflow's code.
     async fn refuse_self_target(
         &self,
         caller_id: &str,
