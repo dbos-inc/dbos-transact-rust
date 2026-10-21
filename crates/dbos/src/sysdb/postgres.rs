@@ -359,19 +359,60 @@ impl<'a> Config<'a> {
 
 /// Whether the connection options `url` resolves to already set
 /// `idle_in_transaction_session_timeout`: the URL's `options` parameter, in either of its forms,
-/// or `PGOPTIONS`, decoded and compared without case as the server compares parameter names. A
-/// URL that does not parse sets nothing here, and fails at connect.
+/// or `PGOPTIONS`, decoded. A URL that does not parse sets nothing here, and fails at connect.
 fn options_set_idle_transaction_timeout(url: &str) -> bool {
     url.parse::<sqlx::postgres::PgConnectOptions>()
         .ok()
         .and_then(|options| {
-            options.get_options().map(|options| {
-                options
-                    .to_ascii_lowercase()
-                    .contains("idle_in_transaction_session_timeout")
-            })
+            options
+                .get_options()
+                .map(|options| option_names(options).any(|name| name == IDLE_TIMEOUT_PARAMETER))
         })
         .unwrap_or(false)
+}
+
+const IDLE_TIMEOUT_PARAMETER: &str = "idle_in_transaction_session_timeout";
+
+/// The parameter names a libpq `options` string assigns, as the server reads them: split on
+/// unescaped whitespace (a backslash escapes the next character), each assignment either `-c`
+/// followed by `name=value`, `-cname=value`, or `--name=value`, and the name compared lowercased
+/// with dashes as underscores. Anything else, a value included, names nothing.
+fn option_names(options: &str) -> impl Iterator<Item = String> + '_ {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => word.extend(chars.next()),
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut words = words.into_iter();
+    std::iter::from_fn(move || {
+        loop {
+            let word = words.next()?;
+            let assignment = if word == "-c" {
+                words.next()?
+            } else if let Some(rest) = word.strip_prefix("--") {
+                rest.to_owned()
+            } else if let Some(rest) = word.strip_prefix("-c") {
+                rest.to_owned()
+            } else {
+                continue;
+            };
+            if let Some((name, _)) = assignment.split_once('=') {
+                return Some(name.to_ascii_lowercase().replace('-', "_"));
+            }
+        }
+    })
 }
 
 /// The polling cap for a pool of `pool_size` connections.
@@ -471,13 +512,15 @@ impl PostgresSystemDatabase {
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
     pub async fn connect(config: &Config<'_>) -> Result<Self, Error> {
+        // Before anything touches the server, so a bad setting creates no database.
+        config.idle_transaction_timeout.validate()?;
+
         // Only when migrating. A caller that has opted out is saying the database is someone
         // else's to set up, and creating one here would hide the fact that it is missing.
         if config.migrate {
             ensure_database_exists(config.url).await?;
         }
 
-        config.idle_transaction_timeout.validate()?;
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
         if let Some(millis) = config.idle_transaction_timeout.millis()
             && !options_set_idle_transaction_timeout(config.url)
@@ -8247,20 +8290,24 @@ mod tests {
         );
     }
 
-    /// **`connect` sets the idle-transaction timeout on its connections**, a positive value under a
-    /// millisecond as a millisecond. Connection options that set it themselves keep their own,
-    /// however they spell it, and a pool the caller built is left alone.
+    /// **`connect` sets the idle-transaction timeout on its connections**: sixty seconds by
+    /// default, a positive value under a millisecond as a millisecond, and the server's own setting
+    /// for `ServerSetting`. Connection options that set it themselves keep their own, however they
+    /// spell it; one that only mentions it in a value doesn't count, and a pool the caller built is
+    /// left alone. Each is compared with the same server's reading of the value set directly, so
+    /// how a backend formats the setting doesn't matter.
     #[tokio::test]
     async fn connect_sets_the_idle_transaction_timeout() {
+        use super::IdleTransactionTimeout::{After, Default, ServerSetting};
         async fn show(pool: &sqlx::PgPool) -> String {
             sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
                 .fetch_one(pool)
                 .await
                 .unwrap()
         }
-        async fn connected(url: &str, timeout: std::time::Duration) -> String {
+        async fn connected(url: &str, timeout: super::IdleTransactionTimeout) -> String {
             let sys = PostgresSystemDatabase::connect(&super::Config {
-                idle_transaction_timeout: super::IdleTransactionTimeout::After(timeout),
+                idle_transaction_timeout: timeout,
                 migrate: false,
                 ..super::Config::new(url)
             })
@@ -8273,32 +8320,51 @@ mod tests {
             let separator = if db.url().contains('?') { '&' } else { '?' };
             format!("{}{separator}{query}", db.url())
         };
+        // What the server reports for `millis` set directly, on a pool `connect` didn't make.
+        let set_directly = async |millis: u64| {
+            let url = with(&format!(
+                "options=-c%20idle_in_transaction_session_timeout%3D{millis}"
+            ));
+            show(&sqlx::PgPool::connect(&url).await.unwrap()).await
+        };
         let ms = std::time::Duration::from_millis;
         let server = show(&db.pool().await).await;
 
-        let set = connected(db.url(), ms(300)).await;
-        assert_ne!(set, server, "the timeout was set");
-        let tiny = connected(db.url(), std::time::Duration::from_micros(500)).await;
-        assert_ne!(
-            tiny, server,
-            "under a millisecond is a millisecond, not the server's"
+        assert_eq!(
+            connected(db.url(), Default).await,
+            set_directly(60_000).await
         );
+        assert_eq!(
+            connected(db.url(), After(ms(300))).await,
+            set_directly(300).await
+        );
+        assert_eq!(
+            connected(db.url(), After(std::time::Duration::from_micros(500))).await,
+            set_directly(1).await,
+            "under a millisecond is a millisecond"
+        );
+        assert_eq!(connected(db.url(), ServerSetting).await, server);
 
-        let own = connected(
-            &with("options=-c%20idle_in_transaction_session_timeout%3D1234"),
-            ms(300),
-        )
-        .await;
-        assert_ne!(own, set, "the URL's own setting is kept");
-        let shouted = connected(
-            &with("options=-c%20IDLE%5FIN%5FTRANSACTION%5FSESSION%5FTIMEOUT%3D1234"),
-            ms(300),
-        )
-        .await;
-        assert_eq!(shouted, own, "however it is spelled");
-        // A bare query parameter is not a connection option and sets nothing, so the timeout is.
-        let bare = connected(&with("idle_in_transaction_session_timeout=1234"), ms(300)).await;
-        assert_eq!(bare, set);
+        let own = set_directly(1234).await;
+        for options in [
+            "options=-c%20idle_in_transaction_session_timeout%3D1234",
+            "options=-c%20IDLE%5FIN%5FTRANSACTION%5FSESSION%5FTIMEOUT%3D1234",
+            "options=--idle-in-transaction-session-timeout%3D1234",
+        ] {
+            assert_eq!(connected(&with(options), Default).await, own, "{options}");
+        }
+        // Neither of these sets the parameter, so the timeout is set: a bare query parameter is
+        // not a connection option, and a value that names the parameter assigns another one.
+        for query in [
+            "idle_in_transaction_session_timeout=1234",
+            "options=-c%20application_name%3Didle_in_transaction_session_timeout",
+        ] {
+            assert_eq!(
+                connected(&with(query), After(ms(300))).await,
+                set_directly(300).await,
+                "{query}"
+            );
+        }
 
         let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
         assert_eq!(
@@ -8306,6 +8372,21 @@ mod tests {
             server,
             "a pool the caller built is left alone"
         );
+    }
+
+    /// The names an `options` string assigns, in each form the server reads, and nothing else.
+    #[test]
+    fn option_names_are_read_as_the_server_reads_them() {
+        let names = |options| super::option_names(options).collect::<Vec<_>>();
+        assert_eq!(
+            names("-c a=1 -cB=2 --c-d=3 -c e\\ f=4"),
+            ["a", "b", "c_d", "e f"]
+        );
+        assert_eq!(
+            names("-c application_name=idle_in_transaction_session_timeout"),
+            ["application_name"]
+        );
+        assert!(names("-B 100 stray -c").is_empty());
     }
 
     /// **A transaction left idle is ended by the server**, after the timeout `connect` sets on its
