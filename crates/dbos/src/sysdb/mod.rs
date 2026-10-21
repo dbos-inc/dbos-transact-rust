@@ -536,6 +536,16 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
+    /// **`from_workflow` is the workflow making the call, which may not target itself**: named
+    /// directly, or, with `cancel_children`, through an ancestor whose tree it is inside. Either is
+    /// [`Error::InvalidInput`] and nothing moves. A workflow that wants to stop returns or fails
+    /// instead. It is the caller's workflow whenever `caller` is given, and also for a call made
+    /// inside a step body, which records nothing and so has no `caller`. The check runs in the
+    /// transaction that records the call, so a recorded refusal is the call's answer and a replay
+    /// raises it again rather than deciding it afresh. A [`Client`](crate::Client) passes `None`
+    /// and is not checked: a client is outside every workflow, even one made inside a workflow's
+    /// code.
+    ///
     /// **The cascade is one transaction, which buys atomicity and not exclusion.** A failure
     /// partway through leaves the tree untouched rather than half-cancelled — that is the part it
     /// buys. It does not stop a child being spawned behind the walk: at READ COMMITTED these
@@ -557,6 +567,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
@@ -577,18 +588,24 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
-    /// TODO(dbos-team): UPSTREAM item 27. The only guard is that the row is not terminal, which is
-    /// the predicate all five share — so `PENDING` passes, and resuming a workflow that is
-    /// executing right now re-enqueues it underneath its own execution. The next sweep claims the
-    /// row and dispatches it, and two executions of one id run concurrently: neither is told about
-    /// the other, and the running one is not cancelled, so nothing stops it at its next step. It
-    /// cannot simply be tightened here, because `PENDING` means *owned*, not *running*, and the
-    /// row cannot say whether the owner is alive — a workflow left `PENDING` by a dead node is the
-    /// case an operator most wants to resume by hand.
+    /// `from_workflow` may not be among `workflow_ids`, as in
+    /// [`cancel_workflows`](Self::cancel_workflows): a resume would re-enqueue the workflow
+    /// underneath its own execution, so the claim that dequeues it starts a second execution beside
+    /// the first.
+    ///
+    /// TODO(dbos-team): UPSTREAM item 27. Past the refusal above, the only guard is that the row is
+    /// not terminal, which is the predicate all five share — so `PENDING` passes, and resuming a
+    /// workflow that is executing right now re-enqueues it underneath its own execution. The next
+    /// sweep claims the row and dispatches it, and two executions of one id run concurrently:
+    /// neither is told about the other, and the running one is not cancelled, so nothing stops it
+    /// at its next step. It cannot simply be tightened here, because `PENDING` means *owned*, not
+    /// *running*, and the row cannot say whether the owner is alive — a workflow left `PENDING` by
+    /// a dead node is the case an operator most wants to resume by hand.
     async fn resume_workflows(
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 

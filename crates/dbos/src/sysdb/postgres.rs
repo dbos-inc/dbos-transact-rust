@@ -825,7 +825,50 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     decode_step_value(step, recorded, caller, step_name, "an output")
 }
 
+/// Refuses a cancel or a resume `caller_id` makes of itself by name: the `from_workflow` check of
+/// [`cancel_workflows`](SystemDatabase::cancel_workflows), before anything runs. A cascade's
+/// reach into the caller's own tree is the cascade's to find, as it walks.
+fn refuse_self_target(caller_id: &str, targets: &[&str], action: &str) -> Result<(), Error> {
+    if targets.contains(&caller_id) {
+        return Err(Error::InvalidInput {
+            field: "workflow_ids".into(),
+            detail: format!("workflow {caller_id} cannot {action} itself"),
+        });
+    }
+    Ok(())
+}
+
 impl PostgresSystemDatabase {
+    /// Which of `roots` has `caller_id` in its tree, for a cascade that has just reached it.
+    ///
+    /// Read only to name the tree in the refusal: up the caller's ancestry, which is short, and
+    /// only once the cascade has found it, so a cancel that is not refused pays nothing for it.
+    /// Falls back to every root should the walk not arrive at one, which `parent_workflow_id`, set
+    /// once at insert, does not allow.
+    async fn root_containing(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        caller_id: &str,
+        roots: &[&str],
+    ) -> Result<String, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
+        let mut current = caller_id.to_owned();
+        loop {
+            let parent: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
+            )))
+            .bind(&current)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match parent.flatten() {
+                Some(parent) if roots.contains(&parent.as_str()) => return Ok(parent),
+                Some(parent) if seen.insert(parent.clone()) => current = parent,
+                _ => return Ok(roots.join(", ")),
+            }
+        }
+    }
+
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
     /// The shape every system-database call needs when it must be atomic with the step recording
@@ -4131,6 +4174,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // An empty batch still has to reach `run_transactional_step` when there is a caller: the
@@ -4156,6 +4200,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::CANCEL_WORKFLOW,
                 started_at,
                 |mut tx| async move {
+                    if let Some(caller_id) = from_workflow {
+                        refuse_self_target(caller_id, workflow_ids, "cancel")?;
+                    }
                     // One statement per *level*, not per workflow: `cancel_batch` takes the whole
                     // frontier and matches it with `= ANY($1)`, so the round trips scale with the
                     // depth of the tree rather than its size.
@@ -4180,6 +4227,24 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // Terminates because `seen` only grows and a workflow enters a frontier at
                     // most once.
                     while !frontier.is_empty() {
+                        // A cascade that reaches the caller is a cancel of the tree it is inside,
+                        // found by the walk itself rather than by reading the caller's ancestry
+                        // up front. The levels above are cancelled by now, and returning the
+                        // error rolls them back with the rest of the transaction.
+                        if let Some(caller_id) = from_workflow
+                            && frontier.iter().any(|id| id == caller_id)
+                        {
+                            let root = self
+                                .root_containing(&mut tx, caller_id, workflow_ids)
+                                .await?;
+                            return Err(Error::InvalidInput {
+                                field: "workflow_ids".into(),
+                                detail: format!(
+                                    "workflow {caller_id} cannot cancel the tree of {root}, which \
+                                     contains it"
+                                ),
+                            });
+                        }
                         cancelled.extend(self.cancel_batch(&mut tx, &frontier).await?);
                         let children = self.direct_children(&mut tx, &frontier).await?;
                         frontier = children
@@ -4207,6 +4272,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
@@ -4224,6 +4290,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::RESUME_WORKFLOW,
                 started_at,
                 |mut tx| async move {
+                    if let Some(caller_id) = from_workflow {
+                        refuse_self_target(caller_id, workflow_ids, "resume")?;
+                    }
                     // Existence is asked separately because a zero-row update conflates "already
                     // finished" — which is legal — with "no such workflow", which is not. In the
                     // same transaction as the update, so a workflow deleted between the two
