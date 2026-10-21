@@ -26,7 +26,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepPlacement};
+use crate::checkpoint::{Built, PendingStep, StepCall, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
@@ -90,7 +90,12 @@ where
             // `set_event` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — the `else` is unreachable and says so rather than inventing a
             // second meaning for a write with no id.
-            let Some((workflow_id, step_id)) = placement.step() else {
+            let Some(StepCall {
+                workflow_id,
+                step_id,
+                owner_xid,
+            }) = placement.step_call()
+            else {
                 unreachable!("set_event is refused outside a workflow and inside a step")
             };
             executor
@@ -101,7 +106,7 @@ where
                     key,
                     &encoded,
                     Some(encoding.name()),
-                    placement.owner().map(|owner| owner.owner_xid),
+                    owner_xid,
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;
@@ -302,7 +307,7 @@ where
                         workflow_id: caller.workflow_id,
                         step_id: caller.step_id,
                         timeout_step_id,
-                        owner_xid: Some(caller.owner_xid),
+                        owner_xid: caller.owner_xid,
                     });
             executor
                 .connection()

@@ -68,7 +68,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepPlacement};
+use crate::checkpoint::{Built, PendingStep, StepCall, StepPlacement};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
@@ -269,7 +269,12 @@ where
             // `recv` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — `sysdb::recv` takes a required caller for the same reason, there
             // being no uncheckpointed form of a call that consumes.
-            let Some((workflow_id, step_id)) = placement.step() else {
+            let Some(StepCall {
+                workflow_id,
+                step_id,
+                owner_xid,
+            }) = placement.step_call()
+            else {
                 unreachable!("recv is refused outside a workflow and inside a step")
             };
             let found = executor
@@ -280,7 +285,7 @@ where
                     timeout_step_id,
                     topic,
                     timeout,
-                    placement.owner().map(|owner| owner.owner_xid),
+                    owner_xid,
                 )
                 .await
                 .map_err(Error::SystemDatabase)?;

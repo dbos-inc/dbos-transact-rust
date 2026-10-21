@@ -13,7 +13,7 @@ use dbos::sysdb::types::{
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
 use dbos_test_support as support;
-use dbos_test_support::{Backend, test_database};
+use dbos_test_support::{Backend, owner_token, test_database};
 
 fn workflow(id: &str) -> NewWorkflow<'_> {
     NewWorkflow {
@@ -576,7 +576,7 @@ async fn every_settable_field_round_trips() {
                 step_id: 0,
                 step_name: "checkout",
                 started_at: Timestamp::now(),
-                owner_xid: None,
+                owner_xid: &owner_token(&sys, "wf-parent").await,
             }),
         )
         .await
@@ -662,15 +662,16 @@ async fn every_settable_field_round_trips() {
 async fn only_the_first_outcome_is_recorded() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-race"), None).await.unwrap();
+    let owner = owner_token(&sys, "wf-race").await;
 
     let first = sys
-        .record_workflow_outcome("wf-race", Outcome::Output(Some("\"winner\"")), None)
+        .record_workflow_outcome("wf-race", Outcome::Output(Some("\"winner\"")), &owner)
         .await
         .expect("the first write should succeed");
     assert_eq!(first, OutcomeWrite::Recorded);
 
     let second = sys
-        .record_workflow_outcome("wf-race", Outcome::Error("\"loser\""), None)
+        .record_workflow_outcome("wf-race", Outcome::Error("\"loser\""), &owner)
         .await
         .expect("the second write should not error");
     assert_eq!(
@@ -691,7 +692,7 @@ async fn only_the_first_outcome_is_recorded() {
 async fn recording_an_outcome_for_a_missing_workflow_is_not_an_error() {
     let (sys, _db) = sysdb().await;
     let result = sys
-        .record_workflow_outcome("never-existed", Outcome::Output(None), None)
+        .record_workflow_outcome("never-existed", Outcome::Output(None), "any-execution")
         .await
         .expect("a missing row should not be an error");
     assert_eq!(result, OutcomeWrite::AlreadyFinished);
@@ -712,9 +713,13 @@ async fn an_await_returns_a_recorded_outcome() {
         sys.init_workflow(&workflow(id), None).await.unwrap();
     }
 
-    sys.record_workflow_outcome("wf-ok", Outcome::Output(Some("\"done\"")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-ok",
+        Outcome::Output(Some("\"done\"")),
+        &owner_token(&sys, "wf-ok").await,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sys.await_workflow_result("wf-ok", BRISK_POLL, false)
             .await
@@ -727,9 +732,13 @@ async fn an_await_returns_a_recorded_outcome() {
     );
 
     // Not raised: this layer does not deserialize payloads, so a failure is data like any other.
-    sys.record_workflow_outcome("wf-bad", Outcome::Error("\"boom\""), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-bad",
+        Outcome::Error("\"boom\""),
+        &owner_token(&sys, "wf-bad").await,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sys.await_workflow_result("wf-bad", BRISK_POLL, false)
             .await
@@ -746,9 +755,13 @@ async fn an_await_returns_a_recorded_outcome() {
 async fn an_await_reports_a_void_return_as_a_success() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-void"), None).await.unwrap();
-    sys.record_workflow_outcome("wf-void", Outcome::Output(None), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-void",
+        Outcome::Output(None),
+        &owner_token(&sys, "wf-void").await,
+    )
+    .await
+    .unwrap();
 
     assert!(matches!(
         sys.await_workflow_result("wf-void", BRISK_POLL, false)
@@ -769,7 +782,11 @@ async fn an_await_waits_for_a_workflow_that_has_not_finished() {
     let finishing = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         finisher
-            .record_workflow_outcome("wf-slow", Outcome::Output(Some("\"late\"")), None)
+            .record_workflow_outcome(
+                "wf-slow",
+                Outcome::Output(Some("\"late\"")),
+                &owner_token(&finisher, "wf-slow").await,
+            )
             .await
             .unwrap();
     });
@@ -849,7 +866,11 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     let finisher = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
     for id in &ids {
         finisher
-            .record_workflow_outcome(id, Outcome::Output(Some("\"done\"")), None)
+            .record_workflow_outcome(
+                id,
+                Outcome::Output(Some("\"done\"")),
+                &owner_token(&finisher, id).await,
+            )
             .await
             .unwrap();
     }
@@ -997,9 +1018,13 @@ async fn an_absent_row_is_waited_through_unless_the_caller_says_otherwise() {
             sys.init_workflow(&workflow("wf-later"), None)
                 .await
                 .unwrap();
-            sys.record_workflow_outcome("wf-later", Outcome::Output(Some("\"arrived\"")), None)
-                .await
-                .unwrap();
+            sys.record_workflow_outcome(
+                "wf-later",
+                Outcome::Output(Some("\"arrived\"")),
+                &owner_token(&sys, "wf-later").await,
+            )
+            .await
+            .unwrap();
         }
     });
 
@@ -1267,15 +1292,22 @@ async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
     // parent. `wf-a` is first in the list, so it exists by the time either points at it.
     let children_of_a = [("wf-b", 0), ("wf-d", 1)];
     for wf in &seeds {
-        let caller = children_of_a
+        let step_id = children_of_a
             .iter()
             .find(|(id, _)| *id == wf.workflow_id)
-            .map(|(_, step_id)| InitWorkflowCaller {
+            .map(|(_, step_id)| *step_id);
+        let owner = match step_id {
+            Some(_) => Some(owner_token(&sys, "wf-a").await),
+            None => None,
+        };
+        let caller = step_id
+            .zip(owner.as_deref())
+            .map(|(step_id, owner_xid)| InitWorkflowCaller {
                 parent_workflow_id: "wf-a",
-                step_id: *step_id,
+                step_id,
                 step_name: wf.name.unwrap_or_default(),
                 started_at: Timestamp::now(),
-                owner_xid: None,
+                owner_xid,
             });
         sys.init_workflow(wf, caller)
             .await
@@ -1668,9 +1700,13 @@ async fn payloads_can_be_left_unloaded() {
         ..NewWorkflow::new("wf-payload")
     };
     sys.init_workflow(&wf, None).await.unwrap();
-    sys.record_workflow_outcome("wf-payload", Outcome::Output(Some("42")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-payload",
+        Outcome::Output(Some("42")),
+        &owner_token(&sys, "wf-payload").await,
+    )
+    .await
+    .unwrap();
 
     let loaded = &sys.list_workflows(&F::default(), None).await.unwrap()[0];
     assert_eq!(loaded.input.as_deref(), Some(r#"{"positionalArgs":[1]}"#));
@@ -1794,9 +1830,13 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
 async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-done"), None).await.unwrap();
-    sys.record_workflow_outcome("wf-done", Outcome::Output(Some("42")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-done",
+        Outcome::Output(Some("42")),
+        &owner_token(&sys, "wf-done").await,
+    )
+    .await
+    .unwrap();
 
     let cancelled = sys
         .cancel_workflows(&["wf-done"], false, None, None)
@@ -1827,13 +1867,19 @@ async fn cancelling_children_descends_the_whole_tree() {
     ] {
         // Parentage arrives with the start that records it, so a tree is seeded by creating
         // each generation as its parent's child.
-        let caller = parent.map(|parent_workflow_id| InitWorkflowCaller {
-            parent_workflow_id,
-            step_id: 0,
-            step_name: "spawn",
-            started_at: Timestamp::now(),
-            owner_xid: None,
-        });
+        let owner = match parent {
+            Some(parent_workflow_id) => Some(owner_token(&sys, parent_workflow_id).await),
+            None => None,
+        };
+        let caller = parent
+            .zip(owner.as_deref())
+            .map(|(parent_workflow_id, owner_xid)| InitWorkflowCaller {
+                parent_workflow_id,
+                step_id: 0,
+                step_name: "spawn",
+                started_at: Timestamp::now(),
+                owner_xid,
+            });
         sys.init_workflow(&NewWorkflow::new(id), caller)
             .await
             .unwrap();
@@ -1864,7 +1910,7 @@ async fn cancelling_children_descends_the_whole_tree() {
             step_id: 0,
             step_name: "spawn",
             started_at: Timestamp::now(),
-            owner_xid: None,
+            owner_xid: &owner_token(&sys, "wf-root2").await,
         }),
     )
     .await
@@ -2097,7 +2143,7 @@ async fn a_step_result_round_trips() {
         Outcome::Output(Some(r#"{"ok":true}"#)),
         Some("portable_json"),
         Some(timing),
-        None,
+        &owner_token(&sys, "wf-steps").await,
     )
     .await
     .unwrap();
@@ -2136,14 +2182,30 @@ async fn a_step_recorded_twice_distinguishes_a_retry_from_a_rival() {
         completed_at: Timestamp::from_epoch_ms(5_000),
     };
     let first = Outcome::Output(Some("first"));
-    sys.record_step("wf-twice", 0, "charge", first, None, Some(timing), None)
-        .await
-        .unwrap();
+    sys.record_step(
+        "wf-twice",
+        0,
+        "charge",
+        first,
+        None,
+        Some(timing),
+        &owner_token(&sys, "wf-twice").await,
+    )
+    .await
+    .unwrap();
 
     // The same timing again: an acknowledgement was lost and the caller asked again.
-    sys.record_step("wf-twice", 0, "charge", first, None, Some(timing), None)
-        .await
-        .expect("a caller's own retry must succeed");
+    sys.record_step(
+        "wf-twice",
+        0,
+        "charge",
+        first,
+        None,
+        Some(timing),
+        &owner_token(&sys, "wf-twice").await,
+    )
+    .await
+    .expect("a caller's own retry must succeed");
 
     // A different completion is a second execution, which must not take the step.
     let rival_timing = StepTiming {
@@ -2158,7 +2220,7 @@ async fn a_step_recorded_twice_distinguishes_a_retry_from_a_rival() {
             Outcome::Output(Some("second")),
             None,
             Some(rival_timing),
-            None,
+            &owner_token(&sys, "wf-twice").await,
         )
         .await
     {
@@ -2189,7 +2251,7 @@ async fn a_step_recorded_under_another_name_is_rejected() {
         Outcome::Output(None),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-drift").await,
     )
     .await
     .unwrap();
@@ -2244,7 +2306,7 @@ async fn steps_are_listed_in_execution_order() {
             Outcome::Output(Some(&output)),
             None,
             None,
-            None,
+            &owner_token(&sys, "wf-list").await,
         )
         .await
         .unwrap();
@@ -2294,7 +2356,7 @@ async fn a_child_and_its_start_record_are_one_write() {
         step_id: 0,
         step_name: "checkout",
         started_at: Timestamp::now(),
-        owner_xid: None,
+        owner_xid: &owner_token(&sys, "wf-parent").await,
     };
     sys.init_workflow(&workflow("wf-kid"), Some(start))
         .await
@@ -2327,7 +2389,7 @@ async fn a_child_and_its_start_record_are_one_write() {
         step_id: 0,
         step_name: "checkout",
         started_at: Timestamp::now(),
-        owner_xid: None,
+        owner_xid: &owner_token(&sys, "wf-parent").await,
     };
     match sys
         .init_workflow(&workflow("wf-second-kid"), Some(clash))
@@ -2365,9 +2427,16 @@ async fn a_child_workflow_is_recorded_against_its_step() {
         None,
         "nothing has started a child at this position",
     );
-    sys.record_child_workflow("wf-parent", "wf-kid", 0, "run_child", None, None)
-        .await
-        .unwrap();
+    sys.record_child_workflow(
+        "wf-parent",
+        "wf-kid",
+        0,
+        "run_child",
+        None,
+        &owner_token(&sys, "wf-parent").await,
+    )
+    .await
+    .unwrap();
     // Read back through the ordinary replay check, which is the path Python uses: the child id
     // is a field of the recorded step, not a separate lookup.
     let step = sys
@@ -2384,13 +2453,27 @@ async fn a_child_workflow_is_recorded_against_its_step() {
 
     // Recording the same child again is a retry, and must succeed however much later it is —
     // the completion time will differ, and the child id is what decides.
-    sys.record_child_workflow("wf-parent", "wf-kid", 0, "run_child", None, None)
-        .await
-        .expect("re-recording the same child is idempotent");
+    sys.record_child_workflow(
+        "wf-parent",
+        "wf-kid",
+        0,
+        "run_child",
+        None,
+        &owner_token(&sys, "wf-parent").await,
+    )
+    .await
+    .expect("re-recording the same child is idempotent");
 
     // A different child at the same position is nondeterminism in the parent.
     match sys
-        .record_child_workflow("wf-parent", "wf-other", 0, "run_child", None, None)
+        .record_child_workflow(
+            "wf-parent",
+            "wf-other",
+            0,
+            "run_child",
+            None,
+            &owner_token(&sys, "wf-parent").await,
+        )
         .await
     {
         Err(Error::StepNondeterminism { step_id, .. }) => assert_eq!(step_id, 0),
@@ -2399,7 +2482,14 @@ async fn a_child_workflow_is_recorded_against_its_step() {
 
     // An empty child id would wedge the parent on replay, so it is refused.
     match sys
-        .record_child_workflow("wf-parent", "", 2, "run_child", None, None)
+        .record_child_workflow(
+            "wf-parent",
+            "",
+            2,
+            "run_child",
+            None,
+            &owner_token(&sys, "wf-parent").await,
+        )
         .await
     {
         Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "child_workflow_id"),
@@ -2414,7 +2504,7 @@ async fn a_child_workflow_is_recorded_against_its_step() {
         Outcome::Output(None),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-parent").await,
     )
     .await
     .unwrap();
@@ -2454,7 +2544,7 @@ async fn recording_a_step_restamps_the_executor() {
             Outcome::Output(None),
             None,
             None,
-            None,
+            &owner_token(&recovering, "wf-takeover").await,
         )
         .await
         .unwrap();
@@ -2489,7 +2579,7 @@ async fn a_step_may_be_recorded_without_timings() {
         Outcome::Output(None),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-timing").await,
     )
     .await
     .expect("a step without timings is legal");
@@ -2514,7 +2604,7 @@ async fn a_step_may_be_recorded_without_timings() {
         Outcome::Output(None),
         None,
         Some(timing),
-        None,
+        &owner_token(&sys, "wf-timing").await,
     )
     .await
     .unwrap();
@@ -2539,14 +2629,30 @@ async fn an_untimed_step_cannot_detect_a_rival() {
         .unwrap();
 
     let first = Outcome::Output(Some("first"));
-    sys.record_step("wf-untimed", 0, "charge", first, None, None, None)
-        .await
-        .unwrap();
+    sys.record_step(
+        "wf-untimed",
+        0,
+        "charge",
+        first,
+        None,
+        None,
+        &owner_token(&sys, "wf-untimed").await,
+    )
+    .await
+    .unwrap();
 
     let rival = Outcome::Output(Some("second"));
-    sys.record_step("wf-untimed", 0, "charge", rival, None, None, None)
-        .await
-        .expect("with no completion time there is nothing to compare against");
+    sys.record_step(
+        "wf-untimed",
+        0,
+        "charge",
+        rival,
+        None,
+        None,
+        &owner_token(&sys, "wf-untimed").await,
+    )
+    .await
+    .expect("with no completion time there is nothing to compare against");
 
     // The first result still stands: the insert conflicted and changed nothing.
     let read = sys
@@ -2573,9 +2679,17 @@ async fn a_step_records_either_an_output_or_an_error() {
         .unwrap();
 
     let failed = Outcome::Error(r#"{"type":"ValueError"}"#);
-    sys.record_step("wf-outcome", 0, "charge", failed, None, None, None)
-        .await
-        .unwrap();
+    sys.record_step(
+        "wf-outcome",
+        0,
+        "charge",
+        failed,
+        None,
+        None,
+        &owner_token(&sys, "wf-outcome").await,
+    )
+    .await
+    .unwrap();
     let read = sys
         .check_step("wf-outcome", 0, "charge")
         .await
@@ -2592,7 +2706,7 @@ async fn a_step_records_either_an_output_or_an_error() {
         Outcome::Output(None),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-outcome").await,
     )
     .await
     .unwrap();
@@ -2646,7 +2760,7 @@ async fn losing_the_checkpoint_does_not_claim_the_workflow() {
             Outcome::Output(Some("first")),
             None,
             Some(winning),
-            None,
+            &owner_token(&winner, "wf-race-step").await,
         )
         .await
         .unwrap();
@@ -2666,7 +2780,7 @@ async fn losing_the_checkpoint_does_not_claim_the_workflow() {
             Outcome::Output(Some("second")),
             None,
             Some(losing),
-            None,
+            &owner_token(&loser, "wf-race-step").await,
         )
         .await;
     assert!(
@@ -2694,13 +2808,19 @@ async fn workflow_children_reach_the_whole_tree() {
     ] {
         // Parentage arrives with the start that records it, so a tree is seeded by creating
         // each generation as its parent's child.
-        let caller = parent.map(|parent_workflow_id| InitWorkflowCaller {
-            parent_workflow_id,
-            step_id: 0,
-            step_name: "spawn",
-            started_at: Timestamp::now(),
-            owner_xid: None,
-        });
+        let owner = match parent {
+            Some(parent_workflow_id) => Some(owner_token(&sys, parent_workflow_id).await),
+            None => None,
+        };
+        let caller = parent
+            .zip(owner.as_deref())
+            .map(|(parent_workflow_id, owner_xid)| InitWorkflowCaller {
+                parent_workflow_id,
+                step_id: 0,
+                step_name: "spawn",
+                started_at: Timestamp::now(),
+                owner_xid,
+            });
         sys.init_workflow(&NewWorkflow::new(id), caller)
             .await
             .unwrap();
@@ -2724,13 +2844,19 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
     for (id, parent) in [("wf-gone", None), ("wf-gone-kid", Some("wf-gone"))] {
         // Parentage arrives with the start that records it, so a tree is seeded by creating
         // each generation as its parent's child.
-        let caller = parent.map(|parent_workflow_id| InitWorkflowCaller {
-            parent_workflow_id,
-            step_id: 0,
-            step_name: "spawn",
-            started_at: Timestamp::now(),
-            owner_xid: None,
-        });
+        let owner = match parent {
+            Some(parent_workflow_id) => Some(owner_token(&sys, parent_workflow_id).await),
+            None => None,
+        };
+        let caller = parent
+            .zip(owner.as_deref())
+            .map(|(parent_workflow_id, owner_xid)| InitWorkflowCaller {
+                parent_workflow_id,
+                step_id: 0,
+                step_name: "spawn",
+                started_at: Timestamp::now(),
+                owner_xid,
+            });
         sys.init_workflow(&NewWorkflow::new(id), caller)
             .await
             .unwrap();
@@ -2743,7 +2869,7 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
         Outcome::Output(None),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-gone").await,
     )
     .await
     .unwrap();
@@ -2776,13 +2902,19 @@ async fn deleting_a_workflow_cascades_to_its_rows() {
     ] {
         // Parentage arrives with the start that records it, so a tree is seeded by creating
         // each generation as its parent's child.
-        let caller = parent.map(|parent_workflow_id| InitWorkflowCaller {
-            parent_workflow_id,
-            step_id: 0,
-            step_name: "spawn",
-            started_at: Timestamp::now(),
-            owner_xid: None,
-        });
+        let owner = match parent {
+            Some(parent_workflow_id) => Some(owner_token(&sys, parent_workflow_id).await),
+            None => None,
+        };
+        let caller = parent
+            .zip(owner.as_deref())
+            .map(|(parent_workflow_id, owner_xid)| InitWorkflowCaller {
+                parent_workflow_id,
+                step_id: 0,
+                step_name: "spawn",
+                started_at: Timestamp::now(),
+                owner_xid,
+            });
         sys.init_workflow(&NewWorkflow::new(id), caller)
             .await
             .unwrap();
@@ -2814,9 +2946,13 @@ async fn pending_workflows_are_scoped_by_executor_and_version() {
         ..NewWorkflow::new("wf-finished")
     };
     sys.init_workflow(&done, None).await.unwrap();
-    sys.record_workflow_outcome("wf-finished", Outcome::Output(None), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-finished",
+        Outcome::Output(None),
+        &owner_token(&sys, "wf-finished").await,
+    )
+    .await
+    .unwrap();
 
     let found = ids(&sys, &pending("alpha", "v1")).await;
     assert_eq!(
@@ -2960,9 +3096,13 @@ async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
         ..NewWorkflow::new("wf-finished")
     };
     sys.init_workflow(&done, None).await.unwrap();
-    sys.record_workflow_outcome("wf-finished", Outcome::Output(None), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-finished",
+        Outcome::Output(None),
+        &owner_token(&sys, "wf-finished").await,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         sys.reenqueue_for_recovery(&["alpha"], "v1", INTERNAL_QUEUE)
@@ -3459,7 +3599,7 @@ async fn set_event_publishes_a_value_and_its_history() {
         "progress",
         "50",
         Some("portable_json"),
-        None,
+        &owner_token(&sys, "wf-publisher").await,
     )
     .await
     .unwrap();
@@ -3480,9 +3620,16 @@ async fn set_event_publishes_a_value_and_its_history() {
     assert_eq!(step.step_name, "DBOS.set_event");
 
     // Setting the same key again from a later step replaces the value and adds history.
-    sys.set_event("wf-publisher", 1, "progress", "100", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        1,
+        "progress",
+        "100",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
     let events = sys.get_all_events("wf-publisher").await.unwrap();
     assert_eq!(events.len(), 1, "the current value is one row per key");
     assert_eq!(events[0].value, "100");
@@ -3509,15 +3656,29 @@ async fn replaying_set_event_does_not_republish() {
     sys.init_workflow(&workflow("wf-replay"), None)
         .await
         .unwrap();
-    sys.set_event("wf-replay", 0, "answer", "42", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-replay",
+        0,
+        "answer",
+        "42",
+        None,
+        &owner_token(&sys, "wf-replay").await,
+    )
+    .await
+    .unwrap();
 
     // The same step id again — what a replay does. The recorded step short-circuits it, so the
     // second value never lands.
-    sys.set_event("wf-replay", 0, "answer", "99", None, None)
-        .await
-        .expect("a replay is skipped, not an error");
+    sys.set_event(
+        "wf-replay",
+        0,
+        "answer",
+        "99",
+        None,
+        &owner_token(&sys, "wf-replay").await,
+    )
+    .await
+    .expect("a replay is skipped, not an error");
 
     let events = sys.get_all_events("wf-replay").await.unwrap();
     assert_eq!(events[0].value, "42", "the replay must not overwrite");
@@ -3557,7 +3718,7 @@ async fn an_event_already_published_returns_at_once() {
         "progress",
         "50",
         Some("portable_json"),
-        None,
+        &owner_token(&sys, "wf-publisher").await,
     )
     .await
     .unwrap();
@@ -3654,7 +3815,7 @@ async fn a_value_published_during_the_wait_still_arrives() {
             "progress",
             "\"done\"",
             Some("portable_json"),
-            None,
+            &owner_token(&publisher, "wf-publisher").await,
         )
         .await
         .unwrap();
@@ -3713,15 +3874,22 @@ async fn a_read_that_finds_nothing_reports_absence() {
 async fn a_read_records_the_publishers_own_payload() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.set_event("wf-publisher", 0, "progress", "50", Some("pickle"), None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "50",
+        Some("pickle"),
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
 
     let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
-        owner_xid: None,
+        owner_xid: &owner_token(&sys, "wf-reader").await,
     };
     sys.get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
         .await
@@ -3745,15 +3913,22 @@ async fn a_read_records_the_publishers_own_payload() {
 async fn a_replayed_read_returns_what_the_first_run_saw() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.set_event("wf-publisher", 0, "progress", "50", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "50",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
 
     let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
-        owner_xid: None,
+        owner_xid: &owner_token(&sys, "wf-reader").await,
     };
     let first = sys
         .get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
@@ -3761,9 +3936,16 @@ async fn a_replayed_read_returns_what_the_first_run_saw() {
         .unwrap();
     assert_eq!(first.as_ref().map(|v| v.value.as_str()), Some("50"));
 
-    sys.set_event("wf-publisher", 1, "progress", "100", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        1,
+        "progress",
+        "100",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
     let replayed = sys
         .get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
         .await
@@ -3784,7 +3966,7 @@ async fn a_replayed_timeout_stays_a_timeout() {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
-        owner_xid: None,
+        owner_xid: &owner_token(&sys, "wf-reader").await,
     };
     assert_eq!(
         sys.get_event("wf-publisher", "progress", BRIEFLY, Some(caller))
@@ -3814,9 +3996,16 @@ async fn a_replayed_timeout_stays_a_timeout() {
     );
 
     // And a value arriving after the fact does not change it.
-    sys.set_event("wf-publisher", 0, "progress", "50", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "50",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sys.get_event("wf-publisher", "progress", RECHECK * 30, Some(caller))
             .await
@@ -3835,15 +4024,22 @@ async fn a_replayed_timeout_stays_a_timeout() {
 async fn a_replayed_read_does_not_depend_on_the_row_still_existing() {
     let (sys, db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.set_event("wf-publisher", 0, "progress", "50", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "50",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
 
     let caller = GetEventCaller {
         workflow_id: "wf-reader",
         step_id: 0,
         timeout_step_id: 1,
-        owner_xid: None,
+        owner_xid: &owner_token(&sys, "wf-reader").await,
     };
     let timeout = std::time::Duration::from_secs(600);
     let first = sys
@@ -3897,7 +4093,7 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
                     workflow_id: "wf-reader",
                     step_id: 0,
                     timeout_step_id: 1,
-                    owner_xid: None,
+                    owner_xid: &owner_token(&*sys, "wf-reader").await,
                 }),
             )
             .await
@@ -3914,13 +4110,20 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
         Outcome::Output(Some("\"rival\"")),
         Some("portable_json"),
         None,
-        None,
+        &owner_token(&*sys, "wf-reader").await,
     )
     .await
     .unwrap();
-    sys.set_event("wf-publisher", 0, "progress", "\"mine\"", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "\"mine\"",
+        None,
+        &owner_token(&*sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
 
     let found = tokio::time::timeout(RECHECK * 20, reading)
         .await
@@ -3947,9 +4150,16 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
 async fn a_read_records_a_deadline_it_may_abandon_rather_than_a_sleep() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.set_event("wf-publisher", 0, "progress", "50", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "50",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
 
     let timeout = std::time::Duration::from_secs(600);
     sys.get_event(
@@ -3960,7 +4170,7 @@ async fn a_read_records_a_deadline_it_may_abandon_rather_than_a_sleep() {
             workflow_id: "wf-reader",
             step_id: 0,
             timeout_step_id: 1,
-            owner_xid: None,
+            owner_xid: &owner_token(&sys, "wf-reader").await,
         }),
     )
     .await
@@ -3995,9 +4205,14 @@ async fn a_read_records_a_deadline_it_may_abandon_rather_than_a_sleep() {
 async fn a_recovered_read_resumes_the_original_deadline() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.record_sleep("wf-reader", 1, std::time::Duration::ZERO, None)
-        .await
-        .unwrap();
+    sys.record_sleep(
+        "wf-reader",
+        1,
+        std::time::Duration::ZERO,
+        &owner_token(&sys, "wf-reader").await,
+    )
+    .await
+    .unwrap();
 
     let began = Timestamp::now();
     let found = tokio::time::timeout(
@@ -4010,7 +4225,7 @@ async fn a_recovered_read_resumes_the_original_deadline() {
                 workflow_id: "wf-reader",
                 step_id: 0,
                 timeout_step_id: 1,
-                owner_xid: None,
+                owner_xid: &owner_token(&sys, "wf-reader").await,
             }),
         ),
     )
@@ -4034,6 +4249,7 @@ async fn a_recovered_read_resumes_the_original_deadline() {
 async fn a_cancelled_reader_stops_rather_than_waiting() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    let owner = owner_token(&sys, "wf-reader").await;
     sys.cancel_workflows(&["wf-reader"], false, None, None)
         .await
         .unwrap();
@@ -4048,7 +4264,7 @@ async fn a_cancelled_reader_stops_rather_than_waiting() {
                 workflow_id: "wf-reader",
                 step_id: 0,
                 timeout_step_id: 1,
-                owner_xid: None,
+                owner_xid: &owner,
             }),
         ),
     )
@@ -4080,9 +4296,16 @@ async fn a_capped_read_does_not_hold_its_permit_across_the_wait() {
     sys.init_workflow(&workflow("wf-publisher"), None)
         .await
         .unwrap();
-    sys.set_event("wf-publisher", 0, "published", "50", None, None)
-        .await
-        .unwrap();
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "published",
+        "50",
+        None,
+        &owner_token(&*sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
 
     // First, and given a head start, so it is the one holding the permit if the permit is held.
     let forever = {
@@ -4137,7 +4360,14 @@ async fn a_message_already_waiting_is_taken_at_once() {
 
     let began = Timestamp::now();
     let taken = sys
-        .recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
+        .recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            RECHECK * 600,
+            &owner_token(&sys, "wf-receiver").await,
+        )
         .await
         .unwrap();
 
@@ -4197,7 +4427,14 @@ async fn a_message_sent_during_the_wait_still_arrives() {
     let began = Timestamp::now();
     let taken = tokio::time::timeout(
         RECHECK * 10,
-        sys.recv("wf-receiver", 0, 1, None, RECHECK * 600, None),
+        sys.recv(
+            "wf-receiver",
+            0,
+            1,
+            None,
+            RECHECK * 600,
+            &owner_token(&*sys, "wf-receiver").await,
+        ),
     )
     .await
     .expect("the wait loop never delivered a message that was sent during it")
@@ -4220,9 +4457,16 @@ async fn a_recv_that_finds_nothing_reports_absence() {
         .unwrap();
 
     assert_eq!(
-        sys.recv("wf-receiver", 0, 1, Some("orders"), BRIEFLY, None)
-            .await
-            .unwrap(),
+        sys.recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            BRIEFLY,
+            &owner_token(&sys, "wf-receiver").await
+        )
+        .await
+        .unwrap(),
         None,
     );
     let step = sys
@@ -4236,9 +4480,16 @@ async fn a_recv_that_finds_nothing_reports_absence() {
     // rather than a wildcard.
     send_to_receiver(&sys, None, "\"untopicked\"").await;
     assert_eq!(
-        sys.recv("wf-receiver", 2, 3, Some("orders"), BRIEFLY, None)
-            .await
-            .unwrap(),
+        sys.recv(
+            "wf-receiver",
+            2,
+            3,
+            Some("orders"),
+            BRIEFLY,
+            &owner_token(&sys, "wf-receiver").await
+        )
+        .await
+        .unwrap(),
         None,
         "a message on the default topic is not a message on `orders`",
     );
@@ -4264,7 +4515,7 @@ async fn messages_are_taken_oldest_first() {
                 step_id + 1,
                 Some("orders"),
                 RECHECK * 600,
-                None,
+                &owner_token(&sys, "wf-receiver").await,
             )
             .await
             .unwrap()
@@ -4293,11 +4544,25 @@ async fn a_replayed_recv_does_not_take_a_second_message() {
     send_to_receiver(&sys, Some("orders"), "\"two\"").await;
 
     let first = sys
-        .recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
+        .recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            RECHECK * 600,
+            &owner_token(&sys, "wf-receiver").await,
+        )
         .await
         .unwrap();
     let replayed = sys
-        .recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
+        .recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            RECHECK * 600,
+            &owner_token(&sys, "wf-receiver").await,
+        )
         .await
         .unwrap();
 
@@ -4326,7 +4591,14 @@ async fn a_replayed_recv_does_not_wait_for_a_message_it_already_has() {
 
     let timeout = RECHECK * 600;
     let first = sys
-        .recv("wf-receiver", 0, 1, Some("orders"), timeout, None)
+        .recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            timeout,
+            &owner_token(&sys, "wf-receiver").await,
+        )
         .await
         .unwrap();
     assert_eq!(first.as_ref().map(|m| m.value.as_str()), Some("\"one\""));
@@ -4336,7 +4608,14 @@ async fn a_replayed_recv_does_not_wait_for_a_message_it_already_has() {
     let began = Timestamp::now();
     let replayed = tokio::time::timeout(
         RECHECK * 10,
-        sys.recv("wf-receiver", 0, 1, Some("orders"), timeout, None),
+        sys.recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            timeout,
+            &owner_token(&sys, "wf-receiver").await,
+        ),
     )
     .await
     .expect("a replay waited for a message it had already received")
@@ -4367,8 +4646,15 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
     let receiving = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
-                .await
+            sys.recv(
+                "wf-receiver",
+                0,
+                1,
+                Some("orders"),
+                RECHECK * 600,
+                &owner_token(&*sys, "wf-receiver").await,
+            )
+            .await
         })
     };
 
@@ -4382,7 +4668,7 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
         Outcome::Output(Some("\"rival\"")),
         Some("portable_json"),
         None,
-        None,
+        &owner_token(&*sys, "wf-receiver").await,
     )
     .await
     .unwrap();
@@ -4423,15 +4709,29 @@ async fn two_receivers_in_one_process_share_one_message() {
     let first = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 20, None)
-                .await
+            sys.recv(
+                "wf-receiver",
+                0,
+                1,
+                Some("orders"),
+                RECHECK * 20,
+                &owner_token(&*sys, "wf-receiver").await,
+            )
+            .await
         })
     };
     let second = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 20, None)
-                .await
+            sys.recv(
+                "wf-receiver",
+                2,
+                3,
+                Some("orders"),
+                RECHECK * 20,
+                &owner_token(&*sys, "wf-receiver").await,
+            )
+            .await
         })
     };
     tokio::time::sleep(BRIEFLY).await;
@@ -4505,8 +4805,15 @@ async fn two_receivers_cannot_take_the_same_message() {
         .into_iter()
         .map(|sys| {
             tokio::spawn(async move {
-                sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
-                    .await
+                sys.recv(
+                    "wf-receiver",
+                    0,
+                    1,
+                    Some("orders"),
+                    RECHECK * 600,
+                    &owner_token(&*sys, "wf-receiver").await,
+                )
+                .await
             })
         })
         .collect();
@@ -4556,13 +4863,14 @@ async fn a_cancelled_receiver_stops_rather_than_waiting() {
     sys.init_workflow(&workflow("wf-receiver"), None)
         .await
         .unwrap();
+    let owner = owner_token(&sys, "wf-receiver").await;
     sys.cancel_workflows(&["wf-receiver"], false, None, None)
         .await
         .unwrap();
 
     let err = tokio::time::timeout(
         RECHECK * 10,
-        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None),
+        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, &owner),
     )
     .await
     .expect("a cancelled receiver waited out its timeout instead of stopping")
@@ -4580,14 +4888,26 @@ async fn a_recovered_recv_resumes_the_original_deadline() {
     sys.init_workflow(&workflow("wf-receiver"), None)
         .await
         .unwrap();
-    sys.record_sleep("wf-receiver", 1, std::time::Duration::ZERO, None)
-        .await
-        .unwrap();
+    sys.record_sleep(
+        "wf-receiver",
+        1,
+        std::time::Duration::ZERO,
+        &owner_token(&sys, "wf-receiver").await,
+    )
+    .await
+    .unwrap();
 
     let began = Timestamp::now();
     let taken = tokio::time::timeout(
         RECHECK * 10,
-        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None),
+        sys.recv(
+            "wf-receiver",
+            0,
+            1,
+            Some("orders"),
+            RECHECK * 600,
+            &owner_token(&sys, "wf-receiver").await,
+        ),
     )
     .await
     .expect("the recovered deadline had already passed; the timeout was restarted instead")
@@ -4633,15 +4953,29 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
     let forever = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("never-sent"), RECHECK * 600, None)
-                .await
+            sys.recv(
+                "wf-receiver",
+                0,
+                1,
+                Some("never-sent"),
+                RECHECK * 600,
+                &owner_token(&*sys, "wf-receiver").await,
+            )
+            .await
         })
     };
     tokio::time::sleep(BRIEFLY).await;
 
     let taken = tokio::time::timeout(
         RECHECK * 10,
-        sys.recv("wf-other", 0, 1, None, RECHECK * 600, None),
+        sys.recv(
+            "wf-other",
+            0,
+            1,
+            None,
+            RECHECK * 600,
+            &owner_token(&*sys, "wf-other").await,
+        ),
     )
     .await
     .expect("starved: a polling permit is being held across a wait")
@@ -4710,8 +5044,15 @@ async fn a_listener_delivers_a_message_sooner_than_the_interval_allows() {
     let receiving = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
-                .await
+            sys.recv(
+                "wf-receiver",
+                0,
+                1,
+                Some("orders"),
+                RECHECK * 600,
+                &owner_token(&*sys, "wf-receiver").await,
+            )
+            .await
         })
     };
     // Long enough that the receiver's first look has already found nothing and it is parked on an
@@ -4768,8 +5109,15 @@ async fn a_message_that_notified_nobody_is_found_on_reconnect() {
     let receiving = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, None)
-                .await
+            sys.recv(
+                "wf-receiver",
+                0,
+                1,
+                Some("orders"),
+                RECHECK * 600,
+                &owner_token(&*sys, "wf-receiver").await,
+            )
+            .await
         })
     };
     // Parked, and — because a listener is delivering — parked for a minute rather than a second.
@@ -4908,7 +5256,7 @@ async fn an_event_set_elsewhere_arrives_sooner_than_the_interval_allows() {
             "ready",
             "\"go\"",
             Some("portable_json"),
-            None,
+            &owner_token(&writer, "wf-publisher").await,
         )
         .await
         .unwrap();
@@ -4955,7 +5303,7 @@ async fn a_stream_write_is_pushed_where_the_trigger_used_to_publish() {
         "\"a\"",
         Some("portable_json"),
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-producer").await,
     )
     .await
     .unwrap();
@@ -5002,7 +5350,7 @@ async fn a_close_pushes_what_the_window_was_still_holding() {
         "ready",
         "\"go\"",
         Some("portable_json"),
-        None,
+        &owner_token(&sys, "wf-publisher").await,
     )
     .await
     .unwrap();
@@ -5056,7 +5404,7 @@ async fn a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing() {
         "ready",
         "\"go\"",
         Some("portable_json"),
-        None,
+        &owner_token(&*sys, "wf-publisher").await,
     )
     .await
     .unwrap();
@@ -5087,7 +5435,12 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
 
     let before = Timestamp::now();
     let wake = sys
-        .record_sleep("wf-sleeper", 0, std::time::Duration::from_secs(3600), None)
+        .record_sleep(
+            "wf-sleeper",
+            0,
+            std::time::Duration::from_secs(3600),
+            &owner_token(&sys, "wf-sleeper").await,
+        )
         .await
         .unwrap();
     let offset = wake.as_epoch_ms() - before.as_epoch_ms();
@@ -5098,7 +5451,12 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
 
     // The replay asks for the same duration again and must get the same instant back.
     let replayed = sys
-        .record_sleep("wf-sleeper", 0, std::time::Duration::from_secs(3600), None)
+        .record_sleep(
+            "wf-sleeper",
+            0,
+            std::time::Duration::from_secs(3600),
+            &owner_token(&sys, "wf-sleeper").await,
+        )
         .await
         .unwrap();
     assert_eq!(replayed, wake, "a replay must not restart the clock");
@@ -5133,7 +5491,12 @@ async fn a_sleep_records_its_duration_as_the_sleep() {
 
     let before = Timestamp::now();
     let wake = sys
-        .record_sleep("wf-waiter", 0, std::time::Duration::from_secs(60), None)
+        .record_sleep(
+            "wf-waiter",
+            0,
+            std::time::Duration::from_secs(60),
+            &owner_token(&sys, "wf-waiter").await,
+        )
         .await
         .unwrap();
     let step = sys
@@ -5241,7 +5604,7 @@ async fn a_fork_carries_the_steps_below_its_start_step() {
             Outcome::Output(Some(&format!("\"out{step_id}\""))),
             None,
             None,
-            None,
+            &owner_token(&sys, "wf-src").await,
         )
         .await
         .unwrap();
@@ -5306,7 +5669,8 @@ async fn a_fork_records_its_step_and_replays_from_it() {
         .await
         .unwrap();
 
-    let caller = Some(support::step_caller("wf-operator", 0));
+    let operator = owner_token(&sys, "wf-operator").await;
+    let caller = Some(support::step_caller("wf-operator", 0, &operator));
     let first = sys
         .fork_workflows(&[Fork::new("wf-forked")], &ForkOptions::default(), caller)
         .await
@@ -5362,7 +5726,8 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
         .await
         .unwrap();
 
-    let caller = Some(support::step_caller("wf-operator", 0));
+    let operator = owner_token(&sys, "wf-operator").await;
+    let caller = Some(support::step_caller("wf-operator", 0, &operator));
     let first = sys
         .cancel_workflows(&["wf-target"], false, None, caller)
         .await
@@ -5416,13 +5781,22 @@ async fn from_workflow_refuses_only_the_callers_own_line() {
         ("wf-side", Some(("wf-top", 1))),
         ("wf-loner", None),
     ] {
-        let caller = parent.map(|(parent_workflow_id, step_id)| InitWorkflowCaller {
-            parent_workflow_id,
-            step_id,
-            step_name: "spawn",
-            started_at: Timestamp::now(),
-            owner_xid: None,
-        });
+        let owner = match parent {
+            Some((parent_workflow_id, _)) => Some(owner_token(&sys, parent_workflow_id).await),
+            None => None,
+        };
+        let caller =
+            parent
+                .zip(owner.as_deref())
+                .map(
+                    |((parent_workflow_id, step_id), owner_xid)| InitWorkflowCaller {
+                        parent_workflow_id,
+                        step_id,
+                        step_name: "spawn",
+                        started_at: Timestamp::now(),
+                        owner_xid,
+                    },
+                );
         sys.init_workflow(&NewWorkflow::new(id), caller)
             .await
             .unwrap();
@@ -5539,7 +5913,8 @@ async fn from_workflow_survives_cycles_and_empty_targets() {
     cancelled.sort();
     assert_eq!(cancelled, ["wf-a", "wf-b"]);
 
-    let caller = Some(support::step_caller("wf-operator", 0));
+    let operator = owner_token(&sys, "wf-operator").await;
+    let caller = Some(support::step_caller("wf-operator", 0, &operator));
     let nothing = sys
         .cancel_workflows(&[], true, Some("wf-operator"), caller)
         .await
@@ -5567,7 +5942,8 @@ async fn a_listing_replays_the_rows_it_recorded() {
         .await
         .unwrap();
 
-    let caller = Some(support::step_caller("wf-operator", 0));
+    let operator = owner_token(&sys, "wf-operator").await;
+    let caller = Some(support::step_caller("wf-operator", 0, &operator));
     let filter = WorkflowFilter {
         workflow_ids: vec!["wf-first", "wf-later"],
         ..WorkflowFilter::default()
@@ -5610,12 +5986,13 @@ async fn a_replayed_fork_from_does_not_resolve_the_fork_point_again() {
         Outcome::Output(Some("\"out\"")),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-resolved").await,
     )
     .await
     .unwrap();
 
-    let caller = Some(support::step_caller("wf-operator", 0));
+    let operator = owner_token(&sys, "wf-operator").await;
+    let caller = Some(support::step_caller("wf-operator", 0, &operator));
     let first = sys
         .fork_from(
             &["wf-resolved"],
@@ -5675,9 +6052,16 @@ async fn a_fork_sees_the_event_values_as_of_its_start_step() {
         .unwrap();
     // The same key set three times, at steps 0, 1 and 2.
     for (step_id, value) in [(0, "\"first\""), (1, "\"second\""), (2, "\"third\"")] {
-        sys.set_event("wf-events", step_id, "progress", value, None, None)
-            .await
-            .unwrap();
+        sys.set_event(
+            "wf-events",
+            step_id,
+            "progress",
+            value,
+            None,
+            &owner_token(&sys, "wf-events").await,
+        )
+        .await
+        .unwrap();
     }
 
     let forks = [Fork {
@@ -5838,9 +6222,16 @@ async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
 async fn replacing_one_child_twice_is_refused() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-dup"), None).await.unwrap();
-    sys.record_child_workflow("wf-dup", "child", 0, "spawn", None, None)
-        .await
-        .unwrap();
+    sys.record_child_workflow(
+        "wf-dup",
+        "child",
+        0,
+        "spawn",
+        None,
+        &owner_token(&sys, "wf-dup").await,
+    )
+    .await
+    .unwrap();
 
     let result = sys
         .fork_workflows(
@@ -5902,9 +6293,16 @@ async fn a_fork_can_rewrite_the_children_it_replays() {
     sys.init_workflow(&workflow("wf-parent"), None)
         .await
         .unwrap();
-    sys.record_child_workflow("wf-parent", "child-original", 0, "spawn", None, None)
-        .await
-        .unwrap();
+    sys.record_child_workflow(
+        "wf-parent",
+        "child-original",
+        0,
+        "spawn",
+        None,
+        &owner_token(&sys, "wf-parent").await,
+    )
+    .await
+    .unwrap();
     // An ordinary step beside it: with a non-empty map, `r.original = NULL` matches nothing, so
     // this must come across with its `child_workflow_id` still null rather than picking one up.
     sys.record_step(
@@ -5914,7 +6312,7 @@ async fn a_fork_can_rewrite_the_children_it_replays() {
         Outcome::Output(Some("\"ok\"")),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-parent").await,
     )
     .await
     .unwrap();
@@ -5961,7 +6359,7 @@ async fn workflow_with_a_failure(sys: &PostgresSystemDatabase, id: &str) {
         Outcome::Output(Some("\"ok\"")),
         None,
         None,
-        None,
+        &owner_token(sys, id).await,
     )
     .await
     .unwrap();
@@ -5972,7 +6370,7 @@ async fn workflow_with_a_failure(sys: &PostgresSystemDatabase, id: &str) {
         Outcome::Error("card declined"),
         None,
         None,
-        None,
+        &owner_token(sys, id).await,
     )
     .await
     .unwrap();
@@ -5983,7 +6381,7 @@ async fn workflow_with_a_failure(sys: &PostgresSystemDatabase, id: &str) {
         Outcome::Output(Some("\"sent\"")),
         None,
         None,
-        None,
+        &owner_token(sys, id).await,
     )
     .await
     .unwrap();
@@ -6038,7 +6436,7 @@ async fn forking_from_the_failure_of_a_workflow_that_never_failed_uses_its_last_
             Outcome::Output(Some("\"ok\"")),
             None,
             None,
-            None,
+            &owner_token(&sys, "wf-clean").await,
         )
         .await
         .unwrap();
@@ -6169,9 +6567,17 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
         (1, Outcome::Error("boom")),
         (2, Outcome::Output(Some("\"ok\""))),
     ] {
-        sys.record_step("wf-alpha", step_id, "s", outcome, None, None, None)
-            .await
-            .unwrap();
+        sys.record_step(
+            "wf-alpha",
+            step_id,
+            "s",
+            outcome,
+            None,
+            None,
+            &owner_token(&sys, "wf-alpha").await,
+        )
+        .await
+        .unwrap();
     }
 
     // Fails at step 3 of 4, so it must resolve to a different step than wf-alpha.
@@ -6182,9 +6588,17 @@ async fn a_batch_resolves_each_workflow_separately_and_keeps_the_order() {
         (2, Outcome::Output(Some("\"ok\""))),
         (3, Outcome::Error("boom")),
     ] {
-        sys.record_step("wf-beta", step_id, "s", outcome, None, None, None)
-            .await
-            .unwrap();
+        sys.record_step(
+            "wf-beta",
+            step_id,
+            "s",
+            outcome,
+            None,
+            None,
+            &owner_token(&sys, "wf-beta").await,
+        )
+        .await
+        .unwrap();
     }
 
     let ids = sys
@@ -6712,7 +7126,7 @@ async fn a_stream_offset_reads_back_with_its_producers_status() {
         "\"a\"",
         Some("portable_json"),
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-stream").await,
     )
     .await
     .unwrap();
@@ -6754,9 +7168,13 @@ async fn an_empty_offset_still_reports_whether_the_producer_is_running() {
     }
 
     // And the status is the *current* one, so a reader sees the producer stop.
-    sys.record_workflow_outcome("wf-stream", Outcome::Output(Some("\"done\"")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-stream",
+        Outcome::Output(Some("\"done\"")),
+        &owner_token(&sys, "wf-stream").await,
+    )
+    .await
+    .unwrap();
     let read = sys
         .read_stream_values("wf-stream", "progress", 0, 10)
         .await
@@ -6794,13 +7212,19 @@ async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
         "\"a\"",
         Some("portable_json"),
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-stream").await,
     )
     .await
     .unwrap();
-    sys.close_stream("wf-stream", 1, "progress", WrittenBy::Workflow, None)
-        .await
-        .unwrap();
+    sys.close_stream(
+        "wf-stream",
+        1,
+        "progress",
+        WrittenBy::Workflow,
+        &owner_token(&sys, "wf-stream").await,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         sys.read_stream_values("wf-stream", "progress", 1, 10)
@@ -6841,14 +7265,20 @@ async fn the_pages_of_a_stream_read_back_as_the_stream() {
             value,
             Some("portable_json"),
             WrittenBy::Workflow,
-            None,
+            &owner_token(&sys, "wf-stream").await,
         )
         .await
         .unwrap();
     }
-    sys.close_stream("wf-stream", 3, "progress", WrittenBy::Workflow, None)
-        .await
-        .unwrap();
+    sys.close_stream(
+        "wf-stream",
+        3,
+        "progress",
+        WrittenBy::Workflow,
+        &owner_token(&sys, "wf-stream").await,
+    )
+    .await
+    .unwrap();
 
     let mut read = Vec::new();
     let mut offset = 0;
@@ -7003,7 +7433,7 @@ async fn a_write_wakes_a_waiting_read() {
         "\"late\"",
         Some("portable_json"),
         WrittenBy::Workflow,
-        None,
+        &owner_token(&*sys, "wf-live").await,
     )
     .await
     .unwrap();
@@ -7048,20 +7478,30 @@ async fn finished_stream_writer(
             value,
             Some("portable_json"),
             WrittenBy::Workflow,
-            None,
+            &owner_token(sys, workflow_id).await,
         )
         .await
         .unwrap();
     }
     if close {
         let step_id = i32::try_from(values.len()).unwrap();
-        sys.close_stream(workflow_id, step_id, "progress", WrittenBy::Workflow, None)
-            .await
-            .unwrap();
-    }
-    sys.record_workflow_outcome(workflow_id, Outcome::Output(None), None)
+        sys.close_stream(
+            workflow_id,
+            step_id,
+            "progress",
+            WrittenBy::Workflow,
+            &owner_token(sys, workflow_id).await,
+        )
         .await
         .unwrap();
+    }
+    sys.record_workflow_outcome(
+        workflow_id,
+        Outcome::Output(None),
+        &owner_token(sys, workflow_id).await,
+    )
+    .await
+    .unwrap();
 }
 
 /// **A rewind keeps every stream entry, and the re-run appends after them.**
@@ -7070,7 +7510,7 @@ async fn finished_stream_writer(
 /// stay where they are. The re-run's writes, at the same steps, land at the next offsets.
 #[tokio::test]
 async fn a_rewind_keeps_stream_entries_and_the_rerun_appends_after_them() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     finished_stream_writer(&sys, "wf-rewind-stream", &["\"a\"", "\"b\""], false).await;
 
     sys.rewind_workflow("wf-rewind-stream", 0, &RewindOptions::default(), None)
@@ -7082,7 +7522,9 @@ async fn a_rewind_keeps_stream_entries_and_the_rerun_appends_after_them() {
         "the rewind removed entries"
     );
 
-    // The re-run writes at steps 0 and 1 again, whose checkpoints the rewind deleted.
+    // The re-run, once claimed, writes at steps 0 and 1 again, whose checkpoints the rewind
+    // deleted.
+    claim_as(&db, "wf-rewind-stream", "rerun").await;
     for (step_id, value) in [(0, "\"a2\""), (1, "\"b2\"")] {
         sys.write_stream(
             "wf-rewind-stream",
@@ -7091,7 +7533,7 @@ async fn a_rewind_keeps_stream_entries_and_the_rerun_appends_after_them() {
             value,
             Some("portable_json"),
             WrittenBy::Workflow,
-            None,
+            "rerun",
         )
         .await
         .unwrap();
@@ -7106,7 +7548,7 @@ async fn a_rewind_keeps_stream_entries_and_the_rerun_appends_after_them() {
 /// **A rewind past a stream's close reopens it**, and the re-run's entry follows the old one.
 #[tokio::test]
 async fn a_rewind_past_a_close_reopens_the_stream() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     finished_stream_writer(&sys, "wf-reopened", &["\"a\""], true).await;
     assert_eq!(
         stream_values(&sys, "wf-reopened", "progress").await,
@@ -7122,6 +7564,7 @@ async fn a_rewind_past_a_close_reopens_the_stream() {
         "the close is gone and the entry is kept"
     );
 
+    claim_as(&db, "wf-reopened", "rerun").await;
     sys.write_stream(
         "wf-reopened",
         0,
@@ -7129,7 +7572,7 @@ async fn a_rewind_past_a_close_reopens_the_stream() {
         "\"a2\"",
         Some("portable_json"),
         WrittenBy::Workflow,
-        None,
+        "rerun",
     )
     .await
     .unwrap();
@@ -7170,13 +7613,17 @@ async fn a_rewind_deletes_only_a_close_labelled_as_one() {
         dbos::sysdb::STREAM_CLOSED,
         Some("some_other_json"),
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-lookalike").await,
     )
     .await
     .unwrap();
-    sys.record_workflow_outcome("wf-lookalike", Outcome::Output(None), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-lookalike",
+        Outcome::Output(None),
+        &owner_token(&sys, "wf-lookalike").await,
+    )
+    .await
+    .unwrap();
 
     sys.rewind_workflow("wf-lookalike", 0, &RewindOptions::default(), None)
         .await
@@ -7254,7 +7701,7 @@ async fn capped_stream_reads_do_not_block_each_other() {
         "\"a\"",
         None,
         WrittenBy::Workflow,
-        None,
+        &owner_token(&*sys, "wf-stream").await,
     )
     .await
     .unwrap();
@@ -7291,7 +7738,7 @@ async fn stream_writes_are_appended_in_order() {
             value,
             Some("portable_json"),
             WrittenBy::Workflow,
-            None,
+            &owner_token(&sys, "wf-stream").await,
         )
         .await
         .unwrap();
@@ -7313,7 +7760,7 @@ async fn stream_writes_are_appended_in_order() {
         "\"z\"",
         None,
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-stream").await,
     )
     .await
     .unwrap();
@@ -7338,7 +7785,7 @@ async fn a_replayed_stream_write_does_not_append_again() {
             "\"once\"",
             None,
             WrittenBy::Workflow,
-            None,
+            &owner_token(&sys, "wf-replay").await,
         )
         .await
         .unwrap();
@@ -7368,9 +7815,17 @@ async fn a_write_from_inside_a_step_records_nothing_of_its_own() {
         .unwrap();
 
     for _ in 0..3 {
-        sys.write_stream("wf-instep", 0, "k", "\"each\"", None, WrittenBy::Step, None)
-            .await
-            .unwrap();
+        sys.write_stream(
+            "wf-instep",
+            0,
+            "k",
+            "\"each\"",
+            None,
+            WrittenBy::Step,
+            &owner_token(&sys, "wf-instep").await,
+        )
+        .await
+        .unwrap();
     }
 
     assert_eq!(
@@ -7401,13 +7856,19 @@ async fn closing_a_stream_appends_the_sentinel() {
         "\"value\"",
         None,
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-close").await,
     )
     .await
     .unwrap();
-    sys.close_stream("wf-close", 1, "k", WrittenBy::Workflow, None)
-        .await
-        .unwrap();
+    sys.close_stream(
+        "wf-close",
+        1,
+        "k",
+        WrittenBy::Workflow,
+        &owner_token(&sys, "wf-close").await,
+    )
+    .await
+    .unwrap();
 
     let entries = sys.get_all_stream_entries("wf-close").await.unwrap();
     assert_eq!(entries.len(), 2);
@@ -7438,9 +7899,15 @@ async fn closing_a_stream_appends_the_sentinel() {
     );
 
     // And closing twice is a replay, not a second sentinel.
-    sys.close_stream("wf-close", 1, "k", WrittenBy::Workflow, None)
-        .await
-        .unwrap();
+    sys.close_stream(
+        "wf-close",
+        1,
+        "k",
+        WrittenBy::Workflow,
+        &owner_token(&sys, "wf-close").await,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sys.get_all_stream_entries("wf-close").await.unwrap().len(),
         2
@@ -7465,7 +7932,7 @@ async fn the_sentinel_text_under_another_label_is_an_ordinary_write() {
         dbos::sysdb::STREAM_CLOSED,
         Some("rust_serde"),
         WrittenBy::Workflow,
-        None,
+        &owner_token(&sys, "wf-lookalike").await,
     )
     .await
     .unwrap();
@@ -7488,9 +7955,18 @@ async fn the_sentinel_text_under_another_label_is_an_ordinary_write() {
 async fn writing_a_stream_for_a_missing_workflow_is_refused() {
     let (sys, _db) = sysdb().await;
     let result = sys
-        .write_stream("wf-nowhere", 0, "k", "\"v\"", None, WrittenBy::Step, None)
+        .write_stream(
+            "wf-nowhere",
+            0,
+            "k",
+            "\"v\"",
+            None,
+            WrittenBy::Step,
+            "any-execution",
+        )
         .await;
-    assert!(matches!(result, Err(Error::NonExistentWorkflow { .. })));
+    // No execution owns a row that isn't there, so the owner check refuses it first.
+    assert!(matches!(result, Err(Error::WorkflowConflict { .. })));
 }
 
 /// A handle that names its application stamps that name on everything it writes.
@@ -7521,13 +7997,20 @@ async fn a_named_handle_stamps_its_application_on_what_it_writes() {
             Outcome::Output(Some("\"out\"")),
             None,
             None,
-            None,
+            &owner_token(sys, id).await,
         )
         .await
         .unwrap();
-        sys.record_child_workflow(id, &format!("{id}-child"), 1, "a_child", None, None)
-            .await
-            .unwrap();
+        sys.record_child_workflow(
+            id,
+            &format!("{id}-child"),
+            1,
+            "a_child",
+            None,
+            &owner_token(sys, id).await,
+        )
+        .await
+        .unwrap();
     }
 
     for (id, expected) in [("wf-alpha", Some("alpha")), ("wf-nobody", None)] {
@@ -7639,7 +8122,7 @@ async fn a_fork_inherits_its_sources_application() {
             Outcome::Output(Some("\"out\"")),
             None,
             None,
-            None,
+            &owner_token(sys, id).await,
         )
         .await
         .unwrap();
@@ -8374,12 +8857,16 @@ async fn a_rename_moves_every_kind_of_row() {
             Outcome::Output(Some("\"x\"")),
             None,
             None,
-            None,
+            &owner_token(&alpha, "wf-done").await,
         )
         .await
         .unwrap();
     alpha
-        .record_workflow_outcome("wf-done", Outcome::Output(Some("\"done\"")), None)
+        .record_workflow_outcome(
+            "wf-done",
+            Outcome::Output(Some("\"done\"")),
+            &owner_token(&alpha, "wf-done").await,
+        )
         .await
         .unwrap();
 
@@ -8512,13 +8999,17 @@ async fn a_batched_rename_loses_no_rows() {
                     Outcome::Output(Some("\"x\"")),
                     None,
                     None,
-                    None,
+                    &owner_token(&alpha, &id).await,
                 )
                 .await
                 .unwrap();
         }
         alpha
-            .record_workflow_outcome(&id, Outcome::Output(Some("\"done\"")), None)
+            .record_workflow_outcome(
+                &id,
+                Outcome::Output(Some("\"done\"")),
+                &owner_token(&alpha, &id).await,
+            )
             .await
             .unwrap();
     }
@@ -9611,9 +10102,13 @@ async fn a_sweep_takes_one_head_per_partition() {
     );
 
     // Once the head finishes, the next one becomes available.
-    sys.record_workflow_outcome("wf-alpha-0", Outcome::Output(Some("\"done\"")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-alpha-0",
+        Outcome::Output(Some("\"done\"")),
+        &owner_token(&sys, "wf-alpha-0").await,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
             .await
@@ -10020,9 +10515,13 @@ async fn finishing_releases_the_deduplication_key() {
         ["wf-first"],
     );
     assert_eq!(
-        sys.record_workflow_outcome("wf-first", Outcome::Output(Some("\"done\"")), None)
-            .await
-            .unwrap(),
+        sys.record_workflow_outcome(
+            "wf-first",
+            Outcome::Output(Some("\"done\"")),
+            &owner_token(&sys, "wf-first").await
+        )
+        .await
+        .unwrap(),
         OutcomeWrite::Recorded,
     );
 
@@ -10796,7 +11295,11 @@ async fn a_schedule_step_replays_rather_than_repeating() {
 
     sys.create_schedule(
         &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-        Some(support::step_caller("wf-caller", 0)),
+        Some(support::step_caller(
+            "wf-caller",
+            0,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -10818,7 +11321,11 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     // `AlreadyRegistered` — the name is taken, by the first run.
     sys.create_schedule(
         &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-        Some(support::step_caller("wf-caller", 0)),
+        Some(support::step_caller(
+            "wf-caller",
+            0,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -10826,7 +11333,14 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     // A read replays its recorded answer rather than the current row, so a workflow branching on
     // a schedule sees the same one however an operator has since changed it.
     let first = sys
-        .get_schedule("nightly", Some(support::step_caller("wf-caller", 1)))
+        .get_schedule(
+            "nightly",
+            Some(support::step_caller(
+                "wf-caller",
+                1,
+                &owner_token(&sys, "wf-caller").await,
+            )),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -10841,10 +11355,17 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     .await
     .unwrap();
     assert_eq!(
-        sys.get_schedule("nightly", Some(support::step_caller("wf-caller", 1)))
-            .await
-            .unwrap()
-            .unwrap(),
+        sys.get_schedule(
+            "nightly",
+            Some(support::step_caller(
+                "wf-caller",
+                1,
+                &owner_token(&sys, "wf-caller").await
+            ))
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         first,
         "the replay is the recorded schedule, not the changed one"
     );
@@ -10861,18 +11382,32 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     // A read that found nothing records `null` too, and replays as the `None` it was — not as an
     // absent step, which is the same JSON and a different meaning.
     assert_eq!(
-        sys.get_schedule("no-such", Some(support::step_caller("wf-caller", 4)))
-            .await
-            .unwrap(),
+        sys.get_schedule(
+            "no-such",
+            Some(support::step_caller(
+                "wf-caller",
+                4,
+                &owner_token(&sys, "wf-caller").await
+            ))
+        )
+        .await
+        .unwrap(),
         None
     );
     sys.create_schedule(&NewSchedule::new("no-such", "run", "0 0 * * *"), None)
         .await
         .unwrap();
     assert_eq!(
-        sys.get_schedule("no-such", Some(support::step_caller("wf-caller", 4)))
-            .await
-            .unwrap(),
+        sys.get_schedule(
+            "no-such",
+            Some(support::step_caller(
+                "wf-caller",
+                4,
+                &owner_token(&sys, "wf-caller").await
+            ))
+        )
+        .await
+        .unwrap(),
         None,
         "the replay is the recorded absence, not the schedule that now exists"
     );
@@ -10882,7 +11417,11 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     let listed = sys
         .list_schedules(
             &ScheduleFilter::default(),
-            Some(support::step_caller("wf-caller", 2)),
+            Some(support::step_caller(
+                "wf-caller",
+                2,
+                &owner_token(&sys, "wf-caller").await,
+            )),
         )
         .await
         .unwrap();
@@ -10890,7 +11429,11 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     assert_eq!(
         sys.list_schedules(
             &ScheduleFilter::default(),
-            Some(support::step_caller("wf-caller", 2))
+            Some(support::step_caller(
+                "wf-caller",
+                2,
+                &owner_token(&sys, "wf-caller").await
+            ))
         )
         .await
         .unwrap(),
@@ -10899,7 +11442,11 @@ async fn a_schedule_step_replays_rather_than_repeating() {
     assert!(
         sys.list_schedules(
             &ScheduleFilter::default(),
-            Some(support::step_caller("wf-caller", 3))
+            Some(support::step_caller(
+                "wf-caller",
+                3,
+                &owner_token(&sys, "wf-caller").await
+            ))
         )
         .await
         .unwrap()
@@ -10925,14 +11472,22 @@ async fn pausing_and_resuming_are_distinct_steps() {
     sys.set_schedule_status(
         "nightly",
         ScheduleStatus::Paused,
-        Some(support::step_caller("wf-caller", 0)),
+        Some(support::step_caller(
+            "wf-caller",
+            0,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
     sys.set_schedule_status(
         "nightly",
         ScheduleStatus::Active,
-        Some(support::step_caller("wf-caller", 1)),
+        Some(support::step_caller(
+            "wf-caller",
+            1,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -10975,7 +11530,11 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     // Upsert. The replay must not put the definition back.
     sys.upsert_schedule(
         &schedule("0 0 * * *"),
-        Some(support::step_caller("wf-caller", 0)),
+        Some(support::step_caller(
+            "wf-caller",
+            0,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -10991,7 +11550,11 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     .unwrap();
     sys.upsert_schedule(
         &schedule("0 0 * * *"),
-        Some(support::step_caller("wf-caller", 0)),
+        Some(support::step_caller(
+            "wf-caller",
+            0,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -11009,7 +11572,11 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
             schedule: Change::Set("*/10 * * * *"),
             ..Default::default()
         },
-        Some(support::step_caller("wf-caller", 1)),
+        Some(support::step_caller(
+            "wf-caller",
+            1,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -11021,7 +11588,11 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
             schedule: Change::Set("*/10 * * * *"),
             ..Default::default()
         },
-        Some(support::step_caller("wf-caller", 1)),
+        Some(support::step_caller(
+            "wf-caller",
+            1,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -11033,7 +11604,11 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     sys.set_schedule_status(
         "nightly",
         ScheduleStatus::Paused,
-        Some(support::step_caller("wf-caller", 2)),
+        Some(support::step_caller(
+            "wf-caller",
+            2,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -11043,7 +11618,11 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     sys.set_schedule_status(
         "nightly",
         ScheduleStatus::Paused,
-        Some(support::step_caller("wf-caller", 2)),
+        Some(support::step_caller(
+            "wf-caller",
+            2,
+            &owner_token(&sys, "wf-caller").await,
+        )),
     )
     .await
     .unwrap();
@@ -11058,15 +11637,29 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
     );
 
     // Delete. The replay must not remove the schedule registered since.
-    sys.delete_schedule("nightly", Some(support::step_caller("wf-caller", 3)))
-        .await
-        .unwrap();
+    sys.delete_schedule(
+        "nightly",
+        Some(support::step_caller(
+            "wf-caller",
+            3,
+            &owner_token(&sys, "wf-caller").await,
+        )),
+    )
+    .await
+    .unwrap();
     sys.create_schedule(&schedule("0 0 * * *"), None)
         .await
         .unwrap();
-    sys.delete_schedule("nightly", Some(support::step_caller("wf-caller", 3)))
-        .await
-        .unwrap();
+    sys.delete_schedule(
+        "nightly",
+        Some(support::step_caller(
+            "wf-caller",
+            3,
+            &owner_token(&sys, "wf-caller").await,
+        )),
+    )
+    .await
+    .unwrap();
     assert!(
         cron(&sys).await.is_some(),
         "the replayed delete removed nothing"
@@ -11111,7 +11704,11 @@ async fn a_refused_schedule_step_records_its_refusal() {
     assert!(matches!(
         sys.create_schedule(
             &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-            Some(support::step_caller("wf-caller", 0))
+            Some(support::step_caller(
+                "wf-caller",
+                0,
+                &owner_token(&sys, "wf-caller").await
+            ))
         )
         .await,
         Err(Error::AlreadyRegistered { .. })
@@ -11130,7 +11727,11 @@ async fn a_refused_schedule_step_records_its_refusal() {
     assert!(matches!(
         sys.create_schedule(
             &NewSchedule::new("nightly", "generate_report", "0 0 * * *"),
-            Some(support::step_caller("wf-caller", 0)),
+            Some(support::step_caller(
+                "wf-caller",
+                0,
+                &owner_token(&sys, "wf-caller").await
+            )),
         )
         .await,
         Err(Error::AlreadyRegistered { .. })
@@ -11496,7 +12097,11 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
     let first = sys
         .debounce_delayed_workflow(
             &bounce("checkout", "cart-1", pushed_to),
-            Some(support::step_caller("wf-caller", 0)),
+            Some(support::step_caller(
+                "wf-caller",
+                0,
+                &owner_token(&sys, "wf-caller").await,
+            )),
         )
         .await
         .unwrap();
@@ -11536,7 +12141,11 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
                 "cart-1",
                 Timestamp::from_epoch_ms(7_000_000_000),
             ),
-            Some(support::step_caller("wf-caller", 0)),
+            Some(support::step_caller(
+                "wf-caller",
+                0,
+                &owner_token(&sys, "wf-caller").await,
+            )),
         )
         .await
         .unwrap();
@@ -11555,7 +12164,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
 /// A held key replays as held, with the holder it originally reported.
 #[tokio::test]
 async fn a_replayed_bounce_reports_the_original_holder() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     sys.init_workflow(&workflow("wf-caller"), None)
         .await
         .unwrap();
@@ -11572,21 +12181,30 @@ async fn a_replayed_bounce_reports_the_original_holder() {
     let first = sys
         .debounce_delayed_workflow(
             &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
-            Some(support::step_caller("wf-caller", 0)),
+            Some(support::step_caller(
+                "wf-caller",
+                0,
+                &owner_token(&sys, "wf-caller").await,
+            )),
         )
         .await
         .unwrap();
     assert!(matches!(first, Debounce::Held(_)), "got {first:?}");
 
-    // The holder finishes, so a fresh bounce would now report the key unheld.
-    sys.record_workflow_outcome("wf-held", Outcome::Output(Some("\"done\"")), None)
+    // The holder is dequeued and finishes, so a fresh bounce would now report the key unheld.
+    claim_as(&db, "wf-held", "claim").await;
+    sys.record_workflow_outcome("wf-held", Outcome::Output(Some("\"done\"")), "claim")
         .await
         .unwrap();
 
     let replayed = sys
         .debounce_delayed_workflow(
             &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
-            Some(support::step_caller("wf-caller", 0)),
+            Some(support::step_caller(
+                "wf-caller",
+                0,
+                &owner_token(&sys, "wf-caller").await,
+            )),
         )
         .await
         .unwrap();
@@ -11812,7 +12430,11 @@ async fn payloads_are_written_to_the_payload_tables() {
     assert_eq!(legacy_payloads(&pool, "wf-new").await, (None, None, None));
 
     let outcome = sys
-        .record_workflow_outcome("wf-new", Outcome::Output(Some("\"done\"")), None)
+        .record_workflow_outcome(
+            "wf-new",
+            Outcome::Output(Some("\"done\"")),
+            &owner_token(&sys, "wf-new").await,
+        )
         .await
         .unwrap();
     assert_eq!(outcome, OutcomeWrite::Recorded);
@@ -11829,9 +12451,13 @@ async fn payloads_are_written_to_the_payload_tables() {
     sys.init_workflow(&workflow("wf-new-failed"), None)
         .await
         .unwrap();
-    sys.record_workflow_outcome("wf-new-failed", Outcome::Error("\"boom\""), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-new-failed",
+        Outcome::Error("\"boom\""),
+        &owner_token(&sys, "wf-new-failed").await,
+    )
+    .await
+    .unwrap();
     let stored: (Option<String>, Option<String>) = sqlx::query_as(
         r#"SELECT output, error FROM "dbos"."workflow_output" WHERE workflow_uuid = 'wf-new-failed'"#,
     )
@@ -11891,12 +12517,13 @@ async fn a_refused_outcome_writes_no_payload() {
     sys.init_workflow(&workflow("wf-cancelled"), None)
         .await
         .unwrap();
+    let owner = owner_token(&sys, "wf-cancelled").await;
     sys.cancel_workflows(&["wf-cancelled"], false, None, None)
         .await
         .unwrap();
 
     let outcome = sys
-        .record_workflow_outcome("wf-cancelled", Outcome::Output(Some("\"late\"")), None)
+        .record_workflow_outcome("wf-cancelled", Outcome::Output(Some("\"late\"")), &owner)
         .await
         .unwrap();
     assert_eq!(outcome, OutcomeWrite::AlreadyFinished);
@@ -11909,19 +12536,23 @@ async fn a_refused_outcome_writes_no_payload() {
 async fn a_new_outcome_hides_a_legacy_one() {
     let (sys, db) = sysdb().await;
     let pool = db.pool().await;
-    // Pending again, as a resume leaves it, but still carrying the error its first run wrote to
-    // the legacy column.
+    // Pending again and claimed by its second run, but still carrying the error its first run
+    // wrote to the legacy column.
     sqlx::query(
-        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, error)
-           VALUES ('wf-retried', 'PENDING', 'checkout', '"first run failed"')"#,
+        r#"INSERT INTO "dbos"."workflow_status" (workflow_uuid, status, name, error, owner_xid)
+           VALUES ('wf-retried', 'PENDING', 'checkout', '"first run failed"', 'second-run')"#,
     )
     .execute(&pool)
     .await
     .unwrap();
 
-    sys.record_workflow_outcome("wf-retried", Outcome::Output(Some("\"second run\"")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-retried",
+        Outcome::Output(Some("\"second run\"")),
+        "second-run",
+    )
+    .await
+    .unwrap();
     let read = sys.get_workflow("wf-retried").await.unwrap().unwrap();
     assert_eq!(read.output.as_deref(), Some("\"second run\""));
     assert_eq!(read.error, None, "the legacy error must not show through");
@@ -11983,13 +12614,17 @@ async fn deleting_a_workflow_removes_its_payloads_and_steps() {
         Outcome::Output(None),
         None,
         None,
-        None,
+        &owner_token(&sys, "wf-doomed-payload").await,
     )
     .await
     .unwrap();
-    sys.record_workflow_outcome("wf-doomed-payload", Outcome::Output(Some("1")), None)
-        .await
-        .unwrap();
+    sys.record_workflow_outcome(
+        "wf-doomed-payload",
+        Outcome::Output(Some("1")),
+        &owner_token(&sys, "wf-doomed-payload").await,
+    )
+    .await
+    .unwrap();
 
     sys.delete_workflows(&["wf-doomed-payload"], false, None)
         .await
@@ -12124,7 +12759,11 @@ async fn the_timeout_sweep_cancels_expired_workflows_nobody_is_running() {
         sys.init_workflow(wf, None).await.unwrap();
     }
     alpha
-        .record_workflow_outcome("wf-done", Outcome::Output(Some("1")), None)
+        .record_workflow_outcome(
+            "wf-done",
+            Outcome::Output(Some("1")),
+            &owner_token(&alpha, "wf-done").await,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -12287,7 +12926,7 @@ async fn the_owner_token_follows_claims_and_is_cleared_by_every_hand_off() {
     );
 
     assert_eq!(
-        sys.record_workflow_outcome("wf-token", Outcome::Output(Some("1")), Some("claim-1"))
+        sys.record_workflow_outcome("wf-token", Outcome::Output(Some("1")), "claim-1")
             .await
             .unwrap(),
         OutcomeWrite::AlreadyFinished,
@@ -12311,7 +12950,7 @@ async fn the_owner_token_follows_claims_and_is_cleared_by_every_hand_off() {
         .await
         .unwrap();
     assert_eq!(
-        sys.record_workflow_outcome("wf-token", Outcome::Output(Some("1")), Some("claim-3"))
+        sys.record_workflow_outcome("wf-token", Outcome::Output(Some("1")), "claim-3")
             .await
             .unwrap(),
         OutcomeWrite::Recorded
@@ -12346,6 +12985,16 @@ async fn workflow_owner(sys: &PostgresSystemDatabase, workflow_id: &str) -> Opti
         .unwrap()
         .unwrap()
         .owner_xid
+}
+
+/// Hands `workflow_id` to the execution holding `owner_xid`, as the claim that dequeues it would.
+async fn claim_as(db: &support::TestDatabase, workflow_id: &str, owner_xid: &str) {
+    sqlx::query(r#"UPDATE "dbos"."workflow_status" SET owner_xid = $1 WHERE workflow_uuid = $2"#)
+        .bind(owner_xid)
+        .bind(workflow_id)
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
 }
 
 /// Whether `result` is the fence refusing `workflow_id`.
@@ -12392,7 +13041,7 @@ async fn a_stale_execution_writes_nothing() {
     .await
     .unwrap();
 
-    let stale = Some("stale");
+    let stale = "stale";
     let timing = Some(StepTiming {
         started_at: Timestamp::now(),
         completed_at: Timestamp::now(),
@@ -12506,10 +13155,7 @@ async fn a_stale_execution_writes_nothing() {
             &["wf-bystander"],
             false,
             Some(id),
-            Some(dbos::sysdb::types::StepCaller {
-                owner_xid: stale,
-                ..support::step_caller(id, 11)
-            }),
+            Some(support::step_caller(id, 11, stale)),
         )
         .await,
         id
@@ -12597,7 +13243,7 @@ async fn a_stale_execution_writes_nothing() {
         Outcome::Output(Some("1")),
         None,
         timing,
-        Some("current"),
+        "current",
     )
     .await
     .expect("the owner's write is refused");
@@ -12614,7 +13260,7 @@ async fn a_stale_execution_writes_nothing() {
             Outcome::Output(Some("1")),
             None,
             timing,
-            Some("current")
+            "current"
         )
         .await,
         id
@@ -12627,7 +13273,7 @@ async fn a_stale_execution_writes_nothing() {
             Outcome::Output(None),
             None,
             timing,
-            Some("x")
+            "x"
         )
         .await,
         "wf-missing"

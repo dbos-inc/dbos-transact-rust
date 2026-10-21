@@ -202,12 +202,12 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `owner_xid` is the token of the execution recording it, which must still own the workflow:
     /// one that has been handed off gets `AlreadyFinished` too, and adopts the new owner's outcome.
-    /// `None` skips that check, for a caller that is not an execution. The write clears the owner.
+    /// The write clears the owner.
     async fn record_workflow_outcome(
         &self,
         workflow_id: &str,
         outcome: Outcome<'_>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<OutcomeWrite, Error>;
 
     /// Waits for a workflow to finish and reports how it did.
@@ -886,7 +886,7 @@ pub trait SystemDatabase: Send + Sync {
         timeout_step_id: i32,
         topic: Option<&str>,
         timeout: Duration,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<Option<EncodedValue>, Error>;
 
     /// Appends a value to a workflow's stream.
@@ -916,7 +916,7 @@ pub trait SystemDatabase: Send + Sync {
         value: &str,
         serialization: Option<&str>,
         written_by: WrittenBy,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Marks a stream closed, so a reader knows no more values are coming.
@@ -930,7 +930,7 @@ pub trait SystemDatabase: Send + Sync {
         step_id: i32,
         key: &str,
         written_by: WrittenBy,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Releases the connections this backend holds.
@@ -1002,9 +1002,8 @@ pub trait SystemDatabase: Send + Sync {
     /// Recording also **re-stamps the workflow's executor id**, because an executor that runs a
     /// step is by definition the one running the workflow.
     ///
-    /// `owner_xid` is the recording execution's token: given one, the record lands only while the
-    /// workflow is still that execution's (see [`WorkflowOwner`]). `None` is a caller that
-    /// is not an execution.
+    /// `owner_xid` is the recording execution's token: the record lands only while the workflow is
+    /// still that execution's (see [`WorkflowOwner`]).
     #[allow(clippy::too_many_arguments)]
     async fn record_step(
         &self,
@@ -1014,7 +1013,7 @@ pub trait SystemDatabase: Send + Sync {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Reads a workflow's steps in execution order.
@@ -1065,7 +1064,7 @@ pub trait SystemDatabase: Send + Sync {
         workflow_id: &str,
         step_id: i32,
         duration: Duration,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<Timestamp, Error>;
 
     /// Publishes a key/value on a workflow, for another workflow to read.
@@ -1090,7 +1089,7 @@ pub trait SystemDatabase: Send + Sync {
         key: &str,
         value: &str,
         serialization: Option<&str>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Reads a key another workflow published, waiting up to `timeout` for it to appear.
@@ -1798,7 +1797,7 @@ pub trait SystemDatabase: Send + Sync {
         step_id: i32,
         step_name: &str,
         started_at: Option<Timestamp>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 
     /// Reads back a recorded child-workflow await, or `None` if the parent has not got this far.
@@ -1846,6 +1845,6 @@ pub trait SystemDatabase: Send + Sync {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error>;
 }

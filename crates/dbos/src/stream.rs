@@ -29,7 +29,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepPlacement, revive};
+use crate::checkpoint::{Built, PendingStep, StepCall, StepPlacement, revive};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
@@ -187,21 +187,24 @@ where
     PendingStep::placed(name, built, move |(conn, encoded), placement| async move {
         // A step id of the workflow's own when written from its body; the enclosing step's id when
         // written from inside one, where the write records nothing and the column is all it gets.
-        let (workflow_id, step_id, written_by) = match &placement {
-            StepPlacement::Recorded { ctx, step_id } => {
-                (ctx.workflow_id(), *step_id, WrittenBy::Workflow)
-            }
+        let (workflow_id, step_id, owner_xid, written_by) = match &placement {
+            StepPlacement::Recorded { ctx, step_id } => (
+                ctx.workflow_id(),
+                *step_id,
+                ctx.owner_xid(),
+                WrittenBy::Workflow,
+            ),
             StepPlacement::InsideStep { ctx } => (
                 ctx.workflow_id(),
                 ctx.step_id()
                     .expect("a context inside a step knows its step id"),
+                ctx.owner_xid(),
                 WrittenBy::Step,
             ),
             StepPlacement::Outside | StepPlacement::ClientConnection => {
                 unreachable!("a stream write is placed from the ambient workflow's own context")
             }
         };
-        let owner_xid = placement.owner().map(|owner| owner.owner_xid);
         let sysdb = conn.sysdb();
         match &encoded {
             Some((value, encoding)) => {
@@ -997,7 +1000,12 @@ async fn record(
     serialization: Option<&str>,
     started_at: Timestamp,
 ) -> Result<()> {
-    let Some((workflow_id, step_id)) = placement.step() else {
+    let Some(StepCall {
+        workflow_id,
+        step_id,
+        owner_xid,
+    }) = placement.step_call()
+    else {
         return Ok(());
     };
     conn.sysdb()
@@ -1011,7 +1019,7 @@ async fn record(
                 started_at,
                 completed_at: Timestamp::now(),
             }),
-            placement.owner().map(|owner| owner.owner_xid),
+            owner_xid,
         )
         .await
         .map_err(Error::SystemDatabase)

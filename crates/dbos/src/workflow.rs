@@ -1294,7 +1294,7 @@ async fn create<R, E>(
             // which records the joined case under the same one.
             step_name: &key.name,
             started_at,
-            owner_xid: Some(parent.owner_xid()),
+            owner_xid: parent.owner_xid(),
         }),
     )
     .await
@@ -1732,7 +1732,7 @@ impl Parent<'_> {
                 workflow_id: self.workflow_id(),
                 step_id: self.step_id,
                 codec: executor.serializer(),
-                owner_xid: Some(self.owner_xid()),
+                owner_xid: self.owner_xid(),
             };
             let value: serde_json::Value =
                 decode_step_value(&recorded, encoded, caller, step_name, "an error")
@@ -1819,7 +1819,7 @@ impl Parent<'_> {
                 Outcome::Error(&recorded.value),
                 recorded.serialization.as_deref(),
                 Some(timing),
-                Some(self.owner_xid()),
+                self.owner_xid(),
             )
             .await
         {
@@ -1865,7 +1865,7 @@ impl Parent<'_> {
                 self.step_id,
                 step_name,
                 Some(started_at),
-                Some(self.owner_xid()),
+                self.owner_xid(),
             )
             .await
             .map_err(Error::SystemDatabase)
@@ -2096,7 +2096,7 @@ async fn execute(
                 .record_workflow_outcome(
                     workflow_id,
                     Outcome::Output(output.encoded.as_deref()),
-                    Some(&owner_xid),
+                    &owner_xid,
                 )
                 .await
         }
@@ -2131,11 +2131,7 @@ async fn execute(
         Err(Failure::Recorded(recorded)) => {
             executor
                 .sysdb()
-                .record_workflow_outcome(
-                    workflow_id,
-                    Outcome::Error(&recorded.encoded),
-                    Some(&owner_xid),
-                )
+                .record_workflow_outcome(workflow_id, Outcome::Error(&recorded.encoded), &owner_xid)
                 .await
         }
     }

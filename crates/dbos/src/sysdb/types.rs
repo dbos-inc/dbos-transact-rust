@@ -2155,17 +2155,17 @@ pub struct StepCaller<'a> {
     /// How the recorded result is encoded and decoded.
     pub codec: &'a dyn StepCodec,
     /// The token the calling execution owns its workflow by: the call and its record land only
-    /// while the workflow is still that execution's. `None` is not checked.
-    pub owner_xid: Option<&'a str>,
+    /// while the workflow is still that execution's.
+    pub owner_xid: &'a str,
 }
 
 impl<'a> StepCaller<'a> {
-    /// The execution making the call, if it is to be checked.
-    pub fn owner(&self) -> Option<WorkflowOwner<'a>> {
-        self.owner_xid.map(|owner_xid| WorkflowOwner {
+    /// The execution making the call, which the call is checked against.
+    pub fn owner(&self) -> WorkflowOwner<'a> {
+        WorkflowOwner {
             workflow_id: self.workflow_id,
-            owner_xid,
-        })
+            owner_xid: self.owner_xid,
+        }
     }
 }
 
@@ -2198,9 +2198,8 @@ pub struct GetEventCaller<'a> {
     /// start the timeout again — a read that waited fifty of its sixty seconds and crashed has ten
     /// left.
     pub timeout_step_id: i32,
-    /// The token the reading execution owns its workflow by, which both records present. `None` is
-    /// not checked.
-    pub owner_xid: Option<&'a str>,
+    /// The token the reading execution owns its workflow by, which both records present.
+    pub owner_xid: &'a str,
 }
 
 /// The workflow an [`init_workflow`](crate::sysdb::SystemDatabase::init_workflow) creates a child
@@ -2241,8 +2240,7 @@ pub struct InitWorkflowCaller<'a> {
     pub started_at: Timestamp,
     /// The token the parent's execution owns it by. The child is created, and the start
     /// recorded, only while the parent is still that execution's: a stale parent starts nothing.
-    /// `None` is not checked.
-    pub owner_xid: Option<&'a str>,
+    pub owner_xid: &'a str,
 }
 
 /// An encoded payload and the format it is encoded in.

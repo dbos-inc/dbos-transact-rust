@@ -1175,12 +1175,28 @@ impl dbos::sysdb::types::StepCodec for TestCodec {
     }
 }
 
-/// Step `step_id` of `workflow_id`, recorded through [`TestCodec`].
-pub fn step_caller(workflow_id: &str, step_id: i32) -> dbos::sysdb::types::StepCaller<'_> {
+/// The token of the execution that owns `workflow_id` now, which a test writing as that
+/// execution presents. Panics if no execution owns it.
+pub async fn owner_token(sys: &dyn dbos::sysdb::SystemDatabase, workflow_id: &str) -> String {
+    sys.get_workflow(workflow_id)
+        .await
+        .expect("could not read the workflow")
+        .expect("no such workflow")
+        .owner_xid
+        .expect("no execution owns the workflow")
+}
+
+/// Step `step_id` of `workflow_id`, recorded through [`TestCodec`] by the execution holding
+/// `owner_xid`.
+pub fn step_caller<'a>(
+    workflow_id: &'a str,
+    step_id: i32,
+    owner_xid: &'a str,
+) -> dbos::sysdb::types::StepCaller<'a> {
     dbos::sysdb::types::StepCaller {
         workflow_id,
         step_id,
         codec: &TestCodec,
-        owner_xid: None,
+        owner_xid,
     }
 }

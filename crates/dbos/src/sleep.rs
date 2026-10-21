@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::checkpoint::{PendingStep, StepPlacement};
+use crate::checkpoint::{PendingStep, StepCall, StepPlacement};
 use crate::error::{DurableError, Error};
 use crate::sysdb::types::{Timestamp, step_names};
 
@@ -59,7 +59,15 @@ where
             // Both halves or neither: an executor with no id behind it is the in-step and
             // outside-a-workflow cases, where the placement recorded nothing and there is
             // nothing to record now.
-            let Some((executor, (workflow_id, step_id))) = executor.zip(placement.step()) else {
+            let Some((
+                executor,
+                StepCall {
+                    workflow_id,
+                    step_id,
+                    owner_xid,
+                },
+            )) = executor.zip(placement.step_call())
+            else {
                 tracing::debug!(
                     duration_ms = duration.as_millis(),
                     "the sleep is not checkpointed: it is outside a workflow, or inside a step"
@@ -70,12 +78,7 @@ where
 
             let wake_at = executor
                 .sysdb()
-                .record_sleep(
-                    workflow_id,
-                    step_id,
-                    duration,
-                    placement.owner().map(|owner| owner.owner_xid),
-                )
+                .record_sleep(workflow_id, step_id, duration, owner_xid)
                 .await
                 .map_err(Error::SystemDatabase)?;
 

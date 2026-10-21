@@ -599,7 +599,7 @@ mod tests {
                 )),
                 Some(executor.connection().serializer().name()),
                 None,
-                None,
+                crate::context::TEST_OWNER,
             )
             .await
             .expect("could not plant the winner's row");

@@ -12,7 +12,7 @@ use dbos::{
     StartOptions, Timeout,
 };
 
-use dbos_test_support::{TestDatabase, test_database};
+use dbos_test_support::{TestDatabase, owner_token, test_database};
 
 /// The version each instance in this file launches with, derived from its application name.
 ///
@@ -1864,7 +1864,15 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
     // The row exists as soon as `start_with` returns, which is what this write needs.
     let reader = reader(&db).await;
     reader
-        .record_step(id, 0, "child", Outcome::Output(Some("1")), None, None, None)
+        .record_step(
+            id,
+            0,
+            "child",
+            Outcome::Output(Some("1")),
+            None,
+            None,
+            &owner_token(&reader, id).await,
+        )
         .await
         .expect("planting the step failed");
     tx.send(()).expect("the parent is waiting on the gate");
@@ -2121,7 +2129,7 @@ async fn a_recorded_await_of_another_workflow_is_refused() {
             Outcome::Output(Some("7")),
             None,
             None,
-            None,
+            &owner_token(&reader, id).await,
         )
         .await
         .expect("planting the await failed");

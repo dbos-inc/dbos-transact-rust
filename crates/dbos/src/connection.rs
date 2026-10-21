@@ -202,7 +202,7 @@ impl Connection {
             workflow_id: caller.workflow_id,
             step_id: caller.step_id,
             codec: &self.serializer,
-            owner_xid: Some(caller.owner_xid),
+            owner_xid: caller.owner_xid,
         })
     }
 

@@ -925,9 +925,7 @@ impl PostgresSystemDatabase {
         // Check, then work: the owner check comes first, so a refusal rolls the work back with
         // it, and the work and its record commit together under the lock the check took.
         if let Some(caller) = caller {
-            if let Some(owner) = caller.owner() {
-                self.check_owner_on(&mut tx, owner).await?;
-            }
+            self.check_owner_on(&mut tx, caller.owner()).await?;
             if let Some(step) = self
                 .check_step_on(&mut tx, caller.workflow_id, caller.step_id, step_name)
                 .await?
@@ -1129,9 +1127,7 @@ impl PostgresSystemDatabase {
         };
         let record = async {
             let mut tx = self.pool.begin().await?;
-            if let Some(owner) = caller.owner() {
-                self.check_owner_on(&mut tx, owner).await?;
-            }
+            self.check_owner_on(&mut tx, caller.owner()).await?;
             self.record_step_on(
                 &mut tx,
                 workflow_id,
@@ -1199,9 +1195,7 @@ impl PostgresSystemDatabase {
         };
 
         let mut conn = StepConn::Transactional(Box::new(self.pool.begin().await?));
-        if let Some(owner) = caller.owner() {
-            self.check_owner_on(&mut conn, owner).await?;
-        }
+        self.check_owner_on(&mut conn, caller.owner()).await?;
         if let Some(step) = self
             .check_step_on(&mut conn, caller.workflow_id, caller.step_id, step_name)
             .await?
@@ -2681,7 +2675,7 @@ impl PostgresSystemDatabase {
         step_id: i32,
         duration: Duration,
         kind: SleepKind,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         let pool = &self.pool;
         // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
@@ -2694,16 +2688,14 @@ impl PostgresSystemDatabase {
             // A transaction for the owner check, which locks the workflow's row until the record
             // commits; the record itself is the only write, and the wake time its output.
             let mut conn = pool.begin().await?;
-            if let Some(owner_xid) = owner_xid {
-                self.check_owner_on(
-                    &mut conn,
-                    WorkflowOwner {
-                        workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut conn,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
 
             // A replay wakes at the *original* instant. Starting the clock again would make a
             // workflow that crashed fifty minutes into an hour sleep another full hour.
@@ -3101,14 +3093,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             let mut tx = pool.begin().await?;
             // A start from inside a workflow is a write of that workflow's, so its execution must
             // still own it; checked first, so a stale parent creates no child.
-            if let Some(caller) = caller
-                && let Some(owner_xid) = caller.owner_xid
-            {
+            if let Some(caller) = caller {
                 self.check_owner_on(
                     &mut tx,
                     WorkflowOwner {
                         workflow_id: caller.parent_workflow_id,
-                        owner_xid,
+                        owner_xid: caller.owner_xid,
                     },
                 )
                 .await?;
@@ -3614,7 +3604,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_id: &str,
         outcome: Outcome<'_>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<OutcomeWrite, Error> {
         let (workflow_table, output_table, pool) = (
             self.tables.workflow_status.as_str(),
@@ -3646,7 +3636,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                  updated_at = {NOW_MS_SQL}, completed_at = {NOW_MS_SQL}, \
                  deduplication_id = NULL, owner_xid = NULL \
                  WHERE workflow_uuid = $1 AND status = 'PENDING' \
-                   AND ($3::text IS NULL OR owner_xid = $3)"
+                   AND owner_xid = $3"
             )))
             .bind(workflow_id)
             .bind(outcome.status().as_str())
@@ -4757,7 +4747,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         timeout_step_id: i32,
         topic: Option<&str>,
         timeout: Duration,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<Option<EncodedValue>, Error> {
         let notifications_table = self.tables.notifications.as_str();
         let (pool, polling) = (&self.pool, &self.polling);
@@ -4924,16 +4914,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             let mut tx = pool.begin().await?;
             // First, so a refusal rolls the consume back with it: the message stays for the
             // workflow's new owner.
-            if let Some(owner_xid) = owner_xid {
-                self.check_owner_on(
-                    &mut tx,
-                    WorkflowOwner {
-                        workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
 
             // The check that opened this call cannot stand in for this one: the wait between them
             // is exactly when another execution of this workflow would have recorded its own
@@ -5004,7 +4992,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         value: &str,
         serialization: Option<&str>,
         written_by: WrittenBy,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         // Derived, not passed: a close is recorded as a close whichever entry point reached it.
         // The label is part of the match, so a user value that encodes to the same text is not.
@@ -5038,16 +5026,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                 let mut tx = pool.begin().await?;
                 // A write made inside a step is checked as one made by the workflow is: either
                 // way the execution writing it must still own the workflow.
-                if let Some(owner_xid) = owner_xid {
-                    self.check_owner_on(
-                        &mut tx,
-                        WorkflowOwner {
-                            workflow_id,
-                            owner_xid,
-                        },
-                    )
-                    .await?;
-                }
+                self.check_owner_on(
+                    &mut tx,
+                    WorkflowOwner {
+                        workflow_id,
+                        owner_xid,
+                    },
+                )
+                .await?;
 
                 // A replay must not append a second entry. Only a workflow-level write records a
                 // step to find: one made inside a step is replayed by its step being replayed.
@@ -5130,7 +5116,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         key: &str,
         written_by: WrittenBy,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         self.write_stream(
             workflow_id,
@@ -5207,21 +5193,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "record_step", move || async move {
             let mut tx = pool.begin().await?;
-            if let Some(owner_xid) = owner_xid {
-                self.check_owner_on(
-                    &mut tx,
-                    WorkflowOwner {
-                        workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
             self.record_step_on(
                 &mut tx,
                 workflow_id,
@@ -5248,21 +5232,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         outcome: Outcome<'_>,
         serialization: Option<&str>,
         timing: Option<StepTiming>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "record_child_result", move || async move {
             let mut tx = pool.begin().await?;
-            if let Some(owner_xid) = owner_xid {
-                self.check_owner_on(
-                    &mut tx,
-                    WorkflowOwner {
-                        workflow_id: parent_workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id: parent_workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
             self.record_step_on(
                 &mut tx,
                 parent_workflow_id,
@@ -5317,7 +5299,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         workflow_id: &str,
         step_id: i32,
         duration: Duration,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         self.checkpoint_sleep(
             workflow_id,
@@ -5336,7 +5318,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         key: &str,
         value: &str,
         serialization: Option<&str>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let events = &self.tables.workflow_events;
         let history = &self.tables.workflow_events_history;
@@ -5350,16 +5332,14 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(&self.retry, "set_event", move || async move {
             let mut tx = pool.begin().await?;
-            if let Some(owner_xid) = owner_xid {
-                self.check_owner_on(
-                    &mut tx,
-                    WorkflowOwner {
-                        workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
 
             // A replay that already published this key must not publish it again — and must not
             // be told it failed either.
@@ -5568,16 +5548,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         // exactly when another execution of this workflow would have recorded its own answer.
         with_retry(&self.retry, "get_event", move || async move {
             let mut tx = pool.begin().await?;
-            if let Some(owner_xid) = caller.owner_xid {
-                self.check_owner_on(
-                    &mut tx,
-                    WorkflowOwner {
-                        workflow_id: caller.workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id: caller.workflow_id,
+                    owner_xid: caller.owner_xid,
+                },
+            )
+            .await?;
             if let Some(step) = self
                 .check_step_on(
                     &mut tx,
@@ -7697,21 +7675,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         step_id: i32,
         step_name: &str,
         started_at: Option<Timestamp>,
-        owner_xid: Option<&str>,
+        owner_xid: &str,
     ) -> Result<(), Error> {
         let pool = &self.pool;
         with_retry(&self.retry, "record_child_workflow", move || async move {
             let mut tx = pool.begin().await?;
-            if let Some(owner_xid) = owner_xid {
-                self.check_owner_on(
-                    &mut tx,
-                    WorkflowOwner {
-                        workflow_id: parent_workflow_id,
-                        owner_xid,
-                    },
-                )
-                .await?;
-            }
+            self.check_owner_on(
+                &mut tx,
+                WorkflowOwner {
+                    workflow_id: parent_workflow_id,
+                    owner_xid,
+                },
+            )
+            .await?;
             self.record_child_workflow_on(
                 &mut tx,
                 parent_workflow_id,
@@ -8161,12 +8137,12 @@ mod tests {
             workflow_id: "wf-caller",
             step_id: 0,
             codec: &UnitCodec,
-            owner_xid: None,
+            owner_xid: crate::context::TEST_OWNER,
         })
     }
 
-    /// A migrated database holding one `PENDING` workflow, `wf-caller`, for the runner to record
-    /// steps against.
+    /// A migrated database holding one `PENDING` workflow, `wf-caller`, owned by
+    /// [`TEST_OWNER`](crate::context::TEST_OWNER), for the runner to record steps against.
     async fn caller() -> (PostgresSystemDatabase, dbos_test_support::TestDatabase) {
         let db = dbos_test_support::test_database().await;
         let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
@@ -8179,6 +8155,7 @@ mod tests {
         )
         .await
         .expect("init_workflow failed");
+        crate::context::own_for_test(&db, "wf-caller").await;
         (sys, db)
     }
 
@@ -8338,7 +8315,7 @@ mod tests {
             Outcome::Output(Some("1")),
             Some("pickle"),
             None,
-            None,
+            crate::context::TEST_OWNER,
         )
         .await
         .unwrap();

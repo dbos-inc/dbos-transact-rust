@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::checkpoint::{PendingStep, StepPlacement};
+use crate::checkpoint::{PendingStep, StepCall, StepPlacement};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result};
@@ -416,7 +416,12 @@ impl ChildResultPlacement {
         settled: &std::result::Result<EncodedOutput, Failure>,
         started_at: Timestamp,
     ) -> std::result::Result<(), Error> {
-        let Some((workflow_id, step_id)) = self.0.step() else {
+        let Some(StepCall {
+            workflow_id,
+            step_id,
+            owner_xid,
+        }) = self.0.step_call()
+        else {
             return Ok(());
         };
         let cancelled;
@@ -455,7 +460,7 @@ impl ChildResultPlacement {
                     started_at,
                     completed_at: Timestamp::now(),
                 }),
-                self.0.owner().map(|owner| owner.owner_xid),
+                owner_xid,
             )
             .await
             .map_err(Error::SystemDatabase)

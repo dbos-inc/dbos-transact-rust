@@ -10,7 +10,7 @@ use dbos::{
     Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout,
 };
 
-use dbos_test_support::{Backend, TestDatabase, raw_database, test_database};
+use dbos_test_support::{Backend, TestDatabase, owner_token, raw_database, test_database};
 
 /// The version every instance in this file launches with: DBOS computes none, so a launch without
 /// one fails — and sharing it is what lets a relaunch recover what the previous launch left.
@@ -281,7 +281,11 @@ async fn a_deadline_that_loses_to_a_recorded_outcome_reports_that_outcome() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     let reader = reader(&db).await;
     reader
-        .record_workflow_outcome(id, Outcome::Output(Some("7")), None)
+        .record_workflow_outcome(
+            id,
+            Outcome::Output(Some("7")),
+            &owner_token(&reader, id).await,
+        )
         .await
         .expect("the rival could not record its outcome");
 

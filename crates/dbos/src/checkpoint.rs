@@ -851,7 +851,12 @@ impl StepPlacement {
         outcome: Outcome<'_>,
         started_at: Timestamp,
     ) -> Result<(), Error> {
-        let Some((workflow_id, step_id)) = self.step() else {
+        let Some(StepCall {
+            workflow_id,
+            step_id,
+            owner_xid,
+        }) = self.step_call()
+        else {
             return Ok(());
         };
         conn.sysdb()
@@ -865,7 +870,7 @@ impl StepPlacement {
                     started_at,
                     completed_at: Timestamp::now(),
                 }),
-                self.owner().map(|owner| owner.owner_xid),
+                owner_xid,
             )
             .await
             .map_err(Error::SystemDatabase)

@@ -11,7 +11,7 @@ use dbos::{
 };
 use tokio::sync::Notify;
 
-use dbos_test_support::{TestDatabase, test_database};
+use dbos_test_support::{TestDatabase, owner_token, test_database};
 
 const DEADLINE: Duration = Duration::from_secs(60);
 
@@ -700,7 +700,7 @@ async fn a_workflows_timed_out_read_replays_as_a_timeout() {
             "\"late\"",
             Some("rust_serde"),
             WrittenBy::Step,
-            None,
+            &owner_token(&reader, "wf-silent").await,
         )
         .await
         .expect("write failed");
