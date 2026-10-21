@@ -5514,6 +5514,148 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
     );
 }
 
+/// **`from_workflow` refuses only the calling workflow's own line**: itself, and with the cascade,
+/// an ancestor whose tree it is inside. Its descendants, a sibling's tree and its parent on its own
+/// are fair targets, and `None` checks nothing, as for a client.
+///
+/// Every refusal is asserted before any allowed call moves a row, and the refused calls each name
+/// a bystander still `PENDING`, so a refusal that came after the work would show as a moved row.
+#[tokio::test]
+async fn from_workflow_refuses_only_the_callers_own_line() {
+    let (sys, _db) = sysdb().await;
+    // wf-top ── wf-mid ── wf-low
+    //       └── wf-side
+    for (id, parent) in [
+        ("wf-top", None),
+        ("wf-mid", Some(("wf-top", 0))),
+        ("wf-low", Some(("wf-mid", 0))),
+        ("wf-side", Some(("wf-top", 1))),
+        ("wf-loner", None),
+    ] {
+        let caller = parent.map(|(parent_workflow_id, step_id)| InitWorkflowCaller {
+            parent_workflow_id,
+            step_id,
+            step_name: "spawn",
+            started_at: Timestamp::now(),
+        });
+        sys.init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, caller)
+            .await
+            .unwrap();
+    }
+    let refused = |result: Result<Vec<String>, Error>, what: &str| match result {
+        Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "workflow_ids", "{what}"),
+        other => panic!("{what} was not refused: {other:?}"),
+    };
+    let status = |id: &'static str| {
+        let sys = &sys;
+        async move { sys.get_workflow(id).await.unwrap().unwrap().status }
+    };
+
+    refused(
+        sys.cancel_workflows(&["wf-top"], true, Some("wf-low"), None)
+            .await,
+        "a cascade through the grandparent",
+    );
+    refused(
+        sys.cancel_workflows(&["wf-loner", "wf-low"], false, Some("wf-low"), None)
+            .await,
+        "a cancel of itself among others",
+    );
+    refused(
+        sys.resume_workflows(&["wf-loner", "wf-low"], None, Some("wf-low"), None)
+            .await,
+        "a resume of itself among others",
+    );
+    for id in ["wf-top", "wf-mid", "wf-low", "wf-side", "wf-loner"] {
+        assert_eq!(status(id).await, WorkflowStatus::Pending, "{id} moved");
+    }
+
+    let allowed = |result: Result<Vec<String>, Error>, what: &str| {
+        let mut ids = result.unwrap_or_else(|error| panic!("{what} was refused: {error}"));
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-side"], true, Some("wf-mid"), None)
+                .await,
+            "a cascade over a sibling's tree",
+        ),
+        ["wf-side"],
+    );
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-low"], true, Some("wf-mid"), None)
+                .await,
+            "a cascade over its own descendants",
+        ),
+        ["wf-low"],
+    );
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-top"], false, Some("wf-mid"), None)
+                .await,
+            "a cancel of its parent alone",
+        ),
+        ["wf-top"],
+    );
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-mid"], false, None, None).await,
+            "a cancel of itself with no from_workflow",
+        ),
+        ["wf-mid"],
+    );
+}
+
+/// **The ancestry walk ends on a missing row and on a cycle**, neither of which a well-formed tree
+/// has, and a recorded call with nothing to target is still recorded.
+#[tokio::test]
+async fn from_workflow_survives_missing_ancestors_cycles_and_empty_targets() {
+    let (sys, db) = sysdb().await;
+    for id in ["wf-a", "wf-b", "wf-c", "wf-target", "wf-operator"] {
+        sys.init_workflow(&workflow(id), None, Submission::Fresh, None)
+            .await
+            .unwrap();
+    }
+    // A caller whose row is gone, or was never written, has no ancestry to be inside.
+    assert_eq!(
+        sys.cancel_workflows(&["wf-target"], true, Some("wf-ghost"), None)
+            .await
+            .unwrap(),
+        ["wf-target"],
+    );
+    // Two rows naming each other, which the schema does not prevent.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status"
+           SET parent_workflow_id = CASE workflow_uuid WHEN 'wf-a' THEN 'wf-b' ELSE 'wf-a' END
+           WHERE workflow_uuid IN ('wf-a', 'wf-b')"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sys.cancel_workflows(&["wf-c"], true, Some("wf-a"), None),
+    )
+    .await
+    .expect("the walk did not end on a cycle")
+    .unwrap();
+    assert_eq!(cancelled, ["wf-c"]);
+
+    let caller = Some(support::step_caller("wf-operator", 0));
+    let nothing = sys
+        .cancel_workflows(&[], true, Some("wf-operator"), caller)
+        .await
+        .unwrap();
+    assert!(nothing.is_empty());
+    let steps = sys
+        .list_workflow_steps("wf-operator", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "the empty call was not recorded: {steps:?}");
+}
+
 /// **A read is checkpointed too, so a replay sees the rows the first execution saw.**
 ///
 /// Go leaves its listings on the non-transactional wrapper; here they take the same one

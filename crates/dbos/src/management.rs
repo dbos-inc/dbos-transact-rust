@@ -410,6 +410,13 @@ impl DBOS {
     /// Children are left alone — [`cancel_all`](Self::cancel_all) with [`Children::Include`] is how
     /// a tree is cancelled.
     ///
+    /// **A workflow cannot cancel itself**, from its own code or from inside one of its steps:
+    /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is cancelled. A workflow that
+    /// wants to stop returns or fails instead. The check knows the caller from the workflow's
+    /// context, so it does not reach a cancel through a [`Client`](crate::Client), which is outside
+    /// every workflow, or one from a task the workflow spawned with `tokio::spawn`, which leaves
+    /// that context behind.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// dbos.cancel("runaway-workflow").await?;
@@ -446,6 +453,11 @@ impl DBOS {
     /// can miss a workflow spawned during the walk. Here the walk is also one transaction, so a
     /// tree is either wholly cancelled or untouched, and a failure partway leaves nothing to
     /// finish.
+    ///
+    /// **A workflow cannot cancel itself here either**, by naming its own id, or with
+    /// [`Children::Include`] by naming an ancestor whose tree it is inside. Either refuses the
+    /// whole call, as [`cancel`](Self::cancel) describes, and nothing moves. Its own descendants, a
+    /// sibling's tree, and its parent with [`Children::Skip`] are fair targets.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -491,15 +503,18 @@ impl DBOS {
     ///
     /// # Resuming a workflow that is still running
     ///
-    /// **Nothing checks for one.** Not being terminal is the whole guard, so a `PENDING` row
-    /// passes — and `PENDING` means *some executor owns this*, not *this has stopped*. Resuming a
-    /// workflow that is executing right now re-enqueues it underneath its own execution: the next
-    /// sweep claims the row and dispatches it, and two executions of one id run concurrently.
-    /// Neither is told about the other, and the running one is not cancelled, so nothing stops it
-    /// at its next step — see the module documentation on why cancelling is the only thing step
-    /// preemption watches for. Both run to a conclusion, one records the outcome and the other's
-    /// write is refused; the row is then tidy, but any step neither had checkpointed is performed
-    /// twice, side effects included.
+    /// **Nothing checks for one, except a workflow resuming itself.** That is refused as
+    /// [`Error::SystemDatabase`] carrying `InvalidInput`, from the workflow's own code or one of
+    /// its steps, though not through a [`Client`](crate::Client) or from a task it spawned, as
+    /// [`cancel`](Self::cancel) describes. Otherwise not being terminal is the whole guard, so a
+    /// `PENDING` row passes — and `PENDING` means *some executor owns this*, not *this has
+    /// stopped*. Resuming a workflow that is executing right now re-enqueues it underneath its own
+    /// execution: the next sweep claims the row and dispatches it, and two executions of one id run
+    /// concurrently. Neither is told about the other, and the running one is not cancelled, so
+    /// nothing stops it at its next step — see the module documentation on why cancelling is the
+    /// only thing step preemption watches for. Both run to a conclusion, one records the outcome
+    /// and the other's write is refused; the row is then tidy, but any step neither had
+    /// checkpointed is performed twice, side effects included.
     ///
     /// **[`cancel`](Self::cancel) first if the workflow may be live.** That gives the running
     /// execution something to observe, so it abandons its attempt at the next preemptible step
@@ -576,7 +591,8 @@ impl DBOS {
     /// its `ResumeWorkflows` skipping a missing id where its `ResumeWorkflow` refuses one, and
     /// Java's `resumeWorkflows` being a single `UPDATE ... WHERE workflow_uuid = ANY(?)` that
     /// never notices one. Following Python here keeps the batch and the single form answering the
-    /// same way.
+    /// same way. Naming the calling workflow among them fails the call the same way, as
+    /// [`resume`](Self::resume) describes.
     pub fn resume_all<'a, R: 'a, E: 'a>(
         &self,
         workflow_ids: &'a [&'a str],
@@ -1364,6 +1380,11 @@ impl crate::Client {
 /// has no step counter of its own to agree with a workflow's. That is the same line
 /// [`WorkflowHandle::result`](crate::WorkflowHandle::result) draws for a client's handle awaited
 /// inside a workflow, and `Connection::get_event` for a client's read.
+///
+/// Cancel and resume also take `from_workflow`, the workflow making the call, which they refuse to
+/// target. It is not `caller` with the step dropped: inside a step body the call records nothing
+/// and `caller` is `None`, but the workflow is still the one calling. A client passes `None` for
+/// both.
 impl Connection {
     /// Cancels workflows, optionally cascading, and reports which ones moved.
     pub(crate) async fn cancel_all(

@@ -2451,7 +2451,8 @@ async fn a_refused_self_cancel_is_recorded_and_replayed() {
 
 /// **The cascade is refused from further down too**, through a grandparent, from inside a step,
 /// and when the caller is one of several ids named. Each refusal comes before anything moves, so
-/// the other ids named alongside are left as they were.
+/// the other ids named alongside are left as they were: one held `DELAYED`, which a cancel would
+/// move, and one already `CANCELLED`, which a resume would.
 #[tokio::test]
 async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
     let db = test_database().await;
@@ -2462,7 +2463,7 @@ async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
     let grandchild = dbos
         .register_workflow("targeting-grandchild", {
             let dbos = dbos.clone();
-            move |(own_id, root, other): (String, String, String)| {
+            move |(own_id, root, held, stopped): (String, String, String, String)| {
                 let dbos = dbos.clone();
                 async move {
                     let tree = dbos
@@ -2483,12 +2484,12 @@ async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
                     })
                     .await?;
                     let among = dbos
-                        .cancel_all(&[&other, &own_id], Children::Skip)
+                        .cancel_all(&[&held, &own_id], Children::Skip)
                         .await
                         .expect_err("the grandchild cancelled itself among others")
                         .to_string();
                     let resumed = dbos
-                        .resume_all::<(), Error>(&[&other, &own_id], ResumeOptions::default())
+                        .resume_all::<(), Error>(&[&stopped, &own_id], ResumeOptions::default())
                         .await
                         .expect_err("the grandchild resumed itself among others")
                         .to_string();
@@ -2499,13 +2500,13 @@ async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
         .unwrap();
     let child = dbos
         .register_workflow("middle-child", {
-            move |(root, other): (String, String)| {
+            move |(root, held, stopped): (String, String, String)| {
                 let grandchild = grandchild.clone();
                 async move {
                     let own = format!("{root}-grandchild");
                     grandchild
                         .run_with(
-                            (own.clone(), root, other),
+                            (own.clone(), root, held, stopped),
                             dbos::RunOptions {
                                 workflow_id: Some(&own),
                                 ..Default::default()
@@ -2518,30 +2519,45 @@ async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
         .unwrap();
     let root_workflow = dbos
         .register_workflow("the-grandparent", {
-            move |(root, other): (String, String)| {
+            move |(root, held, stopped): (String, String, String)| {
                 let child = child.clone();
-                async move { child.run((root, other)).await }
+                async move { child.run((root, held, stopped)).await }
             }
         })
         .unwrap();
     dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "held-bystanders",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
 
-    let other = "a-bystander";
-    bystander
-        .run_with(
-            (),
-            dbos::RunOptions {
-                workflow_id: Some(other),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    // Far enough out that neither is released while the test runs.
+    let (held, stopped) = ("a-held-bystander", "a-stopped-bystander");
+    for id in [held, stopped] {
+        bystander
+            .start_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(id),
+                    queue: Some(Enqueue {
+                        delay: Some(Duration::from_secs(3600)),
+                        ..Enqueue::new("held-bystanders")
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("enqueue failed");
+    }
+    dbos.cancel(stopped).await.expect("cancel failed");
     let root = "the-grandparent-root";
     let messages = tokio::time::timeout(
         Duration::from_secs(10),
         root_workflow.run_with(
-            (root.to_owned(), other.to_owned()),
+            (root.to_owned(), held.to_owned(), stopped.to_owned()),
             dbos::RunOptions {
                 workflow_id: Some(root),
                 ..Default::default()
@@ -2556,10 +2572,71 @@ async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
     assert!(messages[1].contains(&tree), "{messages:?}");
     assert!(messages[2].contains("cannot cancel itself"), "{messages:?}");
     assert!(messages[3].contains("cannot resume itself"), "{messages:?}");
-    for id in [root, other] {
+    for (id, status) in [
+        (root, WorkflowStatus::Success),
+        (held, WorkflowStatus::Delayed),
+        (stopped, WorkflowStatus::Cancelled),
+    ] {
         let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
-        assert_eq!(row.status, WorkflowStatus::Success, "{id} was moved");
+        assert_eq!(row.status, status, "{id} was moved");
     }
+
+    dbos.shutdown().await;
+}
+
+/// **A client is outside every workflow, even one driven from inside a workflow's code**, so its
+/// cancel of the very workflow running it is not refused: the cancel lands, and the workflow stops
+/// at its next step.
+#[tokio::test]
+async fn a_client_inside_a_workflow_may_cancel_that_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("client-self-cancel-app", &db));
+    let client = Client::connect(ClientConfig {
+        app_name: Some("client-self-cancel-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+    let answer = Arc::new(Mutex::new(None));
+    let workflow = dbos
+        .register_workflow("cancelled-by-its-client", {
+            let answer = Arc::clone(&answer);
+            move |own_id: String| {
+                let (client, answer) = (client.clone(), Arc::clone(&answer));
+                async move {
+                    let cancelled = client.cancel(&own_id).await.map_err(|e| e.to_string());
+                    *answer.lock().unwrap() = Some(cancelled);
+                    dbos::step("after", || async { Ok::<_, Error>(()) }).await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "cancelled-by-its-own-client";
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished");
+    assert_eq!(
+        *answer.lock().unwrap(),
+        Some(Ok(())),
+        "the client's cancel was refused"
+    );
+    assert!(
+        outcome.is_err(),
+        "the cancelled workflow finished: {outcome:?}"
+    );
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Cancelled);
 
     dbos.shutdown().await;
 }
