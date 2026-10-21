@@ -331,11 +331,11 @@ pub struct Config<'a> {
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
-    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None` or zero
-    /// leaves the server's own setting, as do connection options that already set
-    /// `idle_in_transaction_session_timeout` (the URL's `options` parameter, or `PGOPTIONS`).
-    /// Anything else replaces the server's setting, one made with `ALTER ROLE` or `ALTER DATABASE`
-    /// included. A positive value under a millisecond is a millisecond, and longer than
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None` is
+    /// [`DEFAULT_IDLE_TRANSACTION_TIMEOUT`]. Zero leaves the server's own setting, as do connection
+    /// options that already set `idle_in_transaction_session_timeout` (the URL's `options`
+    /// parameter, or `PGOPTIONS`). Anything else replaces the server's setting, one made with
+    /// `ALTER ROLE` or `ALTER DATABASE` included. A positive value under a millisecond is a millisecond, and longer than
     /// [`MAX_IDLE_TRANSACTION_TIMEOUT`] is refused.
     ///
     /// A process that stalls mid-transaction (a frozen container, a network partition) would
@@ -359,7 +359,7 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
-            idle_transaction_timeout: Some(DEFAULT_IDLE_TRANSACTION_TIMEOUT),
+            idle_transaction_timeout: None,
             migrate: true,
             settings: Settings::default(),
         }
@@ -493,23 +493,20 @@ impl PostgresSystemDatabase {
             ensure_database_exists(config.url).await?;
         }
 
-        if config
+        let idle_transaction_timeout = config
             .idle_transaction_timeout
-            .is_some_and(|timeout| timeout > MAX_IDLE_TRANSACTION_TIMEOUT)
-        {
+            .unwrap_or(DEFAULT_IDLE_TRANSACTION_TIMEOUT);
+        if idle_transaction_timeout > MAX_IDLE_TRANSACTION_TIMEOUT {
             return Err(Error::InvalidInput {
                 field: "idle_transaction_timeout".into(),
                 detail: format!("must be at most {MAX_IDLE_TRANSACTION_TIMEOUT:?}"),
             });
         }
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
-        if let Some(millis) = config
-            .idle_transaction_timeout
-            .filter(|timeout| !timeout.is_zero())
-            // The server reads zero as no timeout, so a positive value under a millisecond is one.
-            .map(|timeout| timeout.as_millis().max(1))
-            && !options_set_idle_transaction_timeout(config.url)
+        if !idle_transaction_timeout.is_zero() && !options_set_idle_transaction_timeout(config.url)
         {
+            // The server reads zero as no timeout, so a positive value under a millisecond is one.
+            let millis = idle_transaction_timeout.as_millis().max(1);
             pool = pool.after_connect(move |conn, _| {
                 Box::pin(async move {
                     sqlx::query(AssertSqlSafe(format!(
