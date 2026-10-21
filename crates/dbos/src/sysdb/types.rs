@@ -1476,6 +1476,40 @@ pub struct ApplicationRowCounts {
     pub steps: u64,
 }
 
+/// How many polling reads may run at once against a system database's pool.
+///
+/// Every wait is a loop that re-queries the database, and each pass takes a connection. Uncapped,
+/// enough waiters empty the pool and starve the control plane — enqueue, dequeue, status writes,
+/// recovery, cancellation — leaving the waiters blocked on writes that can no longer happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PollingConcurrency {
+    /// Half the pool, and at least one. The half is what leaves the other half for the control
+    /// plane, and the minimum matters at `max_connections = 1`, where half is zero: a cap of zero
+    /// would not be a small budget but a permanent block.
+    #[default]
+    Default,
+    /// No cap.
+    Unlimited,
+    /// At most this many. Above the pool size is the caller's business: this caps polling, the
+    /// pool caps connections.
+    AtMost(std::num::NonZeroU32),
+}
+
+impl PollingConcurrency {
+    /// The permits a cap of this size takes, for a pool of `pool_size` connections.
+    ///
+    /// No cap is a permit count nothing will exhaust rather than an absent semaphore, so a handle
+    /// holds one unconditional [`Semaphore`](tokio::sync::Semaphore) with no branch on the acquire
+    /// path.
+    pub(crate) fn permits(self, pool_size: u32) -> usize {
+        match self {
+            PollingConcurrency::Default => usize::max((pool_size / 2) as usize, 1),
+            PollingConcurrency::Unlimited => tokio::sync::Semaphore::MAX_PERMITS,
+            PollingConcurrency::AtMost(n) => n.get() as usize,
+        }
+    }
+}
+
 /// How many workflows a queue may start per window.
 ///
 /// One value rather than two `Option`s, because the two columns behind it are only meaningful

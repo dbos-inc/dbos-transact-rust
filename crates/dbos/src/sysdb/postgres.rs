@@ -86,10 +86,10 @@ use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
     Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
     ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
-    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency, QueueRecord, QueueUpdate,
+    RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord,
+    ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord,
+    Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
@@ -270,13 +270,8 @@ pub struct Settings<'a> {
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
     /// longer happen.
     ///
-    /// `None` is half the pool and at least one, which is Python's default
-    /// (`sys_db_polling_concurrency`) and TypeScript's. `Some(0)` switches the cap off, which the
-    /// references spell as any non-positive number.
-    ///
-    /// Named without a `sys_db_` prefix, unlike Python: that prefix distinguishes the system
-    /// database's pool from its others, and this field already sits on a `sysdb` type.
-    pub polling_concurrency: Option<u32>,
+    /// [`PollingConcurrency::Default`] is half the pool and at least one.
+    pub polling_concurrency: PollingConcurrency,
     /// How long a written key waits for company before this handle pushes a wakeup for it.
     ///
     /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
@@ -300,7 +295,7 @@ impl Default for Settings<'_> {
             retry: RetryPolicy::default(),
             executor_id: None,
             application_name: None,
-            polling_concurrency: None,
+            polling_concurrency: PollingConcurrency::Default,
             notification_coalesce: None,
         }
     }
@@ -346,28 +341,6 @@ impl<'a> Config<'a> {
     }
 }
 
-/// The polling cap for a pool of `pool_size` connections.
-///
-/// `configured` is the caller's choice: `None` takes the default, and `Some(0)` switches the cap
-/// off. Python and TypeScript spell the second as any non-positive number, which they need because
-/// their integers are signed and their configuration untyped; here the only unsigned value that can
-/// mean "off" is zero.
-///
-/// **The default is half the pool, and at least one.** Both references use exactly this, and the
-/// half is what leaves the other half for the control plane. The minimum matters at
-/// `max_connections = 1`, where half is zero — and a cap of zero would not be a small budget but a
-/// permanent block, the opposite of what a caller asking for a small pool wants.
-///
-/// Off is a permit count nothing will exhaust rather than an absent semaphore, so the handle holds
-/// one unconditional [`Semaphore`](tokio::sync::Semaphore) with no branch on the acquire path.
-fn polling_limit(configured: Option<u32>, pool_size: u32) -> usize {
-    match configured {
-        Some(0) => tokio::sync::Semaphore::MAX_PERMITS,
-        Some(n) => n as usize,
-        None => usize::max((pool_size / 2) as usize, 1),
-    }
-}
-
 /// A system database backed by PostgreSQL or CockroachDB.
 pub struct PostgresSystemDatabase {
     pool: PgPool,
@@ -387,7 +360,7 @@ pub struct PostgresSystemDatabase {
     /// Uncapped, enough waiters empty the pool and starve the control plane — enqueue, dequeue,
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
     /// longer happen. Python and TypeScript cap the same thing the same way; see
-    /// [`Settings::polling_concurrency`] for the size and [`polling_limit`] for the default.
+    /// [`Settings::polling_concurrency`] for the size.
     ///
     /// **A permit covers one query, never a wait.** A call site acquires, queries, and lets the
     /// permit drop before waiting. Held across the wait it would cap concurrent *waiters* rather
@@ -478,10 +451,12 @@ impl PostgresSystemDatabase {
         let handle = Self {
             // The cap's default is read off the pool rather than off `config.max_connections`, so
             // that it is the same expression here and in `from_pool`, which never sees a `Config`.
-            polling: tokio::sync::Semaphore::new(polling_limit(
-                config.settings.polling_concurrency,
-                pool.options().get_max_connections(),
-            )),
+            polling: tokio::sync::Semaphore::new(
+                config
+                    .settings
+                    .polling_concurrency
+                    .permits(pool.options().get_max_connections()),
+            ),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             notifier: Arc::new(Notifier::new(
                 pool.clone(),
@@ -595,10 +570,11 @@ impl PostgresSystemDatabase {
         let notify: Arc<Registry> = Arc::default();
         Self {
             // A caller's pool knows its own size, so the default needs nothing passed alongside it.
-            polling: tokio::sync::Semaphore::new(polling_limit(
-                settings.polling_concurrency,
-                pool.options().get_max_connections(),
-            )),
+            polling: tokio::sync::Semaphore::new(
+                settings
+                    .polling_concurrency
+                    .permits(pool.options().get_max_connections()),
+            ),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             notifier: Arc::new(Notifier::new(
                 pool.clone(),
@@ -7700,8 +7676,8 @@ impl PostgresSystemDatabase {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssertSqlSafe, NOW_MS_SQL, PostgresSystemDatabase, Settings, classify_sqlstate,
-        is_transport_failure, polling_limit, split_database, step_listing_query,
+        AssertSqlSafe, NOW_MS_SQL, PollingConcurrency, PostgresSystemDatabase, Settings,
+        classify_sqlstate, is_transport_failure, split_database, step_listing_query,
         timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
@@ -7821,30 +7797,34 @@ mod tests {
 
     #[test]
     fn the_default_polling_cap_is_half_the_pool() {
-        assert_eq!(polling_limit(None, 10), 5);
-        assert_eq!(polling_limit(None, 21), 10);
+        assert_eq!(PollingConcurrency::Default.permits(10), 5);
+        assert_eq!(PollingConcurrency::Default.permits(21), 10);
     }
 
     /// Half of one is zero, which as a cap would block every poll forever rather than allow a
     /// small number of them.
     #[test]
     fn a_pool_too_small_to_halve_still_admits_one_poll() {
-        assert_eq!(polling_limit(None, 1), 1);
-        assert_eq!(polling_limit(None, 0), 1);
+        assert_eq!(PollingConcurrency::Default.permits(1), 1);
+        assert_eq!(PollingConcurrency::Default.permits(0), 1);
     }
 
     #[test]
     fn a_configured_polling_cap_is_taken_as_given() {
-        assert_eq!(polling_limit(Some(3), 10), 3);
+        let at_most = |n| PollingConcurrency::AtMost(std::num::NonZeroU32::new(n).unwrap());
+        assert_eq!(at_most(3).permits(10), 3);
         // Above the pool size is the caller's business: this caps polling, the pool caps
-        // connections. Neither reference rejects it either.
-        assert_eq!(polling_limit(Some(100), 10), 100);
+        // connections.
+        assert_eq!(at_most(100).permits(10), 100);
     }
 
-    /// Off is a permit count nothing will exhaust, not an absent semaphore.
+    /// No cap is a permit count nothing will exhaust, not an absent semaphore.
     #[test]
-    fn zero_switches_the_polling_cap_off() {
-        assert_eq!(polling_limit(Some(0), 10), Semaphore::MAX_PERMITS);
+    fn an_unlimited_polling_cap_never_runs_out() {
+        assert_eq!(
+            PollingConcurrency::Unlimited.permits(10),
+            Semaphore::MAX_PERMITS
+        );
     }
 
     #[test]

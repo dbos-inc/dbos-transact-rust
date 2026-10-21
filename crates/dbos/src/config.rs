@@ -91,10 +91,9 @@ pub struct Config {
     /// Off suits an application whose database is migrated by a deployment step instead.
     pub migrate: bool,
 
-    /// How many polling reads may run at once.
-    ///
-    /// `None` is half the pool and at least one; `Some(0)` switches the cap off.
-    pub polling_concurrency: Option<u32>,
+    /// How many polling reads may run at once: half the pool by default; see
+    /// [`PollingConcurrency`](crate::PollingConcurrency).
+    pub polling_concurrency: crate::PollingConcurrency,
 
     /// How often a caller waiting on a workflow it does not own asks whether it has finished.
     ///
@@ -161,7 +160,7 @@ impl Config {
             serializer: Serializer::default(),
             use_listen_notify: true,
             migrate: true,
-            polling_concurrency: None,
+            polling_concurrency: crate::PollingConcurrency::Default,
             outcome_poll_interval: None,
             listen_queues: None,
             notification_coalesce: None,
