@@ -5430,7 +5430,7 @@ async fn from_workflow_refuses_only_the_callers_own_line() {
             step_name: "spawn",
             started_at: Timestamp::now(),
         });
-        sys.init_workflow(&NewWorkflow::new(id), None, Submission::Fresh, caller)
+        sys.init_workflow(&NewWorkflow::new(id), None, caller)
             .await
             .unwrap();
     }
@@ -5506,9 +5506,7 @@ async fn from_workflow_refuses_only_the_callers_own_line() {
 async fn from_workflow_survives_cycles_and_empty_targets() {
     let (sys, db) = sysdb().await;
     for id in ["wf-a", "wf-b", "wf-operator"] {
-        sys.init_workflow(&workflow(id), None, Submission::Fresh, None)
-            .await
-            .unwrap();
+        sys.init_workflow(&workflow(id), None, None).await.unwrap();
     }
     // Two rows naming each other, which the schema does not prevent.
     sqlx::query(
