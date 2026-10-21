@@ -410,6 +410,13 @@ impl DBOS {
     /// Children are left alone — [`cancel_all`](Self::cancel_all) with [`Children::Include`] is how
     /// a tree is cancelled.
     ///
+    /// **A workflow cannot cancel itself**, from its own code or from inside one of its steps:
+    /// [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is cancelled. A workflow that
+    /// wants to stop returns or fails instead. The check knows the caller from the workflow's
+    /// context, so it does not reach a cancel through a [`Client`](crate::Client), which is outside
+    /// every workflow, or one from a task the workflow spawned with `tokio::spawn`, which leaves
+    /// that context behind.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// dbos.cancel("runaway-workflow").await?;
@@ -420,11 +427,14 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "cancel")
-                    .await?;
                 executor
                     .connection()
-                    .cancel_all(&[workflow_id], Children::Skip, placement.step_call())
+                    .cancel_all(
+                        &[workflow_id],
+                        Children::Skip,
+                        placement.workflow_id(),
+                        placement.step_call(),
+                    )
                     .await?;
                 Ok(())
             },
@@ -444,6 +454,11 @@ impl DBOS {
     /// tree is either wholly cancelled or untouched, and a failure partway leaves nothing to
     /// finish.
     ///
+    /// **A workflow cannot cancel itself here either**, by naming its own id, or with
+    /// [`Children::Include`] by naming an ancestor whose tree it is inside. Either refuses the
+    /// whole call, as [`cancel`](Self::cancel) describes, and nothing moves. Its own descendants, a
+    /// sibling's tree, and its parent with [`Children::Skip`] are fair targets.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// // One workflow and its whole tree.
@@ -459,17 +474,14 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(
-                    &executor,
-                    &placement,
-                    workflow_ids,
-                    children == Children::Include,
-                    "cancel",
-                )
-                .await?;
                 executor
                     .connection()
-                    .cancel_all(workflow_ids, children, placement.step_call())
+                    .cancel_all(
+                        workflow_ids,
+                        children,
+                        placement.workflow_id(),
+                        placement.step_call(),
+                    )
                     .await
             },
         )
@@ -491,12 +503,15 @@ impl DBOS {
     ///
     /// # Resuming a workflow that is still running
     ///
-    /// **Allowed, and it hands the workflow over.** Not being terminal is the whole guard, so a
-    /// `PENDING` row passes — and `PENDING` means *some executor owns this*, not *this has
-    /// stopped*. Resuming a workflow that is executing right now re-enqueues it and takes it from
-    /// its execution: the next sweep claims the row and dispatches a new one, and the old one's
-    /// next write is refused, so it stops there and its caller gets the new one's outcome. A step
-    /// the old one was running when the hand-off came runs again in the new one, side effects
+    /// **Allowed, except a workflow resuming itself, and it hands the workflow over.** Resuming
+    /// itself is refused as [`Error::SystemDatabase`] carrying `InvalidInput`, from the workflow's
+    /// own code or one of its steps, though not through a [`Client`](crate::Client) or from a task
+    /// it spawned, as [`cancel`](Self::cancel) describes. Otherwise not being terminal is the whole
+    /// guard, so a `PENDING` row passes — and `PENDING` means *some executor owns this*, not *this
+    /// has stopped*. Resuming a workflow that is executing right now re-enqueues it and takes it
+    /// from its execution: the next sweep claims the row and dispatches a new one, and the old
+    /// one's next write is refused, so it stops there and its caller gets the new one's outcome. A
+    /// step the old one was running when the hand-off came runs again in the new one, side effects
     /// included.
     ///
     /// **[`cancel`](Self::cancel) first if the workflow may be live.** That gives the running
@@ -545,11 +560,14 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "resume")
-                    .await?;
                 executor
                     .connection()
-                    .resume_all(&[workflow_id], options, placement.step_call())
+                    .resume_all(
+                        &[workflow_id],
+                        options,
+                        placement.workflow_id(),
+                        placement.step_call(),
+                    )
                     .await?
                     .pop()
                     .ok_or_else(|| {
@@ -571,7 +589,8 @@ impl DBOS {
     /// its `ResumeWorkflows` skipping a missing id where its `ResumeWorkflow` refuses one, and
     /// Java's `resumeWorkflows` being a single `UPDATE ... WHERE workflow_uuid = ANY(?)` that
     /// never notices one. Following Python here keeps the batch and the single form answering the
-    /// same way.
+    /// same way. Naming the calling workflow among them fails the call the same way, as
+    /// [`resume`](Self::resume) describes.
     pub fn resume_all<'a, R: 'a, E: 'a>(
         &self,
         workflow_ids: &'a [&'a str],
@@ -581,11 +600,14 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(&executor, &placement, workflow_ids, false, "resume")
-                    .await?;
                 executor
                     .connection()
-                    .resume_all(workflow_ids, options, placement.step_call())
+                    .resume_all(
+                        workflow_ids,
+                        options,
+                        placement.workflow_id(),
+                        placement.step_call(),
+                    )
                     .await
             },
         )
@@ -1131,7 +1153,7 @@ impl crate::Client {
         children: Children,
     ) -> Result<Vec<String>> {
         self.connection()
-            .cancel_all(workflow_ids, children, None)
+            .cancel_all(workflow_ids, children, None, None)
             .await
     }
 
@@ -1162,7 +1184,7 @@ impl crate::Client {
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         self.connection()
-            .resume_all(workflow_ids, options, None)
+            .resume_all(workflow_ids, options, None, None)
             .await
     }
 
@@ -1357,30 +1379,6 @@ impl crate::Client {
     }
 }
 
-/// Refuses a cancel or a resume of the workflow whose step body is making it.
-///
-/// A call from inside a step body records nothing and carries no caller, so the system database
-/// can't see whose workflow it is in; this asks it with the step's own workflow instead. See
-/// [`refuse_self_target`](crate::sysdb::SystemDatabase::refuse_self_target) for why: a step that
-/// resumed its own workflow would run again in every new execution, and resume it again. A
-/// recorded call is refused by the system database itself.
-async fn refuse_self_target_in_step(
-    executor: &Executor,
-    placement: &StepPlacement,
-    targets: &[&str],
-    children: bool,
-    action: &str,
-) -> Result<()> {
-    if let StepPlacement::InsideStep { ctx } = placement {
-        executor
-            .sysdb()
-            .refuse_self_target(ctx.workflow_id(), targets, children, action)
-            .await
-            .map_err(Error::from_sysdb)?;
-    }
-    Ok(())
-}
-
 /// The operator surface, on the connection every caller reaches it through.
 ///
 /// Each method here is the whole operation — the system-database call, its logging, and the handles
@@ -1390,12 +1388,18 @@ async fn refuse_self_target_in_step(
 /// has no step counter of its own to agree with a workflow's. That is the same line
 /// [`WorkflowHandle::result`](crate::WorkflowHandle::result) draws for a client's handle awaited
 /// inside a workflow, and `Connection::get_event` for a client's read.
+///
+/// Cancel and resume also take `from_workflow`, the workflow making the call, which they refuse to
+/// target. It is not `caller` with the step dropped: inside a step body the call records nothing
+/// and `caller` is `None`, but the workflow is still the one calling. A client passes `None` for
+/// both.
 impl Connection {
     /// Cancels workflows, optionally cascading, and reports which ones moved.
     pub(crate) async fn cancel_all(
         &self,
         workflow_ids: &[&str],
         children: Children,
+        from_workflow: Option<&str>,
         caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<String>> {
         let cancelled = self
@@ -1403,6 +1407,7 @@ impl Connection {
             .cancel_workflows(
                 workflow_ids,
                 children == Children::Include,
+                from_workflow,
                 self.step_caller(caller),
             )
             .await
@@ -1421,11 +1426,17 @@ impl Connection {
         self: &Arc<Self>,
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
+        from_workflow: Option<&str>,
         caller: Option<crate::checkpoint::StepCall<'_>>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let resumed = self
             .sysdb()
-            .resume_workflows(workflow_ids, options.queue, self.step_caller(caller))
+            .resume_workflows(
+                workflow_ids,
+                options.queue,
+                from_workflow,
+                self.step_caller(caller),
+            )
             .await
             .map_err(Error::from_sysdb)?;
         // What moved, not what was asked for: an id that had already finished is not

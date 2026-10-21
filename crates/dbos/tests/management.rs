@@ -2377,9 +2377,267 @@ async fn a_workflow_cannot_cancel_an_ancestors_tree() {
     .await
     .expect("the workflow never finished")
     .expect("the workflow failed");
-    assert!(message.contains("cannot cancel itself"), "{message}");
+    assert!(
+        message.contains("cannot cancel the tree of the-cancelled-ancestor"),
+        "{message}"
+    );
     let row = reader(&db).await.get_workflow(root).await.unwrap().unwrap();
     assert_eq!(row.status, WorkflowStatus::Success);
+
+    dbos.shutdown().await;
+}
+
+/// **A refusal is the call's recorded answer**, so a replay raises it again from the checkpoint
+/// rather than deciding it afresh. A fork from the step after the refused cancel replays it: the
+/// fork is a different workflow, so deciding afresh would let it cancel the original.
+#[tokio::test]
+async fn a_refused_self_cancel_is_recorded_and_replayed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refusal-replay-app", &db));
+    let workflow = dbos
+        .register_workflow("refused-then-on", {
+            let dbos = dbos.clone();
+            move |own_id: String| {
+                let dbos = dbos.clone();
+                async move {
+                    let refused = dbos
+                        .cancel(&own_id)
+                        .await
+                        .expect_err("the workflow cancelled itself")
+                        .to_string();
+                    let after = dbos::step("after", || async { Ok::<_, Error>(7u32) }).await?;
+                    Ok::<_, Error>((refused, after))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "refused-and-recorded";
+    let original = workflow
+        .run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    let steps = dbos.list_workflow_steps(id).await.unwrap();
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(
+        steps[0].error.is_some(),
+        "the refusal is recorded: {steps:?}"
+    );
+    assert_eq!(
+        (steps[1].step_id, steps[1].step_name.as_str()),
+        (1, "after")
+    );
+
+    let forked = dbos
+        .fork::<(String, u32), Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(Duration::from_secs(10), forked.result())
+        .await
+        .expect("the fork never finished")
+        .expect("the fork failed");
+    assert_eq!(replayed, original, "the fork replays the recorded refusal");
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Success, "nothing cancelled it");
+
+    dbos.shutdown().await;
+}
+
+/// **The cascade is refused from further down too**, through a grandparent, from inside a step,
+/// and when the caller is one of several ids named. Each refusal comes before anything moves, so
+/// the other ids named alongside are left as they were: one held `DELAYED`, which a cancel would
+/// move, and one already `CANCELLED`, which a resume would.
+#[tokio::test]
+async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("self-target-cases-app", &db));
+    let bystander = dbos
+        .register_workflow("bystander", |(): ()| async { Ok::<_, Error>(()) })
+        .unwrap();
+    let grandchild = dbos
+        .register_workflow("targeting-grandchild", {
+            let dbos = dbos.clone();
+            move |(own_id, root, held, stopped): (String, String, String, String)| {
+                let dbos = dbos.clone();
+                async move {
+                    let tree = dbos
+                        .cancel_all(&[&root], Children::Include)
+                        .await
+                        .expect_err("the grandchild cancelled its grandparent's tree")
+                        .to_string();
+                    let in_step = dbos::step("kick", || {
+                        let (dbos, root) = (dbos.clone(), root.clone());
+                        async move {
+                            Ok::<_, Error>(
+                                dbos.cancel_all(&[&root], Children::Include)
+                                    .await
+                                    .expect_err("a step cancelled its grandparent's tree")
+                                    .to_string(),
+                            )
+                        }
+                    })
+                    .await?;
+                    let among = dbos
+                        .cancel_all(&[&held, &own_id], Children::Skip)
+                        .await
+                        .expect_err("the grandchild cancelled itself among others")
+                        .to_string();
+                    let resumed = dbos
+                        .resume_all::<(), Error>(&[&stopped, &own_id], ResumeOptions::default())
+                        .await
+                        .expect_err("the grandchild resumed itself among others")
+                        .to_string();
+                    Ok::<_, Error>(vec![tree, in_step, among, resumed])
+                }
+            }
+        })
+        .unwrap();
+    let child = dbos
+        .register_workflow("middle-child", {
+            move |(root, held, stopped): (String, String, String)| {
+                let grandchild = grandchild.clone();
+                async move {
+                    let own = format!("{root}-grandchild");
+                    grandchild
+                        .run_with(
+                            (own.clone(), root, held, stopped),
+                            dbos::RunOptions {
+                                workflow_id: Some(&own),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    let root_workflow = dbos
+        .register_workflow("the-grandparent", {
+            move |(root, held, stopped): (String, String, String)| {
+                let child = child.clone();
+                async move { child.run((root, held, stopped)).await }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "held-bystanders",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    // Far enough out that neither is released while the test runs.
+    let (held, stopped) = ("a-held-bystander", "a-stopped-bystander");
+    for id in [held, stopped] {
+        bystander
+            .start_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(id),
+                    queue: Some(Enqueue {
+                        delay: Some(Duration::from_secs(3600)),
+                        ..Enqueue::new("held-bystanders")
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("enqueue failed");
+    }
+    dbos.cancel(stopped).await.expect("cancel failed");
+    let root = "the-grandparent-root";
+    let messages = tokio::time::timeout(
+        Duration::from_secs(10),
+        root_workflow.run_with(
+            (root.to_owned(), held.to_owned(), stopped.to_owned()),
+            dbos::RunOptions {
+                workflow_id: Some(root),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished")
+    .expect("the workflow failed");
+    let tree = format!("cannot cancel the tree of {root}");
+    assert!(messages[0].contains(&tree), "{messages:?}");
+    assert!(messages[1].contains(&tree), "{messages:?}");
+    assert!(messages[2].contains("cannot cancel itself"), "{messages:?}");
+    assert!(messages[3].contains("cannot resume itself"), "{messages:?}");
+    for (id, status) in [
+        (root, WorkflowStatus::Success),
+        (held, WorkflowStatus::Delayed),
+        (stopped, WorkflowStatus::Cancelled),
+    ] {
+        let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+        assert_eq!(row.status, status, "{id} was moved");
+    }
+
+    dbos.shutdown().await;
+}
+
+/// **A client is outside every workflow, even one driven from inside a workflow's code**, so its
+/// cancel of the very workflow running it is not refused: the cancel lands, and the workflow stops
+/// at its next step.
+#[tokio::test]
+async fn a_client_inside_a_workflow_may_cancel_that_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("client-self-cancel-app", &db));
+    let client = Client::connect(ClientConfig {
+        app_name: Some("client-self-cancel-app".to_owned()),
+        ..ClientConfig::new(db.url())
+    })
+    .await
+    .expect("connect failed");
+    let answer = Arc::new(Mutex::new(None));
+    let workflow = dbos
+        .register_workflow("cancelled-by-its-client", {
+            let answer = Arc::clone(&answer);
+            move |own_id: String| {
+                let (client, answer) = (client.clone(), Arc::clone(&answer));
+                async move {
+                    let cancelled = client.cancel(&own_id).await.map_err(|e| e.to_string());
+                    *answer.lock().unwrap() = Some(cancelled);
+                    dbos::step("after", || async { Ok::<_, Error>(()) }).await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "cancelled-by-its-own-client";
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        workflow.run_with(
+            id.to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the workflow never finished");
+    assert_eq!(
+        *answer.lock().unwrap(),
+        Some(Ok(())),
+        "the client's cancel was refused"
+    );
+    assert!(
+        outcome.is_err(),
+        "the cancelled workflow finished: {outcome:?}"
+    );
+    let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Cancelled);
 
     dbos.shutdown().await;
 }

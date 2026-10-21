@@ -85,13 +85,14 @@ use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
     Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
-    ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
-    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp,
-    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowOwner,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
-    duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
+    ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
+    NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
+    StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value,
+    duration_from_ms, duration_from_secs, encode_step_value, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -277,13 +278,8 @@ pub struct Settings<'a> {
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
     /// longer happen.
     ///
-    /// `None` is half the pool and at least one, which is Python's default
-    /// (`sys_db_polling_concurrency`) and TypeScript's. `Some(0)` switches the cap off, which the
-    /// references spell as any non-positive number.
-    ///
-    /// Named without a `sys_db_` prefix, unlike Python: that prefix distinguishes the system
-    /// database's pool from its others, and this field already sits on a `sysdb` type.
-    pub polling_concurrency: Option<u32>,
+    /// [`PollingConcurrency::Default`] is half the pool and at least one.
+    pub polling_concurrency: PollingConcurrency,
     /// How long a written key waits for company before this handle pushes a wakeup for it.
     ///
     /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
@@ -307,7 +303,7 @@ impl Default for Settings<'_> {
             retry: RetryPolicy::default(),
             executor_id: None,
             application_name: None,
-            polling_concurrency: None,
+            polling_concurrency: PollingConcurrency::Default,
             notification_coalesce: None,
         }
     }
@@ -331,15 +327,12 @@ pub struct Config<'a> {
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
-    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None`, or less
-    /// than a millisecond, leaves the server's own setting, as does a URL that already sets
-    /// `idle_in_transaction_session_timeout`. Longer than [`MAX_IDLE_TRANSACTION_TIMEOUT`] is
-    /// refused.
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens.
     ///
     /// The owner check locks a workflow's row until the write it guards commits, so a process that
     /// stalls mid-transaction (a frozen container, a network partition) would otherwise hold that
     /// row, and with it every hand-off of the workflow, for as long as the stall lasts.
-    pub idle_transaction_timeout: Option<Duration>,
+    pub idle_transaction_timeout: IdleTransactionTimeout,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
     /// On by default. Turning it off suits an application whose database is migrated by something
@@ -357,40 +350,69 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
-            idle_transaction_timeout: Some(DEFAULT_IDLE_TRANSACTION_TIMEOUT),
+            idle_transaction_timeout: IdleTransactionTimeout::Default,
             migrate: true,
             settings: Settings::default(),
         }
     }
 }
 
-/// What [`Config::idle_transaction_timeout`] is unless told otherwise.
-pub const DEFAULT_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Whether the connection options `url` resolves to already set
+/// `idle_in_transaction_session_timeout`: the URL's `options` parameter, in either of its forms,
+/// or `PGOPTIONS`, decoded. A URL that does not parse sets nothing here, and fails at connect.
+fn options_set_idle_transaction_timeout(url: &str) -> bool {
+    url.parse::<sqlx::postgres::PgConnectOptions>()
+        .ok()
+        .and_then(|options| {
+            options
+                .get_options()
+                .map(|options| option_names(options).any(|name| name == IDLE_TIMEOUT_PARAMETER))
+        })
+        .unwrap_or(false)
+}
 
-/// The longest [`Config::idle_transaction_timeout`] the server takes: the parameter is a 32-bit
-/// count of milliseconds.
-pub const MAX_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(i32::MAX as u64);
+const IDLE_TIMEOUT_PARAMETER: &str = "idle_in_transaction_session_timeout";
 
-/// The polling cap for a pool of `pool_size` connections.
-///
-/// `configured` is the caller's choice: `None` takes the default, and `Some(0)` switches the cap
-/// off. Python and TypeScript spell the second as any non-positive number, which they need because
-/// their integers are signed and their configuration untyped; here the only unsigned value that can
-/// mean "off" is zero.
-///
-/// **The default is half the pool, and at least one.** Both references use exactly this, and the
-/// half is what leaves the other half for the control plane. The minimum matters at
-/// `max_connections = 1`, where half is zero — and a cap of zero would not be a small budget but a
-/// permanent block, the opposite of what a caller asking for a small pool wants.
-///
-/// Off is a permit count nothing will exhaust rather than an absent semaphore, so the handle holds
-/// one unconditional [`Semaphore`](tokio::sync::Semaphore) with no branch on the acquire path.
-fn polling_limit(configured: Option<u32>, pool_size: u32) -> usize {
-    match configured {
-        Some(0) => tokio::sync::Semaphore::MAX_PERMITS,
-        Some(n) => n as usize,
-        None => usize::max((pool_size / 2) as usize, 1),
+/// The parameter names a libpq `options` string assigns, as the server reads them: split on
+/// unescaped whitespace (a backslash escapes the next character), each assignment either `-c`
+/// followed by `name=value`, `-cname=value`, or `--name=value`, and the name compared lowercased
+/// with dashes as underscores. Anything else, a value included, names nothing.
+fn option_names(options: &str) -> impl Iterator<Item = String> + '_ {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => word.extend(chars.next()),
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
     }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut words = words.into_iter();
+    std::iter::from_fn(move || {
+        loop {
+            let word = words.next()?;
+            let assignment = if word == "-c" {
+                words.next()?
+            } else if let Some(rest) = word.strip_prefix("--") {
+                rest.to_owned()
+            } else if let Some(rest) = word.strip_prefix("-c") {
+                rest.to_owned()
+            } else {
+                continue;
+            };
+            if let Some((name, _)) = assignment.split_once('=') {
+                return Some(name.to_ascii_lowercase().replace('-', "_"));
+            }
+        }
+    })
 }
 
 /// A system database backed by PostgreSQL or CockroachDB.
@@ -412,7 +434,7 @@ pub struct PostgresSystemDatabase {
     /// Uncapped, enough waiters empty the pool and starve the control plane — enqueue, dequeue,
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
     /// longer happen. Python and TypeScript cap the same thing the same way; see
-    /// [`Settings::polling_concurrency`] for the size and [`polling_limit`] for the default.
+    /// [`Settings::polling_concurrency`] for the size.
     ///
     /// **A permit covers one query, never a wait.** A call site acquires, queries, and lets the
     /// permit drop before waiting. Held across the wait it would cap concurrent *waiters* rather
@@ -468,27 +490,18 @@ impl PostgresSystemDatabase {
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
     pub async fn connect(config: &Config<'_>) -> Result<Self, Error> {
+        // Before anything touches the server, so a bad setting creates no database.
+        config.idle_transaction_timeout.validate()?;
+
         // Only when migrating. A caller that has opted out is saying the database is someone
         // else's to set up, and creating one here would hide the fact that it is missing.
         if config.migrate {
             ensure_database_exists(config.url).await?;
         }
 
-        if config
-            .idle_transaction_timeout
-            .is_some_and(|timeout| timeout > MAX_IDLE_TRANSACTION_TIMEOUT)
-        {
-            return Err(Error::InvalidInput {
-                field: "idle_transaction_timeout".into(),
-                detail: format!("must be at most {MAX_IDLE_TRANSACTION_TIMEOUT:?}"),
-            });
-        }
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
-        if let Some(millis) = config
-            .idle_transaction_timeout
-            .map(|timeout| timeout.as_millis())
-            .filter(|millis| *millis > 0)
-            && !config.url.contains("idle_in_transaction_session_timeout")
+        if let Some(millis) = config.idle_transaction_timeout.millis()
+            && !options_set_idle_transaction_timeout(config.url)
         {
             pool = pool.after_connect(move |conn, _| {
                 Box::pin(async move {
@@ -527,10 +540,12 @@ impl PostgresSystemDatabase {
         let handle = Self {
             // The cap's default is read off the pool rather than off `config.max_connections`, so
             // that it is the same expression here and in `from_pool`, which never sees a `Config`.
-            polling: tokio::sync::Semaphore::new(polling_limit(
-                config.settings.polling_concurrency,
-                pool.options().get_max_connections(),
-            )),
+            polling: tokio::sync::Semaphore::new(
+                config
+                    .settings
+                    .polling_concurrency
+                    .permits(pool.options().get_max_connections()),
+            ),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             notifier: Arc::new(Notifier::new(
                 pool.clone(),
@@ -644,10 +659,11 @@ impl PostgresSystemDatabase {
         let notify: Arc<Registry> = Arc::default();
         Self {
             // A caller's pool knows its own size, so the default needs nothing passed alongside it.
-            polling: tokio::sync::Semaphore::new(polling_limit(
-                settings.polling_concurrency,
-                pool.options().get_max_connections(),
-            )),
+            polling: tokio::sync::Semaphore::new(
+                settings
+                    .polling_concurrency
+                    .permits(pool.options().get_max_connections()),
+            ),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             notifier: Arc::new(Notifier::new(
                 pool.clone(),
@@ -814,7 +830,50 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     decode_step_value(step, recorded, caller, step_name, "an output")
 }
 
+/// Refuses a cancel or a resume `caller_id` makes of itself by name: the `from_workflow` check of
+/// [`cancel_workflows`](SystemDatabase::cancel_workflows), before anything runs. A cascade's
+/// reach into the caller's own tree is the cascade's to find, as it walks.
+fn refuse_self_target(caller_id: &str, targets: &[&str], action: &str) -> Result<(), Error> {
+    if targets.contains(&caller_id) {
+        return Err(Error::InvalidInput {
+            field: "workflow_ids".into(),
+            detail: format!("workflow {caller_id} cannot {action} itself"),
+        });
+    }
+    Ok(())
+}
+
 impl PostgresSystemDatabase {
+    /// Which of `roots` has `caller_id` in its tree, for a cascade that has just reached it.
+    ///
+    /// Read only to name the tree in the refusal: up the caller's ancestry, which is short, and
+    /// only once the cascade has found it, so a cancel that is not refused pays nothing for it.
+    /// Falls back to every root should the walk not arrive at one, which `parent_workflow_id`, set
+    /// once at insert, does not allow.
+    async fn root_containing(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        caller_id: &str,
+        roots: &[&str],
+    ) -> Result<String, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
+        let mut current = caller_id.to_owned();
+        loop {
+            let parent: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
+            )))
+            .bind(&current)
+            .fetch_optional(&mut *conn)
+            .await?;
+            match parent.flatten() {
+                Some(parent) if roots.contains(&parent.as_str()) => return Ok(parent),
+                Some(parent) if seen.insert(parent.clone()) => current = parent,
+                _ => return Ok(roots.join(", ")),
+            }
+        }
+    }
+
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
     /// The shape every system-database call needs when it must be atomic with the step recording
@@ -4085,58 +4144,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn refuse_self_target(
-        &self,
-        caller_id: &str,
-        targets: &[&str],
-        children: bool,
-        action: &str,
-    ) -> Result<(), Error> {
-        let refused = || Error::InvalidInput {
-            field: "workflow_ids".into(),
-            detail: format!("workflow {caller_id} cannot {action} itself"),
-        };
-        if targets.contains(&caller_id) {
-            return Err(refused());
-        }
-        if !children {
-            return Ok(());
-        }
-        // Up the caller's ancestry, which is short, rather than down every target's tree.
-        let workflow_table = self.tables.workflow_status.as_str();
-        let pool = &self.pool;
-        let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
-        let mut current = caller_id.to_owned();
-        loop {
-            let parent: Option<Option<String>> = {
-                let current = current.as_str();
-                with_retry(&self.retry, "refuse_self_target", move || async move {
-                    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
-                        "SELECT parent_workflow_id FROM {workflow_table} WHERE workflow_uuid = $1"
-                    )))
-                    .bind(current)
-                    .fetch_optional(pool)
-                    .await?)
-                })
-                .await?
-            };
-            let Some(parent) = parent.flatten() else {
-                return Ok(());
-            };
-            if targets.contains(&parent.as_str()) {
-                return Err(refused());
-            }
-            if !seen.insert(parent.clone()) {
-                return Ok(());
-            }
-            current = parent;
-        }
-    }
-
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // An empty batch still has to reach `run_transactional_step` when there is a caller: the
@@ -4148,10 +4160,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         // stands there and spares a client a transaction that would do nothing.
         if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
-        }
-        if let Some(caller) = caller {
-            self.refuse_self_target(caller.workflow_id, workflow_ids, cancel_children, "cancel")
-                .await?;
         }
         let started_at = Timestamp::now();
 
@@ -4166,6 +4174,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::CANCEL_WORKFLOW,
                 started_at,
                 |mut tx| async move {
+                    if let Some(caller_id) = from_workflow {
+                        refuse_self_target(caller_id, workflow_ids, "cancel")?;
+                    }
                     // One statement per *level*, not per workflow: `cancel_batch` takes the whole
                     // frontier and matches it with `= ANY($1)`, so the round trips scale with the
                     // depth of the tree rather than its size.
@@ -4190,6 +4201,24 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // Terminates because `seen` only grows and a workflow enters a frontier at
                     // most once.
                     while !frontier.is_empty() {
+                        // A cascade that reaches the caller is a cancel of the tree it is inside,
+                        // found by the walk itself rather than by reading the caller's ancestry
+                        // up front. The levels above are cancelled by now, and returning the
+                        // error rolls them back with the rest of the transaction.
+                        if let Some(caller_id) = from_workflow
+                            && frontier.iter().any(|id| id == caller_id)
+                        {
+                            let root = self
+                                .root_containing(&mut tx, caller_id, workflow_ids)
+                                .await?;
+                            return Err(Error::InvalidInput {
+                                field: "workflow_ids".into(),
+                                detail: format!(
+                                    "workflow {caller_id} cannot cancel the tree of {root}, which \
+                                     contains it"
+                                ),
+                            });
+                        }
                         cancelled.extend(self.cancel_batch(&mut tx, &frontier).await?);
                         let children = self.direct_children(&mut tx, &frontier).await?;
                         frontier = children
@@ -4217,16 +4246,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
         // `cancel_workflows` for why the caller decides this.
         if workflow_ids.is_empty() && caller.is_none() {
             return Ok(Vec::new());
-        }
-        if let Some(caller) = caller {
-            self.refuse_self_target(caller.workflow_id, workflow_ids, false, "resume")
-                .await?;
         }
         let workflow_table = self.tables.workflow_status.as_str();
         let queue = queue_name.unwrap_or(INTERNAL_QUEUE);
@@ -4238,6 +4264,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::RESUME_WORKFLOW,
                 started_at,
                 |mut tx| async move {
+                    if let Some(caller_id) = from_workflow {
+                        refuse_self_target(caller_id, workflow_ids, "resume")?;
+                    }
                     // Existence is asked separately because a zero-row update conflates "already
                     // finished" — which is legal — with "no such workflow", which is not. In the
                     // same transaction as the update, so a workflow deleted between the two
@@ -4811,9 +4840,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         }
 
         // Before the first look: registering after looking would miss a message that landed in
-        // between. Shared, not exclusive: an execution whose workflow was handed to a new one may
-        // still be waiting here beside the new owner. Both wake, and the stale one's consume is
-        // refused by the owner check.
+        // between. Shared, not exclusive: two receives of one execution can wait here at once, and
+        // so can an execution whose workflow was handed to a new one, beside the new owner. Both
+        // wake, the consuming statement gives the message to one of them, and a stale execution's
+        // consume is refused by the owner check.
         let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
@@ -4866,8 +4896,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await;
         }
-        // Released here rather than at the end of the call: the taking below does not wait, and
-        // holding the topic through it would keep the next `recv` out for no reason.
+        // Released here rather than at the end of the call: the taking below does not wait, so
+        // there is nothing left to be woken for.
         drop(subscription);
 
         // Fixed here rather than inside the retry: `completed_at` is also what recognises this
@@ -6422,13 +6452,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // **`recovery_attempts` is counted here, and only here.** This is the transition that
             // starts a workflow, and since recovery re-enqueues rather than re-invoking, it is the
             // transition every recovered workflow makes too — so a budget counted anywhere else is
-            // a budget never spent. `init_workflow`'s `ON CONFLICT` deliberately does not count it:
-            // that arm is Java's, and Java can own the count because Java re-invokes a `PENDING`
-            // row instead of re-enqueueing it, so its upsert sees the claim this statement sees.
-            // The three implementations that re-enqueue all count in their claim exactly here — go
-            // `system_database.go`, ts `system_database.ts` (in both of its claim paths), python
-            // `_sys_db.py`, whose comment says it outright: *"Count this dispatch against the DLQ
-            // limit; no later insert does it."*
+            // a budget never spent. The dispatch that follows reads the count this writes, and
+            // parks the row once it is past the limit.
             //
             // Guarded on `ENQUEUED` and on ownership together: a peer that won the race has
             // already moved the row, so a loser matches nothing, charges the workflow nothing, and
@@ -7913,8 +7938,8 @@ impl PostgresSystemDatabase {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssertSqlSafe, NOW_MS_SQL, PostgresSystemDatabase, Settings, classify_sqlstate,
-        is_transport_failure, polling_limit, split_database, step_listing_query,
+        AssertSqlSafe, NOW_MS_SQL, PollingConcurrency, PostgresSystemDatabase, Settings,
+        classify_sqlstate, is_transport_failure, split_database, step_listing_query,
         timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
@@ -8034,30 +8059,34 @@ mod tests {
 
     #[test]
     fn the_default_polling_cap_is_half_the_pool() {
-        assert_eq!(polling_limit(None, 10), 5);
-        assert_eq!(polling_limit(None, 21), 10);
+        assert_eq!(PollingConcurrency::Default.permits(10), 5);
+        assert_eq!(PollingConcurrency::Default.permits(21), 10);
     }
 
     /// Half of one is zero, which as a cap would block every poll forever rather than allow a
     /// small number of them.
     #[test]
     fn a_pool_too_small_to_halve_still_admits_one_poll() {
-        assert_eq!(polling_limit(None, 1), 1);
-        assert_eq!(polling_limit(None, 0), 1);
+        assert_eq!(PollingConcurrency::Default.permits(1), 1);
+        assert_eq!(PollingConcurrency::Default.permits(0), 1);
     }
 
     #[test]
     fn a_configured_polling_cap_is_taken_as_given() {
-        assert_eq!(polling_limit(Some(3), 10), 3);
+        let at_most = |n| PollingConcurrency::AtMost(std::num::NonZeroU32::new(n).unwrap());
+        assert_eq!(at_most(3).permits(10), 3);
         // Above the pool size is the caller's business: this caps polling, the pool caps
-        // connections. Neither reference rejects it either.
-        assert_eq!(polling_limit(Some(100), 10), 100);
+        // connections.
+        assert_eq!(at_most(100).permits(10), 100);
     }
 
-    /// Off is a permit count nothing will exhaust, not an absent semaphore.
+    /// No cap is a permit count nothing will exhaust, not an absent semaphore.
     #[test]
-    fn zero_switches_the_polling_cap_off() {
-        assert_eq!(polling_limit(Some(0), 10), Semaphore::MAX_PERMITS);
+    fn an_unlimited_polling_cap_never_runs_out() {
+        assert_eq!(
+            PollingConcurrency::Unlimited.permits(10),
+            Semaphore::MAX_PERMITS
+        );
     }
 
     #[test]
@@ -8424,27 +8453,123 @@ mod tests {
         );
     }
 
+    /// **`connect` sets the idle-transaction timeout on its connections**: sixty seconds by
+    /// default, a positive value under a millisecond as a millisecond, and the server's own setting
+    /// for `ServerSetting`. Connection options that set it themselves keep their own, however they
+    /// spell it; one that only mentions it in a value doesn't count, and a pool the caller built is
+    /// left alone. Each is compared with the same server's reading of the value set directly, so
+    /// how a backend formats the setting doesn't matter.
+    #[tokio::test]
+    async fn connect_sets_the_idle_transaction_timeout() {
+        use super::IdleTransactionTimeout::{After, Default, ServerSetting};
+        async fn show(pool: &sqlx::PgPool) -> String {
+            sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn connected(url: &str, timeout: super::IdleTransactionTimeout) -> String {
+            let sys = PostgresSystemDatabase::connect(&super::Config {
+                idle_transaction_timeout: timeout,
+                migrate: false,
+                ..super::Config::new(url)
+            })
+            .await
+            .expect("connect failed");
+            show(&sys.pool).await
+        }
+        let db = dbos_test_support::test_database().await;
+        let with = |query: &str| {
+            let separator = if db.url().contains('?') { '&' } else { '?' };
+            format!("{}{separator}{query}", db.url())
+        };
+        // What the server reports for `millis` set directly, on a pool `connect` didn't make.
+        let set_directly = async |millis: u64| {
+            let url = with(&format!(
+                "options=-c%20idle_in_transaction_session_timeout%3D{millis}"
+            ));
+            show(&sqlx::PgPool::connect(&url).await.unwrap()).await
+        };
+        let ms = std::time::Duration::from_millis;
+        let server = show(&db.pool().await).await;
+
+        assert_eq!(
+            connected(db.url(), Default).await,
+            set_directly(60_000).await
+        );
+        assert_eq!(
+            connected(db.url(), After(ms(300))).await,
+            set_directly(300).await
+        );
+        assert_eq!(
+            connected(db.url(), After(std::time::Duration::from_micros(500))).await,
+            set_directly(1).await,
+            "under a millisecond is a millisecond"
+        );
+        assert_eq!(connected(db.url(), ServerSetting).await, server);
+
+        let own = set_directly(1234).await;
+        for options in [
+            "options=-c%20idle_in_transaction_session_timeout%3D1234",
+            "options=-c%20IDLE%5FIN%5FTRANSACTION%5FSESSION%5FTIMEOUT%3D1234",
+            "options=--idle-in-transaction-session-timeout%3D1234",
+        ] {
+            assert_eq!(connected(&with(options), Default).await, own, "{options}");
+        }
+        // Neither of these sets the parameter, so the timeout is set: a bare query parameter is
+        // not a connection option, and a value that names the parameter assigns another one.
+        for query in [
+            "idle_in_transaction_session_timeout=1234",
+            "options=-c%20application_name%3Didle_in_transaction_session_timeout",
+        ] {
+            assert_eq!(
+                connected(&with(query), After(ms(300))).await,
+                set_directly(300).await,
+                "{query}"
+            );
+        }
+
+        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        assert_eq!(
+            show(&supplied.pool).await,
+            server,
+            "a pool the caller built is left alone"
+        );
+    }
+
+    /// The names an `options` string assigns, in each form the server reads, and nothing else.
+    #[test]
+    fn option_names_are_read_as_the_server_reads_them() {
+        let names = |options| super::option_names(options).collect::<Vec<_>>();
+        assert_eq!(
+            names("-c a=1 -cB=2 --c-d=3 -c e\\ f=4"),
+            ["a", "b", "c_d", "e f"]
+        );
+        assert_eq!(
+            names("-c application_name=idle_in_transaction_session_timeout"),
+            ["application_name"]
+        );
+        assert!(names("-B 100 stray -c").is_empty());
+    }
+
     /// **A transaction left idle is ended by the server**, after the timeout `connect` sets on its
-    /// connections, and the row lock it held goes with it. A URL that sets the timeout itself
-    /// keeps its own, and a pool the caller built is left alone.
+    /// connections, and the row lock it held goes with it. Checked on PostgreSQL; the setting
+    /// itself is checked on both backends above.
     #[tokio::test]
     async fn connect_ends_transactions_left_idle() {
         let db = dbos_test_support::test_database().await;
         if db.backend() == dbos_test_support::Backend::Cockroach {
-            return; // The setting is the same there; ending the session is what this pins.
+            return;
         }
         let sys = PostgresSystemDatabase::connect(&super::Config {
-            idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
+            idle_transaction_timeout: super::IdleTransactionTimeout::After(
+                std::time::Duration::from_millis(300),
+            ),
             migrate: false,
             ..super::Config::new(db.url())
         })
         .await
         .expect("connect failed");
-        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&sys.pool)
-            .await
-            .unwrap();
-        assert_eq!(setting, "300ms");
 
         sys.init_workflow(&NewWorkflow::new("wf-idle"), None)
             .await
@@ -8474,35 +8599,5 @@ mod tests {
             sqlx::query("SELECT 1").execute(&mut *idle).await.is_err(),
             "the idle transaction's session was ended"
         );
-        drop(idle);
-
-        let url = format!(
-            "{}{}options=-c%20idle_in_transaction_session_timeout%3D1234",
-            db.url(),
-            if db.url().contains('?') { '&' } else { '?' }
-        );
-        let own = PostgresSystemDatabase::connect(&super::Config {
-            idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
-            migrate: false,
-            ..super::Config::new(&url)
-        })
-        .await
-        .expect("connect failed");
-        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&own.pool)
-            .await
-            .unwrap();
-        assert_eq!(setting, "1234ms", "the URL's own setting is kept");
-
-        let server: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&other)
-            .await
-            .unwrap();
-        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
-        let setting: String = sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
-            .fetch_one(&supplied.pool)
-            .await
-            .unwrap();
-        assert_eq!(setting, server, "a pool the caller built is left alone");
     }
 }

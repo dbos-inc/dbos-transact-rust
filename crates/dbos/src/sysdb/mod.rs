@@ -505,28 +505,6 @@ pub trait SystemDatabase: Send + Sync {
     /// expiry on the same clock.
     async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
 
-    /// Refuses a cancel or a resume a workflow makes of itself, directly or, with `children`,
-    /// through an ancestor whose tree it is inside.
-    ///
-    /// Both clear the targets' `owner_xid`, so the calling execution's next write (the call's own
-    /// checkpoint, or the record of the step it was made in) would be refused, and the execution
-    /// would wait for an outcome. For a resume nobody ever computes one: each new execution
-    /// replays to the same point, resumes itself again, and the reset attempt count keeps it from
-    /// ever being parked. A workflow that wants to stop returns or fails instead. Refused before
-    /// anything runs, as a delete of itself is, so the caller hears why and can go on.
-    ///
-    /// [`cancel_workflows`](Self::cancel_workflows) and
-    /// [`resume_workflows`](Self::resume_workflows) make this check themselves for a recorded
-    /// caller; the engine calls it directly for a cancel or a resume made inside a step body,
-    /// which records nothing and so passes no caller.
-    async fn refuse_self_target(
-        &self,
-        caller_id: &str,
-        targets: &[&str],
-        children: bool,
-        action: &str,
-    ) -> Result<(), Error>;
-
     /// Cancels workflows, returning the ids that actually moved.
     ///
     /// A workflow that has already finished is left alone rather than reported as an error —
@@ -552,6 +530,16 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
+    /// **`from_workflow` is the workflow making the call, which may not target itself**: named
+    /// directly, or, with `cancel_children`, through an ancestor whose tree it is inside. Either is
+    /// [`Error::InvalidInput`] and nothing moves. A workflow that wants to stop returns or fails
+    /// instead. It is the caller's workflow whenever `caller` is given, and also for a call made
+    /// inside a step body, which records nothing and so has no `caller`. The check runs in the
+    /// transaction that records the call, so a recorded refusal is the call's answer and a replay
+    /// raises it again rather than deciding it afresh. A [`Client`](crate::Client) passes `None`
+    /// and is not checked: a client is outside every workflow, even one made inside a workflow's
+    /// code.
+    ///
     /// **The cascade is one transaction, which buys atomicity and not exclusion.** A failure
     /// partway through leaves the tree untouched rather than half-cancelled — that is the part it
     /// buys. It does not stop a child being spawned behind the walk: at READ COMMITTED these
@@ -573,6 +561,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
@@ -593,17 +582,23 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
-    /// The only guard is that the row is not terminal, so `PENDING` passes: resuming a workflow
-    /// that is executing right now re-enqueues it underneath its own execution, and the claim
-    /// that dequeues it starts a new one. Clearing `owner_xid` is what stops the old one: its next
-    /// write is refused, and it waits for the new one's outcome. It can't simply be refused here,
-    /// because `PENDING` means *owned*, not *running*, and the row can't say whether the owner is
-    /// alive — a workflow left `PENDING` by a dead node is the case an operator most wants to
-    /// resume by hand.
+    /// `from_workflow` may not be among `workflow_ids`, as in
+    /// [`cancel_workflows`](Self::cancel_workflows): a resume would hand the workflow to a new
+    /// execution while the caller is the old one, so the caller's own record of the call would be
+    /// refused.
+    ///
+    /// Past that refusal, the only guard is that the row is not terminal, so `PENDING` passes:
+    /// resuming a workflow that is executing right now re-enqueues it underneath its own execution,
+    /// and the claim that dequeues it starts a new one. Clearing `owner_xid` is what stops the old
+    /// one: its next write is refused, and it waits for the new one's outcome. It can't simply be
+    /// refused here, because `PENDING` means *owned*, not *running*, and the row can't say whether
+    /// the owner is alive — a workflow left `PENDING` by a dead node is the case an operator most
+    /// wants to resume by hand.
     async fn resume_workflows(
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
@@ -869,10 +864,10 @@ pub trait SystemDatabase: Send + Sync {
     /// message.
     ///
     /// **Two concurrent receivers on one (workflow, topic) both wait**, and both are woken; the
-    /// consuming statement gives a message to one of them. The case that produces two is a
-    /// workflow handed to a new execution while the old one still waits, in this process or
-    /// another, and there `owner_xid` refuses the old one's consume, so the message is the new
-    /// owner's.
+    /// consuming statement gives a message to one of them. Two receives of one execution produce
+    /// two, and the one that missed out waits on to its deadline. So does a workflow handed to a
+    /// new execution while the old one still waits, in this process or another, and there
+    /// `owner_xid` refuses the old one's consume, so the message is the new owner's.
     ///
     /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
     /// raises a timeout error, in its engine rather than at this layer.

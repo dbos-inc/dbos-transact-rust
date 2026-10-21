@@ -33,7 +33,8 @@ use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    Applications, DatabaseTime, QueueRecord, WorkflowFilter, WorkflowRecord, WorkflowStatus,
+    Applications, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord,
+    WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
@@ -561,12 +562,14 @@ async fn dispatch_claimed(
     {
         Ok(rows) => rows,
         Err(error) => {
-            // The rows stay `PENDING` with this executor's id on them, which is what recovery is
-            // for. Nothing is lost; this tick is.
+            // The rows stay `PENDING` with this executor's id on them, and recovery re-enqueues
+            // them when this executor next launches; until then they count against the queue's
+            // concurrency. Nothing is lost; this tick is, and the rows wait for the restart.
             tracing::warn!(
                 error = %error,
                 claimed = claimed.len(),
-                "could not read the claimed workflows; they stay PENDING for recovery"
+                "could not read the claimed workflows; they stay PENDING until this executor \
+                 restarts"
             );
             return;
         }
@@ -583,23 +586,12 @@ async fn dispatch_claimed(
 
     // **A reading of the database's clock, for timing the claimed deadlines.** The claim set each
     // one on that clock, and a wait for it is measured from a reading of it rather than this
-    // host's wall clock. One per batch, and none for a batch with no deadline in it. Taken after
-    // the claim, so a wait measured from it ends late by the round trips between, never early.
+    // host's wall clock. One per batch, and none for a batch with no deadline in it, which times
+    // nothing. A wait measured from it ends late by the reading's return trip, never early.
     let clock = if rows.iter().any(|row| row.deadline.is_some()) {
-        match executor.sysdb().database_time().await {
-            Ok(clock) => Some(clock),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    claimed = claimed.len(),
-                    "could not read the database's clock; the claimed workflows stay PENDING for \
-                     recovery"
-                );
-                return;
-            }
-        }
+        timing_clock(executor.sysdb().database_time().await)
     } else {
-        None
+        local_clock()
     };
 
     // **Dispatched in claim order, not in the order the read came back.** The claim sorts its
@@ -628,7 +620,8 @@ async fn dispatch_claimed(
             tracing::warn!(
                 workflow_id,
                 error = %error,
-                "could not start the dequeued workflow; it stays PENDING for recovery"
+                "could not start the dequeued workflow; it stays PENDING until this executor \
+                 restarts"
             );
         }
     }
@@ -637,17 +630,17 @@ async fn dispatch_claimed(
 /// Submits one workflow from the row that describes it, if this executor still can and should.
 ///
 /// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
-/// describes — look the registration up by the row's own name, check the row is still the claim's,
-/// and spawn — and that is what this does. It takes the row rather than fetching it because the
-/// claim already read every row it took in one round trip, which is the shape Python's
-/// `start_dequeued_workflows` chose and the reason
-/// [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns ids.
+/// describes — look the registration up by the row's own name, check the row is still `PENDING`
+/// and still the claim's, and spawn — and that is what this does. It takes the row rather than
+/// fetching it because the claim already read every row it took in one round trip, which is the
+/// reason [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns
+/// ids.
 ///
 /// `owner_xid` is the claim's token. The execution presents it on every write, so if the row is
 /// handed to another execution between the claim and the run (a resume, a recovery), this one's
 /// first write is refused.
 ///
-/// **The registry is consulted before the row is claimed, and that is harmless rather than
+/// **The registry is consulted after the row is claimed, and that is harmless rather than
 /// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
 /// stamped `executor_id` before this is reached, so there is nothing for the order to save. What
 /// it does mean is that a row this process cannot run is never parked, however many attempts it
@@ -665,7 +658,7 @@ async fn dispatch(
     executor: &Arc<Executor>,
     row: WorkflowRecord,
     owner_xid: &str,
-    clock: Option<DatabaseTime>,
+    clock: DatabaseTime,
     slot: Option<Slot>,
 ) -> crate::Result<()> {
     let workflow_id = row.workflow_id;
@@ -696,53 +689,44 @@ async fn dispatch(
         return Ok(());
     }
 
-    // **Only a `PENDING` row can own its outcome.** A row that moved on since the claim
-    // (cancelled, resumed, or finished by another execution) would run for nothing, and a resumed
-    // one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`, so
-    // running it here while the next sweep claims it again is one workflow executing twice.
-    if row.status != WorkflowStatus::Pending {
-        tracing::warn!(
-            workflow_id,
-            status = %row.status,
-            "the dequeued workflow is no longer pending; it is not started"
-        );
-        return Ok(());
-    }
-
-    // **And only while this claim still owns it.** `PENDING` is not enough: between the claim and
-    // the read, the workflow can be resumed or re-enqueued and claimed again, by another executor
-    // or by this one, and is `PENDING` under that claim's token. Running it here would be refused
-    // at its first write, but only after its first step's body had run. Checked before parking
-    // too, so this never parks a workflow another claim is running. A hand-off after this read
-    // is still caught by the owner check at the first write.
-    if row.owner_xid.as_deref() != Some(owner_xid) {
-        tracing::debug!(
-            workflow_id,
-            "the dequeued workflow has been claimed again since; it is not started"
-        );
-        return Ok(());
-    }
-
-    // **Parked once it has been dispatched more often than allowed.** The claim counted this
-    // attempt; a workflow that keeps being recovered without finishing is crashing its executors,
-    // and running it again would crash another. The guard on the count leaves a row alone that a
-    // resume reset meanwhile.
-    if row.recovery_attempts > MAX_RECOVERY_ATTEMPTS + 1 {
-        match executor
-            .sysdb()
-            .dead_letter_workflows(&[&workflow_id], row.recovery_attempts)
-            .await
-        {
-            Ok(parked) if !parked.is_empty() => tracing::warn!(
+    match admission(
+        row.status,
+        row.owner_xid.as_deref() == Some(owner_xid),
+        row.recovery_attempts,
+    ) {
+        Admission::Run => {}
+        Admission::NotPending => {
+            tracing::warn!(
                 workflow_id,
-                attempts = row.recovery_attempts,
-                limit = MAX_RECOVERY_ATTEMPTS,
-                "the workflow exceeded its recovery attempts and is parked"
-            ),
-            Ok(_) => {}
-            Err(error) => return Err(Error::SystemDatabase(error)),
+                status = %row.status,
+                "the dequeued workflow is no longer pending; it is not started"
+            );
+            return Ok(());
         }
-        return Ok(());
+        Admission::ClaimedAgain => {
+            tracing::debug!(
+                workflow_id,
+                "the dequeued workflow has been claimed again since; it is not started"
+            );
+            return Ok(());
+        }
+        Admission::Park => {
+            match executor
+                .sysdb()
+                .dead_letter_workflows(&[&workflow_id], row.recovery_attempts)
+                .await
+            {
+                Ok(parked) if !parked.is_empty() => tracing::warn!(
+                    workflow_id,
+                    attempts = row.recovery_attempts,
+                    limit = MAX_RECOVERY_ATTEMPTS,
+                    "the workflow exceeded its recovery attempts and is parked"
+                ),
+                Ok(_) => {}
+                Err(error) => return Err(Error::SystemDatabase(error)),
+            }
+            return Ok(());
+        }
     }
 
     tracing::debug!(
@@ -764,7 +748,7 @@ async fn dispatch(
         row.input,
         // The row's own tag, which is how its input was written — by this SDK or another.
         row.serialization,
-        clock.and_then(|clock| crate::workflow::Deadline::of(row.deadline, clock)),
+        crate::workflow::Deadline::of(row.deadline, clock),
         slot,
     );
     Ok(())
@@ -828,6 +812,70 @@ fn jitter(interval: Duration) -> Duration {
 pub(crate) fn random_unit() -> f64 {
     let bits = uuid::Uuid::new_v4().as_u128() as u32;
     f64::from(bits) / f64::from(u32::MAX).next_up()
+}
+
+/// What a dispatch does with a claimed row, decided on the batch read's copy of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Started.
+    Run,
+    /// Left alone. **Only a `PENDING` row can own its outcome**: a row that moved on since the
+    /// claim (cancelled, resumed, or finished by another execution) would run for nothing, and a
+    /// resumed one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`,
+    /// so running it here while the next sweep claims it again is one workflow executing twice.
+    NotPending,
+    /// Left alone: `PENDING`, but no longer this claim's. Between the claim and the read the
+    /// workflow can be resumed or re-enqueued and claimed again, by another executor or by this
+    /// one, and is `PENDING` under that claim's token. Running it here would be refused at its
+    /// first write, but only after its first step's body had run. A hand-off after the read is
+    /// still caught by the owner check at the first write.
+    ClaimedAgain,
+    /// Parked, once it has been dispatched more often than allowed. The claim counted this
+    /// attempt; a workflow that keeps being recovered without finishing is crashing its
+    /// executors, and running it again would crash another. The park's guard on the count leaves
+    /// a row alone that a resume reset meanwhile.
+    Park,
+}
+
+/// The status first, so a row that is no longer `PENDING` is left as it is whatever its count; then
+/// the claim, so this never parks a workflow another claim is running. `owned` is whether the row's
+/// `owner_xid` is this claim's token.
+fn admission(status: WorkflowStatus, owned: bool, recovery_attempts: i64) -> Admission {
+    if status != WorkflowStatus::Pending {
+        Admission::NotPending
+    } else if !owned {
+        Admission::ClaimedAgain
+    } else if recovery_attempts > MAX_RECOVERY_ATTEMPTS + 1 {
+        Admission::Park
+    } else {
+        Admission::Run
+    }
+}
+
+/// The clock a batch's deadlines are timed from: the database's reading, or, if the read failed
+/// outright, this host's.
+///
+/// The fallback trades accuracy for progress. Skew between the two clocks moves the deadlines of
+/// this one batch, where holding the rows back instead would leave them `PENDING` under a live
+/// executor, counting against the queue's concurrency, until it next launched.
+///
+/// **A lost connection never reaches it.** The read is retried until the database answers, like
+/// every system-database call and like the batch read just before it, so an unreachable database
+/// holds the batch there rather than here. Nothing dispatched sooner would get further: its first
+/// checkpoint would wait on the same database.
+fn timing_clock(reading: Result<DatabaseTime, sysdb::Error>) -> DatabaseTime {
+    reading.unwrap_or_else(|error| {
+        tracing::warn!(
+            error = %error,
+            "could not read the database's clock; the claimed deadlines are timed from this host's"
+        );
+        local_clock()
+    })
+}
+
+/// A reading of this host's wall clock, in the shape a database reading takes.
+fn local_clock() -> DatabaseTime {
+    DatabaseTime::read(Timestamp::now().as_epoch_ms())
 }
 
 #[cfg(test)]
@@ -922,13 +970,19 @@ mod tests {
         };
         let owner = row().await.owner_xid.expect("a started row is owned");
 
-        dispatch(&executor, row().await, "an-earlier-claim", None, None)
-            .await
-            .unwrap();
+        dispatch(
+            &executor,
+            row().await,
+            "an-earlier-claim",
+            local_clock(),
+            None,
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 0, "a stale claim started it");
 
-        dispatch(&executor, row().await, &owner, None, None)
+        dispatch(&executor, row().await, &owner, local_clock(), None)
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -940,5 +994,64 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         dbos.shutdown().await;
+    }
+
+    /// A row that moved on since the claim, or that another claim has taken since, is not started,
+    /// and is not parked either, however many attempts it carries; a `PENDING` row still this
+    /// claim's runs up to the limit and is parked past it.
+    #[test]
+    fn a_claimed_row_runs_only_while_pending_and_within_its_attempts() {
+        let limit = MAX_RECOVERY_ATTEMPTS + 1;
+        for status in [
+            WorkflowStatus::Cancelled,
+            WorkflowStatus::Enqueued,
+            WorkflowStatus::Success,
+        ] {
+            for owned in [true, false] {
+                assert_eq!(
+                    admission(status, owned, 1),
+                    Admission::NotPending,
+                    "{status}"
+                );
+                assert_eq!(
+                    admission(status, owned, limit + 1),
+                    Admission::NotPending,
+                    "{status}"
+                );
+            }
+        }
+        assert_eq!(admission(WorkflowStatus::Pending, true, 1), Admission::Run);
+        assert_eq!(
+            admission(WorkflowStatus::Pending, true, limit),
+            Admission::Run
+        );
+        assert_eq!(
+            admission(WorkflowStatus::Pending, true, limit + 1),
+            Admission::Park
+        );
+        // Another claim's row is left to it, never parked here, however many attempts it carries.
+        for attempts in [1, limit + 1] {
+            assert_eq!(
+                admission(WorkflowStatus::Pending, false, attempts),
+                Admission::ClaimedAgain
+            );
+        }
+    }
+
+    /// A failed read of the database's clock times the batch from this host's instead, so its
+    /// deadlines still run out rather than holding the rows back.
+    #[test]
+    fn a_failed_clock_read_times_from_this_host() {
+        let in_a_minute = Timestamp::from_epoch_ms(Timestamp::now().as_epoch_ms() + 60_000);
+        let expires =
+            timing_clock(Err(sysdb::Error::Malformed("no clock".to_owned()))).reaches(in_a_minute);
+        let left = expires.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            (Duration::from_secs(58)..=Duration::from_secs(60)).contains(&left),
+            "{left:?}"
+        );
+
+        let read = DatabaseTime::read(0);
+        assert_eq!(timing_clock(Ok(read)), read, "a reading is used as it is");
     }
 }

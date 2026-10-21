@@ -167,10 +167,9 @@ pub struct ClientConfig {
     /// CockroachDB has no LISTEN/NOTIFY, so there the client polls whatever this says.
     pub use_listen_notify: bool,
 
-    /// How many polling reads may run at once.
-    ///
-    /// `None` is half the pool and at least one; `Some(0)` switches the cap off.
-    pub polling_concurrency: Option<u32>,
+    /// How many polling reads may run at once: half the pool by default; see
+    /// [`PollingConcurrency`](crate::PollingConcurrency).
+    pub polling_concurrency: crate::PollingConcurrency,
 
     /// How often a caller waiting on a workflow asks whether it has finished.
     ///
@@ -188,13 +187,8 @@ pub struct ClientConfig {
     /// How long a system-database connection may sit idle inside an open transaction before the
     /// server ends its session.
     ///
-    /// `None` is sixty seconds; `Some(Duration::ZERO)`, or anything under a millisecond, leaves the
-    /// server's own setting, as does a database URL that already sets
-    /// `idle_in_transaction_session_timeout`. The server takes at most `i32::MAX` milliseconds,
-    /// about 24.8 days, and longer is refused. Every write a workflow
-    /// makes locks the workflow's row until it commits, so a process that stalls mid-transaction
-    /// would otherwise hold that row for as long as the stall lasts.
-    pub idle_transaction_timeout: Option<Duration>,
+    /// Sixty seconds by default; see [`IdleTransactionTimeout`](crate::IdleTransactionTimeout).
+    pub idle_transaction_timeout: crate::IdleTransactionTimeout,
 }
 
 impl ClientConfig {
@@ -211,10 +205,10 @@ impl ClientConfig {
             schema: DEFAULT_SCHEMA.to_owned(),
             serializer: Serializer::default(),
             use_listen_notify: false,
-            polling_concurrency: None,
+            polling_concurrency: crate::PollingConcurrency::Default,
             outcome_poll_interval: None,
             notification_coalesce: None,
-            idle_transaction_timeout: None,
+            idle_transaction_timeout: crate::IdleTransactionTimeout::Default,
         }
     }
 
@@ -275,15 +269,9 @@ impl ClientConfig {
                 "`outcome_poll_interval` cannot be zero".to_owned(),
             ));
         }
-        if self
-            .idle_transaction_timeout
-            .is_some_and(|timeout| timeout > crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT)
-        {
-            return Err(crate::Error::Config(format!(
-                "`idle_transaction_timeout` must be at most {:?}",
-                crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT
-            )));
-        }
+        self.idle_transaction_timeout
+            .validate()
+            .map_err(|error| crate::Error::Config(error.to_string()))?;
         Ok(())
     }
 

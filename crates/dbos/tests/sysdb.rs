@@ -5,10 +5,10 @@ use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, EncodedValue,
     Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue,
-    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
-    RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus,
-    ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus, WrittenBy,
+    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
+    WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -816,7 +816,7 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -887,7 +887,7 @@ async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -927,7 +927,7 @@ async fn an_await_reports_a_cancelled_workflow_as_cancelled() {
     sys.init_workflow(&workflow("wf-doomed"), None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-doomed"], false, None)
+    sys.cancel_workflows(&["wf-doomed"], false, None, None)
         .await
         .unwrap();
 
@@ -1709,7 +1709,7 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
     sys.init_workflow(&wf, None).await.unwrap();
 
     let cancelled = sys
-        .cancel_workflows(&["wf-cancel"], false, None)
+        .cancel_workflows(&["wf-cancel"], false, None, None)
         .await
         .unwrap();
     assert_eq!(cancelled, ["wf-cancel"]);
@@ -1757,7 +1757,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
         .unwrap();
 
     let first = sys
-        .cancel_workflows(&["wf-twice-cancelled"], false, None)
+        .cancel_workflows(&["wf-twice-cancelled"], false, None, None)
         .await
         .unwrap();
     assert_eq!(first, ["wf-twice-cancelled"]);
@@ -1768,7 +1768,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
         .unwrap();
 
     let second = sys
-        .cancel_workflows(&["wf-twice-cancelled"], false, None)
+        .cancel_workflows(&["wf-twice-cancelled"], false, None, None)
         .await
         .unwrap();
     assert!(
@@ -1799,7 +1799,7 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
         .unwrap();
 
     let cancelled = sys
-        .cancel_workflows(&["wf-done"], false, None)
+        .cancel_workflows(&["wf-done"], false, None, None)
         .await
         .unwrap();
     assert!(
@@ -1840,7 +1840,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     }
 
     let mut cancelled = sys
-        .cancel_workflows(&["wf-root"], true, None)
+        .cancel_workflows(&["wf-root"], true, None, None)
         .await
         .unwrap();
     cancelled.sort();
@@ -1870,7 +1870,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     .await
     .unwrap();
     let shallow = sys
-        .cancel_workflows(&["wf-root2"], false, None)
+        .cancel_workflows(&["wf-root2"], false, None, None)
         .await
         .unwrap();
     assert_eq!(shallow, ["wf-root2"]);
@@ -1895,7 +1895,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     .unwrap();
 
     let resumed = sys
-        .resume_workflows(&["wf-resume"], None, None)
+        .resume_workflows(&["wf-resume"], None, None, None)
         .await
         .unwrap();
     assert_eq!(resumed, ["wf-resume"]);
@@ -1918,7 +1918,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     sys.init_workflow(&workflow("wf-resume2"), None)
         .await
         .unwrap();
-    sys.resume_workflows(&["wf-resume2"], Some("orders"), None)
+    sys.resume_workflows(&["wf-resume2"], Some("orders"), None, None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-resume2").await.unwrap().unwrap();
@@ -1935,7 +1935,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     sys.init_workflow(&workflow("wf-real"), None).await.unwrap();
 
     match sys
-        .resume_workflows(&["wf-real", "wf-ghost"], None, None)
+        .resume_workflows(&["wf-real", "wf-ghost"], None, None, None)
         .await
     {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
@@ -1951,7 +1951,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     );
 
     let cancelled = sys
-        .cancel_workflows(&["wf-ghost"], false, None)
+        .cancel_workflows(&["wf-ghost"], false, None, None)
         .await
         .expect("cancelling a missing workflow is a no-op, not an error");
     assert!(cancelled.is_empty());
@@ -2212,7 +2212,7 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
     sys.init_workflow(&workflow("wf-stopped"), None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-stopped"], false, None)
+    sys.cancel_workflows(&["wf-stopped"], false, None, None)
         .await
         .unwrap();
 
@@ -4034,7 +4034,7 @@ async fn a_recovered_read_resumes_the_original_deadline() {
 async fn a_cancelled_reader_stops_rather_than_waiting() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.cancel_workflows(&["wf-reader"], false, None)
+    sys.cancel_workflows(&["wf-reader"], false, None, None)
         .await
         .unwrap();
 
@@ -4073,7 +4073,7 @@ async fn a_capped_read_does_not_hold_its_permit_across_the_wait() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -4406,9 +4406,9 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
     );
 }
 
-/// **Two receivers on one (workflow, topic) in one process both wait**, and one message goes to
-/// one of them: the other times out with nothing. The case that produces two is a workflow handed
-/// to a new execution while the old one waits, where the old one's consume is refused anyway.
+/// **Two receives on one (workflow, topic) in one process both wait**, and one message goes to
+/// one of them: the other times out with nothing. These are two receives of one execution, at
+/// different steps, as a receive joined with another would be; both are woken by the one send.
 #[tokio::test]
 async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
@@ -4445,6 +4445,12 @@ async fn two_receivers_in_one_process_share_one_message() {
         answers.iter().filter(|answer| answer.is_some()).count(),
         1,
         "one message, one receiver: {answers:?}"
+    );
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "{notifications:?}"
     );
 }
 
@@ -4550,7 +4556,7 @@ async fn a_cancelled_receiver_stops_rather_than_waiting() {
     sys.init_workflow(&workflow("wf-receiver"), None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-receiver"], false, None)
+    sys.cancel_workflows(&["wf-receiver"], false, None, None)
         .await
         .unwrap();
 
@@ -4601,7 +4607,7 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -5358,7 +5364,7 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
 
     let caller = Some(support::step_caller("wf-operator", 0));
     let first = sys
-        .cancel_workflows(&["wf-target"], false, caller)
+        .cancel_workflows(&["wf-target"], false, None, caller)
         .await
         .unwrap();
     assert_eq!(first, ["wf-target"]);
@@ -5377,19 +5383,173 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
 
     // Without the checkpoint this returns nothing: the row is already terminal.
     let fresh = sys
-        .cancel_workflows(&["wf-target"], false, None)
+        .cancel_workflows(&["wf-target"], false, None, None)
         .await
         .unwrap();
     assert!(fresh.is_empty(), "a second cancel moved something");
 
     let replayed = sys
-        .cancel_workflows(&["wf-target"], false, caller)
+        .cancel_workflows(&["wf-target"], false, None, caller)
         .await
         .unwrap();
     assert_eq!(
         replayed, first,
         "the replay cancelled again instead of replaying its checkpoint"
     );
+}
+
+/// **`from_workflow` refuses only the calling workflow's own line**: itself, and with the cascade,
+/// an ancestor whose tree it is inside. Its descendants, a sibling's tree and its parent on its own
+/// are fair targets, and `None` checks nothing, as for a client.
+///
+/// Every refusal is asserted before any allowed call moves a row, and the refused calls each name
+/// a bystander still `PENDING`, so a refusal that came after the work would show as a moved row.
+#[tokio::test]
+async fn from_workflow_refuses_only_the_callers_own_line() {
+    let (sys, _db) = sysdb().await;
+    // wf-top ── wf-mid ── wf-low
+    //       └── wf-side
+    for (id, parent) in [
+        ("wf-top", None),
+        ("wf-mid", Some(("wf-top", 0))),
+        ("wf-low", Some(("wf-mid", 0))),
+        ("wf-side", Some(("wf-top", 1))),
+        ("wf-loner", None),
+    ] {
+        let caller = parent.map(|(parent_workflow_id, step_id)| InitWorkflowCaller {
+            parent_workflow_id,
+            step_id,
+            step_name: "spawn",
+            started_at: Timestamp::now(),
+            owner_xid: None,
+        });
+        sys.init_workflow(&NewWorkflow::new(id), caller)
+            .await
+            .unwrap();
+    }
+    let refused = |result: Result<Vec<String>, Error>, what: &str| match result {
+        Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "workflow_ids", "{what}"),
+        other => panic!("{what} was not refused: {other:?}"),
+    };
+    let status = |id: &'static str| {
+        let sys = &sys;
+        async move { sys.get_workflow(id).await.unwrap().unwrap().status }
+    };
+
+    refused(
+        sys.cancel_workflows(&["wf-top"], true, Some("wf-low"), None)
+            .await,
+        "a cascade through the grandparent",
+    );
+    refused(
+        sys.cancel_workflows(&["wf-loner", "wf-low"], false, Some("wf-low"), None)
+            .await,
+        "a cancel of itself among others",
+    );
+    refused(
+        sys.resume_workflows(&["wf-loner", "wf-low"], None, Some("wf-low"), None)
+            .await,
+        "a resume of itself among others",
+    );
+    for id in ["wf-top", "wf-mid", "wf-low", "wf-side", "wf-loner"] {
+        assert_eq!(status(id).await, WorkflowStatus::Pending, "{id} moved");
+    }
+
+    let allowed = |result: Result<Vec<String>, Error>, what: &str| {
+        let mut ids = result.unwrap_or_else(|error| panic!("{what} was refused: {error}"));
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-side"], true, Some("wf-mid"), None)
+                .await,
+            "a cascade over a sibling's tree",
+        ),
+        ["wf-side"],
+    );
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-low"], true, Some("wf-mid"), None)
+                .await,
+            "a cascade over its own descendants",
+        ),
+        ["wf-low"],
+    );
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-top"], false, Some("wf-mid"), None)
+                .await,
+            "a cancel of its parent alone",
+        ),
+        ["wf-top"],
+    );
+    assert_eq!(
+        allowed(
+            sys.cancel_workflows(&["wf-mid"], false, None, None).await,
+            "a cancel of itself with no from_workflow",
+        ),
+        ["wf-mid"],
+    );
+}
+
+/// **A cascade over a cycle still finds the caller inside it and still ends**, though a
+/// well-formed tree has no cycle, and a recorded call with nothing to target is still recorded.
+#[tokio::test]
+async fn from_workflow_survives_cycles_and_empty_targets() {
+    let (sys, db) = sysdb().await;
+    for id in ["wf-a", "wf-b", "wf-operator"] {
+        sys.init_workflow(&workflow(id), None).await.unwrap();
+    }
+    // Two rows naming each other, which the schema does not prevent.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status"
+           SET parent_workflow_id = CASE workflow_uuid WHEN 'wf-a' THEN 'wf-b' ELSE 'wf-a' END
+           WHERE workflow_uuid IN ('wf-a', 'wf-b')"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    let within = |from| {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sys.cancel_workflows(&["wf-a"], true, Some(from), None),
+        )
+    };
+    match within("wf-b")
+        .await
+        .expect("the walk did not end on a cycle")
+    {
+        Err(Error::InvalidInput { detail, .. }) => {
+            assert!(
+                detail.contains("cannot cancel the tree of wf-a"),
+                "{detail}"
+            )
+        }
+        other => panic!("the cascade over its own cycle was not refused: {other:?}"),
+    }
+    for id in ["wf-a", "wf-b"] {
+        let row = sys.get_workflow(id).await.unwrap().unwrap();
+        assert_eq!(row.status, WorkflowStatus::Pending, "{id} moved");
+    }
+    let mut cancelled = within("wf-operator")
+        .await
+        .expect("the cascade did not end on a cycle")
+        .unwrap();
+    cancelled.sort();
+    assert_eq!(cancelled, ["wf-a", "wf-b"]);
+
+    let caller = Some(support::step_caller("wf-operator", 0));
+    let nothing = sys
+        .cancel_workflows(&[], true, Some("wf-operator"), caller)
+        .await
+        .unwrap();
+    assert!(nothing.is_empty());
+    let steps = sys
+        .list_workflow_steps("wf-operator", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "the empty call was not recorded: {steps:?}");
 }
 
 /// **A read is checkpointed too, so a replay sees the rows the first execution saw.**
@@ -7080,7 +7240,7 @@ async fn capped_stream_reads_do_not_block_each_other() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -11731,7 +11891,7 @@ async fn a_refused_outcome_writes_no_payload() {
     sys.init_workflow(&workflow("wf-cancelled"), None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-cancelled"], false, None)
+    sys.cancel_workflows(&["wf-cancelled"], false, None, None)
         .await
         .unwrap();
 
@@ -12109,7 +12269,7 @@ async fn the_owner_token_follows_claims_and_is_cleared_by_every_hand_off() {
         WorkflowStatus::Pending
     );
 
-    sys.resume_workflows(&["wf-token"], Some("owned"), None)
+    sys.resume_workflows(&["wf-token"], Some("owned"), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -12136,7 +12296,7 @@ async fn the_owner_token_follows_claims_and_is_cleared_by_every_hand_off() {
     sys.init_workflow(&workflow("wf-token-cancel"), None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-token-cancel"], false, None)
+    sys.cancel_workflows(&["wf-token-cancel"], false, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -12316,6 +12476,7 @@ async fn a_stale_execution_writes_nothing() {
         sys.cancel_workflows(
             &["wf-bystander"],
             false,
+            Some(id),
             Some(dbos::sysdb::types::StepCaller {
                 owner_xid: stale,
                 ..support::step_caller(id, 11)
@@ -12470,7 +12631,7 @@ async fn a_hand_off_waits_for_an_owner_checked_write_to_commit() {
     .await
     .unwrap();
 
-    let cancel = sys.cancel_workflows(&["wf-locked"], false, None);
+    let cancel = sys.cancel_workflows(&["wf-locked"], false, None, None);
     let mut cancel = std::pin::pin!(cancel);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), &mut cancel)
