@@ -839,7 +839,7 @@ fn refuse_self_target(caller_id: &str, targets: &[&str], action: &str) -> Result
 }
 
 impl PostgresSystemDatabase {
-    /// Which of `roots` has `caller_id` in its tree, for a cascade that has just reached the caller.
+    /// Which of `roots` has `caller_id` in its tree, for a cascade that has just reached it.
     ///
     /// Read only to name the tree in the refusal: up the caller's ancestry, which is short, and
     /// only once the cascade has found it, so a cancel that is not refused pays nothing for it.
