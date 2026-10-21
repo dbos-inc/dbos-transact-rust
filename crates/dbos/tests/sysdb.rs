@@ -958,7 +958,7 @@ async fn an_await_reports_a_cancelled_workflow_as_cancelled() {
     sys.init_workflow(&workflow("wf-doomed"), None, Submission::Fresh, None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-doomed"], false, None)
+    sys.cancel_workflows(&["wf-doomed"], false, None, None)
         .await
         .unwrap();
 
@@ -1749,7 +1749,7 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
         .unwrap();
 
     let cancelled = sys
-        .cancel_workflows(&["wf-cancel"], false, None)
+        .cancel_workflows(&["wf-cancel"], false, None, None)
         .await
         .unwrap();
     assert_eq!(cancelled, ["wf-cancel"]);
@@ -1802,7 +1802,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
     .unwrap();
 
     let first = sys
-        .cancel_workflows(&["wf-twice-cancelled"], false, None)
+        .cancel_workflows(&["wf-twice-cancelled"], false, None, None)
         .await
         .unwrap();
     assert_eq!(first, ["wf-twice-cancelled"]);
@@ -1813,7 +1813,7 @@ async fn cancelling_twice_does_not_move_the_cancellation() {
         .unwrap();
 
     let second = sys
-        .cancel_workflows(&["wf-twice-cancelled"], false, None)
+        .cancel_workflows(&["wf-twice-cancelled"], false, None, None)
         .await
         .unwrap();
     assert!(
@@ -1846,7 +1846,7 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
         .unwrap();
 
     let cancelled = sys
-        .cancel_workflows(&["wf-done"], false, None)
+        .cancel_workflows(&["wf-done"], false, None, None)
         .await
         .unwrap();
     assert!(
@@ -1886,7 +1886,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     }
 
     let mut cancelled = sys
-        .cancel_workflows(&["wf-root"], true, None)
+        .cancel_workflows(&["wf-root"], true, None, None)
         .await
         .unwrap();
     cancelled.sort();
@@ -1917,7 +1917,7 @@ async fn cancelling_children_descends_the_whole_tree() {
     .await
     .unwrap();
     let shallow = sys
-        .cancel_workflows(&["wf-root2"], false, None)
+        .cancel_workflows(&["wf-root2"], false, None, None)
         .await
         .unwrap();
     assert_eq!(shallow, ["wf-root2"]);
@@ -1939,7 +1939,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     }
 
     let resumed = sys
-        .resume_workflows(&["wf-resume"], None, None)
+        .resume_workflows(&["wf-resume"], None, None, None)
         .await
         .unwrap();
     assert_eq!(resumed, ["wf-resume"]);
@@ -1962,7 +1962,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
     sys.init_workflow(&workflow("wf-resume2"), None, Submission::Fresh, None)
         .await
         .unwrap();
-    sys.resume_workflows(&["wf-resume2"], Some("orders"), None)
+    sys.resume_workflows(&["wf-resume2"], Some("orders"), None, None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-resume2").await.unwrap().unwrap();
@@ -1981,7 +1981,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
         .unwrap();
 
     match sys
-        .resume_workflows(&["wf-real", "wf-ghost"], None, None)
+        .resume_workflows(&["wf-real", "wf-ghost"], None, None, None)
         .await
     {
         Err(Error::NonExistentWorkflow { workflow_ids }) => {
@@ -1997,7 +1997,7 @@ async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
     );
 
     let cancelled = sys
-        .cancel_workflows(&["wf-ghost"], false, None)
+        .cancel_workflows(&["wf-ghost"], false, None, None)
         .await
         .expect("cancelling a missing workflow is a no-op, not an error");
     assert!(cancelled.is_empty());
@@ -2250,7 +2250,7 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
     sys.init_workflow(&workflow("wf-stopped"), None, Submission::Fresh, None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-stopped"], false, None)
+    sys.cancel_workflows(&["wf-stopped"], false, None, None)
         .await
         .unwrap();
 
@@ -4114,7 +4114,7 @@ async fn a_recovered_read_resumes_the_original_deadline() {
 async fn a_cancelled_reader_stops_rather_than_waiting() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
-    sys.cancel_workflows(&["wf-reader"], false, None)
+    sys.cancel_workflows(&["wf-reader"], false, None, None)
         .await
         .unwrap();
 
@@ -4692,7 +4692,7 @@ async fn a_cancelled_receiver_stops_rather_than_waiting() {
     sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh, None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-receiver"], false, None)
+    sys.cancel_workflows(&["wf-receiver"], false, None, None)
         .await
         .unwrap();
 
@@ -5480,7 +5480,7 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
 
     let caller = Some(support::step_caller("wf-operator", 0));
     let first = sys
-        .cancel_workflows(&["wf-target"], false, caller)
+        .cancel_workflows(&["wf-target"], false, None, caller)
         .await
         .unwrap();
     assert_eq!(first, ["wf-target"]);
@@ -5499,13 +5499,13 @@ async fn a_cancel_records_its_step_and_replays_from_it() {
 
     // Without the checkpoint this returns nothing: the row is already terminal.
     let fresh = sys
-        .cancel_workflows(&["wf-target"], false, None)
+        .cancel_workflows(&["wf-target"], false, None, None)
         .await
         .unwrap();
     assert!(fresh.is_empty(), "a second cancel moved something");
 
     let replayed = sys
-        .cancel_workflows(&["wf-target"], false, caller)
+        .cancel_workflows(&["wf-target"], false, None, caller)
         .await
         .unwrap();
     assert_eq!(
@@ -11853,7 +11853,7 @@ async fn a_refused_outcome_writes_no_payload() {
     sys.init_workflow(&workflow("wf-cancelled"), None, Submission::Fresh, None)
         .await
         .unwrap();
-    sys.cancel_workflows(&["wf-cancelled"], false, None)
+    sys.cancel_workflows(&["wf-cancelled"], false, None, None)
         .await
         .unwrap();
 

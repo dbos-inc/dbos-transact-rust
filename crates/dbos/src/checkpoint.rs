@@ -742,6 +742,15 @@ impl StepPlacement {
         !matches!(self, Self::Outside)
     }
 
+    /// The workflow making this call, recorded or not: `Some` inside a step body too, where
+    /// [`step`](Self::step) is `None`. `None` outside a workflow and through a client.
+    pub(crate) fn workflow_id(&self) -> Option<&str> {
+        match self {
+            Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Some(ctx.workflow_id()),
+            Self::Outside | Self::ClientConnection => None,
+        }
+    }
+
     /// The workflow and step id this call is recorded under, if it is recorded at all.
     pub(crate) fn step(&self) -> Option<(&str, i32)> {
         match self {

@@ -826,9 +826,10 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
 }
 
 impl PostgresSystemDatabase {
-    /// [`refuse_self_target`](SystemDatabase::refuse_self_target), on a connection of the caller's:
-    /// for a recorded caller, the transaction that records the call, so the refusal is recorded
-    /// with it and a replay raises it again from the checkpoint rather than deciding it afresh.
+    /// Refuses a cancel or a resume `caller_id` makes of itself, directly or, with `children`,
+    /// through an ancestor whose tree it is inside: the `from_workflow` check of
+    /// [`cancel_workflows`](SystemDatabase::cancel_workflows), on the transaction that records the
+    /// call.
     async fn refuse_self_target_on(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -4147,29 +4148,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn refuse_self_target(
-        &self,
-        caller_id: &str,
-        targets: &[&str],
-        children: bool,
-        action: &str,
-    ) -> Result<(), Error> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-        let pool = &self.pool;
-        with_retry(&self.retry, "refuse_self_target", move || async move {
-            let mut conn = pool.acquire().await?;
-            self.refuse_self_target_on(&mut conn, caller_id, targets, children, action)
-                .await
-        })
-        .await
-    }
-
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // An empty batch still has to reach `run_transactional_step` when there is a caller: the
@@ -4195,10 +4178,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::CANCEL_WORKFLOW,
                 started_at,
                 |mut tx| async move {
-                    if let Some(caller) = caller {
+                    if let Some(caller_id) = from_workflow {
                         self.refuse_self_target_on(
                             &mut tx,
-                            caller.workflow_id,
+                            caller_id,
                             workflow_ids,
                             cancel_children,
                             "cancel",
@@ -4256,6 +4239,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error> {
         // Empty and uncheckpointed, so there is nothing to record and nothing to run: see
@@ -4273,10 +4257,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::RESUME_WORKFLOW,
                 started_at,
                 |mut tx| async move {
-                    if let Some(caller) = caller {
+                    if let Some(caller_id) = from_workflow {
                         self.refuse_self_target_on(
                             &mut tx,
-                            caller.workflow_id,
+                            caller_id,
                             workflow_ids,
                             false,
                             "resume",

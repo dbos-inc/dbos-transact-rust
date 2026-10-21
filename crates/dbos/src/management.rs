@@ -420,11 +420,14 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "cancel")
-                    .await?;
                 executor
                     .connection()
-                    .cancel_all(&[workflow_id], Children::Skip, placement.step())
+                    .cancel_all(
+                        &[workflow_id],
+                        Children::Skip,
+                        placement.workflow_id(),
+                        placement.step(),
+                    )
                     .await?;
                 Ok(())
             },
@@ -459,17 +462,14 @@ impl DBOS {
             step_names::CANCEL_WORKFLOW,
             self.placed("cancel a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(
-                    &executor,
-                    &placement,
-                    workflow_ids,
-                    children == Children::Include,
-                    "cancel",
-                )
-                .await?;
                 executor
                     .connection()
-                    .cancel_all(workflow_ids, children, placement.step())
+                    .cancel_all(
+                        workflow_ids,
+                        children,
+                        placement.workflow_id(),
+                        placement.step(),
+                    )
                     .await
             },
         )
@@ -547,11 +547,14 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(&executor, &placement, &[workflow_id], false, "resume")
-                    .await?;
                 executor
                     .connection()
-                    .resume_all(&[workflow_id], options, placement.step())
+                    .resume_all(
+                        &[workflow_id],
+                        options,
+                        placement.workflow_id(),
+                        placement.step(),
+                    )
                     .await?
                     .pop()
                     .ok_or_else(|| {
@@ -583,11 +586,14 @@ impl DBOS {
             step_names::RESUME_WORKFLOW,
             self.placed("resume a workflow"),
             move |executor, placement| async move {
-                refuse_self_target_in_step(&executor, &placement, workflow_ids, false, "resume")
-                    .await?;
                 executor
                     .connection()
-                    .resume_all(workflow_ids, options, placement.step())
+                    .resume_all(
+                        workflow_ids,
+                        options,
+                        placement.workflow_id(),
+                        placement.step(),
+                    )
                     .await
             },
         )
@@ -1123,7 +1129,7 @@ impl crate::Client {
         children: Children,
     ) -> Result<Vec<String>> {
         self.connection()
-            .cancel_all(workflow_ids, children, None)
+            .cancel_all(workflow_ids, children, None, None)
             .await
     }
 
@@ -1154,7 +1160,7 @@ impl crate::Client {
         options: ResumeOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         self.connection()
-            .resume_all(workflow_ids, options, None)
+            .resume_all(workflow_ids, options, None, None)
             .await
     }
 
@@ -1349,29 +1355,6 @@ impl crate::Client {
     }
 }
 
-/// Refuses a cancel or a resume of the workflow whose step body is making it.
-///
-/// A call from inside a step body records nothing and carries no caller, so the system database
-/// can't see whose workflow it is in; this asks it with the step's own workflow instead. See
-/// [`refuse_self_target`](crate::sysdb::SystemDatabase::refuse_self_target) for why. A recorded
-/// call is refused by the system database itself.
-async fn refuse_self_target_in_step(
-    executor: &Executor,
-    placement: &StepPlacement,
-    targets: &[&str],
-    children: bool,
-    action: &str,
-) -> Result<()> {
-    if let StepPlacement::InsideStep { ctx } = placement {
-        executor
-            .sysdb()
-            .refuse_self_target(ctx.workflow_id(), targets, children, action)
-            .await
-            .map_err(Error::from_sysdb)?;
-    }
-    Ok(())
-}
-
 /// The operator surface, on the connection every caller reaches it through.
 ///
 /// Each method here is the whole operation — the system-database call, its logging, and the handles
@@ -1387,6 +1370,7 @@ impl Connection {
         &self,
         workflow_ids: &[&str],
         children: Children,
+        from_workflow: Option<&str>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<String>> {
         let cancelled = self
@@ -1394,6 +1378,7 @@ impl Connection {
             .cancel_workflows(
                 workflow_ids,
                 children == Children::Include,
+                from_workflow,
                 self.step_caller(caller),
             )
             .await
@@ -1412,11 +1397,17 @@ impl Connection {
         self: &Arc<Self>,
         workflow_ids: &[&str],
         options: ResumeOptions<'_>,
+        from_workflow: Option<&str>,
         caller: Option<(&str, i32)>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
         let resumed = self
             .sysdb()
-            .resume_workflows(workflow_ids, options.queue, self.step_caller(caller))
+            .resume_workflows(
+                workflow_ids,
+                options.queue,
+                from_workflow,
+                self.step_caller(caller),
+            )
             .await
             .map_err(Error::from_sysdb)?;
         // What moved, not what was asked for: an id that had already finished is not

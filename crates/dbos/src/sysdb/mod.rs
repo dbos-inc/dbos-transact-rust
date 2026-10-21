@@ -494,29 +494,6 @@ pub trait SystemDatabase: Send + Sync {
     /// expiry on the same clock.
     async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
 
-    /// Refuses a cancel or a resume a workflow makes of itself, directly or, with `children`,
-    /// through an ancestor whose tree it is inside.
-    ///
-    /// A resume would re-enqueue the workflow underneath its own execution, so the claim that
-    /// dequeues it starts a second execution beside the first. A workflow that wants to stop
-    /// returns or fails instead. Refused before anything runs, as a delete of itself is, so the
-    /// caller hears why and can go on.
-    ///
-    /// [`cancel_workflows`](Self::cancel_workflows) and
-    /// [`resume_workflows`](Self::resume_workflows) make this check themselves for a recorded
-    /// caller, in the transaction that records the call: the refusal is the call's recorded
-    /// answer, so a replay raises it again rather than deciding it afresh. The engine calls this
-    /// directly for a cancel or a resume made inside a step body, which records nothing and so
-    /// passes no caller. A call through a [`Client`](crate::Client) passes no caller either and is
-    /// not checked: a client is outside every workflow, even one made inside a workflow's code.
-    async fn refuse_self_target(
-        &self,
-        caller_id: &str,
-        targets: &[&str],
-        children: bool,
-        action: &str,
-    ) -> Result<(), Error>;
-
     /// Cancels workflows, returning the ids that actually moved.
     ///
     /// A workflow that has already finished is left alone rather than reported as an error —
@@ -542,6 +519,16 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
+    /// **`from_workflow` is the workflow making the call, which may not target itself**: named
+    /// directly, or, with `cancel_children`, through an ancestor whose tree it is inside. Either is
+    /// [`Error::InvalidInput`] and nothing moves. A workflow that wants to stop returns or fails
+    /// instead. It is the caller's workflow whenever `caller` is given, and also for a call made
+    /// inside a step body, which records nothing and so has no `caller`. The check runs in the
+    /// transaction that records the call, so a recorded refusal is the call's answer and a replay
+    /// raises it again rather than deciding it afresh. A [`Client`](crate::Client) passes `None`
+    /// and is not checked: a client is outside every workflow, even one made inside a workflow's
+    /// code.
+    ///
     /// **The cascade is one transaction, which buys atomicity and not exclusion.** A failure
     /// partway through leaves the tree untouched rather than half-cancelled — that is the part it
     /// buys. It does not stop a child being spawned behind the walk: at READ COMMITTED these
@@ -563,6 +550,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         cancel_children: bool,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 
@@ -583,6 +571,11 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
+    /// `from_workflow` may not be among `workflow_ids`, as in
+    /// [`cancel_workflows`](Self::cancel_workflows): a resume would re-enqueue the workflow
+    /// underneath its own execution, so the claim that dequeues it starts a second execution beside
+    /// the first.
+    ///
     /// TODO(dbos-team): UPSTREAM item 27. The only guard is that the row is not terminal, which is
     /// the predicate all five share — so `PENDING` passes, and resuming a workflow that is
     /// executing right now re-enqueues it underneath its own execution. The next sweep claims the
@@ -595,6 +588,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         workflow_ids: &[&str],
         queue_name: Option<&str>,
+        from_workflow: Option<&str>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<Vec<String>, Error>;
 

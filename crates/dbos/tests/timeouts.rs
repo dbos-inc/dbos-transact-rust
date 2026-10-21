@@ -272,7 +272,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
 
     let reader = reader(&db).await;
     reader
-        .cancel_workflows(&[id], false, None)
+        .cancel_workflows(&[id], false, None, None)
         .await
         .expect("cancel failed");
 
