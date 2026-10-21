@@ -825,29 +825,32 @@ fn replayed_output<T: serde::de::DeserializeOwned>(
     decode_step_value(step, recorded, caller, step_name, "an output")
 }
 
+/// Refuses a cancel or a resume `caller_id` makes of itself by name: the `from_workflow` check of
+/// [`cancel_workflows`](SystemDatabase::cancel_workflows), before anything runs. A cascade's
+/// reach into the caller's own tree is the cascade's to find, as it walks.
+fn refuse_self_target(caller_id: &str, targets: &[&str], action: &str) -> Result<(), Error> {
+    if targets.contains(&caller_id) {
+        return Err(Error::InvalidInput {
+            field: "workflow_ids".into(),
+            detail: format!("workflow {caller_id} cannot {action} itself"),
+        });
+    }
+    Ok(())
+}
+
 impl PostgresSystemDatabase {
-    /// Refuses a cancel or a resume `caller_id` makes of itself, directly or, with `children`,
-    /// through an ancestor whose tree it is inside: the `from_workflow` check of
-    /// [`cancel_workflows`](SystemDatabase::cancel_workflows), on the transaction that records the
-    /// call.
-    async fn refuse_self_target_on(
+    /// Which of `roots` has `caller_id` in its tree, for a cascade that has just reached the caller.
+    ///
+    /// Read only to name the tree in the refusal: up the caller's ancestry, which is short, and
+    /// only once the cascade has found it, so a cancel that is not refused pays nothing for it.
+    /// Falls back to every root should the walk not arrive at one, which `parent_workflow_id`, set
+    /// once at insert, does not allow.
+    async fn root_containing(
         &self,
         conn: &mut sqlx::PgConnection,
         caller_id: &str,
-        targets: &[&str],
-        children: bool,
-        action: &str,
-    ) -> Result<(), Error> {
-        if targets.contains(&caller_id) {
-            return Err(Error::InvalidInput {
-                field: "workflow_ids".into(),
-                detail: format!("workflow {caller_id} cannot {action} itself"),
-            });
-        }
-        if !children || targets.is_empty() {
-            return Ok(());
-        }
-        // Up the caller's ancestry, which is short, rather than down every target's tree.
+        roots: &[&str],
+    ) -> Result<String, Error> {
         let workflow_table = self.tables.workflow_status.as_str();
         let mut seen = std::collections::HashSet::from([caller_id.to_owned()]);
         let mut current = caller_id.to_owned();
@@ -858,22 +861,11 @@ impl PostgresSystemDatabase {
             .bind(&current)
             .fetch_optional(&mut *conn)
             .await?;
-            let Some(parent) = parent.flatten() else {
-                return Ok(());
-            };
-            if targets.contains(&parent.as_str()) {
-                return Err(Error::InvalidInput {
-                    field: "workflow_ids".into(),
-                    detail: format!(
-                        "workflow {caller_id} cannot {action} the tree of {parent}, which \
-                         contains it"
-                    ),
-                });
+            match parent.flatten() {
+                Some(parent) if roots.contains(&parent.as_str()) => return Ok(parent),
+                Some(parent) if seen.insert(parent.clone()) => current = parent,
+                _ => return Ok(roots.join(", ")),
             }
-            if !seen.insert(parent.clone()) {
-                return Ok(());
-            }
-            current = parent;
         }
     }
 
@@ -4179,14 +4171,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 started_at,
                 |mut tx| async move {
                     if let Some(caller_id) = from_workflow {
-                        self.refuse_self_target_on(
-                            &mut tx,
-                            caller_id,
-                            workflow_ids,
-                            cancel_children,
-                            "cancel",
-                        )
-                        .await?;
+                        refuse_self_target(caller_id, workflow_ids, "cancel")?;
                     }
                     // One statement per *level*, not per workflow: `cancel_batch` takes the whole
                     // frontier and matches it with `= ANY($1)`, so the round trips scale with the
@@ -4212,6 +4197,24 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // Terminates because `seen` only grows and a workflow enters a frontier at
                     // most once.
                     while !frontier.is_empty() {
+                        // A cascade that reaches the caller is a cancel of the tree it is inside,
+                        // found by the walk itself rather than by reading the caller's ancestry
+                        // up front. The levels above are cancelled by now, and returning the
+                        // error rolls them back with the rest of the transaction.
+                        if let Some(caller_id) = from_workflow
+                            && frontier.iter().any(|id| id == caller_id)
+                        {
+                            let root = self
+                                .root_containing(&mut tx, caller_id, workflow_ids)
+                                .await?;
+                            return Err(Error::InvalidInput {
+                                field: "workflow_ids".into(),
+                                detail: format!(
+                                    "workflow {caller_id} cannot cancel the tree of {root}, which \
+                                     contains it"
+                                ),
+                            });
+                        }
                         cancelled.extend(self.cancel_batch(&mut tx, &frontier).await?);
                         let children = self.direct_children(&mut tx, &frontier).await?;
                         frontier = children
@@ -4258,14 +4261,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 started_at,
                 |mut tx| async move {
                     if let Some(caller_id) = from_workflow {
-                        self.refuse_self_target_on(
-                            &mut tx,
-                            caller_id,
-                            workflow_ids,
-                            false,
-                            "resume",
-                        )
-                        .await?;
+                        refuse_self_target(caller_id, workflow_ids, "resume")?;
                     }
                     // Existence is asked separately because a zero-row update conflates "already
                     // finished" — which is legal — with "no such workflow", which is not. In the

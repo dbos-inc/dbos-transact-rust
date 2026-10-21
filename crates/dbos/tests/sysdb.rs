@@ -5608,23 +5608,16 @@ async fn from_workflow_refuses_only_the_callers_own_line() {
     );
 }
 
-/// **The ancestry walk ends on a missing row and on a cycle**, neither of which a well-formed tree
-/// has, and a recorded call with nothing to target is still recorded.
+/// **A cascade over a cycle still finds the caller inside it and still ends**, though a
+/// well-formed tree has no cycle, and a recorded call with nothing to target is still recorded.
 #[tokio::test]
-async fn from_workflow_survives_missing_ancestors_cycles_and_empty_targets() {
+async fn from_workflow_survives_cycles_and_empty_targets() {
     let (sys, db) = sysdb().await;
-    for id in ["wf-a", "wf-b", "wf-c", "wf-target", "wf-operator"] {
+    for id in ["wf-a", "wf-b", "wf-operator"] {
         sys.init_workflow(&workflow(id), None, Submission::Fresh, None)
             .await
             .unwrap();
     }
-    // A caller whose row is gone, or was never written, has no ancestry to be inside.
-    assert_eq!(
-        sys.cancel_workflows(&["wf-target"], true, Some("wf-ghost"), None)
-            .await
-            .unwrap(),
-        ["wf-target"],
-    );
     // Two rows naming each other, which the schema does not prevent.
     sqlx::query(
         r#"UPDATE "dbos"."workflow_status"
@@ -5634,14 +5627,34 @@ async fn from_workflow_survives_missing_ancestors_cycles_and_empty_targets() {
     .execute(&db.pool().await)
     .await
     .unwrap();
-    let cancelled = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        sys.cancel_workflows(&["wf-c"], true, Some("wf-a"), None),
-    )
-    .await
-    .expect("the walk did not end on a cycle")
-    .unwrap();
-    assert_eq!(cancelled, ["wf-c"]);
+    let within = |from| {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sys.cancel_workflows(&["wf-a"], true, Some(from), None),
+        )
+    };
+    match within("wf-b")
+        .await
+        .expect("the walk did not end on a cycle")
+    {
+        Err(Error::InvalidInput { detail, .. }) => {
+            assert!(
+                detail.contains("cannot cancel the tree of wf-a"),
+                "{detail}"
+            )
+        }
+        other => panic!("the cascade over its own cycle was not refused: {other:?}"),
+    }
+    for id in ["wf-a", "wf-b"] {
+        let row = sys.get_workflow(id).await.unwrap().unwrap();
+        assert_eq!(row.status, WorkflowStatus::Pending, "{id} moved");
+    }
+    let mut cancelled = within("wf-operator")
+        .await
+        .expect("the cascade did not end on a cycle")
+        .unwrap();
+    cancelled.sort();
+    assert_eq!(cancelled, ["wf-a", "wf-b"]);
 
     let caller = Some(support::step_caller("wf-operator", 0));
     let nothing = sys
