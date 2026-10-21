@@ -188,14 +188,8 @@ pub struct ClientConfig {
     /// How long a system-database connection may sit idle inside an open transaction before the
     /// server ends its session.
     ///
-    /// `None` is sixty seconds. `Some(Duration::ZERO)` leaves the server's own setting, as do
-    /// connection options that already set `idle_in_transaction_session_timeout` (the database
-    /// URL's `options` parameter, or `PGOPTIONS`); anything else replaces it, a setting made with
-    /// `ALTER ROLE` or `ALTER DATABASE` included. A positive value under a millisecond is a
-    /// millisecond. The server takes at most `i32::MAX` milliseconds, about 24.8 days, and longer
-    /// is refused. A process that stalls mid-transaction would otherwise hold the transaction's row
-    /// locks, and the connection, for as long as the stall lasts.
-    pub idle_transaction_timeout: Option<Duration>,
+    /// Sixty seconds by default; see [`IdleTransactionTimeout`](crate::IdleTransactionTimeout).
+    pub idle_transaction_timeout: crate::IdleTransactionTimeout,
 }
 
 impl ClientConfig {
@@ -215,7 +209,7 @@ impl ClientConfig {
             polling_concurrency: None,
             outcome_poll_interval: None,
             notification_coalesce: None,
-            idle_transaction_timeout: None,
+            idle_transaction_timeout: crate::IdleTransactionTimeout::Default,
         }
     }
 
@@ -276,13 +270,9 @@ impl ClientConfig {
                 "`outcome_poll_interval` cannot be zero".to_owned(),
             ));
         }
-        if self
-            .idle_transaction_timeout
-            .is_some_and(|timeout| timeout > crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT)
-        {
+        if let Some(detail) = self.idle_transaction_timeout.invalid() {
             return Err(crate::Error::Config(format!(
-                "`idle_transaction_timeout` must be at most {:?}",
-                crate::sysdb::postgres::MAX_IDLE_TRANSACTION_TIMEOUT
+                "`idle_transaction_timeout` {detail}"
             )));
         }
         Ok(())

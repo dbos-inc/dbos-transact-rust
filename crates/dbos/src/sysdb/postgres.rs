@@ -85,12 +85,12 @@ use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
     Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
-    ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
-    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
+    NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, QueueRecord,
+    QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
+    StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
@@ -331,17 +331,8 @@ pub struct Config<'a> {
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
-    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens. `None` is
-    /// [`DEFAULT_IDLE_TRANSACTION_TIMEOUT`]. Zero leaves the server's own setting, as do connection
-    /// options that already set `idle_in_transaction_session_timeout` (the URL's `options`
-    /// parameter, or `PGOPTIONS`). Anything else replaces the server's setting, one made with
-    /// `ALTER ROLE` or `ALTER DATABASE` included. A positive value under a millisecond is a millisecond, and longer than
-    /// [`MAX_IDLE_TRANSACTION_TIMEOUT`] is refused.
-    ///
-    /// A process that stalls mid-transaction (a frozen container, a network partition) would
-    /// otherwise hold the transaction's row locks, and the connection, for as long as the stall
-    /// lasts.
-    pub idle_transaction_timeout: Option<Duration>,
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens.
+    pub idle_transaction_timeout: IdleTransactionTimeout,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
     /// On by default. Turning it off suits an application whose database is migrated by something
@@ -359,19 +350,12 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
-            idle_transaction_timeout: None,
+            idle_transaction_timeout: IdleTransactionTimeout::Default,
             migrate: true,
             settings: Settings::default(),
         }
     }
 }
-
-/// What [`Config::idle_transaction_timeout`] is unless told otherwise.
-pub const DEFAULT_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The longest [`Config::idle_transaction_timeout`] the server takes: the parameter is a 32-bit
-/// count of milliseconds.
-pub const MAX_IDLE_TRANSACTION_TIMEOUT: Duration = Duration::from_millis(i32::MAX as u64);
 
 /// Whether the connection options `url` resolves to already set
 /// `idle_in_transaction_session_timeout`: the URL's `options` parameter, in either of its forms,
@@ -493,20 +477,16 @@ impl PostgresSystemDatabase {
             ensure_database_exists(config.url).await?;
         }
 
-        let idle_transaction_timeout = config
-            .idle_transaction_timeout
-            .unwrap_or(DEFAULT_IDLE_TRANSACTION_TIMEOUT);
-        if idle_transaction_timeout > MAX_IDLE_TRANSACTION_TIMEOUT {
+        if let Some(detail) = config.idle_transaction_timeout.invalid() {
             return Err(Error::InvalidInput {
                 field: "idle_transaction_timeout".into(),
-                detail: format!("must be at most {MAX_IDLE_TRANSACTION_TIMEOUT:?}"),
+                detail,
             });
         }
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
-        if !idle_transaction_timeout.is_zero() && !options_set_idle_transaction_timeout(config.url)
+        if let Some(millis) = config.idle_transaction_timeout.millis()
+            && !options_set_idle_transaction_timeout(config.url)
         {
-            // The server reads zero as no timeout, so a positive value under a millisecond is one.
-            let millis = idle_transaction_timeout.as_millis().max(1);
             pool = pool.after_connect(move |conn, _| {
                 Box::pin(async move {
                     sqlx::query(AssertSqlSafe(format!(
@@ -8290,7 +8270,7 @@ mod tests {
         }
         async fn connected(url: &str, timeout: std::time::Duration) -> String {
             let sys = PostgresSystemDatabase::connect(&super::Config {
-                idle_transaction_timeout: Some(timeout),
+                idle_transaction_timeout: super::IdleTransactionTimeout::After(timeout),
                 migrate: false,
                 ..super::Config::new(url)
             })
@@ -8348,7 +8328,9 @@ mod tests {
             return;
         }
         let sys = PostgresSystemDatabase::connect(&super::Config {
-            idle_transaction_timeout: Some(std::time::Duration::from_millis(300)),
+            idle_transaction_timeout: super::IdleTransactionTimeout::After(
+                std::time::Duration::from_millis(300),
+            ),
             migrate: false,
             ..super::Config::new(db.url())
         })
