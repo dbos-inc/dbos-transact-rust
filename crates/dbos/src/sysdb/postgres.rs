@@ -4675,17 +4675,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             }));
         }
 
-        // Exclusive, and before the first look for both reasons at once: registering after looking
-        // would miss a message that landed in between, and a second receiver has to be refused
-        // before it starts waiting rather than after it has waited out a timeout for a message it
-        // was never going to get.
-        let mut subscription = self
-            .notify
-            .subscribe_exclusive(message_key(workflow_id, topic))
-            .ok_or_else(|| Error::ConcurrentRecv {
-                workflow_id: workflow_id.to_owned(),
-                topic: topic.map(str::to_owned),
-            })?;
+        // Before the first look: registering after looking would miss a message that landed in
+        // between. Shared, not exclusive: a workflow resumed while its execution waits here has a
+        // second execution waiting beside it, and refusing that one would end it with an error
+        // although the message may well be its. Both wake, and the consuming statement gives the
+        // message to one of them.
+        let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
         // sixty seconds and crashed has ten left rather than sixty.
@@ -4731,8 +4726,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await;
         }
-        // Released here rather than at the end of the call: the taking below does not wait, and
-        // holding the topic through it would keep the next `recv` out for no reason.
+        // Released here rather than at the end of the call: the taking below does not wait, so
+        // there is nothing left to be woken for.
         drop(subscription);
 
         // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
