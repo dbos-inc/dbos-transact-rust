@@ -167,10 +167,9 @@ pub struct ClientConfig {
     /// CockroachDB has no LISTEN/NOTIFY, so there the client polls whatever this says.
     pub use_listen_notify: bool,
 
-    /// How many polling reads may run at once.
-    ///
-    /// `None` is half the pool and at least one; `Some(0)` switches the cap off.
-    pub polling_concurrency: Option<u32>,
+    /// How many polling reads may run at once: half the pool by default; see
+    /// [`PollingConcurrency`](crate::PollingConcurrency).
+    pub polling_concurrency: crate::PollingConcurrency,
 
     /// How often a caller waiting on a workflow asks whether it has finished.
     ///
@@ -184,6 +183,12 @@ pub struct ClientConfig {
     ///
     /// `None` is ten milliseconds; `Some(Duration::ZERO)` turns coalescing off.
     pub notification_coalesce: Option<Duration>,
+
+    /// How long a system-database connection may sit idle inside an open transaction before the
+    /// server ends its session.
+    ///
+    /// Sixty seconds by default; see [`IdleTransactionTimeout`](crate::IdleTransactionTimeout).
+    pub idle_transaction_timeout: crate::IdleTransactionTimeout,
 }
 
 impl ClientConfig {
@@ -200,9 +205,10 @@ impl ClientConfig {
             schema: DEFAULT_SCHEMA.to_owned(),
             serializer: Serializer::default(),
             use_listen_notify: false,
-            polling_concurrency: None,
+            polling_concurrency: crate::PollingConcurrency::Default,
             outcome_poll_interval: None,
             notification_coalesce: None,
+            idle_transaction_timeout: crate::IdleTransactionTimeout::Default,
         }
     }
 
@@ -263,6 +269,9 @@ impl ClientConfig {
                 "`outcome_poll_interval` cannot be zero".to_owned(),
             ));
         }
+        self.idle_transaction_timeout
+            .validate()
+            .map_err(|error| crate::Error::Config(error.to_string()))?;
         Ok(())
     }
 
