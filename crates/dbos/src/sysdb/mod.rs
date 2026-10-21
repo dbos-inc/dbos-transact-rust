@@ -409,12 +409,6 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
-    /// Puts a running workflow back on its queue, reporting whether it moved.
-    ///
-    /// For an executor that claimed a queued workflow and then could not run it. Only applies to
-    /// a `PENDING` row that has a queue to return to.
-    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error>;
-
     /// Replaces a workflow's attributes. `None` clears them.
     ///
     /// A replacement rather than a merge, matching every implementation.

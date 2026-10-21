@@ -3099,40 +3099,6 @@ async fn releasing_a_delayed_workflow_clears_only_the_debounce_key() {
     assert_eq!(held.status, WorkflowStatus::Delayed);
 }
 
-/// A claimed workflow can be handed back to its queue, but only if it came from one.
-#[tokio::test]
-async fn a_queued_workflow_can_be_returned_to_its_queue() {
-    let (sys, db) = sysdb().await;
-    let queued = NewWorkflow {
-        queue_name: Some("orders"),
-        ..NewWorkflow::new("wf-claimed")
-    };
-    sys.init_workflow(&queued, None).await.unwrap();
-
-    // Claim it as a dequeue would. Done in SQL rather than through `start_queued_workflows`, so
-    // this row is claimed without a dequeue pass choosing which row to take — `init_workflow`
-    // derives the status from the queue and so leaves it ENQUEUED.
-    let mut conn = db.admin_connection().await;
-    sqlx::query(sqlx::AssertSqlSafe(
-        "UPDATE dbos.workflow_status SET status = 'PENDING', started_at_epoch_ms = 1000 \
-         WHERE workflow_uuid = 'wf-claimed'",
-    ))
-    .execute(&mut conn)
-    .await
-    .unwrap();
-
-    assert!(sys.clear_queue_assignment("wf-claimed").await.unwrap());
-    let read = sys.get_workflow("wf-claimed").await.unwrap().unwrap();
-    assert_eq!(read.status, WorkflowStatus::Enqueued);
-    assert_eq!(read.started_at, None, "the claim's start time is cleared");
-
-    // A workflow that never came from a queue has none to go back to.
-    sys.init_workflow(&workflow("wf-direct"), None)
-        .await
-        .unwrap();
-    assert!(!sys.clear_queue_assignment("wf-direct").await.unwrap());
-}
-
 /// A second workflow cannot take a deduplication key another already holds on the same queue.
 ///
 /// Java raises `DBOSQueueDuplicatedException` here and Python `DBOSQueueDeduplicatedError`; both

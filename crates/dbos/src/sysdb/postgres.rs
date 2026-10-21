@@ -3882,27 +3882,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn clear_queue_assignment(&self, workflow_id: &str) -> Result<bool, Error> {
-        let workflow_table = &self.tables.workflow_status;
-        let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
-
-        with_retry(&self.retry, "clear_queue_assignment", move || async move {
-            // `queue_name IS NOT NULL` is what makes this a *return* rather than an enqueue: a
-            // workflow that never came from a queue has none to go back to.
-            let updated = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET started_at_epoch_ms = NULL, status = 'ENQUEUED', \
-                 updated_at = {NOW_MS_SQL} \
-                 WHERE workflow_uuid = $1 AND queue_name IS NOT NULL AND status = 'PENDING'"
-            )))
-            .bind(workflow_id)
-            .execute(pool)
-            .await?
-            .rows_affected();
-            Ok(updated > 0)
-        })
-        .await
-    }
-
     async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
