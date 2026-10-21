@@ -5,10 +5,10 @@ use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, EncodedValue,
     Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue,
-    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
-    RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus,
-    ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy,
+    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -845,7 +845,7 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -918,7 +918,7 @@ async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -4152,7 +4152,7 @@ async fn a_capped_read_does_not_hold_its_permit_across_the_wait() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -4743,7 +4743,7 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -7195,7 +7195,7 @@ async fn capped_stream_reads_do_not_block_each_other() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
