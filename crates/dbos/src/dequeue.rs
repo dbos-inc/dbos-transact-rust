@@ -630,15 +630,16 @@ async fn dispatch_claimed(
 /// Submits one workflow from the row that describes it, if this executor still can and should.
 ///
 /// A dequeue has claimed the row and read it; what remains is to reconstruct the call the row
-/// describes — look the registration up by the row's own name, check the row is still `PENDING`
-/// and still the claim's, and spawn — and that is what this does. It takes the row rather than
+/// describes — look the registration up by the row's own name, check the row is still `PENDING`,
+/// and spawn — and that is what this does. It takes the row rather than
 /// fetching it because the claim already read every row it took in one round trip, which is the
 /// reason [`start_queued_workflows`](crate::sysdb::SystemDatabase::start_queued_workflows) returns
 /// ids.
 ///
 /// `owner_xid` is the claim's token. The execution presents it on every write, so if the row is
-/// handed to another execution between the claim and the run (a resume, a recovery), this one's
-/// first write is refused.
+/// handed to another execution since the claim (a resume, a recovery), this one's first write is
+/// refused. That is the only check of ownership here: a row claimed again before the read is
+/// `PENDING` and runs, and its first step's body runs before that write is refused.
 ///
 /// **The registry is consulted after the row is claimed, and that is harmless rather than
 /// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
@@ -689,24 +690,13 @@ async fn dispatch(
         return Ok(());
     }
 
-    match admission(
-        row.status,
-        row.owner_xid.as_deref() == Some(owner_xid),
-        row.recovery_attempts,
-    ) {
+    match admission(row.status, row.recovery_attempts) {
         Admission::Run => {}
         Admission::NotPending => {
             tracing::warn!(
                 workflow_id,
                 status = %row.status,
                 "the dequeued workflow is no longer pending; it is not started"
-            );
-            return Ok(());
-        }
-        Admission::ClaimedAgain => {
-            tracing::debug!(
-                workflow_id,
-                "the dequeued workflow has been claimed again since; it is not started"
             );
             return Ok(());
         }
@@ -824,27 +814,18 @@ enum Admission {
     /// resumed one is worse than that: `resume_workflows` puts it back on its queue as `ENQUEUED`,
     /// so running it here while the next sweep claims it again is one workflow executing twice.
     NotPending,
-    /// Left alone: `PENDING`, but no longer this claim's. Between the claim and the read the
-    /// workflow can be resumed or re-enqueued and claimed again, by another executor or by this
-    /// one, and is `PENDING` under that claim's token. Running it here would be refused at its
-    /// first write, but only after its first step's body had run. A hand-off after the read is
-    /// still caught by the owner check at the first write.
-    ClaimedAgain,
     /// Parked, once it has been dispatched more often than allowed. The claim counted this
     /// attempt; a workflow that keeps being recovered without finishing is crashing its
     /// executors, and running it again would crash another. The park's guard on the count leaves
-    /// a row alone that a resume reset meanwhile.
+    /// a row alone that a resume reset meanwhile. A row another claim has taken since is parked
+    /// too, and rightly: that claim counted one more attempt, so its own dispatch would park it.
     Park,
 }
 
-/// The status first, so a row that is no longer `PENDING` is left as it is whatever its count; then
-/// the claim, so this never parks a workflow another claim is running. `owned` is whether the row's
-/// `owner_xid` is this claim's token.
-fn admission(status: WorkflowStatus, owned: bool, recovery_attempts: i64) -> Admission {
+/// The status first, so a row that is no longer `PENDING` is left as it is whatever its count.
+fn admission(status: WorkflowStatus, recovery_attempts: i64) -> Admission {
     if status != WorkflowStatus::Pending {
         Admission::NotPending
-    } else if !owned {
-        Admission::ClaimedAgain
     } else if recovery_attempts > MAX_RECOVERY_ATTEMPTS + 1 {
         Admission::Park
     } else {
@@ -922,11 +903,11 @@ mod tests {
         );
     }
 
-    /// **A claimed row that has been claimed again since is not started.** It is `PENDING`, but
-    /// under another claim's token; running it would execute its first step's body before the
-    /// owner check refused its first write. The same row under its own token starts.
+    /// **A claimed row that has been claimed again since runs, but records nothing.** It is
+    /// `PENDING` under another claim's token, so its body runs and its outcome write is refused;
+    /// the row stays the owner's, and the owner's run is the one that records the outcome.
     #[tokio::test]
-    async fn a_row_claimed_again_since_is_not_started() {
+    async fn a_row_claimed_again_since_records_nothing() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let db = dbos_test_support::test_database().await;
@@ -979,26 +960,46 @@ mod tests {
         )
         .await
         .unwrap();
+        let ran = |n: u32| {
+            let runs = Arc::clone(&runs);
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while runs.load(Ordering::SeqCst) < n {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "run {n} never started"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        ran(1).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(runs.load(Ordering::SeqCst), 0, "a stale claim started it");
+        let held = row().await;
+        assert_eq!(
+            held.status,
+            WorkflowStatus::Pending,
+            "a stale claim settled it"
+        );
+        assert_eq!(held.owner_xid.as_deref(), Some(owner.as_str()));
 
         dispatch(&executor, row().await, &owner, local_clock(), None)
             .await
             .unwrap();
+        ran(2).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while runs.load(Ordering::SeqCst) == 0 {
+        while row().await.status != WorkflowStatus::Success {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the owner's claim never ran"
+                "the owner's run never recorded its outcome"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         dbos.shutdown().await;
     }
 
-    /// A row that moved on since the claim, or that another claim has taken since, is not started,
-    /// and is not parked either, however many attempts it carries; a `PENDING` row still this
-    /// claim's runs up to the limit and is parked past it.
+    /// A row that moved on since the claim is not started, and is not parked either, however many
+    /// attempts it carries; a `PENDING` one runs up to the limit and is parked past it.
     #[test]
     fn a_claimed_row_runs_only_while_pending_and_within_its_attempts() {
         let limit = MAX_RECOVERY_ATTEMPTS + 1;
@@ -1007,35 +1008,19 @@ mod tests {
             WorkflowStatus::Enqueued,
             WorkflowStatus::Success,
         ] {
-            for owned in [true, false] {
-                assert_eq!(
-                    admission(status, owned, 1),
-                    Admission::NotPending,
-                    "{status}"
-                );
-                assert_eq!(
-                    admission(status, owned, limit + 1),
-                    Admission::NotPending,
-                    "{status}"
-                );
-            }
-        }
-        assert_eq!(admission(WorkflowStatus::Pending, true, 1), Admission::Run);
-        assert_eq!(
-            admission(WorkflowStatus::Pending, true, limit),
-            Admission::Run
-        );
-        assert_eq!(
-            admission(WorkflowStatus::Pending, true, limit + 1),
-            Admission::Park
-        );
-        // Another claim's row is left to it, never parked here, however many attempts it carries.
-        for attempts in [1, limit + 1] {
+            assert_eq!(admission(status, 1), Admission::NotPending, "{status}");
             assert_eq!(
-                admission(WorkflowStatus::Pending, false, attempts),
-                Admission::ClaimedAgain
+                admission(status, limit + 1),
+                Admission::NotPending,
+                "{status}"
             );
         }
+        assert_eq!(admission(WorkflowStatus::Pending, 1), Admission::Run);
+        assert_eq!(admission(WorkflowStatus::Pending, limit), Admission::Run);
+        assert_eq!(
+            admission(WorkflowStatus::Pending, limit + 1),
+            Admission::Park
+        );
     }
 
     /// A failed read of the database's clock times the batch from this host's instead, so its
