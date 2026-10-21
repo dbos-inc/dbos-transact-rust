@@ -477,12 +477,7 @@ impl PostgresSystemDatabase {
             ensure_database_exists(config.url).await?;
         }
 
-        if let Some(detail) = config.idle_transaction_timeout.invalid() {
-            return Err(Error::InvalidInput {
-                field: "idle_transaction_timeout".into(),
-                detail,
-            });
-        }
+        config.idle_transaction_timeout.validate()?;
         let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
         if let Some(millis) = config.idle_transaction_timeout.millis()
             && !options_set_idle_transaction_timeout(config.url)

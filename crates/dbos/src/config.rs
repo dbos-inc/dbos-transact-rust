@@ -227,11 +227,9 @@ impl Config {
                 "`scheduler_polling_interval` cannot be zero".to_owned(),
             ));
         }
-        if let Some(detail) = self.idle_transaction_timeout.invalid() {
-            return Err(crate::Error::Config(format!(
-                "`idle_transaction_timeout` {detail}"
-            )));
-        }
+        self.idle_transaction_timeout
+            .validate()
+            .map_err(|error| crate::Error::Config(error.to_string()))?;
         self.serializer.validate()
     }
 

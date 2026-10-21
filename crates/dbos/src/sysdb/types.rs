@@ -1506,17 +1506,22 @@ impl IdleTransactionTimeout {
     /// about 24.8 days.
     pub const MAX: Duration = Duration::from_millis(i32::MAX as u64);
 
-    /// Why this can't be set, if it can't: a zero or out-of-range [`After`](Self::After).
-    pub(crate) fn invalid(self) -> Option<String> {
-        match self {
-            IdleTransactionTimeout::After(timeout) if timeout.is_zero() => Some(
-                "must be more than zero; `ServerSetting` leaves the server's setting".to_owned(),
-            ),
-            IdleTransactionTimeout::After(timeout) if timeout > Self::MAX => {
-                Some(format!("must be at most {:?}", Self::MAX))
+    /// Rejects an [`After`](Self::After) the server can't take: zero, or longer than
+    /// [`MAX`](Self::MAX).
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        let detail = match self {
+            IdleTransactionTimeout::After(timeout) if timeout.is_zero() => {
+                "must be more than zero; `ServerSetting` leaves the server's setting".to_owned()
             }
-            _ => None,
-        }
+            IdleTransactionTimeout::After(timeout) if *timeout > Self::MAX => {
+                format!("must be at most {:?}", Self::MAX)
+            }
+            _ => return Ok(()),
+        };
+        Err(Error::InvalidInput {
+            field: "idle_transaction_timeout".into(),
+            detail,
+        })
     }
 
     /// The timeout to set on a connection, in the server's milliseconds, or `None` to leave the
