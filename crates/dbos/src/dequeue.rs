@@ -807,12 +807,17 @@ fn admission(status: WorkflowStatus, recovery_attempts: i64) -> Admission {
     }
 }
 
-/// The clock a batch's deadlines are timed from: the database's reading, or, if it could not be
-/// read, this host's.
+/// The clock a batch's deadlines are timed from: the database's reading, or, if the read failed
+/// outright, this host's.
 ///
 /// The fallback trades accuracy for progress. Skew between the two clocks moves the deadlines of
 /// this one batch, where holding the rows back instead would leave them `PENDING` under a live
 /// executor, counting against the queue's concurrency, until it next launched.
+///
+/// **A lost connection never reaches it.** The read is retried until the database answers, like
+/// every system-database call and like the batch read just before it, so an unreachable database
+/// holds the batch there rather than here. Nothing dispatched sooner would get further: its first
+/// checkpoint would wait on the same database.
 fn timing_clock(reading: Result<DatabaseTime, sysdb::Error>) -> DatabaseTime {
     reading.unwrap_or_else(|error| {
         tracing::warn!(
