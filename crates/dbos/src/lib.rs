@@ -132,7 +132,10 @@ pub use stream::{
     write_stream, write_stream_with,
 };
 #[cfg(feature = "engine")]
-pub use sysdb::types::{Change, RateLimit, ScheduleFilter, ScheduleStatus, WorkflowDelay};
+pub use sysdb::types::{
+    Change, IdleTransactionTimeout, PollingConcurrency, RateLimit, ScheduleFilter, ScheduleStatus,
+    WorkflowDelay,
+};
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
 // oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so
 // this makes `tokio-util` a public dependency rather than sparing anyone one — a major bump of it

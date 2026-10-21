@@ -91,10 +91,9 @@ pub struct Config {
     /// Off suits an application whose database is migrated by a deployment step instead.
     pub migrate: bool,
 
-    /// How many polling reads may run at once.
-    ///
-    /// `None` is half the pool and at least one; `Some(0)` switches the cap off.
-    pub polling_concurrency: Option<u32>,
+    /// How many polling reads may run at once: half the pool by default; see
+    /// [`PollingConcurrency`](crate::PollingConcurrency).
+    pub polling_concurrency: crate::PollingConcurrency,
 
     /// How often a caller waiting on a workflow it does not own asks whether it has finished.
     ///
@@ -135,6 +134,12 @@ pub struct Config {
     /// the one duration here where zero is a setting rather than a mistake.
     pub notification_coalesce: Option<Duration>,
 
+    /// How long a system-database connection may sit idle inside an open transaction before the
+    /// server ends its session.
+    ///
+    /// Sixty seconds by default; see [`IdleTransactionTimeout`](crate::IdleTransactionTimeout).
+    pub idle_transaction_timeout: crate::IdleTransactionTimeout,
+
     /// How often the scheduler re-reads the schedules table for schedules created, changed,
     /// paused or deleted since its last look.
     ///
@@ -161,10 +166,11 @@ impl Config {
             serializer: Serializer::default(),
             use_listen_notify: true,
             migrate: true,
-            polling_concurrency: None,
+            polling_concurrency: crate::PollingConcurrency::Default,
             outcome_poll_interval: None,
             listen_queues: None,
             notification_coalesce: None,
+            idle_transaction_timeout: crate::IdleTransactionTimeout::Default,
             scheduler_polling_interval: None,
         }
     }
@@ -220,6 +226,9 @@ impl Config {
                 "`scheduler_polling_interval` cannot be zero".to_owned(),
             ));
         }
+        self.idle_transaction_timeout
+            .validate()
+            .map_err(|error| crate::Error::Config(error.to_string()))?;
         self.serializer.validate()
     }
 
@@ -273,6 +282,32 @@ mod tests {
             err.to_string().contains("outcome_poll_interval"),
             "unlike `notification_coalesce`, zero here is not a setting: {err}"
         );
+    }
+
+    /// The server takes a 32-bit count of milliseconds, so anything longer is refused here rather
+    /// than failing every connection, and a zero timeout is refused rather than read as the
+    /// server's setting, which has its own variant.
+    #[test]
+    fn an_idle_transaction_timeout_out_of_the_servers_range_is_refused() {
+        use crate::IdleTransactionTimeout::{After, ServerSetting};
+        let config = |idle_transaction_timeout| Config {
+            idle_transaction_timeout,
+            app_version: Some("v1".to_owned()),
+            ..Config::new("app", "postgres://x")
+        };
+        assert!(config(ServerSetting).validate().is_ok());
+        assert!(
+            config(After(crate::IdleTransactionTimeout::MAX))
+                .validate()
+                .is_ok()
+        );
+        for refused in [Duration::ZERO, Duration::from_millis(i32::MAX as u64 + 1)] {
+            let err = config(After(refused)).validate().unwrap_err();
+            assert!(
+                err.to_string().contains("idle_transaction_timeout"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

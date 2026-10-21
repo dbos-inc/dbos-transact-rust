@@ -857,14 +857,12 @@ pub trait SystemDatabase: Send + Sync {
     /// because nothing equals `NULL` and a receiver selecting on it would never find its own
     /// message.
     ///
-    /// **Two concurrent receivers on one (workflow, topic) is
-    /// [`Error::ConcurrentRecv`].** One message goes to one of them, so the other can only wait out
-    /// its timeout and report nothing — which the sender cannot distinguish from not having sent.
-    /// Python and Go reject it; TypeScript and Java allow it. Erring towards the error is the
-    /// recoverable direction: a layer above can swallow one this layer raises, and cannot
-    /// manufacture one it never raised. The guard is per process; two receivers in *different*
-    /// processes are arbitrated at the database by the consuming statement, which is the case
-    /// recovery actually produces.
+    /// **Two concurrent receivers on one (workflow, topic) both wait**, and both are woken; the
+    /// consuming statement gives a message to one of them, and the other waits on to its deadline.
+    /// Two receives of one execution produce two, and so does a workflow resumed while its
+    /// execution still waits, so that a second execution of it waits at the same step, in this
+    /// process or another. There the one that missed out adopts the winner's record once its
+    /// deadline passes.
     ///
     /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
     /// raises a timeout error, in its engine rather than at this layer.

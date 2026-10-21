@@ -5,10 +5,10 @@ use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
     Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, EncodedValue,
     Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue,
-    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
-    RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus,
-    ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy,
+    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleStatus, ScheduleUpdate, StepTiming, Submission, Timestamp, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
 
@@ -845,7 +845,7 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -918,7 +918,7 @@ async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -4152,7 +4152,7 @@ async fn a_capped_read_does_not_hold_its_permit_across_the_wait() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -4482,13 +4482,11 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
     );
 }
 
-/// A second receiver on one (workflow, topic) is refused rather than left to time out.
-///
-/// One message goes to one of them, so the loser would wait out its whole timeout and report that
-/// nothing arrived — which the sender cannot tell apart from not having sent. Python and Go refuse
-/// it too; TypeScript and Java allow it.
+/// **Two receives on one (workflow, topic) in one process both wait**, and one message goes to
+/// one of them: the other times out with nothing. These are two receives of one execution, at
+/// different steps, as a receive joined with another would be; both are woken by the one send.
 #[tokio::test]
-async fn a_second_receiver_on_one_topic_is_refused() {
+async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
@@ -4498,50 +4496,103 @@ async fn a_second_receiver_on_one_topic_is_refused() {
         .await
         .unwrap();
 
-    let waiting = {
+    let first = {
         let sys = std::sync::Arc::clone(&sys);
         tokio::spawn(async move {
-            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600)
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 20)
+                .await
+        })
+    };
+    let second = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 20)
                 .await
         })
     };
     tokio::time::sleep(BRIEFLY).await;
+    send_to_receiver(&sys, Some("orders"), "\"only\"").await;
 
-    // Bounded, because the regression is that it *waits*: a second receiver that is admitted
-    // rather than refused sits out its whole ten minutes for a message it was never going to get,
-    // which is exactly the behaviour being ruled out.
-    let err = tokio::time::timeout(
-        RECHECK * 10,
-        sys.recv("wf-receiver", 2, 3, Some("orders"), RECHECK * 600),
-    )
-    .await
-    .expect("a second receiver was admitted and left to wait rather than refused")
-    .expect_err("a second receiver on one topic is a bug in the caller, and is told so");
-    assert!(
-        matches!(
-            err,
-            Error::ConcurrentRecv { ref workflow_id, ref topic }
-                if workflow_id == "wf-receiver" && topic.as_deref() == Some("orders")
-        ),
-        "unexpected error: {err:?}",
+    let answers = [
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap(),
+    ];
+    assert_eq!(
+        answers.iter().filter(|answer| answer.is_some()).count(),
+        1,
+        "one message, one receiver: {answers:?}"
     );
-
-    // Another topic on the same workflow is a different wait, and is not refused.
-    send_to_receiver(&sys, Some("refunds"), "\"other\"").await;
-    assert!(
-        sys.recv("wf-receiver", 4, 5, Some("refunds"), RECHECK * 600)
-            .await
-            .unwrap()
-            .is_some(),
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "{notifications:?}"
     );
+}
 
-    waiting.abort();
+/// **Two executions of one workflow waiting at the same receive, in one process**, as a workflow
+/// resumed while its execution waits produces. One handle, so one registry: both wait, both are
+/// woken by the one send, and the database gives the message to one of them. The other finds
+/// nothing left to take and waits out its timeout; then it adopts the step the winner recorded,
+/// and returns the same message, or loses on its own step write, with what it took rolled back.
+/// Either way one message is consumed.
+#[tokio::test]
+async fn two_executions_at_one_receive_in_one_process_take_one_message() {
+    let db = test_database().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None, Submission::Fresh, None)
+        .await
+        .unwrap();
+
+    let waiting: Vec<_> = (0..2)
+        .map(|_| {
+            let sys = std::sync::Arc::clone(&sys);
+            tokio::spawn(async move {
+                sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 3)
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::sleep(BRIEFLY).await;
+    send_to_receiver(&sys, Some("orders"), "\"only\"").await;
+
+    let mut answers = Vec::new();
+    for handle in waiting {
+        answers.push(
+            tokio::time::timeout(RECHECK * 20, handle)
+                .await
+                .expect("a waiting receiver was never woken")
+                .unwrap(),
+        );
+    }
+    let (delivered, refused): (Vec<_>, Vec<_>) = answers.iter().partition(|answer| answer.is_ok());
+    assert!(
+        refused.len() <= 1
+            && refused
+                .iter()
+                .all(|answer| matches!(answer, Err(Error::StepAlreadyRecorded { step_id: 0, .. }))),
+        "only the loser may be refused, and only on its step write: {answers:?}",
+    );
+    assert!(
+        delivered
+            .iter()
+            .all(|answer| answer.as_ref().unwrap().is_some()),
+        "whoever returned holds the message: {answers:?}",
+    );
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "{notifications:?}"
+    );
 }
 
 /// Two receivers racing at the database consume one message between them, not two.
 ///
-/// **The cross-process case, which the in-process guard cannot see** — two handles have two
-/// registries, so both get past `subscribe_exclusive` exactly as two executors recovering one
+/// **The cross-process case** — two handles have two registries, as two executors recovering one
 /// workflow would. What arbitrates here is the database: the consuming `UPDATE` re-evaluates
 /// `consumed = FALSE` against the winner's committed row, and the losing transaction rolls back
 /// whatever it took when its step write conflicts. Two messages are queued so that a loser going
@@ -4569,8 +4620,8 @@ async fn a_second_receiver_on_one_topic_is_refused() {
 #[tokio::test]
 async fn two_receivers_cannot_take_the_same_message() {
     let db = test_database().await;
-    // Two handles over one pool: separate registries, so the in-process exclusivity does not apply
-    // and both reach the database — which is the situation this test is about.
+    // Two handles over one pool: separate registries, as two processes have, and both reach the
+    // database — which is the situation this test is about.
     let first = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings::default(),
@@ -4692,7 +4743,7 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));
@@ -7144,7 +7195,7 @@ async fn capped_stream_reads_do_not_block_each_other() {
     let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
         db.pool().await,
         &Settings {
-            polling_concurrency: Some(1),
+            polling_concurrency: PollingConcurrency::AtMost(std::num::NonZeroU32::MIN),
             ..Settings::default()
         },
     ));

@@ -85,12 +85,12 @@ use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
     Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
-    ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
-    NotificationRecord, OnExistingQueue, Outcome, QueueRecord, QueueUpdate, RateLimit,
-    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Submission,
-    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
+    NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
+    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
+    StreamRecord, Submission, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
     duration_from_secs, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
@@ -151,6 +151,7 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `57…` | operator intervention — shutdown, cannot connect now | connection |
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
+/// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -197,6 +198,12 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
 fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
     if matches!(code, "40001" | "40P01") {
         return BackendErrorKind::Conflict;
+    }
+    // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
+    // transaction. The transaction rolled back with it, so asking again on a new connection is
+    // what a lost connection would ask for.
+    if code == "25P03" {
+        return BackendErrorKind::Connection;
     }
     match &code[..2.min(code.len())] {
         "08" | "53" | "57" => BackendErrorKind::Connection,
@@ -270,13 +277,8 @@ pub struct Settings<'a> {
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
     /// longer happen.
     ///
-    /// `None` is half the pool and at least one, which is Python's default
-    /// (`sys_db_polling_concurrency`) and TypeScript's. `Some(0)` switches the cap off, which the
-    /// references spell as any non-positive number.
-    ///
-    /// Named without a `sys_db_` prefix, unlike Python: that prefix distinguishes the system
-    /// database's pool from its others, and this field already sits on a `sysdb` type.
-    pub polling_concurrency: Option<u32>,
+    /// [`PollingConcurrency::Default`] is half the pool and at least one.
+    pub polling_concurrency: PollingConcurrency,
     /// How long a written key waits for company before this handle pushes a wakeup for it.
     ///
     /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
@@ -300,7 +302,7 @@ impl Default for Settings<'_> {
             retry: RetryPolicy::default(),
             executor_id: None,
             application_name: None,
-            polling_concurrency: None,
+            polling_concurrency: PollingConcurrency::Default,
             notification_coalesce: None,
         }
     }
@@ -323,6 +325,9 @@ pub struct Config<'a> {
     /// permanent and affects every application sharing the database — see the note on
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
+    /// How long a connection may sit idle inside an open transaction before the server ends its
+    /// session, set on every connection [`PostgresSystemDatabase::connect`] opens.
+    pub idle_transaction_timeout: IdleTransactionTimeout,
     /// Whether [`PostgresSystemDatabase::connect`] brings the schema up to date.
     ///
     /// On by default. Turning it off suits an application whose database is migrated by something
@@ -340,32 +345,69 @@ impl<'a> Config<'a> {
             url,
             max_connections: 10,
             use_listen_notify: true,
+            idle_transaction_timeout: IdleTransactionTimeout::Default,
             migrate: true,
             settings: Settings::default(),
         }
     }
 }
 
-/// The polling cap for a pool of `pool_size` connections.
-///
-/// `configured` is the caller's choice: `None` takes the default, and `Some(0)` switches the cap
-/// off. Python and TypeScript spell the second as any non-positive number, which they need because
-/// their integers are signed and their configuration untyped; here the only unsigned value that can
-/// mean "off" is zero.
-///
-/// **The default is half the pool, and at least one.** Both references use exactly this, and the
-/// half is what leaves the other half for the control plane. The minimum matters at
-/// `max_connections = 1`, where half is zero — and a cap of zero would not be a small budget but a
-/// permanent block, the opposite of what a caller asking for a small pool wants.
-///
-/// Off is a permit count nothing will exhaust rather than an absent semaphore, so the handle holds
-/// one unconditional [`Semaphore`](tokio::sync::Semaphore) with no branch on the acquire path.
-fn polling_limit(configured: Option<u32>, pool_size: u32) -> usize {
-    match configured {
-        Some(0) => tokio::sync::Semaphore::MAX_PERMITS,
-        Some(n) => n as usize,
-        None => usize::max((pool_size / 2) as usize, 1),
+/// Whether the connection options `url` resolves to already set
+/// `idle_in_transaction_session_timeout`: the URL's `options` parameter, in either of its forms,
+/// or `PGOPTIONS`, decoded. A URL that does not parse sets nothing here, and fails at connect.
+fn options_set_idle_transaction_timeout(url: &str) -> bool {
+    url.parse::<sqlx::postgres::PgConnectOptions>()
+        .ok()
+        .and_then(|options| {
+            options
+                .get_options()
+                .map(|options| option_names(options).any(|name| name == IDLE_TIMEOUT_PARAMETER))
+        })
+        .unwrap_or(false)
+}
+
+const IDLE_TIMEOUT_PARAMETER: &str = "idle_in_transaction_session_timeout";
+
+/// The parameter names a libpq `options` string assigns, as the server reads them: split on
+/// unescaped whitespace (a backslash escapes the next character), each assignment either `-c`
+/// followed by `name=value`, `-cname=value`, or `--name=value`, and the name compared lowercased
+/// with dashes as underscores. Anything else, a value included, names nothing.
+fn option_names(options: &str) -> impl Iterator<Item = String> + '_ {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => word.extend(chars.next()),
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
     }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut words = words.into_iter();
+    std::iter::from_fn(move || {
+        loop {
+            let word = words.next()?;
+            let assignment = if word == "-c" {
+                words.next()?
+            } else if let Some(rest) = word.strip_prefix("--") {
+                rest.to_owned()
+            } else if let Some(rest) = word.strip_prefix("-c") {
+                rest.to_owned()
+            } else {
+                continue;
+            };
+            if let Some((name, _)) = assignment.split_once('=') {
+                return Some(name.to_ascii_lowercase().replace('-', "_"));
+            }
+        }
+    })
 }
 
 /// A system database backed by PostgreSQL or CockroachDB.
@@ -387,7 +429,7 @@ pub struct PostgresSystemDatabase {
     /// Uncapped, enough waiters empty the pool and starve the control plane — enqueue, dequeue,
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
     /// longer happen. Python and TypeScript cap the same thing the same way; see
-    /// [`Settings::polling_concurrency`] for the size and [`polling_limit`] for the default.
+    /// [`Settings::polling_concurrency`] for the size.
     ///
     /// **A permit covers one query, never a wait.** A call site acquires, queries, and lets the
     /// permit drop before waiting. Held across the wait it would cap concurrent *waiters* rather
@@ -443,16 +485,31 @@ impl PostgresSystemDatabase {
     /// migrate a database you cannot connect to. Every other DBOS implementation does the same,
     /// so pointing a fresh application at an empty server is expected to work.
     pub async fn connect(config: &Config<'_>) -> Result<Self, Error> {
+        // Before anything touches the server, so a bad setting creates no database.
+        config.idle_transaction_timeout.validate()?;
+
         // Only when migrating. A caller that has opted out is saying the database is someone
         // else's to set up, and creating one here would hide the fact that it is missing.
         if config.migrate {
             ensure_database_exists(config.url).await?;
         }
 
-        let pool = PgPoolOptions::new()
-            .max_connections(config.max_connections)
-            .connect(config.url)
-            .await?;
+        let mut pool = PgPoolOptions::new().max_connections(config.max_connections);
+        if let Some(millis) = config.idle_transaction_timeout.millis()
+            && !options_set_idle_transaction_timeout(config.url)
+        {
+            pool = pool.after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "SET idle_in_transaction_session_timeout = {millis}"
+                    )))
+                    .execute(conn)
+                    .await?;
+                    Ok(())
+                })
+            });
+        }
+        let pool = pool.connect(config.url).await?;
 
         // Either bring the schema up, or check that whoever was supposed to has. Connecting to a
         // schema this build's queries do not fit is a failure either way; the only question is
@@ -478,10 +535,12 @@ impl PostgresSystemDatabase {
         let handle = Self {
             // The cap's default is read off the pool rather than off `config.max_connections`, so
             // that it is the same expression here and in `from_pool`, which never sees a `Config`.
-            polling: tokio::sync::Semaphore::new(polling_limit(
-                config.settings.polling_concurrency,
-                pool.options().get_max_connections(),
-            )),
+            polling: tokio::sync::Semaphore::new(
+                config
+                    .settings
+                    .polling_concurrency
+                    .permits(pool.options().get_max_connections()),
+            ),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             notifier: Arc::new(Notifier::new(
                 pool.clone(),
@@ -595,10 +654,11 @@ impl PostgresSystemDatabase {
         let notify: Arc<Registry> = Arc::default();
         Self {
             // A caller's pool knows its own size, so the default needs nothing passed alongside it.
-            polling: tokio::sync::Semaphore::new(polling_limit(
-                settings.polling_concurrency,
-                pool.options().get_max_connections(),
-            )),
+            polling: tokio::sync::Semaphore::new(
+                settings
+                    .polling_concurrency
+                    .permits(pool.options().get_max_connections()),
+            ),
             listener: Arc::new(Listener::new(pool.clone(), Arc::clone(&notify))),
             notifier: Arc::new(Notifier::new(
                 pool.clone(),
@@ -4788,17 +4848,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             }));
         }
 
-        // Exclusive, and before the first look for both reasons at once: registering after looking
-        // would miss a message that landed in between, and a second receiver has to be refused
-        // before it starts waiting rather than after it has waited out a timeout for a message it
-        // was never going to get.
-        let mut subscription = self
-            .notify
-            .subscribe_exclusive(message_key(workflow_id, topic))
-            .ok_or_else(|| Error::ConcurrentRecv {
-                workflow_id: workflow_id.to_owned(),
-                topic: topic.map(str::to_owned),
-            })?;
+        // Before the first look: registering after looking would miss a message that landed in
+        // between. Shared, not exclusive: a workflow resumed while its execution waits here has a
+        // second execution waiting beside it, and refusing that one would end it with an error
+        // although the message may well be its. Both wake, and the consuming statement gives the
+        // message to one of them.
+        let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
         // sixty seconds and crashed has ten left rather than sixty.
@@ -4844,8 +4899,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await;
         }
-        // Released here rather than at the end of the call: the taking below does not wait, and
-        // holding the topic through it would keep the next `recv` out for no reason.
+        // Released here rather than at the end of the call: the taking below does not wait, so
+        // there is nothing left to be woken for.
         drop(subscription);
 
         // Fixed here rather than inside the retry: `completed_at` is also what distinguishes this
@@ -7789,8 +7844,8 @@ impl PostgresSystemDatabase {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssertSqlSafe, NOW_MS_SQL, PostgresSystemDatabase, Settings, classify_sqlstate,
-        is_transport_failure, polling_limit, split_database, step_listing_query,
+        AssertSqlSafe, NOW_MS_SQL, PollingConcurrency, PostgresSystemDatabase, Settings,
+        classify_sqlstate, is_transport_failure, split_database, step_listing_query,
         timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
@@ -7910,30 +7965,34 @@ mod tests {
 
     #[test]
     fn the_default_polling_cap_is_half_the_pool() {
-        assert_eq!(polling_limit(None, 10), 5);
-        assert_eq!(polling_limit(None, 21), 10);
+        assert_eq!(PollingConcurrency::Default.permits(10), 5);
+        assert_eq!(PollingConcurrency::Default.permits(21), 10);
     }
 
     /// Half of one is zero, which as a cap would block every poll forever rather than allow a
     /// small number of them.
     #[test]
     fn a_pool_too_small_to_halve_still_admits_one_poll() {
-        assert_eq!(polling_limit(None, 1), 1);
-        assert_eq!(polling_limit(None, 0), 1);
+        assert_eq!(PollingConcurrency::Default.permits(1), 1);
+        assert_eq!(PollingConcurrency::Default.permits(0), 1);
     }
 
     #[test]
     fn a_configured_polling_cap_is_taken_as_given() {
-        assert_eq!(polling_limit(Some(3), 10), 3);
+        let at_most = |n| PollingConcurrency::AtMost(std::num::NonZeroU32::new(n).unwrap());
+        assert_eq!(at_most(3).permits(10), 3);
         // Above the pool size is the caller's business: this caps polling, the pool caps
-        // connections. Neither reference rejects it either.
-        assert_eq!(polling_limit(Some(100), 10), 100);
+        // connections.
+        assert_eq!(at_most(100).permits(10), 100);
     }
 
-    /// Off is a permit count nothing will exhaust, not an absent semaphore.
+    /// No cap is a permit count nothing will exhaust, not an absent semaphore.
     #[test]
-    fn zero_switches_the_polling_cap_off() {
-        assert_eq!(polling_limit(Some(0), 10), Semaphore::MAX_PERMITS);
+    fn an_unlimited_polling_cap_never_runs_out() {
+        assert_eq!(
+            PollingConcurrency::Unlimited.permits(10),
+            Semaphore::MAX_PERMITS
+        );
     }
 
     #[test]
@@ -8289,5 +8348,162 @@ mod tests {
             let plan = plan.join("\n");
             assert!(!plan.contains("Seq Scan"), "{kind}: {plan}");
         }
+    }
+
+    /// An idle session ending inside a transaction is a lost connection, and asked again.
+    #[test]
+    fn an_idle_transaction_timeout_is_retried_as_a_lost_connection() {
+        assert_eq!(
+            classify_sqlstate("25P03", None),
+            BackendErrorKind::Connection
+        );
+    }
+
+    /// **`connect` sets the idle-transaction timeout on its connections**: sixty seconds by
+    /// default, a positive value under a millisecond as a millisecond, and the server's own setting
+    /// for `ServerSetting`. Connection options that set it themselves keep their own, however they
+    /// spell it; one that only mentions it in a value doesn't count, and a pool the caller built is
+    /// left alone. Each is compared with the same server's reading of the value set directly, so
+    /// how a backend formats the setting doesn't matter.
+    #[tokio::test]
+    async fn connect_sets_the_idle_transaction_timeout() {
+        use super::IdleTransactionTimeout::{After, Default, ServerSetting};
+        async fn show(pool: &sqlx::PgPool) -> String {
+            sqlx::query_scalar("SHOW idle_in_transaction_session_timeout")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+        async fn connected(url: &str, timeout: super::IdleTransactionTimeout) -> String {
+            let sys = PostgresSystemDatabase::connect(&super::Config {
+                idle_transaction_timeout: timeout,
+                migrate: false,
+                ..super::Config::new(url)
+            })
+            .await
+            .expect("connect failed");
+            show(&sys.pool).await
+        }
+        let db = dbos_test_support::test_database().await;
+        let with = |query: &str| {
+            let separator = if db.url().contains('?') { '&' } else { '?' };
+            format!("{}{separator}{query}", db.url())
+        };
+        // What the server reports for `millis` set directly, on a pool `connect` didn't make.
+        let set_directly = async |millis: u64| {
+            let url = with(&format!(
+                "options=-c%20idle_in_transaction_session_timeout%3D{millis}"
+            ));
+            show(&sqlx::PgPool::connect(&url).await.unwrap()).await
+        };
+        let ms = std::time::Duration::from_millis;
+        let server = show(&db.pool().await).await;
+
+        assert_eq!(
+            connected(db.url(), Default).await,
+            set_directly(60_000).await
+        );
+        assert_eq!(
+            connected(db.url(), After(ms(300))).await,
+            set_directly(300).await
+        );
+        assert_eq!(
+            connected(db.url(), After(std::time::Duration::from_micros(500))).await,
+            set_directly(1).await,
+            "under a millisecond is a millisecond"
+        );
+        assert_eq!(connected(db.url(), ServerSetting).await, server);
+
+        let own = set_directly(1234).await;
+        for options in [
+            "options=-c%20idle_in_transaction_session_timeout%3D1234",
+            "options=-c%20IDLE%5FIN%5FTRANSACTION%5FSESSION%5FTIMEOUT%3D1234",
+            "options=--idle-in-transaction-session-timeout%3D1234",
+        ] {
+            assert_eq!(connected(&with(options), Default).await, own, "{options}");
+        }
+        // Neither of these sets the parameter, so the timeout is set: a bare query parameter is
+        // not a connection option, and a value that names the parameter assigns another one.
+        for query in [
+            "idle_in_transaction_session_timeout=1234",
+            "options=-c%20application_name%3Didle_in_transaction_session_timeout",
+        ] {
+            assert_eq!(
+                connected(&with(query), After(ms(300))).await,
+                set_directly(300).await,
+                "{query}"
+            );
+        }
+
+        let supplied = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        assert_eq!(
+            show(&supplied.pool).await,
+            server,
+            "a pool the caller built is left alone"
+        );
+    }
+
+    /// The names an `options` string assigns, in each form the server reads, and nothing else.
+    #[test]
+    fn option_names_are_read_as_the_server_reads_them() {
+        let names = |options| super::option_names(options).collect::<Vec<_>>();
+        assert_eq!(
+            names("-c a=1 -cB=2 --c-d=3 -c e\\ f=4"),
+            ["a", "b", "c_d", "e f"]
+        );
+        assert_eq!(
+            names("-c application_name=idle_in_transaction_session_timeout"),
+            ["application_name"]
+        );
+        assert!(names("-B 100 stray -c").is_empty());
+    }
+
+    /// **A transaction left idle is ended by the server**, after the timeout `connect` sets on its
+    /// connections, and the row lock it held goes with it. Checked on PostgreSQL; the setting
+    /// itself is checked on both backends above.
+    #[tokio::test]
+    async fn connect_ends_transactions_left_idle() {
+        let db = dbos_test_support::test_database().await;
+        if db.backend() == dbos_test_support::Backend::Cockroach {
+            return;
+        }
+        let sys = PostgresSystemDatabase::connect(&super::Config {
+            idle_transaction_timeout: super::IdleTransactionTimeout::After(
+                std::time::Duration::from_millis(300),
+            ),
+            migrate: false,
+            ..super::Config::new(db.url())
+        })
+        .await
+        .expect("connect failed");
+
+        sys.init_workflow(&NewWorkflow::new("wf-idle"), None, Submission::Fresh, None)
+            .await
+            .unwrap();
+        let table = sys.tables.workflow_status.as_str();
+        let mut idle = sys.pool.begin().await.unwrap();
+        sqlx::query(AssertSqlSafe(format!(
+            "SELECT status FROM {table} WHERE workflow_uuid = 'wf-idle' FOR NO KEY UPDATE"
+        )))
+        .execute(&mut *idle)
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // The lock went with the session, so another write goes through at once.
+        let other = db.pool().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {table} SET updated_at = updated_at WHERE workflow_uuid = 'wf-idle'"
+            )))
+            .execute(&other),
+        )
+        .await
+        .expect("the idle transaction still holds its lock")
+        .unwrap();
+        assert!(
+            sqlx::query("SELECT 1").execute(&mut *idle).await.is_err(),
+            "the idle transaction's session was ended"
+        );
     }
 }
