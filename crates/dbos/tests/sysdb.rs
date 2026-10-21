@@ -12206,6 +12206,35 @@ async fn the_timeout_sweep_takes_the_oldest_deadlines_first_up_to_its_limit() {
     );
 }
 
+/// **A run's own timeout cancel lands only while the run still owns the workflow.** A run that has
+/// lost it leaves the timeout to the sweep and to the new owner, as it does every other write; the
+/// owner's cancel goes through once the database's clock is past the deadline.
+#[tokio::test]
+async fn a_timeout_cancel_lands_only_for_the_owner() {
+    let (sys, _db) = sysdb().await;
+    let past = NewWorkflow {
+        deadline: Some(Timestamp::from_epoch_ms(1_000)),
+        ..workflow("wf-expired")
+    };
+    sys.init_workflow(&past, None).await.unwrap();
+    let row = sys.get_workflow("wf-expired").await.unwrap().unwrap();
+    let owner = row.owner_xid.expect("a started row is owned");
+
+    assert!(
+        !sys.cancel_if_timed_out("wf-expired", "a-stale-run")
+            .await
+            .unwrap(),
+        "a run that lost the workflow cancelled it"
+    );
+    let row = sys.get_workflow("wf-expired").await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Pending);
+
+    assert!(sys.cancel_if_timed_out("wf-expired", &owner).await.unwrap());
+    let row = sys.get_workflow("wf-expired").await.unwrap().unwrap();
+    assert_eq!(row.status, WorkflowStatus::Cancelled);
+    assert_eq!(row.owner_xid, None, "the cancel clears the owner");
+}
+
 /// **The owner token through a workflow's life.** A claim writes its own token, a different one
 /// per claim; an outcome write lands only for the current owner; and every hand-off (a cancel, a
 /// resume, recovery's re-enqueue, and the outcome itself) clears it, so the execution that held

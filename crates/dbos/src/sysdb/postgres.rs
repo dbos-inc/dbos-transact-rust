@@ -4055,16 +4055,18 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error> {
+    async fn cancel_if_timed_out(&self, workflow_id: &str, owner_xid: &str) -> Result<bool, Error> {
         let workflow_table = &self.tables.workflow_status;
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         with_retry(&self.retry, "cancel_if_timed_out", move || async move {
             let moved = sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {workflow_table} SET {set} WHERE workflow_uuid = $1 AND {timed_out}",
+                "UPDATE {workflow_table} SET {set} \
+                 WHERE workflow_uuid = $1 AND owner_xid = $2 AND {timed_out}",
                 set = timed_out_set_sql(),
                 timed_out = timed_out_where_sql(),
             )))
             .bind(workflow_id)
+            .bind(owner_xid)
             .execute(pool)
             .await?
             .rows_affected();

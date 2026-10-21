@@ -503,7 +503,10 @@ pub trait SystemDatabase: Send + Sync {
     /// sweep reaching the row. It writes what
     /// [`cancel_timed_out_workflows`](Self::cancel_timed_out_workflows) writes, and decides
     /// expiry on the same clock.
-    async fn cancel_if_timed_out(&self, workflow_id: &str) -> Result<bool, Error>;
+    ///
+    /// **Only while `owner_xid` still owns the workflow**, like every other write an execution
+    /// makes. A run that has lost the workflow leaves its timeout to the sweep and to the new owner.
+    async fn cancel_if_timed_out(&self, workflow_id: &str, owner_xid: &str) -> Result<bool, Error>;
 
     /// Cancels workflows, returning the ids that actually moved.
     ///

@@ -2008,7 +2008,7 @@ enum Ended {
 /// Records the timeout of a workflow whose local timer fired, and settles on what the row holds.
 ///
 /// **Cancelled only if the database's clock says the deadline has passed**, the same test the
-/// timeout sweep makes. The timer is measured on that clock, so the two normally agree; the test is
+/// timeout sweep makes, and only while this execution still owns the workflow. The timer is measured on that clock, so the two normally agree; the test is
 /// what keeps a timer that fires a moment early, inside a reading's millisecond, from cancelling a
 /// workflow early.
 ///
@@ -2022,10 +2022,15 @@ enum Ended {
 async fn time_out(
     executor: &Executor,
     workflow_id: &str,
+    owner_xid: &str,
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
     drop(slot);
-    match executor.sysdb().cancel_if_timed_out(workflow_id).await {
+    match executor
+        .sysdb()
+        .cancel_if_timed_out(workflow_id, owner_xid)
+        .await
+    {
         Ok(true) => {
             tracing::info!(
                 workflow_id,
@@ -2081,7 +2086,7 @@ async fn execute(
     .await
     {
         Ended::Body(outcome) => outcome,
-        Ended::DeadlinePassed => return time_out(executor, workflow_id, slot).await,
+        Ended::DeadlinePassed => return time_out(executor, workflow_id, &owner_xid, slot).await,
     };
 
     let write = match &outcome {
