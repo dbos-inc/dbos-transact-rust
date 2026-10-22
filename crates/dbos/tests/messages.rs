@@ -6,7 +6,7 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::{Config, DBOS, Error, Forks, Message, SendOptions};
+use dbos::{Config, DBOS, Error, Forks, SendMessage, SendOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -211,7 +211,7 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
         .expect("the workflow never reached its gate");
 
     dbos.send_with(
-        Message::new(&workflow_id, &"yes").topic("approvals"),
+        SendMessage::new(&workflow_id, &"yes").topic("approvals"),
         SendOptions::default(),
     )
     .await
@@ -478,9 +478,9 @@ async fn a_step_may_send_but_may_not_receive() {
 /// forked from its destination, and with the default it does not.
 ///
 /// The fan-out itself is `sysdb`'s and is tested there. What this pins is the engine mapping —
-/// `SendOptions::forks` becoming the flag `sysdb` takes — which `Connection::send_message` does
-/// identically for all three single-send surfaces, so exercising it through one covers them all.
-/// `Connection::send_messages` maps it the same way for the batch, which
+/// `SendOptions::send_to_forks` becoming the flag `sysdb` takes — which `Connection::send_message`
+/// does identically for all three single-send surfaces, so exercising it through one covers them
+/// all. `Connection::send_messages` maps it the same way for the batch, which
 /// [`a_workflows_batch_is_one_checkpoint`] reaches.
 #[tokio::test]
 async fn a_send_may_fan_out_to_the_destinations_forks() {
@@ -523,9 +523,9 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
 
     // Asking for the fan-out reaches both.
     dbos.send_with(
-        Message::new(&original_id, &"included"),
+        SendMessage::new(&original_id, &"included"),
         SendOptions {
-            forks: Forks::Include,
+            send_to_forks: Forks::Include,
             ..Default::default()
         },
     )
@@ -565,10 +565,13 @@ async fn a_workflows_batch_is_one_checkpoint() {
         dbos.register_workflow("broadcasts", move |ids: Vec<String>| {
             let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
             async move {
-                dbos::send_bulk(&[Message::new(&ids[0], &"one"), Message::new(&ids[1], &"two")])
-                    .await?;
+                dbos::send_bulk(&[
+                    SendMessage::new(&ids[0], &"one"),
+                    SendMessage::new(&ids[1], &"two"),
+                ])
+                .await?;
                 // A batch of one: still `DBOS.send_bulk`, because that is the surface reached for.
-                dbos::send_bulk(&[Message::new(&ids[0], &"alone")]).await?;
+                dbos::send_bulk(&[SendMessage::new(&ids[0], &"alone")]).await?;
                 reached.notify_one();
                 release.notified().await;
                 Ok::<_, dbos::Error>(())

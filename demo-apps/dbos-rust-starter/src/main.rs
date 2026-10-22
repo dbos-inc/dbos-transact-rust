@@ -589,7 +589,7 @@ async fn messages_respond(
 ) -> Result<(), AppError> {
     app.dbos
         .send_with(
-            dbos::Message::new(&request.workflow_id, &request.decision).topic(APPROVAL_TOPIC),
+            dbos::SendMessage::new(&request.workflow_id, &request.decision).topic(APPROVAL_TOPIC),
             dbos::SendOptions::default(),
         )
         .await?;
@@ -624,9 +624,9 @@ async fn messages_respond_all(
             waiting.push(id);
         }
     }
-    let messages: Vec<dbos::Message<'_, String>> = waiting
+    let messages: Vec<dbos::SendMessage<'_, String>> = waiting
         .iter()
-        .map(|id| dbos::Message::new(id, &request.decision).topic(APPROVAL_TOPIC))
+        .map(|id| dbos::SendMessage::new(id, &request.decision).topic(APPROVAL_TOPIC))
         .collect();
     app.dbos.send_bulk(&messages).await?;
     Ok(messages.len().to_string())

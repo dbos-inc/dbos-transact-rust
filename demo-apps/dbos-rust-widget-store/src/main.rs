@@ -207,7 +207,7 @@ async fn payment_endpoint(
 ) -> Result<String, AppError> {
     app.dbos
         .send_with(
-            dbos::Message::new(&payment_id, &payment_status).topic(PAYMENT_STATUS),
+            dbos::SendMessage::new(&payment_id, &payment_status).topic(PAYMENT_STATUS),
             dbos::SendOptions::default(),
         )
         .await?;

@@ -11,10 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use dbos::{
-    Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error, Message,
+    Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
     PortableWorkflowArgs, QueueConflict, QueueOptions, ScheduleSpec, ScheduledWorkflowInput,
-    SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
-    WriteStreamOptions,
+    SendMessage, SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey,
+    WorkflowOptions, WriteStreamOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -185,7 +185,7 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
         .unwrap();
     client
         .send_with(
-            Message::new(
+            SendMessage::new(
                 handle.workflow_id(),
                 &InteropMessage {
                     sender: "test".to_owned(),

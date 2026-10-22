@@ -16,7 +16,7 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, ForkOptions, Message, QueueChange, QueueConflict, QueueOptions,
+    EnqueueOptions, Error, ForkOptions, QueueChange, QueueConflict, QueueOptions, SendMessage,
     SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
@@ -468,12 +468,12 @@ async fn a_message_waits_for_its_destination() {
 
     client
         .send_with(
-            Message::new(&id, &"approved").topic("approvals"),
+            SendMessage::new(&id, &"approved").topic("approvals"),
             SendOptions::default(),
         )
         .await
         .expect("send failed");
-    let once = Message::new(&id, &"only once").idempotency_key("once");
+    let once = SendMessage::new(&id, &"only once").idempotency_key("once");
     client
         .send_with(once.clone(), SendOptions::default())
         .await
@@ -523,9 +523,9 @@ async fn a_batch_of_messages_lands_together() {
 
     client
         .send_bulk(&[
-            Message::new(&first, &"one"),
-            Message::new(&second, &"two"),
-            Message::new(&first, &"three"),
+            SendMessage::new(&first, &"one"),
+            SendMessage::new(&second, &"two"),
+            SendMessage::new(&first, &"three"),
         ])
         .await
         .expect("send failed");
@@ -552,8 +552,8 @@ async fn a_batch_of_messages_lands_together() {
     // insert, which is the guarantee a batch buys over a loop of sends.
     let error = client
         .send_bulk(&[
-            Message::new(&first, &"four"),
-            Message::new("no-such-workflow", &"five"),
+            SendMessage::new(&first, &"four"),
+            SendMessage::new("no-such-workflow", &"five"),
         ])
         .await
         .expect_err("a message addressed to nothing should fail");
