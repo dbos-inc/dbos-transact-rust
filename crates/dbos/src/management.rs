@@ -121,11 +121,11 @@ use std::time::Duration;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::connection::Connection;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, input_refusal};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
-    Fork, ForkOptions as SysForkOptions, RewindOptions as SysRewindOptions, StepRecord,
+    Fork, ForkOptions as SysForkOptions, RewindOptions as SysRewindOptions, StepRecord, Timestamp,
     WorkflowDelay, WorkflowFilter, WorkflowRecord, step_names,
 };
 
@@ -935,6 +935,9 @@ impl DBOS {
     /// [`WorkflowDelay::Until`] removes the first of those readings: an absolute instant is
     /// written as given, and nothing on this path consults a clock to do it.
     ///
+    /// A [`WorkflowDelay::For`] whose release instant cannot be stored, as epoch milliseconds in an
+    /// `i64`, is [`Error::InvalidArgument`], refused before the call takes a step id.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// use std::time::Duration;
@@ -947,9 +950,15 @@ impl DBOS {
         workflow_id: &'a str,
         delay: WorkflowDelay,
     ) -> PendingStep<'a, ()> {
+        // The argument check between the launch check and the placement, so a delay that cannot
+        // be stored refuses the call without moving the workflow's step counter.
+        let built = self.executor("delay a workflow").and_then(|executor| {
+            refuse_unstorable_delay(delay)?;
+            StepPlacement::taken(Ok(executor), "delay a workflow")
+        });
         PendingStep::placed(
             step_names::SET_WORKFLOW_DELAY,
-            self.placed("delay a workflow"),
+            built,
             move |executor, placement| async move {
                 executor
                     .connection()
@@ -1313,6 +1322,7 @@ impl crate::Client {
     /// See [`DBOS::set_workflow_delay`]. Only a `DELAYED` row moves: a workflow already released is
     /// running or queued, and pushing its delay out would not recall it.
     pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
+        refuse_unstorable_delay(delay)?;
         self.connection()
             .set_workflow_delay(workflow_id, delay, None)
             .await
@@ -1639,6 +1649,21 @@ fn refuse_negative_start_step(operation: &'static str, field: &str, start_step: 
         });
     }
     Ok(())
+}
+
+/// Refuses a relative delay whose release instant cannot be stored.
+///
+/// Made by the surfaces rather than inside the connection, as [`refuse_negative_start_step`] is,
+/// so a refused call spends no step id. Resolved against this process's clock, as the write will
+/// resolve it; the system database refuses the same delay again for its own callers.
+fn refuse_unstorable_delay(delay: WorkflowDelay) -> Result<()> {
+    match delay.resolve(Timestamp::now()) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(Error::InvalidArgument {
+            operation: "delay a workflow".into(),
+            detail: input_refusal(error),
+        }),
+    }
 }
 
 /// Refuses a chosen fork id on a call that may produce many forks.

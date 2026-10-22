@@ -518,6 +518,20 @@ impl<E> From<E> for Error<E> {
     }
 }
 
+/// A system-database refusal of one input, phrased for a surface that names the call itself:
+/// "`delay` must fit in milliseconds as a 64-bit integer".
+///
+/// For a surface that refuses an argument **before it takes a step id**, by asking the system
+/// database's own check rather than restating it: the two then cannot disagree about what is
+/// storable, and the system database still refuses the same value for callers that reach it
+/// directly.
+pub(crate) fn input_refusal(error: crate::sysdb::Error) -> String {
+    match error {
+        crate::sysdb::Error::InvalidInput { field, detail } => format!("`{field}` {detail}"),
+        other => other.to_string(),
+    }
+}
+
 impl<E> Error<E> {
     /// A system-database failure, in the engine's terms.
     ///

@@ -402,6 +402,9 @@ pub trait SystemDatabase: Send + Sync {
     /// write and its step checkpoint **commit together** — see
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
+    ///
+    /// A [`WorkflowDelay::For`] whose release instant cannot be stored as epoch milliseconds in an
+    /// `i64` is [`Error::InvalidInput`], refused before anything is written.
     async fn set_workflow_delay(
         &self,
         workflow_id: &str,
@@ -1059,6 +1062,9 @@ pub trait SystemDatabase: Send + Sync {
     /// not taken a minute. Python and TypeScript expose that as a flag on this method; here it is
     /// the implementation's business, because no caller of *this* method wants it — a caller
     /// registering a deadline is calling the blocking read, not recording a sleep by hand.
+    ///
+    /// A `duration` whose wake time cannot be stored as epoch milliseconds in an `i64` is
+    /// [`Error::InvalidInput`], refused before anything is written.
     async fn record_sleep(
         &self,
         workflow_id: &str,

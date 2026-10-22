@@ -6282,6 +6282,181 @@ async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
     );
 }
 
+/// A workflow timeout or delay that cannot be stored is refused rather than truncated, and the
+/// refusal writes nothing.
+///
+/// Three ways to get there: a timeout and a delay too long to be milliseconds in an `i64` at all,
+/// and a delay that fits on its own but carries `now` past the largest instant.
+#[tokio::test]
+async fn a_workflow_timeout_or_delay_that_cannot_be_stored_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let cases = [
+        (
+            "timeout",
+            NewWorkflow {
+                timeout: Some(std::time::Duration::MAX),
+                ..workflow("wf-huge-timeout")
+            },
+        ),
+        (
+            "delay",
+            NewWorkflow {
+                queue_name: Some("orders"),
+                delay: Some(std::time::Duration::MAX),
+                ..workflow("wf-huge-delay")
+            },
+        ),
+        (
+            "delay",
+            NewWorkflow {
+                queue_name: Some("orders"),
+                delay: Some(std::time::Duration::from_millis(i64::MAX as u64)),
+                ..workflow("wf-overflowing-delay")
+            },
+        ),
+    ];
+
+    for (expected_field, wf) in cases {
+        match sys.init_workflow(&wf, None).await {
+            Err(Error::InvalidInput { field, .. }) => assert_eq!(
+                field, expected_field,
+                "the wrong field was blamed for {}",
+                wf.workflow_id,
+            ),
+            other => panic!("expected {} to be refused, got {other:?}", wf.workflow_id),
+        }
+    }
+
+    let all = sys
+        .list_workflows(&WorkflowFilter::default(), None)
+        .await
+        .unwrap();
+    assert!(all.is_empty(), "a refused workflow must leave no row");
+}
+
+/// A relative delay whose release instant cannot be stored is refused, and the row keeps the
+/// delay it had.
+#[tokio::test]
+async fn a_moved_delay_that_cannot_be_stored_is_refused() {
+    let (sys, _db) = sysdb().await;
+    let wf = NewWorkflow {
+        queue_name: Some("orders"),
+        delay: Some(std::time::Duration::from_secs(3600)),
+        ..NewWorkflow::new("wf-delayed")
+    };
+    sys.init_workflow(&wf, None).await.unwrap();
+    let before = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
+
+    let result = sys
+        .set_workflow_delay(
+            "wf-delayed",
+            WorkflowDelay::For(std::time::Duration::MAX),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+        ),
+        "expected the delay to be refused, got {result:?}"
+    );
+
+    let after = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
+    assert_eq!(
+        after.delay_until, before.delay_until,
+        "a refused delay moved the row"
+    );
+    assert_eq!(after.status, WorkflowStatus::Delayed);
+}
+
+/// A durable sleep whose wake time cannot be stored is refused, and records no step.
+///
+/// A replay would read back whatever the first run recorded, so recording a wrapped wake time
+/// would wake the workflow at the wrong instant on every execution. The slot stays free: a sleep
+/// that can be stored records there afterwards.
+#[tokio::test]
+async fn a_sleep_that_cannot_be_stored_is_refused() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-sleeper"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&sys, "wf-sleeper").await;
+
+    let result = sys
+        .record_sleep("wf-sleeper", 0, std::time::Duration::MAX, &owner)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput { ref field, .. }) if field == "duration"
+        ),
+        "expected the sleep to be refused, got {result:?}"
+    );
+    assert!(
+        sys.check_step("wf-sleeper", 0, "DBOS.sleep")
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused sleep recorded a step",
+    );
+
+    sys.record_sleep("wf-sleeper", 0, std::time::Duration::ZERO, &owner)
+        .await
+        .expect("the slot a refused sleep left should still be free");
+}
+
+/// A deadline too far out to store is one that never elapses, not a refusal.
+///
+/// The read asked to wait as long as it takes, and the largest instant there is says exactly
+/// that — the answer the same read gets outside a workflow, where no deadline is recorded.
+#[tokio::test]
+async fn a_read_deadline_too_far_out_to_store_never_elapses() {
+    let (sys, _db) = sysdb().await;
+    publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
+    sys.set_event(
+        "wf-publisher",
+        0,
+        "progress",
+        "50",
+        None,
+        &owner_token(&sys, "wf-publisher").await,
+    )
+    .await
+    .unwrap();
+
+    let found = sys
+        .get_event(
+            "wf-publisher",
+            "progress",
+            std::time::Duration::MAX,
+            Some(GetEventCaller {
+                workflow_id: "wf-reader",
+                step_id: 0,
+                timeout_step_id: 1,
+                owner_xid: &owner_token(&sys, "wf-reader").await,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(found.is_some(), "the published value should have been read");
+
+    let deadline: i64 = sys
+        .check_step("wf-reader", 1, "DBOS.sleep")
+        .await
+        .unwrap()
+        .expect("the deadline is checkpointed")
+        .output
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        deadline,
+        i64::MAX,
+        "the deadline should be held at the largest instant"
+    );
+}
+
 /// Forking a parent rewrites the children it recorded, so it adopts the forked ones.
 ///
 /// Also the guard for the `start_step > 0` boundary: forking from step 1 must carry step 0. It is

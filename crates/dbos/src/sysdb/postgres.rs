@@ -91,8 +91,8 @@ use super::types::{
     ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
     StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
     WorkflowFilter, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value,
-    duration_from_ms, duration_from_secs, encode_step_value, is_valid_application_name,
-    validate_attributes,
+    duration_from_ms, duration_from_secs, duration_to_ms, encode_step_value,
+    is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -2681,8 +2681,20 @@ impl PostgresSystemDatabase {
         // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
         // the clock per attempt would push it further out each time.
         let started_at = Timestamp::now();
-        let wake_at =
-            Timestamp::from_epoch_ms(started_at.as_epoch_ms() + duration.as_millis() as i64);
+        // Settled before the retry, and so before any write.
+        //
+        // A sleep whose wake time cannot be stored is refused: the caller asked to be woken at an
+        // instant this layer cannot record, and recording a different one would wake it at the
+        // wrong time on every replay. A deadline is different, because it bounds a wait rather
+        // than being the wait: one too far out to store is one that never elapses, which is what
+        // the caller asked for, so it is held at the largest instant there is — the same answer
+        // `get_event` gives outside a workflow, where no deadline is recorded at all.
+        let wake_at = match kind {
+            SleepKind::Durable => started_at.try_add("duration", duration)?,
+            SleepKind::Deadline => started_at
+                .checked_add(duration)
+                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX)),
+        };
 
         with_retry(&self.retry, "checkpoint_sleep", move || async move {
             // A transaction for the owner check, which locks the workflow's row until the record
@@ -2709,7 +2721,7 @@ impl PostgresSystemDatabase {
             tracing::debug!(
                 workflow_id,
                 step_id,
-                duration_ms = duration.as_millis() as u64,
+                duration_ms = duration.as_millis(),
                 "running sleep"
             );
 
@@ -3067,10 +3079,19 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // TODO(dbos-team): UPSTREAM item 22. The delay should resolve against the database clock,
         // read once outside the retry.
+        //
+        // `validate` has already refused a delay or a timeout too long to store as milliseconds,
+        // but a delay that fits can still carry `now` past the largest instant, which only the
+        // resolution can see. Both are settled here, before the retry and before any write.
         let now = Timestamp::now();
         let delay_until = workflow
             .delay
-            .map(|d| Timestamp::from_epoch_ms(now.as_epoch_ms() + d.as_millis() as i64));
+            .map(|d| WorkflowDelay::For(d).resolve(now))
+            .transpose()?;
+        let timeout_ms = workflow
+            .timeout
+            .map(|d| duration_to_ms("timeout", d))
+            .transpose()?;
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
@@ -3161,7 +3182,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.application_version)
             .bind(workflow.application_id)
             .bind(initial_attempts)
-            .bind(workflow.timeout.map(|d| d.as_millis() as i64))
+            .bind(timeout_ms)
             .bind(workflow.deadline.map(Timestamp::as_epoch_ms))
             // The child's own back-pointer, from the caller that is also recording the start:
             // one value, both rows, no way for them to name different parents.
@@ -3902,7 +3923,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // TODO(dbos-team): UPSTREAM item 22, as on `init_workflow`.
         let now = Timestamp::now();
-        let delay_until = delay.resolve(now).as_epoch_ms();
+        // Refused here, before any write, when the instant cannot be stored.
+        let delay_until = delay.resolve(now)?.as_epoch_ms();
         let workflow_table = workflow_table.as_str();
         let started_at = Timestamp::now();
 

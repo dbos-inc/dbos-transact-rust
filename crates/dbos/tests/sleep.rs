@@ -111,3 +111,54 @@ async fn a_sleep_outside_a_workflow_waits_plainly() {
         .expect("the sleep failed");
     assert!(before.elapsed() >= Duration::from_millis(45));
 }
+
+/// A sleep whose wake time cannot be recorded is refused at the call, before it takes a step id.
+///
+/// Inside a workflow the refusal must move no counter: the step written after it takes the id the
+/// sleep would have had, and nothing is recorded for the sleep itself.
+#[tokio::test]
+async fn a_sleep_that_cannot_be_recorded_is_refused_and_spends_no_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refused-sleep-app", &db));
+    let workflow = dbos
+        .register_workflow("oversleeps", |()| async move {
+            let refused = dbos::sleep::<dbos::Error>(Duration::MAX).await;
+            assert!(
+                matches!(refused, Err(dbos::Error::InvalidArgument { .. })),
+                "a sleep that cannot be recorded should be refused, got {refused:?}"
+            );
+            dbos::step("after", || async { Ok(()) }).await?;
+            Ok::<u32, dbos::Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-refused-sleeper";
+    workflow
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "after")],
+        "a refused sleep took the step id the step after it should have had",
+    );
+
+    dbos.shutdown().await;
+}

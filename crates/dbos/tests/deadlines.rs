@@ -830,3 +830,45 @@ async fn a_timeout_holds_when_the_database_clock_runs_ahead() {
 async fn a_timeout_holds_when_the_database_clock_runs_behind() {
     timeouts_hold_with_the_database_clock_off_by(-60).await;
 }
+
+/// A workflow timeout the row cannot hold is refused before anything is written.
+///
+/// The budget is stored as milliseconds in an `i64`; one too long for that is refused with the
+/// start's other argument checks rather than truncated into the column.
+#[tokio::test]
+async fn a_timeout_the_row_cannot_hold_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unstorable-timeout-app", &db));
+    let workflow = dbos
+        .register_workflow("bounded", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "never-started";
+    let refused = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                timeout: Timeout::Explicit(Duration::MAX),
+                ..StartOptions::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::Config(message)) if message.contains("`timeout`")),
+        "expected the timeout to be refused, got {:?}",
+        refused.map(|_| ())
+    );
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .is_none(),
+        "a refused start wrote a row"
+    );
+
+    dbos.shutdown().await;
+}

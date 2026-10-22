@@ -1911,6 +1911,102 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
     dbos.shutdown().await;
 }
 
+/// A child start whose timeout or delay the row cannot hold is refused before it takes a step id.
+///
+/// Both are refused with the start's other argument checks, ahead of the placement, so the
+/// parent's counter does not move: the step written after them takes the id the first start would
+/// have had, and no child row is created under any derived id.
+#[tokio::test]
+async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("refused-duration-child-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                let refused = child
+                    .start_with(
+                        (),
+                        StartOptions {
+                            timeout: Timeout::Explicit(Duration::MAX),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await;
+                assert!(
+                    matches!(&refused, Err(Error::Config(message)) if message.contains("`timeout`")),
+                    "a timeout the row cannot hold should be refused, got {:?}",
+                    refused.map(|_| ())
+                );
+
+                let refused = child
+                    .start_with(
+                        (),
+                        StartOptions {
+                            queue: Some(Enqueue {
+                                delay: Some(Duration::MAX),
+                                ..Enqueue::new("never-reached")
+                            }),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await;
+                assert!(
+                    matches!(&refused, Err(Error::Config(message)) if message.contains("`delay`")),
+                    "a delay the row cannot hold should be refused, got {:?}",
+                    refused.map(|_| ())
+                );
+
+                dbos::step("after", || async { Ok(()) }).await?;
+                Ok::<u32, Error>(1)
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "refuses-its-children";
+    parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(0, "after")],
+        "a refused start took the step id the step after it should have had",
+    );
+    for child_id in [format!("{id}-0"), format!("{id}-1")] {
+        assert!(
+            reader
+                .get_workflow(&child_id)
+                .await
+                .expect("read failed")
+                .is_none(),
+            "a refused start created {child_id}"
+        );
+    }
+
+    dbos.shutdown().await;
+}
+
 /// A `WorkflowRef` from another instance cannot start a child of this workflow.
 ///
 /// The second place [`Error::WrongInstance`] is reachable from, and the reason it exists: the step

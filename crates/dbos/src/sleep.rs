@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
-use crate::error::{DurableError, Error};
+use crate::error::{DurableError, Error, input_refusal};
 use crate::sysdb::types::{Timestamp, step_names};
 
 /// Waits for `duration`, resuming at the **original** wake time after a crash.
@@ -38,6 +38,12 @@ use crate::sysdb::types::{Timestamp, step_names};
 ///
 /// A zero or negative duration is not an error: it records the checkpoint and returns, so a
 /// computed delay that has already elapsed behaves the same on the first run and on a replay.
+///
+/// **A duration whose wake time cannot be recorded is [`Error::InvalidArgument`]**: one that does
+/// not fit in milliseconds as a 64-bit integer, or that carries the wake time past the largest
+/// instant those can hold. Refused at the call, before the step id is taken, so a refused sleep
+/// moves no counter — and refused outside a workflow too, so the same call does not succeed or
+/// fail depending on where it is written.
 pub fn sleep<E>(duration: Duration) -> PendingStep<'static, (), E>
 where
     E: DurableError + 'static,
@@ -50,8 +56,20 @@ where
     // The executor comes off the placement rather than from a second read of the ambient context,
     // so the two cannot disagree about whether there is one: that is the invariant the run below
     // leans on when it asks for an executor and an id together.
-    let placement = StepPlacement::here();
-    let built = Ok((placement.executor().map(Arc::clone), placement));
+    //
+    // The duration is checked first, against the system database's own rule for the wake time it
+    // would record, so a refusal claims no id. Read against this process's clock, as the record
+    // will be; the system database refuses the same duration again for its own callers.
+    let built = match Timestamp::now().try_add("duration", duration) {
+        Err(error) => Err(Error::InvalidArgument {
+            operation: "sleep".into(),
+            detail: input_refusal(error),
+        }),
+        Ok(_) => {
+            let placement = StepPlacement::here();
+            Ok((placement.executor().map(Arc::clone), placement))
+        }
+    };
     PendingStep::placed(
         step_names::SLEEP,
         built,
@@ -95,4 +113,25 @@ where
             Ok(())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Outside a workflow too, so the same call does not succeed in one place and fail in another.
+    #[tokio::test]
+    async fn a_sleep_that_cannot_be_recorded_is_refused_outside_a_workflow() {
+        let refused = sleep::<crate::error::EngineOnly>(Duration::MAX).await;
+        match refused {
+            Err(Error::InvalidArgument { operation, detail }) => {
+                assert_eq!(operation, "sleep");
+                assert_eq!(
+                    detail,
+                    "`duration` must fit in milliseconds as a 64-bit integer"
+                );
+            }
+            other => panic!("expected the sleep to be refused, got {other:?}"),
+        }
+    }
 }

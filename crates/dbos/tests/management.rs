@@ -3045,6 +3045,15 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                         "a negative step should be refused"
                     );
 
+                    // Nor an instant past the largest the row can hold to release at.
+                    let refused = dbos
+                        .set_workflow_delay(&id, dbos::WorkflowDelay::For(Duration::MAX))
+                        .await;
+                    assert!(
+                        matches!(refused, Err(Error::InvalidArgument { .. })),
+                        "a delay that cannot be stored should be refused"
+                    );
+
                     dbos::step("after", || async { Ok(()) }).await?;
                     Ok::<(), Error>(())
                 }

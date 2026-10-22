@@ -70,7 +70,9 @@ use crate::serialization::Serializer;
 use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode_input};
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
-use crate::workflow::{Enqueue, Submitted, encode_attributes, init_or_join, new_row};
+use crate::workflow::{
+    Enqueue, Submitted, encode_attributes, init_or_join, new_row, validate_timeout,
+};
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
 /// Everything a [`Client`] needs.
@@ -409,6 +411,7 @@ impl Client {
         // Refused before the input is encoded, as before anything is written: an enqueue no queue
         // could honour should not spend the encoding either.
         options.queue.validate()?;
+        validate_timeout(options.timeout)?;
         let encoding = PayloadEncoding::resolve(
             options.queue.serialization,
             self.connection().serializer().encoding(),
@@ -443,6 +446,7 @@ impl Client {
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         options.queue.validate()?;
+        validate_timeout(options.timeout)?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
         self.enqueue_encoded(workflow, &input, PayloadEncoding::Portable, options)
             .await
