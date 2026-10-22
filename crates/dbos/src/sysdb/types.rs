@@ -865,22 +865,6 @@ mod tests {
         }
     }
 
-    /// A deadline of the largest instant becomes a capped wait rather than an `Instant` overflow,
-    /// and a deadline within the cap is waited for exactly.
-    #[test]
-    fn the_largest_deadline_is_waited_for_far_ahead_without_overflowing() {
-        let clock = DatabaseTime::read(1_000);
-        assert_eq!(
-            clock.reaches(Timestamp::from_epoch_ms(i64::MAX)),
-            clock.read_at + DatabaseTime::FAR_FUTURE
-        );
-        assert_eq!(
-            clock.reaches(Timestamp::from_epoch_ms(61_000)),
-            clock.read_at + Duration::from_secs(60)
-        );
-        assert_eq!(clock.reaches(Timestamp::from_epoch_ms(0)), clock.read_at);
-    }
-
     /// An instant plus a caller's duration is refused, not wrapped, past the largest instant.
     #[test]
     fn an_instant_past_the_largest_is_refused_not_wrapped() {
@@ -1507,19 +1491,10 @@ impl DatabaseTime {
 
     /// When, on this process's monotonic clock, the database's clock reaches `instant`: the
     /// moment of the reading for an instant already behind it.
-    ///
-    /// **Capped at thirty years ahead of the reading.** How far an [`Instant`] can reach depends
-    /// on the platform, and adding past it panics; a deadline of the largest storable instant,
-    /// which is what a timeout too long to store becomes, is far beyond it. No process waits that
-    /// long, so a wait capped there is one that never elapses.
     pub fn reaches(self, instant: Timestamp) -> Instant {
         let ahead = instant.as_epoch_ms().saturating_sub(self.epoch_ms);
-        let wait = Duration::from_millis(u64::try_from(ahead).unwrap_or(0));
-        self.read_at + wait.min(Self::FAR_FUTURE)
+        self.read_at + Duration::from_millis(u64::try_from(ahead).unwrap_or(0))
     }
-
-    /// The longest wait [`reaches`](Self::reaches) hands back: thirty years.
-    const FAR_FUTURE: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
 }
 
 /// What the database said about a workflow after initialising it.
