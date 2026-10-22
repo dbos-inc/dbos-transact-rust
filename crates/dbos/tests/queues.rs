@@ -1507,6 +1507,14 @@ async fn an_incoherent_enqueue_is_refused() {
             },
             "`delay` must fit in milliseconds as a 64-bit integer",
         ),
+        (
+            "a zero delay, which means no delay",
+            Enqueue {
+                delay: Some(Duration::ZERO),
+                ..Enqueue::new("demo-queue")
+            },
+            "`delay` must be a positive, non-zero duration",
+        ),
     ];
 
     for (what, enqueue, expected) in cases {

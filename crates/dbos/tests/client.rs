@@ -83,6 +83,26 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             },
             "`delay`",
         ),
+        (
+            "zero-timeout",
+            EnqueueOptions {
+                workflow_id: Some("zero-timeout"),
+                timeout: Some(Duration::ZERO),
+                ..EnqueueOptions::new("work")
+            },
+            "`timeout` must be a positive, non-zero duration",
+        ),
+        (
+            "zero-delay",
+            EnqueueOptions {
+                workflow_id: Some("zero-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::ZERO),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay` must be a positive, non-zero duration",
+        ),
     ];
     for (id, options, expected) in cases {
         let refused = client

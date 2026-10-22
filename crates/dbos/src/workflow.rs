@@ -23,7 +23,7 @@ use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, 
 use crate::sysdb::types::{
     AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
     StepCaller, StepTiming, Timestamp, WorkflowDelay, WorkflowInitResult, decode_step_value,
-    duration_to_ms, encode_step_value,
+    encode_step_value, workflow_duration_ms,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -495,7 +495,8 @@ impl<'a> Enqueue<'a> {
     ///   accepting it would give that state a second spelling that reads like a real priority;
     ///   the references' documented range starts at 1 for the same reason. The ceiling is
     ///   [`i32::MAX`] because the column is a signed 32-bit integer.
-    /// - **A delay must resolve to an instant the row can hold**, epoch milliseconds in an `i64`.
+    /// - **A delay must be more than zero, and resolve to an instant the row can hold**, epoch
+    ///   milliseconds in an `i64`. A zero delay is a caller that meant `None`.
     ///   Resolved against this process's clock, as the write will resolve it; the system database
     ///   refuses the same delay again for its own callers.
     ///
@@ -533,7 +534,8 @@ impl<'a> Enqueue<'a> {
             }
         }
         if let Some(delay) = self.delay
-            && let Err(error) = WorkflowDelay::For(delay).resolve(Timestamp::now())
+            && let Err(error) = workflow_duration_ms("delay", delay)
+                .and_then(|_| WorkflowDelay::For(delay).resolve(Timestamp::now()))
         {
             return refuse(input_refusal(error));
         }
@@ -549,13 +551,13 @@ impl<'a> Enqueue<'a> {
     }
 }
 
-/// Refuses a workflow timeout too long to store as milliseconds.
+/// Refuses a workflow timeout of zero, or one too long to store as milliseconds.
 ///
 /// Made by the surfaces that start or enqueue a workflow, beside [`Enqueue::validate`] and for
 /// the same reason: refused there, it costs no row and no step id. The system database refuses
 /// the same timeout again for its own callers.
 pub(crate) fn validate_timeout(timeout: Option<Duration>) -> Result<()> {
-    match timeout.map(|timeout| duration_to_ms("timeout", timeout)) {
+    match timeout.map(|timeout| workflow_duration_ms("timeout", timeout)) {
         Some(Err(error)) => Err(Error::Config(input_refusal(error))),
         _ => Ok(()),
     }
@@ -2318,6 +2320,25 @@ mod tests {
         assert!(
             matches!(&timeout, Err(Error::Config(message))
                 if message == "`timeout` must fit in milliseconds as a 64-bit integer"),
+            "got {timeout:?}"
+        );
+
+        // Zero is refused here too, with the system database's own wording, rather than once the
+        // start has taken its step id.
+        let delay = Enqueue {
+            delay: Some(Duration::ZERO),
+            ..Enqueue::new("q")
+        }
+        .validate();
+        assert!(
+            matches!(&delay, Err(Error::Config(message))
+                if message == "enqueue onto `q`: `delay` must be a positive, non-zero duration"),
+            "got {delay:?}"
+        );
+        let timeout = validate_timeout(Some(Duration::ZERO));
+        assert!(
+            matches!(&timeout, Err(Error::Config(message))
+                if message == "`timeout` must be a positive, non-zero duration"),
             "got {timeout:?}"
         );
     }

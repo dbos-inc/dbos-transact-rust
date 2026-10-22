@@ -216,6 +216,24 @@ pub fn duration_from_secs(secs: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(secs).ok()
 }
 
+/// A workflow's delay or timeout in milliseconds, or [`Error::InvalidInput`] naming `field` when
+/// it is zero or does not fit.
+///
+/// The rule [`NewWorkflow::validate`] applies, kept in one place so the surfaces that start a
+/// workflow can refuse the same values before they take a step id. A zero delay is a caller that
+/// meant `None`, and a zero timeout would expire the workflow before it ran. Both are written as
+/// milliseconds: the timeout as itself, the delay as an instant `init_workflow` resolves from it,
+/// so one that does not fit is refused rather than truncated into the column.
+pub(crate) fn workflow_duration_ms(field: &'static str, duration: Duration) -> Result<i64, Error> {
+    if duration.is_zero() {
+        return Err(Error::InvalidInput {
+            field: field.into(),
+            detail: "must be a positive, non-zero duration".to_owned(),
+        });
+    }
+    duration_to_ms(field, duration)
+}
+
 /// Converts a caller's duration to the integer milliseconds a column such as
 /// `workflow_timeout_ms` stores, or [`Error::InvalidInput`] naming `field` when it does not fit.
 ///
@@ -644,21 +662,11 @@ impl<'a> NewWorkflow<'a> {
                 });
             }
         }
-        // Java rejects a zero or negative duration outright; `Duration` already rules out
-        // negatives, so only zero is left to catch. A zero delay is a caller that meant `None`,
-        // and a zero timeout would expire the workflow before it ran.
+        // `Duration` already rules out negatives, so zero and a value too long to store are what
+        // is left; `workflow_duration_ms` says why each is refused.
         for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
-            if value == Some(Duration::ZERO) {
-                return Err(Error::InvalidInput {
-                    field: field.into(),
-                    detail: "must be a positive, non-zero duration".to_owned(),
-                });
-            }
-            // Both are written as milliseconds: the timeout as itself, the delay as an instant
-            // `init_workflow` resolves from it. Refused here, ahead of every write, rather than
-            // truncated into the column.
             if let Some(value) = value {
-                duration_to_ms(field, value)?;
+                workflow_duration_ms(field, value)?;
             }
         }
         validate_attributes(self.attributes)?;

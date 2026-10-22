@@ -1913,7 +1913,8 @@ async fn a_start_position_holding_a_plain_step_is_refused() {
 
 /// A child start whose timeout or delay the row cannot hold is refused before it takes a step id.
 ///
-/// Both are refused with the start's other argument checks, ahead of the placement, so the
+/// The same goes for a zero timeout or delay, which no row can carry either. All of them are
+/// refused with the start's other argument checks, ahead of the placement, so the
 /// parent's counter does not move: the step written after them takes the id the first start would
 /// have had, and no child row is created under any derived id.
 #[tokio::test]
@@ -1927,38 +1928,41 @@ async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
         .register_workflow("parent", move |()| {
             let child = child.clone();
             async move {
-                let refused = child
-                    .start_with(
-                        (),
-                        StartOptions {
-                            timeout: Timeout::Explicit(Duration::MAX),
-                            ..StartOptions::default()
-                        },
-                    )
-                    .await;
-                assert!(
-                    matches!(&refused, Err(Error::Config(message)) if message.contains("`timeout`")),
-                    "a timeout the row cannot hold should be refused, got {:?}",
-                    refused.map(|_| ())
-                );
+                // Too long to store, and zero: neither is a timeout or delay a row can carry.
+                for duration in [Duration::MAX, Duration::ZERO] {
+                    let refused = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                timeout: Timeout::Explicit(duration),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(&refused, Err(Error::Config(message)) if message.contains("`timeout`")),
+                        "a timeout of {duration:?} should be refused, got {:?}",
+                        refused.map(|_| ())
+                    );
 
-                let refused = child
-                    .start_with(
-                        (),
-                        StartOptions {
-                            queue: Some(Enqueue {
-                                delay: Some(Duration::MAX),
-                                ..Enqueue::new("never-reached")
-                            }),
-                            ..StartOptions::default()
-                        },
-                    )
-                    .await;
-                assert!(
-                    matches!(&refused, Err(Error::Config(message)) if message.contains("`delay`")),
-                    "a delay the row cannot hold should be refused, got {:?}",
-                    refused.map(|_| ())
-                );
+                    let refused = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    delay: Some(duration),
+                                    ..Enqueue::new("never-reached")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(&refused, Err(Error::Config(message)) if message.contains("`delay`")),
+                        "a delay of {duration:?} should be refused, got {:?}",
+                        refused.map(|_| ())
+                    );
+                }
 
                 dbos::step("after", || async { Ok(()) }).await?;
                 Ok::<u32, Error>(1)
@@ -1993,7 +1997,7 @@ async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
         [(0, "after")],
         "a refused start took the step id the step after it should have had",
     );
-    for child_id in [format!("{id}-0"), format!("{id}-1")] {
+    for child_id in (0..4).map(|step| format!("{id}-{step}")) {
         assert!(
             reader
                 .get_workflow(&child_id)
