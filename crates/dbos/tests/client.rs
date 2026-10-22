@@ -481,7 +481,7 @@ async fn a_message_waits_for_its_destination() {
         ..SendMessage::new(&id, &"only once")
     };
     client
-        .send_with(once.clone(), SendOptions::default())
+        .send_with(once, SendOptions::default())
         .await
         .expect("send failed");
     client

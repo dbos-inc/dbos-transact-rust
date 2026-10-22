@@ -481,9 +481,9 @@ async fn a_step_may_send_but_may_not_receive() {
 /// forked from its destination, and with the default it does not.
 ///
 /// The fan-out itself is `sysdb`'s and is tested there. What this pins is the engine mapping —
-/// `SendOptions::send_to_forks` becoming the flag `sysdb` takes — which `Connection::send_message`
+/// `SendOptions::send_to_forks` becoming the flag `sysdb` takes — which `Connection::send_encoded`
 /// does identically for all three single-send surfaces, so exercising it through one covers them
-/// all. `Connection::send_messages` maps it the same way for the batch, which
+/// all. `Connection::send_all_encoded` maps it the same way for the batch, which
 /// [`a_workflows_batch_is_one_checkpoint`] reaches.
 #[tokio::test]
 async fn a_send_may_fan_out_to_the_destinations_forks() {
@@ -539,6 +539,64 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
         delivered(&fork_id).await,
         1,
         "Forks::Include reaches the workflows forked from the destination"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A send borrows nothing from its caller once it is built, so one made from temporaries can be
+/// held past its statement or joined with other calls. This is chiefly a compile-time check: each
+/// call below passes a payload, and a message, that is dropped at the end of its own statement.
+#[tokio::test]
+async fn a_send_built_from_temporaries_outlives_them() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("temporaries-app", &db));
+    let sleeps = dbos
+        .register_workflow("sleeps", |()| async {
+            dbos::sleep(Duration::from_secs(5)).await?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    let sends = dbos
+        .register_workflow("sends", |id: String| async move {
+            let held = dbos::send(&id, &"held".to_owned());
+            held.await?;
+            let (one, two, three) = tokio::join!(
+                dbos::send(&id, &"one".to_owned()),
+                dbos::send_with(
+                    SendMessage {
+                        topic: Some("topic"),
+                        ..SendMessage::new(&id, &"two".to_owned())
+                    },
+                    SendOptions::default(),
+                ),
+                dbos::send_bulk(&[SendMessage::new(&id, &"three".to_owned())]),
+            );
+            one?;
+            two?;
+            three?;
+            Ok::<_, dbos::Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let destination = sleeps.start(()).await.expect("start failed");
+    let destination_id = destination.workflow_id().to_owned();
+    let sender = sends
+        .start(destination_id.clone())
+        .await
+        .expect("start failed");
+    let sender_id = sender.workflow_id().to_owned();
+
+    let reader = reader(&db).await;
+    await_success(&reader, &sender_id).await;
+    assert_eq!(
+        reader
+            .get_all_notifications(&destination_id)
+            .await
+            .expect("read failed")
+            .len(),
+        4
     );
 
     dbos.shutdown().await;
