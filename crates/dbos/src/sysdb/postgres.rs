@@ -1909,10 +1909,15 @@ const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 ///
 /// The sum is taken in `numeric`, which cannot overflow, and clamped before narrowing back to
 /// `bigint`; `numeric` is an alias of `DECIMAL` on CockroachDB, so one expression serves both.
+///
+/// A NULL operand is passed through explicitly, because `LEAST` and `GREATEST` skip NULL
+/// arguments: without the `CASE`, no timeout would clamp to the minimum and read as a deadline
+/// already past.
 fn now_ms_plus_sql(operand: &str) -> String {
     format!(
-        "LEAST(GREATEST({NOW_MS_SQL}::numeric + ({operand})::numeric, \
-         ({min})::numeric), ({max})::numeric)::bigint",
+        "CASE WHEN ({operand}) IS NULL THEN NULL \
+         ELSE LEAST(GREATEST({NOW_MS_SQL}::numeric + ({operand})::numeric, \
+         ({min})::numeric), ({max})::numeric)::bigint END",
         min = i64::MIN,
         max = i64::MAX,
     )
