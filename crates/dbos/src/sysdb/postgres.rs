@@ -1892,6 +1892,32 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// compared against is the dequeue's own.
 const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 
+/// [`NOW_MS_SQL`] plus `operand`, a `bigint` column or parameter of milliseconds, held within
+/// `bigint`'s range where the sum would leave it: the deadline a timeout gives a workflow.
+///
+/// **Saturating, because the operand is a stored value and one row must not stop a batch.** The
+/// timeout column is written by every client that can reach the table, not only through this
+/// layer's validation, so it can hold anything a `bigint` can. Plain `+` raises `bigint out of
+/// range` for a timeout within `now` of the maximum, and in a dequeue's claim that failure takes
+/// the whole batch with it: the statement rolls back, the row stays `ENQUEUED`, and the next poll
+/// claims it again and fails the same way, so nothing on the queue ever starts.
+///
+/// The maximum is the right answer as well as a safe one: a deadline too far out to store is one
+/// that never elapses, which is what such a timeout asked for, and the same answer a blocking
+/// read gives a deadline it cannot store. The minimum, for a negative timeout no valid writer
+/// produces, is a deadline already past, which is what a negative budget means.
+///
+/// The sum is taken in `numeric`, which cannot overflow, and clamped before narrowing back to
+/// `bigint`; `numeric` is an alias of `DECIMAL` on CockroachDB, so one expression serves both.
+fn now_ms_plus_sql(operand: &str) -> String {
+    format!(
+        "LEAST(GREATEST({NOW_MS_SQL}::numeric + ({operand})::numeric, \
+         ({min})::numeric), ({max})::numeric)::bigint",
+        min = i64::MIN,
+        max = i64::MAX,
+    )
+}
+
 /// What a timeout writes: a cancel's columns plus `owner_xid`, so no execution holds the row.
 fn timed_out_set_sql() -> String {
     format!(
@@ -3137,6 +3163,10 @@ impl SystemDatabase for PostgresSystemDatabase {
             // **The conflict arm changes nothing.** It exists so `RETURNING` reports the row
             // that was already there; whoever holds it keeps it, its attempt count and its
             // executor.
+            //
+            // The deadline saturates rather than overflowing; see `now_ms_plus_sql`. The cast
+            // fixes the parameter's type for the arithmetic on both backends.
+            let deadline_from_timeout = now_ms_plus_sql("$18::bigint");
             let row = sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {workflow_table} (workflow_uuid, status, \
                  name, class_name, config_name, \
@@ -3149,7 +3179,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                  debounce_deadline_epoch_ms, is_debounced, application_name, creator_xid) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
                  {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, \
-                 COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {NOW_MS_SQL} + $18 END), \
+                 COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {deadline_from_timeout} END), \
                  $20, CASE WHEN $2 = 'PENDING' THEN $21 END, $22, $23::jsonb, $24, $25, $26, \
                  $27, $21) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
@@ -6462,6 +6492,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             let started: Vec<String> = if candidates.is_empty() {
                 Vec::new()
             } else {
+                // Saturating, so a stored timeout near the maximum cannot fail the whole batch;
+                // see `now_ms_plus_sql`.
+                let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
                 let flipped: HashSet<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $2, application_version = $3, \
@@ -6473,7 +6506,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
+                             THEN {deadline_from_timeout} \
                              ELSE workflow_deadline_epoch_ms \
                          END \
                      WHERE workflow_uuid = ANY($5::text[]) AND status = 'ENQUEUED' \
@@ -6751,6 +6784,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // Counts `recovery_attempts` for the reason the unpartitioned sweep gives, and
                 // both count because both are claims: TypeScript increments in each of its two
                 // as well.
+                //
+                // The deadline saturates, as in the unpartitioned claim; see `now_ms_plus_sql`.
+                let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
                 let flipped: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} \
                      SET status = 'PENDING', executor_id = $5, application_version = $3, \
@@ -6762,7 +6798,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                          workflow_deadline_epoch_ms = CASE \
                              WHEN workflow_timeout_ms IS NOT NULL \
                               AND workflow_deadline_epoch_ms IS NULL \
-                             THEN {NOW_MS_SQL} + workflow_timeout_ms \
+                             THEN {deadline_from_timeout} \
                              ELSE workflow_deadline_epoch_ms \
                          END \
                      WHERE {claim_predicate} RETURNING workflow_uuid"

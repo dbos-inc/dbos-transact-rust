@@ -872,3 +872,43 @@ async fn a_timeout_the_row_cannot_hold_is_refused() {
 
     dbos.shutdown().await;
 }
+
+/// A timeout that fits in milliseconds but lies within `now` of the largest one is accepted, and
+/// gives a deadline that never elapses rather than a failed start.
+///
+/// The insert adds the timeout to the database's clock, which would overflow; it saturates at the
+/// largest instant instead, and the run times its wait against that without overflowing either.
+#[tokio::test]
+async fn a_timeout_near_the_largest_gives_a_deadline_that_never_elapses() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("far-timeout-app", &db));
+    let workflow = dbos
+        .register_workflow("bounded", |()| async move { Ok::<u32, Error>(7) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "bounded-far-out";
+    let result = workflow
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                timeout: Timeout::Explicit(Duration::from_millis(i64::MAX as u64 - 1000)),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("a timeout that fits in milliseconds should be accepted");
+    assert_eq!(result, 7);
+
+    let row = reader(&db)
+        .await
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the workflow was written");
+    assert_eq!(row.status, WorkflowStatus::Success);
+    assert_eq!(row.deadline, Some(Timestamp::from_epoch_ms(i64::MAX)));
+
+    dbos.shutdown().await;
+}

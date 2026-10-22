@@ -9587,6 +9587,149 @@ async fn enqueue(
     sys.init_workflow(&wf, None).await.unwrap();
 }
 
+/// A timeout that fits in milliseconds but lies within `now` of the largest `bigint`.
+///
+/// Every layer that validates a timeout accepts it, so a row can carry it whoever wrote it; only
+/// the deadline the database adds it to `now` for cannot be stored.
+const FAR_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(i64::MAX as u64 - 1000);
+
+/// Claims from `queue` until `expected` workflows have started, or a few polls have passed.
+///
+/// Polled rather than asked once because a claim may under-deliver on CockroachDB, which is not
+/// what these tests are about.
+async fn claim_all(
+    sys: &PostgresSystemDatabase,
+    queue: &QueueRecord,
+    expected: usize,
+) -> Vec<String> {
+    let mut started = Vec::new();
+    for _ in 0..5 {
+        started.extend(
+            sys.start_queued_workflows(queue, "exec-1", "v1", "claim", None, 0, 0)
+                .await
+                .expect("a claim failed"),
+        );
+        if started.len() >= expected {
+            break;
+        }
+    }
+    started.sort();
+    started
+}
+
+/// A stored timeout too far out to add to `now` gives a deadline that never elapses, and does not
+/// fail the claim it is part of.
+///
+/// Plain `+` raises `bigint out of range` for this row, and in a claim that rolls back the whole
+/// batch: the row stays `ENQUEUED`, and every later poll fails the same way, so the ordinary
+/// workflow queued beside it never starts either.
+#[tokio::test]
+async fn a_claim_saturates_a_deadline_too_far_out_to_store() {
+    let (sys, _db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("far"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    enqueue(&sys, "wf-far", "far", 0, Some(FAR_TIMEOUT)).await;
+    enqueue(
+        &sys,
+        "wf-ordinary",
+        "far",
+        0,
+        Some(std::time::Duration::from_secs(60)),
+    )
+    .await;
+
+    let queue = sys.get_queue("far").await.unwrap().unwrap();
+    let before = Timestamp::now();
+    assert_eq!(
+        claim_all(&sys, &queue, 2).await,
+        ["wf-far", "wf-ordinary"],
+        "both rows should be claimed, the ordinary one included",
+    );
+
+    let far = sys.get_workflow("wf-far").await.unwrap().unwrap();
+    assert_eq!(far.status, WorkflowStatus::Pending);
+    assert_eq!(
+        far.deadline,
+        Some(Timestamp::from_epoch_ms(i64::MAX)),
+        "a deadline too far out to store is held at the largest instant",
+    );
+    let ordinary = sys.get_workflow("wf-ordinary").await.unwrap().unwrap();
+    assert_eq!(ordinary.status, WorkflowStatus::Pending);
+    let offset = ordinary
+        .deadline
+        .expect("a deadline from the timeout")
+        .as_epoch_ms()
+        - before.as_epoch_ms();
+    assert!(
+        (50_000..70_000).contains(&offset),
+        "an ordinary timeout still becomes now plus the timeout, got {offset}ms",
+    );
+}
+
+/// The partition sweep's claim saturates the same way.
+#[tokio::test]
+async fn a_partition_sweep_saturates_a_deadline_too_far_out_to_store() {
+    let (sys, _db) = sysdb().await;
+    let queue = partitioned_queue(&sys, "far-partitioned").await;
+    for (id, partition, timeout) in [
+        ("wf-far", "alpha", FAR_TIMEOUT),
+        ("wf-ordinary", "beta", std::time::Duration::from_secs(60)),
+    ] {
+        let wf = NewWorkflow {
+            queue_name: Some("far-partitioned"),
+            queue_partition_key: Some(partition),
+            timeout: Some(timeout),
+            application_version: Some("v1"),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None).await.unwrap();
+    }
+
+    let mut started = Vec::new();
+    for _ in 0..5 {
+        started.extend(
+            sys.start_queued_partitioned_workflows(&queue, "exec-1", "v1", "claim", None)
+                .await
+                .expect("a sweep failed"),
+        );
+        if started.len() >= 2 {
+            break;
+        }
+    }
+    started.sort();
+    assert_eq!(started, ["wf-far", "wf-ordinary"]);
+
+    let far = sys.get_workflow("wf-far").await.unwrap().unwrap();
+    assert_eq!(far.deadline, Some(Timestamp::from_epoch_ms(i64::MAX)));
+    let ordinary = sys.get_workflow("wf-ordinary").await.unwrap().unwrap();
+    assert!(
+        ordinary.deadline.unwrap() < Timestamp::from_epoch_ms(i64::MAX),
+        "an ordinary timeout is not saturated",
+    );
+}
+
+/// A workflow started at once turns the same timeout into the same never-elapsing deadline at its
+/// insert, rather than failing the insert.
+#[tokio::test]
+async fn a_start_saturates_a_deadline_too_far_out_to_store() {
+    let (sys, _db) = sysdb().await;
+    let started = sys
+        .init_workflow(
+            &NewWorkflow {
+                timeout: Some(FAR_TIMEOUT),
+                ..workflow("wf-far-direct")
+            },
+            None,
+        )
+        .await
+        .expect("a timeout that fits in milliseconds should be accepted");
+    assert_eq!(started.deadline, Some(Timestamp::from_epoch_ms(i64::MAX)));
+    let row = sys.get_workflow("wf-far-direct").await.unwrap().unwrap();
+    assert_eq!(row.deadline, Some(Timestamp::from_epoch_ms(i64::MAX)));
+    assert_eq!(row.timeout, Some(FAR_TIMEOUT));
+}
+
 /// A dequeue takes enqueued workflows in priority then age order, and starts them.
 #[tokio::test]
 async fn a_dequeue_starts_workflows_in_order() {
