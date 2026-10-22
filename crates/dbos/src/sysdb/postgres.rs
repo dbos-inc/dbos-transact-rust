@@ -3975,6 +3975,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::SET_WORKFLOW_DELAY,
                 started_at,
                 |mut conn| async move {
+                    // The step runs this only when nothing is recorded, so only a first run is
+                    // refused; a replay reads back the refusal it recorded.
                     let delay_until = delay_until.clone()?;
                     // `status = 'DELAYED'` is the guard: a released workflow is running or
                     // queued, and pushing its delay out would not recall it.
