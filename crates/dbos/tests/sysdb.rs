@@ -6257,21 +6257,19 @@ async fn replacing_one_child_twice_is_refused() {
     assert!(sys.get_workflow("wf-dup-fork").await.unwrap().is_none());
 }
 
-/// A timeout too large to store is reported rather than quietly becoming a different one.
+/// A timeout too large to store is reported rather than quietly becoming a different one, by
+/// both ways of forking.
 #[tokio::test]
 async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
     let (sys, _db) = sysdb().await;
     sys.init_workflow(&workflow("wf-huge"), None).await.unwrap();
+    let options = ForkOptions {
+        timeout: Some(std::time::Duration::MAX),
+        ..ForkOptions::default()
+    };
 
     let result = sys
-        .fork_workflows(
-            &[Fork::new("wf-huge")],
-            &ForkOptions {
-                timeout: Some(std::time::Duration::MAX),
-                ..ForkOptions::default()
-            },
-            None,
-        )
+        .fork_workflows(&[Fork::new("wf-huge")], &options, None)
         .await;
     assert!(
         matches!(
@@ -6279,6 +6277,17 @@ async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
             Err(Error::InvalidInput { ref field, .. }) if field == "timeout"
         ),
         "expected the timeout to be refused, got {result:?}"
+    );
+
+    let result = sys
+        .fork_from(&["wf-huge"], ForkPoint::Step(0), &options, None)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(Error::InvalidInput { ref field, .. }) if field == "timeout"
+        ),
+        "expected fork_from to refuse the timeout, got {result:?}"
     );
 }
 

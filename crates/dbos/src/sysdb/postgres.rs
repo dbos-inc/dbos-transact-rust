@@ -1261,19 +1261,10 @@ impl PostgresSystemDatabase {
         let copies_anything = start_steps.iter().any(|&step| step > 0);
 
         let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
-        // Reported rather than saturated, following `Timestamp::checked_add` and the rule stated
-        // on `to_system_time`: a value this layer cannot store is the caller's to hear about, not
-        // one to quietly replace with a different timeout.
-        let timeout_ms = match options.timeout.map(|t| i64::try_from(t.as_millis())) {
-            None => None,
-            Some(Ok(ms)) => Some(ms),
-            Some(Err(_)) => {
-                return Err(Error::InvalidInput {
-                    field: "timeout".into(),
-                    detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
-                });
-            }
-        };
+        // `fork_workflows` and `fork_from`, the only ways here, both run `ForkOptions::validate`
+        // first, which refuses a timeout too large to store, so this cannot fail. It converts
+        // through the method that check uses, so the rule is written once.
+        let timeout_ms = options.timeout_ms()?;
         let (replace_from, replace_to): (Vec<&str>, Vec<&str>) =
             options.replacement_children.iter().copied().unzip();
         let (replace_from, replace_to) = (&replace_from[..], &replace_to[..]);

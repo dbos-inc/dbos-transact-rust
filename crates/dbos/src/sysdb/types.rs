@@ -2473,6 +2473,7 @@ impl ForkOptions<'_> {
                 detail: "must be absent rather than zero".to_owned(),
             });
         }
+        self.timeout_ms()?;
         // The replacements are applied by joining against them, so one child named twice would
         // match a copied step twice and duplicate it. The primary key would catch that as a
         // constraint violation, which says nothing about the map that caused it. Python and
@@ -2504,6 +2505,23 @@ impl ForkOptions<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The timeout in milliseconds, the unit its column stores.
+    ///
+    /// Refused rather than saturated, following `Timestamp::checked_add` and the rule stated on
+    /// `to_system_time`: a value this layer cannot store is the caller's to hear about, not one to
+    /// quietly replace with a different timeout. [`validate`](Self::validate) is where a caller
+    /// hears it; the insert converts through here too, so the rule is written once.
+    pub(crate) fn timeout_ms(&self) -> Result<Option<i64>, Error> {
+        self.timeout
+            .map(|timeout| {
+                i64::try_from(timeout.as_millis()).map_err(|_| Error::InvalidInput {
+                    field: "timeout".into(),
+                    detail: "must fit in milliseconds as a 64-bit integer".to_owned(),
+                })
+            })
+            .transpose()
     }
 }
 

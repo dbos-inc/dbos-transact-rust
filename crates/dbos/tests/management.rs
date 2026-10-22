@@ -3185,9 +3185,9 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
 /// **A management call refused by its own arguments moves no step counter.**
 ///
 /// The launch check comes first, then the call's own argument check, and only then the step id —
-/// so `fork_all` refusing a negative step, a duplicated or empty forked id, a zero timeout or an
-/// invalid replacement map, and `fork` refusing a negative step, leave the step after them on the
-/// slot it would have had. The instance-level refusals are covered by
+/// so `fork_all` refusing a negative step, a duplicated or empty forked id, a zero or oversized
+/// timeout or an invalid replacement map, and `fork` refusing a negative step, leave the step after
+/// them on the slot it would have had. The instance-level refusals are covered by
 /// `management_through_another_instance_from_inside_a_workflow_is_refused`; these are the ones the
 /// method itself raises.
 #[tokio::test]
@@ -3234,12 +3234,16 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                         );
                     }
 
-                    // Nor options the system database would refuse: a zero timeout, and a
-                    // replacement map with an empty replacement.
+                    // Nor options the system database would refuse: a zero timeout, one too
+                    // large to store, and a replacement map with an empty replacement.
                     let empty_replacement = [("some-child", "")];
                     for options in [
                         ForkOptions {
                             timeout: Some(Duration::ZERO),
+                            ..ForkOptions::default()
+                        },
+                        ForkOptions {
+                            timeout: Some(Duration::MAX),
                             ..ForkOptions::default()
                         },
                         ForkOptions {
