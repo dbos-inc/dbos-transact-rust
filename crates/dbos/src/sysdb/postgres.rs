@@ -1325,7 +1325,8 @@ impl PostgresSystemDatabase {
                 w.authenticated_roles, w.assumed_role, w.serialization, w.request, \
                 $5, $6, w.workflow_uuid, w.attributes, $7, \
                 COALESCE(w.application_name, $8) \
-             FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
+             FROM unnest($1::text[], $2::text[], $3::int4[]) \
+               AS m(original_id, fork_id, start_step) \
              JOIN {workflow_table} w ON w.workflow_uuid = m.original_id"
         )))
         .bind(original_ids)
@@ -1379,7 +1380,8 @@ impl PostgresSystemDatabase {
                     COALESCE(r.replacement, o.child_workflow_id), \
                     o.started_at_epoch_ms, o.completed_at_epoch_ms, \
                     COALESCE(w.application_name, $6) \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) \
+                   AS m(original_id, fork_id, start_step) \
                  JOIN {steps_table} o \
                    ON o.workflow_uuid = m.original_id AND o.function_id < m.start_step \
                  JOIN {workflow_table} w ON w.workflow_uuid = m.original_id \
@@ -1403,7 +1405,8 @@ impl PostgresSystemDatabase {
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {history_table} (workflow_uuid, function_id, key, value, serialization) \
                  SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) \
+                   AS m(original_id, fork_id, start_step) \
                  JOIN {history_table} h \
                    ON h.workflow_uuid = m.original_id AND h.function_id < m.start_step"
             )))
@@ -1422,7 +1425,8 @@ impl PostgresSystemDatabase {
                    SELECT m.fork_id, h.key, h.value, h.serialization, \
                           row_number() OVER (PARTITION BY m.fork_id, h.key \
                                              ORDER BY h.function_id DESC) AS rn \
-                   FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
+                   FROM unnest($1::text[], $2::text[], $3::int4[]) \
+                     AS m(original_id, fork_id, start_step) \
                    JOIN {history_table} h \
                      ON h.workflow_uuid = m.original_id AND h.function_id < m.start_step \
                  ) latest WHERE rn = 1"
@@ -1439,7 +1443,8 @@ impl PostgresSystemDatabase {
                 "INSERT INTO {streams_table} (workflow_uuid, function_id, key, value, \
                     serialization, \"offset\") \
                  SELECT m.fork_id, s.function_id, s.key, s.value, s.serialization, s.\"offset\" \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) \
+                   AS m(original_id, fork_id, start_step) \
                  JOIN {streams_table} s \
                    ON s.workflow_uuid = m.original_id AND s.function_id < m.start_step"
             )))

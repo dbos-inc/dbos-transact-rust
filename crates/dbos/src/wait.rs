@@ -60,11 +60,8 @@
 //! argument a second way. It also makes the heterogeneous case expressible: a fan-out whose members
 //! return different types has no common `WorkflowHandle<R, E>` to put in a slice.
 //!
-//! **The all-wait is TypeScript's alone, and it is here anyway.** Python has `wait_first` and no
-//! `wait_all`; Go and Java have neither. Both are here because a fan-out wants both questions and
-//! because having one without the other would leave the natural pair half-built — the same argument
-//! [`Client::fork_all`](crate::Client::fork_all) makes for existing where no reference client has
-//! it.
+//! **Both waits are here.** A fan-out wants both questions — which member finished first, and
+//! when have they all — and having one without the other would leave the natural pair half-built.
 //!
 //! **They are named for the concurrency primitives, not for the references.** Python's `wait_first`
 //! and TypeScript's `waitFirst`/`waitAll` describe the wait; `select_workflow` and `join_workflows`

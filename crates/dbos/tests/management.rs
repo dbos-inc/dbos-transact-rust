@@ -601,8 +601,8 @@ async fn a_fork_adopts_the_replacement_for_a_failed_child() {
         let refused = |result: dbos::Result<_>| {
             matches!(
                 result,
-                Err(Error::SystemDatabase(dbos::sysdb::Error::InvalidInput { ref field, .. }))
-                    if field == "replacement_children"
+                Err(Error::InvalidArgument { ref detail, .. })
+                    if detail.contains("ForkOptions::replacement_children")
             )
         };
         assert!(
@@ -1457,8 +1457,9 @@ async fn forking_from_a_negative_step_is_refused() {
 }
 
 /// **A batch is checked as a whole before anything is written.** Two forks naming one id, an empty
-/// forked id and an empty original id are each refused with `InvalidArgument`, the valid forks
-/// beside them included, and no workflow is written.
+/// forked id, an empty original id, a forked id that is an original in the batch, and an option
+/// given as an empty string are each refused with `InvalidArgument`, the valid forks beside them
+/// included, and no workflow is written.
 #[tokio::test]
 async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
     let db = test_database().await;
@@ -1509,10 +1510,25 @@ async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
         },
     ];
     let empty_original_id = [Fork::new(sources[0], 0), Fork::new("", 0)];
+    // A forked id that is an original in the batch, its own fork's or another's, is certain to
+    // collide with that original's row.
+    let onto_own_original = [Fork {
+        forked_id: Some(sources[0]),
+        ..Fork::new(sources[0], 0)
+    }];
+    let onto_other_original = [
+        Fork::new(sources[0], 0),
+        Fork {
+            forked_id: Some(sources[0]),
+            ..Fork::new(sources[1], 0)
+        },
+    ];
     for (forks, mentions) in [
         (&duplicated[..], "one-id-twice"),
         (&empty_forked_id[..], "forked_id"),
         (&empty_original_id[..], "original_id"),
+        (&onto_own_original[..], sources[0]),
+        (&onto_other_original[..], sources[0]),
     ] {
         let error = dbos
             .fork_all::<u32, EngineOnly>(forks, ForkOptions::default())
@@ -1521,6 +1537,41 @@ async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
         assert!(
             matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains(mentions)),
             "{forks:?}: {error:?}"
+        );
+    }
+
+    // An option given as an empty string refuses a batch of valid forks.
+    let valid = sources.map(|id| Fork::new(id, 0));
+    for (options, mentions) in [
+        (
+            ForkOptions {
+                app_version: Some(""),
+                ..ForkOptions::default()
+            },
+            "ForkOptions::app_version",
+        ),
+        (
+            ForkOptions {
+                queue: Some(""),
+                ..ForkOptions::default()
+            },
+            "ForkOptions::queue",
+        ),
+        (
+            ForkOptions {
+                queue_partition_key: Some(""),
+                ..ForkOptions::default()
+            },
+            "ForkOptions::queue_partition_key",
+        ),
+    ] {
+        let error = dbos
+            .fork_all::<u32, EngineOnly>(&valid, options)
+            .await
+            .expect_err("an empty option was accepted");
+        assert!(
+            matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains(mentions)),
+            "{options:?}: {error:?}"
         );
     }
 
@@ -3128,10 +3179,11 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
 /// **A management call refused by its own arguments moves no step counter.**
 ///
 /// The launch check comes first, then the call's own argument check, and only then the step id —
-/// so `fork_all` refusing a negative step, a duplicated forked id or an empty one, and `fork`
-/// refusing a negative step, leave the step after them on the slot it would have had. The instance-level refusals are
-/// covered by `management_through_another_instance_from_inside_a_workflow_is_refused`; these are
-/// the ones the method itself raises.
+/// so `fork_all` refusing a negative step, a duplicated or empty forked id, a zero timeout or an
+/// invalid replacement map, and `fork` refusing a negative step, leave the step after them on the
+/// slot it would have had. The instance-level refusals are covered by
+/// `management_through_another_instance_from_inside_a_workflow_is_refused`; these are the ones the
+/// method itself raises.
 #[tokio::test]
 async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
     let db = test_database().await;
@@ -3173,6 +3225,28 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
                         assert!(
                             matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
                             "{forks:?} should be refused in bulk"
+                        );
+                    }
+
+                    // Nor options the system database would refuse: a zero timeout, and a
+                    // replacement map with an empty replacement.
+                    let empty_replacement = [("some-child", "")];
+                    for options in [
+                        ForkOptions {
+                            timeout: Some(Duration::ZERO),
+                            ..ForkOptions::default()
+                        },
+                        ForkOptions {
+                            replacement_children: &empty_replacement,
+                            ..ForkOptions::default()
+                        },
+                    ] {
+                        let refused = dbos
+                            .fork_all::<u32, EngineOnly>(&[Fork::new(&id, 0)], options)
+                            .await;
+                        assert!(
+                            matches!(refused.map(|_| ()), Err(Error::InvalidArgument { .. })),
+                            "{options:?} should be refused"
                         );
                     }
 

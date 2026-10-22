@@ -213,9 +213,14 @@ pub struct Fork<'a> {
     pub start_step: i32,
     /// The id the fork gets. `None` generates one.
     ///
-    /// `Some("")` is an [`Error::InvalidArgument`], and so is one id on two forks of a batch. An
-    /// id some existing workflow already has is refused by the database when the fork is written:
-    /// the call fails with [`Error::SystemDatabase`], and no fork in the batch is written.
+    /// `Some("")` is an [`Error::InvalidArgument`], and so is one id on two forks of a batch, or
+    /// an id that is also an original id in the batch.
+    ///
+    /// An id some existing workflow already has is refused by the database when the fork is
+    /// written, and the call fails with [`Error::SystemDatabase`]. The batch is one transaction,
+    /// so that usually means nothing was written — but a commit whose acknowledgement was lost is
+    /// retried, and the retry hits the forks the commit wrote. A caller that chose its ids can
+    /// look them up with [`WorkflowHandle::status`] to tell the two apart.
     pub forked_id: Option<&'a str>,
 }
 
@@ -226,6 +231,23 @@ impl<'a> Fork<'a> {
             original_id,
             start_step,
             forked_id: None,
+        }
+    }
+
+    /// Refuses what the system database would refuse of this fork, as an
+    /// [`Error::InvalidArgument`] naming the field as it is spelled here.
+    fn validate(&self) -> Result<()> {
+        self.to_sys()
+            .validate()
+            .map_err(|error| refused_fork(error, |field| format!("Fork::{field}")))
+    }
+
+    /// This fork as the system database takes it.
+    fn to_sys(self) -> SysFork<'a> {
+        SysFork {
+            original_id: self.original_id,
+            forked_id: self.forked_id,
+            start_step: self.start_step,
         }
     }
 }
@@ -239,6 +261,9 @@ impl<'a> Fork<'a> {
 /// source's; the queue, its partition and the timeout are the *fork's own*, because a fork is
 /// enqueued where the caller says rather than where its source ran. Saying nothing about those
 /// three asks for the internal queue, no partition, and no bound — not "as before".
+///
+/// A field given as an empty string, or a zero [`timeout`](Self::timeout), is an
+/// [`Error::InvalidArgument`]: say `None` to leave it out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForkOptions<'a> {
     /// The version the fork runs under. `None` inherits the source's.
@@ -280,8 +305,36 @@ pub struct ForkOptions<'a> {
     /// [`fork_all`](DBOS::fork_all) applies the pairs to every fork.
     ///
     /// Each `original` may appear once. Naming one twice, or giving an empty id on either side,
-    /// fails with [`Error::SystemDatabase`] carrying `InvalidInput`, and nothing is forked.
+    /// is an [`Error::InvalidArgument`], and nothing is forked.
     pub replacement_children: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> ForkOptions<'a> {
+    /// Refuses what the system database would refuse of these options, as an
+    /// [`Error::InvalidArgument`] naming the field as it is spelled here.
+    fn validate(&self) -> Result<()> {
+        self.to_sys().validate().map_err(|error| {
+            refused_fork(error, |field| {
+                let field = match field {
+                    "application_version" => "app_version",
+                    "queue_name" => "queue",
+                    other => other,
+                };
+                format!("ForkOptions::{field}")
+            })
+        })
+    }
+
+    /// These options as the system database takes them.
+    fn to_sys(self) -> SysForkOptions<'a> {
+        SysForkOptions {
+            application_version: self.app_version,
+            queue_name: self.queue,
+            queue_partition_key: self.queue_partition_key,
+            timeout: self.timeout,
+            replacement_children: self.replacement_children,
+        }
+    }
 }
 
 /// Where a rewind cuts a workflow's history, and where the rewound workflow goes.
@@ -784,11 +837,11 @@ impl DBOS {
     /// checks, and only then the step id — so a refused fork moves the workflow's counter no more
     /// than an unlaunched one does.
     fn fork_placed(&self, forks: &[Fork<'_>], options: &ForkOptions<'_>) -> Built<Arc<Executor>> {
-        self.executor("fork a workflow").and_then(|executor| {
+        self.executor(FORK_OPERATION).and_then(|executor| {
             refuse_invalid_forks(forks, options)?;
             // The executor came from this handle rather than from the ambient context, so the two
             // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
-            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
+            let placement = StepPlacement::of(executor.connection(), FORK_OPERATION)?;
             Ok((executor, placement))
         })
     }
@@ -1656,7 +1709,7 @@ impl Connection {
     }
 }
 
-/// Refuses a negative start step, for a fork or a rewind. `field` names the step in the message
+/// Refuses a negative rewind start step. `field` names the step in the message
 /// as the caller passed it.
 ///
 /// **Made by the surfaces rather than inside the connection**, because a refused call must not
@@ -1675,103 +1728,53 @@ fn refuse_negative_start_step(operation: &'static str, field: &str, start_step: 
 /// What a refused fork names as the operation.
 const FORK_OPERATION: &str = "fork a workflow";
 
-/// Refuses a fork call the system database would refuse, or one that cannot mean anything.
+/// Refuses a fork call the system database would refuse, or one that cannot succeed.
 ///
 /// Made by the surfaces rather than inside the connection, as [`refuse_negative_start_step`] is,
-/// so a refused call spends no step id. One bad fork refuses the whole batch, the valid ones
-/// beside it included. The system database checks the per-fork and option rules again for its
-/// own callers.
+/// so a refused call spends no step id. The first bad fork refuses the whole batch, the valid
+/// ones beside it included.
 ///
-/// **Two forks naming the same id are refused here** because the batch can see that for itself.
-/// An id already taken by an existing workflow cannot be seen until the insert, which the
-/// database refuses as a unique violation: the call fails with [`Error::SystemDatabase`], and
-/// no fork in the batch is written.
+/// The per-fork and option rules are the system database's own, run through
+/// [`Fork::validate`] and [`ForkOptions::validate`], so the two layers cannot drift apart. What
+/// this adds is what only the whole batch can see: one forked id on two forks, and a forked id
+/// that is also an original id in the batch. An original must exist, so forking onto its id is
+/// certain to hit the primary key. An id taken by a workflow outside the batch is left to the
+/// database.
 fn refuse_invalid_forks(forks: &[Fork<'_>], options: &ForkOptions<'_>) -> Result<()> {
+    let refuse = |detail: String| {
+        Err(Error::InvalidArgument {
+            operation: FORK_OPERATION.into(),
+            detail,
+        })
+    };
+    let original_ids: HashSet<&str> = forks.iter().map(|fork| fork.original_id).collect();
     let mut forked_ids = HashSet::with_capacity(forks.len());
     for fork in forks {
         fork.validate()?;
-        if let Some(id) = fork.forked_id
-            && !forked_ids.insert(id)
-        {
-            return Err(Error::InvalidArgument {
-                operation: FORK_OPERATION.into(),
-                detail: format!("`{id}` is the forked id of more than one fork"),
-            });
+        if let Some(id) = fork.forked_id {
+            if original_ids.contains(id) {
+                return refuse(format!("`{id}` is both a forked id and an original id"));
+            }
+            if !forked_ids.insert(id) {
+                return refuse(format!("`{id}` is the forked id of more than one fork"));
+            }
         }
     }
     options.validate()
 }
 
-impl Fork<'_> {
-    /// Refuses an empty original id, a negative start step, and a forked id given as an empty
-    /// string.
-    fn validate(&self) -> Result<()> {
-        let refuse = |detail: String| {
-            Err(Error::InvalidArgument {
-                operation: FORK_OPERATION.into(),
-                detail,
-            })
-        };
-        if self.original_id.is_empty() {
-            return refuse("Fork::original_id must not be empty".to_owned());
-        }
-        if self.start_step < 0 {
-            refuse_negative_start_step(
-                FORK_OPERATION,
-                &format!("Fork::start_step of `{}`", self.original_id),
-                self.start_step,
-            )?;
-        }
-        if self.forked_id == Some("") {
-            return refuse(format!(
-                "Fork::forked_id of `{}` must be absent rather than empty",
-                self.original_id
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl ForkOptions<'_> {
-    /// Refuses an option given as an empty string.
-    fn validate(&self) -> Result<()> {
-        for (field, value) in [
-            ("app_version", self.app_version),
-            ("queue", self.queue),
-            ("queue_partition_key", self.queue_partition_key),
-        ] {
-            if value == Some("") {
-                return Err(Error::InvalidArgument {
-                    operation: FORK_OPERATION.into(),
-                    detail: format!("ForkOptions::{field} must be absent rather than empty"),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<'a> Fork<'a> {
-    /// This fork as the system database takes it.
-    fn to_sys(self) -> SysFork<'a> {
-        SysFork {
-            original_id: self.original_id,
-            forked_id: self.forked_id,
-            start_step: self.start_step,
-        }
-    }
-}
-
-impl<'a> ForkOptions<'a> {
-    /// These options as the system database takes them.
-    fn to_sys(self) -> SysForkOptions<'a> {
-        SysForkOptions {
-            application_version: self.app_version,
-            queue_name: self.queue,
-            queue_partition_key: self.queue_partition_key,
-            timeout: self.timeout,
-            replacement_children: self.replacement_children,
-        }
+/// A system database refusal of a fork's arguments, as the surface reports it: an
+/// [`Error::InvalidArgument`] whose detail names the field through `field`.
+fn refused_fork(error: crate::sysdb::Error, field: impl FnOnce(&str) -> String) -> Error {
+    match error {
+        crate::sysdb::Error::InvalidInput {
+            field: name,
+            detail,
+        } => Error::InvalidArgument {
+            operation: FORK_OPERATION.into(),
+            detail: format!("{}: {detail}", field(&name)),
+        },
+        other => Error::from_sysdb(other),
     }
 }
 
