@@ -244,7 +244,9 @@ pub async fn check_select<E: DurableError>(branches: &Branches<E>) -> Result<Rac
         if winner >= branches.len() {
             // `Some` wherever a row was read at all — `check` answers `None` for every placement
             // that holds no step — so this arm knows both halves rather than defaulting them.
-            let (workflow_id, step_id) = placement.step().unwrap_or(("", 0));
+            let (workflow_id, step_id) = placement
+                .step_position()
+                .map_or(("", 0), |at| (at.workflow_id, at.step_id));
             return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                 // `expected` is what this run asks for and `recorded` what the row holds, which is
                 // the order `Error::UnexpectedStep` prints them in.

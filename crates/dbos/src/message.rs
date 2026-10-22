@@ -68,7 +68,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepCall, StepPlacement};
+use crate::checkpoint::{Built, PendingStep, StepPlacement, StepPosition, StepWriter};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
@@ -269,11 +269,11 @@ where
             // `recv` is refused anywhere that records nothing, so the placement is always
             // `Recorded` here — `sysdb::recv` takes a required caller for the same reason, there
             // being no uncheckpointed form of a call that consumes.
-            let Some(StepCall {
+            let Some(StepWriter {
                 workflow_id,
                 step_id,
                 owner_xid,
-            }) = placement.step_call()
+            }) = placement.step_writer()
             else {
                 unreachable!("recv is refused outside a workflow and inside a step")
             };
@@ -514,7 +514,7 @@ fn pending_send<'a, E: DurableError + 'a>(
             conn.send_encoded(
                 &encoded.as_message(),
                 &encoded.encoding,
-                placement.step(),
+                placement.step_position(),
                 forks,
                 placement.owner(),
             )
@@ -544,7 +544,7 @@ fn pending_send_bulk<'a, E: DurableError + 'a>(
             conn.send_all_encoded(
                 &messages,
                 &encoding,
-                placement.step(),
+                placement.step_position(),
                 forks,
                 placement.owner(),
             )
@@ -576,7 +576,7 @@ impl Connection {
         &self,
         message: &EncodedMessage<'_>,
         encoding: &PayloadEncoding,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepPosition<'_>>,
         forks: Forks,
         owner: Option<crate::sysdb::types::WorkflowOwner<'_>>,
     ) -> Result<(), E>
@@ -587,7 +587,7 @@ impl Connection {
             .send_message(
                 message,
                 Some(encoding.name()),
-                caller,
+                caller.map(|at| (at.workflow_id, at.step_id)),
                 forks == Forks::Include,
                 owner,
             )
@@ -605,7 +605,7 @@ impl Connection {
         &self,
         messages: &[EncodedMessage<'_>],
         encoding: &PayloadEncoding,
-        caller: Option<(&str, i32)>,
+        caller: Option<StepPosition<'_>>,
         forks: Forks,
         owner: Option<crate::sysdb::types::WorkflowOwner<'_>>,
     ) -> Result<(), E>
@@ -616,7 +616,7 @@ impl Connection {
             .send_messages(
                 messages,
                 Some(encoding.name()),
-                caller,
+                caller.map(|at| (at.workflow_id, at.step_id)),
                 forks == Forks::Include,
                 owner,
             )

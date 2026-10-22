@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use tokio::task::JoinHandle;
 
-use crate::checkpoint::{PendingStep, StepCall, StepPlacement};
+use crate::checkpoint::{PendingStep, StepPlacement, StepPosition, StepWriter};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result};
@@ -337,7 +337,11 @@ impl ChildResultPlacement {
         conn: &Connection,
         awaited_workflow_id: &str,
     ) -> std::result::Result<Option<StepRecord>, Error> {
-        let Some((workflow_id, step_id)) = self.0.step() else {
+        let Some(StepPosition {
+            workflow_id,
+            step_id,
+        }) = self.0.step_position()
+        else {
             return Ok(None);
         };
         let Some(recorded) = conn
@@ -416,11 +420,11 @@ impl ChildResultPlacement {
         settled: &std::result::Result<EncodedOutput, Failure>,
         started_at: Timestamp,
     ) -> std::result::Result<(), Error> {
-        let Some(StepCall {
+        let Some(StepWriter {
             workflow_id,
             step_id,
             owner_xid,
-        }) = self.0.step_call()
+        }) = self.0.step_writer()
         else {
             return Ok(());
         };

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::checkpoint::{PendingStep, StepCall, StepPlacement};
+use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::error::{DurableError, Error};
 use crate::sysdb::types::{Timestamp, step_names};
 
@@ -61,12 +61,12 @@ where
             // nothing to record now.
             let Some((
                 executor,
-                StepCall {
+                StepWriter {
                     workflow_id,
                     step_id,
                     owner_xid,
                 },
-            )) = executor.zip(placement.step_call())
+            )) = executor.zip(placement.step_writer())
             else {
                 tracing::debug!(
                     duration_ms = duration.as_millis(),

@@ -40,6 +40,7 @@
 
 use std::time::Duration;
 
+use crate::checkpoint::StepWriter;
 use crate::config::Config;
 use crate::serialization::Serializer;
 use crate::sysdb::types::StepCaller;
@@ -196,7 +197,7 @@ impl Connection {
     /// serializer, as a step's output is.
     pub(crate) fn step_caller<'a>(
         &'a self,
-        caller: Option<crate::checkpoint::StepCall<'a>>,
+        caller: Option<StepWriter<'a>>,
     ) -> Option<StepCaller<'a>> {
         caller.map(|caller| StepCaller {
             workflow_id: caller.workflow_id,

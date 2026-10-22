@@ -176,7 +176,7 @@
 
 use std::sync::Arc;
 
-use crate::checkpoint::{PendingStep, StepPlacement, revive};
+use crate::checkpoint::{PendingStep, StepPlacement, StepPosition, revive};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
@@ -727,7 +727,10 @@ impl Connection {
     ) -> Result<String> {
         // The ids first, so the refusal below has them: `check` answers `Some` only where the
         // placement holds a step, so inside this arm they are known rather than defaulted.
-        if let Some((workflow_id, step_id)) = placement.step()
+        if let Some(StepPosition {
+            workflow_id,
+            step_id,
+        }) = placement.step_position()
             && let Some(recorded) = placement.check(self, step_names::SELECT_WORKFLOW).await?
         {
             // A recorded failure replays as that failure. The only one this call records is the

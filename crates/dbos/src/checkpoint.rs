@@ -76,10 +76,17 @@ use crate::instance::Executor;
 use crate::serialization::{PayloadEncoding, Serializer, decode_error};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowOwner};
 
-/// A call recorded as a step of a workflow: the step, and the token of the execution making it,
-/// which the call presents so it lands only while that execution still owns the workflow.
+/// Where a recorded call sits in its workflow: what a replay reads back, and all it needs.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StepCall<'a> {
+pub(crate) struct StepPosition<'a> {
+    pub(crate) workflow_id: &'a str,
+    pub(crate) step_id: i32,
+}
+
+/// Who writes at a recorded call's position: the step, and the token of the execution making it,
+/// which the write presents so it lands only while that execution still owns the workflow.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StepWriter<'a> {
     pub(crate) workflow_id: &'a str,
     pub(crate) step_id: i32,
     pub(crate) owner_xid: &'a str,
@@ -752,7 +759,8 @@ impl StepPlacement {
     }
 
     /// The workflow making this call, recorded or not: `Some` inside a step body too, where
-    /// [`step`](Self::step) is `None`. `None` outside a workflow and through a client.
+    /// [`step_position`](Self::step_position) is `None`. `None` outside a workflow and through a
+    /// client.
     pub(crate) fn workflow_id(&self) -> Option<&str> {
         match self {
             Self::Recorded { ctx, .. } | Self::InsideStep { ctx } => Some(ctx.workflow_id()),
@@ -760,18 +768,23 @@ impl StepPlacement {
         }
     }
 
-    /// The workflow and step id this call is recorded under, if it is recorded at all.
-    pub(crate) fn step(&self) -> Option<(&str, i32)> {
+    /// The workflow and step id this call is recorded under, if it is recorded at all: what a
+    /// replay read needs, which is not fenced.
+    pub(crate) fn step_position(&self) -> Option<StepPosition<'_>> {
         match self {
-            Self::Recorded { ctx, step_id } => Some((ctx.workflow_id(), *step_id)),
+            Self::Recorded { ctx, step_id } => Some(StepPosition {
+                workflow_id: ctx.workflow_id(),
+                step_id: *step_id,
+            }),
             _ => None,
         }
     }
 
-    /// The step this call is recorded under and the execution making it, if it is recorded.
-    pub(crate) fn step_call(&self) -> Option<StepCall<'_>> {
+    /// The step this call is recorded under and the execution writing it, if it is recorded:
+    /// what a fenced write presents.
+    pub(crate) fn step_writer(&self) -> Option<StepWriter<'_>> {
         match self {
-            Self::Recorded { ctx, step_id } => Some(StepCall {
+            Self::Recorded { ctx, step_id } => Some(StepWriter {
                 workflow_id: ctx.workflow_id(),
                 step_id: *step_id,
                 owner_xid: ctx.owner_xid(),
@@ -824,7 +837,11 @@ impl StepPlacement {
         conn: &Connection,
         step_name: &str,
     ) -> Result<Option<StepRecord>, Error> {
-        let Some((workflow_id, step_id)) = self.step() else {
+        let Some(StepPosition {
+            workflow_id,
+            step_id,
+        }) = self.step_position()
+        else {
             return Ok(None);
         };
         conn.sysdb()
@@ -851,11 +868,11 @@ impl StepPlacement {
         outcome: Outcome<'_>,
         started_at: Timestamp,
     ) -> Result<(), Error> {
-        let Some(StepCall {
+        let Some(StepWriter {
             workflow_id,
             step_id,
             owner_xid,
-        }) = self.step_call()
+        }) = self.step_writer()
         else {
             return Ok(());
         };

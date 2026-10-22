@@ -29,7 +29,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::DBOS;
-use crate::checkpoint::{Built, PendingStep, StepCall, StepPlacement, revive};
+use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter, revive};
 use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
@@ -621,7 +621,7 @@ where
                     return Ok(None);
                 }
                 // Ids are taken in order, so once one has no record, none after it does.
-                None => self.replaying = placement.step().is_none(),
+                None => self.replaying = placement.step_position().is_none(),
             }
         }
 
@@ -1000,11 +1000,11 @@ async fn record(
     serialization: Option<&str>,
     started_at: Timestamp,
 ) -> Result<()> {
-    let Some(StepCall {
+    let Some(StepWriter {
         workflow_id,
         step_id,
         owner_xid,
-    }) = placement.step_call()
+    }) = placement.step_writer()
     else {
         return Ok(());
     };
