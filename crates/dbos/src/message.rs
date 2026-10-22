@@ -75,7 +75,7 @@ use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error, Result};
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_tagged, encode};
-use crate::sysdb::types::Message as EncodedMessage;
+use crate::sysdb::types::Message as SysdbMessage;
 use crate::sysdb::types::step_names;
 
 /// Sends a message to a workflow, for it to [`recv`] when it is ready.
@@ -453,7 +453,7 @@ fn place_send<C>(
 /// would make the run generic over the caller's `T` and demand `T: Sync` of every sender for no
 /// reason — the run has no use for the value, only for the string it encoded to. The three
 /// addressing fields are `&str`, so they travel as they are.
-struct Encoded<'a> {
+struct EncodedSendMessage<'a> {
     destination_id: &'a str,
     topic: Option<&'a str>,
     idempotency_key: Option<&'a str>,
@@ -462,10 +462,10 @@ struct Encoded<'a> {
     encoding: PayloadEncoding,
 }
 
-impl<'a> Encoded<'a> {
-    /// What `sysdb` is handed, borrowing the encoded payload rather than copying it.
-    fn as_message(&self) -> EncodedMessage<'_> {
-        EncodedMessage {
+impl<'a> EncodedSendMessage<'a> {
+    /// The `SysdbMessage` handed to `sysdb`, borrowing the encoded payload rather than copying it.
+    fn as_sysdb_message(&self) -> SysdbMessage<'_> {
+        SysdbMessage {
             destination_id: self.destination_id,
             topic: self.topic,
             message: &self.message,
@@ -480,8 +480,8 @@ impl<'a> Encoded<'a> {
 fn encode_one<'a, T: Serialize>(
     message: &SendMessage<'a, T>,
     encoding: PayloadEncoding,
-) -> Result<Encoded<'a>> {
-    Ok(Encoded {
+) -> Result<EncodedSendMessage<'a>> {
+    Ok(EncodedSendMessage {
         destination_id: message.destination_id,
         topic: message.topic,
         idempotency_key: message.idempotency_key,
@@ -498,11 +498,11 @@ fn encode_one<'a, T: Serialize>(
 fn encode_all<'a, T: Serialize>(
     messages: &'a [SendMessage<'a, T>],
     encoding: &PayloadEncoding,
-) -> Result<Vec<Encoded<'a>>> {
+) -> Result<Vec<EncodedSendMessage<'a>>> {
     messages
         .iter()
         .map(|message| {
-            Ok(Encoded {
+            Ok(EncodedSendMessage {
                 destination_id: message.destination_id,
                 topic: message.topic,
                 idempotency_key: message.idempotency_key,
@@ -520,7 +520,7 @@ fn encode_all<'a, T: Serialize>(
 /// [`Client`](crate::Client)'s stays a plain `async fn`, because it takes no id and is legitimately
 /// driven from anywhere.
 fn pending_send<'a, E: DurableError + 'a>(
-    built: Built<(Arc<Connection>, Encoded<'a>)>,
+    built: Built<(Arc<Connection>, EncodedSendMessage<'a>)>,
     forks: Forks,
 ) -> PendingStep<'a, (), E> {
     PendingStep::placed(
@@ -528,7 +528,7 @@ fn pending_send<'a, E: DurableError + 'a>(
         built,
         move |(conn, encoded), placement| async move {
             conn.send_encoded(
-                &encoded.as_message(),
+                &encoded.as_sysdb_message(),
                 &encoded.encoding,
                 placement.step_position(),
                 forks,
@@ -542,7 +542,7 @@ fn pending_send<'a, E: DurableError + 'a>(
 
 /// A batch send as a [`PendingStep`] — see [`pending_send`], of which this is the plural.
 fn pending_send_bulk<'a, E: DurableError + 'a>(
-    built: Built<(Arc<Connection>, Vec<Encoded<'a>>)>,
+    built: Built<(Arc<Connection>, Vec<EncodedSendMessage<'a>>)>,
     forks: Forks,
 ) -> PendingStep<'a, (), E> {
     PendingStep::placed(
@@ -555,8 +555,10 @@ fn pending_send_bulk<'a, E: DurableError + 'a>(
                 .first()
                 .map(|one| one.encoding.clone())
                 .unwrap_or_default();
-            let messages: Vec<EncodedMessage<'_>> =
-                encoded.iter().map(Encoded::as_message).collect();
+            let messages: Vec<SysdbMessage<'_>> = encoded
+                .iter()
+                .map(EncodedSendMessage::as_sysdb_message)
+                .collect();
             conn.send_all_encoded(
                 &messages,
                 &encoding,
@@ -590,7 +592,7 @@ impl Connection {
     /// engine variant either way, and `E` only says which channel it travels in.
     pub(crate) async fn send_encoded<E>(
         &self,
-        message: &EncodedMessage<'_>,
+        message: &SysdbMessage<'_>,
         encoding: &PayloadEncoding,
         caller: Option<StepPosition<'_>>,
         forks: Forks,
@@ -619,7 +621,7 @@ impl Connection {
     /// a batch exists to avoid.
     pub(crate) async fn send_all_encoded<E>(
         &self,
-        messages: &[EncodedMessage<'_>],
+        messages: &[SysdbMessage<'_>],
         encoding: &PayloadEncoding,
         caller: Option<StepPosition<'_>>,
         forks: Forks,
@@ -686,7 +688,7 @@ impl crate::Client {
         // against and nothing to replay it for.
         self.connection()
             .send_encoded(
-                &encoded.as_message(),
+                &encoded.as_sysdb_message(),
                 &encoded.encoding,
                 None,
                 options.send_to_forks,
@@ -727,7 +729,10 @@ impl crate::Client {
             self.connection().serializer().encoding(),
         );
         let encoded = encode_all(messages, &encoding)?;
-        let messages: Vec<EncodedMessage<'_>> = encoded.iter().map(Encoded::as_message).collect();
+        let messages: Vec<SysdbMessage<'_>> = encoded
+            .iter()
+            .map(EncodedSendMessage::as_sysdb_message)
+            .collect();
         // No caller: a client is never inside a workflow, so there is no step to record the batch
         // against and nothing to replay it for.
         self.connection()
