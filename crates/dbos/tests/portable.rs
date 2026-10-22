@@ -824,17 +824,13 @@ async fn insert_row(
     .unwrap();
 }
 
-/// A start that finds a row already written in another encoding runs what the row holds, by the
-/// row's tag — not the input it was called with, which it encoded differently.
+/// A row already written in another encoding runs what the row holds, by the row's tag — not the
+/// input a later start was called with, which it encoded differently. The row is a crash's
+/// leftover, so the launch's recovery runs it; the start finds the row and runs nothing of its own.
 #[tokio::test]
 async fn a_start_of_an_existing_row_runs_it_in_its_own_encoding() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("portable-restart", &db));
-    let echo = dbos
-        .register_workflow("echo", |text: String| async move { Ok::<_, Error>(text) })
-        .unwrap();
-    dbos.launch().await.expect("launch failed");
-    // Pending and unowned, as a row whose first run never got going: the start below claims it.
+    let config = config("portable-restart", &db);
     insert_row(
         &db,
         "wf-restart",
@@ -844,6 +840,23 @@ async fn a_start_of_an_existing_row_runs_it_in_its_own_encoding() {
         "portable_json",
     )
     .await;
+    // Pending under this executor and version, as a run that crashed before its first step.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status"
+             SET executor_id = 'local', application_version = $2
+           WHERE workflow_uuid = $1"#,
+    )
+    .bind("wf-restart")
+    .bind(config.app_version.as_deref())
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+
+    let dbos = DBOS::new(config);
+    let echo = dbos
+        .register_workflow("echo", |text: String| async move { Ok::<_, Error>(text) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
 
     let handle = echo
         .start_with(

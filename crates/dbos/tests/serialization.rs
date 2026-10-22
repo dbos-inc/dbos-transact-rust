@@ -141,32 +141,38 @@ async fn a_dequeued_row_in_an_unreadable_encoding_is_not_run() {
     dbos.shutdown().await;
 }
 
-/// A start that claims a row it did not create runs the row's input, not the one it was called
-/// with: only the creator writes a row's input, and a recovery of the row would run what it holds.
-/// The same whether the row's tag is the caller's own or absent.
+/// A row another execution created runs the row's input, not the one a later start was called
+/// with: only the creator writes a row's input, and a start that finds the row runs nothing of its
+/// own. The row here is a crash's leftover, so the launch's recovery is what runs it. The same
+/// whether the row's tag is the caller's own or absent.
 #[tokio::test]
 async fn a_start_of_an_existing_row_runs_the_rows_input() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("tag-existing", &db));
+    let config = config("tag-existing", &db);
+    for (id, tag) in [("wf-tagged", Some("rust_serde")), ("wf-untagged", None)] {
+        // Pending under this executor and version, as a run that crashed before its first step.
+        sqlx::query(
+            r#"INSERT INTO "dbos"."workflow_status"
+                 (workflow_uuid, name, status, inputs, created_at, serialization,
+                  executor_id, application_version)
+               VALUES ($1, 'echo', 'PENDING', '"stored"',
+                       (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, $2, 'local', $3)"#,
+        )
+        .bind(id)
+        .bind(tag)
+        .bind(config.app_version.as_deref())
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    }
+
+    let dbos = DBOS::new(config);
     let echo = dbos
         .register_workflow("echo", |text: String| async move { Ok::<_, Error>(text) })
         .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    for (id, tag) in [("wf-tagged", Some("rust_serde")), ("wf-untagged", None)] {
-        // Pending and unowned, as a row whose first run never got going: the start claims it.
-        sqlx::query(
-            r#"INSERT INTO "dbos"."workflow_status"
-                 (workflow_uuid, name, status, inputs, created_at, serialization)
-               VALUES ($1, 'echo', 'PENDING', '"stored"',
-                       (EXTRACT(EPOCH FROM now()) * 1000)::BIGINT, $2)"#,
-        )
-        .bind(id)
-        .bind(tag)
-        .execute(&db.pool().await)
-        .await
-        .unwrap();
-
+    for id in ["wf-tagged", "wf-untagged"] {
         let handle = echo
             .start_with(
                 "caller".to_owned(),
