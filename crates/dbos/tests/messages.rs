@@ -211,7 +211,10 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
         .expect("the workflow never reached its gate");
 
     dbos.send_with(
-        SendMessage::new(&workflow_id, &"yes").topic("approvals"),
+        SendMessage {
+            topic: Some("approvals"),
+            ..SendMessage::new(&workflow_id, &"yes")
+        },
         SendOptions::default(),
     )
     .await

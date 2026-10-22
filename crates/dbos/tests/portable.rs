@@ -185,14 +185,16 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
         .unwrap();
     client
         .send_with(
-            SendMessage::new(
-                handle.workflow_id(),
-                &InteropMessage {
-                    sender: "test".to_owned(),
-                    payload: vec![1, 2, 3],
-                },
-            )
-            .topic("interop_topic"),
+            SendMessage {
+                topic: Some("interop_topic"),
+                ..SendMessage::new(
+                    handle.workflow_id(),
+                    &InteropMessage {
+                        sender: "test".to_owned(),
+                        payload: vec![1, 2, 3],
+                    },
+                )
+            },
             SendOptions {
                 serialization: SerializationFormat::Portable,
                 ..Default::default()

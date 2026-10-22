@@ -468,12 +468,18 @@ async fn a_message_waits_for_its_destination() {
 
     client
         .send_with(
-            SendMessage::new(&id, &"approved").topic("approvals"),
+            SendMessage {
+                topic: Some("approvals"),
+                ..SendMessage::new(&id, &"approved")
+            },
             SendOptions::default(),
         )
         .await
         .expect("send failed");
-    let once = SendMessage::new(&id, &"only once").idempotency_key("once");
+    let once = SendMessage {
+        idempotency_key: Some("once"),
+        ..SendMessage::new(&id, &"only once")
+    };
     client
         .send_with(once.clone(), SendOptions::default())
         .await

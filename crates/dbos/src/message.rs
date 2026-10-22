@@ -138,7 +138,10 @@ where
 /// # async fn approve() -> dbos::Result<()> {
 /// use dbos::{SendMessage, SendOptions};
 /// dbos::send_with(
-///     SendMessage::new("order-42", &"approved").topic("approvals"),
+///     SendMessage {
+///         topic: Some("approvals"),
+///         ..SendMessage::new("order-42", &"approved")
+///     },
 ///     SendOptions::default(),
 /// )
 /// .await
@@ -748,11 +751,14 @@ impl crate::Client {
 /// is [`SendOptions`], beside it. The topic and the idempotency key are here rather than there
 /// because in a batch they vary per message.
 ///
-/// [`SendMessage::new`] plus its builders:
+/// [`SendMessage::new`] plus functional update, like everything else that takes options here:
 ///
 /// ```no_run
 /// # use dbos::SendMessage;
-/// let messages = [SendMessage::new("order-42", &"approved").topic("approvals")];
+/// let messages = [SendMessage {
+///     topic: Some("approvals"),
+///     ..SendMessage::new("order-42", &"approved")
+/// }];
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendMessage<'a, T> {
@@ -789,23 +795,6 @@ impl<'a, T> SendMessage<'a, T> {
             message,
             topic: None,
             idempotency_key: None,
-        }
-    }
-
-    /// Files the message under `topic` rather than the default one.
-    pub fn topic(self, topic: &'a str) -> Self {
-        Self {
-            topic: Some(topic),
-            ..self
-        }
-    }
-
-    /// Makes re-sending the message under `key` a no-op — see
-    /// [`idempotency_key`](Self::idempotency_key).
-    pub fn idempotency_key(self, key: &'a str) -> Self {
-        Self {
-            idempotency_key: Some(key),
-            ..self
         }
     }
 }
@@ -881,10 +870,6 @@ mod tests {
             "each send is a distinct message unless a key says otherwise"
         );
         assert_eq!(Forks::default(), Forks::Skip);
-
-        let message = message.topic("approvals").idempotency_key("once");
-        assert_eq!(message.topic, Some("approvals"));
-        assert_eq!(message.idempotency_key, Some("once"));
     }
 
     /// Neither free function has anything to stand on outside a workflow, and both say so rather
