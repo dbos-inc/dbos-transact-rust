@@ -216,22 +216,29 @@ pub fn duration_from_secs(secs: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(secs).ok()
 }
 
-/// A workflow's delay or timeout in milliseconds, or [`Error::InvalidInput`] naming `field` when
-/// it is zero or does not fit.
+/// Rejects a workflow or fork's delay or timeout that is zero, or too long to store as
+/// milliseconds, as [`Error::InvalidInput`] naming `field`.
 ///
-/// The rule [`NewWorkflow::validate`] applies, kept in one place so the surfaces that start a
-/// workflow can refuse the same values before they take a step id. A zero delay is a caller that
-/// meant `None`, and a zero timeout would expire the workflow before it ran. Both are written as
-/// milliseconds: the timeout as itself, the delay as an instant `init_workflow` resolves from it,
-/// so one that does not fit is refused rather than truncated into the column.
-pub(crate) fn workflow_duration_ms(field: &'static str, duration: Duration) -> Result<i64, Error> {
+/// The rule [`NewWorkflow::validate`] and [`ForkOptions::validate`] apply, kept in one place so
+/// the surfaces that start a workflow can refuse the same values before they take a step id. A
+/// zero delay is a caller that meant `None`, and a zero timeout would expire the workflow before
+/// it ran. Both are written as milliseconds: the timeout as itself, the delay as an instant
+/// resolved from it, so one that does not fit is refused rather than truncated into the column.
+///
+/// Neither rule reads a clock, so a surface can apply them before a step id is taken without a
+/// replay deciding differently from the first run.
+pub(crate) fn validate_positive_duration(
+    field: &'static str,
+    duration: Duration,
+) -> Result<(), Error> {
     if duration.is_zero() {
         return Err(Error::InvalidInput {
             field: field.into(),
             detail: "must be a positive, non-zero duration".to_owned(),
         });
     }
-    duration_to_ms(field, duration)
+    duration_to_ms(field, duration)?;
+    Ok(())
 }
 
 /// Converts a caller's duration to the integer milliseconds a column such as
@@ -663,10 +670,10 @@ impl<'a> NewWorkflow<'a> {
             }
         }
         // `Duration` already rules out negatives, so zero and a value too long to store are what
-        // is left; `workflow_duration_ms` says why each is refused.
+        // is left; `validate_positive_duration` says why each is refused.
         for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
             if let Some(value) = value {
-                workflow_duration_ms(field, value)?;
+                validate_positive_duration(field, value)?;
             }
         }
         validate_attributes(self.attributes)?;
@@ -2652,13 +2659,9 @@ impl ForkOptions<'_> {
             }
         }
         // As on `NewWorkflow`: a zero timeout would expire the fork before it ran.
-        if self.timeout == Some(Duration::ZERO) {
-            return Err(Error::InvalidInput {
-                field: "timeout".into(),
-                detail: "must be absent rather than zero".to_owned(),
-            });
+        if let Some(timeout) = self.timeout {
+            validate_positive_duration("timeout", timeout)?;
         }
-        self.timeout_ms()?;
         // The replacements are applied by joining against them, so one child named twice would
         // match a copied step twice and duplicate it. The primary key would catch that as a
         // constraint violation, which says nothing about the map that caused it. Python and
@@ -2695,7 +2698,8 @@ impl ForkOptions<'_> {
     /// The timeout in milliseconds, the unit its column stores.
     ///
     /// Refused rather than saturated, by [`duration_to_ms`]. [`validate`](Self::validate) is where
-    /// a caller hears it; the insert converts through here too, so the rule is written once.
+    /// a caller hears it, through [`validate_positive_duration`]; the insert converts through here,
+    /// so the unit is written once.
     pub(crate) fn timeout_ms(&self) -> Result<Option<i64>, Error> {
         self.timeout
             .map(|timeout| duration_to_ms("timeout", timeout))

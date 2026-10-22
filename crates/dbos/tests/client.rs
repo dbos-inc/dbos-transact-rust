@@ -1470,6 +1470,19 @@ async fn a_client_lists_tags_and_delays_workflows() {
         .await
         .expect("delay failed");
 
+    // A delay whose release instant cannot be stored is refused by the system database, and
+    // reported as an argument refusal: too long to be milliseconds at all, or fitting but carrying
+    // the clock past the largest instant.
+    for delay in [Duration::MAX, Duration::from_millis(i64::MAX as u64)] {
+        let refused = client
+            .set_workflow_delay(id, dbos::WorkflowDelay::For(delay))
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail.contains("`delay`")),
+            "a delay of {delay:?} should be refused, got {refused:?}"
+        );
+    }
+
     client.close().await;
 }
 

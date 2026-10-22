@@ -2708,7 +2708,7 @@ impl PostgresSystemDatabase {
         // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
         // the clock per attempt would push it further out each time.
         let started_at = Timestamp::now();
-        // Settled before the retry, and so before any write.
+        // Computed before the retry, and so before any write.
         //
         // A sleep whose wake time cannot be stored is refused: the caller asked to be woken at an
         // instant this layer cannot record, and recording a different one would wake it at the
@@ -2716,12 +2716,17 @@ impl PostgresSystemDatabase {
         // than being the wait: one too far out to store is one that never elapses, which is what
         // the caller asked for, so it is held at the largest instant there is — the same answer
         // `get_event` gives outside a workflow, where no deadline is recorded at all.
+        //
+        // **The refusal is held until the record has been looked for.** Whether the sum fits
+        // depends on the clock, so a replay must not decide it again: a sleep the first run
+        // recorded wakes at its recorded instant, whatever `now + duration` would be today.
         let wake_at = match kind {
-            SleepKind::Durable => started_at.try_add("duration", duration)?,
-            SleepKind::Deadline => started_at
+            SleepKind::Durable => started_at.try_add("duration", duration),
+            SleepKind::Deadline => Ok(started_at
                 .checked_add(duration)
-                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX)),
+                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX))),
         };
+        let wake_at = &wake_at;
 
         with_retry(&self.retry, "checkpoint_sleep", move || async move {
             // A transaction for the owner check, which locks the workflow's row until the record
@@ -2752,6 +2757,8 @@ impl PostgresSystemDatabase {
                 "running sleep"
             );
 
+            // Only a first run reaches here, so only a first run is refused.
+            let wake_at = wake_at.clone()?;
             let recorded = wake_at.as_epoch_ms().to_string();
             let timing = StepTiming {
                 started_at,
@@ -3954,8 +3961,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // TODO(dbos-team): UPSTREAM item 22, as on `init_workflow`.
         let now = Timestamp::now();
-        // Refused here, before any write, when the instant cannot be stored.
-        let delay_until = delay.resolve(now)?.as_epoch_ms();
+        // An instant that cannot be stored is refused inside the step, not here: whether it fits
+        // depends on the clock, so a replay must read back what the first run recorded rather
+        // than decide again. The step records the refusal like any other failure.
+        let delay_until = delay.resolve(now).map(Timestamp::as_epoch_ms);
+        let delay_until = &delay_until;
         let workflow_table = workflow_table.as_str();
         let started_at = Timestamp::now();
 
@@ -3965,6 +3975,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 step_names::SET_WORKFLOW_DELAY,
                 started_at,
                 |mut conn| async move {
+                    let delay_until = delay_until.clone()?;
                     // `status = 'DELAYED'` is the guard: a released workflow is running or
                     // queued, and pushing its delay out would not recall it.
                     sqlx::query(AssertSqlSafe(format!(

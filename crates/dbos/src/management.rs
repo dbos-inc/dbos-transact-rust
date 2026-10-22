@@ -122,12 +122,12 @@ use std::time::Duration;
 
 use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter};
 use crate::connection::Connection;
-use crate::error::{Error, Result, input_refusal};
+use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
     Fork as SysFork, ForkOptions as SysForkOptions, RewindOptions as SysRewindOptions, StepRecord,
-    Timestamp, WorkflowDelay, WorkflowFilter, WorkflowRecord, step_names,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, duration_to_ms, step_names,
 };
 
 /// Whether an operation reaches a workflow's descendants.
@@ -1051,8 +1051,10 @@ impl DBOS {
     /// [`WorkflowDelay::Until`] removes the first of those readings: an absolute instant is
     /// written as given, and nothing on this path consults a clock to do it.
     ///
-    /// A [`WorkflowDelay::For`] whose release instant cannot be stored, as epoch milliseconds in an
-    /// `i64`, is [`Error::InvalidArgument`], refused before the call takes a step id.
+    /// A [`WorkflowDelay::For`] too long to store as milliseconds in an `i64` is
+    /// [`Error::InvalidArgument`], refused before the call takes a step id. One that fits but
+    /// carries this process's clock past the largest instant is the same error, decided inside the
+    /// step and recorded there, so a replay reads back the first run's answer.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1066,11 +1068,11 @@ impl DBOS {
         workflow_id: &'a str,
         delay: WorkflowDelay,
     ) -> PendingStep<'a, ()> {
-        // The argument check between the launch check and the placement, so a delay that cannot
-        // be stored refuses the call without moving the workflow's step counter.
-        let built = self.executor("delay a workflow").and_then(|executor| {
+        // The argument check between the launch check and the placement, so a delay too long to
+        // store refuses the call without moving the workflow's step counter.
+        let built = self.executor(DELAY_OPERATION).and_then(|executor| {
             refuse_unstorable_delay(delay)?;
-            StepPlacement::taken(Ok(executor), "delay a workflow")
+            StepPlacement::taken(Ok(executor), DELAY_OPERATION)
         });
         PendingStep::placed(
             step_names::SET_WORKFLOW_DELAY,
@@ -1423,7 +1425,6 @@ impl crate::Client {
     /// See [`DBOS::set_workflow_delay`]. Only a `DELAYED` row moves: a workflow already released is
     /// running or queued, and pushing its delay out would not recall it.
     pub async fn set_workflow_delay(&self, workflow_id: &str, delay: WorkflowDelay) -> Result<()> {
-        refuse_unstorable_delay(delay)?;
         self.connection()
             .set_workflow_delay(workflow_id, delay, None)
             .await
@@ -1673,7 +1674,7 @@ impl Connection {
         self.sysdb()
             .set_workflow_delay(workflow_id, delay, self.step_caller(caller))
             .await
-            .map_err(Error::from_sysdb)?;
+            .map_err(|error| Error::refused_argument(DELAY_OPERATION, error))?;
         // Phrased as the request rather than the effect. The statement is guarded on the row
         // still being `DELAYED` and reports no count, so this call cannot tell a workflow that
         // was rescheduled from one that had already been released — unlike `cancel_all` and
@@ -1752,18 +1753,22 @@ fn refuse_negative_start_step(operation: &'static str, field: &str, start_step: 
     Ok(())
 }
 
-/// Refuses a relative delay whose release instant cannot be stored.
+/// What a refused delay names as the operation.
+const DELAY_OPERATION: &str = "delay a workflow";
+
+/// Refuses a relative delay too long to store as milliseconds.
 ///
-/// Made by the surfaces rather than inside the connection, as [`refuse_negative_start_step`] is,
-/// so a refused call spends no step id. Resolved against this process's clock, as the write will
-/// resolve it; the system database refuses the same delay again for its own callers.
+/// Made by the surface rather than inside the connection, as [`refuse_negative_start_step`] is,
+/// so a refused call spends no step id. Only the rule that reads no clock: a delay that fits but
+/// carries `now` past the largest instant is refused by the system database as it resolves the
+/// delay, inside the step, so a replay reads back what the first run recorded rather than
+/// deciding again against a later clock.
 fn refuse_unstorable_delay(delay: WorkflowDelay) -> Result<()> {
-    match delay.resolve(Timestamp::now()) {
-        Ok(_) => Ok(()),
-        Err(error) => Err(Error::InvalidArgument {
-            operation: "delay a workflow".into(),
-            detail: input_refusal(error),
-        }),
+    match delay {
+        WorkflowDelay::For(duration) => duration_to_ms("delay", duration)
+            .map(drop)
+            .map_err(|error| Error::refused_argument(DELAY_OPERATION, error)),
+        WorkflowDelay::Until(_) => Ok(()),
     }
 }
 
@@ -1808,16 +1813,10 @@ fn refuse_invalid_forks(forks: &[Fork<'_>], options: &ForkOptions<'_>) -> Result
 /// A system database refusal of a fork's arguments, as the surface reports it: an
 /// [`Error::InvalidArgument`] whose detail names the field through `field`.
 fn refused_fork(error: crate::sysdb::Error, field: impl FnOnce(&str) -> String) -> Error {
-    match error {
-        crate::sysdb::Error::InvalidInput {
-            field: name,
-            detail,
-        } => Error::InvalidArgument {
-            operation: FORK_OPERATION.into(),
-            detail: format!("{}: {detail}", field(&name)),
-        },
-        other => Error::from_sysdb(other),
-    }
+    Error::from_refusal(error, |name, detail| Error::InvalidArgument {
+        operation: FORK_OPERATION.into(),
+        detail: format!("{}: {detail}", field(name)),
+    })
 }
 
 /// Refuses a negative rewind step, and an option given as an empty string.

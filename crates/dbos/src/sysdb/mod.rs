@@ -404,7 +404,9 @@ pub trait SystemDatabase: Send + Sync {
     /// surface takes it.
     ///
     /// A [`WorkflowDelay::For`] whose release instant cannot be stored as epoch milliseconds in an
-    /// `i64` is [`Error::InvalidInput`], refused before anything is written.
+    /// `i64` is [`Error::InvalidInput`], and the row is not touched. Given a `caller`, the refusal
+    /// is decided inside the step and recorded as its outcome like any other failure, so a replay
+    /// reads back the first run's answer rather than deciding again against a later clock.
     async fn set_workflow_delay(
         &self,
         workflow_id: &str,
@@ -1064,7 +1066,9 @@ pub trait SystemDatabase: Send + Sync {
     /// registering a deadline is calling the blocking read, not recording a sleep by hand.
     ///
     /// A `duration` whose wake time cannot be stored as epoch milliseconds in an `i64` is
-    /// [`Error::InvalidInput`], refused before anything is written.
+    /// [`Error::InvalidInput`], refused before anything is written — but only once the record has
+    /// been looked for. Whether it fits depends on the clock, so a sleep already recorded replays
+    /// its recorded wake time rather than being decided again.
     async fn record_sleep(
         &self,
         workflow_id: &str,

@@ -6190,7 +6190,13 @@ async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
             .fork_workflows(&[Fork::new("wf-blank")], &options, None)
             .await;
         match result {
-            Err(Error::InvalidInput { field: f, .. }) => assert_eq!(f, field),
+            Err(Error::InvalidInput { field: f, detail }) => {
+                assert_eq!(f, field);
+                if field == "timeout" {
+                    // The rule a workflow's own timeout is held to.
+                    assert_eq!(detail, "must be a positive, non-zero duration");
+                }
+            }
             other => panic!("expected {field} to be refused, got {other:?}"),
         }
     }
@@ -6413,6 +6419,52 @@ async fn a_sleep_that_cannot_be_stored_is_refused() {
     sys.record_sleep("wf-sleeper", 0, std::time::Duration::ZERO, &owner)
         .await
         .expect("the slot a refused sleep left should still be free");
+}
+
+/// A recorded sleep replays its recorded wake time, even when recomputing it now would overflow.
+///
+/// Whether `now + duration` fits depends on the clock, so the refusal must not be decided again
+/// on a replay: the record is looked for first, and a first run that recorded a wake time is
+/// answered by it. Planted directly, as a first run near the edge would have left it, with a
+/// duration that fits in milliseconds but whose sum with today's clock does not.
+#[tokio::test]
+async fn a_recorded_sleep_replays_even_when_recomputing_it_would_overflow() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-replayed-sleeper"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&sys, "wf-replayed-sleeper").await;
+    let recorded = i64::MAX - 1_000;
+    sys.record_step(
+        "wf-replayed-sleeper",
+        0,
+        "DBOS.sleep",
+        Outcome::Output(Some(&recorded.to_string())),
+        Some("portable_json"),
+        None,
+        &owner,
+    )
+    .await
+    .unwrap();
+
+    let overflowing = std::time::Duration::from_millis(i64::MAX as u64);
+    let wake_at = sys
+        .record_sleep("wf-replayed-sleeper", 0, overflowing, &owner)
+        .await
+        .expect("a recorded sleep should replay rather than be refused");
+    assert_eq!(wake_at, Timestamp::from_epoch_ms(recorded));
+
+    // The same duration with no record behind it is refused.
+    let refused = sys
+        .record_sleep("wf-replayed-sleeper", 1, overflowing, &owner)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::InvalidInput { ref field, .. }) if field == "duration"
+        ),
+        "expected the unrecorded sleep to be refused, got {refused:?}"
+    );
 }
 
 /// A deadline too far out to store is one that never elapses, not a refusal.

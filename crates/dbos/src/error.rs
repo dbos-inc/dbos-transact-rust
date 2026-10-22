@@ -518,18 +518,10 @@ impl<E> From<E> for Error<E> {
     }
 }
 
-/// A system-database refusal of one input, phrased for a surface that names the call itself:
-/// "`delay` must fit in milliseconds as a 64-bit integer".
-///
-/// For a surface that refuses an argument **before it takes a step id**, by asking the system
-/// database's own check rather than restating it: the two then cannot disagree about what is
-/// storable, and the system database still refuses the same value for callers that reach it
-/// directly.
-pub(crate) fn input_refusal(error: crate::sysdb::Error) -> String {
-    match error {
-        crate::sysdb::Error::InvalidInput { field, detail } => format!("`{field}` {detail}"),
-        other => other.to_string(),
-    }
+/// A system-database refusal's field and detail as one phrase, for a message that names the call
+/// separately: "`delay` must be a positive, non-zero duration".
+pub(crate) fn refusal_detail(field: &str, detail: &str) -> String {
+    format!("`{field}` {detail}")
 }
 
 impl<E> Error<E> {
@@ -547,6 +539,36 @@ impl<E> Error<E> {
             }
             other => Error::SystemDatabase(other),
         }
+    }
+
+    /// A system-database refusal of one of a call's arguments, as the surface reports it.
+    ///
+    /// `refuse` builds the error from [`InvalidInput`](crate::sysdb::Error::InvalidInput)'s field
+    /// and detail, which lets each surface name the field the way its own API spells it. Any other
+    /// error is not a refusal and goes through [`from_sysdb`](Self::from_sysdb) unchanged, so a
+    /// backend or connection failure keeps its [`SystemDatabase`](Self::SystemDatabase) variant.
+    ///
+    /// For a surface that refuses an argument by asking the system database's own check rather
+    /// than restating it: the two then cannot disagree about what is storable, and the system
+    /// database still refuses the same value for callers that reach it directly.
+    pub(crate) fn from_refusal(
+        error: crate::sysdb::Error,
+        refuse: impl FnOnce(&str, String) -> Self,
+    ) -> Self {
+        match error {
+            crate::sysdb::Error::InvalidInput { field, detail } => refuse(&field, detail),
+            other => Self::from_sysdb(other),
+        }
+    }
+
+    /// [`from_refusal`](Self::from_refusal) as an [`InvalidArgument`](Self::InvalidArgument) to
+    /// `operation`, its detail phrased by [`refusal_detail`]: "`duration` must fit in milliseconds
+    /// as a 64-bit integer".
+    pub(crate) fn refused_argument(operation: &'static str, error: crate::sysdb::Error) -> Self {
+        Self::from_refusal(error, |field, detail| Error::InvalidArgument {
+            operation: operation.into(),
+            detail: refusal_detail(field, &detail),
+        })
     }
 
     /// A value that could not be encoded for its column; `what` names it, as `"argument"` or

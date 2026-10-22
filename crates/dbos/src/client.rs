@@ -71,7 +71,7 @@ use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{
-    Enqueue, Submitted, encode_attributes, init_or_join, new_row, validate_timeout,
+    Enqueue, Submitted, encode_attributes, init_or_join, new_row, validate_start,
 };
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
@@ -410,8 +410,7 @@ impl Client {
     {
         // Refused before the input is encoded, as before anything is written: an enqueue no queue
         // could honour should not spend the encoding either.
-        options.queue.validate()?;
-        validate_timeout(options.timeout)?;
+        options.validate()?;
         let encoding = PayloadEncoding::resolve(
             options.queue.serialization,
             self.connection().serializer().encoding(),
@@ -445,8 +444,7 @@ impl Client {
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        options.queue.validate()?;
-        validate_timeout(options.timeout)?;
+        options.validate()?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
         self.enqueue_encoded(workflow, &input, PayloadEncoding::Portable, options)
             .await
@@ -855,6 +853,12 @@ pub struct EnqueueOptions<'a> {
 }
 
 impl<'a> EnqueueOptions<'a> {
+    /// Refuses an enqueue no row could hold, with the check every start makes — see
+    /// [`validate_start`].
+    fn validate(&self) -> Result<()> {
+        validate_start(Some(&self.queue), self.timeout)
+    }
+
     /// A plain enqueue onto `queue`, asking for nothing else.
     pub fn new(queue: &'a str) -> Self {
         Self::on(Enqueue::new(queue))
