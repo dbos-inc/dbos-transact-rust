@@ -16,8 +16,8 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, ForkOptions, Message, QueueChange, QueueConflict, QueueOptions,
-    SendOptions, StartOptions, WorkflowHandle,
+    EnqueueOptions, Error, ForkOptions, ForkSpec, Message, QueueChange, QueueConflict,
+    QueueOptions, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -1165,8 +1165,7 @@ async fn a_client_forks_a_workflow_the_application_then_runs() {
     let client = client("client-fork", &db).await;
     let fork = client
         .fork_with::<u32, EngineOnly>(
-            source,
-            0,
+            ForkSpec::new(source, 0),
             ForkOptions {
                 app_version: Some(APP_VERSION),
                 ..ForkOptions::default()
@@ -1182,31 +1181,31 @@ async fn a_client_forks_a_workflow_the_application_then_runs() {
     assert_eq!(fork.result().await.expect("the fork failed"), 9);
     assert_eq!(ran.load(Ordering::SeqCst), 2, "the fork did not run");
 
-    client.close().await;
-    dbos.shutdown().await;
-}
-
-/// A chosen id names one fork, so the bulk form refuses it — the same refusal `DBOS::fork_all`
-/// makes, checked here because it is the one rule this surface enforces before any I/O.
-#[tokio::test]
-async fn a_clients_bulk_fork_refuses_a_chosen_id() {
-    let db = test_database().await;
-    let client = client("client-fork-refusal", &db).await;
-
-    let error = client
+    // The bulk form names its forks per source.
+    let named = client
         .fork_all::<u32, EngineOnly>(
-            &["a", "b"],
-            0,
+            &[ForkSpec {
+                forked_id: Some("client-named-fork"),
+                ..ForkSpec::new(source, 0)
+            }],
             ForkOptions {
-                forked_id: Some("only-one-of-me"),
+                app_version: Some(APP_VERSION),
                 ..ForkOptions::default()
             },
         )
         .await
-        .expect_err("one id cannot name two forks");
-    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
+        .expect("bulk fork failed");
+    assert_eq!(
+        named.iter().map(|h| h.workflow_id()).collect::<Vec<_>>(),
+        ["client-named-fork"],
+    );
+    for fork in named {
+        assert_eq!(fork.result().await.expect("the named fork failed"), 9);
+    }
+    assert_eq!(ran.load(Ordering::SeqCst), 3, "the named fork did not run");
 
     client.close().await;
+    dbos.shutdown().await;
 }
 
 /// A negative step is refused before any I/O, on the single and the bulk form — the same refusal
@@ -1226,7 +1225,7 @@ async fn a_clients_fork_refuses_a_negative_step() {
         "{error:?}"
     );
     let error = client
-        .fork_all::<u32, EngineOnly>(&["has-a-step"], -1, ForkOptions::default())
+        .fork_all::<u32, EngineOnly>(&[ForkSpec::new("has-a-step", -1)], ForkOptions::default())
         .await
         .expect_err("a negative step was accepted in bulk");
     assert!(

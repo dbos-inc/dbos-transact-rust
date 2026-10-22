@@ -46,10 +46,11 @@
 //! **Required as arguments, optional in a struct.** All three single sends read
 //! `send(destination_id, message)`, with a topic, an idempotency key and the fork fan-out in
 //! [`SendOptions`] on the `_with` form — the split [`step`](crate::step())/[`step_with`](crate::step_with)
-//! and `fork`/[`fork_with`](crate::DBOS::fork_with) already make. The batch is the one exception and
-//! has to be: the [`send_bulk`] family takes [`Message`] values carrying their own topic and key,
-//! because those vary per message, beside a batch-wide [`SendBulkOptions`]. Python and Java split it
-//! in the same place.
+//! already makes. The batch is the one exception and has to be: the [`send_bulk`] family takes
+//! [`Message`] values carrying their own topic and key, because those vary per message, beside a
+//! batch-wide [`SendBulkOptions`]. Python and Java split it in the same place, and
+//! [`fork_all`](crate::DBOS::fork_all) does too, with [`ForkSpec`](crate::ForkSpec) beside
+//! [`ForkOptions`](crate::ForkOptions).
 //!
 //! **The batch is on all three surfaces, not just the client.** Python and Java are the only
 //! references with a batch send and both expose it on their runtime as well as their client, and
@@ -725,10 +726,10 @@ impl crate::Client {
 /// **The element type of the [`send_bulk`] family, and only that.** A single send names its
 /// destination
 /// and payload as arguments and everything else through [`SendOptions`] — required as parameters,
-/// optional in the bag, which is the shape [`step_with`](crate::step_with),
-/// [`run_with`](crate::WorkflowRef::run_with) and [`fork_with`](crate::DBOS::fork_with) all take. A
-/// *batch* cannot: its topic and its idempotency key vary per message, so they travel with the
-/// message. Python's and Java's `SendMessage` carry the same four fields for the same reason.
+/// optional in the bag, which is the shape [`step_with`](crate::step_with) and
+/// [`run_with`](crate::WorkflowRef::run_with) take. A *batch* cannot: its topic and its idempotency
+/// key vary per message, so they travel with the message. Python's and Java's `SendMessage` carry
+/// the same four fields for the same reason.
 ///
 /// [`Message::new`] plus functional update, like everything else that takes options here:
 ///
@@ -780,9 +781,9 @@ impl<'a, T> Message<'a, T> {
 ///
 /// **Everything optional, and nothing required.** A destination and a payload are what a send
 /// cannot do without, so they are arguments; a topic, an idempotency key and the fork fan-out are
-/// choices, so they are here. That is the split [`step`](crate::step())/[`step_with`](crate::step_with),
-/// `run`/[`run_with`](crate::WorkflowRef::run_with) and `fork`/[`fork_with`](crate::DBOS::fork_with)
-/// already make, and it is why the plain [`send`] is two arguments long.
+/// choices, so they are here. That is the split [`step`](crate::step())/[`step_with`](crate::step_with)
+/// and `run`/[`run_with`](crate::WorkflowRef::run_with) already make, and it is why the plain
+/// [`send`] is two arguments long.
 ///
 /// **A struct so that the next option is not a breaking change.** A send has accumulated options in
 /// every implementation — a serialization override in TypeScript and Go, a caller-supplied

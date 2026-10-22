@@ -54,10 +54,10 @@
 //! `join_workflows` returns nothing for the same reason its references return their inputs
 //! unchanged: there is nothing to hand back that the caller did not already have.
 //!
-//! **They take handles; these take ids.** Every bulk call in this crate takes `&[&str]` —
-//! [`cancel_all`](crate::DBOS::cancel_all), [`delete_all`](crate::DBOS::delete_all),
-//! [`fork_all`](crate::DBOS::fork_all) — and a wait is not different enough to spell its argument
-//! a second way. It also makes the heterogeneous case expressible: a fan-out whose members return
+//! **They take handles; these take ids.** Every bulk call here that only names workflows takes
+//! `&[&str]` — [`cancel_all`](crate::DBOS::cancel_all), [`delete_all`](crate::DBOS::delete_all),
+//! [`resume_all`](crate::DBOS::resume_all) — and a wait is not different enough to spell its
+//! argument a second way. It also makes the heterogeneous case expressible: a fan-out whose members return
 //! different types has no common `WorkflowHandle<R, E>` to put in a slice, and TypeScript only
 //! avoids that by erasing to `WorkflowHandle<unknown>`.
 //!

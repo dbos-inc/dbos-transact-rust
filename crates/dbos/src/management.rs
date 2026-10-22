@@ -32,7 +32,7 @@
 //! # Bulk forms
 //!
 //! Every operation that has one in the references has one here, suffixed `_all`, and the singular
-//! form is a caller with one id. [`retrieve_workflow`](DBOS::retrieve_workflow),
+//! form is a caller with a one-element batch. [`retrieve_workflow`](DBOS::retrieve_workflow),
 //! [`set_workflow_delay`](DBOS::set_workflow_delay) and
 //! [`update_workflow_attributes`](DBOS::update_workflow_attributes) have none, in this crate or in
 //! any reference: each addresses one row and none of them is worth a round trip to batch.
@@ -119,7 +119,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
+use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
@@ -180,7 +180,52 @@ pub struct ResumeOptions<'a> {
     pub queue: Option<&'a str>,
 }
 
-/// What a fork inherits, and where it goes.
+/// One fork: the workflow it is forked from, the step it restarts at, and the id it gets.
+///
+/// **The element type of [`fork_all`](DBOS::fork_all), and the argument of
+/// [`fork_with`](DBOS::fork_with).** These are the fields that vary per fork. A chosen id names
+/// exactly one fork, and a batch re-running a fan-out may need each member restarted at its own
+/// step, so both travel with the source they belong to; what is uniform across the call is in
+/// [`ForkOptions`]. That is the split [`Message`](crate::Message) and
+/// [`SendBulkOptions`](crate::SendBulkOptions) make for a batch send.
+///
+/// [`ForkSpec::new`] plus functional update, like everything else that takes options here:
+///
+/// ```no_run
+/// # use dbos::ForkSpec;
+/// let forks = [
+///     ForkSpec { forked_id: Some("order-42-retry"), ..ForkSpec::new("order-42", 3) },
+///     ForkSpec::new("order-43", 0),
+/// ];
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkSpec<'a> {
+    /// The workflow to fork. It is not modified beyond being marked as forked from.
+    pub original_id: &'a str,
+    /// The first step the fork runs.
+    ///
+    /// Every step below it replays from the original's checkpoint, and this step and every one
+    /// after it run again. Step ids start at 0, so 0 re-runs the whole workflow. Negative is an
+    /// [`Error::InvalidArgument`], and in a batch it refuses the whole call.
+    pub start_step: i32,
+    /// The id the fork gets. `None` generates one.
+    pub forked_id: Option<&'a str>,
+}
+
+impl<'a> ForkSpec<'a> {
+    /// A fork of `original_id` restarting at `start_step`, under a generated id.
+    pub fn new(original_id: &'a str, start_step: i32) -> Self {
+        Self {
+            original_id,
+            start_step,
+            forked_id: None,
+        }
+    }
+}
+
+/// What every fork of a call inherits, and where it goes.
+///
+/// The per-fork fields — the source, the start step and the chosen id — are on [`ForkSpec`].
 ///
 /// **`None` does not mean the same thing across these fields.**
 /// [`app_version`](Self::app_version) is the only one that falls back to the
@@ -189,10 +234,6 @@ pub struct ResumeOptions<'a> {
 /// three asks for the internal queue, no partition, and no bound — not "as before".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForkOptions<'a> {
-    /// The id the fork gets. `None` generates one.
-    ///
-    /// [`fork_all`](DBOS::fork_all) refuses it: one id cannot name many forks.
-    pub forked_id: Option<&'a str>,
     /// The version the fork runs under. `None` inherits the source's.
     ///
     /// **This is what forking is usually for.** A workflow that failed against broken code is
@@ -333,9 +374,9 @@ impl DBOS {
     /// **The id is spent here, at the call**, which is why every method below is a plain `fn`
     /// handing back a [`PendingStep`] rather than an `async fn`: a management call built beside a
     /// step and driven with it takes the same slot on every execution. A method with an argument
-    /// check of its own — [`fork_all`](Self::fork_all)'s refusal of a chosen id,
-    /// [`fork_with`](Self::fork_with)'s refusal of a negative step — makes it between the launch
-    /// check and this, so a refused call spends nothing.
+    /// check of its own — [`fork_with`](Self::fork_with)'s and [`fork_all`](Self::fork_all)'s
+    /// refusal of a negative step — makes it between the launch check and this, so a refused call
+    /// spends nothing.
     pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
     }
@@ -620,26 +661,33 @@ impl DBOS {
     /// [`Error::InvalidArgument`]. To fork from a failure, find the failed step's id with
     /// [`list_workflow_steps`](Self::list_workflow_steps).
     ///
-    /// [`fork_with`](Self::fork_with) for the options; this is the common case.
+    /// [`fork_with`](Self::fork_with) for a chosen id and the options; this is the common case.
     pub fn fork<'a, R: 'a, E: 'a>(
         &self,
         workflow_id: &'a str,
         start_step: i32,
     ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        self.fork_with(workflow_id, start_step, ForkOptions::default())
+        self.fork_with(
+            ForkSpec::new(workflow_id, start_step),
+            ForkOptions::default(),
+        )
     }
 
-    /// Forks a workflow, choosing what the fork inherits and where it runs.
+    /// Forks a workflow, choosing the fork's id, what it inherits and where it runs.
     ///
     /// A fork is a **new workflow** that inherits its source's identity — name, inputs, roles,
-    /// attributes — along with the recorded results of every step below `start_step`. Those
-    /// steps replay rather than run, so the fork arrives at `start_step` in the state the
-    /// original was in, and carries on from a moment that has already happened. Re-running failed
-    /// work against fixed code is what it is for, which is why
-    /// [`ForkOptions::app_version`] exists.
+    /// attributes — along with the recorded results of every step below
+    /// [`start_step`](ForkSpec::start_step). Those steps replay rather than run, so the fork
+    /// arrives at the start step in the state the original was in, and carries on from a moment
+    /// that has already happened. Re-running failed work against fixed code is what it is for,
+    /// which is why [`ForkOptions::app_version`] exists.
     ///
     /// The source is not modified beyond being marked as forked from; the fork gets its own id,
-    /// generated unless [`ForkOptions::forked_id`] names one.
+    /// generated unless [`ForkSpec::forked_id`] names one.
+    ///
+    /// Takes a [`ForkSpec`] rather than the id and step as arguments, because the chosen id sits
+    /// beside them there: it is the same per-fork triple a [`fork_all`](Self::fork_all) batch is
+    /// made of, and the single fork is that batch with one element.
     ///
     /// **Enqueued, never started.** The handle is a polling one — see the module documentation.
     ///
@@ -655,50 +703,34 @@ impl DBOS {
     /// let steps = dbos.list_workflow_steps("failed-workflow").await?;
     /// let failed = steps.iter().rev().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
     /// let handle = dbos.fork_with::<u32, dbos::EngineOnly>(
-    ///     "failed-workflow",
-    ///     failed,
+    ///     dbos::ForkSpec::new("failed-workflow", failed),
     ///     dbos::ForkOptions { app_version: Some("v2"), ..Default::default() },
     /// ).await?;
     /// # Ok(()) }
     /// ```
     pub fn fork_with<'a, R: 'a, E: 'a>(
         &self,
-        workflow_id: &'a str,
-        start_step: i32,
+        fork: ForkSpec<'a>,
         options: ForkOptions<'a>,
     ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        // The argument check between the launch check and the placement, so a negative step
-        // refuses the call without moving the workflow's step counter.
-        let built = self.executor("fork a workflow").and_then(|executor| {
-            refuse_negative_start_step("fork a workflow", "start_step", start_step)?;
-            // The executor came from this handle rather than from the ambient context, so the two
-            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
-            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
-            Ok((executor, placement))
-        });
+        let original_id = fork.original_id;
         PendingStep::placed(
             step_names::FORK_WORKFLOW,
-            built,
-            move |executor, placement| async move {
+            self.fork_placed(std::slice::from_ref(&fork), &options),
+            move |(executor, request), placement| async move {
                 executor
                     .connection()
-                    .fork_all(
-                        &[workflow_id],
-                        start_step,
-                        options.forked_id,
-                        &options,
-                        placement.step_writer(),
-                    )
+                    .fork_all(request, placement.step_writer())
                     .await?
                     .pop()
                     .ok_or_else(|| {
-                        Error::Config(format!("forking `{workflow_id}` produced no workflow"))
+                        Error::Config(format!("forking `{original_id}` produced no workflow"))
                     })
             },
         )
     }
 
-    /// Forks workflows from the same step, handing back a handle to each fork in the order given.
+    /// Forks workflows, handing back a handle to each fork in the order given.
     ///
     /// The batch is the system database's primitive rather than a loop over
     /// [`fork_with`](Self::fork_with), and the difference is visible: every source must exist, or
@@ -706,45 +738,63 @@ impl DBOS {
     /// siblings never existed, which for a fan-out being re-run against fixed code is worse than
     /// forking nothing.
     ///
-    /// [`ForkOptions::forked_id`] is refused here: one id cannot name many forks, and generating
-    /// them silently would hand back a fork under an id the caller did not ask for. Every other
-    /// option applies to the whole batch, which is what makes
+    /// Each [`ForkSpec`] names its own source, start step and, optionally, the fork's id. The
+    /// options apply to the whole batch, which is what makes
     /// [`app_version`](ForkOptions::app_version) useful — re-running a fan-out
     /// against the deployment that fixes it is the case this method exists for.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// use dbos::{ForkOptions, ForkSpec};
+    ///
+    /// let forks = [
+    ///     ForkSpec { forked_id: Some("shard-1-retry"), ..ForkSpec::new("shard-1", 2) },
+    ///     ForkSpec { forked_id: Some("shard-2-retry"), ..ForkSpec::new("shard-2", 5) },
+    /// ];
+    /// let handles = dbos
+    ///     .fork_all::<u32, dbos::EngineOnly>(
+    ///         &forks,
+    ///         ForkOptions { app_version: Some("v2"), ..Default::default() },
+    ///     )
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
     pub fn fork_all<'a, R: 'a, E: 'a>(
         &self,
-        workflow_ids: &'a [&'a str],
-        start_step: i32,
+        forks: &'a [ForkSpec<'a>],
         options: ForkOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        // Which instance is serving this first, as every other method on this surface does: an
-        // unlaunched instance should say so whatever else is wrong with the call. Then the
-        // argument checks, and only then the step id — so a call refused for naming one id for
-        // many forks moves the workflow's counter no more than an unlaunched one does.
-        let built = self.executor("fork a workflow").and_then(|executor| {
-            refuse_negative_start_step("fork a workflow", "start_step", start_step)?;
-            refuse_forked_id_in_bulk(&options)?;
-            // The executor came from this handle rather than from the ambient context, so the two
-            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
-            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
-            Ok((executor, placement))
-        });
         PendingStep::placed(
             step_names::FORK_WORKFLOW,
-            built,
-            move |executor, placement| async move {
+            self.fork_placed(forks, &options),
+            move |(executor, request), placement| async move {
                 executor
                     .connection()
-                    .fork_all(
-                        workflow_ids,
-                        start_step,
-                        None,
-                        &options,
-                        placement.step_writer(),
-                    )
+                    .fork_all(request, placement.step_writer())
                     .await
             },
         )
+    }
+
+    /// The serving executor, the checked request, and the step id, for
+    /// [`fork_with`](Self::fork_with) and [`fork_all`](Self::fork_all).
+    ///
+    /// Which instance is serving this first, as every other method on this surface does: an
+    /// unlaunched instance should say so whatever else is wrong with the call. Then the argument
+    /// checks, and only then the step id — so a call refused for a negative step moves the
+    /// workflow's counter no more than an unlaunched one does.
+    fn fork_placed<'a>(
+        &self,
+        forks: &[ForkSpec<'a>],
+        options: &ForkOptions<'a>,
+    ) -> Built<(Arc<Executor>, ForkRequest<'a>)> {
+        self.executor("fork a workflow").and_then(|executor| {
+            let request = ForkRequest::new(forks, options)?;
+            // The executor came from this handle rather than from the ambient context, so the two
+            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
+            let placement = StepPlacement::of(executor.connection(), "fork a workflow")?;
+            Ok(((executor, request), placement))
+        })
     }
 
     /// Re-runs a finished workflow from its first step, under the same id.
@@ -1200,8 +1250,7 @@ impl crate::Client {
     /// let failed = steps.iter().rev().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
     /// let handle = client
     ///     .fork_with::<u32, dbos::EngineOnly>(
-    ///         "failed-workflow",
-    ///         failed,
+    ///         dbos::ForkSpec::new("failed-workflow", failed),
     ///         dbos::ForkOptions { app_version: Some("1.4.0"), ..Default::default() },
     ///     )
     ///     .await?;
@@ -1212,33 +1261,34 @@ impl crate::Client {
         workflow_id: &str,
         start_step: i32,
     ) -> Result<WorkflowHandle<R, E>> {
-        self.fork_with(workflow_id, start_step, ForkOptions::default())
-            .await
+        self.fork_with(
+            ForkSpec::new(workflow_id, start_step),
+            ForkOptions::default(),
+        )
+        .await
     }
 
-    /// [`fork`](Self::fork), with the version, queue, timeout, chosen id and replacement children
-    /// spelled out.
+    /// [`fork`](Self::fork), with the chosen id, version, queue, timeout and replacement children
+    /// spelled out. See [`DBOS::fork_with`].
     pub async fn fork_with<R, E>(
         &self,
-        workflow_id: &str,
-        start_step: i32,
+        fork: ForkSpec<'_>,
         options: ForkOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        refuse_negative_start_step("fork a workflow", "start_step", start_step)?;
+        let request = ForkRequest::new(std::slice::from_ref(&fork), &options)?;
         self.connection()
-            .fork_all(
-                &[workflow_id],
-                start_step,
-                options.forked_id,
-                &options,
-                None,
-            )
+            .fork_all(request, None)
             .await?
             .pop()
-            .ok_or_else(|| Error::Config(format!("forking `{workflow_id}` produced no workflow")))
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "forking `{}` produced no workflow",
+                    fork.original_id
+                ))
+            })
     }
 
-    /// Forks workflows from the same step, handing back a handle to each fork in the order given.
+    /// Forks workflows, handing back a handle to each fork in the order given.
     ///
     /// See [`DBOS::fork_all`]: every source must exist, or the call fails and no fork is written.
     ///
@@ -1249,15 +1299,11 @@ impl crate::Client {
     /// operator reaches for a client to do.
     pub async fn fork_all<R, E>(
         &self,
-        workflow_ids: &[&str],
-        start_step: i32,
+        forks: &[ForkSpec<'_>],
         options: ForkOptions<'_>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        refuse_negative_start_step("fork a workflow", "start_step", start_step)?;
-        refuse_forked_id_in_bulk(&options)?;
-        self.connection()
-            .fork_all(workflow_ids, start_step, None, &options, None)
-            .await
+        let request = ForkRequest::new(forks, &options)?;
+        self.connection().fork_all(request, None).await
     }
 
     /// Re-runs a finished workflow from its first step, under the same id.
@@ -1454,34 +1500,15 @@ impl Connection {
             .collect())
     }
 
-    /// Forks workflows from the same step, and hands back a handle to each fork.
+    /// Forks the workflows a checked request names, and hands back a handle to each fork.
     pub(crate) async fn fork_all<R, E>(
         self: &Arc<Self>,
-        workflow_ids: &[&str],
-        start_step: i32,
-        forked_id: Option<&str>,
-        options: &ForkOptions<'_>,
+        request: ForkRequest<'_>,
         caller: Option<StepWriter<'_>>,
     ) -> Result<Vec<WorkflowHandle<R, E>>> {
-        let sys_options = SysForkOptions {
-            application_version: options.app_version,
-            queue_name: options.queue,
-            queue_partition_key: options.queue_partition_key,
-            timeout: options.timeout,
-            replacement_children: options.replacement_children,
-        };
-
-        let forks: Vec<Fork<'_>> = workflow_ids
-            .iter()
-            .map(|source_id| Fork {
-                source_id,
-                forked_id,
-                start_step,
-            })
-            .collect();
         let forked = self
             .sysdb()
-            .fork_workflows(&forks, &sys_options, self.step_caller(caller))
+            .fork_workflows(&request.forks, &request.options, self.step_caller(caller))
             .await
             .map_err(Error::from_sysdb)?;
 
@@ -1641,20 +1668,48 @@ fn refuse_negative_start_step(operation: &'static str, field: &str, start_step: 
     Ok(())
 }
 
-/// Refuses a chosen fork id on a call that may produce many forks.
+/// A fork call whose arguments have been checked, and the only thing
+/// [`Connection::fork_all`] takes.
 ///
-/// One id cannot name several forks. Go carries its id per-source on `ForkWorkflowSpec` instead,
-/// which is the same difference — its id sits beside each source id, and this one sits beside the
-/// batch — and both surfaces here have to say so.
-fn refuse_forked_id_in_bulk(options: &ForkOptions<'_>) -> Result<()> {
-    if options.forked_id.is_some() {
-        return Err(Error::InvalidArgument {
-            operation: "fork_all".into(),
-            detail: "ForkOptions::forked_id names a single fork and cannot be used with fork_all"
-                .to_owned(),
-        });
+/// **Built by the surfaces, before a step id is taken**, for the reason
+/// [`refuse_negative_start_step`] gives: a refused call must not spend one, and the connection is
+/// only reached once one has. Making the connection take this rather than the raw arguments is
+/// what keeps the checks in one place — [`ForkRequest::new`] is the one way to build it, so no
+/// surface can reach the connection without making them.
+pub(crate) struct ForkRequest<'a> {
+    forks: Vec<Fork<'a>>,
+    options: SysForkOptions<'a>,
+}
+
+impl<'a> ForkRequest<'a> {
+    /// Checks every fork, refusing the whole call if any one of them is invalid.
+    fn new(forks: &[ForkSpec<'a>], options: &ForkOptions<'a>) -> Result<Self> {
+        let forks = forks
+            .iter()
+            .map(|fork| {
+                refuse_negative_start_step(
+                    "fork a workflow",
+                    &format!("ForkSpec::start_step of `{}`", fork.original_id),
+                    fork.start_step,
+                )?;
+                Ok(Fork {
+                    source_id: fork.original_id,
+                    forked_id: fork.forked_id,
+                    start_step: fork.start_step,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            forks,
+            options: SysForkOptions {
+                application_version: options.app_version,
+                queue_name: options.queue,
+                queue_partition_key: options.queue_partition_key,
+                timeout: options.timeout,
+                replacement_children: options.replacement_children,
+            },
+        })
     }
-    Ok(())
 }
 
 /// Refuses a negative rewind step, and an option given as an empty string.

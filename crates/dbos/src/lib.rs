@@ -105,7 +105,7 @@ pub use identity::{APP_ID_ENV, APP_VERSION_ENV, CLOUD_APP_NAME_ENV, CLOUD_ENV, E
 pub use instance::{DBOS, Executor};
 #[cfg(feature = "engine")]
 pub use management::{
-    Children, ForkOptions, ListWorkflowStepsOptions, ResumeOptions, RewindOptions,
+    Children, ForkOptions, ForkSpec, ListWorkflowStepsOptions, ResumeOptions, RewindOptions,
 };
 #[cfg(feature = "engine")]
 pub use message::{
