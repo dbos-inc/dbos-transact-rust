@@ -52,7 +52,8 @@
 //! slice, and the same [`SendOptions`] serves both. That is the split
 //! [`step`](crate::step())/[`step_with`](crate::step_with) and
 //! `fork`/[`fork_with`](crate::DBOS::fork_with) already make: the plain form for the common case,
-//! the `_with` form for everything else.
+//! the `_with` form for everything else. [`fork_all`](crate::DBOS::fork_all) splits its batch the
+//! same way, with [`Fork`](crate::Fork) beside [`ForkOptions`](crate::ForkOptions).
 //!
 //! **The batch is on all three surfaces, not just the client.** Python and Java are the only
 //! references with a batch send and both expose it on their runtime as well as their client, and
