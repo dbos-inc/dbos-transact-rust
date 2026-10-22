@@ -1501,10 +1501,10 @@ impl DatabaseTime {
     /// When, on this process's monotonic clock, the database's clock reaches `instant`: the
     /// moment of the reading for an instant already behind it.
     ///
-    /// **Capped at thirty years ahead of the reading.** How far an [`Instant`]
-    /// can reach depends on the platform, and adding past it panics; a deadline of the largest
-    /// storable instant, which is what a timeout too long to store becomes, is far beyond it. No
-    /// process waits that long, so a wait capped there is one that never elapses.
+    /// **Capped at thirty years ahead of the reading.** How far an [`Instant`] can reach depends
+    /// on the platform, and adding past it panics; a deadline of the largest storable instant,
+    /// which is what a timeout too long to store becomes, is far beyond it. No process waits that
+    /// long, so a wait capped there is one that never elapses.
     pub fn reaches(self, instant: Timestamp) -> Instant {
         let ahead = instant.as_epoch_ms().saturating_sub(self.epoch_ms);
         let wait = Duration::from_millis(u64::try_from(ahead).unwrap_or(0));
