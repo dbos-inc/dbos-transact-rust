@@ -57,9 +57,8 @@
 //! **They take handles; these take ids.** Every bulk call here that only names workflows takes
 //! `&[&str]` — [`cancel_all`](crate::DBOS::cancel_all), [`delete_all`](crate::DBOS::delete_all),
 //! [`resume_all`](crate::DBOS::resume_all) — and a wait is not different enough to spell its
-//! argument a second way. It also makes the heterogeneous case expressible: a fan-out whose members return
-//! different types has no common `WorkflowHandle<R, E>` to put in a slice, and TypeScript only
-//! avoids that by erasing to `WorkflowHandle<unknown>`.
+//! argument a second way. It also makes the heterogeneous case expressible: a fan-out whose members
+//! return different types has no common `WorkflowHandle<R, E>` to put in a slice.
 //!
 //! **The all-wait is TypeScript's alone, and it is here anyway.** Python has `wait_first` and no
 //! `wait_all`; Go and Java have neither. Both are here because a fan-out wants both questions and

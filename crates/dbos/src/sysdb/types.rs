@@ -2333,35 +2333,30 @@ pub struct StreamRecord {
 
 /// One workflow to fork, and where its fork picks up.
 ///
-/// A struct per fork rather than three parallel lists. Python takes `original_workflow_ids`,
-/// `forked_workflow_ids` and `start_steps` and raises when their lengths disagree; pairing them
-/// here means they cannot.
+/// A struct per fork rather than three parallel lists, so the original, its fork's id and its
+/// start step cannot disagree in length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fork<'a> {
     /// The workflow to fork from. It is not modified beyond being marked as forked from.
-    pub source_id: &'a str,
+    pub original_id: &'a str,
     /// The id the fork gets, or `None` to have one generated.
     ///
-    /// Optional because Go and TypeScript both generate one when the caller does not care, and
-    /// the generated ids come back from [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
+    /// The generated ids come back from
+    /// [`SystemDatabase::fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows).
     pub forked_id: Option<&'a str>,
     /// The first step the fork will run.
     ///
     /// Every step *below* this is copied to the fork, so it replays them instead of running them.
     /// Steps are numbered from zero, so `0` copies nothing and restarts the workflow from the
     /// beginning, and `1` carries step 0 across.
-    ///
-    /// That last case is where the references disagree: TypeScript copies for any
-    /// `start_step > 0` and Python only for `step > 1`, so a Python fork from step 1 re-runs the
-    /// step it was given the result of. This follows TypeScript.
     pub start_step: i32,
 }
 
 impl<'a> Fork<'a> {
-    /// A fork of `source_id` restarting from the beginning, with a generated id.
-    pub fn new(source_id: &'a str) -> Self {
+    /// A fork of `original_id` restarting from the beginning, with a generated id.
+    pub fn new(original_id: &'a str) -> Self {
         Self {
-            source_id,
+            original_id,
             forked_id: None,
             start_step: 0,
         }
@@ -2369,9 +2364,9 @@ impl<'a> Fork<'a> {
 
     /// Rejects ids the schema cannot key on, matching [`NewWorkflow::validate`].
     pub(crate) fn validate(&self) -> Result<(), Error> {
-        if self.source_id.is_empty() {
+        if self.original_id.is_empty() {
             return Err(Error::InvalidInput {
-                field: "source_id".into(),
+                field: "original_id".into(),
                 detail: "must not be empty".to_owned(),
             });
         }

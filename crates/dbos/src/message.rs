@@ -48,9 +48,8 @@
 //! [`SendOptions`] on the `_with` form — the split [`step`](crate::step())/[`step_with`](crate::step_with)
 //! already makes. The batch is the one exception and has to be: the [`send_bulk`] family takes
 //! [`Message`] values carrying their own topic and key, because those vary per message, beside a
-//! batch-wide [`SendBulkOptions`]. Python and Java split it in the same place, and
-//! [`fork_all`](crate::DBOS::fork_all) does too, with [`ForkSpec`](crate::ForkSpec) beside
-//! [`ForkOptions`](crate::ForkOptions).
+//! batch-wide [`SendBulkOptions`]. [`fork_all`](crate::DBOS::fork_all) splits its batch the same
+//! way, with [`Fork`](crate::Fork) beside [`ForkOptions`](crate::ForkOptions).
 //!
 //! **The batch is on all three surfaces, not just the client.** Python and Java are the only
 //! references with a batch send and both expose it on their runtime as well as their client, and
@@ -728,8 +727,7 @@ impl crate::Client {
 /// and payload as arguments and everything else through [`SendOptions`] — required as parameters,
 /// optional in the bag, which is the shape [`step_with`](crate::step_with) and
 /// [`run_with`](crate::WorkflowRef::run_with) take. A *batch* cannot: its topic and its idempotency
-/// key vary per message, so they travel with the message. Python's and Java's `SendMessage` carry
-/// the same four fields for the same reason.
+/// key vary per message, so they travel with the message.
 ///
 /// [`Message::new`] plus functional update, like everything else that takes options here:
 ///

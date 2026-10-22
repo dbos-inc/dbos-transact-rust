@@ -5611,7 +5611,7 @@ async fn a_fork_carries_the_steps_below_its_start_step() {
     }
 
     let forks = [Fork {
-        source_id: "wf-src",
+        original_id: "wf-src",
         forked_id: Some("wf-fork"),
         start_step: 2,
     }];
@@ -6065,7 +6065,7 @@ async fn a_fork_sees_the_event_values_as_of_its_start_step() {
     }
 
     let forks = [Fork {
-        source_id: "wf-events",
+        original_id: "wf-events",
         forked_id: Some("wf-events-fork"),
         start_step: 2,
     }];
@@ -6096,12 +6096,12 @@ async fn forking_a_missing_workflow_writes_nothing() {
 
     let forks = [
         Fork {
-            source_id: "wf-present",
+            original_id: "wf-present",
             forked_id: Some("wf-would-be"),
             start_step: 1,
         },
         Fork {
-            source_id: "wf-absent",
+            original_id: "wf-absent",
             forked_id: Some("wf-never"),
             start_step: 1,
         },
@@ -6199,7 +6199,7 @@ async fn a_fork_option_that_is_empty_rather_than_absent_is_refused() {
     let result = sys
         .fork_workflows(
             &[Fork {
-                source_id: "wf-blank",
+                original_id: "wf-blank",
                 forked_id: Some(""),
                 start_step: 0,
             }],
@@ -6236,7 +6236,7 @@ async fn replacing_one_child_twice_is_refused() {
     let result = sys
         .fork_workflows(
             &[Fork {
-                source_id: "wf-dup",
+                original_id: "wf-dup",
                 forked_id: Some("wf-dup-fork"),
                 start_step: 1,
             }],
@@ -6319,7 +6319,7 @@ async fn a_fork_can_rewrite_the_children_it_replays() {
 
     sys.fork_workflows(
         &[Fork {
-            source_id: "wf-parent",
+            original_id: "wf-parent",
             forked_id: Some("wf-parent-fork"),
             start_step: 2,
         }],
@@ -8132,12 +8132,12 @@ async fn a_fork_inherits_its_sources_application() {
     beta.fork_workflows(
         &[
             Fork {
-                source_id: "wf-owned",
+                original_id: "wf-owned",
                 forked_id: Some("fork-of-owned"),
                 start_step: 1,
             },
             Fork {
-                source_id: "wf-unowned",
+                original_id: "wf-unowned",
                 forked_id: Some("fork-of-unowned"),
                 start_step: 1,
             },

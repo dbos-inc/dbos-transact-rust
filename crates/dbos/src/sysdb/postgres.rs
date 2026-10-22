@@ -1236,7 +1236,7 @@ impl PostgresSystemDatabase {
     async fn fork_on(
         &self,
         mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
-        source_ids: &[&str],
+        original_ids: &[&str],
         forked_ids: &[String],
         steps: StartSteps<'_>,
         options: &ForkOptions<'_>,
@@ -1248,7 +1248,7 @@ impl PostgresSystemDatabase {
             StartSteps::Given(given) => given,
             StartSteps::Resolve { aggregate, named } => {
                 resolved = self
-                    .resolve_fork_points_on(&mut tx, source_ids, aggregate, named)
+                    .resolve_fork_points_on(&mut tx, original_ids, aggregate, named)
                     .await?;
                 &resolved
             }
@@ -1292,10 +1292,10 @@ impl PostgresSystemDatabase {
         let found: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT workflow_uuid FROM {workflow_table} WHERE workflow_uuid = ANY($1)"
         )))
-        .bind(source_ids)
+        .bind(original_ids)
         .fetch_all(&mut *tx)
         .await?;
-        let missing: Vec<String> = source_ids
+        let missing: Vec<String> = original_ids
             .iter()
             .filter(|id| !found.iter().any(|f| f == *id))
             .map(|id| (*id).to_owned())
@@ -1325,10 +1325,10 @@ impl PostgresSystemDatabase {
                 w.authenticated_roles, w.assumed_role, w.serialization, w.request, \
                 $5, $6, w.workflow_uuid, w.attributes, $7, \
                 COALESCE(w.application_name, $8) \
-             FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
-             JOIN {workflow_table} w ON w.workflow_uuid = m.source_id"
+             FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
+             JOIN {workflow_table} w ON w.workflow_uuid = m.original_id"
         )))
-        .bind(source_ids)
+        .bind(original_ids)
         .bind(forked_ids)
         .bind(start_steps)
         .bind(options.application_version)
@@ -1348,12 +1348,12 @@ impl PostgresSystemDatabase {
         sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {input_table} (workflow_uuid, inputs) \
              SELECT m.fork_id, COALESCE(i.inputs, w.inputs) \
-             FROM unnest($1::text[], $2::text[]) AS m(source_id, fork_id) \
-             JOIN {workflow_table} w ON w.workflow_uuid = m.source_id \
-             LEFT JOIN {input_table} i ON i.workflow_uuid = m.source_id \
+             FROM unnest($1::text[], $2::text[]) AS m(original_id, fork_id) \
+             JOIN {workflow_table} w ON w.workflow_uuid = m.original_id \
+             LEFT JOIN {input_table} i ON i.workflow_uuid = m.original_id \
              ON CONFLICT (workflow_uuid) DO UPDATE SET inputs = EXCLUDED.inputs"
         )))
-        .bind(source_ids)
+        .bind(original_ids)
         .bind(forked_ids)
         .execute(&mut *tx)
         .await?;
@@ -1362,7 +1362,7 @@ impl PostgresSystemDatabase {
         sqlx::query(AssertSqlSafe(format!(
             "UPDATE {workflow_table} SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)"
         )))
-        .bind(source_ids)
+        .bind(original_ids)
         .execute(&mut *tx)
         .await?;
 
@@ -1379,14 +1379,14 @@ impl PostgresSystemDatabase {
                     COALESCE(r.replacement, o.child_workflow_id), \
                     o.started_at_epoch_ms, o.completed_at_epoch_ms, \
                     COALESCE(w.application_name, $6) \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
                  JOIN {steps_table} o \
-                   ON o.workflow_uuid = m.source_id AND o.function_id < m.start_step \
-                 JOIN {workflow_table} w ON w.workflow_uuid = m.source_id \
+                   ON o.workflow_uuid = m.original_id AND o.function_id < m.start_step \
+                 JOIN {workflow_table} w ON w.workflow_uuid = m.original_id \
                  LEFT JOIN unnest($4::text[], $5::text[]) AS r(original, replacement) \
                    ON r.original = o.child_workflow_id"
             )))
-            .bind(source_ids)
+            .bind(original_ids)
             .bind(forked_ids)
             .bind(start_steps)
             .bind(replace_from)
@@ -1403,11 +1403,11 @@ impl PostgresSystemDatabase {
             sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {history_table} (workflow_uuid, function_id, key, value, serialization) \
                  SELECT m.fork_id, h.function_id, h.key, h.value, h.serialization \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
                  JOIN {history_table} h \
-                   ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step"
+                   ON h.workflow_uuid = m.original_id AND h.function_id < m.start_step"
             )))
-            .bind(source_ids)
+            .bind(original_ids)
             .bind(forked_ids)
             .bind(start_steps)
             .execute(&mut *tx)
@@ -1422,12 +1422,12 @@ impl PostgresSystemDatabase {
                    SELECT m.fork_id, h.key, h.value, h.serialization, \
                           row_number() OVER (PARTITION BY m.fork_id, h.key \
                                              ORDER BY h.function_id DESC) AS rn \
-                   FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                   FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
                    JOIN {history_table} h \
-                     ON h.workflow_uuid = m.source_id AND h.function_id < m.start_step \
+                     ON h.workflow_uuid = m.original_id AND h.function_id < m.start_step \
                  ) latest WHERE rn = 1"
             )))
-            .bind(source_ids)
+            .bind(original_ids)
             .bind(forked_ids)
             .bind(start_steps)
             .execute(&mut *tx)
@@ -1439,11 +1439,11 @@ impl PostgresSystemDatabase {
                 "INSERT INTO {streams_table} (workflow_uuid, function_id, key, value, \
                     serialization, \"offset\") \
                  SELECT m.fork_id, s.function_id, s.key, s.value, s.serialization, s.\"offset\" \
-                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(source_id, fork_id, start_step) \
+                 FROM unnest($1::text[], $2::text[], $3::int4[]) AS m(original_id, fork_id, start_step) \
                  JOIN {streams_table} s \
-                   ON s.workflow_uuid = m.source_id AND s.function_id < m.start_step"
+                   ON s.workflow_uuid = m.original_id AND s.function_id < m.start_step"
             )))
-            .bind(source_ids)
+            .bind(original_ids)
             .bind(forked_ids)
             .bind(start_steps)
             .execute(&mut *tx)
@@ -1451,7 +1451,7 @@ impl PostgresSystemDatabase {
         }
 
         tracing::info!(
-            count = source_ids.len(),
+            count = original_ids.len(),
             queue_name,
             "forked workflows onto the queue"
         );
@@ -1471,7 +1471,7 @@ impl PostgresSystemDatabase {
     /// another execution's by comparing the stored completion time against it.
     async fn fork_batch(
         &self,
-        source_ids: &[&str],
+        original_ids: &[&str],
         forked_ids: &[String],
         steps: StartSteps<'_>,
         options: &ForkOptions<'_>,
@@ -1486,7 +1486,7 @@ impl PostgresSystemDatabase {
                 started_at,
                 |tx| async move {
                     let tx = self
-                        .fork_on(tx, source_ids, forked_ids, steps, options)
+                        .fork_on(tx, original_ids, forked_ids, steps, options)
                         .await?;
                     Ok((tx, forked_ids.to_vec()))
                 },
@@ -4448,11 +4448,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned)
             })
             .collect();
-        let source_ids: Vec<&str> = forks.iter().map(|f| f.source_id).collect();
+        let original_ids: Vec<&str> = forks.iter().map(|f| f.original_id).collect();
         let start_steps: Vec<i32> = forks.iter().map(|f| f.start_step).collect();
 
         self.fork_batch(
-            &source_ids,
+            &original_ids,
             &forked_ids,
             StartSteps::Given(&start_steps),
             options,
@@ -4492,9 +4492,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             ForkPoint::Step(step) => step,
             _ => 0,
         };
-        for &source_id in workflow_ids {
+        for &original_id in workflow_ids {
             Fork {
-                source_id,
+                original_id,
                 forked_id: None,
                 start_step: given_step,
             }
