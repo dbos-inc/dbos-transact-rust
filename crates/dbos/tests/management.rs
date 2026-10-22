@@ -1420,16 +1420,22 @@ async fn forking_from_a_negative_step_is_refused() {
         matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
         "{error:?}"
     );
-    // One bad fork refuses the batch, the valid one beside it included.
+    // One bad fork refuses the batch, the valid one beside it included, and the refusal names
+    // the fork that was wrong and the step it gave.
     let error = dbos
         .fork_all::<u32, EngineOnly>(
-            &[Fork::new(id, 0), Fork::new(id, -1)],
+            &[Fork::new(id, 0), Fork::new("another-source", -1)],
             ForkOptions::default(),
         )
         .await
         .expect_err("a negative step was accepted in bulk");
     assert!(
-        matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains("start_step")),
+        matches!(
+            &error,
+            Error::InvalidArgument { detail, .. }
+                if detail.contains("Fork::start_step of `another-source`")
+                    && detail.contains("got -1")
+        ),
         "{error:?}"
     );
 
@@ -1525,7 +1531,7 @@ async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
     ];
     for (forks, mentions) in [
         (&duplicated[..], "one-id-twice"),
-        (&empty_forked_id[..], "forked_id"),
+        (&empty_forked_id[..], "Fork::forked_id of `invalid-bulk-b`"),
         (&empty_original_id[..], "original_id"),
         (&onto_own_original[..], sources[0]),
         (&onto_other_original[..], sources[0]),

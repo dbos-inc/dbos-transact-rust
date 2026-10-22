@@ -235,11 +235,28 @@ impl<'a> Fork<'a> {
     }
 
     /// Refuses what the system database would refuse of this fork, as an
-    /// [`Error::InvalidArgument`] naming the field as it is spelled here.
+    /// [`Error::InvalidArgument`] naming the field as it is spelled here and the workflow it is
+    /// about, so a caller can tell which fork in a batch was wrong.
     fn validate(&self) -> Result<()> {
-        self.to_sys()
-            .validate()
-            .map_err(|error| refused_fork(error, |field| format!("Fork::{field}")))
+        self.to_sys().validate().map_err(|error| {
+            // The rule is the system database's; the value is added here, where it is known.
+            let error = match error {
+                crate::sysdb::Error::InvalidInput { field, detail } if field == "start_step" => {
+                    crate::sysdb::Error::InvalidInput {
+                        detail: format!("{detail}, got {}", self.start_step),
+                        field,
+                    }
+                }
+                other => other,
+            };
+            refused_fork(error, |field| {
+                if self.original_id.is_empty() {
+                    format!("Fork::{field}")
+                } else {
+                    format!("Fork::{field} of `{}`", self.original_id)
+                }
+            })
+        })
     }
 
     /// This fork as the system database takes it.
