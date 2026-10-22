@@ -187,8 +187,8 @@ pub struct ResumeOptions<'a> {
 /// [`fork_with`](DBOS::fork_with).** These are the fields that vary per fork. A chosen id names
 /// exactly one fork, and a batch re-running a fan-out may need each member restarted at its own
 /// step, so both travel with the source they belong to; what is uniform across the call is in
-/// [`ForkOptions`]. That is the split [`Message`](crate::Message) and
-/// [`SendBulkOptions`](crate::SendBulkOptions) make for a batch send.
+/// [`ForkOptions`]. That is the split [`SendMessage`](crate::SendMessage) and
+/// [`SendOptions`](crate::SendOptions) make for a send.
 ///
 /// [`Fork::new`] plus functional update, like everything else that takes options here:
 ///

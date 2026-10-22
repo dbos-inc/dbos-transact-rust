@@ -16,8 +16,8 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, Fork, ForkOptions, Message, QueueChange, QueueConflict, QueueOptions,
-    SendOptions, StartOptions, WorkflowHandle,
+    EnqueueOptions, Error, Fork, ForkOptions, QueueChange, QueueConflict, QueueOptions,
+    SendMessage, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -468,25 +468,24 @@ async fn a_message_waits_for_its_destination() {
 
     client
         .send_with(
-            &id,
-            &"approved",
-            SendOptions {
+            SendMessage {
                 topic: Some("approvals"),
-                ..Default::default()
+                ..SendMessage::new(&id, &"approved")
             },
+            SendOptions::default(),
         )
         .await
         .expect("send failed");
-    let once = SendOptions {
+    let once = SendMessage {
         idempotency_key: Some("once"),
-        ..Default::default()
+        ..SendMessage::new(&id, &"only once")
     };
     client
-        .send_with(&id, &"only once", once)
+        .send_with(once, SendOptions::default())
         .await
         .expect("send failed");
     client
-        .send_with(&id, &"only once", once)
+        .send_with(once, SendOptions::default())
         .await
         .expect("a resend under a held key is a no-op, not an error");
 
@@ -530,9 +529,9 @@ async fn a_batch_of_messages_lands_together() {
 
     client
         .send_bulk(&[
-            Message::new(&first, &"one"),
-            Message::new(&second, &"two"),
-            Message::new(&first, &"three"),
+            SendMessage::new(&first, &"one"),
+            SendMessage::new(&second, &"two"),
+            SendMessage::new(&first, &"three"),
         ])
         .await
         .expect("send failed");
@@ -559,8 +558,8 @@ async fn a_batch_of_messages_lands_together() {
     // insert, which is the guarantee a batch buys over a loop of sends.
     let error = client
         .send_bulk(&[
-            Message::new(&first, &"four"),
-            Message::new("no-such-workflow", &"five"),
+            SendMessage::new(&first, &"four"),
+            SendMessage::new("no-such-workflow", &"five"),
         ])
         .await
         .expect_err("a message addressed to nothing should fail");

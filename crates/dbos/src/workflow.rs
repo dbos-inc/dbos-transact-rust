@@ -621,8 +621,8 @@ impl OwnedEnqueue {
     ///
     /// An inherent `as_*` rather than [`AsRef`] or [`Borrow`](std::borrow::Borrow), which both
     /// have to hand back a reference: an [`Enqueue`] is a value *made* of references, so there is
-    /// nothing here to lend. `Encoded::as_message` in `message.rs` is the same shape for the same
-    /// reason.
+    /// nothing here to lend. `EncodedSendMessage::as_sysdb_message` in `message.rs` is the same
+    /// shape for the same reason.
     fn as_enqueue(&self) -> Enqueue<'_> {
         Enqueue {
             name: &self.name,

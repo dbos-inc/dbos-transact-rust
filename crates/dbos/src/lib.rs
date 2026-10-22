@@ -109,7 +109,7 @@ pub use management::{
 };
 #[cfg(feature = "engine")]
 pub use message::{
-    Forks, Message, SendBulkOptions, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
+    Forks, SendMessage, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
 };
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};

@@ -207,12 +207,11 @@ async fn payment_endpoint(
 ) -> Result<String, AppError> {
     app.dbos
         .send_with(
-            &payment_id,
-            &payment_status,
-            dbos::SendOptions {
+            dbos::SendMessage {
                 topic: Some(PAYMENT_STATUS),
-                ..Default::default()
+                ..dbos::SendMessage::new(&payment_id, &payment_status)
             },
+            dbos::SendOptions::default(),
         )
         .await?;
 
