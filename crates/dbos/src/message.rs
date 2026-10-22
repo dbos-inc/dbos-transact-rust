@@ -120,12 +120,15 @@ use crate::sysdb::types::step_names;
 ///
 /// Outside a workflow there is no context to take an executor from, so this is
 /// [`Error::NotInWorkflow`]. That is where [`DBOS::send`] is the call.
-pub fn send<'a, T, E>(destination_id: &'a str, message: &T) -> PendingStep<'a, (), E>
+pub fn send<'a, T, E>(destination_id: &'a str, message: &'a T) -> PendingStep<'a, (), E>
 where
     T: Serialize,
     E: DurableError + 'a,
 {
-    send_one(destination_id, None, None, message, SendOptions::default())
+    send_with(
+        SendMessage::new(destination_id, message),
+        SendOptions::default(),
+    )
 }
 
 /// [`send`], with a [`SendMessage`] that may carry a topic or an idempotency key, and
@@ -153,31 +156,6 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    send_one(
-        message.destination_id,
-        message.topic,
-        message.idempotency_key,
-        message.message,
-        options,
-    )
-}
-
-/// The free single send, from its parts.
-///
-/// Taking the parts rather than a [`SendMessage`] is what lets [`send`] keep borrowing its payload
-/// for less than its destination: a [`SendMessage`] ties the two to one lifetime, and the step only
-/// needs the payload until it is encoded, at the call.
-fn send_one<'a, T, E>(
-    destination_id: &'a str,
-    topic: Option<&'a str>,
-    idempotency_key: Option<&'a str>,
-    message: &T,
-    options: SendOptions,
-) -> PendingStep<'a, (), E>
-where
-    T: Serialize,
-    E: DurableError + 'a,
-{
     // Encoded before the id is taken, so a payload that cannot be encoded is a send that never
     // happened and never moved the counter. Inside a step the placement records nothing, which is
     // what makes that send plain: no id is allocated, so nothing shifts the replay slots of the
@@ -186,7 +164,7 @@ where
         .and_then(|conn| {
             let encoding =
                 PayloadEncoding::resolve_ambient(options.serialization, conn.serializer());
-            let encoded = encode_one(destination_id, topic, idempotency_key, message, encoding)?;
+            let encoded = encode_one(&message, encoding)?;
             Ok((encoded, conn))
         })
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send"));
@@ -391,9 +369,12 @@ impl DBOS {
     pub fn send<'a, T: Serialize>(
         &self,
         destination_id: &'a str,
-        message: &T,
+        message: &'a T,
     ) -> PendingStep<'a, ()> {
-        self.send_one(destination_id, None, None, message, SendOptions::default())
+        self.send_with(
+            SendMessage::new(destination_id, message),
+            SendOptions::default(),
+        )
     }
 
     /// [`send`](Self::send), with a [`SendMessage`] that may carry a topic or an idempotency key,
@@ -403,31 +384,12 @@ impl DBOS {
         message: SendMessage<'a, T>,
         options: SendOptions,
     ) -> PendingStep<'a, ()> {
-        self.send_one(
-            message.destination_id,
-            message.topic,
-            message.idempotency_key,
-            message.message,
-            options,
-        )
-    }
-
-    /// The instance's single send, from its parts — see the free `send_one` for why parts.
-    fn send_one<'a, T: Serialize>(
-        &self,
-        destination_id: &'a str,
-        topic: Option<&'a str>,
-        idempotency_key: Option<&'a str>,
-        message: &T,
-        options: SendOptions,
-    ) -> PendingStep<'a, ()> {
         let built = self
             .executor("send")
             .and_then(|executor| {
                 let encoding =
                     PayloadEncoding::resolve_ambient(options.serialization, executor.serializer());
-                let encoded =
-                    encode_one(destination_id, topic, idempotency_key, message, encoding)?;
+                let encoded = encode_one(&message, encoding)?;
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send")?))
             })
             .map(|(encoded, (executor, placement))| {
@@ -516,17 +478,14 @@ impl<'a> Encoded<'a> {
 ///
 /// Encoded before the step id is taken, for the reason [`place_send`] gives.
 fn encode_one<'a, T: Serialize>(
-    destination_id: &'a str,
-    topic: Option<&'a str>,
-    idempotency_key: Option<&'a str>,
-    message: &T,
+    message: &SendMessage<'a, T>,
     encoding: PayloadEncoding,
 ) -> Result<Encoded<'a>> {
     Ok(Encoded {
-        destination_id,
-        topic,
-        idempotency_key,
-        message: encode(message, &encoding, "message")?,
+        destination_id: message.destination_id,
+        topic: message.topic,
+        idempotency_key: message.idempotency_key,
+        message: encode(message.message, &encoding, "message")?,
         encoding,
     })
 }
@@ -722,13 +681,7 @@ impl crate::Client {
             options.serialization,
             self.connection().serializer().encoding(),
         );
-        let encoded = encode_one(
-            message.destination_id,
-            message.topic,
-            message.idempotency_key,
-            message.message,
-            encoding,
-        )?;
+        let encoded = encode_one(&message, encoding)?;
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
         self.connection()
