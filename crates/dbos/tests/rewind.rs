@@ -247,12 +247,8 @@ async fn a_rewind_resets_the_row_and_discards_the_history() {
         .await
         .expect("start failed");
     dbos.send_with(
-        id,
-        &"hello",
-        dbos::SendOptions {
-            topic: Some("inbox"),
-            ..Default::default()
-        },
+        dbos::Message::new(id, &"hello").topic("inbox"),
+        dbos::SendOptions::default(),
     )
     .await
     .expect("send failed");
@@ -444,12 +440,8 @@ async fn a_rewind_discards_the_messages_the_discarded_steps_consumed() {
         let dbos = dbos.clone();
         async move {
             dbos.send_with(
-                id,
-                &message,
-                dbos::SendOptions {
-                    topic: Some(topic),
-                    ..Default::default()
-                },
+                dbos::Message::new(id, &message).topic(topic),
+                dbos::SendOptions::default(),
             )
             .await
             .expect("send failed")

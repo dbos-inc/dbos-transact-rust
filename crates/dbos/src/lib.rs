@@ -108,9 +108,7 @@ pub use management::{
     Children, ForkOptions, ListWorkflowStepsOptions, ResumeOptions, RewindOptions,
 };
 #[cfg(feature = "engine")]
-pub use message::{
-    Forks, Message, SendBulkOptions, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
-};
+pub use message::{Forks, Message, SendOptions, recv, send, send_bulk, send_bulk_with, send_with};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]

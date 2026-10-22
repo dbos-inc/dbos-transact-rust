@@ -211,12 +211,8 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
         .expect("the workflow never reached its gate");
 
     dbos.send_with(
-        &workflow_id,
-        &"yes",
-        SendOptions {
-            topic: Some("approvals"),
-            ..Default::default()
-        },
+        Message::new(&workflow_id, &"yes").topic("approvals"),
+        SendOptions::default(),
     )
     .await
     .expect("send failed");
@@ -527,8 +523,7 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
 
     // Asking for the fan-out reaches both.
     dbos.send_with(
-        &original_id,
-        &"included",
+        Message::new(&original_id, &"included"),
         SendOptions {
             forks: Forks::Include,
             ..Default::default()

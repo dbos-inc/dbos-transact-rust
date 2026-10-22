@@ -306,12 +306,8 @@ async fn a_hand_off_during_recv_leaves_the_message_for_the_new_owner() {
 
     for n in [7u32, 8] {
         dbos.send_with(
-            id,
-            &n,
-            dbos::SendOptions {
-                topic: Some("topic"),
-                ..Default::default()
-            },
+            dbos::Message::new(id, &n).topic("topic"),
+            dbos::SendOptions::default(),
         )
         .await
         .expect("send failed");

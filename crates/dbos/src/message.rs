@@ -43,13 +43,14 @@
 //! is called is what chooses the recorded step name — `sysdb` takes it from the method rather than
 //! deriving it from a count.
 //!
-//! **Required as arguments, optional in a struct.** All three single sends read
-//! `send(destination_id, message)`, with a topic, an idempotency key and the fork fan-out in
-//! [`SendOptions`] on the `_with` form — the split [`step`](crate::step())/[`step_with`](crate::step_with)
-//! and `fork`/[`fork_with`](crate::DBOS::fork_with) already make. The batch is the one exception and
-//! has to be: the [`send_bulk`] family takes [`Message`] values carrying their own topic and key,
-//! because those vary per message, beside a batch-wide [`SendBulkOptions`]. Python and Java split it
-//! in the same place.
+//! **What is sent, and how the call behaves, are two different things.** The plain forms read
+//! `send(destination_id, message)` and `send_bulk(messages)`. The `_with` forms take a [`Message`]
+//! (or a slice of them) for everything about the message itself — destination, payload, topic,
+//! idempotency key — and [`SendOptions`] for everything about the call — the fork fan-out and the
+//! encoding. So [`send_with`] is a batch of one in the same shape [`send_bulk_with`] takes, and one
+//! options struct serves both. That is the split [`step`](crate::step())/[`step_with`](crate::step_with)
+//! and `fork`/[`fork_with`](crate::DBOS::fork_with) already make: the plain form for the common case,
+//! the `_with` form for everything else.
 //!
 //! **The batch is on all three surfaces, not just the client.** Python and Java are the only
 //! references with a batch send and both expose it on their runtime as well as their client, and
@@ -96,9 +97,9 @@ use crate::sysdb::types::step_names;
 /// The send is checkpointed under a step id, so a replay does not send twice — `sysdb` finds the
 /// recorded step and inserts nothing, in the same transaction that would have written. **That is a
 /// workflow's whole idempotency**, and it is why a workflow body rarely sets
-/// [`SendOptions::idempotency_key`]: the step already makes the send exactly-once. The key is
-/// available here all the same, through [`send_with`], as it is in Python, and it is what a send
-/// from inside a *step* has instead.
+/// [`Message::idempotency_key`]: the step already makes the send exactly-once. The key is
+/// available here all the same, through [`send_with`], and it is what a send from inside a *step*
+/// has instead.
 ///
 /// **The step id is taken at the call, not at the first poll** — see [`PendingStep`] — so a send
 /// built beside a step and driven with it by `tokio::join!` takes the same slot on every execution.
@@ -113,7 +114,7 @@ use crate::sysdb::types::step_names;
 /// everything its body did. The cost is real and is the references' accepted position rather than
 /// ours: a step that retries sends again, and this form has no idempotency key to stop it. Python,
 /// TypeScript and Java all do exactly this; Go alone refuses the call. A send that must happen once
-/// across retries wants [`send_with`] and a [`SendOptions::idempotency_key`], or wants hoisting out
+/// across retries wants [`send_with`] and a [`Message::idempotency_key`], or wants hoisting out
 /// of the step, where the step id makes it exactly-once.
 ///
 /// Outside a workflow there is no context to take an executor from, so this is
@@ -123,18 +124,51 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    send_with(destination_id, message, SendOptions::default())
+    send_one(destination_id, None, None, message, SendOptions::default())
 }
 
-/// [`send`], with [`SendOptions`] rather than the defaults — a topic, an idempotency key, or the
-/// fork fan-out.
+/// [`send`], with a [`Message`] that may carry a topic or an idempotency key, and [`SendOptions`]
+/// rather than the defaults.
+///
+/// ```no_run
+/// # async fn approve() -> dbos::Result<()> {
+/// use dbos::{Message, SendOptions};
+/// dbos::send_with(
+///     Message::new("order-42", &"approved").topic("approvals"),
+///     SendOptions::default(),
+/// )
+/// .await
+/// # }
+/// ```
 ///
 /// The same call in every respect but the options: see [`send`] for what it does, where it may
-/// stand, and what a step does to it.
-pub fn send_with<'a, T, E>(
+/// stand, and what a step does to it. Recorded as `DBOS.send`, not `DBOS.send_bulk`, although it
+/// takes the same [`Message`] a batch does: the step name says which surface was reached for.
+pub fn send_with<'a, T, E>(message: Message<'a, T>, options: SendOptions) -> PendingStep<'a, (), E>
+where
+    T: Serialize,
+    E: DurableError + 'a,
+{
+    send_one(
+        message.destination_id,
+        message.topic,
+        message.idempotency_key,
+        message.message,
+        options,
+    )
+}
+
+/// The free single send, from its parts.
+///
+/// Taking the parts rather than a [`Message`] is what lets [`send`] keep borrowing its payload for
+/// less than its destination: a [`Message`] ties the two to one lifetime, and the step only needs
+/// the payload until it is encoded, at the call.
+fn send_one<'a, T, E>(
     destination_id: &'a str,
+    topic: Option<&'a str>,
+    idempotency_key: Option<&'a str>,
     message: &T,
-    options: SendOptions<'a>,
+    options: SendOptions,
 ) -> PendingStep<'a, (), E>
 where
     T: Serialize,
@@ -148,7 +182,7 @@ where
         .and_then(|conn| {
             let encoding =
                 PayloadEncoding::resolve_ambient(options.serialization, conn.serializer());
-            let encoded = encode_one(destination_id, message, options, encoding)?;
+            let encoded = encode_one(destination_id, topic, idempotency_key, message, encoding)?;
             Ok((encoded, conn))
         })
         .and_then(|(encoded, conn)| place_send(encoded, conn, "send"));
@@ -167,10 +201,9 @@ where
 /// determinism error, while one whose message *count* merely changes is not, that being no change
 /// of operation.
 ///
-/// Where a single [`send`] takes its destination and payload as arguments, a batch takes
-/// [`Message`] values: the topic and the idempotency key vary per message, so they travel with the
-/// message rather than in the options. Only [`SendBulkOptions`] is left, for what is uniform across
-/// the call.
+/// A batch takes [`Message`] values, which carry their own topic and idempotency key: those vary
+/// per message, so they travel with the message, while [`SendOptions`] on [`send_bulk_with`] holds
+/// what is uniform across the call.
 ///
 /// Python and Java expose the same as `send_bulk` on their runtime as well as their client;
 /// TypeScript and Go have no batch send at all, and a caller there writes the loop and lives with
@@ -191,13 +224,13 @@ where
     T: Serialize,
     E: DurableError + 'a,
 {
-    send_bulk_with(messages, SendBulkOptions::default())
+    send_bulk_with(messages, SendOptions::default())
 }
 
-/// [`send_bulk`], with [`SendBulkOptions`] rather than the defaults.
+/// [`send_bulk`], with [`SendOptions`] rather than the defaults.
 pub fn send_bulk_with<'a, T, E>(
     messages: &'a [Message<'a, T>],
-    options: SendBulkOptions,
+    options: SendOptions,
 ) -> PendingStep<'a, (), E>
 where
     T: Serialize,
@@ -356,22 +389,41 @@ impl DBOS {
         destination_id: &'a str,
         message: &T,
     ) -> PendingStep<'a, ()> {
-        self.send_with(destination_id, message, SendOptions::default())
+        self.send_one(destination_id, None, None, message, SendOptions::default())
     }
 
-    /// [`send`](Self::send), with [`SendOptions`] rather than the defaults.
+    /// [`send`](Self::send), with a [`Message`] that may carry a topic or an idempotency key, and
+    /// [`SendOptions`] rather than the defaults — see the free [`send_with`].
     pub fn send_with<'a, T: Serialize>(
         &self,
+        message: Message<'a, T>,
+        options: SendOptions,
+    ) -> PendingStep<'a, ()> {
+        self.send_one(
+            message.destination_id,
+            message.topic,
+            message.idempotency_key,
+            message.message,
+            options,
+        )
+    }
+
+    /// The instance's single send, from its parts — see the free `send_one` for why parts.
+    fn send_one<'a, T: Serialize>(
+        &self,
         destination_id: &'a str,
+        topic: Option<&'a str>,
+        idempotency_key: Option<&'a str>,
         message: &T,
-        options: SendOptions<'a>,
+        options: SendOptions,
     ) -> PendingStep<'a, ()> {
         let built = self
             .executor("send")
             .and_then(|executor| {
                 let encoding =
                     PayloadEncoding::resolve_ambient(options.serialization, executor.serializer());
-                let encoded = encode_one(destination_id, message, options, encoding)?;
+                let encoded =
+                    encode_one(destination_id, topic, idempotency_key, message, encoding)?;
                 Ok((encoded, StepPlacement::taken(Ok(executor), "send")?))
             })
             .map(|(encoded, (executor, placement))| {
@@ -389,14 +441,14 @@ impl DBOS {
         &self,
         messages: &'a [Message<'a, T>],
     ) -> PendingStep<'a, ()> {
-        self.send_bulk_with(messages, SendBulkOptions::default())
+        self.send_bulk_with(messages, SendOptions::default())
     }
 
-    /// [`send_bulk`](Self::send_bulk), with [`SendBulkOptions`] rather than the defaults.
+    /// [`send_bulk`](Self::send_bulk), with [`SendOptions`] rather than the defaults.
     pub fn send_bulk_with<'a, T: Serialize>(
         &self,
         messages: &'a [Message<'a, T>],
-        options: SendBulkOptions,
+        options: SendOptions,
     ) -> PendingStep<'a, ()> {
         let built = self
             .executor("send_bulk")
@@ -461,14 +513,15 @@ impl<'a> Encoded<'a> {
 /// Encoded before the step id is taken, for the reason [`place_send`] gives.
 fn encode_one<'a, T: Serialize>(
     destination_id: &'a str,
+    topic: Option<&'a str>,
+    idempotency_key: Option<&'a str>,
     message: &T,
-    options: SendOptions<'a>,
     encoding: PayloadEncoding,
 ) -> Result<Encoded<'a>> {
     Ok(Encoded {
         destination_id,
-        topic: options.topic,
-        idempotency_key: options.idempotency_key,
+        topic,
+        idempotency_key,
         message: encode(message, &encoding, "message")?,
         encoding,
     })
@@ -638,19 +691,22 @@ impl crate::Client {
     ///
     /// **A client's send is not a step**, and that is the difference from a workflow's. A
     /// workflow's send is checkpointed, so a replay does not send twice; a client has no replay and
-    /// no step sequence, and [`SendOptions::idempotency_key`] is the mechanism it has instead — the
+    /// no step sequence, and [`Message::idempotency_key`] is the mechanism it has instead — the
     /// key becomes the row's identity, so a retried request delivers one message.
     pub async fn send<T: Serialize>(&self, destination_id: &str, message: &T) -> Result<()> {
-        self.send_with(destination_id, message, SendOptions::default())
-            .await
+        self.send_with(
+            Message::new(destination_id, message),
+            SendOptions::default(),
+        )
+        .await
     }
 
-    /// [`send`](Self::send), with [`SendOptions`] rather than the defaults.
+    /// [`send`](Self::send), with a [`Message`] that may carry a topic or an idempotency key, and
+    /// [`SendOptions`] rather than the defaults.
     pub async fn send_with<T: Serialize>(
         &self,
-        destination_id: &str,
-        message: &T,
-        options: SendOptions<'_>,
+        message: Message<'_, T>,
+        options: SendOptions,
     ) -> Result<()> {
         // Encoded here rather than inside the write, so a client reaches the payload the same way
         // the two checkpointed surfaces do. They have to encode at the call, ahead of the step id;
@@ -662,7 +718,13 @@ impl crate::Client {
             options.serialization,
             self.connection().serializer().encoding(),
         );
-        let encoded = encode_one(destination_id, message, options, encoding)?;
+        let encoded = encode_one(
+            message.destination_id,
+            message.topic,
+            message.idempotency_key,
+            message.message,
+            encoding,
+        )?;
         // No caller: a client is never inside a workflow, so there is no step to record the send
         // against and nothing to replay it for.
         self.connection()
@@ -683,25 +745,22 @@ impl crate::Client {
     /// Python and Java expose the same as `send_bulk`; TypeScript and Go have no equivalent, and a
     /// caller there writes the loop and lives with the prefix.
     ///
-    /// **The per-message options move onto [`Message`] here, and only the batch-wide ones stay in
-    /// an options struct.** A topic and an idempotency key belong to one message — the key
-    /// especially, since it becomes that row's identity and a batch sharing one would collide with
-    /// itself — while the fork fan-out is a property of the call. Python and Java split it exactly
-    /// here too: a list of `SendMessage`, carrying destination, payload, topic and key, beside a
-    /// batch-wide `send_to_forks`.
+    /// **A topic and an idempotency key travel on each [`Message`], and only the call's behaviour
+    /// is in [`SendOptions`].** The key especially belongs to one message, since it becomes that
+    /// row's identity and a batch sharing one would collide with itself; the fork fan-out and the
+    /// encoding are properties of the call.
     ///
     /// One payload type for the whole batch, which is what typing it costs. A batch of genuinely
     /// different shapes is a batch of `serde_json::Value`, or two calls.
     pub async fn send_bulk<T: Serialize>(&self, messages: &[Message<'_, T>]) -> Result<()> {
-        self.send_bulk_with(messages, SendBulkOptions::default())
-            .await
+        self.send_bulk_with(messages, SendOptions::default()).await
     }
 
-    /// [`send_bulk`](Self::send_bulk), with [`SendBulkOptions`] rather than the defaults.
+    /// [`send_bulk`](Self::send_bulk), with [`SendOptions`] rather than the defaults.
     pub async fn send_bulk_with<T: Serialize>(
         &self,
         messages: &[Message<'_, T>],
-        options: SendBulkOptions,
+        options: SendOptions,
     ) -> Result<()> {
         // Encoded up front, so nothing is sent when one payload cannot be: the batch is one
         // transaction, and failing halfway through the encoding would be the prefix a batch exists
@@ -720,24 +779,18 @@ impl crate::Client {
     }
 }
 
-/// One message of a batch: a payload, the workflow it is for, and how to address it.
+/// One message: a payload, the workflow it is for, and how to address it.
 ///
-/// **The element type of the [`send_bulk`] family, and only that.** A single send names its
-/// destination
-/// and payload as arguments and everything else through [`SendOptions`] — required as parameters,
-/// optional in the bag, which is the shape [`step_with`](crate::step_with),
-/// [`run_with`](crate::WorkflowRef::run_with) and [`fork_with`](crate::DBOS::fork_with) all take. A
-/// *batch* cannot: its topic and its idempotency key vary per message, so they travel with the
-/// message. Python's and Java's `SendMessage` carry the same four fields for the same reason.
+/// **Everything about the message, and nothing about the call.** [`send_with`] takes one and the
+/// [`send_bulk`] family a slice of them; how the call behaves — the fork fan-out, the encoding —
+/// is [`SendOptions`], beside it. The topic and the idempotency key are here rather than there
+/// because in a batch they vary per message.
 ///
-/// [`Message::new`] plus functional update, like everything else that takes options here:
+/// [`Message::new`] plus its builders:
 ///
 /// ```no_run
 /// # use dbos::Message;
-/// let messages = [Message {
-///     topic: Some("approvals"),
-///     ..Message::new("order-42", &"approved")
-/// }];
+/// let messages = [Message::new("order-42", &"approved").topic("approvals")];
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<'a, T> {
@@ -755,12 +808,14 @@ pub struct Message<'a, T> {
     /// It becomes the row's identity, so a second send under the same key is discarded by the
     /// database rather than delivered twice.
     ///
-    /// **Per message rather than per batch, and that is why it lives here and not on
-    /// [`SendBulkOptions`].** The key *is* the row's primary key, so a batch whose messages shared
-    /// one would collide with itself and deliver a single message instead of all of them. Python's
-    /// and Java's `SendMessage` carry it in exactly this position for the same reason.
+    /// **Chiefly for a sender with no step to protect it** — a [`Client`](crate::Client), or a
+    /// [`send_with`] from inside a step, both of which may run twice with nothing recording that
+    /// they did. A workflow body rarely needs one: its send is a checkpointed step, which already
+    /// makes it exactly-once.
     ///
-    /// A single send says the same thing through [`SendOptions::idempotency_key`].
+    /// **Per message rather than per call, and that is why it lives here and not on
+    /// [`SendOptions`].** The key *is* the row's primary key, so a batch whose messages shared one
+    /// would collide with itself and deliver a single message instead of all of them.
     pub idempotency_key: Option<&'a str>,
 }
 
@@ -774,28 +829,42 @@ impl<'a, T> Message<'a, T> {
             idempotency_key: None,
         }
     }
+
+    /// Files the message under `topic` rather than the default one.
+    pub fn topic(self, topic: &'a str) -> Self {
+        Self {
+            topic: Some(topic),
+            ..self
+        }
+    }
+
+    /// Makes re-sending the message under `key` a no-op — see
+    /// [`idempotency_key`](Self::idempotency_key).
+    pub fn idempotency_key(self, key: &'a str) -> Self {
+        Self {
+            idempotency_key: Some(key),
+            ..self
+        }
+    }
 }
 
-/// What a send may ask for, beyond the destination and the payload.
+/// How a send behaves, as opposed to what it sends.
 ///
-/// **Everything optional, and nothing required.** A destination and a payload are what a send
-/// cannot do without, so they are arguments; a topic, an idempotency key and the fork fan-out are
-/// choices, so they are here. That is the split [`step`](crate::step())/[`step_with`](crate::step_with),
-/// `run`/[`run_with`](crate::WorkflowRef::run_with) and `fork`/[`fork_with`](crate::DBOS::fork_with)
-/// already make, and it is why the plain [`send`] is two arguments long.
+/// **Taken by both [`send_with`] and [`send_bulk_with`], on every surface.** What is sent — the
+/// destination, the payload, a topic, an idempotency key — is a [`Message`]; what is left here is
+/// what a call decides once for every message it carries: whether the messages also reach the
+/// destinations' forks, and how they are encoded.
 ///
 /// **A struct so that the next option is not a breaking change.** A send has accumulated options in
-/// every implementation — a serialization override in TypeScript and Go, a caller-supplied
-/// transaction in Go — and each one arriving as another positional parameter would break every call
-/// site. This is where they land instead. TypeScript and Java call theirs `SendOptions` too; Go
-/// takes variadic `SendOption` functions to the same end.
+/// every implementation, and each one arriving as another positional parameter would break every
+/// call site. This is where they land instead.
 ///
 /// Built by functional update from [`Default`], as [`Config`](crate::Config) and
 /// [`ForkOptions`](crate::ForkOptions) are:
 ///
 /// ```no_run
-/// # use dbos::SendOptions;
-/// let options = SendOptions { topic: Some("approvals"), ..Default::default() };
+/// # use dbos::{Forks, SendOptions};
+/// let options = SendOptions { forks: Forks::Include, ..Default::default() };
 /// ```
 ///
 /// **Deliberately not `#[non_exhaustive]`.** That attribute forbids struct-literal construction
@@ -804,55 +873,17 @@ impl<'a, T> Message<'a, T> {
 /// convention is documented rather than enforced — the same choice [`Config`](crate::Config) makes
 /// and for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SendOptions<'a> {
-    /// The topic to file the message under, or `None` for the default one.
+pub struct SendOptions {
+    /// Whether each message also reaches the workflows forked from its destination.
     ///
-    /// A receiver selects on the topic, so a message sent under one nobody is receiving on waits in
-    /// the database rather than being delivered to a different [`recv`].
-    pub topic: Option<&'a str>,
-    /// A key that makes re-sending this message a no-op.
-    ///
-    /// It becomes the row's identity, so a second send under the same key is discarded by the
-    /// database rather than delivered twice.
-    ///
-    /// **Chiefly for a sender with no step to protect it** — a [`Client`](crate::Client), or a
-    /// [`send`] from inside a step, both of which may run twice with nothing recording that they
-    /// did. A workflow body rarely needs one: its send is a checkpointed step, which already makes
-    /// it exactly-once. It is offered on every surface all the same, as Python and Java offer
-    /// theirs.
-    pub idempotency_key: Option<&'a str>,
-    /// Whether the message also reaches the workflows forked from its destination.
-    ///
-    /// Defaults to [`Forks::Skip`]: the destination named, and nothing else.
+    /// Defaults to [`Forks::Skip`]: the destinations named, and nothing else.
     pub forks: Forks,
-    /// How the message is encoded.
+    /// How the messages are encoded.
     ///
     /// [`SerializationFormat::Default`] takes the sending workflow's encoding, or the configured
     /// [`Serializer`](crate::Serializer) outside one. A [`Client`](crate::Client)'s send takes the
     /// client's own serializer, wherever it is called from.
     /// [`SerializationFormat::Portable`] is for a message a workflow in another language receives.
-    pub serialization: SerializationFormat,
-}
-
-/// What a batch send may ask for, beyond the messages themselves.
-///
-/// **Separate from [`SendOptions`] because a batch's options are the ones that are *uniform*.** A
-/// topic and an idempotency key belong to a single message and travel on [`Message`]; the fork
-/// fan-out is a property of the call and belongs here. Folding the two together would let a caller
-/// give one idempotency key to a whole batch, and since the key becomes each row's identity that
-/// batch would collide with itself and deliver one message instead of all of them.
-///
-/// Python and Java draw the line in the same place: a list of `SendMessage` beside a batch-wide
-/// `send_to_forks`.
-///
-/// Built by functional update from [`Default`], as [`SendOptions`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SendBulkOptions {
-    /// Whether each message also reaches the workflows forked from its destination.
-    ///
-    /// Defaults to [`Forks::Skip`]: the destinations named, and nothing else.
-    pub forks: Forks,
-    /// How every message in the batch is encoded — see [`SendOptions::serialization`].
     pub serialization: SerializationFormat,
 }
 
@@ -888,6 +919,10 @@ mod tests {
             "each send is a distinct message unless a key says otherwise"
         );
         assert_eq!(Forks::default(), Forks::Skip);
+
+        let message = message.topic("approvals").idempotency_key("once");
+        assert_eq!(message.topic, Some("approvals"));
+        assert_eq!(message.idempotency_key, Some("once"));
     }
 
     /// Neither free function has anything to stand on outside a workflow, and both say so rather

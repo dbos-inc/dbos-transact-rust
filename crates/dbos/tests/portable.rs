@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use dbos::{
-    Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
+    Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error, Message,
     PortableWorkflowArgs, QueueConflict, QueueOptions, ScheduleSpec, ScheduledWorkflowInput,
     SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
     WriteStreamOptions,
@@ -185,13 +185,15 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
         .unwrap();
     client
         .send_with(
-            handle.workflow_id(),
-            &InteropMessage {
-                sender: "test".to_owned(),
-                payload: vec![1, 2, 3],
-            },
+            Message::new(
+                handle.workflow_id(),
+                &InteropMessage {
+                    sender: "test".to_owned(),
+                    payload: vec![1, 2, 3],
+                },
+            )
+            .topic("interop_topic"),
             SendOptions {
-                topic: Some("interop_topic"),
                 serialization: SerializationFormat::Portable,
                 ..Default::default()
             },

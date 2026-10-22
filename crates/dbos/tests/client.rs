@@ -468,25 +468,18 @@ async fn a_message_waits_for_its_destination() {
 
     client
         .send_with(
-            &id,
-            &"approved",
-            SendOptions {
-                topic: Some("approvals"),
-                ..Default::default()
-            },
+            Message::new(&id, &"approved").topic("approvals"),
+            SendOptions::default(),
         )
         .await
         .expect("send failed");
-    let once = SendOptions {
-        idempotency_key: Some("once"),
-        ..Default::default()
-    };
+    let once = Message::new(&id, &"only once").idempotency_key("once");
     client
-        .send_with(&id, &"only once", once)
+        .send_with(once.clone(), SendOptions::default())
         .await
         .expect("send failed");
     client
-        .send_with(&id, &"only once", once)
+        .send_with(once, SendOptions::default())
         .await
         .expect("a resend under a held key is a no-op, not an error");
 
