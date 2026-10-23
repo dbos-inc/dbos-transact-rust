@@ -2149,6 +2149,55 @@ pub enum OnExistingQueue {
     Leave,
 }
 
+/// What one claim from a queue took, and why it took nothing if it did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dequeued {
+    /// The workflows this claim started, in dequeue order.
+    pub workflow_ids: Vec<String>,
+    /// The limit that left this claim no room, when one did.
+    ///
+    /// Set only when the claim returned before selecting anything, so `workflow_ids` is then
+    /// empty. `None` with nothing claimed means no row was eligible, or a peer took them first.
+    pub stopped_by: Option<DequeueStop>,
+}
+
+/// The limit that left a claim no room to start anything.
+///
+/// Each is the first limit, in the order the claim checks them, whose remaining room came to zero:
+/// worker concurrency, then the rate limits, then the concurrency limits, the queue-wide one ahead
+/// of the per-partition one at each step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequeueStop {
+    /// This process is already running as many of the queue's workflows as it may.
+    WorkerConcurrency,
+    /// This process is already running as many of the partition's workflows as it may.
+    PartitionWorkerConcurrency,
+    /// The queue's rate-limit window is full.
+    RateLimit,
+    /// The partition's rate-limit window is full.
+    PartitionRateLimit,
+    /// The queue already has as many workflows `PENDING` as its concurrency allows.
+    Concurrency,
+    /// The partition already has as many workflows `PENDING` as its concurrency allows.
+    PartitionConcurrency,
+}
+
+impl DequeueStop {
+    /// Whether the limit is counted across the whole queue, whichever partition was claimed from.
+    ///
+    /// Such a limit leaves every other partition just as full, so a caller walking the partitions
+    /// one at a time can end the walk on it rather than paying a claim per partition to learn the
+    /// same thing. A per-partition limit says nothing about the next key.
+    pub fn spans_partitions(self) -> bool {
+        match self {
+            Self::WorkerConcurrency | Self::RateLimit | Self::Concurrency => true,
+            Self::PartitionWorkerConcurrency
+            | Self::PartitionRateLimit
+            | Self::PartitionConcurrency => false,
+        }
+    }
+}
+
 /// A registered version of the application.
 ///
 /// The registry is what lets a firing schedule stamp the *latest* version, so only executors

@@ -3,9 +3,9 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, EncodedValue,
-    Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message, NewQueue,
-    NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
+    Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, DequeueStop,
+    EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
+    NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
     ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy,
@@ -293,7 +293,8 @@ async fn the_dequeue_claim_counts_an_attempt() {
     let claimed = sys
         .start_queued_workflows(&queue, "local", "v1", "claim", None, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(claimed, ["wf-counted"]);
 
     let row = sys.get_workflow("wf-counted").await.unwrap().unwrap();
@@ -325,13 +326,15 @@ async fn a_claim_that_wins_nothing_counts_nothing() {
     let winner = sys
         .start_queued_workflows(&queue, "winner", "v1", "claim", None, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(winner, ["wf-raced"]);
     // The row is `PENDING` now, so the loser's guard matches nothing.
     let loser = sys
         .start_queued_workflows(&queue, "loser", "v1", "claim", None, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert!(loser.is_empty(), "the second claim should have won nothing");
 
     let row = sys.get_workflow("wf-raced").await.unwrap().unwrap();
@@ -366,7 +369,8 @@ async fn repeated_recoveries_through_the_queue_park_the_workflow() {
         let claimed = sys
             .start_queued_workflows(&queue, "local", "v1", "claim", None, 0, 0)
             .await
-            .unwrap();
+            .unwrap()
+            .workflow_ids;
         if claimed.is_empty() {
             break;
         }
@@ -2988,7 +2992,8 @@ async fn reenqueue_for_recovery_returns_workflows_to_their_own_queues() {
     let claimed = sys
         .start_queued_workflows(&queue, "alpha", "v1", "claim", None, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(claimed, ["wf-was-queued"]);
 
     let mut moved = sys
@@ -3050,7 +3055,8 @@ async fn reenqueue_for_recovery_leaves_a_workflow_a_live_executor_took() {
     assert_eq!(
         sys.start_queued_workflows(&queue, "live", "v1", "claim", None, 0, 0)
             .await
-            .unwrap(),
+            .unwrap()
+            .workflow_ids,
         ["wf-taken-over"],
     );
 
@@ -9709,7 +9715,8 @@ async fn claim_all(
         started.extend(
             sys.start_queued_workflows(queue, "exec-1", "v1", "claim", None, 0, 0)
                 .await
-                .expect("a claim failed"),
+                .expect("a claim failed")
+                .workflow_ids,
         );
         if started.len() >= expected {
             break;
@@ -9853,7 +9860,8 @@ async fn a_dequeue_starts_workflows_in_order() {
     let started = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(
         started,
         ["wf-high", "wf-also-high", "wf-low"],
@@ -9870,6 +9878,7 @@ async fn a_dequeue_starts_workflows_in_order() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty()
     );
 }
@@ -9945,6 +9954,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .len(),
         2,
         "a free worker takes its whole allowance",
@@ -9953,6 +9963,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 1, 0)
             .await
             .unwrap()
+            .workflow_ids
             .len(),
         1,
         "one already running leaves room for one",
@@ -9961,6 +9972,7 @@ async fn worker_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 2, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
         "a full worker takes nothing",
     );
@@ -9993,6 +10005,7 @@ async fn concurrency_counts_across_executors() {
         sys.start_queued_workflows(&registered, "exec-other", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .len(),
         2,
     );
@@ -10001,6 +10014,7 @@ async fn concurrency_counts_across_executors() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
         "the limit is global, so a second executor sees none free",
     );
@@ -10033,6 +10047,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .len(),
         2,
         "the window allows two",
@@ -10041,6 +10056,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
         "and no more until it passes",
     );
@@ -10050,6 +10066,7 @@ async fn a_rate_limit_bounds_starts_per_window() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .len(),
         2,
         "a fresh window allows two more",
@@ -10089,6 +10106,7 @@ async fn a_partition_rate_limit_bounds_each_key_separately() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some(partition), 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .len()
     };
 
@@ -10136,7 +10154,8 @@ async fn a_dequeue_claims_what_it_starts() {
     let mut started = alpha
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     started.sort();
     assert_eq!(
         started,
@@ -10186,13 +10205,15 @@ async fn unversioned_work_goes_to_the_latest_version() {
         sys.start_queued_workflows(&registered, "exec-old", "v1", "claim", None, 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
         "only the latest version adopts unversioned work",
     );
     assert_eq!(
         sys.start_queued_workflows(&registered, "exec-new", "v2", "claim", None, 0, 0)
             .await
-            .unwrap(),
+            .unwrap()
+            .workflow_ids,
         ["wf-unversioned"],
     );
 }
@@ -10228,7 +10249,8 @@ async fn an_empty_partition_key_is_refused() {
     assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
-            .unwrap(),
+            .unwrap()
+            .workflow_ids,
         ["wf-1"],
     );
 }
@@ -10307,13 +10329,15 @@ async fn partition_concurrency_bounds_a_dequeue() {
     let alpha = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(alpha.len(), 2, "the partition's limit, not the queue's");
 
     let beta = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(
         beta.len(),
         2,
@@ -10325,6 +10349,7 @@ async fn partition_concurrency_bounds_a_dequeue() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
     );
 }
@@ -10359,14 +10384,16 @@ async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
     let alpha = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(alpha.len(), 2, "its own per-partition allowance");
 
     // Beta's allowance is 2, but the queue has only one left of its 3.
     let beta = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(
         beta.len(),
         1,
@@ -10377,9 +10404,168 @@ async fn the_queue_wide_limit_bounds_the_sum_of_the_partitions() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
         "the queue is at its limit whichever partition asks"
     );
+}
+
+/// Puts a workflow on `queue` that is already running, as a peer's claim would have left it.
+///
+/// Written directly rather than claimed, so the test does not depend on a claim delivering
+/// completely — which is what lets the stop-reason tests below run on CockroachDB too.
+async fn running_on_queue(
+    sys: &PostgresSystemDatabase,
+    db: &support::TestDatabase,
+    id: &str,
+    queue: &str,
+    partition: Option<&str>,
+) {
+    sys.init_workflow(&workflow(id), None).await.unwrap();
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status"
+           SET queue_name = $2, queue_partition_key = $3, rate_limited = TRUE,
+               started_at_epoch_ms = (EXTRACT(epoch FROM now()) * 1000)::bigint
+           WHERE workflow_uuid = $1"#,
+    )
+    .bind(id)
+    .bind(queue)
+    .bind(partition)
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+}
+
+/// The pending count is the queue's `PENDING` rows alone: not its waiting ones, and not another
+/// queue's running ones.
+#[tokio::test]
+async fn counting_a_queues_pending_workflows_counts_only_its_running_rows() {
+    let (sys, db) = sysdb().await;
+    sys.upsert_queue(&NewQueue::new("orders"), OnExistingQueue::Update)
+        .await
+        .unwrap();
+    assert_eq!(
+        sys.count_pending_queue_workflows("orders").await.unwrap(),
+        0
+    );
+
+    running_on_queue(&sys, &db, "wf-running-a", "orders", Some("alpha")).await;
+    running_on_queue(&sys, &db, "wf-running-b", "orders", Some("beta")).await;
+    running_on_queue(&sys, &db, "wf-elsewhere", "invoices", None).await;
+    enqueue_partitioned(&sys, "wf-waiting", "orders", "alpha").await;
+
+    assert_eq!(
+        sys.count_pending_queue_workflows("orders").await.unwrap(),
+        2
+    );
+}
+
+/// A partition claim on a queue whose global concurrency is spent says so, and names a limit that
+/// spans the partitions — every other key would come back the same.
+#[tokio::test]
+async fn a_partition_claim_names_a_spent_queue_wide_concurrency_limit() {
+    let (sys, db) = sysdb().await;
+    let queue = NewQueue {
+        concurrency: Some(1),
+        partition_concurrency: Some(1),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    running_on_queue(&sys, &db, "wf-running", "orders", Some("alpha")).await;
+    enqueue_partitioned(&sys, "wf-waiting", "orders", "beta").await;
+
+    let claimed = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
+        .await
+        .unwrap();
+    assert!(claimed.workflow_ids.is_empty());
+    assert_eq!(claimed.stopped_by, Some(DequeueStop::Concurrency));
+    assert!(DequeueStop::Concurrency.spans_partitions());
+}
+
+/// A spent queue-wide rate limit is reported the same way, before anything is selected.
+#[tokio::test]
+async fn a_partition_claim_names_a_spent_queue_wide_rate_limit() {
+    let (sys, db) = sysdb().await;
+    let queue = NewQueue {
+        rate_limit: Some(RateLimit {
+            limit: 1,
+            period: std::time::Duration::from_secs(3600),
+        }),
+        partition_concurrency: Some(1),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    running_on_queue(&sys, &db, "wf-started", "orders", Some("alpha")).await;
+    enqueue_partitioned(&sys, "wf-waiting", "orders", "beta").await;
+
+    let claimed = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("beta"), 0, 0)
+        .await
+        .unwrap();
+    assert!(claimed.workflow_ids.is_empty());
+    assert_eq!(claimed.stopped_by, Some(DequeueStop::RateLimit));
+    assert!(DequeueStop::RateLimit.spans_partitions());
+}
+
+/// A full partition is reported as the partition's own limit, which says nothing about the next
+/// key, so a walk carries on past it.
+#[tokio::test]
+async fn a_full_partition_is_named_as_a_limit_of_that_partition_alone() {
+    let (sys, db) = sysdb().await;
+    let queue = NewQueue {
+        concurrency: Some(10),
+        partition_concurrency: Some(1),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+
+    running_on_queue(&sys, &db, "wf-running", "orders", Some("alpha")).await;
+    enqueue_partitioned(&sys, "wf-waiting", "orders", "alpha").await;
+
+    let claimed = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
+        .await
+        .unwrap();
+    assert!(claimed.workflow_ids.is_empty());
+    assert_eq!(claimed.stopped_by, Some(DequeueStop::PartitionConcurrency));
+    assert!(!DequeueStop::PartitionConcurrency.spans_partitions());
+}
+
+/// A worker already at its limit is named too, without a query, and spans the partitions: it is
+/// this process's running count across the whole queue.
+#[tokio::test]
+async fn a_full_worker_is_named_as_the_stop() {
+    let (sys, _db) = sysdb().await;
+    let queue = NewQueue {
+        worker_concurrency: Some(1),
+        partition_concurrency: Some(1),
+        ..NewQueue::new("orders")
+    };
+    sys.upsert_queue(&queue, OnExistingQueue::Update)
+        .await
+        .unwrap();
+    let registered = sys.get_queue("orders").await.unwrap().unwrap();
+    enqueue_partitioned(&sys, "wf-waiting", "orders", "alpha").await;
+
+    let claimed = sys
+        .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 1, 0)
+        .await
+        .unwrap();
+    assert!(claimed.workflow_ids.is_empty());
+    assert_eq!(claimed.stopped_by, Some(DequeueStop::WorkerConcurrency));
+    assert!(DequeueStop::WorkerConcurrency.spans_partitions());
 }
 
 /// The two worker limits are answered locally, each at its own scope.
@@ -10406,7 +10592,8 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
     let claimed = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 0)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(claimed.len(), 2, "bounded by partition_worker_concurrency");
 
     // One already running in this partition leaves it one, even though the queue-wide worker
@@ -10414,7 +10601,8 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
     let claimed = sys
         .start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 0, 1)
         .await
-        .unwrap();
+        .unwrap()
+        .workflow_ids;
     assert_eq!(claimed.len(), 1, "the partition-local count is subtracted");
 
     // Three already running queue-wide leaves nothing, whatever the partition has room for.
@@ -10422,6 +10610,7 @@ async fn both_worker_limits_are_counted_at_their_own_scope() {
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", Some("alpha"), 3, 0)
             .await
             .unwrap()
+            .workflow_ids
             .is_empty(),
         "the queue-wide worker limit still binds"
     );
@@ -10940,7 +11129,8 @@ async fn finishing_releases_the_deduplication_key() {
     assert_eq!(
         sys.start_queued_workflows(&registered, "exec-1", "v1", "claim", None, 0, 0)
             .await
-            .unwrap(),
+            .unwrap()
+            .workflow_ids,
         ["wf-first"],
     );
     assert_eq!(

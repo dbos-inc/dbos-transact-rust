@@ -75,13 +75,13 @@ use std::time::Duration;
 use types::step_names;
 use types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
-    DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller,
-    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
-    OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate, RenameBatching, RenameFrom,
-    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
-    StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue,
-    VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult, WorkflowOwner, WorkflowRecord,
-    WrittenBy,
+    DebounceRequest, Dequeued, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
+    GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
+    NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
+    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
+    ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp,
+    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult,
+    WorkflowOwner, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -1377,6 +1377,13 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `owner_xid` is this claim's token, one per call: every row it claims is owned by it, and
     /// the executions dispatched from them present it on every write they make.
+    ///
+    /// **A limit with no room left is reported, not just obeyed.** The claim then returns before
+    /// selecting anything, naming the limit in [`Dequeued::stopped_by`]. A caller walking
+    /// partitions reads it to end the walk when the limit is queue-wide, since every other key
+    /// would come back the same; see [`DequeueStop::spans_partitions`].
+    ///
+    /// [`DequeueStop::spans_partitions`]: types::DequeueStop::spans_partitions
     #[allow(clippy::too_many_arguments)]
     async fn start_queued_workflows(
         &self,
@@ -1387,7 +1394,17 @@ pub trait SystemDatabase: Send + Sync {
         partition_key: Option<&str>,
         local_running_count: i64,
         partition_local_running_count: i64,
-    ) -> Result<Vec<String>, Error>;
+    ) -> Result<Dequeued, Error>;
+
+    /// How many of a queue's workflows are `PENDING` across every executor.
+    ///
+    /// The population [`start_queued_workflows`](Self::start_queued_workflows) counts against the
+    /// queue's global concurrency, and by the same predicate: only rows this application could
+    /// dequeue, or unclaimed ones. A caller walking partitions reads it once per poll to learn how
+    /// much room the queue has left before paying a claim per partition to find out. It is a
+    /// snapshot, not a reservation: each claim counts again in its own transaction, so a stale
+    /// figure costs a wasted claim or a shorter walk, never an overrun.
+    async fn count_pending_queue_workflows(&self, queue_name: &str) -> Result<i64, Error>;
 
     /// The partitions of a queue that currently have work waiting.
     ///

@@ -84,15 +84,15 @@ use std::time::Duration;
 use super::types::step_names;
 use super::types::{
     ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
-    Debounce, DebounceHolder, DebounceRequest, EncodedValue, EventRecord, Fork, ForkOptions,
-    ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
-    NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
-    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming,
-    StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
-    WorkflowFilter, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value,
-    duration_from_ms, duration_from_secs, duration_to_ms, encode_step_value,
-    is_valid_application_name, validate_attributes,
+    Debounce, DebounceHolder, DebounceRequest, DequeueStop, Dequeued, EncodedValue, EventRecord,
+    Fork, ForkOptions, ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller,
+    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
+    PollingConcurrency, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
+    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
+    StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue,
+    UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowOwner, WorkflowRecord,
+    WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms, duration_from_secs,
+    duration_to_ms, encode_step_value, is_valid_application_name, validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -1988,6 +1988,16 @@ const QUEUE_COLUMNS: &str = "name, concurrency, worker_concurrency, rate_limit_m
      rate_limit_period_sec, partition_concurrency, partition_worker_concurrency, \
      partition_rate_limit_max, partition_rate_limit_period_sec, polling_interval_sec, \
      application_name";
+
+/// The workflows a queue's global concurrency is counted against: its `PENDING` rows this
+/// application could dequeue, or unclaimed ones, across every executor. Binds the application name
+/// to `$1` and the queue to `$2`.
+///
+/// One definition for the claim's own count and for
+/// [`count_pending_queue_workflows`](SystemDatabase::count_pending_queue_workflows), so the room a
+/// partition walk budgets for is the room each claim will find.
+const QUEUE_PENDING_PREDICATE: &str = "queue_name = $2 AND status = 'PENDING' \
+     AND ($1::text IS NULL OR application_name = $1 OR application_name IS NULL)";
 
 /// Binds a queue registration to `$1`–`$13`, in the order both of
 /// [`upsert_queue`](SystemDatabase::upsert_queue)'s statements name its columns: the name, the
@@ -6291,7 +6301,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         partition_key: Option<&str>,
         local_running_count: i64,
         partition_local_running_count: i64,
-    ) -> Result<Vec<String>, Error> {
+    ) -> Result<Dequeued, Error> {
         // Refused rather than matched, because no row can hold it: `NewWorkflow` and
         // `ForkOptions` both reject an empty partition key on the way in. Accepting it here would
         // select nothing and report an empty partition, which reads as "no work" rather than as
@@ -6385,11 +6395,17 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // How many this executor may take under every limit the queue carries: the tightest
             // of them, and `None` when it carries none. Deliberately not a capturing closure, so
-            // the early returns between the groups below can read `max_tasks` while it is live.
+            // the early returns below can read `max_tasks` while it is live.
             let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
                 Some(current.map_or(available, |taken: i64| taken.min(available)))
             };
             let mut max_tasks: Option<i64> = None;
+            // Checked after every limit rather than after each group, so the claim can name the
+            // limit that closed it: the first in this order to reach zero.
+            let stopped = |stop: DequeueStop| Dequeued {
+                workflow_ids: Vec::new(),
+                stopped_by: Some(stop),
+            };
 
             // Worker concurrency first, because it costs no query. Answered from what this
             // process is already running rather than from the database, which cannot see a
@@ -6399,6 +6415,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     max_tasks,
                     (i64::from(worker_concurrency) - local_running_count).max(0),
                 );
+                if max_tasks == Some(0) {
+                    tx.commit().await?;
+                    return Ok(stopped(DequeueStop::WorkerConcurrency));
+                }
             }
             if let Some(worker_concurrency) = queue.partition_worker_concurrency
                 && partition_key.is_some()
@@ -6407,10 +6427,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     max_tasks,
                     (i64::from(worker_concurrency) - partition_local_running_count).max(0),
                 );
-            }
-            if max_tasks == Some(0) {
-                tx.commit().await?;
-                return Ok(Vec::new());
+                if max_tasks == Some(0) {
+                    tx.commit().await?;
+                    return Ok(stopped(DequeueStop::PartitionWorkerConcurrency));
+                }
             }
 
             // Then the rate limits, read as slots left in a rolling window rather than as a yes
@@ -6433,6 +6453,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .fetch_one(&mut *tx)
                 .await?;
                 max_tasks = narrow(max_tasks, (i64::from(limit.limit) - recent_starts).max(0));
+                if max_tasks == Some(0) {
+                    tx.commit().await?;
+                    return Ok(stopped(DequeueStop::RateLimit));
+                }
             }
             if let (Some(limit), Some(key)) = (queue.partition_rate_limit, partition_key) {
                 let partition_starts: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -6453,10 +6477,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     max_tasks,
                     (i64::from(limit.limit) - partition_starts).max(0),
                 );
-            }
-            if max_tasks == Some(0) {
-                tx.commit().await?;
-                return Ok(Vec::new());
+                if max_tasks == Some(0) {
+                    tx.commit().await?;
+                    return Ok(stopped(DequeueStop::PartitionRateLimit));
+                }
             }
 
             // Then the concurrency limits, each a count minus what is already pending at that
@@ -6466,8 +6490,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // Unscoped whichever partition is being swept: a queue-wide limit governs the
                 // queue, and counting only this key would let every other key spend it again.
                 let running: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-                    "SELECT count(*) FROM {workflow_table} \
-                     WHERE queue_name = $2 AND status = 'PENDING' AND {owner_predicate}"
+                    "SELECT count(*) FROM {workflow_table} WHERE {QUEUE_PENDING_PREDICATE}"
                 )))
                 .bind(application_name)
                 .bind(&queue.name)
@@ -6484,6 +6507,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     );
                 }
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
+                if max_tasks == Some(0) {
+                    tx.commit().await?;
+                    return Ok(stopped(DequeueStop::Concurrency));
+                }
             }
             if let (Some(concurrency), Some(key)) = (queue.partition_concurrency, partition_key) {
                 // Its own query rather than one grouped with the queue-wide count: this predicate
@@ -6508,10 +6535,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                     );
                 }
                 max_tasks = narrow(max_tasks, (i64::from(concurrency) - running).max(0));
-            }
-            if max_tasks == Some(0) {
-                tx.commit().await?;
-                return Ok(Vec::new());
+                if max_tasks == Some(0) {
+                    tx.commit().await?;
+                    return Ok(stopped(DequeueStop::PartitionConcurrency));
+                }
             }
 
             let is_latest = self
@@ -6617,8 +6644,32 @@ impl SystemDatabase for PostgresSystemDatabase {
             if !started.is_empty() {
                 tracing::debug!(queue = %queue.name, started = started.len(), "dequeued");
             }
-            Ok(started)
+            Ok(Dequeued {
+                workflow_ids: started,
+                stopped_by: None,
+            })
         })
+        .await
+    }
+
+    async fn count_pending_queue_workflows(&self, queue_name: &str) -> Result<i64, Error> {
+        let workflow_table = self.tables.workflow_status.as_str();
+        let pool = &self.pool;
+        let application_name = self.application_name.as_deref();
+        with_retry(
+            &self.retry,
+            "count_pending_queue_workflows",
+            move || async move {
+                let pending: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT count(*) FROM {workflow_table} WHERE {QUEUE_PENDING_PREDICATE}"
+                )))
+                .bind(application_name)
+                .bind(queue_name)
+                .fetch_one(pool)
+                .await?;
+                Ok(pending)
+            },
+        )
         .await
     }
 

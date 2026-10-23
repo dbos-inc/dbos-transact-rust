@@ -339,9 +339,9 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
         let ceiling = floor.max(MAX_POLLING_INTERVAL);
         interval = interval.clamp(floor, ceiling);
 
-        let backs_off = poll_once(&executor, &queue, &running)
-            .await
-            .is_some_and(Contention::backs_off);
+        let polled = poll_once(&executor, &queue, &running).await;
+        tracing::trace!(claims = polled.claims, "polled the queue");
+        let backs_off = polled.contention.is_some_and(Contention::backs_off);
 
         interval = if backs_off {
             interval.mul_f64(BACKOFF_FACTOR).min(ceiling)
@@ -366,7 +366,23 @@ fn worker_budget(queue: &QueueRecord, running: i64) -> Option<i64> {
         .map(|worker| (i64::from(worker) - running).max(0))
 }
 
-/// One dequeue and the dispatch of whatever it claimed. Reports the contention it met, if any.
+/// What one poll of a queue met.
+#[derive(Debug, Default)]
+struct Polled {
+    /// The contention that ended it, if any.
+    contention: Option<Contention>,
+    /// How many claim transactions it ran — one per partition visited, when it walked them.
+    claims: usize,
+}
+
+impl Polled {
+    fn new(contention: Option<Contention>, claims: usize) -> Self {
+        Self { contention, claims }
+    }
+}
+
+/// One dequeue and the dispatch of whatever it claimed. Reports the contention it met, if any, and
+/// how many claims it took to get there.
 ///
 /// **Three shapes, which is the split TypeScript makes.** An unpartitioned queue is one claim. A
 /// partitioned queue whose only limit is one-at-a-time-per-key is a single batched sweep, which is
@@ -374,11 +390,20 @@ fn worker_budget(queue: &QueueRecord, running: i64) -> Option<i64> {
 /// partitioned queue walks its partitions one at a time, because the limits it carries have to be
 /// counted within each key — and in a shuffled order, so a queue with more partitions than budget
 /// does not starve the ones sorting last.
+///
+/// **The walk is bounded by the queue-wide limits as well as by the worker's own.** Each visit is
+/// a claim transaction at a stricter isolation, and with a queue-wide limit spent every one of
+/// them claims nothing, so a queue with tens of thousands of waiting partitions would otherwise pay
+/// that many transactions a poll to learn one fact. The queue's room under its global concurrency
+/// is read once up front: none means no partition is visited at all, and the walk ends as soon as
+/// this poll has claimed it. A claim that reports a queue-wide limit closed — a peer filled it
+/// since, or the rate limit's window is full — ends the walk too, since every other key would
+/// report the same.
 async fn poll_once(
     executor: &Arc<Executor>,
     queue: &QueueRecord,
     running: &Arc<Running>,
-) -> Option<Contention> {
+) -> Polled {
     // One token per claim: every row a claim takes is owned by it.
     let owner_xid = || uuid::Uuid::new_v4().to_string();
     if !queue.is_partitioned() {
@@ -397,10 +422,18 @@ async fn poll_once(
             .await
         {
             Ok(claimed) => {
-                dispatch_claimed(executor, queue, None, running, claimed, &owner_xid).await;
-                None
+                dispatch_claimed(
+                    executor,
+                    queue,
+                    None,
+                    running,
+                    claimed.workflow_ids,
+                    &owner_xid,
+                )
+                .await;
+                Polled::new(None, 1)
             }
-            Err(error) => report_dequeue_error(&error),
+            Err(error) => Polled::new(report_dequeue_error(&error), 1),
         };
     }
 
@@ -409,7 +442,7 @@ async fn poll_once(
     let already_running = running.count(&queue.name);
     let budget = worker_budget(queue, already_running);
     if budget == Some(0) {
-        return None;
+        return Polled::default();
     }
 
     // The batched path, and the only one that does not count: see
@@ -436,22 +469,48 @@ async fn poll_once(
                 // The sweep returns one head per partition and does not say which; each claimed
                 // row carries its own key, so the tally is credited from the rows themselves.
                 dispatch_claimed(executor, queue, None, running, claimed, &owner_xid).await;
-                None
+                Polled::new(None, 1)
             }
-            Err(error) => report_dequeue_error(&error),
+            Err(error) => Polled::new(report_dequeue_error(&error), 1),
         };
+    }
+
+    // The room left under the queue's global concurrency, across every executor: `None` when it
+    // has none. One count rather than one per partition, and a snapshot rather than a promise —
+    // each claim below counts again in its own transaction, so a peer that spends the room in the
+    // meantime costs this walk a claim, not an overrun.
+    let global_room = match queue.concurrency {
+        None => None,
+        Some(concurrency) => {
+            match executor
+                .sysdb()
+                .count_pending_queue_workflows(&queue.name)
+                .await
+            {
+                Ok(pending) => Some((i64::from(concurrency) - pending).max(0)),
+                Err(error) => return Polled::new(report_dequeue_error(&error), 0),
+            }
+        }
+    };
+    // Not even listed: with the queue full, every partition would claim nothing.
+    if global_room == Some(0) {
+        return Polled::default();
     }
 
     let partitions = match executor.sysdb().get_queue_partitions(&queue.name).await {
         Ok(partitions) => shuffled(partitions),
-        Err(error) => return report_dequeue_error(&error),
+        Err(error) => return Polled::new(report_dequeue_error(&error), 0),
     };
 
     let mut claimed_here = 0i64;
+    let mut claims = 0usize;
     for partition in partitions {
-        if worker_budget(queue, already_running + claimed_here) == Some(0) {
+        if worker_budget(queue, already_running + claimed_here) == Some(0)
+            || global_room.is_some_and(|room| claimed_here >= room)
+        {
             break;
         }
+        claims += 1;
         let owner_xid = owner_xid();
         let claimed = match executor
             .sysdb()
@@ -484,18 +543,28 @@ async fn poll_once(
                 continue;
             }
         };
-        claimed_here += i64::try_from(claimed.len()).unwrap_or(i64::MAX);
+        claimed_here += i64::try_from(claimed.workflow_ids.len()).unwrap_or(i64::MAX);
         dispatch_claimed(
             executor,
             queue,
             Some(&partition),
             running,
-            claimed,
+            claimed.workflow_ids,
             &owner_xid,
         )
         .await;
+        if let Some(stop) = claimed.stopped_by
+            && stop.spans_partitions()
+        {
+            tracing::debug!(
+                partition,
+                ?stop,
+                "a queue-wide limit has no room left; ending the partition walk"
+            );
+            break;
+        }
     }
-    None
+    Polled::new(None, claims)
 }
 
 /// Logs a failed dequeue at the level it deserves, and reports the contention it was, if any.
@@ -995,6 +1064,174 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        dbos.shutdown().await;
+    }
+
+    /// A launched executor that polls no queue of its own accord, with `queue` registered and one
+    /// workflow waiting on each of `partitions` partitions of it.
+    ///
+    /// `listen_queues` is empty so the only polls of the queue are the test's own, which is what
+    /// lets a test count the claims one poll makes.
+    async fn partitioned_backlog(
+        queue: crate::sysdb::types::NewQueue<'_>,
+        partitions: usize,
+    ) -> (
+        crate::DBOS,
+        Arc<Executor>,
+        dbos_test_support::TestDatabase,
+        QueueRecord,
+    ) {
+        let db = dbos_test_support::test_database().await;
+        let dbos = crate::DBOS::new(crate::Config {
+            migrate: false,
+            app_version: Some("1.0.0".to_owned()),
+            listen_queues: Some(Vec::new()),
+            ..crate::Config::new("walk-test", db.url())
+        });
+        dbos.register_workflow("noop", |()| async { Ok::<_, crate::Error>(()) })
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+        let executor = dbos.executor("test").expect("launched");
+        let sysdb = executor.sysdb();
+        sysdb
+            .upsert_queue(&queue, crate::sysdb::types::OnExistingQueue::Update)
+            .await
+            .unwrap();
+        for n in 0..partitions {
+            let id = format!("wf-waiting-{n}");
+            let partition = format!("p-{n}");
+            sysdb
+                .init_workflow(
+                    &crate::sysdb::types::NewWorkflow {
+                        name: Some("noop"),
+                        input: Some("null"),
+                        serialization: Some("rust_serde"),
+                        queue_name: Some(queue.name),
+                        queue_partition_key: Some(&partition),
+                        application_version: Some(executor.app_version()),
+                        ..crate::sysdb::types::NewWorkflow::new(&id)
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let registered = sysdb.get_queue(queue.name).await.unwrap().unwrap();
+        (dbos, executor, db, registered)
+    }
+
+    /// Puts a workflow on `queue` that started moments ago and is still running, as a peer's
+    /// claim would have left it: it holds a slot of the queue's concurrency and of its rate limit.
+    async fn started_elsewhere(
+        executor: &Executor,
+        db: &dbos_test_support::TestDatabase,
+        queue: &str,
+    ) {
+        executor
+            .sysdb()
+            .init_workflow(
+                &crate::sysdb::types::NewWorkflow {
+                    name: Some("noop"),
+                    input: Some("null"),
+                    serialization: Some("rust_serde"),
+                    application_version: Some(executor.app_version()),
+                    ..crate::sysdb::types::NewWorkflow::new("wf-started-elsewhere")
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_status"
+               SET queue_name = $1, queue_partition_key = 'elsewhere', rate_limited = TRUE,
+                   started_at_epoch_ms = (EXTRACT(epoch FROM now()) * 1000)::bigint
+               WHERE workflow_uuid = 'wf-started-elsewhere'"#,
+        )
+        .bind(queue)
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    }
+
+    /// **A partitioned queue whose global concurrency is already spent visits no partition**,
+    /// however many are waiting: the one pending count up front shows there is no room, so the
+    /// poll neither lists the partitions nor pays a claim transaction for each of them.
+    #[tokio::test]
+    async fn a_walk_with_the_queue_wide_concurrency_spent_visits_no_partition() {
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(1),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
+        started_elsewhere(&executor, &db, "walked").await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(polled.claims, 0, "no partition should have been visited");
+        assert_eq!(polled.contention, None);
+        dbos.shutdown().await;
+    }
+
+    /// **A spent queue-wide rate limit ends the walk on its first claim.** The pending count
+    /// cannot see a rate limit, so one claim is paid to learn it; that claim reports the limit,
+    /// and since it spans every partition the rest are not visited.
+    #[tokio::test]
+    async fn a_walk_with_the_queue_wide_rate_limit_spent_stops_after_one_claim() {
+        let queue = crate::sysdb::types::NewQueue {
+            rate_limit: Some(crate::sysdb::types::RateLimit {
+                limit: 1,
+                period: Duration::from_secs(3600),
+            }),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
+        started_elsewhere(&executor, &db, "walked").await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 1,
+            "the first claim's stop should end the walk"
+        );
+        assert_eq!(polled.contention, None);
+        dbos.shutdown().await;
+    }
+
+    /// **A walk stops once it has claimed the room the queue had**, rather than visiting the
+    /// remaining partitions to be told each time that the queue is now full.
+    #[tokio::test]
+    async fn a_walk_stops_once_the_queue_wide_room_is_claimed() {
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(2),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
+        // Exact only where every claim delivers what it is entitled to. On CockroachDB a claim can
+        // come back short of a row enqueued moments ago, and each short claim costs the walk one
+        // more visit; the walk is still bounded there, just not to this count.
+        if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
+            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            dbos.shutdown().await;
+            return;
+        }
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 2,
+            "one claim per unit of room, and none after it is spent"
+        );
+        assert_eq!(polled.contention, None);
+        // Counted as no longer waiting rather than as pending: the claimed workflows are
+        // dispatched, and may already have finished.
+        let claimed: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "dbos"."workflow_status"
+               WHERE queue_name = 'walked' AND status <> 'ENQUEUED'"#,
+        )
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap();
+        assert_eq!(claimed, 2, "exactly the room the queue had");
         dbos.shutdown().await;
     }
 
