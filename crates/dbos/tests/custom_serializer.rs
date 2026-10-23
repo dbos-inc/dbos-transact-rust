@@ -11,7 +11,7 @@ use serde_json::json;
 use dbos::{
     Client, ClientConfig, Config, CustomSerializer, DBOS, EngineOnly, Error, Payload, PayloadSlot,
     QueueConflict, QueueOptions, ReadStreamOptions, ScheduleSpec, ScheduledWorkflowInput,
-    SerializationFormat, Serializer, SetEventOptions, WorkflowKey, WorkflowOptions,
+    SerializationFormat, Serializer, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -783,5 +783,100 @@ async fn a_schedules_context_survives_a_format_that_is_not_human_readable() {
         .expect("the run finishes")
         .unwrap();
     assert_eq!(ran, address);
+    dbos.shutdown().await;
+}
+
+/// The one value [`Picky`] will not write.
+const FORBIDDEN: &str = "forbidden";
+
+/// [`Backwards`], except that it refuses the string [`FORBIDDEN`]: a serializer that fails on one
+/// value and writes every other, errors included.
+#[derive(Debug)]
+struct Picky;
+
+impl CustomSerializer for Picky {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(&value)?;
+        if json == serde_json::to_string(FORBIDDEN)? {
+            return Err(format!("{FORBIDDEN} is not to be written").into());
+        }
+        Ok(json.chars().rev().collect())
+    }
+
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Backwards.deserialize(text, into)
+    }
+}
+
+/// **A result the custom serializer refuses is the workflow's error**, written by that serializer:
+/// the row ends ERROR, and the caller and a replay of the same id read back the refusal without the
+/// body running again.
+#[tokio::test]
+async fn a_result_the_custom_serializer_refuses_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("custom-refuses", &db, Serializer::custom(Picky)));
+    let runs = Arc::new(AtomicU32::new(0));
+    let forbidden = dbos
+        .register_workflow("forbidden", {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, Error>(FORBIDDEN.to_owned()) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "result" && message == "forbidden is not to be written"
+        )
+    };
+
+    let handle = forbidden.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+
+    let (status, tag) = row(
+        &db,
+        r#"SELECT status, serialization FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+        &id,
+    )
+    .await;
+    assert_eq!(status.as_deref(), Some("ERROR"));
+    assert_eq!(tag.as_deref(), Some(NAME));
+
+    let replayed = forbidden
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
     dbos.shutdown().await;
 }

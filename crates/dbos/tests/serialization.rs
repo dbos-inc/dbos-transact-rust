@@ -256,3 +256,138 @@ async fn non_finite_floats_round_trip_through_the_database() {
     client.close().await;
     dbos.shutdown().await;
 }
+
+/// A result `serde_json` cannot write: it has no spelling for a non-string map key.
+type TupleKeys = std::collections::BTreeMap<(u8, u8), u8>;
+
+/// **A result its encoding refuses is the workflow's error.** The body ran to its end, and running
+/// it again would compute the same value and be refused the same way, so the refusal is recorded:
+/// the row ends ERROR, and the caller, a replay of the same id and a client all read back the same
+/// [`Error::Serialization`] without the body running again.
+#[tokio::test]
+async fn a_result_its_encoding_refuses_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-result", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("tuple_keys", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async move { Ok::<TupleKeys, Error>([((1, 2), 3)].into_iter().collect()) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "result" && message.contains("key must be a string")
+        )
+    };
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(status(&db, &id).await.as_deref(), Some("ERROR"));
+
+    let replayed = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+
+    let client = client(&db).await;
+    let read = client
+        .retrieve_workflow::<TupleKeys, EngineOnly>(&id)
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&read), "{read:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// An application error `serde_json` cannot write, for the same reason as [`TupleKeys`].
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("no keys fit")]
+struct BadKeys {
+    by_pair: TupleKeys,
+}
+
+/// **An error its encoding refuses is recorded as the refusal**, carrying what the error displayed,
+/// so the row ends ERROR rather than staying for recovery to run the body again; the caller and a
+/// replay of the same id read back the same [`Error::Serialization`].
+#[tokio::test]
+async fn an_error_its_encoding_refuses_is_recorded_as_the_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-error", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("bad_keys", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Err::<(), _>(Error::Application(BadKeys {
+                        by_pair: [((1, 2), 3)].into_iter().collect(),
+                    }))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error<BadKeys>| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "error"
+                    && message.contains("key must be a string")
+                    && message.contains("no keys fit")
+        )
+    };
+
+    let handle = workflow.start(()).await.expect("start failed");
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(status(&db, &id).await.as_deref(), Some("ERROR"));
+
+    let replayed = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
+}
