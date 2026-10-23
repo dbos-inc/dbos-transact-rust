@@ -392,8 +392,8 @@ impl Polled {
 /// does not starve the ones sorting last.
 ///
 /// **The walk is bounded by the queue-wide limits as well as by the worker's own.** Each visit is
-/// a claim transaction at a stricter isolation, and with a queue-wide limit spent every one of
-/// them claims nothing, so a queue with tens of thousands of waiting partitions would otherwise pay
+/// a claim transaction, at a stricter isolation whenever the queue carries a shared limit, and with
+/// a queue-wide limit spent every one of them claims nothing, so a queue with tens of thousands of waiting partitions would otherwise pay
 /// that many transactions a poll to learn one fact. The queue's room under its global concurrency
 /// is read once up front: none means no partition is visited at all, and the walk ends as soon as
 /// this poll has claimed it. A claim that reports a queue-wide limit closed — a peer filled it
@@ -1120,12 +1120,14 @@ mod tests {
         (dbos, executor, db, registered)
     }
 
-    /// Puts a workflow on `queue` that started moments ago and is still running, as a peer's
-    /// claim would have left it: it holds a slot of the queue's concurrency and of its rate limit.
+    /// Puts a workflow on `partition` of `queue` that started moments ago and is still running,
+    /// as a peer's claim would have left it: it holds a slot of the queue's concurrency and rate
+    /// limit, and of the partition's.
     async fn started_elsewhere(
         executor: &Executor,
         db: &dbos_test_support::TestDatabase,
         queue: &str,
+        partition: &str,
     ) {
         executor
             .sysdb()
@@ -1143,11 +1145,12 @@ mod tests {
             .unwrap();
         sqlx::query(
             r#"UPDATE "dbos"."workflow_status"
-               SET queue_name = $1, queue_partition_key = 'elsewhere', rate_limited = TRUE,
+               SET queue_name = $1, queue_partition_key = $2, rate_limited = TRUE,
                    started_at_epoch_ms = (EXTRACT(epoch FROM now()) * 1000)::bigint
                WHERE workflow_uuid = 'wf-started-elsewhere'"#,
         )
         .bind(queue)
+        .bind(partition)
         .execute(&db.pool().await)
         .await
         .unwrap();
@@ -1164,7 +1167,7 @@ mod tests {
             ..crate::sysdb::types::NewQueue::new("walked")
         };
         let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
-        started_elsewhere(&executor, &db, "walked").await;
+        started_elsewhere(&executor, &db, "walked", "elsewhere").await;
 
         let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
         assert_eq!(polled.claims, 0, "no partition should have been visited");
@@ -1186,7 +1189,7 @@ mod tests {
             ..crate::sysdb::types::NewQueue::new("walked")
         };
         let (dbos, executor, db, registered) = partitioned_backlog(queue, 50).await;
-        started_elsewhere(&executor, &db, "walked").await;
+        started_elsewhere(&executor, &db, "walked", "elsewhere").await;
 
         let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
         assert_eq!(
@@ -1194,6 +1197,51 @@ mod tests {
             "the first claim's stop should end the walk"
         );
         assert_eq!(polled.contention, None);
+        dbos.shutdown().await;
+    }
+
+    /// **A partition at its own limit does not end the walk.** Only a limit counted across the
+    /// whole queue says anything about the next key, so a walk that meets a full partition skips
+    /// it and goes on to claim from every other one.
+    #[tokio::test]
+    async fn a_full_partition_does_not_end_the_walk() {
+        // A queue-wide concurrency with room to spare keeps this queue off the batched sweep, so
+        // the poll walks its partitions one claim at a time.
+        let queue = crate::sysdb::types::NewQueue {
+            concurrency: Some(100),
+            partition_concurrency: Some(1),
+            ..crate::sysdb::types::NewQueue::new("walked")
+        };
+        let (dbos, executor, db, registered) = partitioned_backlog(queue, 5).await;
+        // Exact only where every claim delivers what it is entitled to. On CockroachDB a claim can
+        // come back short of a row enqueued moments ago, leaving one of the open partitions'
+        // rows waiting through no fault of the walk.
+        if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
+            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            dbos.shutdown().await;
+            return;
+        }
+        // `p-0` is at its one-at-a-time limit; the other four partitions are open.
+        started_elsewhere(&executor, &db, "walked", "p-0").await;
+
+        let polled = poll_once(&executor, &registered, &Arc::new(Running::default())).await;
+        assert_eq!(
+            polled.claims, 5,
+            "every partition visited, the full one included, wherever the shuffle put it"
+        );
+        assert_eq!(polled.contention, None);
+        let waiting: Vec<String> = sqlx::query_scalar(
+            r#"SELECT workflow_uuid FROM "dbos"."workflow_status"
+               WHERE queue_name = 'walked' AND status = 'ENQUEUED'"#,
+        )
+        .fetch_all(&db.pool().await)
+        .await
+        .unwrap();
+        assert_eq!(
+            waiting,
+            ["wf-waiting-0"],
+            "only the full partition's row should still be waiting"
+        );
         dbos.shutdown().await;
     }
 

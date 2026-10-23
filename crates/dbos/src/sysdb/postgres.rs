@@ -6395,7 +6395,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // How many this executor may take under every limit the queue carries: the tightest
             // of them, and `None` when it carries none. Deliberately not a capturing closure, so
-            // the early returns below can read `max_tasks` while it is live.
+            // `max_tasks` can be checked against zero after each limit while it is live.
             let narrow = |current: Option<i64>, available: i64| -> Option<i64> {
                 Some(current.map_or(available, |taken: i64| taken.min(available)))
             };
