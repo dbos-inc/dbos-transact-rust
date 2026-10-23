@@ -9,8 +9,9 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::instance::Executor;
@@ -224,11 +225,67 @@ struct WorkflowState {
     ///
     /// TODO(dbos-team): UPSTREAM item 19.
     next_step_id: AtomicI32,
+    /// The child starts this workflow has in flight, which it waits for before recording its
+    /// outcome.
+    ///
+    /// **A start writes under this execution's owner token, and recording the outcome gives the
+    /// token up.** A start the body dropped part-way goes on in a task of its own, and if the
+    /// outcome landed first that task's write would be refused, with nobody left awaiting it to
+    /// hear so: the child would never exist, and nothing would record why. Waiting here is what
+    /// makes a dropped start keep its promise to start the child.
+    starts: Arc<Starts>,
 }
 
 impl WorkflowState {
     fn next_step_id(&self) -> i32 {
         self.next_step_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// A count of the child starts a workflow has in flight, and a way to wait until there are none.
+///
+/// A start holds a [`StartToken`] for as long as its task exists, and the execution waits on
+/// [`drained`](Self::drained) once its body has ended. Built from an atomic and a
+/// [`tokio::sync::Notify`] alone, which need no particular runtime to run on.
+#[derive(Debug, Default)]
+pub(crate) struct Starts {
+    in_flight: AtomicUsize,
+    none_left: Notify,
+}
+
+impl Starts {
+    /// Counts one more start in flight, until the token is dropped.
+    pub(crate) fn token(self: &Arc<Self>) -> StartToken {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        StartToken(Arc::clone(self))
+    }
+
+    /// Returns once no start is in flight: at once if none is.
+    ///
+    /// Registers for the wake-up before reading the count, so a last token dropped between the
+    /// read and the await still wakes it.
+    pub(crate) async fn drained(&self) {
+        loop {
+            let mut notified = std::pin::pin!(self.none_left.notified());
+            notified.as_mut().enable();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One start in flight, counted in its workflow's [`Starts`] until this is dropped — however the
+/// task holding it ends.
+#[derive(Debug)]
+pub(crate) struct StartToken(Arc<Starts>);
+
+impl Drop for StartToken {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.none_left.notify_waiters();
+        }
     }
 }
 
@@ -249,6 +306,7 @@ impl Ctx {
                 deadline,
                 encoding,
                 next_step_id: AtomicI32::new(0),
+                starts: Arc::default(),
             }),
             step: None,
         }
@@ -328,6 +386,12 @@ impl Ctx {
     /// the caller did not already have.
     pub(crate) fn is_same_execution(&self, other: &Ctx) -> bool {
         Arc::ptr_eq(&self.workflow, &other.workflow)
+    }
+
+    /// The child starts this workflow has in flight. A start holds a token from it for as long as
+    /// its task exists, and the execution waits for them all before recording its outcome.
+    pub(crate) fn starts(&self) -> &Arc<Starts> {
+        &self.workflow.starts
     }
 
     /// When this workflow must stop, if it has a deadline at all.
@@ -622,6 +686,7 @@ pub(crate) async fn own_for_test(db: &dbos_test_support::TestDatabase, workflow_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// The step counter is the half of the context that needs no executor, so it is tested on
     /// `WorkflowState` directly. The scoping tests below need a real `Ctx`, so they launch against
@@ -633,7 +698,59 @@ mod tests {
             deadline: None,
             encoding: PayloadEncoding::Native,
             next_step_id: AtomicI32::new(0),
+            starts: Arc::default(),
         }
+    }
+
+    /// With no start in flight, the wait is over at once.
+    #[tokio::test]
+    async fn no_starts_in_flight_drains_at_once() {
+        let starts = Arc::new(Starts::default());
+        tokio::time::timeout(Duration::from_secs(1), starts.drained())
+            .await
+            .expect("nothing was in flight");
+    }
+
+    /// The wait lasts until the last token is dropped, and not past it.
+    #[tokio::test]
+    async fn drained_waits_for_the_last_start() {
+        let starts = Arc::new(Starts::default());
+        let first = starts.token();
+        let second = starts.token();
+
+        let mut drained = std::pin::pin!(starts.drained());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), drained.as_mut())
+                .await
+                .is_err(),
+            "drained with two starts in flight"
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), drained.as_mut())
+                .await
+                .is_err(),
+            "drained with one start still in flight"
+        );
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), drained)
+            .await
+            .expect("the last start was dropped");
+    }
+
+    /// A token dropped by another task while the wait is parked wakes it.
+    #[tokio::test]
+    async fn a_token_dropped_elsewhere_wakes_the_wait() {
+        let starts = Arc::new(Starts::default());
+        let token = starts.token();
+        let dropper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(token);
+        });
+        tokio::time::timeout(Duration::from_secs(1), starts.drained())
+            .await
+            .expect("the token was dropped");
+        dropper.await.unwrap();
     }
 
     #[test]

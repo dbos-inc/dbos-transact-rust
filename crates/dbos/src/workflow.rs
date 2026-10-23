@@ -1129,6 +1129,11 @@ where
         // is derived from — and resolved *here* rather than in the task so that this call can name
         // the workflow whatever becomes of the task.
         let workflow_id = child_workflow_id(options.workflow_id, placed.parent().as_ref());
+        // Held by the task for as long as it exists, so a parent waits for its start before
+        // recording its outcome, and with it giving up the token the start writes under. See
+        // `Ctx::starts`. Taken before the spawn and moved into the task, so one aborted before its
+        // first poll still gives it back.
+        let tracked = placed.parent().map(|parent| parent.ctx.starts().token());
         let (executor, placement) = placed.into_parts();
         // The registration's choice, unless an enqueue makes its own, and the configured
         // serializer where neither does. A child does not inherit its parent's: what it is encoded
@@ -1157,6 +1162,10 @@ where
             request,
         )
         .instrument(tracing::Span::current());
+        let creating = async move {
+            let _tracked = tracked;
+            creating.await
+        };
 
         match spawn_tracked(&executor, creating).await {
             Ok(started) => started,
@@ -2119,6 +2128,7 @@ async fn execute(
 
     // Kept for the outcome write, which only lands while this execution still owns the workflow.
     let owner_xid = ctx.owner_xid().to_owned();
+    let starts = ctx.starts().clone();
     let outcome = match run_until_deadline(
         expires,
         Ctx::scope(ctx, async move {
@@ -2131,6 +2141,11 @@ async fn execute(
         Ended::Body(outcome) => outcome,
         Ended::DeadlinePassed => return time_out(executor, workflow_id, &owner_xid, slot).await,
     };
+
+    // **A start the body dropped may still be writing under this execution's token**, which the
+    // outcome write gives up. Its write would then be refused with nobody awaiting it, and the
+    // child would never exist, so the outcome waits for every start the body began.
+    starts.drained().await;
 
     let write = match &outcome {
         Ok(output) => {

@@ -12,7 +12,7 @@ use dbos::{
     StartOptions, Timeout,
 };
 
-use dbos_test_support::{TestDatabase, owner_token, test_database};
+use dbos_test_support::{Backend, TestDatabase, owner_token, test_database};
 
 /// The version each instance in this file launches with, derived from its application name.
 ///
@@ -247,6 +247,105 @@ async fn a_start_dropped_after_it_begins_still_starts_the_child() {
         [(0, "child", Some(child_id.as_str())), (1, "after", None)],
         "the dropped start recorded its own row and left `after` where it would have been anyway",
     );
+
+    dbos.shutdown().await;
+}
+
+/// A start dropped by a parent that then finishes still starts the child, however slow the start.
+///
+/// **A start writes under its parent's owner token, and a parent recording its outcome gives the
+/// token up**, so a start still in flight when its parent finished would be refused and lose the
+/// child: nothing awaits the dropped start to hear about it, and nothing records it. The parent
+/// therefore waits for its starts before it records its outcome.
+///
+/// Forced rather than raced: the test holds `operation_outputs` locked, which stops the start at
+/// its first read and leaves the parent's outcome write — to `workflow_status` alone — free to go
+/// ahead. A parent that recorded its outcome while its start waited would do it here at once.
+#[tokio::test]
+async fn a_start_dropped_by_a_parent_that_then_finishes_still_starts_the_child() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let db = test_database().await;
+    if db.backend() == Backend::Cockroach {
+        // The lock that stalls the start is Postgres's `LOCK TABLE`, and what this checks — the
+        // parent waiting for its starts — is the same on both backends.
+        return;
+    }
+    let dbos = DBOS::new(config("outlived-start-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let mut start = child.start(21);
+                    // One poll reaches the spawn and no further; see the test above.
+                    assert!(matches!(
+                        Pin::new(&mut start).poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Pending
+                    ));
+                    drop(start);
+                    // Nothing after it: a step would write to the locked table and wait too.
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let pool = db.pool().await;
+    let mut lock = pool.begin().await.expect("begin failed");
+    sqlx::query("LOCK TABLE dbos.operation_outputs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock failed");
+
+    let id = "the-outlived-parent";
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start");
+
+    // Long enough for a parent that does not wait to record its outcome many times over.
+    let reader = reader(&db).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let row = reader.get_workflow(id).await.expect("read failed");
+        assert_ne!(
+            row.map(|row| row.status),
+            Some(WorkflowStatus::Success),
+            "the parent recorded its outcome while its start was still in flight",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    lock.rollback().await.expect("unlock failed");
+
+    assert_eq!(handle.result().await.expect("the parent failed"), 1);
+    let child_id = format!("{id}-0");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(row) = reader.get_workflow(&child_id).await.expect("read failed")
+            && row.status == WorkflowStatus::Success
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the start the parent outlived never produced a finished child",
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     dbos.shutdown().await;
 }
