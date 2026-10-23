@@ -1515,6 +1515,16 @@ async fn an_incoherent_enqueue_is_refused() {
             },
             "`delay` must be a positive, non-zero duration",
         ),
+        (
+            // Refused by the insert rather than before it, since whether it fits depends on the
+            // clock, and reported the same way.
+            "a delay that carries the clock past the largest instant",
+            Enqueue {
+                delay: Some(Duration::from_millis(i64::MAX as u64)),
+                ..Enqueue::new("demo-queue")
+            },
+            "`delay`",
+        ),
     ];
 
     for (what, enqueue, expected) in cases {
@@ -1532,7 +1542,8 @@ async fn an_incoherent_enqueue_is_refused() {
             Err(error) => error,
         };
         assert!(
-            matches!(&error, Error::Config(message) if message.contains(expected)),
+            matches!(&error, Error::InvalidArgument { operation, detail }
+                if operation == "enqueue a workflow" && detail.contains(expected)),
             "{what}: expected a refusal mentioning {expected:?}, got {error:?}"
         );
     }

@@ -501,11 +501,14 @@ impl<'a> Enqueue<'a> {
     ///   by the system database when it resolves the delay, which also refuses everything here
     ///   again for its own callers.
     ///
-    /// Naming the queue in the message rather than only the field, because a start that fails
-    /// validation says nothing else about which enqueue it was.
+    /// An [`Error::InvalidArgument`] to [`ENQUEUE_OPERATION`], naming the queue in the detail
+    /// rather than only the field, because a start that fails validation says nothing else about
+    /// which enqueue it was.
     pub(crate) fn validate(&self) -> Result<()> {
-        let refused =
-            |message: String| Error::Config(format!("enqueue onto `{}`: {message}", self.name));
+        let refused = |message: String| Error::InvalidArgument {
+            operation: ENQUEUE_OPERATION.into(),
+            detail: format!("queue `{}`: {message}", self.name),
+        };
         let refuse = |message: String| Err(refused(message));
 
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
@@ -550,8 +553,41 @@ impl<'a> Enqueue<'a> {
     }
 }
 
+/// The operation a start's argument refusals name: [`ENQUEUE_OPERATION`] for a start onto a
+/// queue, which is every client enqueue, and this for one that runs at once.
+pub(crate) const START_OPERATION: &str = "start a workflow";
+
+/// The operation an enqueue's argument refusals name; see [`START_OPERATION`].
+pub(crate) const ENQUEUE_OPERATION: &str = "enqueue a workflow";
+
+/// The operation a start with these options is refused as.
+pub(crate) fn start_operation(enqueue: Option<&Enqueue<'_>>) -> &'static str {
+    if enqueue.is_some() {
+        ENQUEUE_OPERATION
+    } else {
+        START_OPERATION
+    }
+}
+
+/// A start's error, with the system database's refusal of its arguments reported as the start's
+/// own [`Error::InvalidArgument`] to `operation`.
+///
+/// For the refusal only the insert can make: a delay that fits in milliseconds but carries the
+/// release time past the largest instant, which depends on the clock. A child start records that
+/// refusal at its parent's step as the system database's error, so a replay reads it back in the
+/// same form and this maps it the same way.
+pub(crate) fn refused_start(operation: &'static str, error: Error) -> Error {
+    match error {
+        Error::SystemDatabase(refusal @ crate::sysdb::Error::InvalidInput { .. }) => {
+            Error::refused_argument(operation, refusal)
+        }
+        other => other,
+    }
+}
+
 /// Refuses a start's arguments that no row could hold: its enqueue's, through
-/// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds.
+/// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds. Each is
+/// an [`Error::InvalidArgument`] to the start's [`start_operation`].
 ///
 /// The one check every surface that starts or enqueues a workflow makes before it writes
 /// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
@@ -566,11 +602,8 @@ pub(crate) fn validate_start(
         enqueue.validate()?;
     }
     if let Some(timeout) = timeout {
-        validate_positive_duration("timeout", timeout).map_err(|error| {
-            Error::from_refusal(error, |field, detail| {
-                Error::Config(refusal_detail(field, &detail))
-            })
-        })?;
+        validate_positive_duration("timeout", timeout)
+            .map_err(|error| Error::refused_argument(start_operation(enqueue), error))?;
     }
     Ok(())
 }
@@ -1167,8 +1200,9 @@ where
             creating.await
         };
 
+        let operation = start_operation(options.queue.as_ref());
         match spawn_tracked(&executor, creating).await {
-            Ok(started) => started,
+            Ok(started) => started.map_err(|error| refused_start(operation, error)),
             // Only shutdown aborts this task, and what the abort leaves behind depends on where
             // it landed. Before the transaction committed, nothing was written and the start did
             // not happen. After it, the child exists and is recorded against this parent — what
@@ -2335,8 +2369,9 @@ mod tests {
         }
         .validate();
         assert!(
-            matches!(&delay, Err(Error::Config(message))
-                if message == "enqueue onto `q`: `delay` must fit in milliseconds as a 64-bit integer"),
+            matches!(&delay, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION
+                    && detail == "queue `q`: `delay` must fit in milliseconds as a 64-bit integer"),
             "got {delay:?}"
         );
         // Fits in milliseconds, and would carry now past the largest instant. That rule reads the
@@ -2359,14 +2394,16 @@ mod tests {
             Some(fits),
         );
         assert!(
-            matches!(&both, Err(Error::Config(message)) if message.contains("`delay`")),
+            matches!(&both, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION && detail.contains("`delay`")),
             "got {both:?}"
         );
 
         let timeout = validate_start(None, Some(Duration::MAX));
         assert!(
-            matches!(&timeout, Err(Error::Config(message))
-                if message == "`timeout` must fit in milliseconds as a 64-bit integer"),
+            matches!(&timeout, Err(Error::InvalidArgument { operation, detail })
+                if operation == START_OPERATION
+                    && detail == "`timeout` must fit in milliseconds as a 64-bit integer"),
             "got {timeout:?}"
         );
 
@@ -2378,14 +2415,16 @@ mod tests {
         }
         .validate();
         assert!(
-            matches!(&delay, Err(Error::Config(message))
-                if message == "enqueue onto `q`: `delay` must be a positive, non-zero duration"),
+            matches!(&delay, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION
+                    && detail == "queue `q`: `delay` must be a positive, non-zero duration"),
             "got {delay:?}"
         );
         let timeout = validate_start(None, Some(Duration::ZERO));
         assert!(
-            matches!(&timeout, Err(Error::Config(message))
-                if message == "`timeout` must be a positive, non-zero duration"),
+            matches!(&timeout, Err(Error::InvalidArgument { operation, detail })
+                if operation == START_OPERATION
+                    && detail == "`timeout` must be a positive, non-zero duration"),
             "got {timeout:?}"
         );
     }

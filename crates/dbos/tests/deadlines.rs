@@ -856,7 +856,8 @@ async fn a_timeout_the_row_cannot_hold_is_refused() {
         )
         .await;
     assert!(
-        matches!(&refused, Err(Error::Config(message)) if message.contains("`timeout`")),
+        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+            if operation == "start a workflow" && detail.contains("`timeout`")),
         "expected the timeout to be refused, got {:?}",
         refused.map(|_| ())
     );

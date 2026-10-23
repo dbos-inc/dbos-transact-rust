@@ -743,9 +743,7 @@ async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_wo
                         .await;
                     match started {
                         Ok(handle) => Ok::<_, Error>(format!("started {}", handle.workflow_id())),
-                        Err(e @ Error::SystemDatabase(dbos::sysdb::Error::InvalidInput { .. })) => {
-                            Ok(format!("refused: {e}"))
-                        }
+                        Err(e @ Error::InvalidArgument { .. }) => Ok(format!("refused: {e}")),
                         Err(e) => Err(e),
                     }
                 }
@@ -2226,7 +2224,8 @@ async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
                         )
                         .await;
                     assert!(
-                        matches!(&refused, Err(Error::Config(message)) if message.contains("`timeout`")),
+                        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                            if operation == "start a workflow" && detail.contains("`timeout`")),
                         "a timeout of {duration:?} should be refused, got {:?}",
                         refused.map(|_| ())
                     );
@@ -2244,7 +2243,8 @@ async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
                         )
                         .await;
                     assert!(
-                        matches!(&refused, Err(Error::Config(message)) if message.contains("`delay`")),
+                        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                            if operation == "enqueue a workflow" && detail.contains("`delay`")),
                         "a delay of {duration:?} should be refused, got {:?}",
                         refused.map(|_| ())
                     );

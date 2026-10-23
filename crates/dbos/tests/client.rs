@@ -84,6 +84,19 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             "`delay`",
         ),
         (
+            // Fits in milliseconds, so it passes the checks made before anything is written, and
+            // is refused by the insert, which alone knows the clock it would be added to.
+            "overflowing-delay",
+            EnqueueOptions {
+                workflow_id: Some("overflowing-delay"),
+                ..EnqueueOptions::on(Enqueue {
+                    delay: Some(Duration::from_millis(i64::MAX as u64)),
+                    ..Enqueue::new("work")
+                })
+            },
+            "`delay`",
+        ),
+        (
             "zero-timeout",
             EnqueueOptions {
                 workflow_id: Some("zero-timeout"),
@@ -109,7 +122,8 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             .enqueue_with::<_, (), EngineOnly>("never_registered", (), options)
             .await;
         assert!(
-            matches!(&refused, Err(Error::Config(message)) if message.contains(expected)),
+            matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                if operation == "enqueue a workflow" && detail.contains(expected)),
             "{id}: expected a refusal mentioning {expected}, got {:?}",
             refused.map(|_| ())
         );
@@ -435,7 +449,7 @@ async fn returning_the_existing_workflow_needs_a_key() {
         )
         .await
         .expect_err("there is no collision to resolve without a deduplication id");
-    assert!(matches!(error, Error::Config(_)), "{error}");
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
     assert!(error.to_string().contains("deduplication_id"), "{error}");
 
     client.close().await;
@@ -461,7 +475,7 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
         )
         .await
         .expect_err("a priority of 0 was accepted");
-    assert!(matches!(error, Error::Config(_)), "{error}");
+    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
 
     assert!(
         reader(&db)
