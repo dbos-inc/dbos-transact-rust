@@ -71,8 +71,7 @@ use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{
-    ENQUEUE_OPERATION, Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start,
-    validate_start,
+    Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start, validate_start,
 };
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
@@ -507,7 +506,7 @@ impl Client {
         // parent — the line drawn for every other call a client makes.
         match init_or_join(&self.0, &new, options.queue.duplication_policy, None)
             .await
-            .map_err(|error| refused_start(ENQUEUE_OPERATION, error))?
+            .map_err(|error| refused_start(Some(options.queue.name), error))?
         {
             Submitted::Created(_) => {
                 tracing::debug!(

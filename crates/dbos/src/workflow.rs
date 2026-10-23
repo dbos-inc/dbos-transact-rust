@@ -498,17 +498,14 @@ impl<'a> Enqueue<'a> {
     /// - **A delay must be more than zero, and fit in milliseconds as a 64-bit integer.** A zero
     ///   delay is a caller that meant `None`. Neither rule reads a clock, so a replay decides it as
     ///   the first run did. A delay that fits but carries `now` past the largest instant is refused
-    ///   by the system database when it resolves the delay, which also refuses everything here
-    ///   again for its own callers.
+    ///   by the system database when it resolves the delay, and reported as the same
+    ///   [`Error::InvalidArgument`] by [`refused_start`]. The system database also refuses
+    ///   everything here again for its own callers.
     ///
-    /// An [`Error::InvalidArgument`] to [`ENQUEUE_OPERATION`], naming the queue in the detail
-    /// rather than only the field, because a start that fails validation says nothing else about
-    /// which enqueue it was.
+    /// Each is an [`Error::InvalidArgument`] to [`ENQUEUE_OPERATION`] naming the queue, through
+    /// [`start_refusal`].
     pub(crate) fn validate(&self) -> Result<()> {
-        let refused = |message: String| Error::InvalidArgument {
-            operation: ENQUEUE_OPERATION.into(),
-            detail: format!("queue `{}`: {message}", self.name),
-        };
+        let refused = |message: String| start_refusal(Some(self.name), message);
         let refuse = |message: String| Err(refused(message));
 
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
@@ -553,41 +550,64 @@ impl<'a> Enqueue<'a> {
     }
 }
 
-/// The operation a start's argument refusals name: [`ENQUEUE_OPERATION`] for a start onto a
-/// queue, which is every client enqueue, and this for one that runs at once.
+/// What a start that runs at once is refused as. A start onto a queue, and with it every client
+/// enqueue, is refused as [`ENQUEUE_OPERATION`].
 pub(crate) const START_OPERATION: &str = "start a workflow";
 
-/// The operation an enqueue's argument refusals name; see [`START_OPERATION`].
+/// What a start onto a queue is refused as; see [`START_OPERATION`].
 pub(crate) const ENQUEUE_OPERATION: &str = "enqueue a workflow";
 
-/// The operation a start with these options is refused as.
-pub(crate) fn start_operation(enqueue: Option<&Enqueue<'_>>) -> &'static str {
-    if enqueue.is_some() {
-        ENQUEUE_OPERATION
-    } else {
-        START_OPERATION
+/// A start's refusal of one of its arguments: an [`Error::InvalidArgument`] to
+/// [`ENQUEUE_OPERATION`] when it names a queue, with the queue in the detail because nothing
+/// else in the refusal says which enqueue it was, and to [`START_OPERATION`] when it does not.
+fn start_refusal(queue: Option<&str>, detail: String) -> Error {
+    match queue {
+        Some(queue) => Error::InvalidArgument {
+            operation: ENQUEUE_OPERATION.into(),
+            detail: format!("queue `{queue}`: {detail}"),
+        },
+        None => Error::InvalidArgument {
+            operation: START_OPERATION.into(),
+            detail,
+        },
     }
 }
 
 /// A start's error, with the system database's refusal of its arguments reported as the start's
-/// own [`Error::InvalidArgument`] to `operation`.
+/// own, through [`start_refusal`].
 ///
-/// For the refusal only the insert can make: a delay that fits in milliseconds but carries the
+/// Chiefly the refusal only the insert can make: a delay that fits in milliseconds but carries the
 /// release time past the largest instant, which depends on the clock. A child start records that
 /// refusal at its parent's step as the system database's error, so a replay reads it back in the
-/// same form and this maps it the same way.
-pub(crate) fn refused_start(operation: &'static str, error: Error) -> Error {
+/// same form and this maps it the same way. Also every other value of the row the caller supplied
+/// and the insert refuses — an empty `workflow_id`, `deduplication_id` or `partition_key` — named
+/// as the start's API spells it, which is not always the column's name.
+pub(crate) fn refused_start(queue: Option<&str>, error: Error) -> Error {
     match error {
-        Error::SystemDatabase(refusal @ crate::sysdb::Error::InvalidInput { .. }) => {
-            Error::refused_argument(operation, refusal)
+        Error::SystemDatabase(crate::sysdb::Error::InvalidInput { field, detail }) => {
+            start_refusal(queue, refusal_detail(api_field(&field), &detail))
         }
+        other => other,
+    }
+}
+
+/// The name a start's API gives a column the system database refuses by name: the queue's
+/// [`name`](Enqueue::name) and [`partition_key`](Enqueue::partition_key), and a client's
+/// `workflow` and [`app_version`](crate::EnqueueOptions::app_version). Every other column is
+/// spelled as the API spells it.
+fn api_field(field: &str) -> &str {
+    match field {
+        "queue_name" => "name",
+        "queue_partition_key" => "partition_key",
+        "name" => "workflow",
+        "application_version" => "app_version",
         other => other,
     }
 }
 
 /// Refuses a start's arguments that no row could hold: its enqueue's, through
 /// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds. Each is
-/// an [`Error::InvalidArgument`] to the start's [`start_operation`].
+/// an [`Error::InvalidArgument`], through [`start_refusal`].
 ///
 /// The one check every surface that starts or enqueues a workflow makes before it writes
 /// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
@@ -602,8 +622,14 @@ pub(crate) fn validate_start(
         enqueue.validate()?;
     }
     if let Some(timeout) = timeout {
-        validate_positive_duration("timeout", timeout)
-            .map_err(|error| Error::refused_argument(start_operation(enqueue), error))?;
+        validate_positive_duration("timeout", timeout).map_err(|error| {
+            Error::from_refusal(error, |field, detail| {
+                start_refusal(
+                    enqueue.map(|enqueue| enqueue.name),
+                    refusal_detail(field, &detail),
+                )
+            })
+        })?;
     }
     Ok(())
 }
@@ -964,8 +990,7 @@ where
     ///
     /// **The checks ahead of the placement are ahead of it on purpose**: a start refused for its
     /// instance, its enqueue or its timeout must move no counter, or the refusal shifts every later step
-    /// of the parent onto the wrong replay slot. `queue::validate` refuses a queue's own
-    /// configuration in the same spot, for the same reason it costs a round trip and not a row.
+    /// of the parent onto the wrong replay slot.
     ///
     /// The placement itself is [`StepPlacement::of`]'s, shared with every other library step in
     /// the crate — including the await this start's [`run`](Self::run) pairs it with. Two of its
@@ -982,7 +1007,7 @@ where
     ///   instance's system database, landing where the workflow that allocated it cannot see it.
     ///   `get_event` refuses the same combination for the same reason.
     fn place(&self, options: &StartOptions<'_>) -> Result<StartPlacement> {
-        let executor = self.dbos().executor("start a workflow")?;
+        let executor = self.dbos().executor(START_OPERATION)?;
         // Borrowed rather than moved, because `options` is read again by the run, and **validated
         // before anything is written and before the counter moves**: an enqueue no queue could
         // honour should cost a round trip, not a row and not a step id.
@@ -1200,9 +1225,9 @@ where
             creating.await
         };
 
-        let operation = start_operation(options.queue.as_ref());
+        let queue = options.queue.as_ref().map(|enqueue| enqueue.name);
         match spawn_tracked(&executor, creating).await {
-            Ok(started) => started.map_err(|error| refused_start(operation, error)),
+            Ok(started) => started.map_err(|error| refused_start(queue, error)),
             // Only shutdown aborts this task, and what the abort leaves behind depends on where
             // it landed. Before the transaction committed, nothing was written and the start did
             // not happen. After it, the child exists and is recorded against this parent — what
@@ -2397,6 +2422,15 @@ mod tests {
             matches!(&both, Err(Error::InvalidArgument { operation, detail })
                 if operation == ENQUEUE_OPERATION && detail.contains("`delay`")),
             "got {both:?}"
+        );
+
+        // A queued start's timeout is the enqueue's argument, and names its queue.
+        let queued = validate_start(Some(&Enqueue::new("q")), Some(Duration::MAX));
+        assert!(
+            matches!(&queued, Err(Error::InvalidArgument { operation, detail })
+                if operation == ENQUEUE_OPERATION
+                    && detail == "queue `q`: `timeout` must fit in milliseconds as a 64-bit integer"),
+            "got {queued:?}"
         );
 
         let timeout = validate_start(None, Some(Duration::MAX));

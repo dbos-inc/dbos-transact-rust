@@ -763,8 +763,12 @@ async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_wo
         )
         .await
         .expect("the parent failed");
-    assert!(first.starts_with("refused: "), "{first}");
-    assert!(first.contains("delay"), "{first}");
+    assert!(
+        first.starts_with(
+            "refused: invalid argument to enqueue a workflow: queue `delay-error-queue`: `delay`"
+        ),
+        "{first}"
+    );
 
     let reader = reader(&db).await;
     let steps = reader

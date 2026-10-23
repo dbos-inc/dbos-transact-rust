@@ -449,8 +449,56 @@ async fn returning_the_existing_workflow_needs_a_key() {
         )
         .await
         .expect_err("there is no collision to resolve without a deduplication id");
-    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
+    assert!(
+        matches!(&error, Error::InvalidArgument { operation, .. } if operation == "enqueue a workflow"),
+        "{error}"
+    );
     assert!(error.to_string().contains("deduplication_id"), "{error}");
+
+    client.close().await;
+}
+
+/// A value only the insert checks is refused as the enqueue's argument, named as the API spells
+/// it rather than by its column.
+#[tokio::test]
+async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
+    let db = test_database().await;
+    let client = client("client-empty-values", &db).await;
+
+    let cases = [
+        (
+            EnqueueOptions::on(Enqueue {
+                deduplication_id: Some(""),
+                ..Enqueue::new("work")
+            }),
+            "queue `work`: `deduplication_id` must be absent rather than empty",
+        ),
+        (
+            EnqueueOptions::on(Enqueue {
+                partition_key: Some(""),
+                ..Enqueue::new("work")
+            }),
+            "queue `work`: `partition_key` must be absent rather than empty",
+        ),
+        (
+            EnqueueOptions {
+                app_version: Some(""),
+                ..EnqueueOptions::new("work")
+            },
+            "queue `work`: `app_version` must be absent rather than empty",
+        ),
+    ];
+    for (options, expected) in cases {
+        let refused = client
+            .enqueue_with::<_, (), EngineOnly>("never_registered", (), options)
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+                if operation == "enqueue a workflow" && detail == expected),
+            "expected {expected:?}, got {:?}",
+            refused.map(|_| ())
+        );
+    }
 
     client.close().await;
 }
@@ -475,7 +523,10 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
         )
         .await
         .expect_err("a priority of 0 was accepted");
-    assert!(matches!(error, Error::InvalidArgument { .. }), "{error}");
+    assert!(
+        matches!(&error, Error::InvalidArgument { operation, .. } if operation == "enqueue a workflow"),
+        "{error}"
+    );
 
     assert!(
         reader(&db)

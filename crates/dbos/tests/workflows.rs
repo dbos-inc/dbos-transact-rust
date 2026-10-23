@@ -70,6 +70,42 @@ async fn a_workflow_runs_and_records_its_output() {
     dbos.shutdown().await;
 }
 
+/// A value only the insert checks is refused as the start's argument too: to "start a workflow"
+/// for a start that names no queue, and with nothing written.
+#[tokio::test]
+async fn a_start_with_an_empty_workflow_id_is_refused_as_an_argument() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("empty-id-app", &db));
+    let double = dbos.register_workflow("double", double).unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = double
+        .run_with(
+            21,
+            RunOptions {
+                workflow_id: Some(""),
+                ..RunOptions::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { operation, detail })
+            if operation == "start a workflow" && detail == "`workflow_id` must not be empty"),
+        "got {refused:?}"
+    );
+    assert!(
+        reader(&db)
+            .await
+            .list_workflows(&Default::default(), None)
+            .await
+            .expect("read failed")
+            .is_empty(),
+        "a refused start wrote a row"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// Attributes reach the row of a workflow this process runs, not only of one that was enqueued.
 ///
 /// Searchable metadata is a property of the workflow rather than of the queue it waited on, and
