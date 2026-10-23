@@ -793,6 +793,10 @@ pub(crate) enum Failure {
     Control(Error<EngineOnly>),
 }
 
+/// What a workflow's row records as its error when its custom serializer refuses even the stand-in
+/// [`EncodedError::of`] offers: fixed text, so nothing of the error itself is stored unencoded.
+const UNENCODABLE_ERROR: &str = "the workflow's error could not be encoded by its serializer";
+
 /// A workflow's error as its row holds it, with the encoding that says how to read it.
 ///
 /// **The encoding travels with the bytes** because the encodings write an error differently — the
@@ -814,8 +818,11 @@ impl EncodedError {
     /// to encode the same error the same way. So an error the encoding refuses is recorded as
     /// [`Error::Serialization`] of the `error` instead, with what the serializer said and what the
     /// error displayed as its message. That one is strings alone, which the built-in encodings
-    /// always write; for a custom serializer that refuses it too, the column holds that message as
-    /// plain text, which a reader reports as an error that does not decode.
+    /// always write. For a custom serializer that refuses it too, the column holds
+    /// [`UNENCODABLE_ERROR`], a fixed marker, which a reader reports as an error that does not
+    /// decode. **Never the error's own details**: a custom serializer may exist to keep them out of
+    /// the database, an encrypting one for instance, and text the caller chose could also hold a
+    /// byte the column cannot store. The details go to the log instead.
     pub(crate) fn of<E: DurableError>(error: &Error<E>, encoding: PayloadEncoding) -> Self {
         let encoded = encode_error::<E, EngineOnly>(error, &encoding).unwrap_or_else(|refused| {
             let said = match refused {
@@ -831,8 +838,12 @@ impl EncodedError {
                 error = %stand_in,
                 "the workflow's error could not be encoded; its message is recorded instead"
             );
-            encode_error::<E, EngineOnly>(&stand_in, &encoding)
-                .unwrap_or_else(|_| stand_in.to_string())
+            encode_error::<E, EngineOnly>(&stand_in, &encoding).unwrap_or_else(|_| {
+                tracing::warn!(
+                    "the serializer refused the stand-in too; a fixed marker is recorded"
+                );
+                UNENCODABLE_ERROR.to_owned()
+            })
         });
         Self { encoded, encoding }
     }
@@ -981,10 +992,10 @@ mod tests {
         }
     }
 
-    /// A custom serializer that refuses even the stand-in leaves its message as plain text, so the
-    /// row still ends.
+    /// A custom serializer that refuses even the stand-in leaves a fixed marker, so the row still
+    /// ends without anything of the error stored unencoded.
     #[test]
-    fn a_serializer_that_refuses_everything_leaves_the_message_as_text() {
+    fn a_serializer_that_refuses_everything_records_a_fixed_marker() {
         use crate::serialization::{CustomSerializer, Payload, PayloadSlot, Serializer};
 
         #[derive(Debug)]
@@ -1013,11 +1024,8 @@ mod tests {
 
         let error: Error<CardDeclined> = CardDeclined { attempts: 3 }.into();
         let recorded = EncodedError::of(&error, Serializer::custom(Refuses).encoding());
-        assert_eq!(
-            recorded.encoded,
-            "could not serialize the workflow error: nothing goes; the error was: the card was \
-             declined after 3 attempts"
-        );
+        // Nothing of the error reaches the column: the serializer may be there to keep it out.
+        assert_eq!(recorded.encoded, UNENCODABLE_ERROR);
         // Text the serializer cannot decode back, which a reader reports as that.
         let read = recorded.decode::<CardDeclined>("wf-1");
         assert!(
