@@ -2132,8 +2132,19 @@ async fn execute(
     let outcome = match run_until_deadline(
         expires,
         Ctx::scope(ctx, async move {
-            let encoded = workflow(input, encoding.clone()).await?;
-            Ok(EncodedOutput { encoded, encoding })
+            let outcome = async {
+                let encoded = workflow(input, encoding.clone()).await?;
+                Ok(EncodedOutput { encoded, encoding })
+            }
+            .await;
+            // **A start the body dropped may still be writing under this execution's token**,
+            // which the outcome write gives up. Its write would then be refused with nobody
+            // awaiting it, and the child would never exist, so the outcome waits for every start
+            // the body began. Inside the deadline, so a start that stalls past it cannot hold the
+            // workflow open: the run times out as any other would, and a start refused after
+            // that is refused for a cancelled parent.
+            starts.drained().await;
+            outcome
         }),
     )
     .await
@@ -2141,11 +2152,6 @@ async fn execute(
         Ended::Body(outcome) => outcome,
         Ended::DeadlinePassed => return time_out(executor, workflow_id, &owner_xid, slot).await,
     };
-
-    // **A start the body dropped may still be writing under this execution's token**, which the
-    // outcome write gives up. Its write would then be refused with nobody awaiting it, and the
-    // child would never exist, so the outcome waits for every start the body began.
-    starts.drained().await;
 
     let write = match &outcome {
         Ok(output) => {

@@ -350,6 +350,77 @@ async fn a_start_dropped_by_a_parent_that_then_finishes_still_starts_the_child()
     dbos.shutdown().await;
 }
 
+/// A parent waiting for a stalled start still times out at its deadline.
+///
+/// The wait for the parent's starts runs inside its deadline, so a start that cannot finish does
+/// not hold the parent open past it: the parent is cancelled as any other would be, and its caller
+/// hears so while the start is still stalled. Stalled the same way as the test above.
+#[tokio::test]
+async fn a_parent_waiting_for_a_stalled_start_still_times_out() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let db = test_database().await;
+    if db.backend() == Backend::Cockroach {
+        // `LOCK TABLE` is Postgres's; the deadline it is checked against is the same on both.
+        return;
+    }
+    let dbos = DBOS::new(config("stalled-start-timeout-app", &db));
+    let child = dbos
+        .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    let mut start = child.start(21);
+                    assert!(matches!(
+                        Pin::new(&mut start).poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Pending
+                    ));
+                    drop(start);
+                    Ok::<u32, Error>(1)
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let pool = db.pool().await;
+    let mut lock = pool.begin().await.expect("begin failed");
+    sqlx::query("LOCK TABLE dbos.operation_outputs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock failed");
+
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("the-stalled-parent"),
+                timeout: Timeout::Explicit(Duration::from_secs(1)),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start");
+
+    // Held until the parent's caller has its answer, so the start is still stalled when it does.
+    let result = tokio::time::timeout(Duration::from_secs(20), handle.result())
+        .await
+        .expect("the parent was held past its deadline by the start it was waiting for");
+    assert!(
+        matches!(result, Err(Error::WorkflowCancelled { .. })),
+        "expected the parent to time out, got {result:?}"
+    );
+    lock.rollback().await.expect("unlock failed");
+
+    dbos.shutdown().await;
+}
+
 /// A child that joins a held deduplication key is recorded as the workflow it joined.
 ///
 /// The interesting half is the start record. The child id this call derived — `{parent}-{step}` —
