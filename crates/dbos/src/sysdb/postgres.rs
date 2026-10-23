@@ -4901,7 +4901,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Two statements, unlike `get_event`'s one, and here the split is forced rather than
         // chosen: a message cannot be read without taking it, and taking it has to be atomic with
         // recording the step. So the poll asks only whether something is waiting, and the taking
-        // happens once, below. `LIMIT 1` because this asks a yes/no question: without it the
+        // follows a yes, below. `LIMIT 1` because this asks a yes/no question: without it the
         // statement returns a row per unconsumed message, once per interval, for as long as the
         // receiver waits — and a producer outrunning its consumer is exactly when that grows. Go
         // asks the same question the same way, as `SELECT EXISTS (SELECT 1 …)`; Python, TypeScript
@@ -4925,11 +4925,14 @@ impl SystemDatabase for PostgresSystemDatabase {
         // still true of the row the winner just took and its `RETURNING` hands the same message
         // back.
         //
-        // **It is defence in depth rather than the arbitration**, because the taking and the step
-        // record share a transaction: a loser that gets past this predicate still conflicts on the
-        // step and rolls its consumption back. Worth keeping anyway — it makes the loser's `UPDATE`
-        // a no-op instead of a redundant write, and it means correctness does not rest on the step
-        // insert being the thing that fails.
+        // **Between two executions at one step it is defence in depth rather than the
+        // arbitration**, because the taking and the step record share a transaction: a loser that
+        // gets past this predicate still conflicts on the step and rolls its consumption back.
+        // Worth keeping for that case anyway — it makes the loser's `UPDATE` a no-op instead of a
+        // redundant write, and it means correctness does not rest on the step insert being the
+        // thing that fails. **Between two receives at different steps it is the arbitration**:
+        // their step records cannot collide, so without it both would hand back the one message.
+        // Matching nothing is also what tells the loser to go back to waiting.
         //
         // The destination and topic are *not* restated out here, though Python, TypeScript and Java
         // all restate them: `message_uuid` is the primary key, so the row the subquery names
@@ -4976,8 +4979,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Before the first look: registering after looking would miss a message that landed in
         // between. Shared, not exclusive: two receives of one execution can wait here at once, and
         // so can an execution whose workflow was handed to a new one, beside the new owner. Both
-        // wake, the consuming statement gives the message to one of them, and a stale execution's
-        // consume is refused by the owner check.
+        // wake, the consuming statement gives the message to one of them while the other goes
+        // back to waiting, and a stale execution's consume is refused by the owner check.
         let mut subscription = self.notify.subscribe(message_key(workflow_id, topic));
 
         // Recorded before the wait and replayed on recovery, so a receive that waited fifty of its
@@ -4992,8 +4995,27 @@ impl SystemDatabase for PostgresSystemDatabase {
             )
             .await?;
 
-        // Look, wait a bounded interval, look again — `get_event`'s loop exactly, and for the same
-        // reason: with nothing pushing, this is what delivers.
+        /// What one take came back with.
+        enum Take {
+            /// The step's answer, recorded: the message this take consumed, what another execution
+            /// recorded at this step, or `None` once the deadline has passed.
+            Answered(Option<EncodedValue>),
+            /// Nothing to consume and time still left. Nothing was recorded, so the wait goes on.
+            Missed,
+        }
+
+        // Look, take if there is something to take, and otherwise wait a bounded interval and look
+        // again — `get_event`'s loop, and for the same reason: with nothing pushing, this is what
+        // delivers.
+        //
+        // **The take is inside the loop because a probe's yes is not a promise.** The probe
+        // reserves nothing, and two receives of this workflow's topic can wait at once — a receive
+        // joined or raced with another inside one execution, at different steps. Both see the one
+        // message and one takes it. Were the other to record its empty take as the answer, it would
+        // end with time still on its deadline, a message sent in that time would go to nobody, and
+        // a replay would return the recorded `None` for good. So an empty take before the deadline
+        // records nothing and the loop goes on, still subscribed; an empty result is recorded only
+        // by a take at or past the deadline.
         loop {
             let has_message = with_retry(&self.retry, "recv", move || async move {
                 // Inside the retried region and dropped before the wait, so neither a backoff nor a
@@ -5010,9 +5032,6 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .is_some())
             })
             .await?;
-            if has_message {
-                break;
-            }
 
             // Past the deadline and exactly on it are the same answer — no time left — but
             // `duration_since` reports the first as `None` and the second as zero. Folding them
@@ -5021,109 +5040,157 @@ impl SystemDatabase for PostgresSystemDatabase {
             let remaining = deadline
                 .duration_since(Timestamp::now())
                 .unwrap_or(Duration::ZERO);
-            if remaining.is_zero() {
-                break;
+
+            if has_message || remaining.is_zero() {
+                // Fixed here rather than inside the retry: `completed_at` is also what recognises
+                // this caller's own re-attempt after a lost acknowledgement, so it must not move
+                // between attempts.
+                let timing = StepTiming {
+                    started_at,
+                    completed_at: Timestamp::now(),
+                };
+
+                // **One commit per take, and it has to be.** A message taken but not recorded is
+                // gone: the row is marked consumed, so a replay finds no step, takes nothing, and
+                // reports a timeout for a message that was delivered to nobody. A take that records
+                // nothing has consumed nothing either, which is what lets it run more than once.
+                //
+                // No isolation level is pinned, unlike TypeScript's explicit `READ COMMITTED`. On
+                // PostgreSQL that is the default, the consume's predicate arbitrates, and the
+                // re-check below sees what the arbitration's winner committed. On CockroachDB the
+                // default is `SERIALIZABLE`, which aborts the loser instead — `40001`, which the
+                // retry policy replays as a conflict, so it comes back round, finds nothing
+                // unconsumed, and goes back to waiting as a loser on PostgreSQL does.
+                let take = with_retry(&self.retry, "recv", move || async move {
+                    let mut tx = pool.begin().await?;
+                    // First, so a refusal rolls the consume back with it: the message stays for the
+                    // workflow's new owner.
+                    self.check_owner_on(
+                        &mut tx,
+                        WorkflowOwner {
+                            workflow_id,
+                            owner_xid,
+                        },
+                    )
+                    .await?;
+
+                    // The check that opened this call cannot stand in for this one: the wait
+                    // between them is exactly when another execution of this workflow would have
+                    // recorded its own answer. Same transaction as the write, so there is no window
+                    // between deciding to take a message and taking it.
+                    if let Some(step) = self
+                        .check_step_on(&mut tx, workflow_id, step_id, step_names::RECV)
+                        .await?
+                    {
+                        tx.commit().await?;
+                        tracing::debug!(workflow_id, step_id = step_id, "replaying recv");
+                        return Ok(Take::Answered(step.output.map(|value| EncodedValue {
+                            value,
+                            serialization: step.serialization,
+                        })));
+                    }
+
+                    let row = sqlx::query(AssertSqlSafe(consume.clone()))
+                        .bind(workflow_id)
+                        .bind(stored_topic)
+                        .bind(step_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                    let message = match row {
+                        Some(row) => Some(EncodedValue {
+                            value: row.try_get("message")?,
+                            serialization: row.try_get("serialization")?,
+                        }),
+                        None => None,
+                    };
+
+                    if message.is_none() {
+                        // **Asked again, because the consume can outlast the check above.** A
+                        // consume that waited on another transaction's lock on the message, and
+                        // found it taken once that committed, may have lost it to another execution
+                        // of this workflow at this same step, which recorded its answer in the
+                        // commit it waited on. At READ COMMITTED each statement reads what was
+                        // committed when it began, so this one sees that record where the check
+                        // above could not. Adopting it here is the only prompt way to learn of it:
+                        // nothing wakes a receive for a step record, so a loser left to the loop
+                        // would wait out its whole timeout and only then find it.
+                        if let Some(step) = self
+                            .check_step_on(&mut tx, workflow_id, step_id, step_names::RECV)
+                            .await?
+                        {
+                            tx.commit().await?;
+                            tracing::debug!(workflow_id, step_id = step_id, "replaying recv");
+                            return Ok(Take::Answered(step.output.map(|value| EncodedValue {
+                                value,
+                                serialization: step.serialization,
+                            })));
+                        }
+
+                        // Asked of the clock now rather than before the take, since the consume
+                        // can wait on a lock for as long as its holder keeps it, and a take that
+                        // started with time left may finish without any.
+                        let time_left = deadline
+                            .duration_since(Timestamp::now())
+                            .is_some_and(|left| !left.is_zero());
+                        if time_left {
+                            // Explicit, so the owner check's row lock goes now rather than whenever
+                            // the connection is next used.
+                            tx.rollback().await?;
+                            tracing::debug!(
+                                workflow_id,
+                                step_id = step_id,
+                                topic = stored_topic,
+                                "recv found its message taken; waiting on"
+                            );
+                            return Ok(Take::Missed);
+                        }
+                    }
+
+                    // The sender's own payload under the sender's own format, as `get_event`
+                    // records the publisher's. A timeout records a NULL output.
+                    //
+                    // **A conflict here is reported, and the rollback is what makes that safe.**
+                    // With the owner check first it can only be this execution recording the step
+                    // twice, which is nondeterminism; dropping the transaction un-takes whatever
+                    // this attempt took, so the message stays available.
+                    self.record_step_on(
+                        &mut tx,
+                        workflow_id,
+                        step_id,
+                        step_names::RECV,
+                        Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
+                        message.as_ref().and_then(|m| m.serialization.as_deref()),
+                        Some(timing),
+                        None,
+                    )
+                    .await?;
+                    tx.commit().await?;
+                    tracing::debug!(
+                        workflow_id,
+                        step_id = step_id,
+                        topic = stored_topic,
+                        received = message.is_some(),
+                        "recv finished"
+                    );
+                    Ok(Take::Answered(message))
+                })
+                .await?;
+                match take {
+                    Take::Answered(answer) => return Ok(answer),
+                    // Straight back to the probe rather than to the wait: if another message is
+                    // already there it is this receive's, and if none is the probe says so and the
+                    // wait follows. The probe sees only committed consumes, so the message just
+                    // lost is not seen again.
+                    Take::Missed => continue,
+                }
             }
+
             let _ = tokio::time::timeout(
                 remaining.min(self.listener.poll_interval()),
                 subscription.notified(),
             )
             .await;
         }
-        // Released here rather than at the end of the call: the taking below does not wait, so
-        // there is nothing left to be woken for.
-        drop(subscription);
-
-        // Fixed here rather than inside the retry: `completed_at` is also what recognises this
-        // caller's own re-attempt after a lost acknowledgement, so it must not move between
-        // attempts.
-        let timing = StepTiming {
-            started_at,
-            completed_at: Timestamp::now(),
-        };
-
-        // **One commit, and it has to be.** A message taken but not recorded is gone: the row is
-        // marked consumed, so a replay finds no step, takes nothing, and reports a timeout for a
-        // message that was delivered to nobody. That is why this runs once, after the waiting, and
-        // never inside the loop.
-        //
-        // No isolation level is pinned, unlike TypeScript's explicit `READ COMMITTED`. On
-        // PostgreSQL that is the default and the predicate above arbitrates; on CockroachDB the
-        // default is `SERIALIZABLE`, which aborts the loser instead — `40001`, which the retry
-        // policy replays as a conflict, so it comes back round, finds nothing unconsumed,
-        // and records the same `None` it would have recorded either way.
-        with_retry(&self.retry, "recv", move || async move {
-            let mut tx = pool.begin().await?;
-            // First, so a refusal rolls the consume back with it: the message stays for the
-            // workflow's new owner.
-            self.check_owner_on(
-                &mut tx,
-                WorkflowOwner {
-                    workflow_id,
-                    owner_xid,
-                },
-            )
-            .await?;
-
-            // The check that opened this call cannot stand in for this one: the wait between them
-            // is exactly when another execution of this workflow would have recorded its own
-            // answer. Same transaction as the write, so there is no window between deciding to
-            // take a message and taking it.
-            if let Some(step) = self
-                .check_step_on(&mut tx, workflow_id, step_id, step_names::RECV)
-                .await?
-            {
-                tx.commit().await?;
-                tracing::debug!(workflow_id, step_id = step_id, "replaying recv");
-                return Ok(step.output.map(|value| EncodedValue {
-                    value,
-                    serialization: step.serialization,
-                }));
-            }
-
-            let row = sqlx::query(AssertSqlSafe(consume.clone()))
-                .bind(workflow_id)
-                .bind(stored_topic)
-                .bind(step_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-            let message = match row {
-                Some(row) => Some(EncodedValue {
-                    value: row.try_get("message")?,
-                    serialization: row.try_get("serialization")?,
-                }),
-                None => None,
-            };
-
-            // The sender's own payload under the sender's own format, as `get_event` records the
-            // publisher's. A timeout records a NULL output.
-            //
-            // **A conflict here is reported, and the rollback is what makes that safe.** With the
-            // owner check first it can only be this execution recording the step twice, which is
-            // nondeterminism; dropping the transaction un-takes whatever this attempt took, so the
-            // message stays available.
-            self.record_step_on(
-                &mut tx,
-                workflow_id,
-                step_id,
-                step_names::RECV,
-                Outcome::Output(message.as_ref().map(|m| m.value.as_str())),
-                message.as_ref().and_then(|m| m.serialization.as_deref()),
-                Some(timing),
-                None,
-            )
-            .await?;
-            tx.commit().await?;
-            tracing::debug!(
-                workflow_id,
-                step_id = step_id,
-                topic = stored_topic,
-                received = message.is_some(),
-                "recv finished"
-            );
-            Ok(message)
-        })
-        .await
     }
 
     async fn write_stream(

@@ -4699,6 +4699,9 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
 /// **Two receives on one (workflow, topic) in one process both wait**, and one message goes to
 /// one of them: the other times out with nothing. These are two receives of one execution, at
 /// different steps, as a receive joined with another would be; both are woken by the one send.
+///
+/// The loser keeps waiting after the winner takes the message, so it ends at its deadline; the
+/// timeouts are short for that reason.
 #[tokio::test]
 async fn two_receivers_in_one_process_share_one_message() {
     let db = test_database().await;
@@ -4718,7 +4721,7 @@ async fn two_receivers_in_one_process_share_one_message() {
                 0,
                 1,
                 Some("orders"),
-                RECHECK * 20,
+                RECHECK * 5,
                 &owner_token(&*sys, "wf-receiver").await,
             )
             .await
@@ -4732,7 +4735,7 @@ async fn two_receivers_in_one_process_share_one_message() {
                 2,
                 3,
                 Some("orders"),
-                RECHECK * 20,
+                RECHECK * 5,
                 &owner_token(&*sys, "wf-receiver").await,
             )
             .await
@@ -4768,11 +4771,13 @@ async fn two_receivers_in_one_process_share_one_message() {
 ///
 /// **The loser has two legal outcomes, and which one it gets is a matter of timing.** Its
 /// transaction opens with a `check_step` of its own: if the winner has committed by then, it
-/// adopts that answer and returns the same message. If it has not, the loser reads no step, goes
-/// on to the consuming `UPDATE`, and its own step write conflicts — `StepNondeterminism`, with
-/// the consumption rolled back alongside it. `recv` reports that conflict rather than adopting,
-/// deliberately and for the reasons written where it is raised, so both outcomes are accepted
-/// here. Requiring the first would hold on an idle machine and fail on a loaded one, which is
+/// adopts that answer and returns the same message. If it has not, the loser reads no step and
+/// goes on to the consuming `UPDATE`. Should that `UPDATE` wait on the winner's lock on the
+/// message, it matches nothing once the winner commits, and the loser checks for the step again
+/// and adopts it. Should it start only after the winner has committed, it takes the second
+/// message and its own step write conflicts — `StepNondeterminism`, with the consumption rolled
+/// back alongside it. `recv` reports that conflict rather than adopting, deliberately and for the
+/// reasons written where it is raised, so both outcomes are accepted here. Requiring the first would hold on an idle machine and fail on a loaded one, which is
 /// where CI runs. Nothing is lost by accepting both, because the adopting path has a test of its
 /// own that pins it without a race —
 /// `a_recv_defers_to_a_rival_that_recorded_first`, which records the rival's step during the wait
@@ -4857,6 +4862,270 @@ async fn two_receivers_cannot_take_the_same_message() {
         notifications.iter().filter(|n| n.consumed).count(),
         1,
         "one message was received, so exactly one may be consumed: {notifications:?}",
+    );
+}
+
+/// Whether to skip a test that stages a receive blocked on another transaction's lock.
+///
+/// CockroachDB's serializable isolation aborts one side of that conflict rather than making it
+/// wait, so there is no blocked consume to stage.
+fn skip_without_lock_waits(db: &support::TestDatabase) -> bool {
+    let skipping = matches!(db.backend(), Backend::Cockroach);
+    if skipping {
+        eprintln!(
+            "skipped on CockroachDB: a conflicting consume is aborted there, not made to wait"
+        );
+    }
+    skipping
+}
+
+/// Takes `wf-receiver`'s waiting `orders` message in a transaction left open, as another receive's
+/// take would be between its consume and its commit.
+///
+/// The open transaction holds the message's row lock and its consume is not yet visible, so a
+/// receive started now sees the message, and its own consume waits on the lock until this commits.
+/// `step_id` is the step the rival takes it for. With `record`, the rival records that step in the
+/// same transaction, as another execution of the workflow at that step would.
+async fn take_the_message_and_hold_it(
+    pool: &sqlx::PgPool,
+    step_id: i32,
+    record: bool,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut rival = pool.begin().await.unwrap();
+    let taken: String = sqlx::query_scalar(
+        "UPDATE dbos.notifications SET consumed = TRUE, consumed_by_function_id = $1 \
+         WHERE destination_uuid = 'wf-receiver' AND topic = 'orders' AND consumed = FALSE \
+         RETURNING message",
+    )
+    .bind(step_id)
+    .fetch_one(&mut *rival)
+    .await
+    .expect("there should be a message to take");
+    if record {
+        sqlx::query(
+            "INSERT INTO dbos.operation_outputs \
+             (workflow_uuid, function_id, function_name, output, serialization) \
+             VALUES ('wf-receiver', $1, 'DBOS.recv', $2, 'portable_json')",
+        )
+        .bind(step_id)
+        .bind(taken)
+        .execute(&mut *rival)
+        .await
+        .unwrap();
+    }
+    rival
+}
+
+/// Returns once a statement in this test's database is waiting on a lock while updating the
+/// notifications table: the receive's consume, blocked on the rival holding the message.
+///
+/// Filtered to the current database because tests share a server.
+async fn until_a_consume_waits_on_the_message(pool: &sqlx::PgPool) {
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND query LIKE 'UPDATE %notifications%'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the receive's consume never waited on the held message");
+}
+
+/// **A receive whose message another receive took keeps waiting**, and the next message sent
+/// before its deadline is its own.
+///
+/// The race is staged rather than hoped for: a rival at another step of the workflow takes the
+/// message and holds it, the receive's probe sees it, and its consume waits on the rival's lock.
+/// When the rival commits the consume matches nothing. With ten minutes left that is no answer,
+/// so nothing may be recorded and the receive must still be waiting when the second message comes.
+#[tokio::test]
+async fn a_recv_whose_message_another_receive_took_waits_for_the_next() {
+    let db = test_database().await;
+    if skip_without_lock_waits(&db) {
+        return;
+    }
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, "wf-receiver").await;
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+    let rival = take_the_message_and_hold_it(&pool, 2, false).await;
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, &owner)
+                .await
+        })
+    };
+    until_a_consume_waits_on_the_message(&pool).await;
+    rival.commit().await.unwrap();
+
+    tokio::time::sleep(BRIEFLY).await;
+    if receiving.is_finished() {
+        panic!(
+            "a take that lost its message with time left ended the receive: {:?}",
+            receiving.await,
+        );
+    }
+    assert!(
+        sys.check_step("wf-receiver", 0, "DBOS.recv")
+            .await
+            .unwrap()
+            .is_none(),
+        "an empty take before the deadline must record nothing",
+    );
+
+    send_to_receiver(&sys, Some("orders"), "\"two\"").await;
+    let taken = tokio::time::timeout(RECHECK * 10, receiving)
+        .await
+        .expect("the receive never took the message sent within its deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken.map(|m| m.value), Some("\"two\"".to_owned()));
+    let step = sys
+        .check_step("wf-receiver", 0, "DBOS.recv")
+        .await
+        .unwrap()
+        .expect("receiving is a step");
+    assert_eq!(step.output.as_deref(), Some("\"two\""));
+}
+
+/// **A receive that loses its message to another execution at its own step adopts that
+/// execution's answer at once**, rather than waiting out its timeout.
+///
+/// The rival takes the message and records the step in one transaction, as another execution of
+/// the workflow would, and commits after the receive's step check and while its consume waits.
+/// Nothing wakes a receive for a step record, so with ten minutes left only a second look at the
+/// step, made once the consume comes back empty, can end this call promptly.
+#[tokio::test]
+async fn a_recv_adopts_the_answer_of_a_same_step_rival_that_took_its_message() {
+    let db = test_database().await;
+    if skip_without_lock_waits(&db) {
+        return;
+    }
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, "wf-receiver").await;
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+    let rival = take_the_message_and_hold_it(&pool, 0, true).await;
+
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, &owner)
+                .await
+        })
+    };
+    until_a_consume_waits_on_the_message(&pool).await;
+    let committed = Timestamp::now();
+    rival.commit().await.unwrap();
+
+    let taken = tokio::time::timeout(RECHECK * 10, receiving)
+        .await
+        .expect("the receive waited for a message rather than adopting the recorded step")
+        .unwrap()
+        .expect("losing to a same-step rival is not a failure");
+    assert!(
+        Timestamp::now().duration_since(committed).unwrap() < RECHECK,
+        "the recorded step was adopted, but only after a poll interval",
+    );
+    assert_eq!(
+        taken,
+        Some(EncodedValue {
+            value: "\"one\"".to_owned(),
+            serialization: Some("portable_json".to_owned()),
+        }),
+        "the recorded step is the workflow's answer, whoever wrote it",
+    );
+    let notifications = sys.get_all_notifications("wf-receiver").await.unwrap();
+    assert_eq!(
+        notifications.iter().filter(|n| n.consumed).count(),
+        1,
+        "{notifications:?}"
+    );
+}
+
+/// **A receive whose message is taken from it past its deadline records that nothing came**, and a
+/// replay returns that without waiting.
+///
+/// The rival holds the message until the deadline has gone by, so the receive's consume matches
+/// nothing with no time left. That, and only that, is when an empty take is the answer.
+#[tokio::test]
+async fn a_recv_whose_message_was_taken_past_its_deadline_records_nothing_received() {
+    let db = test_database().await;
+    if skip_without_lock_waits(&db) {
+        return;
+    }
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        db.pool().await,
+        &Settings::default(),
+    ));
+    sys.init_workflow(&workflow("wf-receiver"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, "wf-receiver").await;
+    send_to_receiver(&sys, Some("orders"), "\"one\"").await;
+    let rival = take_the_message_and_hold_it(&pool, 2, false).await;
+
+    let timeout = RECHECK * 2;
+    let receiving = {
+        let sys = std::sync::Arc::clone(&sys);
+        let owner = owner.clone();
+        tokio::spawn(async move {
+            sys.recv("wf-receiver", 0, 1, Some("orders"), timeout, &owner)
+                .await
+        })
+    };
+    until_a_consume_waits_on_the_message(&pool).await;
+    // The receive began before its consume waited, so its deadline is behind this.
+    tokio::time::sleep(timeout + BRIEFLY).await;
+    rival.commit().await.unwrap();
+
+    let taken = tokio::time::timeout(RECHECK * 10, receiving)
+        .await
+        .expect("the receive never finished after its deadline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(taken, None);
+    let step = sys
+        .check_step("wf-receiver", 0, "DBOS.recv")
+        .await
+        .unwrap()
+        .expect("a timeout is a result, and results are recorded");
+    assert_eq!(step.output, None, "nothing received is a NULL output");
+
+    let began = Timestamp::now();
+    let replayed = tokio::time::timeout(
+        RECHECK * 10,
+        sys.recv("wf-receiver", 0, 1, Some("orders"), RECHECK * 600, &owner),
+    )
+    .await
+    .expect("a replay waited for a message instead of returning the recorded timeout")
+    .unwrap();
+    assert_eq!(replayed, None);
+    assert!(
+        Timestamp::now().duration_since(began).unwrap() < RECHECK,
+        "a replay must not wait at all",
     );
 }
 
