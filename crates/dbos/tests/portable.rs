@@ -5,6 +5,7 @@
 //! row that matches here is one the other SDKs read.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -955,4 +956,87 @@ async fn a_value_in_an_unknown_encoding_is_refused() {
         matches!(&error, Error::UnknownSerialization { name } if name == "py_pickle"),
         "{error:?}"
     );
+}
+
+/// **A result portable JSON cannot hold is the workflow's error.** A non-finite float has no
+/// portable spelling, so the result is refused; the refusal is recorded as the envelope of
+/// [`Error::Serialization`], the row ends ERROR, and a replay of the same id reads it back without
+/// running the body again.
+#[tokio::test]
+async fn a_result_portable_json_cannot_hold_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("portable-unencodable", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let not_a_number = dbos
+        .register_workflow_with(WorkflowKey::new("not_a_number"), portable(), {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<f64, Error>(f64::NAN) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    const REFUSAL: &str = "NaN is not a finite number, and portable JSON has no way to store one";
+    let refused = |error: &Error| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. } if what == "result" && message == REFUSAL
+        )
+    };
+
+    let handle = not_a_number.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(
+        scalar(
+            &db,
+            r#"SELECT status FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+            &id
+        )
+        .await
+        .as_deref(),
+        Some("ERROR")
+    );
+    let recorded: Value = serde_json::from_str(
+        &scalar(
+            &db,
+            r#"SELECT error FROM "dbos"."workflow_output" WHERE workflow_uuid = $1"#,
+            &id,
+        )
+        .await
+        .expect("an error is recorded"),
+    )
+    .expect("the error is JSON");
+    assert_eq!(
+        recorded,
+        json!({
+            "name": "dbos::Serialization",
+            "message": format!("could not serialize the workflow result: {REFUSAL}"),
+            "code": null,
+            "data": {"what": "result", "message": REFUSAL},
+        })
+    );
+
+    let replayed = not_a_number
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
 }

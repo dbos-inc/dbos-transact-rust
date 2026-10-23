@@ -15,9 +15,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
-use crate::serialization::{
-    PayloadEncoding, SerializationFormat, decode_input, encode, encode_error,
-};
+use crate::serialization::{PayloadEncoding, SerializationFormat, decode_input, encode};
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -390,21 +388,27 @@ impl DBOS {
                     match workflow(input).await {
                         // A plain value, in any encoding: only an input and an error have an
                         // envelope.
-                        Ok(output) => encode(&output, &encoding, "result")
-                            .map(Some)
-                            .map_err(Failure::Control),
+                        //
+                        // A value the encoding refuses is the workflow's failure, not the
+                        // engine's: the body ran to its end, and running it again computes the
+                        // same value and is refused the same way. So the refusal is recorded as
+                        // the workflow's error, and the row ends rather than staying for recovery
+                        // to re-run.
+                        Ok(output) => match encode::<R, E>(&output, &encoding, "result") {
+                            Ok(encoded) => Ok(Some(encoded)),
+                            Err(refused) => {
+                                Err(Failure::Recorded(EncodedError::of(&refused, encoding)))
+                            }
+                        },
                         // Natively or in a custom serializer the whole `Error<E>` is what gets
                         // recorded, application variant and all, so the column is
                         // self-describing: a reader knows the envelope without having to guess
                         // whether the payload is one of ours or one of the workflow's. Portably it
-                        // is the envelope every SDK reads.
+                        // is the envelope every SDK reads. An error the encoding refuses is
+                        // recorded in a form it does not, for the same reason as a result.
                         Err(error) => Err(match error.control() {
                             Some(control) => Failure::Control(control),
-                            None => Failure::Recorded(EncodedError {
-                                encoded: encode_error(&error, &encoding)
-                                    .map_err(Failure::Control)?,
-                                encoding,
-                            }),
+                            None => Failure::Recorded(EncodedError::of(&error, encoding)),
                         }),
                     }
                 })
@@ -520,6 +524,30 @@ mod tests {
                 })
             ),
             "{err:?}"
+        );
+    }
+
+    /// A result the encoding refuses is the workflow's own failure, recorded as the refusal, not a
+    /// control signal that would leave the row for recovery to run again.
+    #[tokio::test]
+    async fn a_result_the_encoding_refuses_is_recorded_as_the_workflows_error() {
+        let dbos = dbos();
+        dbos.register_workflow("not_a_number", |()| async { Ok::<_, Error>(f64::NAN) })
+            .unwrap();
+
+        let snapshot = dbos.registry().snapshot();
+        let erased = &snapshot
+            .get(&WorkflowKey::new("not_a_number"))
+            .expect("registered")
+            .body;
+        let err = erased(None, PayloadEncoding::Portable).await.unwrap_err();
+        let Failure::Recorded(recorded) = err else {
+            panic!("expected a recorded failure, got {err:?}")
+        };
+        let read = recorded.decode::<EngineOnly>("wf-1");
+        assert!(
+            matches!(&read, Error::Serialization { what, .. } if what == "result"),
+            "{read:?}"
         );
     }
 

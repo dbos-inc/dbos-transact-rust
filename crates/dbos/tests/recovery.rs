@@ -554,3 +554,97 @@ async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
     second.shutdown().await;
     first.shutdown().await;
 }
+
+/// **A workflow whose result its encoding refuses is finished, not abandoned**, so a relaunch has
+/// nothing of it to recover: the row is ERROR, and the body, which ran to its end once, does not
+/// run again.
+///
+/// A second workflow is abandoned at the shutdown for the relaunch to recover, so the test knows
+/// the relaunch's recovery has run before it looks.
+#[tokio::test]
+async fn a_workflow_whose_result_cannot_be_encoded_is_not_recovered() {
+    let runs = Arc::new(AtomicU32::new(0));
+    let witness_runs = Arc::new(AtomicU32::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("unencodable-app", &db));
+    let unencodable = dbos
+        .register_workflow("tuple_keys", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                // `serde_json` has no spelling for a non-string map key.
+                async {
+                    Ok::<_, dbos::Error>(
+                        [((1u8, 2u8), 3u8)]
+                            .into_iter()
+                            .collect::<std::collections::BTreeMap<_, _>>(),
+                    )
+                }
+            }
+        })
+        .unwrap();
+    // Blocks on its first run, so the shutdown abandons it; returns on its recovery.
+    let witness = dbos
+        .register_workflow("witness", {
+            let (runs, entered) = (Arc::clone(&witness_runs), Arc::clone(&entered));
+            move |()| {
+                let first = runs.fetch_add(1, Ordering::SeqCst) == 0;
+                let entered = Arc::clone(&entered);
+                async move {
+                    if first {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok::<_, dbos::Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = unencodable.start(()).await.expect("start failed");
+    let workflow_id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Serialization { what, .. } if what == "result"),
+        "{error:?}"
+    );
+
+    let abandoned = witness.start(()).await.expect("start failed");
+    let witness_id = abandoned.workflow_id().to_owned();
+    tokio::time::timeout(DEADLINE, entered.notified())
+        .await
+        .expect("the witness never started");
+    dbos.shutdown().await;
+
+    let reader = reader(&db).await;
+    let row = reader
+        .get_workflow(&workflow_id)
+        .await
+        .expect("read failed")
+        .expect("the row exists");
+    assert_eq!(row.status, WorkflowStatus::Error, "finished, not abandoned");
+    let attempts = row.recovery_attempts;
+
+    dbos.launch().await.expect("relaunch failed");
+    await_status(&reader, &witness_id, WorkflowStatus::Success).await;
+
+    let row = reader
+        .get_workflow(&workflow_id)
+        .await
+        .expect("read failed")
+        .expect("the row exists");
+    assert_eq!(row.status, WorkflowStatus::Error);
+    assert_eq!(
+        row.recovery_attempts, attempts,
+        "the relaunch never claimed it"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+
+    dbos.shutdown().await;
+}
