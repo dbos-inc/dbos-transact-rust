@@ -1664,6 +1664,14 @@ impl StartPlacement {
 ///   workflow of another function, class or config, and once that row is deleted the same start
 ///   would go ahead.
 ///
+/// One more depends on the clock rather than on another row:
+///
+/// - [`InvalidInput`](crate::sysdb::Error::InvalidInput): a delay that fits in milliseconds but
+///   carries the release time past the largest instant a row can hold. Whether it does depends on
+///   when the start runs, so a replay on a host whose clock is behind could go ahead with it. The
+///   other `InvalidInput`s a start can reach depend only on its arguments, and recording one of
+///   those changes nothing, since the replay would refuse it the same way.
+///
 /// Without the record, the replay would start the child and the parent would take the other branch
 /// from the one it took after the error. Every other error a start can return is one of:
 ///
@@ -1683,6 +1691,7 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
         error,
         crate::sysdb::Error::QueueDeduplicated { .. }
             | crate::sysdb::Error::ConflictingWorkflow { .. }
+            | crate::sysdb::Error::InvalidInput { .. }
     )
 }
 
@@ -1692,7 +1701,8 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
 /// name, so [`check_child`](Parent::check_child) can tell a recorded start error from a plain
 /// step's error by that key, before reading it as the type. A unit test keeps this list and the
 /// predicate in step.
-const RECORDED_START_ERRORS: [&str; 2] = ["QueueDeduplicated", "ConflictingWorkflow"];
+const RECORDED_START_ERRORS: [&str; 3] =
+    ["QueueDeduplicated", "ConflictingWorkflow", "InvalidInput"];
 
 /// Whether `value`, a recorded step error, has the shape of a recorded start error.
 fn is_recorded_start_error(value: &serde_json::Value) -> bool {

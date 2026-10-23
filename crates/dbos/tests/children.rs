@@ -532,6 +532,122 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
     dbos.shutdown().await;
 }
 
+/// **A child start refused for a delay that carries it past the largest instant is recorded too**,
+/// and replays the same.
+///
+/// Whether the delay fits depends on the clock when the start runs, so a replay on a host whose
+/// clock is behind could go ahead with the start the first run refused. The delay is shared with
+/// the test and shortened before the replay, standing in for that clock: a fork that copies the
+/// start's checkpoint still takes the refused branch and creates no child, and a fork that runs the
+/// start again, as a control, starts the child.
+#[tokio::test]
+async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_would_fit() {
+    use std::sync::atomic::AtomicU64;
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-delay-error-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    // Fits in milliseconds, so the start's own checks pass it, but no clock can add it to now.
+    let delay_ms = Arc::new(AtomicU64::new(i64::MAX as u64));
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            let delay_ms = Arc::clone(&delay_ms);
+            move |()| {
+                let child = child.clone();
+                let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
+                async move {
+                    let started = child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                queue: Some(Enqueue {
+                                    delay: Some(delay),
+                                    ..Enqueue::new("delay-error-queue")
+                                }),
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await;
+                    match started {
+                        Ok(handle) => Ok::<_, Error>(format!("started {}", handle.workflow_id())),
+                        Err(e @ Error::SystemDatabase(dbos::sysdb::Error::InvalidInput { .. })) => {
+                            Ok(format!("refused: {e}"))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "the-delay-refused-parent";
+    let first = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert!(first.starts_with("refused: "), "{first}");
+    assert!(first.contains("delay"), "{first}");
+
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps(id, true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(steps[0].step_name, "child");
+    assert!(
+        steps[0].error.is_some() && steps[0].child_workflow_id.is_none(),
+        "the refusal is recorded as the start's, with no child: {:?}",
+        steps[0]
+    );
+
+    delay_ms.store(60_000, Ordering::SeqCst);
+
+    // A fork from step 1 copies the start's checkpoint, so the start replays and must return the
+    // first run's refusal again rather than start the child with a delay that now fits.
+    let replayed = dbos
+        .fork::<String, Error>(id, 1)
+        .await
+        .expect("fork failed");
+    let replayed_id = replayed.workflow_id().to_owned();
+    assert_eq!(
+        replayed.result().await.expect("the replay failed"),
+        first,
+        "the replay took a different branch from the run it replayed"
+    );
+    assert!(
+        reader
+            .get_workflow(&format!("{replayed_id}-0"))
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
+    );
+
+    // A fork from step 0 runs the start again, and with a delay that fits it goes ahead.
+    let rerun = dbos
+        .fork::<String, Error>(id, 0)
+        .await
+        .expect("fork failed");
+    let rerun_id = rerun.workflow_id().to_owned();
+    assert_eq!(
+        rerun.result().await.expect("the rerun failed"),
+        format!("started {rerun_id}-0")
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **A child id taken by another function is a recorded error too**, and a parent that returns it
 /// with `?` ends `ERROR` with it, on the first run and on the replay.
 ///
