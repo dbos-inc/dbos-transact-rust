@@ -4206,10 +4206,8 @@ async fn a_recovered_read_resumes_the_original_deadline() {
     let (sys, _db) = sysdb().await;
     publisher_and_reader(&sys, "wf-publisher", "wf-reader").await;
     sys.record_sleep(
-        "wf-reader",
-        1,
+        support::step_caller("wf-reader", 1, &owner_token(&sys, "wf-reader").await),
         std::time::Duration::ZERO,
-        &owner_token(&sys, "wf-reader").await,
     )
     .await
     .unwrap();
@@ -4889,10 +4887,8 @@ async fn a_recovered_recv_resumes_the_original_deadline() {
         .await
         .unwrap();
     sys.record_sleep(
-        "wf-receiver",
-        1,
+        support::step_caller("wf-receiver", 1, &owner_token(&sys, "wf-receiver").await),
         std::time::Duration::ZERO,
-        &owner_token(&sys, "wf-receiver").await,
     )
     .await
     .unwrap();
@@ -5436,10 +5432,8 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
     let before = Timestamp::now();
     let wake = sys
         .record_sleep(
-            "wf-sleeper",
-            0,
+            support::step_caller("wf-sleeper", 0, &owner_token(&sys, "wf-sleeper").await),
             std::time::Duration::from_secs(3600),
-            &owner_token(&sys, "wf-sleeper").await,
         )
         .await
         .unwrap();
@@ -5452,10 +5446,8 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
     // The replay asks for the same duration again and must get the same instant back.
     let replayed = sys
         .record_sleep(
-            "wf-sleeper",
-            0,
+            support::step_caller("wf-sleeper", 0, &owner_token(&sys, "wf-sleeper").await),
             std::time::Duration::from_secs(3600),
-            &owner_token(&sys, "wf-sleeper").await,
         )
         .await
         .unwrap();
@@ -5492,10 +5484,8 @@ async fn a_sleep_records_its_duration_as_the_sleep() {
     let before = Timestamp::now();
     let wake = sys
         .record_sleep(
-            "wf-waiter",
-            0,
+            support::step_caller("wf-waiter", 0, &owner_token(&sys, "wf-waiter").await),
             std::time::Duration::from_secs(60),
-            &owner_token(&sys, "wf-waiter").await,
         )
         .await
         .unwrap();
@@ -6385,11 +6375,11 @@ async fn a_moved_delay_that_cannot_be_stored_is_refused() {
     assert_eq!(after.status, WorkflowStatus::Delayed);
 }
 
-/// A durable sleep whose wake time cannot be stored is refused, and records no step.
+/// A durable sleep whose wake time cannot be stored is refused, and records the refusal rather
+/// than a wake time.
 ///
-/// A replay would read back whatever the first run recorded, so recording a wrapped wake time
-/// would wake the workflow at the wrong instant on every execution. The slot stays free: a sleep
-/// that can be stored records there afterwards.
+/// A replay reads back whatever the first run recorded, so recording a wrapped wake time would
+/// wake the workflow at the wrong instant on every execution.
 #[tokio::test]
 async fn a_sleep_that_cannot_be_stored_is_refused() {
     let (sys, _db) = sysdb().await;
@@ -6399,7 +6389,10 @@ async fn a_sleep_that_cannot_be_stored_is_refused() {
     let owner = owner_token(&sys, "wf-sleeper").await;
 
     let result = sys
-        .record_sleep("wf-sleeper", 0, std::time::Duration::MAX, &owner)
+        .record_sleep(
+            support::step_caller("wf-sleeper", 0, &owner),
+            std::time::Duration::MAX,
+        )
         .await;
     assert!(
         matches!(
@@ -6408,17 +6401,15 @@ async fn a_sleep_that_cannot_be_stored_is_refused() {
         ),
         "expected the sleep to be refused, got {result:?}"
     );
-    assert!(
-        sys.check_step("wf-sleeper", 0, "DBOS.sleep")
-            .await
-            .unwrap()
-            .is_none(),
-        "a refused sleep recorded a step",
-    );
-
-    sys.record_sleep("wf-sleeper", 0, std::time::Duration::ZERO, &owner)
+    let step = sys
+        .check_step("wf-sleeper", 0, "DBOS.sleep")
         .await
-        .expect("the slot a refused sleep left should still be free");
+        .unwrap()
+        .expect("the refusal is recorded");
+    assert!(
+        step.error.is_some() && step.output.is_none(),
+        "recorded as the sleep's error, with no wake time: {step:?}"
+    );
 }
 
 /// A recorded sleep replays its recorded wake time, even when recomputing it now would overflow.
@@ -6449,14 +6440,20 @@ async fn a_recorded_sleep_replays_even_when_recomputing_it_would_overflow() {
 
     let overflowing = std::time::Duration::from_millis(i64::MAX as u64);
     let wake_at = sys
-        .record_sleep("wf-replayed-sleeper", 0, overflowing, &owner)
+        .record_sleep(
+            support::step_caller("wf-replayed-sleeper", 0, &owner),
+            overflowing,
+        )
         .await
         .expect("a recorded sleep should replay rather than be refused");
     assert_eq!(wake_at, Timestamp::from_epoch_ms(recorded));
 
     // The same duration with no record behind it is refused.
     let refused = sys
-        .record_sleep("wf-replayed-sleeper", 1, overflowing, &owner)
+        .record_sleep(
+            support::step_caller("wf-replayed-sleeper", 1, &owner),
+            overflowing,
+        )
         .await;
     assert!(
         matches!(
@@ -6464,6 +6461,59 @@ async fn a_recorded_sleep_replays_even_when_recomputing_it_would_overflow() {
             Err(Error::InvalidInput { ref field, .. }) if field == "duration"
         ),
         "expected the unrecorded sleep to be refused, got {refused:?}"
+    );
+}
+
+/// A sleep refused for a wake time too far out records the refusal, and a replay gets it back.
+///
+/// Whether `now + duration` fits depends on the clock, so a recovery on a host whose clock is
+/// behind could let through the sleep the first run refused, and a workflow that caught the
+/// refusal would take the other branch. Shown here with a replay whose duration fits outright: the
+/// position answers with what the first run recorded, not with what this call would decide.
+#[tokio::test]
+async fn a_refused_sleep_replays_its_refusal_even_when_recomputing_it_would_fit() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-refused-sleeper"), None)
+        .await
+        .unwrap();
+    let owner = owner_token(&sys, "wf-refused-sleeper").await;
+
+    let overflowing = std::time::Duration::from_millis(i64::MAX as u64);
+    let refused = sys
+        .record_sleep(
+            support::step_caller("wf-refused-sleeper", 0, &owner),
+            overflowing,
+        )
+        .await;
+    let Err(Error::InvalidInput { field, detail }) = refused else {
+        panic!("expected the first run to be refused, got {refused:?}");
+    };
+    assert_eq!(field, "duration");
+
+    let steps = sys
+        .list_workflow_steps("wf-refused-sleeper", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "the refusal is recorded: {steps:?}");
+    assert!(
+        steps[0].error.is_some() && steps[0].output.is_none(),
+        "recorded as the sleep's error, with no wake time: {:?}",
+        steps[0]
+    );
+
+    let replayed = sys
+        .record_sleep(
+            support::step_caller("wf-refused-sleeper", 0, &owner),
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+    assert!(
+        matches!(
+            &replayed,
+            Err(Error::InvalidInput { field: replayed_field, detail: replayed_detail })
+                if *replayed_field == field && *replayed_detail == detail
+        ),
+        "expected the replay to return the recorded refusal, got {replayed:?}"
     );
 }
 
@@ -13525,8 +13575,11 @@ async fn a_stale_execution_writes_nothing() {
         id
     ));
     assert!(refused(
-        sys.record_sleep(id, 10, std::time::Duration::ZERO, stale)
-            .await,
+        sys.record_sleep(
+            support::step_caller(id, 10, stale),
+            std::time::Duration::ZERO
+        )
+        .await,
         id
     ));
     assert!(refused(

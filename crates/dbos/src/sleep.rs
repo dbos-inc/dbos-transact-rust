@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::error::{DurableError, Error};
-use crate::sysdb::types::{Timestamp, duration_to_ms, step_names};
+use crate::sysdb::types::{StepCaller, Timestamp, duration_to_ms, step_names};
 
 /// Waits for `duration`, resuming at the **original** wake time after a crash.
 ///
@@ -46,9 +46,9 @@ use crate::sysdb::types::{Timestamp, duration_to_ms, step_names};
 ///
 /// A duration that fits but carries the wake time past the largest instant those milliseconds can
 /// hold is refused by the checkpoint instead, after the step id is taken, as the same
-/// [`Error::InvalidArgument`]. That rule reads the clock, so it is applied only where the recorded
-/// wake time has been looked for first: a replay wakes at what the first run recorded rather than
-/// deciding again against a later clock.
+/// [`Error::InvalidArgument`]. That rule reads the clock, so it is applied only where the record
+/// has been looked for first, and the refusal is recorded like a wake time: a replay gets back
+/// what the first run recorded, either one, rather than deciding again against a later clock.
 pub fn sleep<E>(duration: Duration) -> PendingStep<'static, (), E>
 where
     E: DurableError + 'static,
@@ -97,7 +97,15 @@ where
 
             let wake_at = executor
                 .sysdb()
-                .record_sleep(workflow_id, step_id, duration, owner_xid)
+                .record_sleep(
+                    StepCaller {
+                        workflow_id,
+                        step_id,
+                        codec: executor.serializer(),
+                        owner_xid,
+                    },
+                    duration,
+                )
                 .await
                 .map_err(|error| Error::refused_argument("sleep", error))?;
 

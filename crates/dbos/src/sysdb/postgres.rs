@@ -88,8 +88,8 @@ use super::types::{
     ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message, NewQueue,
     NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
-    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead,
-    StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
+    ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming,
+    StreamRead, StreamRecord, Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay,
     WorkflowFilter, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value,
     duration_from_ms, duration_from_secs, duration_to_ms, encode_step_value,
     is_valid_application_name, validate_attributes,
@@ -1838,11 +1838,14 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
 /// [`record_sleep`](SystemDatabase::record_sleep): a caller registering a deadline reaches for the
 /// blocking read, not for this. Nothing outside this module has both a reason to record a sleep and
 /// a reason to choose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SleepKind {
+#[derive(Debug, Clone, Copy)]
+enum SleepKind<'a> {
     /// A sleep the caller intends to wait out, stamped complete at the wake time — in the future
     /// when the row is written, so a timeline shows an hour's sleep as an hour.
-    Durable,
+    ///
+    /// Carries the caller's codec, which a wake time too far out to store is recorded in as the
+    /// step's error.
+    Durable(&'a dyn StepCodec),
     /// A deadline the caller registers and usually abandons early, stamped complete now.
     ///
     /// Projecting here would report a `get_event` that answered in 200ms under a 60s timeout as a
@@ -1853,10 +1856,11 @@ enum SleepKind {
 /// The encoding of the one value this layer writes and reads back on its own: a sleep's wake
 /// time.
 ///
-/// Distinct from the workflow's own format, and from the [`StepCodec`](super::types::StepCodec) a
-/// management call brings: the wake time is a plain number that
-/// [`record_sleep`](SystemDatabase::record_sleep) reads back itself, with no caller codec to hand,
-/// so it is stored legibly rather than in whatever the application chose.
+/// Distinct from the workflow's own format, and from the [`StepCodec`] a
+/// caller brings: the wake time is a plain number that
+/// [`record_sleep`](SystemDatabase::record_sleep) reads back itself, so it is stored legibly
+/// rather than in whatever the application chose. A sleep refused for a wake time too far out
+/// records the refusal in the caller's codec, as any step's error is.
 const PORTABLE_JSON: &str = "portable_json";
 
 /// How many times a stream write retries onto a fresh offset before giving up.
@@ -2224,6 +2228,36 @@ fn decode_wake_time(
                 "workflow {workflow_id} step {step_id} wake time {recorded:?} is not epoch milliseconds: {e}"
             ))
         })
+}
+
+/// What a recorded sleep answers a replay with: its wake time, or the refusal a first run recorded
+/// in its place.
+///
+/// Only a sleep records a refusal. A deadline too far out is held at the largest instant instead,
+/// so a deadline that finds an error at its position reads it as the wake time it lacks.
+fn replayed_sleep(
+    step: &StepRecord,
+    kind: SleepKind<'_>,
+    workflow_id: &str,
+    step_id: i32,
+    owner_xid: &str,
+) -> Result<Timestamp, Error> {
+    if let (SleepKind::Durable(codec), Some(recorded)) = (kind, step.error.as_deref()) {
+        let caller = StepCaller {
+            workflow_id,
+            step_id,
+            codec,
+            owner_xid,
+        };
+        return Err(decode_step_value(
+            step,
+            recorded,
+            caller,
+            step_names::SLEEP,
+            "an error",
+        )?);
+    }
+    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
 }
 
 fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
@@ -2701,7 +2735,7 @@ impl PostgresSystemDatabase {
         workflow_id: &str,
         step_id: i32,
         duration: Duration,
-        kind: SleepKind,
+        kind: SleepKind<'_>,
         owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         let pool = &self.pool;
@@ -2719,9 +2753,10 @@ impl PostgresSystemDatabase {
         //
         // **The refusal is held until the record has been looked for.** Whether the sum fits
         // depends on the clock, so a replay must not decide it again: a sleep the first run
-        // recorded wakes at its recorded instant, whatever `now + duration` would be today.
+        // recorded wakes at its recorded instant, or is refused as it was, whatever
+        // `now + duration` would be today.
         let wake_at = match kind {
-            SleepKind::Durable => started_at.try_add("duration", duration),
+            SleepKind::Durable(_) => started_at.try_add("duration", duration),
             SleepKind::Deadline => Ok(started_at
                 .checked_add(duration)
                 .unwrap_or(Timestamp::from_epoch_ms(i64::MAX))),
@@ -2748,7 +2783,7 @@ impl PostgresSystemDatabase {
                 .await?
             {
                 tracing::debug!(workflow_id, step_id, "replaying sleep");
-                return decode_wake_time(step.output.as_deref(), workflow_id, step_id);
+                return replayed_sleep(&step, kind, workflow_id, step_id, owner_xid);
             }
             tracing::debug!(
                 workflow_id,
@@ -2757,20 +2792,48 @@ impl PostgresSystemDatabase {
                 "running sleep"
             );
 
-            // Only a first run reaches here, so only a first run is refused.
-            let wake_at = wake_at.clone()?;
-            let recorded = wake_at.as_epoch_ms().to_string();
-            let timing = StepTiming {
-                started_at,
-                // A sleep is stamped complete at its wake time, which is in the future — so the
-                // step's recorded duration is the sleep. A deadline is stamped now, because the
-                // caller registering it usually returns long before it. Both are fixed outside the
-                // retry, since `completed_at` is also the token that recognises this caller's own
-                // write after a lost acknowledgement.
-                completed_at: match kind {
-                    SleepKind::Durable => wake_at,
-                    SleepKind::Deadline => started_at,
-                },
+            // Only a first run reaches here, so only a first run decides the refusal. It is
+            // recorded in the sleep's place, so a replay reads it back rather than deciding again
+            // against a later clock, which could let through the sleep this run refused.
+            let encoded: EncodedValue;
+            let (outcome, completed_at) = match (wake_at, kind) {
+                (Ok(wake_at), kind) => {
+                    encoded = EncodedValue {
+                        value: wake_at.as_epoch_ms().to_string(),
+                        serialization: Some(PORTABLE_JSON.to_owned()),
+                    };
+                    // A sleep is stamped complete at its wake time, which is in the future — so
+                    // the step's recorded duration is the sleep. A deadline is stamped now,
+                    // because the caller registering it usually returns long before it. Both are
+                    // fixed outside the retry, since `completed_at` is also the token that
+                    // recognises this caller's own write after a lost acknowledgement.
+                    let completed_at = match kind {
+                        SleepKind::Durable(_) => *wake_at,
+                        SleepKind::Deadline => started_at,
+                    };
+                    (Outcome::Output(Some(&encoded.value)), completed_at)
+                }
+                (Err(refusal), SleepKind::Durable(codec)) => {
+                    // A custom serializer may fail to encode the refusal. Then nothing is
+                    // recorded and the encoding failure is what the caller sees, so the position
+                    // is decided afresh next time rather than answered by a refusal nothing
+                    // recorded.
+                    encoded = encode_step_value(refusal, codec, "an error").inspect_err(
+                        |encode_error| {
+                            tracing::warn!(
+                                workflow_id,
+                                step_id,
+                                error = %refusal,
+                                encode_error = %encode_error,
+                                "the sleep was refused, but the refusal could not be encoded to \
+                                 record it"
+                            );
+                        },
+                    )?;
+                    (Outcome::Error(&encoded.value), started_at)
+                }
+                // A deadline too far out is held at the largest instant above, never refused.
+                (Err(refusal), SleepKind::Deadline) => return Err(refusal.clone()),
             };
             match self
                 .record_step_on(
@@ -2778,19 +2841,22 @@ impl PostgresSystemDatabase {
                     workflow_id,
                     step_id,
                     step_names::SLEEP,
-                    Outcome::Output(Some(&recorded)),
-                    Some(PORTABLE_JSON),
-                    Some(timing),
+                    outcome,
+                    encoded.serialization.as_deref(),
+                    Some(StepTiming {
+                        started_at,
+                        completed_at,
+                    }),
                     None,
                 )
                 .await
             {
                 Ok(()) => {
                     conn.commit().await?;
-                    Ok(wake_at)
+                    wake_at.clone()
                 }
-                // The sleep was recorded between our check and our write. Its wake time is the
-                // one every replay must agree on, so adopt it rather than returning ours.
+                // The sleep was recorded between our check and our write. Its answer is the one
+                // every replay must agree on, so adopt it rather than returning ours.
                 Err(Error::StepNondeterminism { .. }) => {
                     let step = self
                         .check_step_on(&mut conn, workflow_id, step_id, step_names::SLEEP)
@@ -2800,7 +2866,7 @@ impl PostgresSystemDatabase {
                                 "sleep reported as recorded but cannot be read back".to_owned(),
                             )
                         })?;
-                    decode_wake_time(step.output.as_deref(), workflow_id, step_id)
+                    replayed_sleep(&step, kind, workflow_id, step_id, owner_xid)
                 }
                 Err(e) => Err(e),
             }
@@ -5362,17 +5428,15 @@ impl SystemDatabase for PostgresSystemDatabase {
 
     async fn record_sleep(
         &self,
-        workflow_id: &str,
-        step_id: i32,
+        caller: StepCaller<'_>,
         duration: Duration,
-        owner_xid: &str,
     ) -> Result<Timestamp, Error> {
         self.checkpoint_sleep(
-            workflow_id,
-            step_id,
+            caller.workflow_id,
+            caller.step_id,
             duration,
-            SleepKind::Durable,
-            owner_xid,
+            SleepKind::Durable(caller.codec),
+            caller.owner_xid,
         )
         .await
     }

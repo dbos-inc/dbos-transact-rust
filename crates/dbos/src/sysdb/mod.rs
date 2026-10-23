@@ -1066,15 +1066,14 @@ pub trait SystemDatabase: Send + Sync {
     /// registering a deadline is calling the blocking read, not recording a sleep by hand.
     ///
     /// A `duration` whose wake time cannot be stored as epoch milliseconds in an `i64` is
-    /// [`Error::InvalidInput`], refused before anything is written — but only once the record has
-    /// been looked for. Whether it fits depends on the clock, so a sleep already recorded replays
-    /// its recorded wake time rather than being decided again.
+    /// [`Error::InvalidInput`] — but only once the record has been looked for, and the refusal is
+    /// itself recorded, as the step's error in the caller's codec. Whether the wake time fits
+    /// depends on the clock, so neither outcome is decided again: a replay gets back the wake
+    /// time or the refusal the first run recorded, whatever its own clock would say.
     async fn record_sleep(
         &self,
-        workflow_id: &str,
-        step_id: i32,
+        caller: StepCaller<'_>,
         duration: Duration,
-        owner_xid: &str,
     ) -> Result<Timestamp, Error>;
 
     /// Publishes a key/value on a workflow, for another workflow to read.
