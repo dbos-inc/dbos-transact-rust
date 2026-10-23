@@ -22,8 +22,8 @@
 //!   replay safe.
 //! - [`BackendErrorKind::Permanent`], and every non-backend error, are returned immediately.
 //!
-//! [`Error::ConflictingWorkflow`] and [`Error::MaxRecoveryAttemptsExceeded`] fall in the last
-//! group, and must: they are answers, not failures, and retrying them would loop forever.
+//! [`Error::ConflictingWorkflow`] falls in the last group, and must: it is an answer, not a
+//! failure, and retrying it would loop forever.
 //!
 //! # What must not go inside the closure
 //!

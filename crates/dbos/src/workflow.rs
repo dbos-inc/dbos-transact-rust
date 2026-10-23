@@ -1689,12 +1689,6 @@ impl StartPlacement {
 /// - database trouble, which a replay should meet afresh;
 /// - a signal about this execution (cancelled, superseded, replaying changed code), which ends the
 ///   run rather than answering the start.
-///
-/// [`MaxRecoveryAttemptsExceeded`](crate::sysdb::Error::MaxRecoveryAttemptsExceeded) is the one
-/// exception: a chosen child id naming an unfinished row that another attempt owns and that is
-/// already over its recovery limit parks that row and returns this error, and a replay then finds
-/// the row parked and joins it. It is not recorded, because a start that is not a dequeue should
-/// not count recovery attempts at all.
 fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
     matches!(
         error,

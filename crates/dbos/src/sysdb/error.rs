@@ -158,13 +158,6 @@ pub enum Error {
         /// The status the rewind read before the row moved.
         status: String,
     },
-    /// The workflow has been recovered too many times and is now parked.
-    MaxRecoveryAttemptsExceeded {
-        /// The parked workflow.
-        workflow_id: String,
-        /// The limit it passed.
-        limit: i64,
-    },
     /// A name is already registered by this same application.
     ///
     /// Distinct from [`Error::RegisteredByAnother`], which is a collision *between* applications
@@ -283,10 +276,6 @@ impl std::fmt::Display for Error {
                 "workflow {workflow_id} changed status from {status} while being rewound; \
                  retry the rewind"
             ),
-            Error::MaxRecoveryAttemptsExceeded { workflow_id, limit } => write!(
-                f,
-                "workflow {workflow_id} exceeded {limit} recovery attempts"
-            ),
             // The remedy is in the message because there is no way to act on this from code:
             // whichever cause it is, a person has to choose a name or move the rows.
             Error::AlreadyRegistered { kind, name } => {
@@ -360,7 +349,6 @@ impl Error {
             | Error::NonExistentWorkflow { .. }
             | Error::WorkflowNotRewindable { .. }
             | Error::RewindInterrupted { .. }
-            | Error::MaxRecoveryAttemptsExceeded { .. }
             | Error::AlreadyRegistered { .. }
             | Error::NotRegistered { .. }
             | Error::RegisteredByAnother { .. } => true,
