@@ -579,7 +579,10 @@ fn start_refusal(queue: Option<&str>, detail: String) -> Error {
 /// Chiefly the refusal only the insert can make: a delay that fits in milliseconds but carries the
 /// release time past the largest instant, which depends on the clock. A child start records that
 /// refusal at its parent's step as the system database's error, so a replay reads it back in the
-/// same form and this maps it the same way. Also every other value of the row the caller supplied
+/// same form and this maps it the same way. **The refusal is what replays; its wording is not
+/// recorded.** The operation and the queue in the detail come from the call making it, so a replay
+/// fails as the first run did, with the same variant, field and reason, and names its own queue if
+/// its options name a different one. Also every other value of the row the caller supplied
 /// and the insert refuses — an empty `workflow_id`, `deduplication_id` or `partition_key` — named
 /// as the start's API spells it, which is not always the column's name.
 pub(crate) fn refused_start(queue: Option<&str>, error: Error) -> Error {
