@@ -220,6 +220,10 @@ pub enum Error<E = EngineOnly> {
     },
 
     /// A value could not be encoded for the database.
+    ///
+    /// A workflow's own `result` or `error` that cannot be encoded is that workflow's outcome: it
+    /// is recorded as the workflow's error, and its handle's `result()` and every replay return
+    /// it, rather than the body running again.
     #[error("could not serialize the workflow {what}: {message}")]
     Serialization {
         /// Which value: `argument`, `result`, `error`.
@@ -1013,6 +1017,12 @@ mod tests {
             recorded.encoded,
             "could not serialize the workflow error: nothing goes; the error was: the card was \
              declined after 3 attempts"
+        );
+        // Text the serializer cannot decode back, which a reader reports as that.
+        let read = recorded.decode::<CardDeclined>("wf-1");
+        assert!(
+            matches!(&read, Error::Deserialization { what, .. } if what == "error"),
+            "{read:?}"
         );
     }
 }

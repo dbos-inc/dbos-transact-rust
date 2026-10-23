@@ -390,13 +390,20 @@ impl DBOS {
                         // envelope.
                         //
                         // A value the encoding refuses is the workflow's failure, not the
-                        // engine's: the body ran to its end, and running it again computes the
-                        // same value and is refused the same way. So the refusal is recorded as
-                        // the workflow's error, and the row ends rather than staying for recovery
-                        // to re-run.
+                        // engine's: the body ran to its end, side effects and all, so running it
+                        // again is not a retry of anything that went wrong in the engine. The
+                        // refusal is recorded as the workflow's error, and the row ends rather
+                        // than staying for recovery to re-run.
                         Ok(output) => match encode::<R, E>(&output, &encoding, "result") {
                             Ok(encoded) => Ok(Some(encoded)),
                             Err(refused) => {
+                                // A type the encoding cannot write is a bug in the workflow, and
+                                // the recorded error may be read long after, by someone else.
+                                tracing::warn!(
+                                    error = %refused,
+                                    "the workflow's result could not be encoded; it is recorded \
+                                     as the workflow's error"
+                                );
                                 Err(Failure::Recorded(EncodedError::of(&refused, encoding)))
                             }
                         },
@@ -405,7 +412,7 @@ impl DBOS {
                         // self-describing: a reader knows the envelope without having to guess
                         // whether the payload is one of ours or one of the workflow's. Portably it
                         // is the envelope every SDK reads. An error the encoding refuses is
-                        // recorded in a form it does not, for the same reason as a result.
+                        // recorded as a refusal it can encode, for the same reason as a result.
                         Err(error) => Err(match error.control() {
                             Some(control) => Failure::Control(control),
                             None => Failure::Recorded(EncodedError::of(&error, encoding)),

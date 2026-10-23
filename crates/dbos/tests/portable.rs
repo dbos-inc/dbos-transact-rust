@@ -1040,3 +1040,92 @@ async fn a_result_portable_json_cannot_hold_is_recorded_as_the_workflows_error()
     assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
     dbos.shutdown().await;
 }
+
+/// An application error whose fields portable JSON cannot write: no JSON object has a non-string
+/// key.
+#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
+#[error("no keys fit")]
+struct BadKeys {
+    by_pair: std::collections::BTreeMap<(u8, u8), u8>,
+}
+
+/// **An error portable JSON cannot write is recorded as the refusal**, as the envelope of
+/// [`Error::Serialization`] carrying what the error displayed, so the row ends ERROR; the caller
+/// and a replay of the same id read it back without the body running again.
+#[tokio::test]
+async fn an_error_portable_json_cannot_write_is_recorded_as_the_refusal() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("portable-unencodable-error", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let bad_keys = dbos
+        .register_workflow_with(WorkflowKey::new("bad_keys"), portable(), {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err::<(), _>(Error::Application(BadKeys {
+                        by_pair: [((1, 2), 3)].into_iter().collect(),
+                    }))
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let refused = |error: &Error<BadKeys>| {
+        matches!(
+            error,
+            Error::Serialization { what, message, .. }
+                if what == "error"
+                    && message.contains("key must be a string")
+                    && message.contains("no keys fit")
+        )
+    };
+
+    let handle = bad_keys.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused(&error), "{error:?}");
+    assert_eq!(
+        scalar(
+            &db,
+            r#"SELECT status FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+            &id
+        )
+        .await
+        .as_deref(),
+        Some("ERROR")
+    );
+    let recorded: Value = serde_json::from_str(
+        &scalar(
+            &db,
+            r#"SELECT error FROM "dbos"."workflow_output" WHERE workflow_uuid = $1"#,
+            &id,
+        )
+        .await
+        .expect("an error is recorded"),
+    )
+    .expect("the error is JSON");
+    assert_eq!(recorded["name"], "dbos::Serialization", "{recorded}");
+    assert_eq!(recorded["data"]["what"], "error", "{recorded}");
+
+    let replayed = bad_keys
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused(&replayed), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
+}
