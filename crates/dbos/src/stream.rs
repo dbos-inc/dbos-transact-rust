@@ -34,11 +34,11 @@ use crate::connection::Connection;
 use crate::context::Ctx;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::serialization::SerializationFormat;
-use crate::serialization::{PayloadEncoding, decode_tagged, encode};
+use crate::serialization::{PORTABLE_JSON, PayloadEncoding, decode_tagged, encode};
 use crate::sysdb::types::{
     AwaitedStream, EncodedValue, Outcome, StepTiming, Timestamp, WrittenBy, step_names,
 };
-use crate::sysdb::{STREAM_CLOSED, STREAM_CLOSED_SERIALIZATION, is_stream_closed};
+use crate::sysdb::{STREAM_CLOSED, is_stream_closed};
 
 /// How long a reader waits before looking again when nothing wakes it, unless
 /// [`ReadStreamOptions::polling_interval`] says otherwise.
@@ -134,7 +134,7 @@ where
 enum StreamWrite<'v, T> {
     /// A value, and the encoding asked for it.
     Value(&'v T, SerializationFormat),
-    /// The close, whose encoding is fixed — see [`STREAM_CLOSED_SERIALIZATION`].
+    /// The close, whose encoding is fixed: [`STREAM_CLOSED`] under [`PORTABLE_JSON`].
     Close,
 }
 
@@ -977,7 +977,7 @@ async fn record_end(
         placement,
         name,
         Outcome::Output(Some(STREAM_CLOSED)),
-        Some(STREAM_CLOSED_SERIALIZATION),
+        Some(PORTABLE_JSON),
         started_at,
     )
     .await

@@ -45,8 +45,9 @@ use shape::{Shape, takes_the_envelope};
 /// The tag a [`PayloadEncoding::Native`] row carries.
 pub(crate) const RUST_SERDE: &str = "rust_serde";
 
-/// The tag a [`PayloadEncoding::Portable`] row carries, the one every DBOS SDK reads.
-pub(crate) const PORTABLE_JSON: &str = "portable_json";
+/// The tag a [`PayloadEncoding::Portable`] row carries, the one every DBOS SDK reads. Defined with
+/// the system database, which writes it itself.
+pub(crate) use crate::sysdb::PORTABLE_JSON;
 
 /// The struct name [`PortableWorkflowArgs`] gives `serde`: how an envelope is recognized, writing
 /// it and reading it, through whatever wraps it.
@@ -1000,8 +1001,7 @@ mod tests {
             );
         }
         assert_eq!(
-            PayloadEncoding::of::<EngineOnly>(Some("portable_json"), &Serializer::RustSerde)
-                .unwrap(),
+            PayloadEncoding::of::<EngineOnly>(Some(PORTABLE_JSON), &Serializer::RustSerde).unwrap(),
             PayloadEncoding::Portable
         );
         let err = PayloadEncoding::of::<EngineOnly>(Some("py_pickle"), &Serializer::RustSerde)

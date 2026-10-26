@@ -27,27 +27,33 @@ pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
 /// another — it is a cross-SDK constant, not an encoding this layer is free to change.
 pub const NULL_TOPIC: &str = "__null__topic__";
 
+/// The serialization tag of portable JSON, the encoding every DBOS SDK reads and writes.
+///
+/// A cross-SDK constant like [`NULL_TOPIC`]: every implementation writes and recognises this exact
+/// string, so it is defined once, here, for every row tagged with it — the serializer's portable
+/// payloads, a durable sleep's wake time, and the stream-closed marker [`STREAM_CLOSED`]. It lives
+/// in this layer rather than with the serializer because this layer writes it itself, and does not
+/// depend on the serializer.
+pub const PORTABLE_JSON: &str = "portable_json";
+
 /// The value written to a stream to mark it closed, as stored: the string
 /// `__DBOS_STREAM_CLOSED__` encoded as portable JSON, quotes included.
 ///
 /// A sentinel entry rather than a column, so closing is an ordinary append and a reader learns
-/// of it in the same pass that reads the values. Always labelled `portable_json`, whatever the
+/// of it in the same pass that reads the values. Always labelled [`PORTABLE_JSON`], whatever the
 /// workflow's serializer, so a reader recognises it without knowing which serializer wrote the
 /// stream. **A close is this value under that label**, never the value alone: a user value
 /// encoded by another JSON-based serializer can be the same text.
 pub const STREAM_CLOSED: &str = "\"__DBOS_STREAM_CLOSED__\"";
 
-/// The label [`STREAM_CLOSED`] is always written under.
-pub const STREAM_CLOSED_SERIALIZATION: &str = "portable_json";
-
-/// Whether a stored stream entry is a close: [`STREAM_CLOSED`] under
-/// [`STREAM_CLOSED_SERIALIZATION`], and never the value alone.
+/// Whether a stored stream entry is a close: [`STREAM_CLOSED`] under [`PORTABLE_JSON`], and never
+/// the value alone.
 ///
 /// The one test for a close. A reader ends on it; a write derives its step name from it; and a
 /// rewind deletes the closes past its cut by the same pair, so a reader stops exactly where a
 /// rewind would reopen the stream.
 pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
-    value == STREAM_CLOSED && serialization == Some(STREAM_CLOSED_SERIALIZATION)
+    value == STREAM_CLOSED && serialization == Some(PORTABLE_JSON)
 }
 
 /// Partitions a single partitioned sweep will look at.

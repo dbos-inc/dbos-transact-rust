@@ -990,7 +990,7 @@ mod tests {
         .unwrap();
         let revived = revive::<EngineOnly>(
             &recorded,
-            Some("portable_json"),
+            Some(crate::serialization::PORTABLE_JSON),
             &Serializer::RustSerde,
             "other",
         );

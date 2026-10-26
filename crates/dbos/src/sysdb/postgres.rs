@@ -96,7 +96,7 @@ use super::types::{
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
-    OutcomeWrite, STREAM_CLOSED, STREAM_CLOSED_SERIALIZATION, SystemDatabase, WorkflowInitResult,
+    OutcomeWrite, PORTABLE_JSON, STREAM_CLOSED, SystemDatabase, WorkflowInitResult,
     is_stream_closed,
 };
 
@@ -1853,16 +1853,6 @@ enum SleepKind<'a> {
     Deadline,
 }
 
-/// The encoding of the one value this layer writes and reads back on its own: a sleep's wake
-/// time.
-///
-/// Distinct from the workflow's own format, and from the [`StepCodec`] a
-/// caller brings: the wake time is a plain number that
-/// [`record_sleep`](SystemDatabase::record_sleep) reads back itself, so it is stored legibly
-/// rather than in whatever the application chose. A sleep refused for a wake time too far out
-/// records the refusal in the caller's codec, as any step's error is.
-const PORTABLE_JSON: &str = "portable_json";
-
 /// How many times a stream write retries onto a fresh offset before giving up.
 ///
 /// A collision means another writer took the offset this one computed, and the retry recomputes
@@ -2808,6 +2798,12 @@ impl PostgresSystemDatabase {
             let encoded: EncodedValue;
             let (outcome, completed_at) = match (wake_at, kind) {
                 (Ok(wake_at), kind) => {
+                    // The one value this layer writes and reads back on its own, so it is stored
+                    // as portable JSON whatever the workflow's format or the caller's
+                    // `StepCodec`: the wake time is a plain number this function reads back
+                    // itself, so it is stored legibly rather than in whatever the application
+                    // chose. A refusal, below, is recorded in the caller's codec, as any step's
+                    // error is.
                     encoded = EncodedValue {
                         value: wake_at.as_epoch_ms().to_string(),
                         serialization: Some(PORTABLE_JSON.to_owned()),
@@ -4770,7 +4766,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     .bind(workflow_id)
                     .bind(start_step)
                     .bind(STREAM_CLOSED)
-                    .bind(STREAM_CLOSED_SERIALIZATION)
+                    .bind(PORTABLE_JSON)
                     .execute(&mut *tx)
                     .await?;
 
@@ -5318,7 +5314,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             step_id,
             key,
             STREAM_CLOSED,
-            Some(STREAM_CLOSED_SERIALIZATION),
+            Some(PORTABLE_JSON),
             written_by,
             owner_xid,
         )
