@@ -217,7 +217,7 @@ async fn a_fork_takes_the_id_and_queue_it_is_given() {
                 ..Fork::new(id, 0)
             },
             ForkOptions {
-                queue: Some("forks"),
+                queue_name: Some("forks"),
                 ..ForkOptions::default()
             },
         )
@@ -294,7 +294,7 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
             ..Fork::new(id, 0)
         },
         ForkOptions {
-            queue: Some("partitioned-forks"),
+            queue_name: Some("partitioned-forks"),
             ..ForkOptions::default()
         },
     )
@@ -308,7 +308,7 @@ async fn a_fork_onto_a_partitioned_queue_carries_the_key_it_is_given() {
                 ..Fork::new(id, 0)
             },
             ForkOptions {
-                queue: Some("partitioned-forks"),
+                queue_name: Some("partitioned-forks"),
                 queue_partition_key: Some("tenant-a"),
                 ..ForkOptions::default()
             },
@@ -1558,10 +1558,10 @@ async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
         ),
         (
             ForkOptions {
-                queue: Some(""),
+                queue_name: Some(""),
                 ..ForkOptions::default()
             },
-            "ForkOptions::queue",
+            "ForkOptions::queue_name",
         ),
         (
             ForkOptions {
@@ -1640,7 +1640,7 @@ async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
         .resume_with::<u32, EngineOnly>(
             id,
             ResumeOptions {
-                queue: Some("recovery"),
+                queue_name: Some("recovery"),
             },
         )
         .await

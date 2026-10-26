@@ -178,7 +178,7 @@ pub struct ResumeOptions<'a> {
     /// everything. Sending it to a queue with a concurrency limit is the way to resume a backlog
     /// without flooding the fleet — and, with an `app_version`-eligible executor pool, the
     /// way to steer resumed work at a particular deployment.
-    pub queue: Option<&'a str>,
+    pub queue_name: Option<&'a str>,
 }
 
 /// One fork: the workflow it is forked from, the step it restarts at, and the id it gets.
@@ -289,8 +289,8 @@ pub struct ForkOptions<'a> {
     /// forked onto the fixed deployment, and only executors running that version will dequeue it.
     pub app_version: Option<&'a str>,
     /// The queue the fork is enqueued on. `None` is the engine's internal queue.
-    pub queue: Option<&'a str>,
-    /// The partition of that queue, which a partitioned [`queue`](Self::queue) requires.
+    pub queue_name: Option<&'a str>,
+    /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
     ///
     /// **Not inherited.** A source enqueued under a key does not pass it on; the fork's column is
     /// written from this field, so `None` is no partition even when the source had one.
@@ -334,7 +334,6 @@ impl<'a> ForkOptions<'a> {
             refused_fork(error, |field| {
                 let field = match field {
                     "application_version" => "app_version",
-                    "queue_name" => "queue",
                     other => other,
                 };
                 format!("ForkOptions::{field}")
@@ -346,7 +345,7 @@ impl<'a> ForkOptions<'a> {
     fn to_sys(self) -> SysForkOptions<'a> {
         SysForkOptions {
             application_version: self.app_version,
-            queue_name: self.queue,
+            queue_name: self.queue_name,
             queue_partition_key: self.queue_partition_key,
             timeout: self.timeout,
             replacement_children: self.replacement_children,
@@ -374,8 +373,8 @@ pub struct RewindOptions<'a> {
     /// deployment that fixes it: only executors running that version will dequeue it.
     pub app_version: Option<&'a str>,
     /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.
-    pub queue: Option<&'a str>,
-    /// The partition of that queue, which a partitioned [`queue`](Self::queue) requires.
+    pub queue_name: Option<&'a str>,
+    /// The partition of that queue, which a partitioned [`queue_name`](Self::queue_name) requires.
     ///
     /// **Not kept.** `None` clears whatever key the workflow had, so a key from the queue it ran
     /// on does not follow it onto another. A partitioned queue sweeps one partition at a time and
@@ -665,7 +664,7 @@ impl DBOS {
     /// // Back on a limited queue, so a resumed backlog does not flood the fleet.
     /// let handle = dbos.resume_with::<u32, dbos::EngineOnly>(
     ///     "stalled-workflow",
-    ///     dbos::ResumeOptions { queue: Some("recovery") },
+    ///     dbos::ResumeOptions { queue_name: Some("recovery") },
     /// ).await?;
     /// # Ok(()) }
     /// ```
@@ -1545,7 +1544,7 @@ impl Connection {
             .sysdb()
             .resume_workflows(
                 workflow_ids,
-                options.queue,
+                options.queue_name,
                 from_workflow,
                 self.step_caller(caller),
             )
@@ -1617,7 +1616,7 @@ impl Connection {
     ) -> Result<WorkflowHandle<R, E>> {
         let sys_options = SysRewindOptions {
             application_version: options.app_version,
-            queue_name: options.queue,
+            queue_name: options.queue_name,
             queue_partition_key: options.queue_partition_key,
         };
         self.sysdb()
@@ -1832,7 +1831,7 @@ fn refuse_invalid_rewind_options(options: &RewindOptions<'_>) -> Result<()> {
     )?;
     for (field, value) in [
         ("app_version", options.app_version),
-        ("queue", options.queue),
+        ("queue_name", options.queue_name),
         ("queue_partition_key", options.queue_partition_key),
     ] {
         if value == Some("") {

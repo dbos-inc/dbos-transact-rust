@@ -380,7 +380,7 @@ impl ScheduleChange<'_> {
 #[derive(Debug, Clone)]
 pub struct Schedule {
     id: String,
-    name: String,
+    schedule_name: String,
     workflow: WorkflowKey,
     schedule: String,
     status: ScheduleStatus,
@@ -400,7 +400,7 @@ impl PartialEq for Schedule {
     fn eq(&self, other: &Self) -> bool {
         let Schedule {
             id,
-            name,
+            schedule_name,
             workflow,
             schedule,
             status,
@@ -413,7 +413,7 @@ impl PartialEq for Schedule {
             application_name,
         } = self;
         *id == other.id
-            && *name == other.name
+            && *schedule_name == other.schedule_name
             && *workflow == other.workflow
             && *schedule == other.schedule
             && *status == other.status
@@ -438,7 +438,7 @@ impl Schedule {
                 None,
             ),
             id: record.schedule_id,
-            name: record.schedule_name,
+            schedule_name: record.schedule_name,
             schedule: record.schedule,
             status: record.status,
             context: record.context,
@@ -453,8 +453,8 @@ impl Schedule {
     }
 
     /// The schedule's name, unique across every application sharing the database.
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn schedule_name(&self) -> &str {
+        &self.schedule_name
     }
 
     /// The id the database generated for the schedule. A schedule deleted and created again under
@@ -1316,7 +1316,7 @@ mod tests {
             &Serializer::RustSerde,
         );
         assert_eq!(schedule.id(), "id-1");
-        assert_eq!(schedule.name(), "nightly");
+        assert_eq!(schedule.schedule_name(), "nightly");
         assert_eq!(
             schedule.workflow(),
             &WorkflowKey {

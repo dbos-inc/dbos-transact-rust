@@ -278,7 +278,7 @@ async fn a_rewind_resets_the_row_and_discards_the_history() {
     dbos.rewind_with::<Option<String>, EngineOnly>(
         id,
         RewindOptions {
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             queue_partition_key: Some("new-key"),
             ..RewindOptions::default()
         },
@@ -398,7 +398,7 @@ async fn a_rewind_clears_an_outcome_held_only_in_the_legacy_columns() {
     dbos.rewind_with::<u32, EngineOnly>(
         id,
         RewindOptions {
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             ..RewindOptions::default()
         },
     )
@@ -506,7 +506,7 @@ async fn a_rewind_discards_the_messages_the_discarded_steps_consumed() {
         id,
         RewindOptions {
             start_step: 2,
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             ..RewindOptions::default()
         },
     )
@@ -570,7 +570,7 @@ async fn a_rewind_reverts_the_events_published_past_the_cut() {
         id,
         RewindOptions {
             start_step: 2,
-            queue: Some(PARKING),
+            queue_name: Some(PARKING),
             ..RewindOptions::default()
         },
     )

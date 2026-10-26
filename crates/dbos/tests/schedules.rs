@@ -187,7 +187,10 @@ async fn schedules_are_created_read_listed_and_deleted() {
     dbos.create_schedule(&other_spec).await.unwrap();
     dbos.pause_schedule("other-schedule").await.unwrap();
     let names = |schedules: Vec<dbos::Schedule>| -> Vec<String> {
-        schedules.into_iter().map(|s| s.name().to_owned()).collect()
+        schedules
+            .into_iter()
+            .map(|s| s.schedule_name().to_owned())
+            .collect()
     };
     assert_eq!(
         names(
