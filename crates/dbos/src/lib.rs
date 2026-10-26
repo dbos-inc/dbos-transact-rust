@@ -80,6 +80,8 @@ mod context;
 #[cfg(feature = "engine")]
 mod cron;
 #[cfg(feature = "engine")]
+mod debouncer;
+#[cfg(feature = "engine")]
 mod dequeue;
 #[cfg(feature = "engine")]
 mod error;
@@ -135,6 +137,8 @@ pub use client::{Client, ClientConfig, EnqueueOptions};
 pub use config::{Config, DATABASE_URL_ENV};
 #[cfg(feature = "engine")]
 pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
+#[cfg(feature = "engine")]
+pub use debouncer::{Debouncer, DebouncerClient};
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]

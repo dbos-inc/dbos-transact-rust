@@ -672,23 +672,51 @@ pub(crate) fn new_row<'a>(workflow_id: &'a str, enqueue: Option<&Enqueue<'a>>) -
 /// itself. Encoding is the one part of a start that can fail without touching the database, and it
 /// would be a poor trade to answer that from a task the caller may already have stopped listening
 /// to.
-struct OwnedStart {
+pub(crate) struct OwnedStart {
     /// The id the child will have, resolved before the task is spawned — see
     /// [`child_workflow_id`] for why it is settled at the call rather than in the task.
-    workflow_id: String,
-    timeout: Timeout,
-    queue: Option<OwnedEnqueue>,
-    input: Option<String>,
+    pub(crate) workflow_id: String,
+    pub(crate) timeout: Timeout,
+    pub(crate) queue: Option<OwnedEnqueue>,
+    pub(crate) input: Option<String>,
     /// How `input` is encoded, and so how the workflow's outcome will be.
-    encoding: PayloadEncoding,
-    attributes: Option<String>,
+    pub(crate) encoding: PayloadEncoding,
+    pub(crate) attributes: Option<String>,
     /// When the start began, which the parent's record of it is stamped with. Read here rather
     /// than in the task so that it measures the call and not the wait for a runtime thread.
-    started_at: Timestamp,
+    pub(crate) started_at: Timestamp,
+    /// Marks the row a debounced one, which only a [`Debouncer`](crate::Debouncer) asks for.
+    pub(crate) debounce: Option<Debounced>,
+    /// The application the row is written for, in place of the executor's own. Only a
+    /// [`Debouncer`](crate::Debouncer) targeting another application sets it.
+    pub(crate) app_name: Option<String>,
+}
+
+/// What makes a fresh enqueue a debounced one: the row goes in with `is_debounced` set, so the
+/// release from `DELAYED` clears its deduplication id, and with the cap no later bounce may push
+/// its release past.
+///
+/// The row's deduplication id and delay are an ordinary enqueue's, set on its [`Enqueue`]; this
+/// carries only the two columns no public option can write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Debounced {
+    /// The latest instant a bounce may move the release to, or `None` for no cap.
+    pub(crate) deadline: Option<Timestamp>,
+}
+
+impl Debounced {
+    /// `row`, marked debounced.
+    pub(crate) fn mark(self, row: NewWorkflow<'_>) -> NewWorkflow<'_> {
+        NewWorkflow {
+            is_debounced: true,
+            debounce_deadline: self.deadline,
+            ..row
+        }
+    }
 }
 
 /// An [`Enqueue`] with its strings owned, for the same reason [`OwnedStart`] is: see there.
-struct OwnedEnqueue {
+pub(crate) struct OwnedEnqueue {
     name: String,
     deduplication_id: Option<String>,
     priority: Option<u32>,
@@ -896,7 +924,7 @@ impl Timeout {
     /// `None` takes nothing, and a row's `workflow_timeout_ms` is what the database turns into a
     /// deadline: the insert, for a workflow that starts now, and the dequeue's claim, for a queued
     /// one. Writing one for either would hand those a budget the caller never asked for.
-    fn budget(self) -> Option<Duration> {
+    pub(crate) fn budget(self) -> Option<Duration> {
         match self {
             Self::Explicit(timeout) => Some(timeout),
             Self::Inherit | Self::None => Option::None,
@@ -1212,6 +1240,8 @@ where
             encoding,
             attributes: encode_attributes(options.attributes)?,
             started_at: Timestamp::now(),
+            debounce: None,
+            app_name: None,
         };
         // The caller's span rather than one of its own: this is the same start, on another
         // thread, and its logs belong where the call was written.
@@ -1255,6 +1285,23 @@ where
 /// A dedup that joins an existing holder runs under a different id than this one, and that is not
 /// a disagreement: this is the id the start would create, which is exactly what a caller learns
 /// from and what a replay of this position derives again.
+/// [`child_workflow_id`] for a start whose placement is all the caller has: a workflow it is a
+/// child of where the placement claimed an id, and a root start everywhere else.
+pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement) -> String {
+    match placement {
+        StepPlacement::Recorded { ctx, step_id } => child_workflow_id(
+            chosen,
+            Some(&Parent {
+                ctx,
+                step_id: *step_id,
+            }),
+        ),
+        StepPlacement::Outside
+        | StepPlacement::InsideStep { .. }
+        | StepPlacement::ClientConnection => child_workflow_id(chosen, None),
+    }
+}
+
 fn child_workflow_id(chosen: Option<&str>, parent: Option<&Parent<'_>>) -> String {
     match (chosen, parent) {
         // An application-assigned id wins over the derivation, in every reference.
@@ -1278,7 +1325,7 @@ fn child_workflow_id(chosen: Option<&str>, parent: Option<&Parent<'_>>) -> Strin
 /// Nothing here is abandoned part-way by a caller losing interest. That is the whole point of it
 /// being here — see [`started`](WorkflowRef::started) — and it is why the order below can be read
 /// as a sequence rather than as a set of states a drop might leave behind.
-async fn create<R, E>(
+pub(crate) async fn create<R, E>(
     executor: Arc<Executor>,
     placement: StepPlacement,
     key: WorkflowKey,
@@ -1299,6 +1346,8 @@ async fn create<R, E>(
         // The caller's reading, taken before this task existed: the step spans the start as the
         // *caller* saw it, not the wait for a runtime thread to pick the task up.
         started_at,
+        debounce,
+        app_name,
     } = request;
     let owned_queue = queue.as_ref().map(OwnedEnqueue::as_enqueue);
     let enqueue = owned_queue.as_ref();
@@ -1357,6 +1406,11 @@ async fn create<R, E>(
         (Timeout::Inherit, None) => None,
     };
 
+    // A row written for another application carries no version: this executor's version means
+    // nothing to that application's executors, and an unversioned row is run by its latest.
+    let for_another_app = app_name
+        .as_deref()
+        .is_some_and(|name| name != executor.app_name());
     let new = NewWorkflow {
         name: Some(&key.name),
         class_name: key.class_name.as_deref(),
@@ -1364,8 +1418,8 @@ async fn create<R, E>(
         input: input.as_deref(),
         serialization: Some(encoding.name()),
         executor_id: Some(executor.executor_id()),
-        application_name: Some(executor.app_name()),
-        application_version: Some(executor.app_version()),
+        application_name: Some(app_name.as_deref().unwrap_or(executor.app_name())),
+        application_version: (!for_another_app).then(|| executor.app_version()),
         // Only a budget is written: an inherited deadline is an *instant* and has no
         // budget behind it, and `Timeout::None` has neither. The column is what the insert
         // and a dequeue's claim compute a deadline from, so filling it in for either would
@@ -1376,6 +1430,10 @@ async fn create<R, E>(
         // The queue's five columns, and nothing below spawns the row they describe: a queue's
         // whole point is that the process which asks is not necessarily the one that runs.
         ..new_row(&workflow_id, enqueue)
+    };
+    let new = match debounce {
+        Some(debounce) => debounce.mark(new),
+        None => new,
     };
 
     let initialized = match init_or_join(
@@ -1578,6 +1636,18 @@ pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
 }
 
 impl<'a, R, E, C> PendingStart<'a, R, E, C> {
+    /// A start built from a placed call that answers with a handle, for a durable call other than
+    /// [`start_with`](WorkflowRef::start_with) that creates a workflow — a
+    /// [`Debouncer`](crate::Debouncer)'s.
+    pub(crate) fn from_step(
+        step: PendingStep<'a, WorkflowHandle<R, E>, crate::EngineOnly>,
+    ) -> Self {
+        Self {
+            starting: PendingWorkflow(step),
+            channel: PhantomData,
+        }
+    }
+
     /// The id this start claimed when it was written, or `None` if it claimed none.
     ///
     /// [`PendingWorkflow::step_id`]'s, forwarded.
