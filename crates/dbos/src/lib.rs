@@ -10,6 +10,46 @@
 //! Under construction. The system database layer, the lifecycle, registration, workflows,
 //! steps, events, messaging, recovery, queues, schedules and the client are here.
 //!
+//! # Changing a workflow's code
+//!
+//! A recovered workflow replays the step history it recorded, position by position, so code that
+//! moves, adds or removes steps can no longer replay executions the old code started.
+//! [`patch`](crate::patch()) is the way to make such a change while those executions are in
+//! flight: new executions take the new path and record that they did, and old ones take the old
+//! path. Once no old execution can run again, [`deprecate_patch`](crate::deprecate_patch())
+//! replaces it and the old code goes:
+//!
+//! ```no_run
+//! # async fn step_one() -> dbos::Result<u32> { Ok(1) }
+//! # async fn step_three() -> dbos::Result<u32> { Ok(3) }
+//! # async fn step_two() -> dbos::Result<u32> { Ok(2) }
+//! // Deployed first.
+//! async fn v1(_: ()) -> dbos::Result<u32> {
+//!     Ok(step_one().await? + step_two().await?)
+//! }
+//!
+//! // Deployed while runs of `v1` may still be recovered: they take the old path.
+//! async fn v2(_: ()) -> dbos::Result<u32> {
+//!     let first = if dbos::patch("use-step-three").await? {
+//!         step_three().await?
+//!     } else {
+//!         step_one().await?
+//!     };
+//!     Ok(first + step_two().await?)
+//! }
+//!
+//! // Deployed once no run of `v1` can run again.
+//! async fn v3(_: ()) -> dbos::Result<u32> {
+//!     dbos::deprecate_patch("use-step-three").await?;
+//!     Ok(step_three().await? + step_two().await?)
+//! }
+//! ```
+//!
+//! Old and new code share executions only if they run under one application version, so the
+//! deployments that patch keep [`Config::app_version`] the same. The other way to change a
+//! workflow's code is a new version per deployment, with the old version's executors kept running
+//! until its executions finish; that needs no patch. See [`patch`](crate::patch()#application-version).
+//!
 //! # Cargo features
 //!
 //! - `engine` *(default)* — the durable execution engine: registry, contexts, workflows,
@@ -55,6 +95,8 @@ mod instance;
 mod management;
 #[cfg(feature = "engine")]
 mod message;
+#[cfg(feature = "engine")]
+mod patch;
 #[cfg(feature = "engine")]
 mod queue;
 #[cfg(feature = "engine")]
@@ -111,6 +153,8 @@ pub use management::{
 pub use message::{
     Forks, SendMessage, SendOptions, recv, send, send_bulk, send_bulk_with, send_with,
 };
+#[cfg(feature = "engine")]
+pub use patch::{deprecate_patch, patch};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]

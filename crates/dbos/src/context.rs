@@ -240,6 +240,16 @@ impl WorkflowState {
     fn next_step_id(&self) -> i32 {
         self.next_step_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn peek_step_id(&self) -> i32 {
+        self.next_step_id.load(Ordering::Relaxed)
+    }
+
+    fn claim_step_id(&self, step_id: i32) -> bool {
+        self.next_step_id
+            .compare_exchange(step_id, step_id + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
 }
 
 /// A count of the child starts a workflow has in flight, and a way to wait until there are none.
@@ -420,6 +430,24 @@ impl Ctx {
     /// The next step id in this workflow, zero-based and never reused.
     pub(crate) fn next_step_id(&self) -> i32 {
         self.workflow.next_step_id()
+    }
+
+    /// The id the next call will take, without taking it.
+    ///
+    /// For a call that has to look at a position before deciding whether to occupy it — a
+    /// [`patch`](crate::patch()) — and that pairs this with [`claim_step_id`](Self::claim_step_id)
+    /// to learn whether anything else took the position while it looked.
+    pub(crate) fn peek_step_id(&self) -> i32 {
+        self.workflow.peek_step_id()
+    }
+
+    /// Takes `step_id` if it is still the next id, and reports whether it was.
+    ///
+    /// One compare-and-swap, so the check and the take are a single step: `false` means some other
+    /// call of this execution took an id since `step_id` was [peeked](Self::peek_step_id), and the
+    /// counter is left as that call left it.
+    pub(crate) fn claim_step_id(&self, step_id: i32) -> bool {
+        self.workflow.claim_step_id(step_id)
     }
 
     /// The executor running this workflow.

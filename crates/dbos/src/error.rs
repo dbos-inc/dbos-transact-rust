@@ -444,6 +444,33 @@ pub enum Error<E = EngineOnly> {
         polled: std::borrow::Cow<'static, str>,
     },
 
+    /// Another durable call of the same workflow took the step position a
+    /// [`patch`](crate::patch()) or [`deprecate_patch`](crate::deprecate_patch()) was built at.
+    ///
+    /// Either call fixes its position where it is built, as every durable call does, but takes it
+    /// only once it has read the workflow's history there, when awaited. A call built in between —
+    /// written after the patch and awaited before it, or built in another branch of the same body,
+    /// one arm of a `tokio::join!` — took the position first. Refused rather than recorded
+    /// elsewhere: await a patch where it is written, from sequential workflow code, before any
+    /// branches start or after they finish.
+    ///
+    /// **A mistake in the code, and recorded like one.** It is the workflow's outcome, as
+    /// [`StepBuiltElsewhere`](Self::StepBuiltElsewhere) is. A call built between a patch and its
+    /// await is refused on every execution, and so is a branch whose call is built before the
+    /// patch is first awaited.
+    #[error(
+        "patch {patch} in workflow {workflow_id} lost step {step_id} to a call built before it \
+         was awaited: await a patch where it is written, from sequential workflow code"
+    )]
+    PatchNondeterminism {
+        /// The workflow that was patching.
+        workflow_id: String,
+        /// The patch's name, as the code gave it.
+        patch: String,
+        /// The position the patch looked at, which another call took.
+        step_id: i32,
+    },
+
     /// A step attempt ran past its timeout and was stopped.
     ///
     /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
@@ -689,6 +716,15 @@ impl<E> Error<E> {
                 step,
                 built,
                 polled,
+            },
+            Error::PatchNondeterminism {
+                workflow_id,
+                patch,
+                step_id,
+            } => Error::PatchNondeterminism {
+                workflow_id,
+                patch,
+                step_id,
             },
             Error::MaxStepRetriesExceeded {
                 step,

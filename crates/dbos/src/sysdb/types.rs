@@ -2798,6 +2798,14 @@ pub mod step_names {
     /// The step name `record_sleep` records.
     pub const SLEEP: &str = "DBOS.sleep";
 
+    /// What a patch marker's step name starts with: the marker for the patch named `v2` is
+    /// recorded as `DBOS.patch-v2`.
+    ///
+    /// A marker records that an execution took a [`patch`](crate::patch())'s new path. It is a
+    /// row with this name and nothing else — no output, no error, no serialization — at the
+    /// position the patch was reached at, which is what a replay looks for there.
+    pub const PATCH_PREFIX: &str = "DBOS.patch-";
+
     /// The step names the two send methods record, one each: `send_message` writes [`SEND`] and
     /// `send_messages` writes [`SEND_BULK`]. The name is therefore the API surface the caller
     /// reached for, never the batch's length — a batch of one is still a batch.
