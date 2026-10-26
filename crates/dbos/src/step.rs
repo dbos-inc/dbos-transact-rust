@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{PendingStep, StepDurability, StepPlacement, revive};
 use crate::context::{Ctx, StepStatus};
-use crate::error::{DurableError, EngineOnly, Error, Result};
-use crate::serialization::{decode_tagged, encode};
+use crate::error::{DurableError, EncodedError, EngineOnly, Error, Result};
+use crate::serialization::{PayloadEncoding, Serializer, decode_tagged, encode, encode_error};
 use crate::sysdb::types::{AwaitedOutcome, Outcome, StepTiming, Timestamp};
 
 /// A step's retry predicate: given a failure, whether to try again.
@@ -525,57 +525,100 @@ where
     let encoding = executor.serializer().encoding();
     let serialization = Some(encoding.name());
 
-    match &outcome {
-        Ok(value) => {
-            let output = encode(value, &encoding, "step result")?;
-            executor
-                .sysdb()
-                .record_step(
-                    workflow_id,
+    // **Encoded after the loop, so a refusal spends no attempt.** A refusal is taken as final: the
+    // built-in encodings refuse a value or an error the same way on every attempt, so running the
+    // body again — its side effects included — could only be refused again. A custom serializer
+    // that fails for a passing reason, a key service it calls being down for instance, has that
+    // failure recorded as final too. Nor is a refusal offered to `should_retry`, which judges the
+    // body's failures, not the engine's handling of them.
+    let (encoded, failed, outcome) = match outcome {
+        Ok(value) => match encode::<T, E>(&value, &encoding, "step result") {
+            Ok(output) => (output, false, Ok(value)),
+            // A value the encoding refuses is the step's failure, recorded as its error. The body
+            // has run, side effects and all, so leaving the position unrecorded would have a
+            // replay or a recovery run it again — and a workflow that handles the error and
+            // carries on would reach that replay with the side effects done twice.
+            Err(refused) => {
+                // A type the encoding cannot write is a bug in the workflow, and the recorded
+                // error may be read long after, by someone else.
+                tracing::warn!(
                     step_id,
-                    name,
-                    Outcome::Output(Some(&output)),
-                    serialization,
-                    timing,
-                    ctx.owner_xid(),
-                )
-                .await
-                .map_err(Error::SystemDatabase)?;
-            tracing::debug!(
-                step_id,
-                step_name = name,
-                "the step ran; its output is recorded"
-            );
-        }
+                    step_name = name,
+                    error = %refused,
+                    "the step's result could not be encoded; it is recorded as the step's error"
+                );
+                let (encoded, outcome) =
+                    encode_step_error(refused, &encoding, executor.serializer(), name);
+                (encoded, true, outcome)
+            }
+        },
         Err(error) => {
             // A control error cannot arrive here: the loop above returns on one without leaving
             // itself, precisely so that a cancelled workflow's step is not recorded as *failed* and
             // replayed as permanently so. What reaches this arm is the step's own outcome.
             debug_assert!(error.control().is_none());
-            // The error itself, encoded, not a description of it: a replay gives back the error
-            // that failed exactly as it gives back the value that succeeded.
-            let encoded = encode(error, &encoding, "step error")?;
-            executor
-                .sysdb()
-                .record_step(
-                    workflow_id,
-                    step_id,
-                    name,
-                    Outcome::Error(&encoded),
-                    serialization,
-                    timing,
-                    ctx.owner_xid(),
-                )
-                .await
-                .map_err(Error::SystemDatabase)?;
-            tracing::debug!(
-                step_id,
-                step_name = name,
-                "the step failed; its error is recorded"
-            );
+            let (encoded, outcome) =
+                encode_step_error(error, &encoding, executor.serializer(), name);
+            (encoded, true, outcome)
         }
+    };
+
+    executor
+        .sysdb()
+        .record_step(
+            workflow_id,
+            step_id,
+            name,
+            if failed {
+                Outcome::Error(&encoded)
+            } else {
+                Outcome::Output(Some(&encoded))
+            },
+            serialization,
+            timing,
+            ctx.owner_xid(),
+        )
+        .await
+        .map_err(Error::SystemDatabase)?;
+    if failed {
+        tracing::debug!(
+            step_id,
+            step_name = name,
+            "the step failed; its error is recorded"
+        );
+    } else {
+        tracing::debug!(
+            step_id,
+            step_name = name,
+            "the step ran; its output is recorded"
+        );
     }
     outcome
+}
+
+/// A step's error as its row records it, and the error to hand the body.
+///
+/// **The error itself, encoded, not a description of it**: a replay gives back the error that
+/// failed exactly as it gives back the value that succeeded, and the body gets the error as it was.
+///
+/// **Total, like a workflow's**, because a step that ran owes its position an outcome. An error the
+/// encoding refuses is recorded as [`EncodedError::refused`] records it, and the body is then handed
+/// what a replay will read back from that, not the error it could not record: a body that handles
+/// the error and carries on has to take the same branch on every execution.
+fn encode_step_error<T, E: DurableError>(
+    error: Error<E>,
+    encoding: &PayloadEncoding,
+    configured: &Serializer,
+    name: &str,
+) -> (String, Result<T, E>) {
+    match encode_error::<E, EngineOnly>(&error, encoding) {
+        Ok(encoded) => (encoded, Err(error)),
+        Err(refused) => {
+            let recorded = EncodedError::refused(&error, refused, encoding.clone(), "step error");
+            let replayed = revive(&recorded.encoded, Some(encoding.name()), configured, name);
+            (recorded.encoded, Err(replayed))
+        }
+    }
 }
 
 /// Runs one attempt under the watchdogs its options ask for.

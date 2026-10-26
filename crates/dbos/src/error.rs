@@ -223,7 +223,9 @@ pub enum Error<E = EngineOnly> {
     ///
     /// A workflow's own `result` or `error` that cannot be encoded is that workflow's outcome: it
     /// is recorded as the workflow's error, and its handle's `result()` and every replay return
-    /// it, rather than the body running again.
+    /// it, rather than the body running again. A step's own `step result` or `step error` that
+    /// cannot be encoded is likewise recorded as that step's error, so a replay returns it rather
+    /// than running the step again.
     #[error("could not serialize the workflow {what}: {message}")]
     Serialization {
         /// Which value: `argument`, `result`, `error`.
@@ -793,11 +795,12 @@ pub(crate) enum Failure {
     Control(Error<EngineOnly>),
 }
 
-/// What a workflow's row records as its error when its custom serializer refuses even the stand-in
-/// [`EncodedError::of`] offers: fixed text, so nothing of the error itself is stored unencoded.
-const UNENCODABLE_ERROR: &str = "the workflow's error could not be encoded by its serializer";
+/// What a row records as a workflow's or a step's error when its custom serializer refuses even the
+/// stand-in [`EncodedError::refused`] offers: fixed text, so nothing of the error itself is stored
+/// unencoded.
+const UNENCODABLE_ERROR: &str = "the error could not be encoded by its serializer";
 
-/// A workflow's error as its row holds it, with the encoding that says how to read it.
+/// A workflow's or a step's error as its row holds it, with the encoding that says how to read it.
 ///
 /// **The encoding travels with the bytes** because the encodings write an error differently — the
 /// whole [`Error`] natively or in a custom serializer, a `{name, message, code, data}` envelope
@@ -815,35 +818,51 @@ impl EncodedError {
     ///
     /// **Total**, because the row has to end. A failure that is not recorded leaves the row
     /// `PENDING`, and recovery would run the whole body again, side effects and all, only to fail
-    /// to encode the same error the same way. So an error the encoding refuses is recorded as
-    /// [`Error::Serialization`] of the `error` instead, with what the serializer said and what the
-    /// error displayed as its message. That one is strings alone, which the built-in encodings
-    /// always write. For a custom serializer that refuses it too, the column holds
-    /// [`UNENCODABLE_ERROR`], a fixed marker, which a reader reports as an error that does not
-    /// decode. **Never the error's own details**: a custom serializer may exist to keep them out of
-    /// the database, an encrypting one for instance, and text the caller chose could also hold a
-    /// byte the column cannot store. The details go to the log instead.
+    /// to encode the same error the same way. An error the encoding refuses is recorded as
+    /// [`refused`](Self::refused) describes.
     pub(crate) fn of<E: DurableError>(error: &Error<E>, encoding: PayloadEncoding) -> Self {
-        let encoded = encode_error::<E, EngineOnly>(error, &encoding).unwrap_or_else(|refused| {
-            let said = match refused {
-                Error::Serialization { message, .. } => message,
-                other => other.to_string(),
-            };
-            let stand_in = Error::<E>::Serialization {
-                what: "error".into(),
-                message: format!("{said}; the error was: {error}"),
-                source: None,
-            };
+        match encode_error::<E, EngineOnly>(error, &encoding) {
+            Ok(encoded) => Self { encoded, encoding },
+            Err(refused) => Self::refused(error, refused, encoding, "error"),
+        }
+    }
+
+    /// `error`, which `encoding` has refused with `refused`, as its row records it instead.
+    ///
+    /// Recorded as [`Error::Serialization`] of `what` — `error` for a workflow's, `step error` for
+    /// a step's — with what the serializer said and what the error displayed as its message. That
+    /// one is strings alone, which the built-in encodings always write. For a custom serializer
+    /// that refuses it too, the column holds [`UNENCODABLE_ERROR`], a fixed marker, which a reader
+    /// reports as an error that does not decode. **Never the error's own details**: a custom
+    /// serializer may exist to keep them out of the database, an encrypting one for instance, and
+    /// text the caller chose could also hold a byte the column cannot store. The details go to the
+    /// log instead.
+    pub(crate) fn refused<E: DurableError>(
+        error: &Error<E>,
+        refused: Error<EngineOnly>,
+        encoding: PayloadEncoding,
+        what: &'static str,
+    ) -> Self {
+        let said = match refused {
+            Error::Serialization { message, .. } => message,
+            other => other.to_string(),
+        };
+        let stand_in = Error::<E>::Serialization {
+            what: what.into(),
+            message: format!("{said}; the error was: {error}"),
+            source: None,
+        };
+        tracing::warn!(
+            what,
+            error = %stand_in,
+            "an error could not be encoded; its message is recorded instead"
+        );
+        let encoded = encode_error::<E, EngineOnly>(&stand_in, &encoding).unwrap_or_else(|_| {
             tracing::warn!(
-                error = %stand_in,
-                "the workflow's error could not be encoded; its message is recorded instead"
+                what,
+                "the serializer refused the stand-in too; a fixed marker is recorded"
             );
-            encode_error::<E, EngineOnly>(&stand_in, &encoding).unwrap_or_else(|_| {
-                tracing::warn!(
-                    "the serializer refused the stand-in too; a fixed marker is recorded"
-                );
-                UNENCODABLE_ERROR.to_owned()
-            })
+            UNENCODABLE_ERROR.to_owned()
         });
         Self { encoded, encoding }
     }
@@ -989,6 +1008,36 @@ mod tests {
                 "{}: {message}",
                 encoding.name()
             );
+        }
+    }
+
+    /// A step's refused error is recorded the same way, as a refusal of the step's error, and a
+    /// [`Error::MaxStepRetriesExceeded`] holding refused attempts is refused as a whole.
+    #[test]
+    fn a_steps_refused_error_is_recorded_as_a_refusal_of_the_step_error() {
+        let retried: Error<BadKeys> = Error::MaxStepRetriesExceeded {
+            step: "charge".to_owned(),
+            attempts: 2,
+            errors: vec![bad_keys(), bad_keys()],
+        };
+        for error in [bad_keys(), retried] {
+            for encoding in [PayloadEncoding::Native, PayloadEncoding::Portable] {
+                let refused = encode_error::<BadKeys, EngineOnly>(&error, &encoding)
+                    .expect_err("the encoding refuses a non-string key");
+                let recorded =
+                    EncodedError::refused(&error, refused, encoding.clone(), "step error");
+                let read = recorded.decode::<BadKeys>("wf-1");
+                let Error::Serialization { what, message, .. } = &read else {
+                    panic!("{} read back as {read:?}", encoding.name())
+                };
+                assert_eq!(what, "step error", "{}", encoding.name());
+                assert!(
+                    message.contains("key must be a string")
+                        && message.ends_with(&error.to_string()),
+                    "{}: {message}",
+                    encoding.name()
+                );
+            }
         }
     }
 
