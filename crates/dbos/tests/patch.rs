@@ -623,3 +623,46 @@ async fn a_deprecated_patch_meeting_the_old_code_finds_an_unexpected_step() {
         other => panic!("expected an unexpected step, got {other:?}"),
     }
 }
+
+/// **A patch is held to the workflow it was built in**, on every poll: carried into a step body or
+/// onto a spawned task, it is refused before it claims a position or writes a marker.
+#[tokio::test]
+async fn a_patch_polled_away_from_its_workflow_is_refused() {
+    async fn carried_away(_: ()) -> dbos::Result<bool> {
+        // Into a step body, where a claimed position would be lost when the step replays.
+        // A step body may run more than once, so the patch is handed over through a slot.
+        let slot = Arc::new(std::sync::Mutex::new(Some(dbos::patch::<EngineOnly>(
+            "into-a-step",
+        ))));
+        let in_step = dbos::step("carrier", move || {
+            let patched = slot.lock().unwrap().take();
+            async move {
+                let patched = patched.expect("the step body ran once");
+                Ok::<_, Error>(matches!(
+                    patched.await,
+                    Err(Error::StepBuiltElsewhere { step, .. }) if step == "DBOS.patch-into-a-step"
+                ))
+            }
+        })
+        .await?;
+
+        // Onto a task of its own, outside any workflow.
+        let patched = dbos::patch::<EngineOnly>("onto-a-task");
+        let on_task = matches!(
+            tokio::spawn(patched).await.expect("the task panicked"),
+            Err(Error::StepBuiltElsewhere { step, .. }) if step == "DBOS.patch-onto-a-task"
+        );
+        Ok(in_step && on_task)
+    }
+
+    let db = test_database().await;
+    let id = "carried-away-run";
+    let (dbos, result) = run_raw("patch-carried-app", &db, id, carried_away).await;
+    assert!(result.expect("the workflow failed"), "both were refused");
+    assert_eq!(
+        names(&dbos, id).await,
+        ["carrier"],
+        "neither refused patch wrote a marker"
+    );
+    dbos.shutdown().await;
+}

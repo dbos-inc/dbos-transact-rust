@@ -36,7 +36,10 @@
 //! execution has handed to another call.
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use crate::checkpoint::StepPlacement;
 use crate::context::Ctx;
 use crate::error::{DurableError, Error};
 use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
@@ -96,6 +99,9 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
 /// - [`Error::PatchNondeterminism`] when another durable call of the workflow was built between
 ///   this one being built and awaited — see that variant. Await a patch where it is written, from
 ///   sequential workflow code.
+/// - [`Error::StepBuiltElsewhere`] when the call is polled anywhere but the workflow it was built
+///   in — carried into a step body, onto a spawned task, or into another workflow — as for every
+///   durable call.
 /// - Whatever reading or writing the system database fails with, as at any step. A workflow
 ///   cancelled meanwhile arrives as [`Error::SystemDatabase`] holding the system database's
 ///   `WorkflowCancelled`, a control signal like every cancellation.
@@ -110,14 +116,7 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
 pub fn patch<E: DurableError>(
     name: &str,
 ) -> impl Future<Output = crate::Result<bool, E>> + Send + use<E> {
-    let point = PatchPoint::here("patch", name, Marker::Write);
-    async move {
-        match point {
-            Ok(point) => point.resolve().await,
-            Err(refused) => Err(refused),
-        }
-        .map_err(Error::lift)
-    }
+    Patching::build("patch", name, Marker::Write)
 }
 
 /// Honours a patch's markers already recorded, without recording new ones.
@@ -143,18 +142,68 @@ pub fn patch<E: DurableError>(
 /// # Errors
 ///
 /// The same as [`patch`]'s: [`Error::NotInWorkflow`], [`Error::InsideStep`],
-/// [`Error::PatchNondeterminism`], and the system database's own. Its position is fixed where it
+/// [`Error::PatchNondeterminism`], [`Error::StepBuiltElsewhere`], and the system database's own. Its position is fixed where it
 /// is built, as [`patch`]'s is.
 pub fn deprecate_patch<E: DurableError>(
     name: &str,
 ) -> impl Future<Output = crate::Result<bool, E>> + Send + use<E> {
-    let point = PatchPoint::here("deprecate_patch", name, Marker::Honour);
-    async move {
-        match point {
-            Ok(point) => point.resolve().await,
-            Err(refused) => Err(refused),
+    Patching::build("deprecate_patch", name, Marker::Honour)
+}
+
+/// A [`patch`] or [`deprecate_patch`] call, held to the execution it was built in.
+///
+/// The position it peeked belongs to one execution's counter, and the marker it may write belongs
+/// to that execution's history. So, as for every durable call, where it is polled is checked on
+/// **every poll**, not only the first: a call carried into a step body, onto another task, or into
+/// another workflow is refused with [`Error::StepBuiltElsewhere`] rather than claim a position or
+/// write a marker for a workflow that is no longer the one around it. Inside a step body the claim
+/// would also be lost on replay, where the step's recorded result is returned without running
+/// the body, and every later position would shift.
+struct Patching<E> {
+    /// The execution the call was built in, or `None` when the build itself refused.
+    built: Option<Ctx>,
+    /// The marker's step name, which names the call in a refusal.
+    label: String,
+    running: Pin<Box<dyn Future<Output = crate::Result<bool, E>> + Send>>,
+}
+
+impl<E: DurableError> Patching<E> {
+    fn build(operation: &'static str, name: &str, marker: Marker) -> Self {
+        let point = PatchPoint::here(operation, name, marker);
+        let built = point.as_ref().ok().map(|point| point.ctx.clone());
+        Self {
+            built,
+            label: format!("{}{name}", step_names::PATCH_PREFIX),
+            running: Box::pin(async move {
+                match point {
+                    Ok(point) => point.resolve().await,
+                    Err(refused) => Err(refused),
+                }
+                .map_err(Error::lift)
+            }),
         }
-        .map_err(Error::lift)
+    }
+}
+
+impl<E> Future for Patching<E> {
+    type Output = crate::Result<bool, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(built) = &this.built {
+            let held = Ctx::with_current(|here| match here {
+                Some(here) if here.is_same_execution(built) && here.step_marker().is_none() => None,
+                here => Some(StepPlacement::describe(here)),
+            });
+            if let Some(polled) = held {
+                return Poll::Ready(Err(Error::StepBuiltElsewhere {
+                    step: this.label.clone(),
+                    built: StepPlacement::describe(Some(built)),
+                    polled,
+                }));
+            }
+        }
+        this.running.as_mut().poll(cx)
     }
 }
 
