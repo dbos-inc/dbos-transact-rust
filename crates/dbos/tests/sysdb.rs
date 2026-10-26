@@ -10,7 +10,7 @@ use dbos::sysdb::types::{
     ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy,
 };
-use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, SystemDatabase};
+use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase};
 
 use dbos_test_support as support;
 use dbos_test_support::{Backend, owner_token, test_database};
@@ -19,7 +19,7 @@ fn workflow(id: &str) -> NewWorkflow<'_> {
     NewWorkflow {
         name: Some("checkout"),
         input: Some(r#"{"positionalArgs":[1],"namedArgs":{}}"#),
-        serialization: Some("portable_json"),
+        serialization: Some(PORTABLE_JSON),
         executor_id: Some("local"),
         application_version: Some("v1"),
         ..NewWorkflow::new(id)
@@ -57,7 +57,7 @@ async fn a_workflow_round_trips() {
         .expect("the workflow should exist");
     assert_eq!(read.status, WorkflowStatus::Pending);
     assert_eq!(read.name.as_deref(), Some("checkout"));
-    assert_eq!(read.serialization.as_deref(), Some("portable_json"));
+    assert_eq!(read.serialization.as_deref(), Some(PORTABLE_JSON));
 }
 
 /// Payloads come back exactly as they went in.
@@ -512,7 +512,7 @@ async fn the_stored_serialization_is_reported_back() {
 
     assert_eq!(
         outcome.serialization.as_deref(),
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         "the stored format wins; the payloads already there are in it",
     );
 }
@@ -731,7 +731,7 @@ async fn an_await_returns_a_recorded_outcome() {
         AwaitedOutcome::Succeeded {
             output: Some("\"done\"".to_owned()),
             // Stamped by `init_workflow` from the workflow's own input encoding.
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }
     );
 
@@ -749,7 +749,7 @@ async fn an_await_returns_a_recorded_outcome() {
             .unwrap(),
         AwaitedOutcome::Failed {
             error: "\"boom\"".to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }
     );
 }
@@ -807,7 +807,7 @@ async fn an_await_waits_for_a_workflow_that_has_not_finished() {
         settled,
         AwaitedOutcome::Succeeded {
             output: Some("\"late\"".to_owned()),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }
     );
     assert!(
@@ -889,7 +889,7 @@ async fn a_waiter_that_never_finishes_does_not_starve_the_others() {
             settled,
             AwaitedOutcome::Succeeded {
                 output: Some("\"done\"".to_owned()),
-                serialization: Some("portable_json".to_owned()),
+                serialization: Some(PORTABLE_JSON.to_owned()),
             }
         );
     }
@@ -1043,7 +1043,7 @@ async fn an_absent_row_is_waited_through_unless_the_caller_says_otherwise() {
         settled,
         AwaitedOutcome::Succeeded {
             output: Some("\"arrived\"".to_owned()),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }
     );
 }
@@ -2145,7 +2145,7 @@ async fn a_step_result_round_trips() {
         0,
         "charge",
         Outcome::Output(Some(r#"{"ok":true}"#)),
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         Some(timing),
         &owner_token(&sys, "wf-steps").await,
     )
@@ -2159,7 +2159,7 @@ async fn a_step_result_round_trips() {
         .expect("the step should be recorded");
     assert_eq!(read.output.as_deref(), Some(r#"{"ok":true}"#));
     assert_eq!(read.error, None);
-    assert_eq!(read.serialization.as_deref(), Some("portable_json"));
+    assert_eq!(read.serialization.as_deref(), Some(PORTABLE_JSON));
     assert_eq!(read.started_at, Some(Timestamp::from_epoch_ms(1_000)));
     assert_eq!(read.completed_at, Some(Timestamp::from_epoch_ms(2_000)));
 
@@ -3545,7 +3545,7 @@ async fn the_bulk_readers_return_notifications_events_and_streams() {
     assert_eq!(notifications[1].topic.as_deref(), Some("orders"));
     assert_eq!(
         notifications[1].serialization.as_deref(),
-        Some("portable_json")
+        Some(PORTABLE_JSON)
     );
 
     let events = sys.get_all_events("wf-bulk").await.unwrap();
@@ -3604,7 +3604,7 @@ async fn set_event_publishes_a_value_and_its_history() {
         0,
         "progress",
         "50",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         &owner_token(&sys, "wf-publisher").await,
     )
     .await
@@ -3614,7 +3614,7 @@ async fn set_event_publishes_a_value_and_its_history() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].key, "progress");
     assert_eq!(events[0].value, "50");
-    assert_eq!(events[0].serialization.as_deref(), Some("portable_json"));
+    assert_eq!(events[0].serialization.as_deref(), Some(PORTABLE_JSON));
 
     // The literal pins the library's recorded step name, so an accidental rename fails this test
     // instead of silently changing Rust workflow replay compatibility.
@@ -3723,7 +3723,7 @@ async fn an_event_already_published_returns_at_once() {
         0,
         "progress",
         "50",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         &owner_token(&sys, "wf-publisher").await,
     )
     .await
@@ -3739,7 +3739,7 @@ async fn an_event_already_published_returns_at_once() {
         found,
         Some(EncodedValue {
             value: "50".to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         })
     );
     // The first look answers it, so no interval is spent. Generous, because the assertion is
@@ -3820,7 +3820,7 @@ async fn a_value_published_during_the_wait_still_arrives() {
             0,
             "progress",
             "\"done\"",
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             &owner_token(&publisher, "wf-publisher").await,
         )
         .await
@@ -3842,7 +3842,7 @@ async fn a_value_published_during_the_wait_still_arrives() {
         found,
         Some(EncodedValue {
             value: "\"done\"".to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         })
     );
 }
@@ -4114,7 +4114,7 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
         0,
         "DBOS.get_event",
         Outcome::Output(Some("\"rival\"")),
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         &owner_token(&*sys, "wf-reader").await,
     )
@@ -4140,7 +4140,7 @@ async fn a_read_adopts_a_rivals_answer_rather_than_failing() {
         found,
         Some(EncodedValue {
             value: "\"rival\"".to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }),
         "the recorded step is the workflow's answer, whoever wrote it",
     );
@@ -4344,7 +4344,7 @@ async fn send_to_receiver(sys: &PostgresSystemDatabase, topic: Option<&str>, mes
             message,
             idempotency_key: None,
         },
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         false,
         None,
@@ -4379,7 +4379,7 @@ async fn a_message_already_waiting_is_taken_at_once() {
         taken,
         Some(EncodedValue {
             value: "\"one\"".to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         })
     );
     assert!(
@@ -4400,7 +4400,7 @@ async fn a_message_already_waiting_is_taken_at_once() {
     assert_eq!(step.output.as_deref(), Some("\"one\""));
     assert_eq!(
         step.serialization.as_deref(),
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         "the sender's format travels with the message",
     );
 }
@@ -4670,7 +4670,7 @@ async fn a_recv_defers_to_a_rival_that_recorded_first() {
         0,
         "DBOS.recv",
         Outcome::Output(Some("\"rival\"")),
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         &owner_token(&*sys, "wf-receiver").await,
     )
@@ -5227,7 +5227,7 @@ async fn a_capped_recv_does_not_hold_its_permit_across_the_wait() {
             message: "\"here\"",
             idempotency_key: None,
         },
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         false,
         None,
@@ -5541,7 +5541,7 @@ async fn an_event_set_elsewhere_arrives_sooner_than_the_interval_allows() {
             0,
             "ready",
             "\"go\"",
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             &owner_token(&writer, "wf-publisher").await,
         )
         .await
@@ -5587,7 +5587,7 @@ async fn a_stream_write_is_pushed_where_the_trigger_used_to_publish() {
         0,
         "progress",
         "\"a\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         WrittenBy::Workflow,
         &owner_token(&sys, "wf-producer").await,
     )
@@ -5635,7 +5635,7 @@ async fn a_close_pushes_what_the_window_was_still_holding() {
         0,
         "ready",
         "\"go\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         &owner_token(&sys, "wf-publisher").await,
     )
     .await
@@ -5689,7 +5689,7 @@ async fn a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing() {
         0,
         "ready",
         "\"go\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         &owner_token(&*sys, "wf-publisher").await,
     )
     .await
@@ -5757,7 +5757,7 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
         output.as_deref(),
         Some(wake.as_epoch_ms().to_string().as_str())
     );
-    assert_eq!(serialization.as_deref(), Some("portable_json"));
+    assert_eq!(serialization.as_deref(), Some(PORTABLE_JSON));
 }
 
 /// A sleep's step is stamped complete at the wake time, so its recorded duration is the sleep.
@@ -6721,7 +6721,7 @@ async fn a_recorded_sleep_replays_even_when_recomputing_it_would_overflow() {
         0,
         "DBOS.sleep",
         Outcome::Output(Some(&recorded.to_string())),
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         &owner,
     )
@@ -7230,7 +7230,7 @@ async fn a_message_is_delivered_to_its_destination() {
                 idempotency_key: None,
             },
         ],
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         false,
         None,
@@ -7700,7 +7700,7 @@ async fn a_stream_offset_reads_back_with_its_producers_status() {
         0,
         "progress",
         "\"a\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         WrittenBy::Workflow,
         &owner_token(&sys, "wf-stream").await,
     )
@@ -7716,7 +7716,7 @@ async fn a_stream_offset_reads_back_with_its_producers_status() {
         read.values,
         [EncodedValue {
             value: "\"a\"".to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }]
     );
 }
@@ -7786,7 +7786,7 @@ async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
         0,
         "progress",
         "\"a\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         WrittenBy::Workflow,
         &owner_token(&sys, "wf-stream").await,
     )
@@ -7809,7 +7809,7 @@ async fn a_closed_stream_reports_its_sentinel_like_any_other_value() {
             .values,
         [EncodedValue {
             value: dbos::sysdb::STREAM_CLOSED.to_owned(),
-            serialization: Some("portable_json".to_owned()),
+            serialization: Some(PORTABLE_JSON.to_owned()),
         }],
         "the sentinel is a value at an offset like any other",
     );
@@ -7839,7 +7839,7 @@ async fn the_pages_of_a_stream_read_back_as_the_stream() {
             step_id,
             "progress",
             value,
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             WrittenBy::Workflow,
             &owner_token(&sys, "wf-stream").await,
         )
@@ -8007,7 +8007,7 @@ async fn a_write_wakes_a_waiting_read() {
         0,
         "progress",
         "\"late\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         WrittenBy::Workflow,
         &owner_token(&*sys, "wf-live").await,
     )
@@ -8052,7 +8052,7 @@ async fn finished_stream_writer(
             step_id,
             "progress",
             value,
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             WrittenBy::Workflow,
             &owner_token(sys, workflow_id).await,
         )
@@ -8107,7 +8107,7 @@ async fn a_rewind_keeps_stream_entries_and_the_rerun_appends_after_them() {
             step_id,
             "progress",
             value,
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             WrittenBy::Workflow,
             "rerun",
         )
@@ -8146,7 +8146,7 @@ async fn a_rewind_past_a_close_reopens_the_stream() {
         0,
         "progress",
         "\"a2\"",
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         WrittenBy::Workflow,
         "rerun",
     )
@@ -8312,7 +8312,7 @@ async fn stream_writes_are_appended_in_order() {
             step_id,
             "progress",
             value,
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             WrittenBy::Workflow,
             &owner_token(&sys, "wf-stream").await,
         )
@@ -8455,7 +8455,7 @@ async fn closing_a_stream_appends_the_sentinel() {
         "closing is an ordinary append of the sentinel"
     );
     // Labelled portable JSON, and it is: decoding by the label gives back the sentinel.
-    assert_eq!(entries[1].serialization.as_deref(), Some("portable_json"));
+    assert_eq!(entries[1].serialization.as_deref(), Some(PORTABLE_JSON));
     assert_eq!(
         serde_json::from_str::<String>(&entries[1].value).unwrap(),
         "__DBOS_STREAM_CLOSED__",
@@ -13936,7 +13936,7 @@ async fn a_stale_execution_writes_nothing() {
             message: "\"waiting\"",
             idempotency_key: None,
         },
-        Some("portable_json"),
+        Some(PORTABLE_JSON),
         None,
         false,
         None,
@@ -14007,7 +14007,7 @@ async fn a_stale_execution_writes_nothing() {
     assert!(refused(
         sys.send_message(
             &message,
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             Some((id, 4)),
             false,
             stale_owner
@@ -14017,7 +14017,7 @@ async fn a_stale_execution_writes_nothing() {
     ));
     // From inside a step: nothing is recorded, but the sender is still checked.
     assert!(refused(
-        sys.send_messages(&[message], Some("portable_json"), None, false, stale_owner)
+        sys.send_messages(&[message], Some(PORTABLE_JSON), None, false, stale_owner)
             .await,
         id
     ));
@@ -14027,7 +14027,7 @@ async fn a_stale_execution_writes_nothing() {
         id
     ));
     assert!(refused(
-        sys.set_event(id, 7, "key", "1", Some("portable_json"), stale)
+        sys.set_event(id, 7, "key", "1", Some(PORTABLE_JSON), stale)
             .await,
         id
     ));
@@ -14037,7 +14037,7 @@ async fn a_stale_execution_writes_nothing() {
             8,
             "key",
             "1",
-            Some("portable_json"),
+            Some(PORTABLE_JSON),
             WrittenBy::Workflow,
             stale
         )
