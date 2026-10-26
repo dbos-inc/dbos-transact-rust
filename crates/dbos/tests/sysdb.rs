@@ -3,7 +3,7 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    Applications, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, DequeueStop,
+    AppScope, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, DequeueStop,
     EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
     NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
@@ -146,7 +146,7 @@ async fn resubmitting_reconciles_and_a_different_function_is_rejected() {
         .expect("re-submitting the same workflow should succeed");
     assert_eq!(again.status, WorkflowStatus::Pending);
     let read = sys.get_workflow("wf-dup").await.unwrap().unwrap();
-    assert_eq!(read.application_version.as_deref(), Some("v1"));
+    assert_eq!(read.app_version.as_deref(), Some("v1"));
 }
 
 /// A fresh start counts one attempt, and submitting it again counts none, or a client retrying
@@ -610,11 +610,8 @@ async fn every_settable_field_round_trips() {
     assert_eq!(read.timeout, written.timeout);
     assert_eq!(read.deadline, written.deadline);
     assert_eq!(read.executor_id.as_deref(), written.executor_id);
-    assert_eq!(
-        read.application_version.as_deref(),
-        written.application_version
-    );
-    assert_eq!(read.application_id.as_deref(), written.application_id);
+    assert_eq!(read.app_version.as_deref(), written.application_version);
+    assert_eq!(read.app_id.as_deref(), written.application_id);
     assert_eq!(
         read.authenticated_user.as_deref(),
         written.authenticated_user
@@ -1370,14 +1367,14 @@ async fn ids(
 
 /// The filter a recovery sweep is keyed on: this executor's `PENDING` rows at this version.
 ///
-/// There is no dedicated query for it. `Applications::Unset` supplies the application scope,
+/// There is no dedicated query for it. `AppScope::Unset` supplies the application scope,
 /// which is the part that matters — `executor_id` defaults to `"local"`, so two applications on
 /// one machine present the same executor here.
 fn pending<'a>(executor_id: &'a str, application_version: &'a str) -> WorkflowFilter<'a> {
     WorkflowFilter {
         status: vec![WorkflowStatus::Pending],
         executor_ids: vec![executor_id],
-        application_versions: vec![application_version],
+        app_versions: vec![application_version],
         load_input: false,
         load_output: false,
         ..WorkflowFilter::default()
@@ -1460,7 +1457,7 @@ async fn every_filter_narrows() {
         (
             "application_versions",
             F {
-                application_versions: vec!["v2"],
+                app_versions: vec!["v2"],
                 ..F::default()
             },
             &["wf-b"],
@@ -5910,7 +5907,7 @@ async fn a_fork_carries_the_steps_below_its_start_step() {
     let source = sys.get_workflow("wf-src").await.unwrap().unwrap();
     assert_eq!(fork.name, source.name);
     assert_eq!(fork.input, source.input);
-    assert_eq!(fork.application_version, source.application_version);
+    assert_eq!(fork.app_version, source.app_version);
     assert!(
         source.was_forked_from,
         "the source is marked as forked from"
@@ -6425,7 +6422,7 @@ async fn a_fork_can_have_its_id_generated_and_its_placement_chosen() {
     assert!(!ids[0].is_empty(), "an id should have been generated");
 
     let fork = sys.get_workflow(&ids[0]).await.unwrap().unwrap();
-    assert_eq!(fork.application_version.as_deref(), Some("v2"));
+    assert_eq!(fork.app_version.as_deref(), Some("v2"));
     assert_eq!(fork.queue_name.as_deref(), Some("reprocess"));
     assert_eq!(fork.queue_partition_key.as_deref(), Some("eu"));
     assert_eq!(fork.timeout, Some(std::time::Duration::from_secs(30)));
@@ -8808,7 +8805,7 @@ async fn recovery_does_not_reach_across_applications() {
 /// The two halves of the same field. A search that has not said whose workflows it wants means
 /// its own — otherwise an unfiltered dashboard shows a peer's work. But a workflow id is a global
 /// address, so a lookup by id answers about that exact workflow whoever owns it, and
-/// `Applications::Any` says "every application" out loud.
+/// `AppScope::Any` says "every application" out loud.
 #[tokio::test]
 async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
     let db = test_database().await;
@@ -8853,7 +8850,7 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
         ids(alpha
             .list_workflows(
                 &WorkflowFilter {
-                    applications: Applications::Any,
+                    app_scope: AppScope::Any,
                     ..WorkflowFilter::default()
                 },
                 None
@@ -8868,7 +8865,7 @@ async fn listing_scopes_to_the_caller_unless_it_names_ids_or_applications() {
         ids(alpha
             .list_workflows(
                 &WorkflowFilter {
-                    applications: Applications::Named(vec!["beta"]),
+                    app_scope: AppScope::Named(vec!["beta"]),
                     ..WorkflowFilter::default()
                 },
                 None
@@ -8942,10 +8939,10 @@ async fn a_workflow_reports_the_application_that_owns_it() {
         .unwrap();
 
     let owned = alpha.get_workflow("wf-owned").await.unwrap().unwrap();
-    assert_eq!(owned.application_name.as_deref(), Some("alpha"));
+    assert_eq!(owned.app_name.as_deref(), Some("alpha"));
     let unowned = alpha.get_workflow("wf-unowned").await.unwrap().unwrap();
     assert_eq!(
-        unowned.application_name, None,
+        unowned.app_name, None,
         "unclaimed reads back as unclaimed rather than as this handle's own",
     );
 }
@@ -9030,7 +9027,7 @@ async fn a_peers_deploy_does_not_become_this_applications_latest() {
         .unwrap()
         .expect("alpha has a version");
     assert_eq!(latest.version_name, "alpha-v1");
-    assert_eq!(latest.application_name.as_deref(), Some("alpha"));
+    assert_eq!(latest.app_name.as_deref(), Some("alpha"));
 
     // And the listing is scoped the same way.
     let names: Vec<String> = alpha
@@ -9147,7 +9144,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(unclaimed.application_name, None);
+    assert_eq!(unclaimed.app_name, None);
 
     alpha.create_application_version("v1", None).await.unwrap();
 
@@ -9156,7 +9153,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(claimed.application_name.as_deref(), Some("alpha"));
+    assert_eq!(claimed.app_name.as_deref(), Some("alpha"));
     assert_eq!(
         claimed.version_id, unclaimed.version_id,
         "claimed in place rather than recreated",
@@ -9177,7 +9174,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
             .await
             .unwrap()
             .unwrap()
-            .application_name
+            .app_name
             .as_deref(),
         Some("alpha"),
     );
@@ -9228,7 +9225,7 @@ async fn a_named_target_overrides_the_handles_own_application() {
         .await
         .unwrap()
         .expect("beta has versions");
-    assert_eq!(latest.application_name.as_deref(), Some("beta"));
+    assert_eq!(latest.app_name.as_deref(), Some("beta"));
 
     // Promotion is targeted the same way: pin beta-v1 past beta-v2 from alpha's handle. The
     // timestamp has to be genuinely later than beta-v2's, which migration 13 defaults to `now()`.
@@ -9295,7 +9292,7 @@ async fn a_workflow_can_be_enqueued_for_another_application() {
                 .await
                 .unwrap()
                 .unwrap()
-                .application_name
+                .app_name
                 .as_deref(),
             Some(expected),
         );
@@ -9887,18 +9884,18 @@ async fn listing_queues_scopes_but_reading_one_does_not() {
     };
 
     assert_eq!(
-        names(alpha.list_queues(&Applications::Unset).await.unwrap()),
+        names(alpha.list_queues(&AppScope::Unset).await.unwrap()),
         ["alpha-queue", "nobodys-queue"],
         "a search defaults to this application's own plus the unclaimed",
     );
     assert_eq!(
-        names(alpha.list_queues(&Applications::Any).await.unwrap()),
+        names(alpha.list_queues(&AppScope::Any).await.unwrap()),
         ["alpha-queue", "beta-queue", "nobodys-queue"],
     );
     assert_eq!(
         names(
             alpha
-                .list_queues(&Applications::Named(vec!["beta"]))
+                .list_queues(&AppScope::Named(vec!["beta"]))
                 .await
                 .unwrap()
         ),
@@ -10453,7 +10450,7 @@ async fn a_dequeue_claims_what_it_starts() {
             .await
             .unwrap()
             .unwrap()
-            .application_name
+            .app_name
             .as_deref(),
         Some("alpha"),
         "starting an unclaimed workflow claims it",
@@ -12012,25 +12009,25 @@ async fn a_schedule_listing_defaults_to_its_own_application() {
         .await
         .unwrap();
 
-    let scoped = |applications| ScheduleFilter {
-        applications,
+    let scoped = |app_scope| ScheduleFilter {
+        app_scope,
         ..Default::default()
     };
     assert_eq!(
-        schedule_names(&alpha, &scoped(Applications::Unset)).await,
+        schedule_names(&alpha, &scoped(AppScope::Unset)).await,
         ["alpha-job", "nobody-job"],
         "its own plus the unclaimed"
     );
     assert_eq!(
-        schedule_names(&alpha, &scoped(Applications::Any)).await,
+        schedule_names(&alpha, &scoped(AppScope::Any)).await,
         ["alpha-job", "beta-job", "nobody-job"]
     );
     assert_eq!(
-        schedule_names(&alpha, &scoped(Applications::Named(vec!["beta"]))).await,
+        schedule_names(&alpha, &scoped(AppScope::Named(vec!["beta"]))).await,
         ["beta-job", "nobody-job"]
     );
     assert_eq!(
-        schedule_names(&anonymous, &scoped(Applications::Unset)).await,
+        schedule_names(&anonymous, &scoped(AppScope::Unset)).await,
         ["alpha-job", "beta-job", "nobody-job"],
         "an unnamed handle has no application to narrow to"
     );
@@ -12968,7 +12965,7 @@ async fn a_bounce_stays_within_an_application() {
             .await
             .unwrap()
             .unwrap()
-            .application_name
+            .app_name
             .as_deref(),
         Some("alpha"),
         "bouncing an unclaimed workflow claims it, as its dequeue would",

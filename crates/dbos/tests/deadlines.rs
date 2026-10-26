@@ -542,7 +542,7 @@ async fn a_timed_out_run_cancels_its_own_row_where_the_sweep_does_not_reach() {
     let row = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
     assert_eq!(row.status, WorkflowStatus::Cancelled);
     assert_eq!(
-        row.application_name.as_deref(),
+        row.app_name.as_deref(),
         Some("another-app"),
         "the row stayed outside this application's sweep"
     );

@@ -80,7 +80,7 @@ use std::time::Duration;
 
 use types::step_names;
 use types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
+    AppScope, ApplicationRowCounts, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
     DebounceRequest, Dequeued, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
     GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
     NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
@@ -1340,7 +1340,7 @@ pub trait SystemDatabase: Send + Sync {
     /// tick*, which is the ordinary case rather than an error.
     ///
     /// **Only this application's workflows, plus unclaimed ones**, and claiming is part of the
-    /// same statement that starts them — see [`types::Applications`]. An unclaimed workflow is
+    /// same statement that starts them — see [`types::AppScope`]. An unclaimed workflow is
     /// taken by whichever application dequeues it first, which is how work enqueued by a nameless
     /// client finds a runner.
     ///
@@ -1463,10 +1463,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Reads the registered queues, scoped to the applications asked for.
     ///
-    /// A search rather than an address, so [`Applications::Unset`] means this handle's own plus
-    /// the unclaimed ones — see [`types::Applications`].
-    async fn list_queues(&self, applications: &Applications<'_>)
-    -> Result<Vec<QueueRecord>, Error>;
+    /// A search rather than an address, so [`AppScope::Unset`] means this handle's own plus
+    /// the unclaimed ones — see [`types::AppScope`].
+    async fn list_queues(&self, applications: &AppScope<'_>) -> Result<Vec<QueueRecord>, Error>;
 
     /// Changes the fields of a registered queue that an update names, leaving the rest.
     ///
@@ -1673,7 +1672,7 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Reads the schedules matching a filter.
     ///
-    /// A search, so [`ScheduleFilter::applications`] defaults to this handle's own plus the
+    /// A search, so [`ScheduleFilter::app_scope`] defaults to this handle's own plus the
     /// unclaimed rather than to every application's.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the

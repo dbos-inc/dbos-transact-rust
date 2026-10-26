@@ -643,12 +643,12 @@ impl Client {
     /// what namelessness means — the same scoping [`list_queues`](Self::list_queues) has.
     ///
     /// What an operator reads to find out which versions of the code have ever announced
-    /// themselves, and which one a workflow row's `application_version` refers to. A *named*
+    /// themselves, and which one a workflow row's `app_version` refers to. A *named*
     /// client answers that question for its own application only — a peer's versions are not in
     /// the listing, and nothing here reads them, which is why a tool that has to see every
     /// application leaves [`app_name`](ClientConfig::app_name) unset. Python and TypeScript scope
     /// their listing the same way, and take no target either.
-    pub async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
+    pub async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
         self.0
             .sysdb()
             .list_application_versions()
@@ -660,7 +660,7 @@ impl Client {
     ///
     /// Scoped to this client's application, or across all of them when it is nameless. Latest by
     /// its registered timestamp rather than by creation, which is how a rollback is expressed.
-    pub async fn latest_application_version(&self) -> Result<Option<VersionInfo>> {
+    pub async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
         self.0
             .sysdb()
             .get_latest_application_version(self.0.app_name())
@@ -670,7 +670,7 @@ impl Client {
 
     /// Promotes an already-registered version to be the latest, by moving its timestamp to now.
     ///
-    /// The write half of [`latest_application_version`](Self::latest_application_version), and how
+    /// The write half of [`latest_app_version`](Self::latest_app_version), and how
     /// a rolling deploy is steered from outside the fleet: the latest version is chosen by
     /// timestamp rather than by creation order, so promoting an older one is a **rollback** — the
     /// executors running it start dequeuing again, and an enqueue that names no version goes to it.
@@ -684,7 +684,7 @@ impl Client {
     /// Scoped to this client's application, as every write here is. Promoting a version another
     /// application registered fails rather than moving it — a timestamp is what a peer's fleet is
     /// rolling on, so it is not this client's to move without saying so. Saying so is
-    /// [`set_latest_application_version_for`](Self::set_latest_application_version_for).
+    /// [`set_latest_app_version_for`](Self::set_latest_app_version_for).
     ///
     /// **That scoping needs the client to have a name.** A client configured without an
     /// [`app_name`](ClientConfig::app_name) has nothing to be refused under, so it
@@ -694,10 +694,10 @@ impl Client {
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
     /// // Roll the fleet back to the version before the bad deploy.
-    /// client.set_latest_application_version("1.4.2").await?;
+    /// client.set_latest_app_version("1.4.2").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn set_latest_application_version(&self, version_name: &str) -> Result<()> {
+    pub async fn set_latest_app_version(&self, version_name: &str) -> Result<()> {
         self.0
             .sysdb()
             .update_application_version_timestamp(version_name, Timestamp::now(), self.0.app_name())
@@ -707,7 +707,7 @@ impl Client {
 
     /// Promotes a version on behalf of the application that registered it.
     ///
-    /// [`set_latest_application_version`](Self::set_latest_application_version) promotes within
+    /// [`set_latest_app_version`](Self::set_latest_app_version) promotes within
     /// this client's own application; this one names the application to act as, which is what lets
     /// a single operator tool roll several applications on a shared system database without
     /// connecting a client per application.
@@ -726,21 +726,17 @@ impl Client {
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
     /// // One operator tool, rolling a peer application back.
-    /// client.set_latest_application_version_for("1.4.2", "billing").await?;
+    /// client.set_latest_app_version_for("1.4.2", "billing").await?;
     /// # Ok(()) }
     /// ```
-    pub async fn set_latest_application_version_for(
+    pub async fn set_latest_app_version_for(
         &self,
         version_name: &str,
-        application_name: &str,
+        app_name: &str,
     ) -> Result<()> {
         self.0
             .sysdb()
-            .update_application_version_timestamp(
-                version_name,
-                Timestamp::now(),
-                Some(application_name),
-            )
+            .update_application_version_timestamp(version_name, Timestamp::now(), Some(app_name))
             .await
             .map_err(Error::SystemDatabase)
     }

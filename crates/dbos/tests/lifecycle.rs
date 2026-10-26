@@ -72,7 +72,7 @@ async fn launching_registers_the_application_version() {
         .expect("read failed")
         .expect("launch should have registered a version");
     assert_eq!(latest.version_name, version);
-    assert_eq!(latest.application_name.as_deref(), Some("version-app"));
+    assert_eq!(latest.app_name.as_deref(), Some("version-app"));
 
     dbos.shutdown().await;
 }
@@ -206,7 +206,7 @@ async fn two_applications_sharing_a_database_own_their_own_versions() {
             .expect("read failed")
             .expect("a version should be registered");
         assert_eq!(latest.version_name, expected);
-        assert_eq!(latest.application_name.as_deref(), Some(app));
+        assert_eq!(latest.app_name.as_deref(), Some(app));
     }
 
     one.shutdown().await;

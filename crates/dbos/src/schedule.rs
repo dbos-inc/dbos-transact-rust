@@ -212,7 +212,7 @@ pub struct ScheduleSpec {
     ///
     /// A client with no application name and no name here writes an **unclaimed** schedule,
     /// which every application sharing the database fires.
-    pub application_name: Option<String>,
+    pub app_name: Option<String>,
 }
 
 impl ScheduleSpec {
@@ -255,7 +255,7 @@ impl ScheduleSpec {
             automatic_backfill: false,
             cron_timezone: None,
             queue_name: None,
-            application_name: None,
+            app_name: None,
         })
     }
 
@@ -301,7 +301,7 @@ impl ScheduleSpec {
             automatic_backfill: self.automatic_backfill,
             cron_timezone: self.cron_timezone.as_deref(),
             queue_name: self.queue_name.as_deref(),
-            application_name: self.application_name.as_deref(),
+            application_name: self.app_name.as_deref(),
             ..NewSchedule::new(&self.schedule_name, &self.workflow.name, &self.schedule)
         }
     }
@@ -391,7 +391,7 @@ pub struct Schedule {
     automatic_backfill: bool,
     cron_timezone: Option<String>,
     queue_name: Option<String>,
-    application_name: Option<String>,
+    app_name: Option<String>,
 }
 
 /// Two views are equal when they read the same row: which serializer reads the context is not
@@ -410,7 +410,7 @@ impl PartialEq for Schedule {
             automatic_backfill,
             cron_timezone,
             queue_name,
-            application_name,
+            app_name,
         } = self;
         *id == other.id
             && *schedule_name == other.schedule_name
@@ -422,7 +422,7 @@ impl PartialEq for Schedule {
             && *automatic_backfill == other.automatic_backfill
             && *cron_timezone == other.cron_timezone
             && *queue_name == other.queue_name
-            && *application_name == other.application_name
+            && *app_name == other.app_name
     }
 }
 
@@ -448,7 +448,7 @@ impl Schedule {
             automatic_backfill: record.automatic_backfill,
             cron_timezone: record.cron_timezone,
             queue_name: record.queue_name,
-            application_name: record.application_name,
+            app_name: record.application_name,
         }
     }
 
@@ -515,8 +515,8 @@ impl Schedule {
 
     /// The application that owns the schedule, or `None` if it is unclaimed and every
     /// application sharing the database fires it.
-    pub fn application_name(&self) -> Option<&str> {
-        self.application_name.as_deref()
+    pub fn app_name(&self) -> Option<&str> {
+        self.app_name.as_deref()
     }
 }
 
@@ -1336,7 +1336,7 @@ mod tests {
         assert!(schedule.automatic_backfill());
         assert_eq!(schedule.cron_timezone(), Some("Europe/Paris"));
         assert_eq!(schedule.queue_name(), Some("reports"));
-        assert_eq!(schedule.application_name(), Some("app"));
+        assert_eq!(schedule.app_name(), Some("app"));
     }
 
     /// JSON, reversed: text only this serializer reads.

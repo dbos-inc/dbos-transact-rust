@@ -56,7 +56,7 @@
 //! **Only searches and sweeps carry it.** Anything addressed by workflow id — cancel, resume,
 //! delete, fork, the messaging verbs — does not: an id is a global address, so asking for one by
 //! id is an identity read, and answering "no such workflow" for one that plainly exists would be
-//! a lie. See [`Applications`] for how a caller overrides the default.
+//! a lie. See [`AppScope`] for how a caller overrides the default.
 
 // The two halves of the wakeup path, both of which are this backend's rather than the trait's:
 // `LISTEN`/`NOTIFY` is PostgreSQL's, and CockroachDB has neither it nor `pg_notify`. The registry
@@ -83,10 +83,10 @@ use std::time::Duration;
 
 use super::types::step_names;
 use super::types::{
-    ApplicationRowCounts, Applications, AwaitedOutcome, AwaitedStream, Change, DatabaseTime,
-    Debounce, DebounceHolder, DebounceRequest, DequeueStop, Dequeued, EncodedValue, EventRecord,
-    Fork, ForkOptions, ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller,
-    Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
+    AppScope, ApplicationRowCounts, AwaitedOutcome, AwaitedStream, Change, DatabaseTime, Debounce,
+    DebounceHolder, DebounceRequest, DequeueStop, Dequeued, EncodedValue, EventRecord, Fork,
+    ForkOptions, ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message,
+    NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
     PollingConcurrency, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
     RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
     StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue,
@@ -2266,7 +2266,7 @@ fn version_from_row(row: &sqlx::postgres::PgRow) -> Result<VersionInfo, Error> {
         version_name: row.try_get("version_name")?,
         version_timestamp: Timestamp::from_epoch_ms(row.try_get("version_timestamp")?),
         created_at: Timestamp::from_epoch_ms(row.try_get("created_at")?),
-        application_name: row.try_get("application_name")?,
+        app_name: row.try_get("application_name")?,
     })
 }
 
@@ -2290,7 +2290,7 @@ fn workflow_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Erro
         error: row.try_get("error")?,
         serialization: row.try_get("serialization")?,
         executor_id: row.try_get("executor_id")?,
-        application_version: row.try_get("application_version")?,
+        app_version: row.try_get("application_version")?,
         // `recovery_attempts` is BIGINT; reading it as i64 is exact on both backends.
         recovery_attempts: row
             .try_get::<Option<i64>, _>("recovery_attempts")?
@@ -2311,8 +2311,8 @@ fn workflow_from_row(row: &sqlx::postgres::PgRow) -> Result<WorkflowRecord, Erro
             .unwrap_or(false),
 
         owner_xid: row.try_get("owner_xid")?,
-        application_name: row.try_get("application_name")?,
-        application_id: row.try_get("application_id")?,
+        app_name: row.try_get("application_name")?,
+        app_id: row.try_get("application_id")?,
         authenticated_user: row.try_get("authenticated_user")?,
         authenticated_roles: decode_roles(
             row.try_get::<Option<String>, _>("authenticated_roles")?,
@@ -3557,19 +3557,19 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // would be a lie. Any other query is a search, and a search that has not said
                     // whose workflows it wants means its own. Prefixes are searches, so they do not
                     // count as id-keyed.
-                    match &filter.applications {
-                        Applications::Any => {}
-                        Applications::Named(names) if names.is_empty() => {}
-                        Applications::Named(names) => {
+                    match &filter.app_scope {
+                        AppScope::Any => {}
+                        AppScope::Named(names) if names.is_empty() => {}
+                        AppScope::Named(names) => {
                             clause(&mut q, "(application_name = ANY(");
                             q.push_bind(&names[..])
                                 .push(") OR application_name IS NULL)");
                         }
-                        Applications::Unset if !filter.workflow_ids.is_empty() => {}
+                        AppScope::Unset if !filter.workflow_ids.is_empty() => {}
                         // A handle with no application of its own has nothing to scope to, so it
                         // sees every application's rows rather than only the unclaimed ones — which
                         // is what `application_name = NULL` would have matched.
-                        Applications::Unset => {
+                        AppScope::Unset => {
                             if let Some(name) = application_name {
                                 clause(&mut q, "(application_name = ");
                                 q.push_bind(name).push(" OR application_name IS NULL)");
@@ -3581,7 +3581,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     any_of!(&filter.class_names[..], "class_name");
                     any_of!(&filter.config_names[..], "config_name");
                     any_of!(status, "status");
-                    any_of!(&filter.application_versions[..], "application_version");
+                    any_of!(&filter.app_versions[..], "application_version");
                     any_of!(&filter.executor_ids[..], "executor_id");
                     any_of!(&filter.authenticated_users[..], "authenticated_user");
                     any_of!(&filter.queue_names[..], "queue_name");
@@ -7065,10 +7065,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn list_queues(
-        &self,
-        applications: &Applications<'_>,
-    ) -> Result<Vec<QueueRecord>, Error> {
+    async fn list_queues(&self, applications: &AppScope<'_>) -> Result<Vec<QueueRecord>, Error> {
         let queues_table = self.tables.queues.as_str();
         let pool = &self.pool;
         let application_name = self.application_name.as_deref();
@@ -7078,14 +7075,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             q.push(QUEUE_COLUMNS).push(" FROM ").push(queues_table);
             // A search, so an unset scope means this application's own plus the unclaimed.
             match applications {
-                Applications::Any => {}
-                Applications::Named(names) if names.is_empty() => {}
-                Applications::Named(names) => {
+                AppScope::Any => {}
+                AppScope::Named(names) if names.is_empty() => {}
+                AppScope::Named(names) => {
                     q.push(" WHERE (application_name = ANY(")
                         .push_bind(&names[..])
                         .push(") OR application_name IS NULL)");
                 }
-                Applications::Unset => {
+                AppScope::Unset => {
                     if let Some(name) = application_name {
                         q.push(" WHERE (application_name = ")
                             .push_bind(name)
@@ -7603,15 +7600,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                         q.push(")");
                     }
                     // A search, so an unset scope means this application's own plus the unclaimed.
-                    match &filter.applications {
-                        Applications::Any => {}
-                        Applications::Named(names) if names.is_empty() => {}
-                        Applications::Named(names) => {
+                    match &filter.app_scope {
+                        AppScope::Any => {}
+                        AppScope::Named(names) if names.is_empty() => {}
+                        AppScope::Named(names) => {
                             q.push(" AND (application_name = ANY(")
                                 .push_bind(&names[..])
                                 .push(") OR application_name IS NULL)");
                         }
-                        Applications::Unset => {
+                        AppScope::Unset => {
                             if let Some(name) = application_name {
                                 q.push(" AND (application_name = ")
                                     .push_bind(name)

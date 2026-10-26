@@ -146,7 +146,7 @@ async fn a_rewound_workflow_runs_again_under_the_same_id() {
     let after = row(&reader, id).await;
     assert_eq!(after.status, WorkflowStatus::Success);
     assert_eq!(
-        after.application_version, before.application_version,
+        after.app_version, before.app_version,
         "a rewind with no version keeps the one the workflow had"
     );
     assert_eq!(after.created_at, before.created_at);
@@ -672,7 +672,7 @@ async fn a_rewind_chooses_the_queue_and_version_the_rerun_gets() {
     let parked = row(&reader, id).await;
     assert_eq!(parked.queue_name.as_deref(), Some(INTERNAL_QUEUE));
     assert_eq!(parked.queue_partition_key, None, "the old key is not kept");
-    assert_eq!(parked.application_version.as_deref(), Some("not-deployed"));
+    assert_eq!(parked.app_version.as_deref(), Some("not-deployed"));
 
     // The internal queue is polled here, but only for this executor's version.
     tokio::time::sleep(Duration::from_secs(2)).await;

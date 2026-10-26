@@ -25,7 +25,7 @@ use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::instance::DBOS;
 use crate::sysdb::types::{
-    Applications, Change, NewQueue, OnExistingQueue, QueueRecord, QueueUpdate, RateLimit,
+    AppScope, Change, NewQueue, OnExistingQueue, QueueRecord, QueueUpdate, RateLimit,
     has_partition_limit,
 };
 use crate::sysdb::{Error as SysdbError, INTERNAL_QUEUE};
@@ -751,7 +751,7 @@ impl Connection {
     pub(crate) async fn list_queues(&self) -> Result<Vec<Queue>> {
         Ok(self
             .sysdb()
-            .list_queues(&Applications::Unset)
+            .list_queues(&AppScope::Unset)
             .await
             .map_err(Error::SystemDatabase)?
             .into_iter()

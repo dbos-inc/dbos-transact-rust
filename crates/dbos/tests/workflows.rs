@@ -62,7 +62,7 @@ async fn a_workflow_runs_and_records_its_output() {
     assert_eq!(row.input.as_deref(), Some("21"));
     assert_eq!(row.serialization.as_deref(), Some("rust_serde"));
     assert_eq!(
-        row.application_version.as_deref(),
+        row.app_version.as_deref(),
         Some(&*dbos.app_version().unwrap())
     );
     assert_eq!(row.executor_id.as_deref(), Some("local"));

@@ -150,14 +150,15 @@ impl Executor {
 
     /// The version of the application's code, as workflow rows record it.
     ///
-    /// **`app_` here, `application_` in `sysdb`**, and the two meet at exactly this call: the
-    /// engine names the pair [`app_name`](Self::app_name) and `app_version`, matching
+    /// **`app_` here, `application_` in the rows `sysdb` writes**, and the two meet at exactly
+    /// this call: the API names the pair [`app_name`](Self::app_name) and `app_version`, matching
     /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV) and the `DBOS__APPVERSION` every
-    /// implementation reads, while `sysdb` spells them `application_name` and
-    /// `application_version` because those are the columns' own names. The conversion happens
-    /// where a value crosses into a `sysdb` type — `NewWorkflow { application_version:
-    /// Some(executor.app_version()), .. }` — which is the same boundary every other schema word
-    /// stops at.
+    /// implementation reads — and so do the `sysdb` types the API hands back, such as
+    /// [`WorkflowRecord`](crate::sysdb::types::WorkflowRecord) — while the `sysdb` types only the
+    /// engine writes spell them `application_name` and `application_version` because those are
+    /// the columns' own names. The conversion happens where a value crosses into such a type —
+    /// `NewWorkflow { application_version: Some(executor.app_version()), .. }` — which is the
+    /// same boundary every other schema word stops at.
     pub fn app_version(&self) -> &str {
         &self.app_version
     }

@@ -371,6 +371,10 @@ impl fmt::Display for WorkflowStatus {
 /// [`Error::Malformed`]: not a retryable class, raised on the
 /// replay path, so the workflow can never get past that step. Unknown fields are already
 /// tolerated, `serde` ignoring them by default, so the reverse direction needs nothing.
+///
+/// For the same reason a field spelled differently from its column — `app_version`, `app_id`,
+/// `app_name` — is serialized under the column's name, which is the key a recorded listing
+/// already holds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowRecord {
     /// Primary key, and the identity a caller uses everywhere else.
@@ -403,8 +407,8 @@ pub struct WorkflowRecord {
     #[serde(default)]
     pub executor_id: Option<String>,
     /// Application version that created it, used to keep recovery on compatible code.
-    #[serde(default)]
-    pub application_version: Option<String>,
+    #[serde(default, rename = "application_version")]
+    pub app_version: Option<String>,
     /// Recovery attempts so far, against the dead-letter limit.
     #[serde(default)]
     pub recovery_attempts: i64,
@@ -441,8 +445,8 @@ pub struct WorkflowRecord {
     #[serde(default)]
     pub owner_xid: Option<String>,
     /// Deployment identifier, for installations running several applications.
-    #[serde(default)]
-    pub application_id: Option<String>,
+    #[serde(default, rename = "application_id")]
+    pub app_id: Option<String>,
     /// User on whose behalf the workflow runs.
     #[serde(default)]
     pub authenticated_user: Option<String>,
@@ -463,8 +467,8 @@ pub struct WorkflowRecord {
     /// Unclaimed means no application has taken it — a row written before any implementation
     /// supported ownership, or by a handle with no application of its own. Every application may
     /// run it, and the first to dequeue it claims it.
-    #[serde(default)]
-    pub application_name: Option<String>,
+    #[serde(default, rename = "application_name")]
+    pub app_name: Option<String>,
 
     // ── Queueing ───────────────────────────────────────────────────────────────
     /// Deduplication key within the queue. At most one live workflow may hold a given key.
@@ -1026,9 +1030,9 @@ mod tests {
 /// later tidy-up that sees an empty list and a missing one as the same thing.
 ///
 /// Unclaimed rows are matched in every case: they belong to no application, so they belong to all
-/// of them. See [`Applications::Named`] for the one exception that is not.
+/// of them. See [`AppScope::Named`] for the one exception that is not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Applications<'a> {
+pub enum AppScope<'a> {
     /// Let the query decide, which is what a caller who has not thought about it wants.
     ///
     /// A **search** scopes to the handle's own application: listing workflows without saying whose
@@ -1041,7 +1045,7 @@ pub enum Applications<'a> {
     Any,
     /// These applications, plus the unclaimed rows.
     ///
-    /// An empty list is [`Applications::Any`] rather than "no applications": there is no useful
+    /// An empty list is [`AppScope::Any`] rather than "no applications": there is no useful
     /// query for rows belonging to none of the applications you named, and reading it as a
     /// narrowing would make an unfiltered UI silently show nothing.
     Named(Vec<&'a str>),
@@ -1053,7 +1057,7 @@ pub enum Applications<'a> {
 /// `WorkflowFilter::default()` lists everything. List fields match any of their entries and are
 /// ignored when empty; `Option<bool>` fields are three-valued, where `None` does not filter.
 ///
-/// [`applications`](Self::applications) is the exception, and deliberately so: its default scopes
+/// [`app_scope`](Self::app_scope) is the exception, and deliberately so: its default scopes
 /// to the caller's own application rather than to everything.
 ///
 /// The set is the union of all four implementations, which do not agree on it: each carries a
@@ -1064,7 +1068,7 @@ pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
     ///
     /// Supplying any makes this an id-keyed read, which changes what
-    /// [`applications`](Self::applications) defaults to — see [`Applications::Unset`].
+    /// [`app_scope`](Self::app_scope) defaults to — see [`AppScope::Unset`].
     pub workflow_ids: Vec<&'a str>,
     /// Workflow ids starting with any of these.
     ///
@@ -1073,7 +1077,7 @@ pub struct WorkflowFilter<'a> {
     pub workflow_id_prefixes: Vec<&'a str>,
 
     /// Whose workflows to list. Defaults to the caller's own application plus unclaimed ones.
-    pub applications: Applications<'a>,
+    pub app_scope: AppScope<'a>,
 
     /// Registered function names.
     pub names: Vec<&'a str>,
@@ -1085,7 +1089,7 @@ pub struct WorkflowFilter<'a> {
     pub status: Vec<WorkflowStatus>,
 
     /// Application versions.
-    pub application_versions: Vec<&'a str>,
+    pub app_versions: Vec<&'a str>,
     /// Executors that claimed the workflow.
     pub executor_ids: Vec<&'a str>,
     /// Authenticated principals at submission.
@@ -1167,12 +1171,12 @@ impl Default for WorkflowFilter<'_> {
         Self {
             workflow_ids: Vec::new(),
             workflow_id_prefixes: Vec::new(),
-            applications: Applications::Unset,
+            app_scope: AppScope::Unset,
             names: Vec::new(),
             class_names: Vec::new(),
             config_names: Vec::new(),
             status: Vec::new(),
-            application_versions: Vec::new(),
+            app_versions: Vec::new(),
             executor_ids: Vec::new(),
             authenticated_users: Vec::new(),
             queue_names: Vec::new(),
@@ -2201,11 +2205,11 @@ impl DequeueStop {
 /// A registered version of the application.
 ///
 /// The registry is what lets a firing schedule stamp the *latest* version, so only executors
-/// running that code dequeue it, and what `application_version` on a workflow row refers to.
+/// running that code dequeue it, and what [`WorkflowRecord::app_version`] refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionInfo {
     /// The application that registered this version, or `None` if it is unclaimed.
-    pub application_name: Option<String>,
+    pub app_name: Option<String>,
     /// Generated identity, distinct from the name.
     pub version_id: String,
     /// The version as the application names it — the value stored on workflow rows.
@@ -3109,7 +3113,7 @@ impl ScheduleUpdate<'_> {
 
 /// Which schedules a listing returns.
 ///
-/// Every field narrows; an empty filter returns the table. `applications` takes the
+/// Every field narrows; an empty filter returns the table. `app_scope` takes the
 /// *observability* form — unset means the reading handle's own plus the unclaimed — because this
 /// is a search rather than an addressed read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3121,5 +3125,5 @@ pub struct ScheduleFilter<'a> {
     /// Only schedules whose name starts with one of these, or every name when empty.
     pub schedule_name_prefixes: Vec<&'a str>,
     /// Which applications' schedules to return.
-    pub applications: Applications<'a>,
+    pub app_scope: AppScope<'a>,
 }

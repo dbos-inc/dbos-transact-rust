@@ -1154,7 +1154,7 @@ impl DBOS {
     /// implementations wide.
     ///
     /// The filter defaults to **this application's workflows plus unclaimed ones**, not to every
-    /// application sharing the database; [`Applications::Any`](crate::sysdb::types::Applications)
+    /// application sharing the database; [`AppScope::Any`](crate::sysdb::types::AppScope)
     /// is the operator's cross-application view. Naming ids explicitly widens it on its own, since
     /// a workflow id is a global address rather than a search.
     ///

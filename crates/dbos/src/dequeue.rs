@@ -33,8 +33,7 @@ use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    Applications, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord,
-    WorkflowStatus,
+    AppScope, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus,
 };
 use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
 
@@ -243,7 +242,7 @@ async fn refresh_queue_set(
     queues: &Queues,
     warned_internal: &mut bool,
 ) -> Vec<String> {
-    let listed = match executor.sysdb().list_queues(&Applications::Unset).await {
+    let listed = match executor.sysdb().list_queues(&AppScope::Unset).await {
         Ok(listed) => listed,
         Err(error) => {
             tracing::warn!(error = %error, "could not list queues; keeping the current set");

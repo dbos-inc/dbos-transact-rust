@@ -133,7 +133,7 @@ async fn schedules_are_created_read_listed_and_deleted() {
     assert_eq!(record.last_fired_at(), None);
     assert!(!record.automatic_backfill());
     assert_eq!(record.queue_name(), None);
-    assert_eq!(record.application_name(), Some("sched-crud-app"));
+    assert_eq!(record.app_name(), Some("sched-crud-app"));
 
     assert!(
         dbos.get_schedule("no-such-schedule")
@@ -570,11 +570,8 @@ async fn a_schedule_fires_on_its_timezone_and_records_each_tick() {
     assert!(runs.len() >= 2);
     for run in &runs {
         assert_eq!(run.schedule_name.as_deref(), Some("fire-utc"));
-        assert_eq!(run.application_name.as_deref(), Some("sched-fire-app"));
-        assert_eq!(
-            run.application_version.as_deref(),
-            Some("sched-fire-app-1.0.0")
-        );
+        assert_eq!(run.app_name.as_deref(), Some("sched-fire-app"));
+        assert_eq!(run.app_version.as_deref(), Some("sched-fire-app-1.0.0"));
     }
     let record = dbos.get_schedule("fire-utc").await.unwrap().unwrap();
     assert!(
@@ -925,7 +922,7 @@ async fn an_application_fires_its_own_schedules_and_unclaimed_ones_only() {
         .unwrap()
         .into_iter()
         .fold(HashMap::new(), |mut counts, run| {
-            *counts.entry(run.application_name).or_default() += 1;
+            *counts.entry(run.app_name).or_default() += 1;
             counts
         });
     assert_eq!(
@@ -961,10 +958,7 @@ async fn a_run_is_stamped_with_the_owners_latest_version() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        row.application_version.as_deref(),
-        Some("sched-version-app-2.0.0")
-    );
+    assert_eq!(row.app_version.as_deref(), Some("sched-version-app-2.0.0"));
     dbos.shutdown().await;
 }
 
@@ -997,7 +991,7 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(record.application_name(), Some("sched-client-app"));
+    assert_eq!(record.app_name(), Some("sched-client-app"));
     assert_eq!(
         client
             .list_schedules(&ScheduleFilter::default())

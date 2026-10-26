@@ -204,7 +204,7 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
     assert_eq!(row.queue_name.as_deref(), Some("work"));
     assert_eq!(row.input.as_deref(), Some("\"payload\""));
     assert_eq!(
-        row.application_name.as_deref(),
+        row.app_name.as_deref(),
         Some("client-rows"),
         "a named client owns what it writes"
     );
@@ -213,7 +213,7 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
         "a client claims nothing: the executor that dequeues it stamps its own id"
     );
     assert_eq!(
-        row.application_version, None,
+        row.app_version, None,
         "a client has no version of its own to pin the row to"
     );
     assert_eq!(row.priority, 0, "unprioritised is stored as the sentinel");
@@ -267,11 +267,11 @@ async fn every_option_reaches_the_row() {
     assert_eq!(row.class_name.as_deref(), Some("Billing"));
     assert_eq!(row.config_name.as_deref(), Some("eu"));
     assert_eq!(
-        row.application_name.as_deref(),
+        row.app_name.as_deref(),
         Some("some-other-app"),
         "an enqueue may hand work to an application this client is not"
     );
-    assert_eq!(row.application_version.as_deref(), Some("v1.2.3"));
+    assert_eq!(row.app_version.as_deref(), Some("v1.2.3"));
     assert_eq!(row.timeout, Some(Duration::from_secs(90)));
     assert_eq!(
         row.deadline, None,
@@ -313,7 +313,7 @@ async fn a_nameless_client_writes_unclaimed_rows() {
         .await
         .expect("read failed")
         .expect("the row is missing");
-    assert_eq!(row.application_name, None);
+    assert_eq!(row.app_name, None);
 
     client.close().await;
 }
@@ -982,10 +982,7 @@ async fn a_client_reads_application_versions() {
     dbos.launch().await.expect("launch failed");
 
     let client = client("client-versions", &db).await;
-    let versions = client
-        .list_application_versions()
-        .await
-        .expect("list failed");
+    let versions = client.list_app_versions().await.expect("list failed");
     assert_eq!(
         versions
             .iter()
@@ -995,7 +992,7 @@ async fn a_client_reads_application_versions() {
     );
     assert_eq!(
         client
-            .latest_application_version()
+            .latest_app_version()
             .await
             .expect("read failed")
             .expect("a version was registered at launch")
@@ -1029,7 +1026,7 @@ async fn a_client_promotes_an_older_version_to_roll_a_deploy_back() {
     let client = client("client-promote", &db).await;
     let latest = async || {
         client
-            .latest_application_version()
+            .latest_app_version()
             .await
             .expect("read failed")
             .expect("a version was registered at launch")
@@ -1038,14 +1035,14 @@ async fn a_client_promotes_an_older_version_to_roll_a_deploy_back() {
     assert_eq!(latest().await, "v2", "the newer deployment is the latest");
 
     client
-        .set_latest_application_version("v1")
+        .set_latest_app_version("v1")
         .await
         .expect("promote failed");
     assert_eq!(latest().await, "v1", "promoting rolls the fleet back");
 
     // Promotion moves a timestamp; it registers nothing.
     let mut names = client
-        .list_application_versions()
+        .list_app_versions()
         .await
         .expect("list failed")
         .into_iter()
@@ -1084,7 +1081,7 @@ async fn a_client_promotes_a_version_for_a_named_application() {
     let peer = client("promote-peer", &db).await;
     let latest = async |client: &dbos::Client| {
         client
-            .latest_application_version()
+            .latest_app_version()
             .await
             .expect("read failed")
             .expect("a version was registered at launch")
@@ -1094,13 +1091,13 @@ async fn a_client_promotes_a_version_for_a_named_application() {
     // Unnamed, the call is scoped to this client's own application, so a peer's version is not its
     // to move.
     assert!(
-        own.set_latest_application_version("p1").await.is_err(),
+        own.set_latest_app_version("p1").await.is_err(),
         "promoting a peer's version without naming the peer should be refused"
     );
     assert_eq!(latest(&peer).await, "p2", "the refusal moved nothing");
 
     // Naming the peer is what makes it legal.
-    own.set_latest_application_version_for("p1", "promote-peer")
+    own.set_latest_app_version_for("p1", "promote-peer")
         .await
         .expect("promote failed");
     assert_eq!(latest(&peer).await, "p1", "the peer rolled back");
