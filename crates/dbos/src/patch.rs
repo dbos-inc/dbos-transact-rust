@@ -84,7 +84,15 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
 /// A workflow is recovered and dequeued only by an executor running the application version that
 /// started it, so new code reaches the old code's executions only if both run under one version.
 /// Patching therefore goes with keeping [`Config::app_version`](crate::Config::app_version) the
-/// same across the deployments that patch.
+/// same across the deployments that patch. Patches with different names need no versions of their
+/// own: each marker is matched by its name at its position.
+///
+/// **The protection runs one way.** New code meeting the old code's history takes the old path,
+/// but old code meeting a history new code has patched finds the marker where it expects one of its
+/// own steps, and fails with an unexpected step. While old and new executors share the version
+/// during a rolling deployment, an old executor can recover or dequeue an execution the new code
+/// already patched, so finish rolling the new code out before relying on the patch, or expect
+/// such an execution to fail if an old executor picks it up.
 ///
 /// Giving each deployment its own version is the other way to change a workflow's code, and it
 /// needs no patch: executors of the old version keep running until they have finished the old
