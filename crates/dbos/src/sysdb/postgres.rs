@@ -4925,14 +4925,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         // still true of the row the winner just took and its `RETURNING` hands the same message
         // back.
         //
-        // **Between two executions at one step it is defence in depth rather than the
-        // arbitration**, because the taking and the step record share a transaction: a loser that
-        // gets past this predicate still conflicts on the step and rolls its consumption back.
-        // Worth keeping for that case anyway — it makes the loser's `UPDATE` a no-op instead of a
-        // redundant write, and it means correctness does not rest on the step insert being the
-        // thing that fails. **Between two receives at different steps it is the arbitration**:
-        // their step records cannot collide, so without it both would hand back the one message.
-        // Matching nothing is also what tells the loser to go back to waiting.
+        // **It is defence in depth rather than the arbitration**, because the taking and the step
+        // record share a transaction: a loser that gets past this predicate still conflicts on the
+        // step and rolls its consumption back. Worth keeping anyway — it makes the loser's `UPDATE`
+        // a no-op instead of a redundant write, and it means correctness does not rest on the step
+        // insert being the thing that fails.
         //
         // The destination and topic are *not* restated out here, though Python, TypeScript and Java
         // all restate them: `message_uuid` is the primary key, so the row the subquery names
@@ -4997,8 +4994,8 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         /// What one take came back with.
         enum Take {
-            /// The step's answer, recorded: the message this take consumed, what another execution
-            /// recorded at this step, or `None` once the deadline has passed.
+            /// The step's answer, recorded: the message this take consumed, what was already
+            /// recorded at this step when the take began, or `None` once the deadline has passed.
             Answered(Option<EncodedValue>),
             /// Nothing to consume and time still left. Nothing was recorded, so the wait goes on.
             Missed,
@@ -5055,12 +5052,19 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // reports a timeout for a message that was delivered to nobody. A take that records
                 // nothing has consumed nothing either, which is what lets it run more than once.
                 //
-                // No isolation level is pinned, unlike TypeScript's explicit `READ COMMITTED`. On
-                // PostgreSQL that is the default, the consume's predicate arbitrates, and the
-                // re-check below sees what the arbitration's winner committed. On CockroachDB the
-                // default is `SERIALIZABLE`, which aborts the loser instead — `40001`, which the
-                // retry policy replays as a conflict, so it comes back round, finds nothing
-                // unconsumed, and goes back to waiting as a loser on PostgreSQL does.
+                // **The owner check serialises takes.** Every take of this workflow opens by
+                // locking its row, so two takes — two steps of one execution, or one step in two
+                // executions — run one after the other. A take that waited on that lock reads the
+                // steps and the messages only once the take before it has committed, so its step
+                // check sees a same-step rival's record and adopts it, and its consume never
+                // reaches for a message the other has taken.
+                //
+                // No isolation level is pinned. On PostgreSQL the default is `READ COMMITTED`, and
+                // each statement sees what committed before it began, which is what the lock above
+                // relies on. On CockroachDB the default is
+                // `SERIALIZABLE`, which may abort the loser instead — `40001`, which the retry
+                // policy replays as a conflict, so it comes back round and sees the winner's
+                // commit as a PostgreSQL loser would.
                 let take = with_retry(&self.retry, "recv", move || async move {
                     let mut tx = pool.begin().await?;
                     // First, so a refusal rolls the consume back with it: the message stays for the
@@ -5076,8 +5080,9 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                     // The check that opened this call cannot stand in for this one: the wait
                     // between them is exactly when another execution of this workflow would have
-                    // recorded its own answer. Same transaction as the write, so there is no window
-                    // between deciding to take a message and taking it.
+                    // recorded its own answer. After the owner check and in the same transaction as
+                    // the write, so a rival's take has either committed and is seen here, or waits
+                    // for this one to finish.
                     if let Some(step) = self
                         .check_step_on(&mut tx, workflow_id, step_id, step_names::RECV)
                         .await?
@@ -5104,31 +5109,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                         None => None,
                     };
 
+                    // Nothing to consume: the message the probe saw went to a take that ran
+                    // first. Before the deadline that is no answer, so nothing is recorded and the
+                    // wait goes on. The clock is asked now rather than before the take, since the
+                    // owner check can wait on another take for as long as that one runs, and a take
+                    // that started with time left may get here without any.
                     if message.is_none() {
-                        // **Asked again, because the consume can outlast the check above.** A
-                        // consume that waited on another transaction's lock on the message, and
-                        // found it taken once that committed, may have lost it to another execution
-                        // of this workflow at this same step, which recorded its answer in the
-                        // commit it waited on. At READ COMMITTED each statement reads what was
-                        // committed when it began, so this one sees that record where the check
-                        // above could not. Adopting it here is the only prompt way to learn of it:
-                        // nothing wakes a receive for a step record, so a loser left to the loop
-                        // would wait out its whole timeout and only then find it.
-                        if let Some(step) = self
-                            .check_step_on(&mut tx, workflow_id, step_id, step_names::RECV)
-                            .await?
-                        {
-                            tx.commit().await?;
-                            tracing::debug!(workflow_id, step_id = step_id, "replaying recv");
-                            return Ok(Take::Answered(step.output.map(|value| EncodedValue {
-                                value,
-                                serialization: step.serialization,
-                            })));
-                        }
-
-                        // Asked of the clock now rather than before the take, since the consume
-                        // can wait on a lock for as long as its holder keeps it, and a take that
-                        // started with time left may finish without any.
                         let time_left = deadline
                             .duration_since(Timestamp::now())
                             .is_some_and(|left| !left.is_zero());
@@ -5175,14 +5161,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                     Ok(Take::Answered(message))
                 })
                 .await?;
-                match take {
-                    Take::Answered(answer) => return Ok(answer),
-                    // Straight back to the probe rather than to the wait: if another message is
-                    // already there it is this receive's, and if none is the probe says so and the
-                    // wait follows. The probe sees only committed consumes, so the message just
-                    // lost is not seen again.
-                    Take::Missed => continue,
+                if let Take::Answered(answer) = take {
+                    return Ok(answer);
                 }
+                // Missed: straight back to the probe rather than to the wait. If another message
+                // is already there it is this receive's; if none is, the probe says so and the
+                // wait follows. The probe sees only committed consumes, so the message just lost
+                // is not seen again.
+                continue;
             }
 
             let _ = tokio::time::timeout(
