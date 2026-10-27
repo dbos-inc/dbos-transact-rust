@@ -11,7 +11,7 @@ use serde_json::json;
 use dbos::{
     Client, ClientConfig, Config, CustomSerializer, DBOS, EngineOnly, Error, Payload, PayloadSlot,
     QueueConflict, QueueOptions, ReadStreamOptions, ScheduleSpec, ScheduledWorkflowInput,
-    SerializationFormat, Serializer, SetEventOptions, StartOptions, WorkflowKey, WorkflowOptions,
+    SerializationFormat, Serializer, SetEventOptions, StartOptions, WorkflowOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -321,7 +321,7 @@ async fn native_and_portable_still_write_the_built_ins() {
     ));
     let native = dbos
         .register_workflow_with(
-            WorkflowKey::new("native"),
+            "native",
             WorkflowOptions {
                 serialization: SerializationFormat::Native,
             },
@@ -517,7 +517,7 @@ async fn a_recovered_workflow_replays_what_it_recorded() {
     let portable_child = {
         let runs = Arc::clone(&runs);
         dbos.register_workflow_with(
-            WorkflowKey::new("portable_child"),
+            "portable_child",
             WorkflowOptions {
                 serialization: SerializationFormat::Portable,
             },

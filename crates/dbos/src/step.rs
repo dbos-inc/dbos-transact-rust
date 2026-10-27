@@ -856,7 +856,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::sysdb::types::{NewWorkflow, StepRecord};
-    use crate::{Config, DBOS};
+    use crate::{Config, DBOS, WorkflowKey};
 
     /// A launched instance and a workflow row to hang steps off.
     ///
@@ -1072,7 +1072,7 @@ mod tests {
 
         let failing = || async {
             Err::<(), crate::Error>(Error::NotRegistered {
-                key: "checkout/Checkout/eu".to_owned(),
+                key: WorkflowKey::instance("checkout", "Checkout", "eu"),
             })
         };
         let first = Ctx::scope(ctx(&dbos, "wf-variant"), async {
@@ -1088,7 +1088,9 @@ mod tests {
         let again = again.unwrap_err();
 
         match &again {
-            Error::NotRegistered { key } => assert_eq!(key, "checkout/Checkout/eu"),
+            Error::NotRegistered { key } => {
+                assert_eq!(key, &WorkflowKey::instance("checkout", "Checkout", "eu"));
+            }
             other => panic!("the variant did not survive the round trip: {other:?}"),
         }
         assert_eq!(again.to_string(), first.to_string());

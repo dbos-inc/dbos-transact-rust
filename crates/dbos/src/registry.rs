@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_input, encode};
+use crate::sysdb::types::WorkflowRecord;
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -82,7 +83,7 @@ pub struct WorkflowOptions {
 /// keys on the name alone with instances in a separate map, Go on a derived FQN qualified by the
 /// config name, Java on the whole `{name}/{class}/{instance}` string — but all three *store* these
 /// three columns, so keying on them directly is the shape that reads back from any of them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowKey {
     /// The workflow's name. Required.
     pub name: String,
@@ -167,10 +168,33 @@ impl From<String> for WorkflowKey {
     }
 }
 
+/// A free function's key — see the `&str` conversion.
+impl From<&String> for WorkflowKey {
+    fn from(name: &String) -> Self {
+        Self::new(name)
+    }
+}
+
 /// A copy of a key held elsewhere, so a stored key can be passed by reference.
 impl From<&WorkflowKey> for WorkflowKey {
     fn from(key: &WorkflowKey) -> Self {
         key.clone()
+    }
+}
+
+impl WorkflowRecord {
+    /// The key this row's workflow runs under, or `None` for a row that names no workflow.
+    ///
+    /// Read the way recovery and dequeue read it, with `NULL` and `""` alike, so a row another
+    /// language wrote resolves to the same key as one Rust wrote. Pass it back to
+    /// [`Client::enqueue`](crate::Client::enqueue) to run the same workflow again.
+    pub fn key(&self) -> Option<WorkflowKey> {
+        let name = self.name.as_deref().filter(|name| !name.is_empty())?;
+        Some(WorkflowKey::from_row(
+            name,
+            self.class_name.as_deref(),
+            self.config_name.as_deref(),
+        ))
     }
 }
 
@@ -230,7 +254,7 @@ impl Registry {
         }
         match state.workflows.entry(key) {
             Entry::Occupied(taken) => Err(Error::AlreadyRegistered {
-                key: taken.key().to_string(),
+                key: taken.key().clone(),
             }),
             Entry::Vacant(slot) => {
                 slot.insert(workflow);
@@ -330,7 +354,12 @@ impl<P, R, E> std::fmt::Debug for WorkflowRef<P, R, E> {
 }
 
 impl DBOS {
-    /// Registers a workflow, returning a typed handle to it.
+    /// Registers a workflow under `key`, returning a typed handle to it.
+    ///
+    /// The key is the workflow's identity: a name alone for a free function, or a
+    /// [`WorkflowKey`] naming a class and a configured instance too. Its name, class and config
+    /// are what a [`Client`](crate::Client) enqueues by and what recovery and dequeue resolve a
+    /// row against.
     ///
     /// Only before [`launch`](DBOS::launch): the executor holds a snapshot of the registry, so a
     /// registration afterwards would be invisible to recovery and to dequeue — which is worse than
@@ -351,23 +380,7 @@ impl DBOS {
     /// leaks one instance, which for a process that launches once is a bounded cost.
     pub fn register_workflow<P, R, E, F, Fut>(
         &self,
-        name: &str,
-        workflow: F,
-    ) -> Result<WorkflowRef<P, R, E>>
-    where
-        F: Fn(P) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<R, E>> + Send + 'static,
-        P: Serialize + DeserializeOwned + Send + 'static,
-        R: Serialize + DeserializeOwned + Send + 'static,
-        E: DurableError,
-    {
-        self.register_workflow_as(WorkflowKey::new(name), workflow)
-    }
-
-    /// [`register_workflow`](DBOS::register_workflow) under a full identity triple.
-    pub fn register_workflow_as<P, R, E, F, Fut>(
-        &self,
-        key: WorkflowKey,
+        key: impl Into<WorkflowKey>,
         workflow: F,
     ) -> Result<WorkflowRef<P, R, E>>
     where
@@ -380,16 +393,16 @@ impl DBOS {
         self.register_workflow_with(key, WorkflowOptions::default(), workflow)
     }
 
-    /// [`register_workflow_as`](DBOS::register_workflow_as), with [`WorkflowOptions`].
+    /// [`register_workflow`](DBOS::register_workflow), with [`WorkflowOptions`].
     ///
     /// For a workflow other languages start or await, register it
     /// [portable](crate::SerializationFormat::Portable):
     ///
     /// ```no_run
-    /// # use dbos::{DBOS, SerializationFormat, WorkflowKey, WorkflowOptions};
+    /// # use dbos::{DBOS, SerializationFormat, WorkflowOptions};
     /// # fn example(dbos: &DBOS) -> dbos::Result<()> {
     /// let greet = dbos.register_workflow_with(
-    ///     WorkflowKey::new("greet"),
+    ///     "greet",
     ///     WorkflowOptions { serialization: SerializationFormat::Portable, ..Default::default() },
     ///     |name: String| async move { Ok::<_, dbos::Error>(format!("hello, {name}")) },
     /// )?;
@@ -397,7 +410,7 @@ impl DBOS {
     /// ```
     pub fn register_workflow_with<P, R, E, F, Fut>(
         &self,
-        key: WorkflowKey,
+        key: impl Into<WorkflowKey>,
         options: WorkflowOptions,
         workflow: F,
     ) -> Result<WorkflowRef<P, R, E>>
@@ -408,6 +421,7 @@ impl DBOS {
         R: Serialize + DeserializeOwned + Send + 'static,
         E: DurableError,
     {
+        let key = key.into();
         let workflow = Arc::new(workflow);
         let erased: ErasedWorkflow =
             Arc::new(move |input: Option<String>, encoding: PayloadEncoding| {
@@ -623,16 +637,20 @@ mod tests {
     #[test]
     fn one_identity_registers_once() {
         let dbos = dbos();
-        dbos.register_workflow("same", takes_nothing).unwrap();
-        let err = dbos.register_workflow("same", takes_nothing).unwrap_err();
-        assert!(matches!(err, Error::AlreadyRegistered { .. }), "{err}");
+        let key = WorkflowKey::instance("same", "Checkout", "eu");
+        dbos.register_workflow(&key, takes_nothing).unwrap();
+        let err = dbos.register_workflow(&key, takes_nothing).unwrap_err();
+        match err {
+            Error::AlreadyRegistered { key: taken } => assert_eq!(taken, key),
+            other => panic!("expected AlreadyRegistered, got {other}"),
+        }
     }
 
     #[test]
     fn a_name_and_an_instance_of_it_are_different_identities() {
         let dbos = dbos();
         dbos.register_workflow("shared", takes_nothing).unwrap();
-        dbos.register_workflow_as(
+        dbos.register_workflow(
             WorkflowKey::instance("shared", "Checkout", "eu"),
             takes_nothing,
         )
@@ -647,6 +665,43 @@ mod tests {
         let free = WorkflowKey::new("checkout");
         assert_eq!(WorkflowKey::from_row("checkout", None, None), free);
         assert_eq!(WorkflowKey::from_row("checkout", Some(""), Some("")), free);
+    }
+
+    #[test]
+    fn a_name_converts_to_a_free_functions_key() {
+        let free = WorkflowKey::new("checkout");
+        let name = "checkout".to_owned();
+        assert_eq!(WorkflowKey::from("checkout"), free);
+        assert_eq!(WorkflowKey::from(&name), free);
+        assert_eq!(WorkflowKey::from(name), free);
+
+        let instance = WorkflowKey::instance("checkout", "Checkout", "eu");
+        assert_eq!(WorkflowKey::from(&instance), instance);
+    }
+
+    #[test]
+    fn a_record_yields_its_key_and_a_nameless_record_none() {
+        let record = |row: serde_json::Value| -> WorkflowRecord {
+            let mut fields = serde_json::json!({ "workflow_id": "w", "status": "PENDING" });
+            fields
+                .as_object_mut()
+                .unwrap()
+                .extend(row.as_object().unwrap().clone());
+            serde_json::from_value(fields).unwrap()
+        };
+        let instance = record(serde_json::json!({
+            "name": "checkout", "class_name": "Checkout", "config_name": "eu",
+        }));
+        assert_eq!(
+            instance.key(),
+            Some(WorkflowKey::instance("checkout", "Checkout", "eu"))
+        );
+        let blank = record(serde_json::json!({
+            "name": "checkout", "class_name": "", "config_name": "",
+        }));
+        assert_eq!(blank.key(), Some(WorkflowKey::new("checkout")));
+        assert_eq!(record(serde_json::json!({})).key(), None);
+        assert_eq!(record(serde_json::json!({ "name": "" })).key(), None);
     }
 
     #[test]

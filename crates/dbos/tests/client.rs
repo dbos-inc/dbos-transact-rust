@@ -263,9 +263,10 @@ async fn every_option_reaches_the_row() {
         .await
         .expect("read failed")
         .expect("the row is missing");
-    assert_eq!(row.name.as_ref(), Some(&billing.name));
-    assert_eq!(row.class_name, billing.class_name);
-    assert_eq!(row.config_name, billing.config_name);
+    assert_eq!(row.name.as_deref(), Some("charge"));
+    assert_eq!(row.class_name.as_deref(), Some("Billing"));
+    assert_eq!(row.config_name.as_deref(), Some("eu"));
+    assert_eq!(row.key(), Some(billing));
     assert_eq!(
         row.app_name.as_deref(),
         Some("some-other-app"),

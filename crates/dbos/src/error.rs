@@ -18,6 +18,7 @@
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
 //! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
+use crate::registry::WorkflowKey;
 use crate::serialization::{PayloadEncoding, decode_error, encode_error};
 use std::borrow::Cow;
 
@@ -216,7 +217,7 @@ pub enum Error<E = EngineOnly> {
     #[error("a workflow is already registered as {key}")]
     AlreadyRegistered {
         /// The identity that was registered twice.
-        key: String,
+        key: WorkflowKey,
     },
 
     /// A value could not be encoded for the database.
@@ -278,7 +279,7 @@ pub enum Error<E = EngineOnly> {
     #[error("no workflow is registered as {key}")]
     NotRegistered {
         /// The identity that was looked up.
-        key: String,
+        key: WorkflowKey,
     },
 
     /// A workflow id resolved to no row at all.

@@ -2174,11 +2174,7 @@ async fn execute(
     let workflow = executor
         .workflows()
         .get(key)
-        .ok_or_else(|| {
-            Failure::Control(Error::NotRegistered {
-                key: key.to_string(),
-            })
-        })?
+        .ok_or_else(|| Failure::Control(Error::NotRegistered { key: key.clone() }))?
         .body
         .clone();
 
