@@ -515,13 +515,11 @@ impl Client {
             timeout: options.timeout,
             deadline: None,
             attributes: attributes.as_deref(),
+            is_debounced: debounce.is_some(),
+            debounce_deadline: debounce.and_then(|debounce| debounce.deadline),
             // Always `Some`: a client cannot run a workflow, so every enqueue it makes names a
             // queue — which is the difference from `start_with`, where the same base takes `None`.
             ..new_row(workflow_id, Some(&options.queue))
-        };
-        let new = match debounce {
-            Some(debounce) => debounce.mark(new),
-            None => new,
         };
 
         // A client has no step counter of its own, so an enqueue it makes records against no

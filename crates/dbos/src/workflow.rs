@@ -693,8 +693,8 @@ pub(crate) struct OwnedStart {
 }
 
 /// What makes a fresh enqueue a debounced one: the row goes in with `is_debounced` set, so the
-/// release from `DELAYED` clears its deduplication id, and with the cap no later bounce may push
-/// its release past.
+/// release from `DELAYED` clears its deduplication id, and with `debounce_deadline` set to the cap
+/// no later bounce may push its release past.
 ///
 /// The row's deduplication id and delay are an ordinary enqueue's, set on its [`Enqueue`]; this
 /// carries only the two columns no public option can write.
@@ -702,17 +702,6 @@ pub(crate) struct OwnedStart {
 pub(crate) struct Debounced {
     /// The latest instant a bounce may move the release to, or `None` for no cap.
     pub(crate) deadline: Option<Timestamp>,
-}
-
-impl Debounced {
-    /// `row`, marked debounced.
-    pub(crate) fn mark(self, row: NewWorkflow<'_>) -> NewWorkflow<'_> {
-        NewWorkflow {
-            is_debounced: true,
-            debounce_deadline: self.deadline,
-            ..row
-        }
-    }
 }
 
 /// An [`Enqueue`] with its strings owned, for the same reason [`OwnedStart`] is: see there.
@@ -1427,13 +1416,11 @@ pub(crate) async fn create<R, E>(
         timeout: timeout.budget(),
         deadline,
         attributes: attributes.as_deref(),
+        is_debounced: debounce.is_some(),
+        debounce_deadline: debounce.and_then(|debounce| debounce.deadline),
         // The queue's five columns, and nothing below spawns the row they describe: a queue's
         // whole point is that the process which asks is not necessarily the one that runs.
         ..new_row(&workflow_id, enqueue)
-    };
-    let new = match debounce {
-        Some(debounce) => debounce.mark(new),
-        None => new,
     };
 
     let initialized = match init_or_join(
