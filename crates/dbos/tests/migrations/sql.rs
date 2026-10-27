@@ -815,6 +815,66 @@ async fn the_corpus_applies_without_listen_notify() {
     );
 }
 
+/// Migrations 124 and 125 build the latest-version lookup's indexes: valid, not unique, keyed on
+/// `version_timestamp` newest first and on `(application_name, version_timestamp DESC)`, with no
+/// included columns, on both backends; and applying them again is harmless.
+#[tokio::test]
+async fn migrations_124_and_125_build_the_version_indexes() {
+    let db = raw_database().await;
+    let pool = db.pool().await;
+    let schema = dbos::sysdb::DEFAULT_SCHEMA;
+    dbos::sysdb::migrations::runner::run(&pool, schema, true)
+        .await
+        .expect("migration failed");
+    let again: Vec<Migration> = build_migrations(schema, dialect_for(db.backend()), true)
+        .into_iter()
+        .filter(|m| matches!(m.version, 124 | 125))
+        .collect();
+    assert_eq!(again.len(), 2);
+    apply_all(&pool, schema, &again).await;
+
+    for (index, expected) in [
+        (
+            "idx_application_versions_timestamp",
+            &["version_timestamp DESC"][..],
+        ),
+        (
+            "idx_application_versions_owner_timestamp",
+            &["application_name", "version_timestamp DESC"][..],
+        ),
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = $1 \
+             AND tablename = 'application_versions' AND indexname = $2",
+        )
+        .bind(schema)
+        .bind(index)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{index} is missing: {e}"));
+        let valid: bool = sqlx::query_scalar(
+            "SELECT ix.indisvalid FROM pg_index ix \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_namespace n ON n.oid = i.relnamespace \
+             WHERE n.nspname = $1 AND i.relname = $2",
+        )
+        .bind(schema)
+        .bind(index)
+        .fetch_one(&pool)
+        .await
+        .expect("failed to read the index's validity");
+        assert!(valid, "the index is invalid: {definition}");
+        assert!(
+            definition.starts_with("CREATE INDEX"),
+            "the index should not be unique: {definition}"
+        );
+
+        let (keys, included) = index_columns(&definition);
+        assert_eq!(keys, expected, "{definition}");
+        assert!(included.is_empty(), "{definition}");
+    }
+}
+
 /// Migration 123 adds `creator_xid`, a nullable text column with no default value, and applying
 /// it twice is harmless.
 #[tokio::test]

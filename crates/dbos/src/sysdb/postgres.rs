@@ -53,6 +53,11 @@
 //! of two. It is spelled out at each site rather than built by a helper, so the numbering is
 //! visible beside the binds it has to match.
 //!
+//! **The latest-version lookup is the exception.** `latest_version_sql` sends one statement for a
+//! handle with an application and another for one without, and runs the own and unclaimed parts
+//! as separate probes, so each reads one index entry rather than walking the version history past
+//! a peer's newer versions.
+//!
 //! **Only searches and sweeps carry it.** Anything addressed by workflow id — cancel, resume,
 //! delete, fork, the messaging verbs — does not: an id is a global address, so asking for one by
 //! id is an identity read, and answering "no such workflow" for one that plainly exists would be
@@ -1596,14 +1601,12 @@ impl PostgresSystemDatabase {
         application_version: &str,
     ) -> Result<bool, Error> {
         let versions_table = self.tables.application_versions.as_str();
-        let latest: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT version_name FROM {versions_table} \
-             WHERE ($1::text IS NULL OR application_name = $1 OR application_name IS NULL) \
-             ORDER BY version_timestamp DESC LIMIT 1"
-        )))
-        .bind(self.application_name.as_deref())
-        .fetch_optional(&mut *conn)
-        .await?;
+        let latest: Option<String> =
+            latest_version_query(versions_table, self.application_name.as_deref())
+                .fetch_optional(&mut *conn)
+                .await?
+                .map(|row| row.try_get("version_name"))
+                .transpose()?;
         Ok(latest.is_none_or(|name| name == application_version))
     }
 }
@@ -2125,6 +2128,52 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
 /// Every column of `application_versions` [`version_from_row`] reads.
 const VERSION_COLUMNS: &str =
     "version_id, version_name, version_timestamp, created_at, application_name";
+
+/// The newest version `application_name` sees in `versions_table`, as [`VERSION_COLUMNS`]: its own
+/// and unclaimed ones, or every application's when it has none.
+fn latest_version_query<'q>(
+    versions_table: &str,
+    application_name: Option<&'q str>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let query = sqlx::query(AssertSqlSafe(latest_version_sql(
+        versions_table,
+        application_name.is_some(),
+    )));
+    match application_name {
+        Some(application_name) => query.bind(application_name),
+        None => query,
+    }
+}
+
+/// [`latest_version_query`]'s statement against `versions_table`: with `named`, `$1` is the
+/// application name; without, it binds nothing.
+///
+/// Named, it finds the newest owned row and the newest unclaimed row separately and keeps the
+/// later of the two. A single filter with an `OR` would walk the timestamp index down from the
+/// newest row, past every newer version a peer has registered, so its cost would grow with the
+/// peers' history. Each probe here reads one entry of migration 125's
+/// `(application_name, version_timestamp DESC)` index instead. The `IS NULL` probe orders by the
+/// constant `application_name` as well, which is what lets it use that index too. Unnamed, it
+/// reads one entry of migration 124's timestamp index.
+///
+/// Two statements rather than one with `$1::text IS NULL OR …`, so no plan has to cover both.
+fn latest_version_sql(versions_table: &str, named: bool) -> String {
+    if !named {
+        return format!(
+            "SELECT {VERSION_COLUMNS} FROM {versions_table} ORDER BY version_timestamp DESC LIMIT 1"
+        );
+    }
+    format!(
+        "(SELECT {VERSION_COLUMNS} FROM {versions_table} \
+           WHERE application_name = $1 \
+           ORDER BY application_name, version_timestamp DESC LIMIT 1) \
+         UNION ALL \
+         (SELECT {VERSION_COLUMNS} FROM {versions_table} \
+           WHERE application_name IS NULL \
+           ORDER BY application_name, version_timestamp DESC LIMIT 1) \
+         ORDER BY version_timestamp DESC LIMIT 1"
+    )
+}
 
 /// The application a row keyed by name should end up owned by, having read which holds it now.
 ///
@@ -6156,16 +6205,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "get_latest_application_version",
             move || async move {
-                let row = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT {VERSION_COLUMNS} FROM {versions_table} \
-                     WHERE ($1::text IS NULL \
-                            OR application_name = $1 \
-                            OR application_name IS NULL) \
-                     ORDER BY version_timestamp DESC LIMIT 1"
-                )))
-                .bind(application_name)
-                .fetch_optional(pool)
-                .await?;
+                let row = latest_version_query(versions_table, application_name)
+                    .fetch_optional(pool)
+                    .await?;
                 row.as_ref().map(version_from_row).transpose()
             },
         )
@@ -8150,8 +8192,8 @@ impl PostgresSystemDatabase {
 mod tests {
     use super::{
         AssertSqlSafe, NOW_MS_SQL, PollingConcurrency, PostgresSystemDatabase, Settings,
-        classify_sqlstate, is_transport_failure, split_database, step_listing_query,
-        timed_out_sweep_sql, with_retry,
+        classify_sqlstate, is_transport_failure, latest_version_sql, split_database,
+        step_listing_query, timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
         EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Timestamp,
@@ -8654,6 +8696,223 @@ mod tests {
             let plan = plan.join("\n");
             assert!(!plan.contains("Seq Scan"), "{kind}: {plan}");
         }
+    }
+
+    /// A handle on `pool` acting for `application_name`.
+    fn versions_handle(
+        pool: &sqlx::PgPool,
+        application_name: Option<&str>,
+    ) -> PostgresSystemDatabase {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name,
+                ..Settings::default()
+            },
+        )
+    }
+
+    /// Registers `3 * per_owner` versions through `sys`'s table, `version-1` upward, each
+    /// timestamped and created at its number: the oldest third owned by `ours`, the middle third
+    /// unclaimed, and the newest third `peer`'s. So `ours` sees `version-{2 * per_owner}` as its
+    /// latest, and every version newer than that belongs to someone else.
+    async fn register_versions(sys: &PostgresSystemDatabase, pool: &sqlx::PgPool, per_owner: i64) {
+        let table = &sys.tables.application_versions;
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {table} \
+               (version_id, version_name, version_timestamp, created_at, application_name) \
+             SELECT g::text, 'version-' || g::text, g, g, \
+                    CASE WHEN g <= $1 THEN 'ours' WHEN g <= 2 * $1 THEN NULL ELSE 'peer' END \
+             FROM generate_series(1, 3 * $1) g"
+        )))
+        .bind(per_owner)
+        .execute(pool)
+        .await
+        .expect("insert failed");
+    }
+
+    /// **Each application sees its own and unclaimed versions**, or every one when it has no
+    /// name, and the dequeue agrees with the lookup on which is latest.
+    #[tokio::test]
+    async fn each_application_sees_its_own_and_unclaimed_versions() {
+        let db = dbos_test_support::test_database().await;
+        let pool = db.pool().await;
+        register_versions(&versions_handle(&pool, None), &pool, 10).await;
+        for (owner, expected) in [
+            (Some("ours"), "version-20"),
+            (Some("absent"), "version-20"),
+            (Some("peer"), "version-30"),
+            (None, "version-30"),
+        ] {
+            let sys = versions_handle(&pool, owner);
+            let latest = sys
+                .get_latest_application_version(None)
+                .await
+                .expect("lookup failed")
+                .expect("a version is registered");
+            assert_eq!(latest.version_name, expected, "{owner:?}");
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(
+                sys.is_latest_application_version(&mut conn, expected)
+                    .await
+                    .unwrap(),
+                "{owner:?}: the dequeue agrees"
+            );
+            assert!(
+                !sys.is_latest_application_version(&mut conn, "version-1")
+                    .await
+                    .unwrap(),
+                "{owner:?}"
+            );
+        }
+    }
+
+    /// **The latest version is found without walking the version history**: the lookup reads one
+    /// index entry per probe however many newer versions belong to a peer.
+    ///
+    /// Run with the values bound, as each lookup is, over 30,000 versions. Every scan must be an
+    /// index scan returning at most one row and filtering none out, and the whole statement must
+    /// touch only a handful of blocks; walking the timestamp index past the peer's 10,000 versions
+    /// touches far more. Vacuumed first, so dead index entries a pooled database kept from an
+    /// earlier lease don't count against it.
+    #[tokio::test]
+    async fn the_latest_version_is_found_without_walking_the_history() {
+        let db = dbos_test_support::test_database().await;
+        if db.backend() == dbos_test_support::Backend::Cockroach {
+            return; // CockroachDB's plans have another shape.
+        }
+        let pool = db.pool().await;
+        let unnamed = versions_handle(&pool, None);
+        let table = &unnamed.tables.application_versions;
+        register_versions(&unnamed, &pool, 10_000).await;
+        // `VACUUM` refuses a transaction block, so it is sent unprepared.
+        sqlx::raw_sql(AssertSqlSafe(format!("VACUUM ANALYZE {table}")))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for (owner, expected) in [
+            (Some("ours"), "version-20000"),
+            (Some("absent"), "version-20000"),
+            (Some("peer"), "version-30000"),
+            (None, "version-30000"),
+        ] {
+            let latest = versions_handle(&pool, owner)
+                .get_latest_application_version(None)
+                .await
+                .expect("lookup failed")
+                .expect("a version is registered");
+            assert_eq!(latest.version_name, expected, "{owner:?}");
+
+            let explain = sqlx::query(AssertSqlSafe(format!(
+                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {}",
+                latest_version_sql(table, owner.is_some())
+            )));
+            let explain = match owner {
+                Some(owner) => explain.bind(owner),
+                None => explain,
+            };
+            let row = explain.fetch_one(&pool).await.expect("EXPLAIN failed");
+            // The plan comes back as `json`, read here as its text.
+            let plan = sqlx::Row::try_get_raw(&row, 0).unwrap().as_str().unwrap();
+            let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+            let plan = &plan[0]["Plan"];
+            let blocks = plan["Shared Hit Blocks"].as_u64().unwrap()
+                + plan["Shared Read Blocks"].as_u64().unwrap();
+            assert!(blocks < 32, "{owner:?}: {blocks} blocks: {plan:#}");
+
+            fn nodes<'a>(node: &'a serde_json::Value, into: &mut Vec<&'a serde_json::Value>) {
+                into.push(node);
+                for child in node["Plans"].as_array().into_iter().flatten() {
+                    nodes(child, into);
+                }
+            }
+            let mut all = Vec::new();
+            nodes(plan, &mut all);
+            let scans: Vec<_> = all
+                .into_iter()
+                .filter(|node| node["Node Type"].as_str().unwrap().contains("Scan"))
+                .collect();
+            assert!(!scans.is_empty(), "{owner:?}: {plan:#}");
+            for scan in scans {
+                assert!(
+                    scan["Node Type"].as_str().unwrap().contains("Index"),
+                    "{owner:?}: {plan:#}"
+                );
+                let rows =
+                    scan["Actual Rows"].as_f64().unwrap() * scan["Actual Loops"].as_f64().unwrap();
+                assert!(rows <= 1.0, "{owner:?}: {plan:#}");
+                assert_eq!(
+                    scan["Rows Removed by Filter"].as_f64().unwrap_or(0.0),
+                    0.0,
+                    "{owner:?}: {plan:#}"
+                );
+            }
+        }
+    }
+
+    /// **Promoting a version and registering it again keep its identity and creation time**, and a
+    /// named handle can still look up a peer's latest without changing its own scope.
+    #[tokio::test]
+    async fn promotion_and_re_registration_keep_a_versions_identity() {
+        let db = dbos_test_support::test_database().await;
+        let pool = db.pool().await;
+        let sys = versions_handle(&pool, Some("ours"));
+        register_versions(&sys, &pool, 10).await;
+        sys.update_application_version_timestamp("version-1", Timestamp::from_epoch_ms(40), None)
+            .await
+            .expect("promotion failed");
+        let promoted = sys
+            .get_latest_application_version(None)
+            .await
+            .unwrap()
+            .expect("a version is registered");
+        assert_eq!(promoted.version_id, "1");
+        assert_eq!(promoted.version_name, "version-1");
+        assert_eq!(promoted.version_timestamp, Timestamp::from_epoch_ms(40));
+        assert_eq!(promoted.created_at, Timestamp::from_epoch_ms(1));
+        assert_eq!(promoted.app_name.as_deref(), Some("ours"));
+
+        sys.create_application_version("version-1", None)
+            .await
+            .expect("re-registration failed");
+        assert_eq!(
+            sys.get_latest_application_version(None).await.unwrap(),
+            Some(promoted)
+        );
+        let peer = sys
+            .get_latest_application_version(Some("peer"))
+            .await
+            .unwrap()
+            .expect("the peer has versions");
+        assert_eq!(peer.version_name, "version-30");
+    }
+
+    /// **An application that sees no versions has no latest**, and the dequeue counts any
+    /// version as the latest, as it does on a database that has never seen a deploy.
+    #[tokio::test]
+    async fn an_application_seeing_no_versions_has_no_latest() {
+        let db = dbos_test_support::test_database().await;
+        let pool = db.pool().await;
+        let sys = versions_handle(&pool, Some("absent"));
+        register_versions(&sys, &pool, 10).await;
+        let table = &sys.tables.application_versions;
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE application_name IS NULL"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sys.get_latest_application_version(None).await.unwrap(),
+            None
+        );
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            sys.is_latest_application_version(&mut conn, "anything")
+                .await
+                .unwrap()
+        );
     }
 
     /// An idle session ending inside a transaction is a lost connection, and asked again.
