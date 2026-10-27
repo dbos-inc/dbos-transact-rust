@@ -3441,10 +3441,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             // rather than runs, whatever has become of the row since: a row a timeout or a cancel
             // left without an owner is still not this caller's to run again.
             let should_execute = stored_creator.as_deref() == Some(creator_xid);
-            // A debounced row is always a new workflow: its input is the debounce's, and joining a
-            // workflow already under the id would drop that input and hand back a workflow the
-            // debounce never fed. Refused before anything is written, so the caller's record of
-            // the start does not land either.
+            // A debounce inserts only when its bounce found no waiting workflow to extend (repeated
+            // debounces of a key coalesce in the bounce, never here), so the row it writes must be
+            // a new workflow. If its id already names one, typically a reused
+            // `DebounceOptions::workflow_id`, joining it would drop this call's input and hand back
+            // a workflow the debounce never fed. Refused before anything is written, so the
+            // caller's record of the start does not land either.
             if workflow.is_debounced && !should_execute {
                 return Err(Error::ConflictingWorkflow {
                     workflow_id: workflow.workflow_id.to_owned(),
