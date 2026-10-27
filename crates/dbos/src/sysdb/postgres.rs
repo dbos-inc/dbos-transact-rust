@@ -7356,8 +7356,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                                  updated_at = {NOW_MS_SQL}, \
                                  application_name = COALESCE(application_name, $6) \
                              WHERE name = $1 AND queue_name = $2 AND deduplication_id = $3 \
-                               AND class_name IS NOT DISTINCT FROM $7 \
-                               AND config_name IS NOT DISTINCT FROM $8 \
+                               AND NULLIF(class_name, '') IS NOT DISTINCT FROM $7 \
+                               AND NULLIF(config_name, '') IS NOT DISTINCT FROM $8 \
                                AND status = 'DELAYED' AND is_debounced = TRUE \
                                AND ($6::text IS NULL OR application_name = $6 \
                                     OR application_name IS NULL) \
@@ -7370,7 +7370,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(request.serialization)
                         .bind(application_name)
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL
-                        // the enqueue stored rather than matching nothing, as `=` would.
+                        // the enqueue stored rather than matching nothing, as `=` would; and
+                        // `NULLIF`, so a row that spells one `''` is absent too, as
+                        // `WorkflowKey::from_row` reads it. The request's own parts are never
+                        // `""`: `DebounceRequest::validate` refuses that.
                         .bind(request.workflow.class_name.as_deref())
                         .bind(request.workflow.config_name.as_deref())
                         .fetch_optional(&mut *tx)

@@ -60,7 +60,10 @@ const RETRY_PAUSE: Duration = Duration::from_millis(100);
 /// workflow spelled as its key displays — `name`, `name/class` or `name/class/config`.
 ///
 /// The whole key, so two configured instances of one class, or a method and a free function of
-/// the same name, debounce one key independently rather than colliding on it.
+/// the same name, debounce one key independently rather than colliding on it. The parts are
+/// joined without escaping, so names that contain `/` or `-` can still spell the same id — a free
+/// function `a/b` and a method `a` of class `b`, or `a` with key `b-c` and `a-b` with key `c`.
+/// Such a collision is refused rather than extended: [`classify`] compares the holder's whole key.
 ///
 /// **The one place the spelling is written**, so changing it is a change here and nowhere else.
 /// Only a debounce that spells the id this way finds a workflow another debounce of the key
@@ -774,7 +777,8 @@ mod tests {
         })
     }
 
-    /// The spelling is `<workflow>-<key>`, which is what makes the two collide in the next test.
+    /// The spelling is `<workflow>-<key>`, which is what makes the two collide in
+    /// `a_bounce_is_classified_by_its_holder`.
     #[test]
     fn the_deduplication_id_is_the_workflow_then_the_key() {
         let free = |name: &str| WorkflowKey::new(name);
@@ -840,7 +844,8 @@ mod tests {
             classify(instance, &wf, Some("app")),
             Next::Raise("holder".to_owned())
         );
-        // A holder that spells an absent class or instance as `""` is the same workflow.
+        // A holder that spells an absent class or instance as `""` is the same workflow, which the
+        // bounce extends too; one it could not extend this time is between states.
         let blank = Debounce::Held(DebounceHolder {
             workflow_id: "holder".to_owned(),
             is_debounced: true,

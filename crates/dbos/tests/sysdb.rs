@@ -12980,6 +12980,73 @@ async fn a_bounce_refuses_an_empty_class_or_instance() {
     ));
 }
 
+/// A row that spells an absent class or instance `''` rather than NULL is the same workflow as
+/// one that stores NULL, so a bounce whose key has neither extends it.
+#[tokio::test]
+async fn a_bounce_extends_a_row_that_spells_an_absent_class_or_instance_empty() {
+    let (sys, db) = sysdb().await;
+    enqueue_debounced(
+        &sys,
+        "wf-blank",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+    enqueue_debounced(
+        &sys,
+        "wf-method",
+        "refund",
+        "cart-2",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+    // Another writer's spelling, which this layer refuses to write itself.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET class_name = '', config_name = ''
+           WHERE workflow_uuid = 'wf-blank'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET class_name = 'Checkout', config_name = ''
+           WHERE workflow_uuid = 'wf-method'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+
+    let pushed_to = Timestamp::from_epoch_ms(9_000_000_000);
+    assert_eq!(
+        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", pushed_to), None)
+            .await
+            .unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-blank".to_owned()
+        },
+    );
+    let method = WorkflowKey::method("refund", "Checkout");
+    assert_eq!(
+        sys.debounce_delayed_workflow(&bounce_as(&method, "cart-2", pushed_to), None)
+            .await
+            .unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-method".to_owned()
+        },
+    );
+    assert_eq!(
+        sys.get_workflow("wf-blank")
+            .await
+            .unwrap()
+            .unwrap()
+            .delay_until,
+        Some(pushed_to)
+    );
+}
+
 /// A bounce pushes the release out and replaces the inputs.
 #[tokio::test]
 async fn a_bounce_extends_the_delay_and_replaces_the_inputs() {
