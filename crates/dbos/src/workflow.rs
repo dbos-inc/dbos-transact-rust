@@ -1285,6 +1285,20 @@ where
 /// A dedup that joins an existing holder runs under a different id than this one, and that is not
 /// a disagreement: this is the id the start would create, which is exactly what a caller learns
 /// from and what a replay of this position derives again.
+fn child_workflow_id(chosen: Option<&str>, parent: Option<&Parent<'_>>) -> String {
+    match (chosen, parent) {
+        // An application-assigned id wins over the derivation, in every reference.
+        (Some(id), _) => id.to_owned(),
+        // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
+        // parent re-derives the same id, so the launch is idempotent even when the crash
+        // landed between creating the child and recording it. Rust's step ids are zero-based
+        // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
+        // so a first child is `parent-0` here and in three of the four.
+        (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
+        (None, None) => uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 /// [`child_workflow_id`] for a start whose placement is all the caller has: a workflow it is a
 /// child of where the placement claimed an id, and a root start everywhere else.
 pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement) -> String {
@@ -1299,20 +1313,6 @@ pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement
         StepPlacement::Outside
         | StepPlacement::InsideStep { .. }
         | StepPlacement::ClientConnection => child_workflow_id(chosen, None),
-    }
-}
-
-fn child_workflow_id(chosen: Option<&str>, parent: Option<&Parent<'_>>) -> String {
-    match (chosen, parent) {
-        // An application-assigned id wins over the derivation, in every reference.
-        (Some(id), _) => id.to_owned(),
-        // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
-        // parent re-derives the same id, so the launch is idempotent even when the crash
-        // landed between creating the child and recording it. Rust's step ids are zero-based
-        // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
-        // so a first child is `parent-0` here and in three of the four.
-        (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
-        (None, None) => uuid::Uuid::new_v4().to_string(),
     }
 }
 

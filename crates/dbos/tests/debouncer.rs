@@ -9,13 +9,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use dbos::sysdb::PORTABLE_JSON;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{Error as SysdbError, INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Client, ClientConfig, Config, DBOS, Debouncer, DebouncerClient, DuplicationPolicy, Enqueue,
-    EnqueueOptions, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout,
-    WorkflowHandle,
+    Client, ClientConfig, Config, DBOS, DebounceOptions, Debouncer, DebouncerClient,
+    DuplicationPolicy, Enqueue, EnqueueOptions, Error, QueueConflict, QueueOptions, RunOptions,
+    SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowKey,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -78,6 +79,20 @@ async fn result<R: serde::de::DeserializeOwned + Send + 'static>(handle: Workflo
         .expect("the workflow failed")
 }
 
+/// Per-call options pinning the fresh workflow's id.
+fn pinned(workflow_id: &str) -> DebounceOptions<'_> {
+    DebounceOptions {
+        workflow_id: Some(workflow_id),
+    }
+}
+
+fn is_conflicting(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::SystemDatabase(SysdbError::ConflictingWorkflow { .. })
+    )
+}
+
 fn is_deduplicated(error: &Error) -> bool {
     matches!(
         error,
@@ -122,14 +137,10 @@ async fn calls_within_the_period_coalesce_into_one_run_with_the_last_input() {
     assert_eq!(result(fourth).await, 3);
 
     // A pinned id names the workflow a debounce enqueues.
-    let pinned = Debouncer {
-        options: StartOptions {
-            workflow_id: Some("pinned-debounce"),
-            ..StartOptions::default()
-        },
-        ..debouncer.clone()
-    };
-    let handle = pinned.debounce("key", PERIOD, 4).await.unwrap();
+    let handle = debouncer
+        .debounce_with("key", PERIOD, 4, pinned("pinned-debounce"))
+        .await
+        .unwrap();
     assert_eq!(handle.workflow_id(), "pinned-debounce");
     assert_eq!(result(handle).await, 4);
 
@@ -158,14 +169,10 @@ async fn a_pinned_id_applies_only_to_a_fresh_workflow() {
 
     // Unpinned first, so the holder has a generated id; the pinned bounce leaves it alone.
     let holder = debouncer.debounce("key", FOREVER, 1).await.unwrap();
-    let pinned = Debouncer {
-        options: StartOptions {
-            workflow_id: Some("never-used"),
-            ..StartOptions::default()
-        },
-        ..debouncer.clone()
-    };
-    let bounced = pinned.debounce("key", FOREVER, 2).await.unwrap();
+    let bounced = debouncer
+        .debounce_with("key", FOREVER, 2, pinned("never-used"))
+        .await
+        .unwrap();
     assert_eq!(bounced.workflow_id(), holder.workflow_id());
     assert!(
         reader.get_workflow("never-used").await.unwrap().is_none(),
@@ -174,16 +181,17 @@ async fn a_pinned_id_applies_only_to_a_fresh_workflow() {
 
     // The same pinned id on both calls: the second bounces the first, and a short period
     // shortens the huge one so the workflow runs.
-    let same = Debouncer {
-        options: StartOptions {
-            workflow_id: Some("pinned-twice"),
-            ..StartOptions::default()
-        },
-        ..debouncer.clone()
-    };
-    let first = same.debounce("other", FOREVER, 3).await.unwrap();
-    let second = same
-        .debounce("other", Duration::from_millis(500), 4)
+    let first = debouncer
+        .debounce_with("other", FOREVER, 3, pinned("pinned-twice"))
+        .await
+        .unwrap();
+    let second = debouncer
+        .debounce_with(
+            "other",
+            Duration::from_millis(500),
+            4,
+            pinned("pinned-twice"),
+        )
         .await
         .unwrap();
     assert_eq!(first.workflow_id(), "pinned-twice");
@@ -194,6 +202,9 @@ async fn a_pinned_id_applies_only_to_a_fresh_workflow() {
 }
 
 /// The workflow waits for the period after the **last** call, not the first.
+///
+/// The first call holds the workflow back for days, so however slowly it runs it cannot let the
+/// workflow go before the second call arrives; the second call's period then shortens the delay.
 ///
 /// Timing-sensitive: asserts a lower bound only — the run starts no earlier than the last call
 /// plus the period, less a small allowance for clock granularity — so a slow machine cannot fail
@@ -217,7 +228,7 @@ async fn the_run_waits_for_the_period_after_the_last_call() {
     dbos.launch().await.expect("launch failed");
     let debouncer = Debouncer::new(&echo);
 
-    let first = debouncer.debounce("key", PERIOD, 1).await.unwrap();
+    let first = debouncer.debounce("key", FOREVER, 1).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     let last_call = Instant::now();
     let second = debouncer.debounce("key", PERIOD, 2).await.unwrap();
@@ -235,8 +246,8 @@ async fn the_run_waits_for_the_period_after_the_last_call() {
 }
 
 /// The debounce timeout caps the total delay: a workflow given a period of days still runs once
-/// the timeout is up, and the fresh row's delay is capped at its deadline from the start. A later
-/// bounce with a short period shortens a long one.
+/// the timeout is up, and the fresh row's release is capped at its deadline from the insert. A
+/// later bounce with a short period shortens a long one.
 ///
 /// Timing-sensitive only in waiting for the two-second timeout to pass, with a generous bound.
 #[tokio::test]
@@ -550,7 +561,7 @@ async fn a_bounce_inside_a_workflow_replays_without_bouncing_again() {
 /// period is long enough that every call lands before the release, however slowly they run.
 #[tokio::test]
 async fn concurrent_debounces_of_one_key_coalesce_onto_one_workflow() {
-    const RACE_PERIOD: Duration = Duration::from_secs(5);
+    const RACE_PERIOD: Duration = Duration::from_secs(30);
     let db = test_database().await;
     let app = "debounce-race-app";
     let dbos = DBOS::new(config(app, &db));
@@ -601,8 +612,8 @@ async fn concurrent_debounces_of_one_key_coalesce_onto_one_workflow() {
     dbos.shutdown().await;
 }
 
-/// Each option a debounce owns is refused, from an application and from a client, and nothing is
-/// written. So is a zero period.
+/// Each option a debounce owns is refused, from an app and from a client, and nothing is written.
+/// So are a zero period, a `workflow_id` stored on the debouncer, and an empty `app_name`.
 #[tokio::test]
 async fn each_option_a_debounce_owns_is_refused() {
     let db = test_database().await;
@@ -692,6 +703,57 @@ async fn each_option_a_debounce_owns_is_refused() {
             .unwrap_err(),
         "period",
     );
+
+    // A pinned id stored on a debouncer would name every workflow it enqueues: refused by its
+    // public name, pointing at the per-call form.
+    let stored_id = Debouncer {
+        options: StartOptions {
+            workflow_id: Some("stored"),
+            ..StartOptions::default()
+        },
+        ..Debouncer::new(&echo)
+    };
+    refused(
+        stored_id.debounce("k", PERIOD, 1).await.unwrap_err(),
+        "options.workflow_id",
+    );
+    let stored_id = DebouncerClient::new(
+        &client,
+        "echo",
+        EnqueueOptions {
+            workflow_id: Some("stored"),
+            ..EnqueueOptions::new(INTERNAL_QUEUE)
+        },
+    );
+    let error = stored_id
+        .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
+        .await
+        .unwrap_err();
+    refused(error, "debounce_with");
+
+    // An empty app name is refused as the API spells it, not as the column it would fill.
+    let error = Debouncer {
+        app_name: Some(""),
+        ..Debouncer::new(&echo)
+    }
+    .debounce("k", PERIOD, 1)
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("application_name"), "{error}");
+    refused(error, "`app_name`");
+    let error = DebouncerClient::new(
+        &client,
+        "echo",
+        EnqueueOptions {
+            app_name: Some(""),
+            ..EnqueueOptions::new(INTERNAL_QUEUE)
+        },
+    )
+    .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("application_name"), "{error}");
+    refused(error, "`app_name`");
 
     assert!(
         rows_named(&reader, "echo").await.is_empty(),
@@ -828,15 +890,17 @@ async fn the_client_debouncer_coalesces_and_honours_its_options() {
     assert_eq!(third.workflow_id(), fourth.workflow_id());
     assert_eq!(result(fourth).await, 3);
 
-    let pinned = DebouncerClient {
+    let timed = DebouncerClient {
         options: EnqueueOptions {
-            workflow_id: Some("client-pinned"),
             timeout: Some(Duration::from_secs(5)),
             ..EnqueueOptions::new("client-queue")
         },
         ..debouncer.clone()
     };
-    let handle: WorkflowHandle<u32> = pinned.debounce("key", PERIOD, 4).await.unwrap();
+    let handle: WorkflowHandle<u32> = timed
+        .debounce_with("key", PERIOD, 4, pinned("client-pinned"))
+        .await
+        .unwrap();
     assert_eq!(handle.workflow_id(), "client-pinned");
     assert_eq!(result(handle).await, 4);
     let ran = row(&reader, "client-pinned").await;
@@ -952,4 +1016,318 @@ async fn a_bounce_claims_an_unclaimed_holder_and_another_application_collides() 
     for client in [nameless, app_a, app_b] {
         client.close().await;
     }
+}
+
+/// A pinned id names one workflow: once the first cycle's workflow has run, a second fresh
+/// debounce under the same id fails with a conflict rather than joining the finished workflow and
+/// dropping its input. The same debounce without the pin starts a fresh workflow, from an app and
+/// from a client.
+#[tokio::test]
+async fn a_pinned_id_reused_after_its_workflow_ran_is_a_conflict_not_a_join() {
+    let db = test_database().await;
+    let app = "debounce-pinned-cycles-app";
+    let dbos = DBOS::new(config(app, &db));
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+    let client = client(Some(app), &db).await;
+    let short = Duration::from_millis(500);
+
+    let debouncer = Debouncer::new(&echo);
+    let first = debouncer
+        .debounce_with("key", short, 1, pinned("pinned-cycle"))
+        .await
+        .unwrap();
+    assert_eq!(first.workflow_id(), "pinned-cycle");
+    assert_eq!(result(first).await, 1);
+
+    // The key is free again, so this enqueues fresh, under an id the finished workflow holds.
+    let error = debouncer
+        .debounce_with("key", short, 2, pinned("pinned-cycle"))
+        .await
+        .unwrap_err();
+    assert!(is_conflicting(&error), "{error}");
+    let finished = row(&reader, "pinned-cycle").await;
+    assert_eq!(finished.status, WorkflowStatus::Success);
+    assert_eq!(finished.deduplication_id, None, "the release freed the key");
+    // So is another key's fresh enqueue under the same id.
+    let error = debouncer
+        .debounce_with("another-key", short, 3, pinned("pinned-cycle"))
+        .await
+        .unwrap_err();
+    assert!(is_conflicting(&error), "{error}");
+    assert_eq!(
+        rows_named(&reader, "echo").await.len(),
+        1,
+        "nothing new was written"
+    );
+
+    // Without the pin, the next cycle is a fresh workflow.
+    let fresh = debouncer.debounce("key", short, 4).await.unwrap();
+    assert_ne!(fresh.workflow_id(), "pinned-cycle");
+    assert_eq!(result(fresh).await, 4);
+
+    // The client refuses the same way.
+    let through_client = DebouncerClient::new(&client, "echo", EnqueueOptions::new(INTERNAL_QUEUE));
+    let error = through_client
+        .debounce_with::<_, u32, dbos::EngineOnly>("key", short, 5, pinned("pinned-cycle"))
+        .await
+        .unwrap_err();
+    assert!(is_conflicting(&error), "{error}");
+    let fresh: WorkflowHandle<u32> = through_client
+        .debounce_with("key", short, 6, pinned("client-pinned-cycle"))
+        .await
+        .unwrap();
+    assert_eq!(fresh.workflow_id(), "client-pinned-cycle");
+    assert_eq!(result(fresh).await, 6);
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// A debounce cannot be made from inside a step, as a start cannot.
+#[tokio::test]
+async fn a_debounce_inside_a_step_is_refused() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("debounce-in-step-app", &db));
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let debouncer: Debouncer<'static, u32, u32> = Debouncer::new(&echo);
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let debouncer = debouncer.clone();
+            async move {
+                dbos::step::<String, dbos::EngineOnly, _, _>("tries_to_debounce", || {
+                    let debouncer = debouncer.clone();
+                    async move {
+                        let handle = debouncer.debounce("key", FOREVER, 1).await?;
+                        Ok(handle.workflow_id().to_owned())
+                    }
+                })
+                .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+
+    let error = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("debounces-in-a-step"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect_err("the parent succeeded");
+    assert!(
+        matches!(&error, Error::InsideStep { operation } if operation.contains("debounc")),
+        "expected an inside-a-step refusal, got {error:?}"
+    );
+    assert!(
+        rows_named(&reader, "echo").await.is_empty(),
+        "nothing was debounced"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A key held by an ordinary enqueue, met from inside a workflow, is the deduplication error; a
+/// replay reads the bounce's checkpoint back and raises it again, even once the key is free,
+/// rather than bouncing again and enqueueing a workflow the first run never did.
+#[tokio::test]
+async fn a_deduplicated_debounce_inside_a_workflow_replays_its_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("debounce-replay-dedup-app", &db));
+    let queue = "replay-dedup-queue";
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let debouncer: Debouncer<'static, u32, u32> = Debouncer {
+        options: StartOptions {
+            queue: Some(Enqueue::new(queue)),
+            ..StartOptions::default()
+        },
+        ..Debouncer::new(&echo)
+    };
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let debouncer = debouncer.clone();
+            async move {
+                match debouncer.debounce("key", PERIOD, 2).await {
+                    Ok(handle) => Ok::<_, Error>(format!("debounced {}", handle.workflow_id())),
+                    Err(e @ Error::SystemDatabase(SysdbError::QueueDeduplicated { .. })) => {
+                        Ok(format!("deduplicated: {e}"))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+
+    // The queue is not registered yet, so nothing dequeues the holder and the key stays held.
+    let holder = echo
+        .start_with(
+            1,
+            StartOptions {
+                queue: Some(Enqueue {
+                    deduplication_id: Some("echo-key"),
+                    ..Enqueue::new(queue)
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the holder was not enqueued");
+
+    let parent_id = "deduplicated-debouncing-parent";
+    let first = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(parent_id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert!(first.starts_with("deduplicated: "), "{first}");
+    assert!(first.contains(holder.workflow_id()), "{first}");
+    let steps = reader
+        .list_workflow_steps(parent_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    assert_eq!(steps.len(), 1, "only the bounce is recorded: {steps:?}");
+    assert_eq!(steps[0].step_name, "DBOS.debounce_delayed_workflow");
+
+    // Let the holder run, which frees the key.
+    dbos.register_queue(
+        queue,
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    assert_eq!(result(holder).await, 1);
+
+    // A fork past the bounce copies its checkpoint: the same error, and no debounced workflow.
+    let replayed = dbos
+        .fork::<String, Error>(parent_id, 1)
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        tokio::time::timeout(WAIT, replayed.result())
+            .await
+            .expect("the replay never finished")
+            .expect("the replay failed"),
+        first,
+        "the replay took a different branch from the run it replayed"
+    );
+    assert_eq!(
+        rows_named(&reader, "echo").await.len(),
+        1,
+        "the replay did not bounce again and enqueue"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A bounce in another encoding than the waiting row's replaces the input and its serialization
+/// tag together, so the run decodes the last input in the encoding it was written in.
+#[tokio::test]
+async fn a_portable_bounce_over_a_native_row_replaces_input_and_tag_together() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("debounce-portable-app", &db));
+    let echo = dbos
+        .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+
+    let native = Debouncer::new(&echo);
+    let portable = Debouncer {
+        options: StartOptions {
+            queue: Some(Enqueue {
+                serialization: SerializationFormat::Portable,
+                ..Enqueue::new(INTERNAL_QUEUE)
+            }),
+            ..StartOptions::default()
+        },
+        ..Debouncer::new(&echo)
+    };
+
+    let first = native.debounce("key", FOREVER, 1).await.unwrap();
+    let before = row(&reader, first.workflow_id()).await;
+    assert_ne!(before.serialization.as_deref(), Some(PORTABLE_JSON));
+
+    // FOREVER again, so the row stays `DELAYED` while it is read.
+    let second = portable.debounce("key", FOREVER, 2).await.unwrap();
+    assert_eq!(second.workflow_id(), first.workflow_id(), "coalesced");
+    let after = row(&reader, first.workflow_id()).await;
+    assert_eq!(after.status, WorkflowStatus::Delayed);
+    assert_eq!(after.serialization.as_deref(), Some(PORTABLE_JSON));
+    assert_ne!(after.input, before.input, "the input was replaced");
+
+    // A short period releases it; the run decodes the portable input.
+    let third = portable
+        .debounce("key", Duration::from_millis(500), 3)
+        .await
+        .unwrap();
+    assert_eq!(third.workflow_id(), first.workflow_id());
+    assert_eq!(result(third).await, 3);
+
+    dbos.shutdown().await;
+}
+
+/// A workflow registered under a class and a configured instance debounces under its full
+/// identity: calls for the same instance coalesce and its row carries both, while another
+/// instance whose key spells the same deduplication id is refused rather than extending it.
+#[tokio::test]
+async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("debounce-instance-app", &db));
+    let key = |config: &str| WorkflowKey::instance("echo", "Billing", config);
+    let eu = dbos
+        .register_workflow_as(key("eu"), |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let us = dbos
+        .register_workflow_as(
+            key("us"),
+            |x: u32| async move { Ok::<u32, Error>(x + 1000) },
+        )
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+
+    let eu_debouncer = Debouncer::new(&eu);
+    let first = eu_debouncer.debounce("key", FOREVER, 1).await.unwrap();
+    let held = row(&reader, first.workflow_id()).await;
+    assert_eq!(held.class_name.as_deref(), Some("Billing"));
+    assert_eq!(held.config_name.as_deref(), Some("eu"));
+    assert!(held.is_debounced);
+
+    let error = Debouncer::new(&us)
+        .debounce("key", PERIOD, 2)
+        .await
+        .unwrap_err();
+    assert!(is_deduplicated(&error), "{error}");
+
+    let second = eu_debouncer
+        .debounce("key", Duration::from_millis(500), 3)
+        .await
+        .unwrap();
+    assert_eq!(second.workflow_id(), first.workflow_id());
+    assert_eq!(
+        result(second).await,
+        3,
+        "the eu instance ran, with the last input"
+    );
+
+    dbos.shutdown().await;
 }

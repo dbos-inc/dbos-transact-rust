@@ -123,7 +123,8 @@ pub trait SystemDatabase: Send + Sync {
     /// **A row already there is left as it is**, and reported: its status, its deadline and how
     /// its payloads are encoded. A different function under the same id is an error (name, class
     /// and config must match); a differing queue is only a warning, since requeueing elsewhere is
-    /// legitimate.
+    /// legitimate. A [debounced](types::NewWorkflow::is_debounced) row is never joined: one already
+    /// under its id is [`Error::ConflictingWorkflow`].
     ///
     /// **Two tokens.** Each call generates a creator token, once, before any retry the
     /// implementation makes, and a new row records it as `creator_xid`. The caller should run the

@@ -573,6 +573,9 @@ pub struct NewWorkflow<'a> {
     /// `now + delay` would put its clock skew into the row.
     pub delay: Option<Duration>,
     /// Marks `deduplication_id` as a debounce key to clear on the `DELAYED` → `ENQUEUED` move.
+    ///
+    /// A debounced row must be new: an existing workflow under the id is
+    /// [`Error::ConflictingWorkflow`] rather than joined.
     pub is_debounced: bool,
     /// How far past the insert a debounce may push the release: the debounce deadline, as a
     /// duration.
