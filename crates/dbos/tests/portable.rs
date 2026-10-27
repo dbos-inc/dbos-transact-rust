@@ -175,12 +175,9 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
     let args: PortableWorkflowArgs = serde_json::from_str(GOLDEN_INPUTS_JSON).unwrap();
     let handle = client
         .enqueue_portable::<CanonicalOutput, EngineOnly>(
-            "canonicalWorkflow",
+            WorkflowKey::method("canonicalWorkflow", "interop"),
             args,
-            EnqueueOptions {
-                class_name: Some("interop"),
-                ..EnqueueOptions::new(QUEUE)
-            },
+            EnqueueOptions::new(QUEUE),
         )
         .await
         .unwrap();

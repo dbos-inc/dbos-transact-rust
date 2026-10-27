@@ -127,6 +127,15 @@ impl WorkflowKey {
         }
     }
 
+    /// A class-bound workflow's key, with no configured instance.
+    pub fn method(name: impl Into<String>, class_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            class_name: Some(class_name.into()),
+            config_name: None,
+        }
+    }
+
     /// A configured instance's key.
     ///
     /// A config name never appears without a class name — true in every reference, and enforced
@@ -141,6 +150,27 @@ impl WorkflowKey {
             class_name: Some(class_name.into()),
             config_name: Some(config_name.into()),
         }
+    }
+}
+
+/// A free function's key, so a name alone stands for one wherever a key is taken.
+impl From<&str> for WorkflowKey {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+/// A free function's key — see the `&str` conversion.
+impl From<String> for WorkflowKey {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+/// A copy of a key held elsewhere, so a stored key can be passed by reference.
+impl From<&WorkflowKey> for WorkflowKey {
+    fn from(key: &WorkflowKey) -> Self {
+        key.clone()
     }
 }
 

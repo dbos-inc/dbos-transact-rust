@@ -73,7 +73,7 @@ use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{
     Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start, validate_start,
 };
-use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
+use crate::{Queue, QueueChange, QueueConflict, QueueOptions, WorkflowKey};
 
 /// Everything a [`Client`] needs.
 ///
@@ -346,19 +346,26 @@ impl Client {
         self.0.app_name()
     }
 
-    /// Enqueues a workflow by name, onto a queue, and hands back a handle to it.
+    /// Enqueues a workflow, onto a queue, and hands back a handle to it.
     ///
     /// **The client's signature operation.** The workflow is recorded `ENQUEUED` and nothing runs
     /// it here; whichever executor next polls that queue claims it, and only that executor needs to
-    /// have the code. `workflow` is the name it was registered under — the same string
-    /// [`WorkflowKey::name`](crate::WorkflowKey::name) holds — and the handle is a polling one,
-    /// because the process that asks is by definition not the one that runs it.
+    /// have the code. The handle is a polling one, because the process that asks is by definition
+    /// not the one that runs it.
+    ///
+    /// `workflow` is the [`WorkflowKey`] it was registered under. A free function's name alone
+    /// converts into one; a workflow registered under a class, or a class and a configured
+    /// instance, is named by [`WorkflowKey::method`] or [`WorkflowKey::instance`], because the
+    /// registration is identified by all three parts.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
     /// let handle: dbos::WorkflowHandle<String> =
     ///     client.enqueue("send_email", "email-queue", "hello").await?;
     /// let sent = handle.result().await?;
+    ///
+    /// let billing = dbos::WorkflowKey::instance("charge", "Billing", "eu");
+    /// let charged: dbos::WorkflowHandle<u64> = client.enqueue(billing, "billing", 42).await?;
     /// # Ok(()) }
     /// ```
     ///
@@ -376,7 +383,7 @@ impl Client {
     /// it is not.
     pub async fn enqueue<P, R, E>(
         &self,
-        workflow: &str,
+        workflow: impl Into<WorkflowKey>,
         queue: &str,
         input: P,
     ) -> Result<WorkflowHandle<R, E>>
@@ -401,7 +408,7 @@ impl Client {
     /// [`enqueue_portable`](Self::enqueue_portable).
     pub async fn enqueue_with<P, R, E>(
         &self,
-        workflow: &str,
+        workflow: impl Into<WorkflowKey>,
         input: P,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>>
@@ -416,7 +423,7 @@ impl Client {
             self.connection().serializer().encoding(),
         );
         let input = encode_input(&input, &encoding)?;
-        self.enqueue_encoded(workflow, &input, encoding, options)
+        self.enqueue_encoded(&workflow.into(), &input, encoding, options)
             .await
     }
 
@@ -440,13 +447,13 @@ impl Client {
     /// ```
     pub async fn enqueue_portable<R, E>(
         &self,
-        workflow: &str,
+        workflow: impl Into<WorkflowKey>,
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         options.validate()?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
-        self.enqueue_encoded(workflow, &input, PayloadEncoding::Portable, options)
+        self.enqueue_encoded(&workflow.into(), &input, PayloadEncoding::Portable, options)
             .await
     }
 
@@ -456,7 +463,7 @@ impl Client {
     /// queue could honour should cost a round trip, not a row, and not an encoding either.
     async fn enqueue_encoded<R, E>(
         &self,
-        workflow: &str,
+        workflow: &WorkflowKey,
         input: &str,
         encoding: PayloadEncoding,
         options: EnqueueOptions<'_>,
@@ -474,9 +481,9 @@ impl Client {
         };
 
         let new = NewWorkflow {
-            name: Some(workflow),
-            class_name: options.class_name,
-            config_name: options.config_name,
+            name: Some(&workflow.name),
+            class_name: workflow.class_name.as_deref(),
+            config_name: workflow.config_name.as_deref(),
             input: Some(input),
             serialization: Some(encoding.name()),
             // **Nobody claims it.** A client runs nothing, and a queued row's executor is stamped
@@ -511,7 +518,7 @@ impl Client {
             Submitted::Created(_) => {
                 tracing::debug!(
                     workflow_id,
-                    workflow,
+                    %workflow,
                     queue = options.queue.name,
                     "the workflow is enqueued"
                 );
@@ -793,17 +800,6 @@ pub struct EnqueueOptions<'a> {
     /// client is a request id, so a retried HTTP request enqueues one workflow.
     pub workflow_id: Option<&'a str>,
 
-    /// The class the workflow's function belongs to, for class-bound workflows.
-    ///
-    /// This and [`config_name`](Self::config_name) are the other two thirds of a
-    /// [`WorkflowKey`](crate::WorkflowKey): a registration is identified by the triple, so a
-    /// workflow registered under a class and an instance is only reachable by naming both. Java's
-    /// client spells them `withClassName` and `withInstanceName`.
-    pub class_name: Option<&'a str>,
-
-    /// The configured instance name, for instance-bound workflows.
-    pub config_name: Option<&'a str>,
-
     /// The application this workflow belongs to, in place of this client's own.
     ///
     /// For a tool that hands work to an application it is not — the name decides which
@@ -875,8 +871,6 @@ impl<'a> EnqueueOptions<'a> {
         Self {
             queue,
             workflow_id: None,
-            class_name: None,
-            config_name: None,
             app_name: None,
             app_version: None,
             timeout: None,
