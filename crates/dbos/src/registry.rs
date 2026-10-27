@@ -185,9 +185,9 @@ impl From<&WorkflowKey> for WorkflowKey {
 impl WorkflowRecord {
     /// The key this row's workflow runs under, or `None` for a row that names no workflow.
     ///
-    /// Read the way recovery and dequeue read it, with `NULL` and `""` alike, so a row another
-    /// language wrote resolves to the same key as one Rust wrote. Pass it back to
-    /// [`Client::enqueue`](crate::Client::enqueue) to run the same workflow again.
+    /// An empty class or config reads as absent, the same as `NULL`, which is how dequeue resolves
+    /// a row against the registry. Pass it back to [`Client::enqueue`](crate::Client::enqueue) to
+    /// run the same workflow again.
     pub fn key(&self) -> Option<WorkflowKey> {
         let name = self.name.as_deref().filter(|name| !name.is_empty())?;
         Some(WorkflowKey::from_row(
@@ -356,10 +356,10 @@ impl<P, R, E> std::fmt::Debug for WorkflowRef<P, R, E> {
 impl DBOS {
     /// Registers a workflow under `key`, returning a typed handle to it.
     ///
-    /// The key is the workflow's identity: a name alone for a free function, or a
-    /// [`WorkflowKey`] naming a class and a configured instance too. Its name, class and config
-    /// are what a [`Client`](crate::Client) enqueues by and what recovery and dequeue resolve a
-    /// row against.
+    /// The key is the workflow's identity: a name alone for a free function, a
+    /// [`WorkflowKey::method`] for a class-bound one, or a [`WorkflowKey::instance`] for a
+    /// configured instance. Its name, class and config are what a [`Client`](crate::Client)
+    /// enqueues by and what dequeue resolves a row against.
     ///
     /// Only before [`launch`](DBOS::launch): the executor holds a snapshot of the registry, so a
     /// registration afterwards would be invisible to recovery and to dequeue — which is worse than

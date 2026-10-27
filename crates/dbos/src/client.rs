@@ -26,10 +26,10 @@
 //! # What a client is not
 //!
 //! **It never runs a workflow.** There is no registry behind it, so a workflow it enqueues is one
-//! *some other process* is expected to have registered — it names the workflow by string, and the
-//! row waits on its queue until an executor that knows that name dequeues it. A name nothing
-//! registers is not an error here and cannot be: the client has no way to know, and the whole point
-//! is that the code lives elsewhere.
+//! *some other process* is expected to have registered — it names the workflow by its
+//! [`WorkflowKey`], and the row waits on its queue until an executor that registered that key
+//! dequeues it. A key nothing registers is not an error here and cannot be: the client has no way
+//! to know, and the whole point is that the code lives elsewhere.
 //!
 //! **It never migrates**, and refuses a database no application has created. Connecting with
 //! migrations off verifies the schema rather than ignoring it, so a missing or outdated one is
@@ -51,7 +51,7 @@
 //! A client's binary is not the application's.
 //!
 //! What this module holds is the part that is a client's alone: connecting without an executor,
-//! and enqueueing a workflow by name. The surfaces a client shares with an application live with
+//! and enqueueing a workflow by its key. The surfaces a client shares with an application live with
 //! their types — the queue operations in [`queue`](crate::queue), messages in
 //! [`message`](crate::message), events in [`event`](crate::event), and workflow management in
 //! [`management`](crate::management).
