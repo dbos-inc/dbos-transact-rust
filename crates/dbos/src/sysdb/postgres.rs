@@ -7363,7 +7363,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                                     OR application_name IS NULL) \
                              RETURNING workflow_uuid"
                         )))
-                        .bind(request.workflow_name)
+                        .bind(&request.workflow.name)
                         .bind(request.queue_name)
                         .bind(request.deduplication_id)
                         .bind(period_ms)
@@ -7371,8 +7371,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(application_name)
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL
                         // the enqueue stored rather than matching nothing, as `=` would.
-                        .bind(request.class_name)
-                        .bind(request.config_name)
+                        .bind(request.workflow.class_name.as_deref())
+                        .bind(request.workflow.config_name.as_deref())
                         .fetch_optional(&mut *tx)
                         .await?;
 

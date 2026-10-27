@@ -8,7 +8,7 @@ use dbos::sysdb::types::{
     NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
     ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy,
+    WorkflowKey, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{
     BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
@@ -12880,11 +12880,21 @@ async fn db_now_ms(db: &support::TestDatabase) -> i64 {
         .unwrap()
 }
 
-fn bounce<'a>(name: &'a str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
+fn bounce<'a>(name: &str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
+    bounce_as(
+        Box::leak(Box::new(WorkflowKey::new(name))),
+        key,
+        period,
+    )
+}
+
+fn bounce_as<'a>(
+    workflow: &'a WorkflowKey,
+    key: &'a str,
+    period: std::time::Duration,
+) -> DebounceRequest<'a> {
     DebounceRequest {
-        workflow_name: name,
-        class_name: None,
-        config_name: None,
+        workflow,
         queue_name: "orders",
         deduplication_id: key,
         period,
@@ -12924,11 +12934,8 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     enqueue_debounced_instance(&sys, "wf-east", "Checkout", "east", "cart-1").await;
 
     // Same name and class, a different instance: a collision, not a bounce.
-    let west = DebounceRequest {
-        class_name: Some("Checkout"),
-        config_name: Some("west"),
-        ..bounce("checkout", "cart-1", AN_HOUR)
-    };
+    let west_key = WorkflowKey::instance("checkout", "Checkout", "west");
+    let west = bounce_as(&west_key, "cart-1", AN_HOUR);
     match sys.debounce_delayed_workflow(&west, None).await.unwrap() {
         Debounce::Held(holder) => {
             assert_eq!(holder.workflow_id, "wf-east");
@@ -12947,11 +12954,8 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     ));
 
     // The east instance's own bounce lands.
-    let east = DebounceRequest {
-        class_name: Some("Checkout"),
-        config_name: Some("east"),
-        ..bounce("checkout", "cart-1", AN_HOUR)
-    };
+    let east_key = WorkflowKey::instance("checkout", "Checkout", "east");
+    let east = bounce_as(&east_key, "cart-1", AN_HOUR);
     assert_eq!(
         sys.debounce_delayed_workflow(&east, None).await.unwrap(),
         Debounce::Bounced {
@@ -12965,13 +12969,14 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
 #[tokio::test]
 async fn a_bounce_refuses_an_empty_class_or_instance() {
     let (sys, _db) = sysdb().await;
-    let request = DebounceRequest {
-        class_name: Some(""),
-        ..bounce("checkout", "cart-1", AN_HOUR)
+    let empty_class = WorkflowKey {
+        class_name: Some(String::new()),
+        ..WorkflowKey::new("checkout")
     };
+    let request = bounce_as(&empty_class, "cart-1", AN_HOUR);
     assert!(matches!(
         sys.debounce_delayed_workflow(&request, None).await,
-        Err(Error::InvalidInput { ref field, .. }) if field == "class_name"
+        Err(Error::InvalidInput { ref field, .. }) if field == "workflow.class_name"
     ));
 }
 

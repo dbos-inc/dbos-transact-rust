@@ -162,7 +162,7 @@ pub use patch::{deprecate_patch, patch};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
-pub use registry::{WorkflowKey, WorkflowOptions, WorkflowRef};
+pub use registry::{WorkflowOptions, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
@@ -182,7 +182,7 @@ pub use stream::{
 #[cfg(feature = "engine")]
 pub use sysdb::types::{
     Change, IdleTransactionTimeout, PollingConcurrency, RateLimit, ScheduleFilter, ScheduleStatus,
-    WorkflowDelay,
+    WorkflowDelay, WorkflowKey,
 };
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
 // oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so

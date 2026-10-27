@@ -1286,12 +1286,14 @@ async fn a_portable_bounce_over_a_native_row_replaces_input_and_tag_together() {
 }
 
 /// A workflow registered under a class and a configured instance debounces under its full
-/// identity: calls for the same instance coalesce and its row carries both, while another
-/// instance whose key spells the same deduplication id is refused rather than extending it.
+/// identity: the deduplication id spells the whole key, so two instances debounce one key
+/// independently, each coalescing with its own calls, and a client naming the instance by its key
+/// feeds the same workflow the app's debouncer does.
 #[tokio::test]
 async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
     let db = test_database().await;
-    let dbos = DBOS::new(config("debounce-instance-app", &db));
+    let app = "debounce-instance-app";
+    let dbos = DBOS::new(config(app, &db));
     let key = |config: &str| WorkflowKey::instance("echo", "Billing", config);
     let eu = dbos
         .register_workflow_as(key("eu"), |x: u32| async move { Ok::<u32, Error>(x) })
@@ -1308,25 +1310,53 @@ async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
     let eu_debouncer = Debouncer::new(&eu);
     let first = eu_debouncer.debounce("key", FOREVER, 1).await.unwrap();
     let held = row(&reader, first.workflow_id()).await;
-    assert_eq!(held.class_name.as_deref(), Some("Billing"));
-    assert_eq!(held.config_name.as_deref(), Some("eu"));
+    assert_eq!(held.key(), Some(key("eu")));
+    assert_eq!(
+        held.deduplication_id.as_deref(),
+        Some("echo/Billing/eu-key")
+    );
     assert!(held.is_debounced);
 
-    let error = Debouncer::new(&us)
-        .debounce("key", PERIOD, 2)
-        .await
-        .unwrap_err();
-    assert!(is_deduplicated(&error), "{error}");
+    // The other instance holds a key of its own rather than colliding with this one.
+    let us_debouncer = Debouncer::new(&us);
+    let other = us_debouncer.debounce("key", FOREVER, 2).await.unwrap();
+    assert_ne!(other.workflow_id(), first.workflow_id());
+    assert_eq!(
+        row(&reader, other.workflow_id())
+            .await
+            .deduplication_id
+            .as_deref(),
+        Some("echo/Billing/us-key")
+    );
 
-    let second = eu_debouncer
-        .debounce("key", Duration::from_millis(500), 3)
+    // A client naming the eu instance by its key coalesces onto the app's workflow.
+    let client = client(Some(app), &db).await;
+    let through_client: WorkflowHandle<u32> =
+        DebouncerClient::new(&client, key("eu"), EnqueueOptions::new(INTERNAL_QUEUE))
+            .debounce("key", FOREVER, 3)
+            .await
+            .unwrap();
+    assert_eq!(through_client.workflow_id(), first.workflow_id());
+
+    let eu_last = eu_debouncer
+        .debounce("key", Duration::from_millis(500), 4)
         .await
         .unwrap();
-    assert_eq!(second.workflow_id(), first.workflow_id());
+    let us_last = us_debouncer
+        .debounce("key", Duration::from_millis(500), 5)
+        .await
+        .unwrap();
+    assert_eq!(eu_last.workflow_id(), first.workflow_id());
+    assert_eq!(us_last.workflow_id(), other.workflow_id());
     assert_eq!(
-        result(second).await,
-        3,
-        "the eu instance ran, with the last input"
+        result(eu_last).await,
+        4,
+        "the eu instance ran, with its last input"
+    );
+    assert_eq!(
+        result(us_last).await,
+        1005,
+        "the us instance ran, with its own last input"
     );
 
     dbos.shutdown().await;

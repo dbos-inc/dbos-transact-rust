@@ -56,12 +56,16 @@ const DEBOUNCE_OPERATION: &str = "debounce a workflow";
 /// states, so a holder stuck there does not have the loop spinning against the database.
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// The deduplication id a debounce of `key` holds for `workflow`: `<workflow>-<key>`.
+/// The deduplication id a debounce of `key` holds for `workflow`: `<workflow>-<key>`, with the
+/// workflow spelled as its key displays — `name`, `name/class` or `name/class/config`.
+///
+/// The whole key, so two configured instances of one class, or a method and a free function of
+/// the same name, debounce one key independently rather than colliding on it.
 ///
 /// **The one place the spelling is written**, so changing it is a change here and nowhere else.
 /// Only a debounce that spells the id this way finds a workflow another debounce of the key
 /// started.
-pub(crate) fn deduplication_id(workflow: &str, key: &str) -> String {
+pub(crate) fn deduplication_id(workflow: &WorkflowKey, key: &str) -> String {
     format!("{workflow}-{key}")
 }
 
@@ -102,14 +106,18 @@ enum Next {
 /// another app owns, which the bounce never extends — retrying it would spin until the holder
 /// left. A holder with no owner, or a debounce acting for no app, cannot be told apart that way,
 /// and is retried.
-fn classify(outcome: Debounce, workflow: &Identity<'_>, target_app: Option<&str>) -> Next {
+fn classify(outcome: Debounce, workflow: &WorkflowKey, target_app: Option<&str>) -> Next {
     match outcome {
         Debounce::Bounced { workflow_id } => Next::Return(workflow_id),
         Debounce::Unheld => Next::Enqueue,
         Debounce::Held(holder) => {
-            let same_workflow = holder.workflow_name.as_deref() == Some(workflow.name)
-                && holder.class_name.as_deref() == workflow.class_name
-                && holder.config_name.as_deref() == workflow.config_name;
+            let same_workflow = holder.workflow_name.as_deref().is_some_and(|name| {
+                WorkflowKey::from_row(
+                    name,
+                    holder.class_name.as_deref(),
+                    holder.config_name.as_deref(),
+                ) == *workflow
+            });
             let another_app = matches!(
                 (target_app, holder.application_name.as_deref()),
                 (Some(target), Some(owner)) if target != owner
@@ -123,20 +131,13 @@ fn classify(outcome: Debounce, workflow: &Identity<'_>, target_app: Option<&str>
     }
 }
 
-/// The three parts of a workflow's identity a bounce matches on, borrowed.
-struct Identity<'a> {
-    name: &'a str,
-    class_name: Option<&'a str>,
-    config_name: Option<&'a str>,
-}
-
 /// Everything a debounce's bounces share, settled once before the loop: what is debounced, under
 /// which key and on which queue, with which input, for which app.
 ///
 /// Both debouncers drive their loops through this, so a bounce is asked for and answered the same
 /// way from an app and from a client.
 struct Bounce<'a> {
-    identity: Identity<'a>,
+    workflow: &'a WorkflowKey,
     queue_name: &'a str,
     deduplication_id: String,
     period: Duration,
@@ -156,9 +157,7 @@ impl Bounce<'_> {
             .try_add("period", self.period)
             .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))?;
         Ok(DebounceRequest {
-            workflow_name: self.identity.name,
-            class_name: self.identity.class_name,
-            config_name: self.identity.config_name,
+            workflow: self.workflow,
             queue_name: self.queue_name,
             deduplication_id: &self.deduplication_id,
             delay_until,
@@ -170,7 +169,7 @@ impl Bounce<'_> {
 
     /// What to do about a bounce's `outcome` — see [`classify`].
     fn next(&self, outcome: Debounce) -> Next {
-        classify(outcome, &self.identity, self.target_app)
+        classify(outcome, self.workflow, self.target_app)
     }
 
     /// The error for a key `holder` holds that this debounce must not extend: the one an enqueue
@@ -460,7 +459,7 @@ where
         input: P,
         options: DebounceOptions<'b>,
     ) -> PendingStart<'b, R, E> {
-        let deduplication_id = deduplication_id(self.workflow.name(), key);
+        let deduplication_id = deduplication_id(self.workflow.key(), key);
         let built = self
             .place(period)
             .map(|(executor, bounce, start)| ((executor, start), bounce));
@@ -534,11 +533,7 @@ where
             ),
         );
         let bounce = Bounce {
-            identity: Identity {
-                name: &key.name,
-                class_name: key.class_name.as_deref(),
-                config_name: key.config_name.as_deref(),
-            },
+            workflow: key,
             queue_name: queue.name,
             deduplication_id,
             period,
@@ -633,9 +628,11 @@ where
 /// # Ok(()) }
 /// ```
 ///
+/// [`workflow`](Self::workflow) is the workflow's key, as [`Client::enqueue`] takes it: a name for
+/// a free function, or a [`WorkflowKey`] naming its class and configured instance.
 /// [`options`](Self::options) describes every workflow a debounce enqueues, as it would for
-/// [`Client::enqueue_with`]: its queue (and the key's scope), class and configured instance, an
-/// app version, a timeout and attributes. Its [`app_name`](EnqueueOptions::app_name), or else the
+/// [`Client::enqueue_with`]: its queue (and the key's scope), an app version, a timeout and
+/// attributes. Its [`app_name`](EnqueueOptions::app_name), or else the
 /// client's, is the app the debounce acts for. The queue options a debounce owns are refused as
 /// on [`Debouncer`], and so is a [`workflow_id`](EnqueueOptions::workflow_id): name one call's
 /// workflow with [`debounce_with`](Self::debounce_with).
@@ -707,13 +704,9 @@ impl<'a> DebouncerClient<'a> {
             conn.serializer().encoding(),
         );
         let bounce = Bounce {
-            identity: Identity {
-                name: self.workflow,
-                class_name: self.options.class_name,
-                config_name: self.options.config_name,
-            },
+            workflow: &self.workflow,
             queue_name: self.options.queue.name,
-            deduplication_id: deduplication_id(self.workflow, key),
+            deduplication_id: deduplication_id(&self.workflow, key),
             period,
             input: encode_input(&input, &encoding)?,
             encoding,
@@ -781,39 +774,57 @@ mod tests {
         })
     }
 
-    const WF: Identity<'static> = Identity {
-        name: "wf",
-        class_name: None,
-        config_name: None,
-    };
-
     /// The spelling is `<workflow>-<key>`, which is what makes the two collide in the next test.
     #[test]
     fn the_deduplication_id_is_the_workflow_then_the_key() {
-        assert_eq!(deduplication_id("wf", "key"), "wf-key");
-        assert_eq!(deduplication_id("a", "b-c"), deduplication_id("a-b", "c"));
+        let free = |name: &str| WorkflowKey::new(name);
+        assert_eq!(deduplication_id(&free("wf"), "key"), "wf-key");
+        assert_eq!(
+            deduplication_id(&free("a"), "b-c"),
+            deduplication_id(&free("a-b"), "c")
+        );
+    }
+
+    /// The whole key is in the id, so a method, its configured instances and a free function of
+    /// the same name each hold a key of their own.
+    #[test]
+    fn the_deduplication_id_spells_the_whole_key() {
+        let eu = WorkflowKey::instance("wf", "Billing", "eu");
+        let us = WorkflowKey::instance("wf", "Billing", "us");
+        let method = WorkflowKey::method("wf", "Billing");
+        assert_eq!(deduplication_id(&eu, "key"), "wf/Billing/eu-key");
+        assert_eq!(deduplication_id(&method, "key"), "wf/Billing-key");
+        let ids = [
+            deduplication_id(&eu, "key"),
+            deduplication_id(&us, "key"),
+            deduplication_id(&method, "key"),
+            deduplication_id(&WorkflowKey::new("wf"), "key"),
+        ];
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "{ids:?}");
     }
 
     #[test]
     fn a_bounce_is_classified_by_its_holder() {
+        let wf = WorkflowKey::new("wf");
         assert_eq!(
             classify(
                 Debounce::Bounced {
                     workflow_id: "w".to_owned()
                 },
-                &WF,
+                &wf,
                 Some("app")
             ),
             Next::Return("w".to_owned())
         );
-        assert_eq!(classify(Debounce::Unheld, &WF, Some("app")), Next::Enqueue);
+        assert_eq!(classify(Debounce::Unheld, &wf, Some("app")), Next::Enqueue);
         // An ordinary deduplicated enqueue, and a colliding key of another workflow.
         assert_eq!(
-            classify(holder("wf", false, Some("app")), &WF, Some("app")),
+            classify(holder("wf", false, Some("app")), &wf, Some("app")),
             Next::Raise("holder".to_owned())
         );
         assert_eq!(
-            classify(holder("wf-b", true, Some("app")), &WF, Some("app")),
+            classify(holder("wf-b", true, Some("app")), &wf, Some("app")),
             Next::Raise("holder".to_owned())
         );
         // Another configured instance of the same class and name.
@@ -826,25 +837,35 @@ mod tests {
             application_name: None,
         });
         assert_eq!(
-            classify(instance, &WF, Some("app")),
+            classify(instance, &wf, Some("app")),
             Next::Raise("holder".to_owned())
         );
+        // A holder that spells an absent class or instance as `""` is the same workflow.
+        let blank = Debounce::Held(DebounceHolder {
+            workflow_id: "holder".to_owned(),
+            is_debounced: true,
+            workflow_name: Some("wf".to_owned()),
+            class_name: Some(String::new()),
+            config_name: Some(String::new()),
+            application_name: Some("app".to_owned()),
+        });
+        assert_eq!(classify(blank, &wf, Some("app")), Next::Retry);
         // Another application's holder is refused, never retried: the bounce cannot extend it.
         assert_eq!(
-            classify(holder("wf", true, Some("other")), &WF, Some("app")),
+            classify(holder("wf", true, Some("other")), &wf, Some("app")),
             Next::Raise("holder".to_owned())
         );
         // Our own, or one no application can be told apart by, is between states.
         assert_eq!(
-            classify(holder("wf", true, Some("app")), &WF, Some("app")),
+            classify(holder("wf", true, Some("app")), &wf, Some("app")),
             Next::Retry
         );
         assert_eq!(
-            classify(holder("wf", true, Some("other")), &WF, None),
+            classify(holder("wf", true, Some("other")), &wf, None),
             Next::Retry
         );
         assert_eq!(
-            classify(holder("wf", true, None), &WF, Some("app")),
+            classify(holder("wf", true, None), &wf, Some("app")),
             Next::Retry
         );
     }
