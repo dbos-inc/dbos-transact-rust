@@ -17,7 +17,7 @@ use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
     EnqueueOptions, Error, Fork, ForkOptions, QueueChange, QueueConflict, QueueOptions,
-    SendMessage, SendOptions, StartOptions, WorkflowHandle,
+    SendMessage, SendOptions, StartOptions, WorkflowHandle, WorkflowKey,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -224,22 +224,22 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
 /// Everything an enqueue may say reaches the row it writes.
 ///
 /// One workflow rather than one per option, because what is being checked is the mapping — every
-/// field of `EnqueueOptions` and `Enqueue` landing in the column it names.
+/// part of the `WorkflowKey` and every field of `EnqueueOptions` and `Enqueue` landing in the
+/// column it names.
 #[tokio::test]
 async fn every_option_reaches_the_row() {
     let db = test_database().await;
     let client = client("client-options", &db).await;
     let mut attributes = serde_json::Map::new();
     attributes.insert("tenant".to_owned(), serde_json::json!("acme"));
+    let billing = WorkflowKey::instance("charge", "Billing", "eu");
 
     let handle: WorkflowHandle<()> = client
         .enqueue_with(
-            "charge",
+            &billing,
             (),
             EnqueueOptions {
                 workflow_id: Some("fully-specified"),
-                class_name: Some("Billing"),
-                config_name: Some("eu"),
                 app_name: Some("some-other-app"),
                 app_version: Some("v1.2.3"),
                 timeout: Some(Duration::from_secs(90)),
@@ -266,6 +266,7 @@ async fn every_option_reaches_the_row() {
     assert_eq!(row.name.as_deref(), Some("charge"));
     assert_eq!(row.class_name.as_deref(), Some("Billing"));
     assert_eq!(row.config_name.as_deref(), Some("eu"));
+    assert_eq!(row.key(), Some(billing));
     assert_eq!(
         row.app_name.as_deref(),
         Some("some-other-app"),

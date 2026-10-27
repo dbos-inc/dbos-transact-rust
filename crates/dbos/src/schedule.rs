@@ -229,7 +229,7 @@ impl ScheduleSpec {
     where
         C: Serialize,
     {
-        Self::for_workflow(schedule_name, workflow.key().clone(), schedule, context)
+        Self::for_workflow(schedule_name, workflow.key(), schedule, context)
     }
 
     /// [`new`](Self::new) for a workflow named rather than held, which is what a
@@ -239,7 +239,7 @@ impl ScheduleSpec {
     /// deserialization failure in each run.
     pub fn for_workflow<C>(
         schedule_name: impl Into<String>,
-        workflow: WorkflowKey,
+        workflow: impl Into<WorkflowKey>,
         schedule: impl Into<String>,
         context: &C,
     ) -> Result<Self>
@@ -249,7 +249,7 @@ impl ScheduleSpec {
         Ok(Self {
             schedule_name: schedule_name.into(),
             schedule: schedule.into(),
-            workflow,
+            workflow: workflow.into(),
             context: serde_json::to_value(Floats::new(context, NonFinite::Refuse))
                 .map_err(|source| Error::encode_failed("schedule context", source))?,
             automatic_backfill: false,
@@ -1405,8 +1405,7 @@ mod tests {
     fn a_context_reads_back_through_a_format_that_is_not_human_readable() {
         let binary = Serializer::custom(MessagePack);
         let address = std::net::Ipv4Addr::new(10, 0, 0, 1);
-        let spec =
-            ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), "* * * * *", &address).unwrap();
+        let spec = ScheduleSpec::for_workflow("s", "w", "* * * * *", &address).unwrap();
         let stored = spec.encode_context(&binary).unwrap();
 
         // Read as `Ipv4Addr` straight from MessagePack, the stored string is not what it expects.
@@ -1457,8 +1456,7 @@ mod tests {
     #[test]
     fn a_context_is_read_by_the_configured_serializer_alone() {
         let custom = Serializer::custom(Backwards);
-        let spec =
-            ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), "* * * * *", &[1, 2]).unwrap();
+        let spec = ScheduleSpec::for_workflow("s", "w", "* * * * *", &[1, 2]).unwrap();
         let sealed = spec.encode_context(&custom).unwrap();
         assert_eq!(sealed, "]2,1[");
         let plain = spec.encode_context(&Serializer::RustSerde).unwrap();
@@ -1531,7 +1529,7 @@ mod tests {
     fn a_spec_refuses_what_no_executor_could_fire() {
         let spec = |cron: &str, timezone: Option<&str>| ScheduleSpec {
             cron_timezone: timezone.map(str::to_owned),
-            ..ScheduleSpec::for_workflow("s", WorkflowKey::new("w"), cron, &()).unwrap()
+            ..ScheduleSpec::for_workflow("s", "w", cron, &()).unwrap()
         };
         assert!(spec("* * * * *", None).validate("test").is_ok());
         for (cron, timezone, expected) in [

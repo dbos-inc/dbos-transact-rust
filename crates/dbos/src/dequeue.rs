@@ -29,7 +29,6 @@ use tracing::Instrument;
 use crate::error::Error;
 use crate::instance::Executor;
 use crate::queue::DEFAULT_POLLING_INTERVAL;
-use crate::registry::WorkflowKey;
 use crate::sysdb;
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
@@ -730,13 +729,14 @@ async fn dispatch(
     clock: DatabaseTime,
     slot: Option<Slot>,
 ) -> crate::Result<()> {
-    let workflow_id = row.workflow_id;
-    let Some(name) = row.name else {
-        tracing::warn!(workflow_id, "the row names no workflow; skipped");
+    let Some(key) = row.key() else {
+        tracing::warn!(
+            workflow_id = row.workflow_id,
+            "the row names no workflow; skipped"
+        );
         return Ok(());
     };
-
-    let key = WorkflowKey::from_row(name, row.class_name.as_deref(), row.config_name.as_deref());
+    let workflow_id = row.workflow_id;
     if !executor.workflows().contains_key(&key) {
         // Logged and skipped, never fatal: the code that knew this workflow was removed or
         // renamed, and the row waits for a launch that recognises it.

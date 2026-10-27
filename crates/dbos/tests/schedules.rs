@@ -15,7 +15,7 @@ use dbos::sysdb::types::{
 };
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Error, QueueConflict, QueueOptions,
-    ScheduleChange, ScheduleSpec, ScheduledWorkflowInput, WorkflowKey, WorkflowRef,
+    ScheduleChange, ScheduleSpec, ScheduledWorkflowInput, WorkflowRef,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -163,13 +163,9 @@ async fn schedules_are_created_read_listed_and_deleted() {
     bad_zone.cron_timezone = Some("Not/A_Zone".to_owned());
     let error = dbos.create_schedule(&bad_zone).await.unwrap_err();
     assert!(error.to_string().contains("invalid timezone"), "{error}");
-    let unregistered = ScheduleSpec::for_workflow(
-        "unregistered",
-        WorkflowKey::new("nobody-registered-this"),
-        EVERY_SECOND,
-        &(),
-    )
-    .unwrap();
+    let unregistered =
+        ScheduleSpec::for_workflow("unregistered", "nobody-registered-this", EVERY_SECOND, &())
+            .unwrap();
     let error = dbos.create_schedule(&unregistered).await.unwrap_err();
     assert!(
         error.to_string().contains("no workflow is registered"),
@@ -797,7 +793,7 @@ async fn a_restart_catches_up_on_missed_ticks_when_asked() {
     let client = client(Some("sched-catchup-app"), &db).await;
     let mut spec = ScheduleSpec::for_workflow(
         "catch-up",
-        WorkflowKey::new("catchup-workflow"),
+        "catchup-workflow",
         "0 0 * * * *",
         &"c".to_owned(),
     )
@@ -876,14 +872,14 @@ async fn an_application_fires_its_own_schedules_and_unclaimed_ones_only() {
     let nameless = client(None, &db).await;
     let theirs = ScheduleSpec::for_workflow(
         "theirs",
-        WorkflowKey::new("scoped-workflow"),
+        "scoped-workflow",
         EVERY_SECOND,
         &"theirs".to_owned(),
     )
     .unwrap();
     let unclaimed = ScheduleSpec::for_workflow(
         "unclaimed",
-        WorkflowKey::new("scoped-workflow"),
+        "scoped-workflow",
         EVERY_SECOND,
         &"unclaimed".to_owned(),
     )
@@ -972,7 +968,7 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
     let client = client(Some("sched-client-app"), &db).await;
     let spec = ScheduleSpec::for_workflow(
         "client-schedule",
-        WorkflowKey::new("client-workflow"),
+        "client-workflow",
         "0 0 * * * *",
         &"from-client".to_owned(),
     )

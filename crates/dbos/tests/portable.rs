@@ -111,11 +111,7 @@ fn expected_output() -> CanonicalOutput {
 async fn launch_canonical(app_name: &str, db: &TestDatabase) -> DBOS {
     let dbos = DBOS::new(config(app_name, db));
     dbos.register_workflow_with(
-        WorkflowKey {
-            name: "canonicalWorkflow".to_owned(),
-            class_name: Some("interop".to_owned()),
-            config_name: None,
-        },
+        WorkflowKey::method("canonicalWorkflow", "interop"),
         portable(),
         |(text, num, dt, items, meta, flag, empty): CanonicalInput| async move {
             dbos::set_event(
@@ -175,12 +171,9 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
     let args: PortableWorkflowArgs = serde_json::from_str(GOLDEN_INPUTS_JSON).unwrap();
     let handle = client
         .enqueue_portable::<CanonicalOutput, EngineOnly>(
-            "canonicalWorkflow",
+            WorkflowKey::method("canonicalWorkflow", "interop"),
             args,
-            EnqueueOptions {
-                class_name: Some("interop"),
-                ..EnqueueOptions::new(QUEUE)
-            },
+            EnqueueOptions::new(QUEUE),
         )
         .await
         .unwrap();
@@ -335,14 +328,12 @@ struct Order {
 async fn the_sql_enqueue_function_reaches_struct_and_tuple_inputs() {
     let db = test_database().await;
     let dbos = DBOS::new(config("portable-sql", &db));
-    dbos.register_workflow_with(
-        WorkflowKey::new("order"),
-        portable(),
-        |order: Order| async move { Ok::<_, Error>(order) },
-    )
+    dbos.register_workflow_with("order", portable(), |order: Order| async move {
+        Ok::<_, Error>(order)
+    })
     .unwrap();
     dbos.register_workflow_with(
-        WorkflowKey::new("pair"),
+        "pair",
         portable(),
         |(sku, quantity): (String, u32)| async move { Ok::<_, Error>(format!("{quantity} x {sku}")) },
     )
@@ -416,7 +407,7 @@ async fn a_portable_workflows_error_is_the_envelope_and_reads_back_as_itself() {
     let db = test_database().await;
     let dbos = DBOS::new(config("portable-error", &db));
     let declines = dbos
-        .register_workflow_with(WorkflowKey::new("declines"), portable(), |(): ()| async {
+        .register_workflow_with("declines", portable(), |(): ()| async {
             Err::<(), _>(Error::Application(CardDeclined { attempts: 3 }))
         })
         .unwrap();
@@ -502,7 +493,7 @@ async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
     let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&runs);
     let declines = dbos
-        .register_workflow_with(WorkflowKey::new("declines"), portable(), move |(): ()| {
+        .register_workflow_with("declines", portable(), move |(): ()| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Err::<(), _>(Error::Application(CardDeclined { attempts: 3 })) }
         })
@@ -562,7 +553,7 @@ async fn a_scheduled_run_takes_its_workflows_registered_format() {
     let dbos = DBOS::new(config("portable-schedule", &db));
     let ticks = dbos
         .register_workflow_with(
-            WorkflowKey::new("ticks"),
+            "ticks",
             portable(),
             |input: ScheduledWorkflowInput<String>| async move { Ok::<_, Error>(input.context) },
         )
@@ -631,7 +622,7 @@ async fn a_write_takes_its_workflows_format_unless_it_names_one() {
         })
         .unwrap();
     let portable_writer = dbos
-        .register_workflow_with(WorkflowKey::new("portable"), portable(), |(): ()| async {
+        .register_workflow_with("portable", portable(), |(): ()| async {
             dbos::set_event("inherited", &3).await?;
             dbos::write_stream("inherited", &4).await?;
             dbos::write_stream_with(
@@ -788,7 +779,7 @@ async fn a_workflow_taking_the_envelope_gets_the_envelope_it_was_started_with() 
     let dbos = DBOS::new(config("portable-envelope", &db));
     let echo = dbos
         .register_workflow_with(
-            WorkflowKey::new("echo"),
+            "echo",
             portable(),
             |args: PortableWorkflowArgs| async move { Ok::<_, Error>(args) },
         )
@@ -900,7 +891,7 @@ async fn a_client_inside_a_workflow_sends_as_a_client() {
     let client = Arc::new(client(&db).await);
     let relay = {
         let client = Arc::clone(&client);
-        dbos.register_workflow_with(WorkflowKey::new("relay"), portable(), move |(): ()| {
+        dbos.register_workflow_with("relay", portable(), move |(): ()| {
             let client = Arc::clone(&client);
             async move {
                 let id = dbos::workflow_id().expect("inside a workflow");
@@ -968,7 +959,7 @@ async fn a_result_portable_json_cannot_hold_is_recorded_as_the_workflows_error()
     let dbos = DBOS::new(config("portable-unencodable", &db));
     let runs = Arc::new(AtomicU32::new(0));
     let not_a_number = dbos
-        .register_workflow_with(WorkflowKey::new("not_a_number"), portable(), {
+        .register_workflow_with("not_a_number", portable(), {
             let runs = Arc::clone(&runs);
             move |(): ()| {
                 runs.fetch_add(1, Ordering::SeqCst);
@@ -1058,7 +1049,7 @@ async fn an_error_portable_json_cannot_write_is_recorded_as_the_refusal() {
     let dbos = DBOS::new(config("portable-unencodable-error", &db));
     let runs = Arc::new(AtomicU32::new(0));
     let bad_keys = dbos
-        .register_workflow_with(WorkflowKey::new("bad_keys"), portable(), {
+        .register_workflow_with("bad_keys", portable(), {
             let runs = Arc::clone(&runs);
             move |(): ()| {
                 runs.fetch_add(1, Ordering::SeqCst);
