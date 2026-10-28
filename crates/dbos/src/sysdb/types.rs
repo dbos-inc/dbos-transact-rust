@@ -568,14 +568,18 @@ pub struct NewWorkflow<'a> {
     pub queue_partition_key: Option<&'a str>,
     /// How long to hold the workflow before it becomes eligible to dequeue.
     ///
-    /// A duration, not an instant: the wall-clock time is stamped by the database layer against
-    /// the same clock it writes `created_at` with. Letting the caller compute `now + delay`
-    /// would put its clock skew into the row.
+    /// A duration, not an instant: the insert resolves it against the database clock it writes
+    /// `created_at` with, the clock the release is decided by. Letting the caller compute
+    /// `now + delay` would put its clock skew into the row.
     pub delay: Option<Duration>,
     /// Marks `deduplication_id` as a debounce key to clear on the `DELAYED` → `ENQUEUED` move.
     pub is_debounced: bool,
-    /// Cap beyond which bounces may not extend `delay`.
-    pub debounce_deadline: Option<Timestamp>,
+    /// How far past the insert a debounce may push the release: the debounce deadline, as a
+    /// duration.
+    ///
+    /// Resolved by the insert against the same clock reading as `delay`, which it also caps, so a
+    /// delay longer than the timeout is released at the deadline exactly.
+    pub debounce_timeout: Option<Duration>,
 
     /// Wall-clock budget for the whole workflow.
     ///
@@ -675,7 +679,11 @@ impl<'a> NewWorkflow<'a> {
         }
         // `Duration` already rules out negatives, so zero and a value too long to store are what
         // is left; `validate_positive_duration` says why each is refused.
-        for (field, value) in [("delay", self.delay), ("timeout", self.timeout)] {
+        for (field, value) in [
+            ("delay", self.delay),
+            ("timeout", self.timeout),
+            ("debounce_timeout", self.debounce_timeout),
+        ] {
             if let Some(value) = value {
                 validate_positive_duration(field, value)?;
             }
@@ -896,39 +904,12 @@ mod tests {
         ));
     }
 
-    /// A relative delay resolves against `now`, and one that cannot be stored is reported.
-    #[test]
-    fn a_relative_delay_that_cannot_be_stored_does_not_resolve() {
-        let now = Timestamp::from_epoch_ms(1_700_000_000_000);
-        assert_eq!(
-            WorkflowDelay::For(Duration::from_secs(60))
-                .resolve(now)
-                .unwrap(),
-            Timestamp::from_epoch_ms(1_700_000_060_000)
-        );
-        // An absolute instant is taken as given, whatever `now` is.
-        let until = Timestamp::from_epoch_ms(i64::MAX);
-        assert_eq!(WorkflowDelay::Until(until).resolve(now).unwrap(), until);
-
-        for refused in [
-            Duration::MAX,
-            Duration::from_millis((i64::MAX - now.as_epoch_ms()) as u64 + 1),
-        ] {
-            assert!(
-                matches!(
-                    WorkflowDelay::For(refused).resolve(now),
-                    Err(Error::InvalidInput { ref field, .. }) if field == "delay"
-                ),
-                "{refused:?} should not resolve"
-            );
-        }
-    }
-
-    /// A workflow's timeout and delay are refused by validation when they cannot be stored, so
-    /// the refusal comes before anything is written.
+    /// A workflow's timeout, delay and debounce timeout are refused by validation when they cannot
+    /// be stored, so the refusal comes before anything is written.
     #[test]
     fn an_oversized_workflow_timeout_or_delay_does_not_validate() {
         let fits = NewWorkflow {
+            debounce_timeout: Some(Duration::from_millis(i64::MAX as u64)),
             delay: Some(Duration::from_millis(i64::MAX as u64)),
             timeout: Some(Duration::from_millis(i64::MAX as u64)),
             ..NewWorkflow::new("wf")
@@ -951,6 +932,16 @@ mod tests {
         assert!(matches!(
             delay.validate(),
             Err(Error::InvalidInput { ref field, .. }) if field == "delay"
+        ));
+        let debounce_timeout = NewWorkflow {
+            queue_name: Some("q"),
+            delay: Some(Duration::from_secs(1)),
+            debounce_timeout: Some(Duration::MAX),
+            ..NewWorkflow::new("wf")
+        };
+        assert!(matches!(
+            debounce_timeout.validate(),
+            Err(Error::InvalidInput { ref field, .. }) if field == "debounce_timeout"
         ));
     }
 
@@ -1428,31 +1419,13 @@ pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error>
 pub enum WorkflowDelay {
     /// Wait this long from now.
     ///
-    /// Resolved by the system database layer rather than by the caller, for the same reason
-    /// [`NewWorkflow::delay`] is a duration: `now + delay` computed at a call site is one more
-    /// place for the two to disagree.
-    ///
-    /// The clock is **this process's**, not the database's, which leaves the stamp out by whatever
-    /// this host and the releasing supervisor's disagree by — UPSTREAM item 22, shared with all
-    /// four implementations.
+    /// Resolved by the write, against the database clock, for the same reason
+    /// [`NewWorkflow::delay`] is a duration: the release is decided on that clock, and
+    /// `now + delay` computed by a caller would carry the caller's skew into the row. An instant
+    /// past the largest one storable saturates to it, which is a delay that never elapses.
     For(Duration),
-    /// Wait until this instant.
+    /// Wait until this instant, written as given.
     Until(Timestamp),
-}
-
-impl WorkflowDelay {
-    /// The instant this delay expires, resolved against `now` if it is relative.
-    ///
-    /// [`Error::InvalidInput`] for a relative delay whose instant cannot be stored. Fallible
-    /// rather than left to a validation upstream, because no check made without `now` can rule
-    /// that out: a delay that fits in milliseconds can still carry `now` past `i64::MAX`, and
-    /// only the resolution knows which `now` it is.
-    pub(crate) fn resolve(self, now: Timestamp) -> Result<Timestamp, Error> {
-        match self {
-            WorkflowDelay::For(d) => now.try_add("delay", d),
-            WorkflowDelay::Until(t) => Ok(t),
-        }
-    }
 }
 
 /// The result of trying to record a workflow's final outcome.
@@ -1912,8 +1885,11 @@ pub struct DebounceRequest<'a> {
     pub queue_name: &'a str,
     /// The debounce key, held in `deduplication_id` while the workflow is delayed.
     pub deduplication_id: &'a str,
-    /// When the workflow should be released, capped at its debounce deadline.
-    pub delay_until: Timestamp,
+    /// How long from the bounce to release the workflow, capped at its debounce deadline.
+    ///
+    /// A duration the bounce resolves against the database clock, as the insert resolved the
+    /// first delay and the deadline.
+    pub period: Duration,
     /// The inputs to run with, replacing whatever the previous request left.
     pub inputs: Option<&'a str>,
     /// How `inputs` is encoded.
@@ -1927,8 +1903,10 @@ impl DebounceRequest<'_> {
     ///
     /// The same rule [`NewWorkflow::validate`] applies on the way in: an empty class or instance
     /// is absent rather than a value, and matching one would find no row and report the key unheld
-    /// — indistinguishable from a key nobody holds.
+    /// — indistinguishable from a key nobody holds. The period is held to the rule `delay` is: a
+    /// positive duration that fits in milliseconds.
     pub fn validate(&self) -> Result<(), Error> {
+        validate_positive_duration("period", self.period)?;
         for (field, value) in [
             ("workflow_name", self.workflow_name),
             ("queue_name", self.queue_name),

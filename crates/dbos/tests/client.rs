@@ -84,19 +84,6 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             "`delay`",
         ),
         (
-            // Fits in milliseconds, so it passes the checks made before anything is written, and
-            // is refused by the insert, which alone knows the clock it would be added to.
-            "overflowing-delay",
-            EnqueueOptions {
-                workflow_id: Some("overflowing-delay"),
-                ..EnqueueOptions::on(Enqueue {
-                    delay: Some(Duration::from_millis(i64::MAX as u64)),
-                    ..Enqueue::new("work")
-                })
-            },
-            "`delay`",
-        ),
-        (
             "zero-timeout",
             EnqueueOptions {
                 workflow_id: Some("zero-timeout"),
@@ -1533,18 +1520,22 @@ async fn a_client_lists_tags_and_delays_workflows() {
         .await
         .expect("delay failed");
 
-    // A delay whose release instant cannot be stored is refused by the system database, and
-    // reported as an argument refusal: too long to be milliseconds at all, or fitting but carrying
-    // the clock past the largest instant.
-    for delay in [Duration::MAX, Duration::from_millis(i64::MAX as u64)] {
-        let refused = client
-            .set_workflow_delay(id, dbos::WorkflowDelay::For(delay))
-            .await;
-        assert!(
-            matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail.contains("`delay`")),
-            "a delay of {delay:?} should be refused, got {refused:?}"
-        );
-    }
+    // A delay too long to be milliseconds at all is refused, and reported as an argument
+    // refusal. One that fits is resolved on the database clock and saturates, so it is accepted.
+    let refused = client
+        .set_workflow_delay(id, dbos::WorkflowDelay::For(Duration::MAX))
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail.contains("`delay`")),
+        "a delay of Duration::MAX should be refused, got {refused:?}"
+    );
+    client
+        .set_workflow_delay(
+            id,
+            dbos::WorkflowDelay::For(Duration::from_millis(i64::MAX as u64)),
+        )
+        .await
+        .expect("a delay that fits in milliseconds is accepted");
 
     client.close().await;
 }

@@ -409,10 +409,14 @@ pub trait SystemDatabase: Send + Sync {
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole
     /// surface takes it.
     ///
-    /// A [`WorkflowDelay::For`] whose release instant cannot be stored as epoch milliseconds in an
-    /// `i64` is [`Error::InvalidInput`], and the row is not touched. Given a `caller`, the refusal
-    /// is decided inside the step and recorded as its outcome like any other failure, so a replay
-    /// reads back the first run's answer rather than deciding again against a later clock.
+    /// A [`WorkflowDelay::For`] is resolved by the write against the database clock, which the
+    /// release compares with. Two limits apply, at two stages:
+    ///
+    /// - **The duration must fit in an `i64` of milliseconds**, or it is [`Error::InvalidInput`]
+    ///   and the row is not touched. This reads no clock. Given a `caller`, the refusal is decided
+    ///   inside the step and recorded as its outcome like any other failure.
+    /// - **A duration that fits but carries `now` past the largest instant saturates there**: the
+    ///   row is written with a release that never comes, rather than refused.
     async fn set_workflow_delay(
         &self,
         workflow_id: &str,

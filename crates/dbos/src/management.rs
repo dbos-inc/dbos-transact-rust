@@ -1036,24 +1036,16 @@ impl DBOS {
     /// that is still waiting, not a way to pause work that has started.
     /// [`cancel`](Self::cancel) is the one that stops something.
     ///
-    /// [`WorkflowDelay::For`] is resolved against **this process's** clock, once, before the write
-    /// — the same as the delay on an enqueue, and the same as every reference: Python's
-    /// `time.time()`, Go's `resolveDelayUntil`, TypeScript's `Date.now()`, Java's `Instant.now()`.
-    /// So a caller's skew does reach the row.
+    /// [`WorkflowDelay::For`] is resolved by the write against the **database's** clock, the same
+    /// clock the release is decided by, as the delay on an enqueue is. So the release lands the
+    /// delay after the write whichever executor runs it, and no caller's skew reaches the row. An
+    /// instant past the largest one storable saturates to it, a release that never comes.
     ///
-    /// **And a second clock decides when the row is acted on.** The workflow is released by
-    /// whichever supervisor next runs, comparing the stamp against *its* reading — so the moment a
-    /// fleet honours is two clocks away from the one that set it, and a skewed operator host moves
-    /// a release time the whole fleet obeys. UPSTREAM item 22 is the proposal to close it:
-    /// resolve the delay against the database's clock, read once before the write.
-    ///
-    /// [`WorkflowDelay::Until`] removes the first of those readings: an absolute instant is
-    /// written as given, and nothing on this path consults a clock to do it.
+    /// [`WorkflowDelay::Until`] is written as given; it is an instant on the database clock, so a
+    /// caller computing it from its own clock carries its skew into the row.
     ///
     /// A [`WorkflowDelay::For`] too long to store as milliseconds in an `i64` is
-    /// [`Error::InvalidArgument`], refused before the call takes a step id. One that fits but
-    /// carries this process's clock past the largest instant is the same error, decided inside the
-    /// step and recorded there, so a replay reads back the first run's answer.
+    /// [`Error::InvalidArgument`], refused before the call takes a step id.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1758,10 +1750,8 @@ const DELAY_OPERATION: &str = "delay a workflow";
 /// Refuses a relative delay too long to store as milliseconds.
 ///
 /// Made by the surface rather than inside the connection, as [`refuse_negative_start_step`] is,
-/// so a refused call spends no step id. Only the rule that reads no clock: a delay that fits but
-/// carries `now` past the largest instant is refused by the system database as it resolves the
-/// delay, inside the step, so a replay reads back what the first run recorded rather than
-/// deciding again against a later clock.
+/// so a refused call spends no step id. It is the only refusal a delay can meet: one that fits is
+/// resolved by the system database on its own clock and saturates rather than failing.
 fn refuse_unstorable_delay(delay: WorkflowDelay) -> Result<()> {
     match delay {
         WorkflowDelay::For(duration) => duration_to_ms("delay", duration)
