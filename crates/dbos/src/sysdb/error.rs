@@ -57,15 +57,18 @@ pub enum Error {
     },
     /// A queued workflow already holds this deduplication key.
     ///
-    /// Raised only by workflow creation, and only when the caller supplied a deduplication id:
-    /// the primary-key conflict is absorbed by `ON CONFLICT (workflow_uuid)`, so the sole unique
-    /// violation left is the partial index on `(queue_name, deduplication_id)`. Python asserts
-    /// exactly that at its own raise site.
+    /// Raised by workflow creation, and only when the caller supplied a deduplication id: the
+    /// primary-key conflict is absorbed by `ON CONFLICT (workflow_uuid)`, so the sole unique
+    /// violation left is the partial index on `(queue_name, deduplication_id)`. A debounced
+    /// creation whose id names a workflow already holding its key raises it too, from that
+    /// conflict arm. A debounce raises it as well, for a holder it must not extend.
     ///
     /// An answer rather than a failure — the caller asked to enqueue work that is already
     /// enqueued — so it is never retried.
     QueueDeduplicated {
-        /// The workflow that could not be enqueued.
+        /// From workflow creation, the workflow that could not be enqueued. From a debounce, the
+        /// workflow that holds the key: a debounce refused before it enqueues has no id of its
+        /// own to name.
         workflow_id: String,
         /// The queue it was destined for.
         ///
