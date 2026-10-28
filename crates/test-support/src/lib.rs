@@ -559,6 +559,45 @@ pub async fn raw_database() -> TestDatabase {
     shared_server().await.create_database().await
 }
 
+/// A database whose clock runs `seconds` ahead of this process's (behind, when negative), or `None`
+/// on CockroachDB, whose built-ins can't be shadowed.
+///
+/// A `now()` and a `clock_timestamp()` of the database's own shadow the built-ins, because the
+/// database's `search_path` names `pg_catalog` after them: every unqualified call this SDK's
+/// statements make reads the offset clock, and nothing in the SDK is told.
+pub async fn skewed_database(seconds: i64) -> Option<TestDatabase> {
+    let db = raw_database().await;
+    if db.backend() == Backend::Cockroach {
+        return None;
+    }
+    let pool = db.pool().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA skew; \
+         CREATE FUNCTION skew.now() RETURNS timestamptz LANGUAGE sql STABLE \
+           AS $$ SELECT pg_catalog.now() + interval '{seconds} seconds' $$; \
+         CREATE FUNCTION skew.clock_timestamp() RETURNS timestamptz LANGUAGE sql VOLATILE \
+           AS $$ SELECT pg_catalog.clock_timestamp() + interval '{seconds} seconds' $$; \
+         DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = skew, pg_catalog, public', \
+           current_database()); END $$;"
+    )))
+    .execute(&pool)
+    .await
+    .expect("skewing the clock failed");
+    pool.close().await;
+
+    // A connection opened from here on reads the offset clock.
+    let skewed: i64 = sqlx::query_scalar("SELECT (EXTRACT(epoch FROM now()) * 1000)::bigint")
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap();
+    let off = skewed - dbos::sysdb::types::Timestamp::now().as_epoch_ms();
+    assert!(
+        (off - seconds * 1000).abs() < 5_000,
+        "the database's clock is {off}ms off, not {seconds}s"
+    );
+    Some(db)
+}
+
 impl TestServer {
     async fn start(backend: Backend) -> Self {
         let timings = Timings::new();

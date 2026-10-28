@@ -1877,9 +1877,11 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// everywhere.
 ///
 /// Workflow deadlines are on this clock too: a timeout becomes one at the insert or the claim, and
-/// the sweep and a run's own timeout compare against it. Times a caller supplies or resolves still
-/// come from the process clock: delays, step timings, durable sleep, and the `version_timestamp` a
-/// promotion writes.
+/// the sweep and a run's own timeout compare against it. So are relative delays and debounce
+/// deadlines, which the write resolves from durations and the release sweep compares against.
+/// Times a caller supplies or resolves still come from the process clock: an absolute delay
+/// ([`WorkflowDelay::Until`]), step timings, durable sleep, and the `version_timestamp` a promotion
+/// writes.
 ///
 /// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
 /// and the stamp taken later in the same transaction agree on one instant.
@@ -4082,6 +4084,12 @@ impl SystemDatabase for PostgresSystemDatabase {
         // sweep compares it with, as on `init_workflow`; an absolute one is written as given.
         // Exactly one of the two is bound.
         //
+        // Unlike `init_workflow`'s insert, this `UPDATE` is not idempotent across a retry: an
+        // attempt that committed but lost its acknowledgement is applied again by the next, with a
+        // later `now()`. The release then lands the delay after the last write, later by at most
+        // the retry's backoff, which is accepted rather than paying a round trip to read the clock
+        // once outside the retry. With a `caller` the retry finds the recorded step instead.
+        //
         // A relative delay too long to store as milliseconds is refused inside the step, so a
         // first run records the refusal and a replay reads it back, as for any other failure.
         let delay = match delay {
@@ -4294,9 +4302,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "transition_delayed_workflows",
             move || async move {
-                // The cutoff is the database clock, the one every write resolved its delay against
-                // (see `init_workflow`), so a delay ends at the same instant whichever executor
-                // runs the release. It is read per attempt on purpose: this is a sweep, not a
+                // The cutoff is the database clock, the one this layer resolves every relative
+                // delay against (see `init_workflow`), so a delay ends at the same instant
+                // whichever executor runs the release. It is read per attempt on purpose: this is a sweep, not a
                 // write a caller is holding an identity for, and a retry should release whatever
                 // has since come due rather than replay a stale cutoff.
                 //
@@ -7314,7 +7322,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                         // statement.
                         //
                         // The new release is the period from now on the database clock, which the
-                        // deadline was resolved against and the release sweep compares with.
+                        // deadline was resolved against and the release sweep compares with. `now()`
+                        // is the transaction's start, so a bounce that waits on the row's lock
+                        // counts its period from before the wait. A retry after a lost
+                        // acknowledgement bounces again with a later `now()`, which only pushes the
+                        // release to the period after the last bounce, as a debounce means.
                         let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
                              SET delay_until_epoch_ms = CASE \

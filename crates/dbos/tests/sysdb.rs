@@ -10,7 +10,9 @@ use dbos::sysdb::types::{
     ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy,
 };
-use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase};
+use dbos::sysdb::{
+    BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
+};
 
 use dbos_test_support as support;
 use dbos_test_support::{Backend, owner_token, test_database};
@@ -3285,6 +3287,147 @@ async fn the_release_is_decided_by_the_database_clock() {
     };
     assert_eq!(status("wf-due").await, WorkflowStatus::Enqueued);
     assert_eq!(status("wf-not-yet").await, WorkflowStatus::Delayed);
+}
+
+/// A migrated system database whose clock is `seconds` off this process's, or `None` on
+/// CockroachDB, whose clock can't be shifted.
+async fn skewed_sysdb(seconds: i64) -> Option<(PostgresSystemDatabase, support::TestDatabase)> {
+    let db = support::skewed_database(seconds).await?;
+    let pool = db.pool().await;
+    dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
+        .await
+        .expect("migrating the skewed database failed");
+    Some((
+        PostgresSystemDatabase::from_pool(pool, &Settings::default()),
+        db,
+    ))
+}
+
+/// **Delays and debounce deadlines hold however far the database's clock is from this
+/// process's.** The offset is an hour, far beyond any delay here, so an instant resolved or a
+/// release decided on the process's clock would land an hour from where these expect it.
+async fn delays_hold_with_the_database_clock_off_by(seconds: i64) {
+    let Some((sys, db)) = skewed_sysdb(seconds).await else {
+        return;
+    };
+    let minute = 60_000;
+    let within = |what: &str, at: i64, from: (i64, i64), offset: i64| {
+        assert!(
+            (from.0 + offset..=from.1 + offset).contains(&at),
+            "{what} at {at}, outside {}..={} on the database clock",
+            from.0 + offset,
+            from.1 + offset,
+        );
+    };
+
+    // The insert: the delay and the debounce deadline, both from the database clock.
+    let before = db_now_ms(&db).await;
+    enqueue_debounced(
+        &sys,
+        "wf-debounced",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        Some(std::time::Duration::from_secs(600)),
+    )
+    .await;
+    let after = db_now_ms(&db).await;
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    within(
+        "the release",
+        read.delay_until.unwrap().as_epoch_ms(),
+        (before, after),
+        minute,
+    );
+    within(
+        "the debounce deadline",
+        read.debounce_deadline.unwrap().as_epoch_ms(),
+        (before, after),
+        10 * minute,
+    );
+
+    // A bounce: the period from the bounce, on the same clock.
+    let before = db_now_ms(&db).await;
+    sys.debounce_delayed_workflow(
+        &bounce("checkout", "cart-1", std::time::Duration::from_secs(120)),
+        None,
+    )
+    .await
+    .unwrap();
+    let after = db_now_ms(&db).await;
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    within(
+        "the bounced release",
+        read.delay_until.unwrap().as_epoch_ms(),
+        (before, after),
+        2 * minute,
+    );
+
+    // Moving a delay: a relative one from the write, on the same clock.
+    let before = db_now_ms(&db).await;
+    sys.set_workflow_delay(
+        "wf-debounced",
+        WorkflowDelay::For(std::time::Duration::from_secs(180)),
+        None,
+    )
+    .await
+    .unwrap();
+    let after = db_now_ms(&db).await;
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    within(
+        "the moved release",
+        read.delay_until.unwrap().as_epoch_ms(),
+        (before, after),
+        3 * minute,
+    );
+
+    // The release: a row due by the database clock goes, and one that is not stays, whatever this
+    // process's clock says. With the database ahead, the first is an hour from due here; with it
+    // behind, the second is long past due here. Either way one row would go the wrong way if the
+    // release read this process's clock.
+    for id in ["wf-due", "wf-not-due"] {
+        let wf = NewWorkflow {
+            queue_name: Some("orders"),
+            delay: Some(std::time::Duration::from_secs(3600)),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None).await.unwrap();
+    }
+    let db_now = db_now_ms(&db).await;
+    let pool = db.pool().await;
+    for (id, at) in [("wf-due", db_now - 1_000), ("wf-not-due", db_now + minute)] {
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_status" SET delay_until_epoch_ms = $2
+               WHERE workflow_uuid = $1"#,
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sys.transition_delayed_workflows().await.unwrap();
+    let status = |id| {
+        let sys = &sys;
+        async move { sys.get_workflow(id).await.unwrap().unwrap().status }
+    };
+    assert_eq!(status("wf-due").await, WorkflowStatus::Enqueued);
+    assert_eq!(status("wf-not-due").await, WorkflowStatus::Delayed);
+    assert_eq!(
+        status("wf-debounced").await,
+        WorkflowStatus::Delayed,
+        "a release three minutes out on the database clock stays"
+    );
+}
+
+#[tokio::test]
+async fn delays_hold_with_the_database_clock_ahead() {
+    delays_hold_with_the_database_clock_off_by(3600).await;
+}
+
+#[tokio::test]
+async fn delays_hold_with_the_database_clock_behind() {
+    delays_hold_with_the_database_clock_off_by(-3600).await;
 }
 
 /// A second workflow cannot take a deduplication key another already holds on the same queue.
@@ -6675,8 +6818,9 @@ async fn a_workflow_timeout_or_delay_that_cannot_be_stored_is_refused() {
     assert_eq!(read.delay_until, Some(Timestamp::from_epoch_ms(i64::MAX)));
 }
 
-/// A relative delay whose release instant cannot be stored is refused, and the row keeps the
-/// delay it had.
+/// A relative delay too long to be milliseconds in an `i64` is refused, and the row keeps the delay
+/// it had. One that fits but carries the database's `now` past the largest instant is accepted and
+/// saturates there, a release that never comes.
 #[tokio::test]
 async fn a_moved_delay_that_cannot_be_stored_is_refused() {
     let (sys, _db) = sysdb().await;
@@ -6709,6 +6853,20 @@ async fn a_moved_delay_that_cannot_be_stored_is_refused() {
         "a refused delay moved the row"
     );
     assert_eq!(after.status, WorkflowStatus::Delayed);
+
+    sys.set_workflow_delay(
+        "wf-delayed",
+        WorkflowDelay::For(std::time::Duration::from_millis(i64::MAX as u64)),
+        None,
+    )
+    .await
+    .expect("a delay that fits in milliseconds is accepted");
+    let saturated = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
+    assert_eq!(
+        saturated.delay_until,
+        Some(Timestamp::from_epoch_ms(i64::MAX))
+    );
+    assert_eq!(saturated.status, WorkflowStatus::Delayed);
 }
 
 /// A durable sleep whose wake time cannot be stored is refused, and records the refusal rather

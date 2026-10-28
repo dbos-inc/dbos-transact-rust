@@ -1038,7 +1038,8 @@ impl DBOS {
     ///
     /// [`WorkflowDelay::For`] is resolved by the write against the **database's** clock, the same
     /// clock the release is decided by, as the delay on an enqueue is. So the release lands the
-    /// delay after the write whichever executor runs it, and no caller's skew reaches the row. An
+    /// delay after the write (counted from the start of its transaction) whichever executor runs
+    /// it, and no caller's skew reaches the row. An
     /// instant past the largest one storable saturates to it, a release that never comes.
     ///
     /// [`WorkflowDelay::Until`] is written as given; it is an instant on the database clock, so a

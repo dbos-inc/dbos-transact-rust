@@ -904,10 +904,36 @@ mod tests {
         ));
     }
 
+    /// A bounce's period is held to the rule a delay is: positive, and storable as milliseconds.
+    #[test]
+    fn a_bounce_refuses_a_zero_or_unstorable_period() {
+        let request = |period| DebounceRequest {
+            workflow_name: "wf",
+            class_name: None,
+            config_name: None,
+            queue_name: "q",
+            deduplication_id: "key",
+            period,
+            inputs: None,
+            serialization: None,
+            application_name: None,
+        };
+        assert!(request(Duration::from_secs(1)).validate().is_ok());
+        for refused in [Duration::ZERO, Duration::MAX] {
+            assert!(
+                matches!(
+                    request(refused).validate(),
+                    Err(Error::InvalidInput { ref field, .. }) if field == "period"
+                ),
+                "{refused:?} should be refused"
+            );
+        }
+    }
+
     /// A workflow's timeout, delay and debounce timeout are refused by validation when they cannot
     /// be stored, so the refusal comes before anything is written.
     #[test]
-    fn an_oversized_workflow_timeout_or_delay_does_not_validate() {
+    fn an_oversized_workflow_duration_does_not_validate() {
         let fits = NewWorkflow {
             debounce_timeout: Some(Duration::from_millis(i64::MAX as u64)),
             delay: Some(Duration::from_millis(i64::MAX as u64)),
