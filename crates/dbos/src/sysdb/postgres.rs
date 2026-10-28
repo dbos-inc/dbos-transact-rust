@@ -3195,12 +3195,17 @@ impl PostgresSystemDatabase {
     }
 }
 
-#[async_trait]
-impl SystemDatabase for PostgresSystemDatabase {
-    async fn init_workflow(
+impl PostgresSystemDatabase {
+    /// [`init_workflow`](SystemDatabase::init_workflow), presenting `creator_xid` as the call's
+    /// creator token.
+    ///
+    /// Two calls with one token are one logical attempt whose first commit's acknowledgement was
+    /// lost, which is how a test stages that retry without losing an acknowledgement.
+    async fn init_workflow_as(
         &self,
-        workflow: &NewWorkflow,
+        workflow: &NewWorkflow<'_>,
         caller: Option<InitWorkflowCaller<'_>>,
+        creator_xid: &str,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
         let workflow_table = &self.tables.workflow_status;
@@ -3214,12 +3219,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         let initial_attempts = i64::from(!queued);
         // Everything below is generated **outside** the retry, and that is the whole reason the
         // retry is a wrapper rather than a loop around the statement.
-        //
-        // The creator token is per logical attempt, not per statement. If a commit
-        // acknowledgement is lost, the retry must present the same token or it will fail to
-        // recognise its own insert and conclude someone else created the row, which would report
-        // `should_execute: false` for a workflow this caller does in fact own.
-        let creator_xid = uuid::Uuid::new_v4().to_string();
         // `created_at` and `updated_at` come from the database clock, inside the statement, as
         // the input row's `retention_timestamp` does through its column default. A retention sweep
         // run by any executor sharing this database relies on that: a payload stamped before its
@@ -3246,11 +3245,10 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
-        let (workflow_table, input_table, pool, creator_xid) = (
+        let (workflow_table, input_table, pool) = (
             workflow_table.as_str(),
             self.tables.workflow_input.as_str(),
             &self.pool,
-            creator_xid.as_str(),
         );
 
         with_retry(&self.retry, "init_workflow", move || async move {
@@ -3326,6 +3324,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                    creator_xid = {workflow_table}.creator_xid \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
                  deduplication_id, workflow_deadline_epoch_ms, creator_xid, serialization, \
+                 created_at = {NOW_MS_SQL} AS inserted, \
                  (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint AS db_now"
             )))
             .bind(workflow.workflow_id)
@@ -3441,6 +3440,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             // rather than runs, whatever has become of the row since: a row a timeout or a cancel
             // left without an owner is still not this caller's to run again.
             let should_execute = stored_creator.as_deref() == Some(creator_xid);
+            // Whether this statement inserted the row, rather than found this caller's own insert
+            // from an earlier attempt whose commit acknowledgement was lost. The insert stamps
+            // `created_at` with this transaction's `now()`, and an earlier attempt's transaction
+            // began before this one did, with a failed commit and a backoff between them.
+            let inserted: bool = row.try_get("inserted")?;
             // A debounce inserts only when its bounce found no waiting workflow to extend (repeated
             // debounces of a key coalesce in the bounce, never here), so the row it writes must be
             // a new workflow. If its id already names one, typically a reused
@@ -3481,15 +3485,17 @@ impl SystemDatabase for PostgresSystemDatabase {
                 );
             }
 
-            // The input, in its own table, **only when this attempt created the row** (a retry
-            // after a lost acknowledgement writes the same input again). A submission that found
-            // an existing row must not touch its input: that is the input the workflow was
-            // recorded with, and a replay has to see it.
+            // The input, in its own table, **only when this statement created the row**. A
+            // submission that found an existing row must not touch its input: that is the input
+            // the workflow was recorded with, and a replay has to see it. That includes this
+            // caller's own row, found by a retry after a lost acknowledgement: the attempt that
+            // committed wrote the input with it, and a debounce may since have bounced the row
+            // and replaced the input and its tag, which writing this one again would undo.
             //
             // An upsert for a `workflow_input` row whose status row is gone, deleted by a writer
             // that relied on the cascade migration 112 removed, or outlived by the retention
             // sweep, which would otherwise hand this fresh workflow a stale input.
-            if should_execute {
+            if should_execute && inserted {
                 sqlx::query(AssertSqlSafe(format!(
                     "INSERT INTO {input_table} (workflow_uuid, inputs) VALUES ($1, $2) \
                      ON CONFLICT (workflow_uuid) DO UPDATE SET inputs = EXCLUDED.inputs"
@@ -3529,6 +3535,23 @@ impl SystemDatabase for PostgresSystemDatabase {
             })
         })
         .await
+    }
+}
+
+#[async_trait]
+impl SystemDatabase for PostgresSystemDatabase {
+    async fn init_workflow(
+        &self,
+        workflow: &NewWorkflow,
+        caller: Option<InitWorkflowCaller<'_>>,
+    ) -> Result<WorkflowInitResult, Error> {
+        // The creator token is per logical attempt, not per statement, so it is generated here,
+        // outside the retry. If a commit acknowledgement is lost, the retry must present the same
+        // token or it will fail to recognise its own insert and conclude someone else created the
+        // row, which would report `should_execute: false` for a workflow this caller does in fact
+        // own.
+        let creator_xid = uuid::Uuid::new_v4().to_string();
+        self.init_workflow_as(workflow, caller, &creator_xid).await
     }
 
     async fn database_time(&self) -> Result<DatabaseTime, Error> {
@@ -9134,5 +9157,67 @@ mod tests {
             sqlx::query("SELECT 1").execute(&mut *idle).await.is_err(),
             "the idle transaction's session was ended"
         );
+    }
+
+    /// A retry of a debounced insert whose commit acknowledgement was lost finds its own row and
+    /// leaves the input alone, so a debounce that bounced the row in between keeps its input and
+    /// its tag.
+    #[tokio::test]
+    async fn a_retried_insert_keeps_the_input_a_bounce_wrote_since() {
+        use crate::sysdb::PORTABLE_JSON;
+        use crate::sysdb::types::{Debounce, DebounceRequest, WorkflowKey};
+        use std::time::Duration;
+
+        let db = dbos_test_support::test_database().await;
+        let sys = PostgresSystemDatabase::from_pool(db.pool().await, &Settings::default());
+        let hour = Duration::from_secs(3600);
+        let wf = NewWorkflow {
+            name: Some("digest"),
+            queue_name: Some("orders"),
+            deduplication_id: Some("digest-key"),
+            is_debounced: true,
+            delay: Some(hour),
+            input: Some("\"first\""),
+            serialization: Some("rust_serde"),
+            ..NewWorkflow::new("wf-debounced")
+        };
+
+        let first = sys
+            .init_workflow_as(&wf, None, "creator")
+            .await
+            .expect("the insert failed");
+        assert!(first.should_execute);
+
+        let key = WorkflowKey::new("digest");
+        let bounce = DebounceRequest {
+            workflow: &key,
+            queue_name: "orders",
+            deduplication_id: "digest-key",
+            period: hour,
+            inputs: Some("\"later\""),
+            serialization: Some(PORTABLE_JSON),
+            application_name: None,
+        };
+        assert_eq!(
+            sys.debounce_delayed_workflow(&bounce, None).await.unwrap(),
+            Debounce::Bounced {
+                workflow_id: "wf-debounced".to_owned()
+            }
+        );
+
+        // The same token: the first attempt's commit landed, but its caller never heard.
+        let retried = sys
+            .init_workflow_as(&wf, None, "creator")
+            .await
+            .expect("the retry failed");
+        assert!(retried.should_execute, "the retry recognises its own row");
+
+        let row = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+        assert_eq!(
+            row.input.as_deref(),
+            Some("\"later\""),
+            "the bounce's input"
+        );
+        assert_eq!(row.serialization.as_deref(), Some(PORTABLE_JSON));
     }
 }
