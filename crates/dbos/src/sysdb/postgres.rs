@@ -4086,9 +4086,12 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // Unlike `init_workflow`'s insert, this `UPDATE` is not idempotent across a retry: an
         // attempt that committed but lost its acknowledgement is applied again by the next, with a
-        // later `now()`. The release then lands the delay after the last write, later by at most
-        // the retry's backoff, which is accepted rather than paying a round trip to read the clock
-        // once outside the retry. With a `caller` the retry finds the recorded step instead.
+        // later `now()`. The release then lands the delay after the last write, later than after
+        // the first by however long the retries took; `with_retry` sets no attempt limit, so after
+        // a long outage that can be the whole outage. Accepted rather than paying a round trip to
+        // read the clock once outside the retry: the outcome is the delay counted from a write
+        // that landed, as if the caller had made the call again. With a `caller` the retry finds
+        // the recorded step instead.
         //
         // A relative delay too long to store as milliseconds is refused inside the step, so a
         // first run records the refusal and a replay reads it back, as for any other failure.
@@ -7325,8 +7328,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                         // deadline was resolved against and the release sweep compares with. `now()`
                         // is the transaction's start, so a bounce that waits on the row's lock
                         // counts its period from before the wait. A retry after a lost
-                        // acknowledgement bounces again with a later `now()`, which only pushes the
-                        // release to the period after the last bounce, as a debounce means.
+                        // acknowledgement bounces again with a later `now()`, which pushes the
+                        // release to the period after the last bounce, as a debounce means; later
+                        // than after the first by however long the retries took, which with no
+                        // attempt limit can be a whole outage.
                         let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
                              SET delay_until_epoch_ms = CASE \
