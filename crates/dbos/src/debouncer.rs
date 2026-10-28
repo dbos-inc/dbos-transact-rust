@@ -344,7 +344,8 @@ pub struct Debouncer<'a, P, R, E = EngineOnly> {
     /// The app the debounce acts for, or `None` for this one.
     ///
     /// A fresh workflow is written for that app — with no app version, so that app's latest runs
-    /// it — and only that app's waiting workflows are extended.
+    /// it. A waiting workflow is extended if it is that app's or no app's, and one that was no
+    /// app's becomes that app's.
     pub app_name: Option<&'a str>,
 }
 
@@ -400,21 +401,24 @@ where
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] for a zero `period`, an invalid
-    ///   [`app_name`](Self::app_name), or an option the debounce owns — see
-    ///   [Options](Self#options).
+    /// - [`Error::InvalidArgument`] for a zero `period` or
+    ///   [`debounce_timeout`](Self::debounce_timeout), an invalid [`app_name`](Self::app_name), or
+    ///   an option the debounce owns — see [Options](Self#options).
     /// - [`Error::SystemDatabase`] with
     ///   [`QueueDeduplicated`](crate::sysdb::Error::QueueDeduplicated) when the key is held by a
     ///   workflow this debounce must not extend — an ordinary deduplicated enqueue, another
     ///   workflow whose key spells the same, or another app's — naming the holder.
+    /// - [`Error::InsideStep`] when called inside a step, and [`Error::WrongInstance`] when called
+    ///   from a workflow another instance runs, as a start is.
     ///
     /// # Step ids
     ///
     /// Inside a workflow, a debounce claims two step ids where it is written: the bounce's, and the
-    /// fresh enqueue's, which a debounce that extends a waiting workflow leaves unused. In the rare
-    /// race where another debounce of the key enqueues between the two, this one claims two more
-    /// for each further attempt as it makes it — so a debounce should be driven to completion
-    /// before the workflow's next durable call, rather than joined with one.
+    /// fresh enqueue's, which a debounce that extends a waiting workflow leaves unused. When an
+    /// attempt neither extends nor enqueues — another debounce of the key enqueued between the
+    /// two, or the bounce met a waiting workflow between states — this one claims two more for
+    /// each further attempt as it makes it. So a debounce should be driven to completion before
+    /// the workflow's next durable call, rather than joined with one.
     pub fn debounce<'b>(&'b self, key: &str, period: Duration, input: P) -> PendingStart<'b, R, E> {
         self.debounce_with(key, period, input, DebounceOptions::default())
     }
@@ -659,7 +663,8 @@ impl<'a> DebouncerClient<'a> {
         }
     }
 
-    /// Debounces `key` — see [`Debouncer::debounce`], whose errors this shares.
+    /// Debounces `key` — see [`Debouncer::debounce`], whose errors this shares, apart from the
+    /// two only a workflow body can meet.
     ///
     /// The input is encoded as [`Client::enqueue_with`] encodes it, and the type parameters are the
     /// caller's assertion, as there.
@@ -829,16 +834,17 @@ mod tests {
             BounceAction::Refuse("holder".to_owned())
         );
         // Another configured instance of the same class and name.
-        let instance = Debounce::Held(DebounceHolder {
+        let east = WorkflowKey::instance("wf", "Billing", "east");
+        let west = Debounce::Held(DebounceHolder {
             workflow_id: "holder".to_owned(),
             is_debounced: true,
             workflow_name: Some("wf".to_owned()),
-            class_name: None,
-            config_name: Some("other".to_owned()),
+            class_name: Some("Billing".to_owned()),
+            config_name: Some("west".to_owned()),
             application_name: None,
         });
         assert_eq!(
-            classify(instance, &wf, Some("app")),
+            classify(west, &east, Some("app")),
             BounceAction::Refuse("holder".to_owned())
         );
         // A holder that spells an absent class or instance as `""` is the same workflow, which the
