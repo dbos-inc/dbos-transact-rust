@@ -553,6 +553,115 @@ async fn a_bounce_inside_a_workflow_replays_without_bouncing_again() {
     dbos.shutdown().await;
 }
 
+/// A debounce inside a workflow that loses the key between its bounce and its enqueue bounces
+/// again under fresh step ids, and a replay walks the same three steps without writing anything.
+///
+/// The race is forced with a fork: forking the parent at its enqueue copies the bounce that found
+/// the key free, while the workflow the original run enqueued still holds it.
+#[tokio::test]
+async fn a_debounce_inside_a_workflow_that_loses_the_key_bounces_again_and_replays() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("debounce-replay-lost-app", &db));
+    let child = dbos
+        .register_workflow("child", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let debouncer: Debouncer<'static, u32, u32> = Debouncer::new(&child);
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let debouncer = debouncer.clone();
+            async move {
+                let handle = debouncer.debounce("key", FOREVER, 7).await?;
+                Ok::<_, Error>(handle.workflow_id().to_owned())
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+
+    let parent_id = "losing-parent";
+    let child_id = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(parent_id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+
+    // The bounce at step 0 is copied and still says the key is free; the enqueue at step 1 runs
+    // again, under the fork's own child id, and finds the original child holding the key.
+    let lost = dbos
+        .fork::<String, Error>(parent_id, 1)
+        .await
+        .expect("fork failed");
+    let lost_id = lost.workflow_id().to_owned();
+    assert_eq!(
+        tokio::time::timeout(WAIT, lost.result())
+            .await
+            .expect("the fork never finished")
+            .expect("the fork failed"),
+        child_id,
+        "the fork coalesced onto the original child"
+    );
+    let steps = reader
+        .list_workflow_steps(&lost_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let names: Vec<_> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            (0, "DBOS.debounce_delayed_workflow"),
+            (1, "child"),
+            (2, "DBOS.debounce_delayed_workflow"),
+        ],
+        "the lost enqueue and the second bounce are both recorded"
+    );
+    assert!(
+        steps[1].error.is_some(),
+        "the lost enqueue records its error"
+    );
+    assert!(
+        reader
+            .get_workflow(&format!("{lost_id}-1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the lost enqueue wrote no workflow"
+    );
+    let released_at = row(&reader, &child_id).await.delay_until;
+
+    // A fork past all three replays them: the same child, no new row, no further bounce.
+    let replayed = dbos
+        .fork::<String, Error>(&lost_id, 4)
+        .await
+        .expect("fork failed");
+    assert_eq!(
+        tokio::time::timeout(WAIT, replayed.result())
+            .await
+            .expect("the replay never finished")
+            .expect("the replay failed"),
+        child_id
+    );
+    assert_eq!(
+        rows_named(&reader, "child").await.len(),
+        1,
+        "no second child"
+    );
+    assert_eq!(
+        row(&reader, &child_id).await.delay_until,
+        released_at,
+        "the replay did not bounce again"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// Concurrent debounces of one key race to enqueue; every loser bounces the winner, so they all
 /// end up with one workflow.
 ///
@@ -908,6 +1017,57 @@ async fn the_client_debouncer_coalesces_and_honours_its_options() {
     assert!(
         ran.deadline.is_some(),
         "the budget became a deadline on dequeue"
+    );
+
+    client.close().await;
+    dbos.shutdown().await;
+}
+
+/// The client's debounce timeout caps the total delay as the application's does: the deadline is
+/// recorded on the fresh row, no bounce moves the release past it, and the workflow runs at it.
+///
+/// Timing-sensitive only in waiting for the two-second timeout to pass, with a generous bound.
+#[tokio::test]
+async fn the_client_debounce_timeout_caps_the_total_delay() {
+    let db = test_database().await;
+    let app = "debounce-client-timeout-app";
+    let dbos = DBOS::new(config(app, &db));
+    dbos.register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "client-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+    let reader = reader(&db).await;
+    let client = client(Some(app), &db).await;
+
+    let capped = DebouncerClient {
+        debounce_timeout: Some(Duration::from_secs(2)),
+        ..DebouncerClient::new(&client, "echo", EnqueueOptions::new("client-queue"))
+    };
+    let first: WorkflowHandle<u32> = capped.debounce("key", FOREVER, 1).await.unwrap();
+    let deadline = row(&reader, first.workflow_id())
+        .await
+        .debounce_deadline
+        .expect("the deadline is recorded");
+    let second: WorkflowHandle<u32> = capped.debounce("key", FOREVER, 2).await.unwrap();
+    assert_eq!(first.workflow_id(), second.workflow_id());
+    assert!(
+        row(&reader, first.workflow_id())
+            .await
+            .delay_until
+            .expect("still delayed")
+            <= deadline,
+        "a bounce never moves the release past the deadline"
+    );
+    assert_eq!(
+        result(first).await,
+        2,
+        "ran at the timeout, with the last input"
     );
 
     client.close().await;
