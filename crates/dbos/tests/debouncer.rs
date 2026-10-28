@@ -1296,10 +1296,10 @@ async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
     let dbos = DBOS::new(config(app, &db));
     let key = |config: &str| WorkflowKey::instance("echo", "Billing", config);
     let eu = dbos
-        .register_workflow_as(key("eu"), |x: u32| async move { Ok::<u32, Error>(x) })
+        .register_workflow(key("eu"), |x: u32| async move { Ok::<u32, Error>(x) })
         .unwrap();
     let us = dbos
-        .register_workflow_as(
+        .register_workflow(
             key("us"),
             |x: u32| async move { Ok::<u32, Error>(x + 1000) },
         )

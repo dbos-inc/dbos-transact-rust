@@ -12881,11 +12881,7 @@ async fn db_now_ms(db: &support::TestDatabase) -> i64 {
 }
 
 fn bounce<'a>(name: &str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
-    bounce_as(
-        Box::leak(Box::new(WorkflowKey::new(name))),
-        key,
-        period,
-    )
+    bounce_as(Box::leak(Box::new(WorkflowKey::new(name))), key, period)
 }
 
 fn bounce_as<'a>(

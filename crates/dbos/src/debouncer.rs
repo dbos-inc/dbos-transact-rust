@@ -646,8 +646,8 @@ where
 pub struct DebouncerClient<'a> {
     /// The client to debounce through.
     pub client: Client,
-    /// The workflow's registered name.
-    pub workflow: &'a str,
+    /// The workflow, by the key it is registered under.
+    pub workflow: WorkflowKey,
     /// What to say about every workflow a debounce enqueues.
     pub options: EnqueueOptions<'a>,
     /// The longest a workflow may be held back, counted from the debounce that enqueued it — see
@@ -657,10 +657,14 @@ pub struct DebouncerClient<'a> {
 
 impl<'a> DebouncerClient<'a> {
     /// Debounces `workflow` as `options` would enqueue it, with no timeout.
-    pub fn new(client: &Client, workflow: &'a str, options: EnqueueOptions<'a>) -> Self {
+    pub fn new(
+        client: &Client,
+        workflow: impl Into<WorkflowKey>,
+        options: EnqueueOptions<'a>,
+    ) -> Self {
         Self {
             client: client.clone(),
-            workflow,
+            workflow: workflow.into(),
             options,
             debounce_timeout: None,
         }
@@ -745,7 +749,7 @@ impl<'a> DebouncerClient<'a> {
                     let created = self
                         .client
                         .enqueue_encoded(
-                            self.workflow,
+                            &self.workflow,
                             &bounce.input,
                             bounce.encoding.clone(),
                             options,
