@@ -12900,6 +12900,67 @@ fn bounce_as<'a>(
     }
 }
 
+/// A debounced insert that meets a workflow by id is refused, but one that meets the holder of its
+/// own key there lost the race for that key, and is told so.
+///
+/// Two debounces pinned to one id can both find the key free; the second insert then lands on the
+/// first's row by id rather than on the deduplication index. Answered as a lost deduplication, the
+/// second debounce bounces again and coalesces, as it would have had the two not overlapped.
+#[tokio::test]
+async fn a_debounced_insert_that_meets_its_keys_holder_by_id_lost_the_key() {
+    let (sys, db) = sysdb().await;
+    enqueue_debounced(&sys, "wf-pinned", "digest", "cart-1", AN_HOUR, None).await;
+    let racing = |key| NewWorkflow {
+        name: Some("digest"),
+        queue_name: Some("orders"),
+        deduplication_id: Some(key),
+        is_debounced: true,
+        delay: Some(AN_HOUR),
+        input: Some("\"second\""),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-pinned")
+    };
+
+    match sys.init_workflow(&racing("cart-1"), None).await {
+        Err(Error::QueueDeduplicated {
+            workflow_id,
+            queue_name,
+            deduplication_id,
+        }) => {
+            assert_eq!(workflow_id, "wf-pinned");
+            assert_eq!(queue_name, "orders");
+            assert_eq!(deduplication_id, "cart-1");
+        }
+        other => panic!("expected the key reported as held, got {other:?}"),
+    }
+    // Under another key, the id names a workflow this debounce never fed.
+    assert!(matches!(
+        sys.init_workflow(&racing("cart-2"), None).await,
+        Err(Error::ConflictingWorkflow { .. })
+    ));
+    let held = sys.get_workflow("wf-pinned").await.unwrap().unwrap();
+    assert_eq!(
+        held.input.as_deref(),
+        Some("\"first\""),
+        "neither insert wrote"
+    );
+
+    // Released, the row no longer holds the key, and the id is plain conflict again.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_status SET delay_until_epoch_ms = 1 \
+         WHERE workflow_uuid = 'wf-pinned'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(sys.transition_delayed_workflows().await.unwrap(), 1);
+    assert!(matches!(
+        sys.init_workflow(&racing("cart-1"), None).await,
+        Err(Error::ConflictingWorkflow { .. })
+    ));
+}
+
 /// Enqueues a debounced workflow belonging to a configured instance of a class.
 async fn enqueue_debounced_instance(
     sys: &PostgresSystemDatabase,

@@ -3325,7 +3325,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    creator_xid = {workflow_table}.creator_xid \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
-                 workflow_deadline_epoch_ms, creator_xid, serialization, \
+                 deduplication_id, workflow_deadline_epoch_ms, creator_xid, serialization, \
                  (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint AS db_now"
             )))
             .bind(workflow.workflow_id)
@@ -3447,7 +3447,26 @@ impl SystemDatabase for PostgresSystemDatabase {
             // `DebounceOptions::workflow_id`, joining it would drop this call's input and hand back
             // a workflow the debounce never fed. Refused before anything is written, so the
             // caller's record of the start does not land either.
+            //
+            // Unless the row holds the very key this debounce is after: a concurrent debounce
+            // pinned to the same id inserted it first, and this insert met it on the id instead of
+            // on the deduplication index. That is the race a lost deduplication answers, and it
+            // gets the same answer, so the debounce bounces again and coalesces onto the row as
+            // it would have had the two not overlapped. A row keeps its deduplication id only
+            // while it waits, so a matching one is a holder of the key.
             if workflow.is_debounced && !should_execute {
+                let stored_deduplication_id: Option<String> = row.try_get("deduplication_id")?;
+                if let Some(deduplication_id) = workflow.deduplication_id
+                    && let Some(queue_name) = workflow.queue_name
+                    && stored_deduplication_id.as_deref() == Some(deduplication_id)
+                    && stored_queue.as_deref() == Some(queue_name)
+                {
+                    return Err(Error::QueueDeduplicated {
+                        workflow_id: workflow.workflow_id.to_owned(),
+                        queue_name: queue_name.to_owned(),
+                        deduplication_id: deduplication_id.to_owned(),
+                    });
+                }
                 return Err(Error::ConflictingWorkflow {
                     workflow_id: workflow.workflow_id.to_owned(),
                     detail: "a debounce enqueues a new workflow, but a workflow with this id \
