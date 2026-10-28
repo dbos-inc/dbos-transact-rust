@@ -693,15 +693,16 @@ pub(crate) struct OwnedStart {
 }
 
 /// What makes a fresh enqueue a debounced one: the row goes in with `is_debounced` set, so the
-/// release from `DELAYED` clears its deduplication id, and with `debounce_deadline` set to the cap
-/// no later bounce may push its release past.
+/// release from `DELAYED` clears its deduplication id, and with a debounce timeout the insert
+/// resolves into the cap no later bounce may push its release past.
 ///
 /// The row's deduplication id and delay are an ordinary enqueue's, set on its [`Enqueue`]; this
 /// carries only the two columns no public option can write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Debounced {
-    /// The latest instant a bounce may move the release to, or `None` for no cap.
-    pub(crate) deadline: Option<Timestamp>,
+    /// How far past the insert a bounce may move the release, or `None` for no cap. A duration,
+    /// which the insert resolves on the database clock along with the delay.
+    pub(crate) timeout: Option<Duration>,
 }
 
 /// An [`Enqueue`] with its strings owned, for the same reason [`OwnedStart`] is: see there.
@@ -1417,7 +1418,7 @@ pub(crate) async fn create<R, E>(
         deadline,
         attributes: attributes.as_deref(),
         is_debounced: debounce.is_some(),
-        debounce_deadline: debounce.and_then(|debounce| debounce.deadline),
+        debounce_timeout: debounce.and_then(|debounce| debounce.timeout),
         // The queue's five columns, and nothing below spawns the row they describe: a queue's
         // whole point is that the process which asks is not necessarily the one that runs.
         ..new_row(&workflow_id, enqueue)

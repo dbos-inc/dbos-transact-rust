@@ -516,7 +516,7 @@ impl Client {
             deadline: None,
             attributes: attributes.as_deref(),
             is_debounced: debounce.is_some(),
-            debounce_deadline: debounce.and_then(|debounce| debounce.deadline),
+            debounce_timeout: debounce.and_then(|debounce| debounce.timeout),
             // Always `Some`: a client cannot run a workflow, so every enqueue it makes names a
             // queue — which is the difference from `start_with`, where the same base takes `None`.
             ..new_row(workflow_id, Some(&options.queue))

@@ -151,23 +151,20 @@ struct Bounce<'a> {
 }
 
 impl Bounce<'_> {
-    /// The request for one bounce, releasing the workflow `period` from now.
+    /// The request for one bounce, releasing the workflow `period` from it.
     ///
-    /// On this process's clock, as a delayed enqueue's release is. Read per attempt, so a bounce
-    /// after a retry measures the period from when it is made.
-    fn request(&self) -> Result<DebounceRequest<'_>> {
-        let delay_until = Timestamp::now()
-            .try_add("period", self.period)
-            .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))?;
-        Ok(DebounceRequest {
+    /// The period goes as a duration, which the bounce resolves on the database clock, so each
+    /// attempt measures it from when that attempt lands.
+    fn request(&self) -> DebounceRequest<'_> {
+        DebounceRequest {
             workflow: self.workflow,
             queue_name: self.queue_name,
             deduplication_id: &self.deduplication_id,
-            delay_until,
+            period: self.period,
             inputs: Some(&self.input),
             serialization: Some(self.encoding.name()),
             application_name: self.target_app,
-        })
+        }
     }
 
     /// What to do about a bounce's `outcome` — see [`classify`].
@@ -280,18 +277,6 @@ fn refuse_durations(period: Duration, debounce_timeout: Option<Duration>) -> Res
     Ok(())
 }
 
-/// The cap on a debounce's release, measured from now: `None` when there is no timeout.
-///
-/// Read once per call, before the loop, so a retry does not push the cap out. A fresh workflow is
-/// enqueued with the period as its delay and this as its deadline, and the insert releases it at
-/// whichever comes first.
-fn deadline_from(debounce_timeout: Option<Duration>) -> Result<Option<Timestamp>> {
-    debounce_timeout
-        .map(|timeout| Timestamp::now().try_add("debounce_timeout", timeout))
-        .transpose()
-        .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))
-}
-
 /// A registered workflow, debounced.
 ///
 /// Built with [`Debouncer::new`] and adjusted by functional update, and reusable: one debouncer
@@ -348,7 +333,8 @@ pub struct Debouncer<'a, P, R, E = EngineOnly> {
     pub workflow: WorkflowRef<P, R, E>,
     /// What to say about every workflow a debounce enqueues — see [Options](Self#options).
     pub options: StartOptions<'a>,
-    /// The longest a workflow may be held back, counted from the debounce that enqueued it.
+    /// The longest a workflow may be held back, counted from the debounce that enqueued it, on the
+    /// database clock.
     ///
     /// Later debounces extend the delay up to this cap and no further, so a steady stream of calls
     /// cannot postpone the workflow forever. `None` is no cap.
@@ -545,9 +531,6 @@ where
             target_app: Some(self.app_name.unwrap_or(executor.app_name())),
         };
         let attributes = encode_attributes(self.options.attributes)?;
-        // A replay that re-runs the fresh start after a crash reads the clock again, so the cap
-        // moves to replay time plus the timeout: later than the first run's, never earlier.
-        let deadline = deadline_from(self.debounce_timeout)?;
         // Never the caller's deadline: the debounce can hold the workflow back for longer than the
         // caller has left.
         let timeout = match self.options.timeout {
@@ -559,7 +542,7 @@ where
             let outcome = conn
                 .sysdb()
                 .debounce_delayed_workflow(
-                    &bounce.request()?,
+                    &bounce.request(),
                     conn.step_caller(bounce_at.step_writer()),
                 )
                 .await
@@ -573,8 +556,10 @@ where
                 Next::Raise(holder) => return Err(bounce.deduplicated(holder)),
                 Next::Retry => tokio::time::sleep(RETRY_PAUSE).await,
                 Next::Enqueue => {
-                    // The period is the delay, and the insert caps the release at the deadline,
-                    // against the clock reading it resolves the delay with.
+                    // The period is the delay and the timeout the deadline, both resolved by the
+                    // insert on one reading of the database clock, which caps the release at the
+                    // deadline. A replay that re-runs the start after a crash resolves them again,
+                    // from when that insert lands.
                     let fresh = Enqueue {
                         deduplication_id: Some(&bounce.deduplication_id),
                         delay: Some(period),
@@ -588,7 +573,9 @@ where
                         encoding: bounce.encoding.clone(),
                         attributes: attributes.clone(),
                         started_at: Timestamp::now(),
-                        debounce: Some(Debounced { deadline }),
+                        debounce: Some(Debounced {
+                            timeout: self.debounce_timeout,
+                        }),
                         app_name: self.app_name.map(str::to_owned),
                     };
                     // Recorded at the start's step as a child start would be — the workflow it
@@ -719,12 +706,10 @@ impl<'a> DebouncerClient<'a> {
             encoding,
             target_app: self.options.app_name.or(conn.app_name()),
         };
-        let deadline = deadline_from(self.debounce_timeout)?;
-
         loop {
             let outcome = conn
                 .sysdb()
-                .debounce_delayed_workflow(&bounce.request()?, None)
+                .debounce_delayed_workflow(&bounce.request(), None)
                 .await
                 .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))?;
 
@@ -735,7 +720,8 @@ impl<'a> DebouncerClient<'a> {
                 Next::Raise(holder) => return Err(bounce.deduplicated(holder)),
                 Next::Retry => tokio::time::sleep(RETRY_PAUSE).await,
                 Next::Enqueue => {
-                    // The period is the delay, and the insert caps the release at the deadline.
+                    // The period is the delay and the timeout the deadline, both resolved by the
+                    // insert on the database clock, which caps the release at the deadline.
                     let options = EnqueueOptions {
                         queue: Enqueue {
                             deduplication_id: Some(&bounce.deduplication_id),
@@ -753,7 +739,9 @@ impl<'a> DebouncerClient<'a> {
                             &bounce.input,
                             bounce.encoding.clone(),
                             options,
-                            Some(Debounced { deadline }),
+                            Some(Debounced {
+                                timeout: self.debounce_timeout,
+                            }),
                         )
                         .await;
                     if !lost_the_key(&created) {

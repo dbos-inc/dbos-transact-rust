@@ -13015,9 +13015,9 @@ async fn a_bounce_extends_a_row_that_spells_an_absent_class_or_instance_empty() 
     .await
     .unwrap();
 
-    let pushed_to = Timestamp::from_epoch_ms(9_000_000_000);
+    let before = db_now_ms(&db).await;
     assert_eq!(
-        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", pushed_to), None)
+        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", AN_HOUR), None)
             .await
             .unwrap(),
         Debounce::Bounced {
@@ -13026,20 +13026,24 @@ async fn a_bounce_extends_a_row_that_spells_an_absent_class_or_instance_empty() 
     );
     let method = WorkflowKey::method("refund", "Checkout");
     assert_eq!(
-        sys.debounce_delayed_workflow(&bounce_as(&method, "cart-2", pushed_to), None)
+        sys.debounce_delayed_workflow(&bounce_as(&method, "cart-2", AN_HOUR), None)
             .await
             .unwrap(),
         Debounce::Bounced {
             workflow_id: "wf-method".to_owned()
         },
     );
-    assert_eq!(
-        sys.get_workflow("wf-blank")
-            .await
-            .unwrap()
-            .unwrap()
-            .delay_until,
-        Some(pushed_to)
+    let release = sys
+        .get_workflow("wf-blank")
+        .await
+        .unwrap()
+        .unwrap()
+        .delay_until
+        .unwrap()
+        .as_epoch_ms();
+    assert!(
+        release >= before + AN_HOUR.as_millis() as i64,
+        "the bounce pushed the release an hour out, to {release}"
     );
 }
 

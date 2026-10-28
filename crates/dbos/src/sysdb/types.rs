@@ -1042,10 +1042,9 @@ mod tests {
     /// A bounce's period is held to the rule a delay is: positive, and storable as milliseconds.
     #[test]
     fn a_bounce_refuses_a_zero_or_unstorable_period() {
+        let workflow = WorkflowKey::new("wf");
         let request = |period| DebounceRequest {
-            workflow_name: "wf",
-            class_name: None,
-            config_name: None,
+            workflow: &workflow,
             queue_name: "q",
             deduplication_id: "key",
             period,
