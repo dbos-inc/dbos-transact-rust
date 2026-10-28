@@ -88,16 +88,18 @@ pub struct DebounceOptions<'a> {
     pub workflow_id: Option<&'a str>,
 }
 
-/// What a debounce does after a bounce.
+/// What a debounce call does about one bounce's outcome.
 #[derive(Debug, PartialEq, Eq)]
-enum Next {
-    /// The bounce extended this workflow; hand back a handle to it.
-    Return(String),
+enum BounceAction {
+    /// The bounce extended this workflow, already waiting under the key; the call coalesces onto
+    /// it and hands back a handle to it.
+    Coalesce(String),
     /// Nothing holds the key; enqueue a fresh workflow.
     Enqueue,
-    /// The key is held by this workflow, which this debounce must not touch.
-    Raise(String),
-    /// A debounced holder of this workflow could not be extended; bounce again.
+    /// The key is held by this workflow, which this debounce must not touch; the call fails as a
+    /// deduplicated enqueue would.
+    Refuse(String),
+    /// A debounced holder of this workflow could not be extended this time; bounce again.
     Retry,
 }
 
@@ -109,10 +111,10 @@ enum Next {
 /// another app owns, which the bounce never extends — retrying it would spin until the holder
 /// left. A holder with no owner, or a debounce acting for no app, cannot be told apart that way,
 /// and is retried.
-fn classify(outcome: Debounce, workflow: &WorkflowKey, target_app: Option<&str>) -> Next {
+fn classify(outcome: Debounce, workflow: &WorkflowKey, target_app: Option<&str>) -> BounceAction {
     match outcome {
-        Debounce::Bounced { workflow_id } => Next::Return(workflow_id),
-        Debounce::Unheld => Next::Enqueue,
+        Debounce::Bounced { workflow_id } => BounceAction::Coalesce(workflow_id),
+        Debounce::Unheld => BounceAction::Enqueue,
         Debounce::Held(holder) => {
             let same_workflow = holder.workflow_name.as_deref().is_some_and(|name| {
                 WorkflowKey::from_row(
@@ -126,9 +128,9 @@ fn classify(outcome: Debounce, workflow: &WorkflowKey, target_app: Option<&str>)
                 (Some(target), Some(owner)) if target != owner
             );
             if !holder.is_debounced || !same_workflow || another_app {
-                Next::Raise(holder.workflow_id)
+                BounceAction::Refuse(holder.workflow_id)
             } else {
-                Next::Retry
+                BounceAction::Retry
             }
         }
     }
@@ -168,7 +170,7 @@ impl Bounce<'_> {
     }
 
     /// What to do about a bounce's `outcome` — see [`classify`].
-    fn next(&self, outcome: Debounce) -> Next {
+    fn action(&self, outcome: Debounce) -> BounceAction {
         classify(outcome, self.workflow, self.target_app)
     }
 
@@ -548,14 +550,14 @@ where
                 .await
                 .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))?;
 
-            match bounce.next(outcome) {
+            match bounce.action(outcome) {
                 // The bounce matched the row, so a later absence is a deletion.
-                Next::Return(workflow_id) => {
+                BounceAction::Coalesce(workflow_id) => {
                     return Ok(WorkflowHandle::polling(Arc::clone(conn), workflow_id, true));
                 }
-                Next::Raise(holder) => return Err(bounce.deduplicated(holder)),
-                Next::Retry => tokio::time::sleep(RETRY_PAUSE).await,
-                Next::Enqueue => {
+                BounceAction::Refuse(holder) => return Err(bounce.deduplicated(holder)),
+                BounceAction::Retry => tokio::time::sleep(RETRY_PAUSE).await,
+                BounceAction::Enqueue => {
                     // The period is the delay and the timeout the deadline, both resolved by the
                     // insert on one reading of the database clock, which caps the release at the
                     // deadline. A replay that re-runs the start after a crash resolves them again,
@@ -713,13 +715,13 @@ impl<'a> DebouncerClient<'a> {
                 .await
                 .map_err(|error| Error::refused_argument(DEBOUNCE_OPERATION, error))?;
 
-            match bounce.next(outcome) {
-                Next::Return(workflow_id) => {
+            match bounce.action(outcome) {
+                BounceAction::Coalesce(workflow_id) => {
                     return Ok(WorkflowHandle::polling(Arc::clone(conn), workflow_id, true));
                 }
-                Next::Raise(holder) => return Err(bounce.deduplicated(holder)),
-                Next::Retry => tokio::time::sleep(RETRY_PAUSE).await,
-                Next::Enqueue => {
+                BounceAction::Refuse(holder) => return Err(bounce.deduplicated(holder)),
+                BounceAction::Retry => tokio::time::sleep(RETRY_PAUSE).await,
+                BounceAction::Enqueue => {
                     // The period is the delay and the timeout the deadline, both resolved by the
                     // insert on the database clock, which caps the release at the deadline.
                     let options = EnqueueOptions {
@@ -811,17 +813,20 @@ mod tests {
                 &wf,
                 Some("app")
             ),
-            Next::Return("w".to_owned())
+            BounceAction::Coalesce("w".to_owned())
         );
-        assert_eq!(classify(Debounce::Unheld, &wf, Some("app")), Next::Enqueue);
+        assert_eq!(
+            classify(Debounce::Unheld, &wf, Some("app")),
+            BounceAction::Enqueue
+        );
         // An ordinary deduplicated enqueue, and a colliding key of another workflow.
         assert_eq!(
             classify(holder("wf", false, Some("app")), &wf, Some("app")),
-            Next::Raise("holder".to_owned())
+            BounceAction::Refuse("holder".to_owned())
         );
         assert_eq!(
             classify(holder("wf-b", true, Some("app")), &wf, Some("app")),
-            Next::Raise("holder".to_owned())
+            BounceAction::Refuse("holder".to_owned())
         );
         // Another configured instance of the same class and name.
         let instance = Debounce::Held(DebounceHolder {
@@ -834,7 +839,7 @@ mod tests {
         });
         assert_eq!(
             classify(instance, &wf, Some("app")),
-            Next::Raise("holder".to_owned())
+            BounceAction::Refuse("holder".to_owned())
         );
         // A holder that spells an absent class or instance as `""` is the same workflow, which the
         // bounce extends too; one it could not extend this time is between states.
@@ -846,24 +851,24 @@ mod tests {
             config_name: Some(String::new()),
             application_name: Some("app".to_owned()),
         });
-        assert_eq!(classify(blank, &wf, Some("app")), Next::Retry);
+        assert_eq!(classify(blank, &wf, Some("app")), BounceAction::Retry);
         // Another application's holder is refused, never retried: the bounce cannot extend it.
         assert_eq!(
             classify(holder("wf", true, Some("other")), &wf, Some("app")),
-            Next::Raise("holder".to_owned())
+            BounceAction::Refuse("holder".to_owned())
         );
         // Our own, or one no application can be told apart by, is between states.
         assert_eq!(
             classify(holder("wf", true, Some("app")), &wf, Some("app")),
-            Next::Retry
+            BounceAction::Retry
         );
         assert_eq!(
             classify(holder("wf", true, Some("other")), &wf, None),
-            Next::Retry
+            BounceAction::Retry
         );
         assert_eq!(
             classify(holder("wf", true, None), &wf, Some("app")),
-            Next::Retry
+            BounceAction::Retry
         );
     }
 
