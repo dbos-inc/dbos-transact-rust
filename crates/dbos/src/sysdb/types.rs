@@ -345,6 +345,138 @@ impl fmt::Display for WorkflowStatus {
     }
 }
 
+/// What identifies a workflow, as the `workflow_status` row stores it.
+///
+/// Three columns rather than one name, because that is what Conductor and Console resolve against
+/// and what a configured instance needs. The references model it three different ways — Python
+/// keys on the name alone with instances in a separate map, Go on a derived FQN qualified by the
+/// config name, Java on the whole `{name}/{class}/{instance}` string — but all three *store* these
+/// three columns, so keying on them directly is the shape that reads back from any of them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowKey {
+    /// The workflow's name. Required.
+    pub name: String,
+    /// The class a method-workflow belongs to; `None` for a free function.
+    pub class_name: Option<String>,
+    /// The configured instance this registration is bound to; `None` unless instance-bound.
+    pub config_name: Option<String>,
+}
+
+impl WorkflowKey {
+    /// A free function's key.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            class_name: None,
+            config_name: None,
+        }
+    }
+
+    /// Rebuilds a key from a status row, treating `NULL` and `""` alike.
+    ///
+    /// Recovery is not why. A workflow belongs to one language from start to finish, so a row this
+    /// executor recovers was written by this executor's own SDK and spells absence the one way
+    /// Rust spells it. The boundary where a row arrives from *elsewhere* is **enqueue**: an
+    /// application in another language can enqueue work for this one, and it writes the status row
+    /// in its own spelling before any Rust executor sees it.
+    ///
+    /// Both spellings are in the wild, and Java's own code is the evidence rather than an
+    /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
+    /// compares an init against an existing row (`WorkflowDAO.java`), which is a defence nobody
+    /// writes against a distinction that cannot occur.
+    pub(crate) fn from_row(
+        name: impl Into<String>,
+        class_name: Option<&str>,
+        config_name: Option<&str>,
+    ) -> Self {
+        let absent = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
+        Self {
+            name: name.into(),
+            class_name: absent(class_name),
+            config_name: absent(config_name),
+        }
+    }
+
+    /// A class-bound workflow's key, with no configured instance.
+    pub fn method(name: impl Into<String>, class_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            class_name: Some(class_name.into()),
+            config_name: None,
+        }
+    }
+
+    /// A configured instance's key.
+    ///
+    /// A config name never appears without a class name — true in every reference, and enforced
+    /// here rather than left to produce a key nothing can resolve.
+    pub fn instance(
+        name: impl Into<String>,
+        class_name: impl Into<String>,
+        config_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            class_name: Some(class_name.into()),
+            config_name: Some(config_name.into()),
+        }
+    }
+}
+
+/// A free function's key, so a name alone stands for one wherever a key is taken.
+impl From<&str> for WorkflowKey {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+/// A free function's key — see the `&str` conversion.
+impl From<String> for WorkflowKey {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+/// A free function's key — see the `&str` conversion.
+impl From<&String> for WorkflowKey {
+    fn from(name: &String) -> Self {
+        Self::new(name)
+    }
+}
+
+/// A copy of a key held elsewhere, so a stored key can be passed by reference.
+impl From<&WorkflowKey> for WorkflowKey {
+    fn from(key: &WorkflowKey) -> Self {
+        key.clone()
+    }
+}
+
+impl WorkflowRecord {
+    /// The key this row's workflow runs under, or `None` for a row that names no workflow.
+    ///
+    /// An empty class or config reads as absent, the same as `NULL`, which is how dequeue resolves
+    /// a row against the registry. Pass it back to [`Client::enqueue`](crate::Client::enqueue) to
+    /// run the same workflow again.
+    pub fn key(&self) -> Option<WorkflowKey> {
+        let name = self.name.as_deref().filter(|name| !name.is_empty())?;
+        Some(WorkflowKey::from_row(
+            name,
+            self.class_name.as_deref(),
+            self.config_name.as_deref(),
+        ))
+    }
+}
+
+impl std::fmt::Display for WorkflowKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.class_name, &self.config_name) {
+            (Some(class), Some(config)) => write!(f, "{}/{class}/{config}", self.name),
+            (Some(class), None) => write!(f, "{}/{class}", self.name),
+            _ => f.write_str(&self.name),
+        }
+    }
+}
+
 /// A row of `workflow_status`.
 ///
 /// **Shaped like the row, not like the domain.** Fields mirror columns one for one, including
@@ -573,6 +705,9 @@ pub struct NewWorkflow<'a> {
     /// `now + delay` would put its clock skew into the row.
     pub delay: Option<Duration>,
     /// Marks `deduplication_id` as a debounce key to clear on the `DELAYED` → `ENQUEUED` move.
+    ///
+    /// A debounced row must be new: an existing workflow under the id is
+    /// [`Error::ConflictingWorkflow`] rather than joined.
     pub is_debounced: bool,
     /// How far past the insert a debounce may push the release: the debounce deadline, as a
     /// duration.
@@ -907,10 +1042,9 @@ mod tests {
     /// A bounce's period is held to the rule a delay is: positive, and storable as milliseconds.
     #[test]
     fn a_bounce_refuses_a_zero_or_unstorable_period() {
+        let workflow = WorkflowKey::new("wf");
         let request = |period| DebounceRequest {
-            workflow_name: "wf",
-            class_name: None,
-            config_name: None,
+            workflow: &workflow,
             queue_name: "q",
             deduplication_id: "key",
             period,
@@ -1884,29 +2018,22 @@ impl QueueUpdate {
 
 /// A request to debounce a workflow onto a deduplication key.
 ///
-/// A struct rather than nine parameters because five of them are `Option<&str>`, and transposing
-/// two would compile. Python guards the same signature by making every argument
-/// keyword-only (`def debounce_delayed_workflow(self, *, …)`); named fields are the same
-/// protection.
+/// A struct rather than seven parameters because several of them are `&str` or `Option<&str>`,
+/// and transposing two would compile; named fields rule that out.
 ///
 /// **No `new` and no `Default`**, unlike [`NewWorkflow`] and [`NewQueue`], which take a single
-/// identifying string. A constructor here would take three `&str` in a row and hand back the
+/// identifying string. A constructor here would take several `&str` in a row and hand back the
 /// transposition this type exists to prevent, and a default would fabricate a request with empty
 /// names — the values the enqueue side rejects. Every field is named at the call site on purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DebounceRequest<'a> {
-    /// The registered function name, matched so a key collision between unrelated workflows never
-    /// overwrites the wrong one's inputs.
-    pub workflow_name: &'a str,
-    /// The class the function belongs to, for class-bound workflows.
-    pub class_name: Option<&'a str>,
-    /// The configured instance name, for instance-bound workflows.
+    /// The workflow being debounced, matched on all three parts of its key so a bounce extends
+    /// only a workflow of the same name, class and configured instance.
     ///
-    /// Matched alongside the name and class because all three identify a workflow: two configured
-    /// instances of one class share a name *and* a class, so without this a bounce for one could
-    /// extend the other and replace its inputs. TypeScript matches the name and class; Python
-    /// matches the name alone.
-    pub config_name: Option<&'a str>,
+    /// Two configured instances of one class share a name *and* a class, so without the instance
+    /// a bounce for one could extend the other and replace its inputs; and a key collision between
+    /// unrelated workflows never overwrites the wrong one's inputs.
+    pub workflow: &'a WorkflowKey,
     /// The queue the debounced workflow sits on.
     pub queue_name: &'a str,
     /// The debounce key, held in `deduplication_id` while the workflow is delayed.
@@ -1934,7 +2061,7 @@ impl DebounceRequest<'_> {
     pub fn validate(&self) -> Result<(), Error> {
         validate_positive_duration("period", self.period)?;
         for (field, value) in [
-            ("workflow_name", self.workflow_name),
+            ("workflow.name", self.workflow.name.as_str()),
             ("queue_name", self.queue_name),
             ("deduplication_id", self.deduplication_id),
         ] {
@@ -1946,8 +2073,8 @@ impl DebounceRequest<'_> {
             }
         }
         for (field, value) in [
-            ("class_name", self.class_name),
-            ("config_name", self.config_name),
+            ("workflow.class_name", self.workflow.class_name.as_deref()),
+            ("workflow.config_name", self.workflow.config_name.as_deref()),
             ("inputs", self.inputs),
             ("serialization", self.serialization),
             ("application_name", self.application_name),

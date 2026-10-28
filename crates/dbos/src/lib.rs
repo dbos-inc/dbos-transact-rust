@@ -80,6 +80,8 @@ mod context;
 #[cfg(feature = "engine")]
 mod cron;
 #[cfg(feature = "engine")]
+mod debouncer;
+#[cfg(feature = "engine")]
 mod dequeue;
 #[cfg(feature = "engine")]
 mod error;
@@ -136,6 +138,8 @@ pub use config::{Config, DATABASE_URL_ENV};
 #[cfg(feature = "engine")]
 pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
 #[cfg(feature = "engine")]
+pub use debouncer::{DebounceOptions, Debouncer, DebouncerClient};
+#[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]
 pub use event::{SetEventOptions, get_event, set_event, set_event_with};
@@ -158,7 +162,7 @@ pub use patch::{deprecate_patch, patch};
 #[cfg(feature = "engine")]
 pub use queue::{Queue, QueueChange, QueueConflict, QueueOptions};
 #[cfg(feature = "engine")]
-pub use registry::{WorkflowKey, WorkflowOptions, WorkflowRef};
+pub use registry::{WorkflowOptions, WorkflowRef};
 #[cfg(feature = "engine")]
 pub use schedule::{Schedule, ScheduleChange, ScheduleSpec, ScheduledWorkflowInput};
 #[cfg(feature = "engine")]
@@ -178,7 +182,7 @@ pub use stream::{
 #[cfg(feature = "engine")]
 pub use sysdb::types::{
     Change, IdleTransactionTimeout, PollingConcurrency, RateLimit, ScheduleFilter, ScheduleStatus,
-    WorkflowDelay,
+    WorkflowDelay, WorkflowKey,
 };
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
 // oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so

@@ -8,7 +8,7 @@ use dbos::sysdb::types::{
     NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
     QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
     ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowRecord, WorkflowStatus, WrittenBy,
+    WorkflowKey, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{
     BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
@@ -12880,11 +12880,17 @@ async fn db_now_ms(db: &support::TestDatabase) -> i64 {
         .unwrap()
 }
 
-fn bounce<'a>(name: &'a str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
+fn bounce<'a>(name: &str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
+    bounce_as(Box::leak(Box::new(WorkflowKey::new(name))), key, period)
+}
+
+fn bounce_as<'a>(
+    workflow: &'a WorkflowKey,
+    key: &'a str,
+    period: std::time::Duration,
+) -> DebounceRequest<'a> {
     DebounceRequest {
-        workflow_name: name,
-        class_name: None,
-        config_name: None,
+        workflow,
         queue_name: "orders",
         deduplication_id: key,
         period,
@@ -12892,6 +12898,67 @@ fn bounce<'a>(name: &'a str, key: &'a str, period: std::time::Duration) -> Debou
         serialization: None,
         application_name: None,
     }
+}
+
+/// A debounced insert that meets a workflow by id is refused, but one that meets the holder of its
+/// own key there lost the race for that key, and is told so.
+///
+/// Two debounces pinned to one id can both find the key free; the second insert then lands on the
+/// first's row by id rather than on the deduplication index. Answered as a lost deduplication, the
+/// second debounce bounces again and coalesces, as it would have had the two not overlapped.
+#[tokio::test]
+async fn a_debounced_insert_that_meets_its_keys_holder_by_id_lost_the_key() {
+    let (sys, db) = sysdb().await;
+    enqueue_debounced(&sys, "wf-pinned", "digest", "cart-1", AN_HOUR, None).await;
+    let racing = |key| NewWorkflow {
+        name: Some("digest"),
+        queue_name: Some("orders"),
+        deduplication_id: Some(key),
+        is_debounced: true,
+        delay: Some(AN_HOUR),
+        input: Some("\"second\""),
+        application_version: Some("v1"),
+        ..NewWorkflow::new("wf-pinned")
+    };
+
+    match sys.init_workflow(&racing("cart-1"), None).await {
+        Err(Error::QueueDeduplicated {
+            workflow_id,
+            queue_name,
+            deduplication_id,
+        }) => {
+            assert_eq!(workflow_id, "wf-pinned");
+            assert_eq!(queue_name, "orders");
+            assert_eq!(deduplication_id, "cart-1");
+        }
+        other => panic!("expected the key reported as held, got {other:?}"),
+    }
+    // Under another key, the id names a workflow this debounce never fed.
+    assert!(matches!(
+        sys.init_workflow(&racing("cart-2"), None).await,
+        Err(Error::ConflictingWorkflow { .. })
+    ));
+    let held = sys.get_workflow("wf-pinned").await.unwrap().unwrap();
+    assert_eq!(
+        held.input.as_deref(),
+        Some("\"first\""),
+        "neither insert wrote"
+    );
+
+    // Released, the row no longer holds the key, and the id is plain conflict again.
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_status SET delay_until_epoch_ms = 1 \
+         WHERE workflow_uuid = 'wf-pinned'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(sys.transition_delayed_workflows().await.unwrap(), 1);
+    assert!(matches!(
+        sys.init_workflow(&racing("cart-1"), None).await,
+        Err(Error::ConflictingWorkflow { .. })
+    ));
 }
 
 /// Enqueues a debounced workflow belonging to a configured instance of a class.
@@ -12924,11 +12991,8 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     enqueue_debounced_instance(&sys, "wf-east", "Checkout", "east", "cart-1").await;
 
     // Same name and class, a different instance: a collision, not a bounce.
-    let west = DebounceRequest {
-        class_name: Some("Checkout"),
-        config_name: Some("west"),
-        ..bounce("checkout", "cart-1", AN_HOUR)
-    };
+    let west_key = WorkflowKey::instance("checkout", "Checkout", "west");
+    let west = bounce_as(&west_key, "cart-1", AN_HOUR);
     match sys.debounce_delayed_workflow(&west, None).await.unwrap() {
         Debounce::Held(holder) => {
             assert_eq!(holder.workflow_id, "wf-east");
@@ -12947,11 +13011,8 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     ));
 
     // The east instance's own bounce lands.
-    let east = DebounceRequest {
-        class_name: Some("Checkout"),
-        config_name: Some("east"),
-        ..bounce("checkout", "cart-1", AN_HOUR)
-    };
+    let east_key = WorkflowKey::instance("checkout", "Checkout", "east");
+    let east = bounce_as(&east_key, "cart-1", AN_HOUR);
     assert_eq!(
         sys.debounce_delayed_workflow(&east, None).await.unwrap(),
         Debounce::Bounced {
@@ -12965,14 +13026,86 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
 #[tokio::test]
 async fn a_bounce_refuses_an_empty_class_or_instance() {
     let (sys, _db) = sysdb().await;
-    let request = DebounceRequest {
-        class_name: Some(""),
-        ..bounce("checkout", "cart-1", AN_HOUR)
+    let empty_class = WorkflowKey {
+        class_name: Some(String::new()),
+        ..WorkflowKey::new("checkout")
     };
+    let request = bounce_as(&empty_class, "cart-1", AN_HOUR);
     assert!(matches!(
         sys.debounce_delayed_workflow(&request, None).await,
-        Err(Error::InvalidInput { ref field, .. }) if field == "class_name"
+        Err(Error::InvalidInput { ref field, .. }) if field == "workflow.class_name"
     ));
+}
+
+/// A row that spells an absent class or instance `''` rather than NULL is the same workflow as
+/// one that stores NULL, so a bounce whose key has neither extends it.
+#[tokio::test]
+async fn a_bounce_extends_a_row_that_spells_an_absent_class_or_instance_empty() {
+    let (sys, db) = sysdb().await;
+    enqueue_debounced(
+        &sys,
+        "wf-blank",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+    enqueue_debounced(
+        &sys,
+        "wf-method",
+        "refund",
+        "cart-2",
+        std::time::Duration::from_secs(60),
+        None,
+    )
+    .await;
+    // Another writer's spelling, which this layer refuses to write itself.
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET class_name = '', config_name = ''
+           WHERE workflow_uuid = 'wf-blank'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE "dbos"."workflow_status" SET class_name = 'Checkout', config_name = ''
+           WHERE workflow_uuid = 'wf-method'"#,
+    )
+    .execute(&db.pool().await)
+    .await
+    .unwrap();
+
+    let before = db_now_ms(&db).await;
+    assert_eq!(
+        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", AN_HOUR), None)
+            .await
+            .unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-blank".to_owned()
+        },
+    );
+    let method = WorkflowKey::method("refund", "Checkout");
+    assert_eq!(
+        sys.debounce_delayed_workflow(&bounce_as(&method, "cart-2", AN_HOUR), None)
+            .await
+            .unwrap(),
+        Debounce::Bounced {
+            workflow_id: "wf-method".to_owned()
+        },
+    );
+    let release = sys
+        .get_workflow("wf-blank")
+        .await
+        .unwrap()
+        .unwrap()
+        .delay_until
+        .unwrap()
+        .as_epoch_ms();
+    assert!(
+        release >= before + AN_HOUR.as_millis() as i64,
+        "the bounce pushed the release an hour out, to {release}"
+    );
 }
 
 /// A bounce pushes the release out and replaces the inputs.

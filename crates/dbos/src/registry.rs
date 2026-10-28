@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_input, encode};
-use crate::sysdb::types::WorkflowRecord;
+pub(crate) use crate::sysdb::types::WorkflowKey;
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -74,138 +74,6 @@ pub struct WorkflowOptions {
     /// a start another language enqueued portably runs portably: the row's tag decides how its
     /// input is read.
     pub serialization: SerializationFormat,
-}
-
-/// What identifies a workflow, as the `workflow_status` row stores it.
-///
-/// Three columns rather than one name, because that is what Conductor and Console resolve against
-/// and what a configured instance needs. The references model it three different ways — Python
-/// keys on the name alone with instances in a separate map, Go on a derived FQN qualified by the
-/// config name, Java on the whole `{name}/{class}/{instance}` string — but all three *store* these
-/// three columns, so keying on them directly is the shape that reads back from any of them.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct WorkflowKey {
-    /// The workflow's name. Required.
-    pub name: String,
-    /// The class a method-workflow belongs to; `None` for a free function.
-    pub class_name: Option<String>,
-    /// The configured instance this registration is bound to; `None` unless instance-bound.
-    pub config_name: Option<String>,
-}
-
-impl WorkflowKey {
-    /// A free function's key.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            class_name: None,
-            config_name: None,
-        }
-    }
-
-    /// Rebuilds a key from a status row, treating `NULL` and `""` alike.
-    ///
-    /// Recovery is not why. A workflow belongs to one language from start to finish, so a row this
-    /// executor recovers was written by this executor's own SDK and spells absence the one way
-    /// Rust spells it. The boundary where a row arrives from *elsewhere* is **enqueue**: an
-    /// application in another language can enqueue work for this one, and it writes the status row
-    /// in its own spelling before any Rust executor sees it.
-    ///
-    /// Both spellings are in the wild, and Java's own code is the evidence rather than an
-    /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
-    /// compares an init against an existing row (`WorkflowDAO.java`), which is a defence nobody
-    /// writes against a distinction that cannot occur.
-    pub(crate) fn from_row(
-        name: impl Into<String>,
-        class_name: Option<&str>,
-        config_name: Option<&str>,
-    ) -> Self {
-        let absent = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
-        Self {
-            name: name.into(),
-            class_name: absent(class_name),
-            config_name: absent(config_name),
-        }
-    }
-
-    /// A class-bound workflow's key, with no configured instance.
-    pub fn method(name: impl Into<String>, class_name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            class_name: Some(class_name.into()),
-            config_name: None,
-        }
-    }
-
-    /// A configured instance's key.
-    ///
-    /// A config name never appears without a class name — true in every reference, and enforced
-    /// here rather than left to produce a key nothing can resolve.
-    pub fn instance(
-        name: impl Into<String>,
-        class_name: impl Into<String>,
-        config_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            class_name: Some(class_name.into()),
-            config_name: Some(config_name.into()),
-        }
-    }
-}
-
-/// A free function's key, so a name alone stands for one wherever a key is taken.
-impl From<&str> for WorkflowKey {
-    fn from(name: &str) -> Self {
-        Self::new(name)
-    }
-}
-
-/// A free function's key — see the `&str` conversion.
-impl From<String> for WorkflowKey {
-    fn from(name: String) -> Self {
-        Self::new(name)
-    }
-}
-
-/// A free function's key — see the `&str` conversion.
-impl From<&String> for WorkflowKey {
-    fn from(name: &String) -> Self {
-        Self::new(name)
-    }
-}
-
-/// A copy of a key held elsewhere, so a stored key can be passed by reference.
-impl From<&WorkflowKey> for WorkflowKey {
-    fn from(key: &WorkflowKey) -> Self {
-        key.clone()
-    }
-}
-
-impl WorkflowRecord {
-    /// The key this row's workflow runs under, or `None` for a row that names no workflow.
-    ///
-    /// An empty class or config reads as absent, the same as `NULL`, which is how dequeue resolves
-    /// a row against the registry. Pass it back to [`Client::enqueue`](crate::Client::enqueue) to
-    /// run the same workflow again.
-    pub fn key(&self) -> Option<WorkflowKey> {
-        let name = self.name.as_deref().filter(|name| !name.is_empty())?;
-        Some(WorkflowKey::from_row(
-            name,
-            self.class_name.as_deref(),
-            self.config_name.as_deref(),
-        ))
-    }
-}
-
-impl std::fmt::Display for WorkflowKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (&self.class_name, &self.config_name) {
-            (Some(class), Some(config)) => write!(f, "{}/{class}/{config}", self.name),
-            (Some(class), None) => write!(f, "{}/{class}", self.name),
-            _ => f.write_str(&self.name),
-        }
-    }
 }
 
 /// Every workflow this instance knows about.
@@ -488,6 +356,7 @@ mod tests {
 
     use super::*;
     use crate::Config;
+    use crate::sysdb::types::WorkflowRecord;
 
     fn dbos() -> DBOS {
         DBOS::new(Config::new("registry-test", "postgres://unused"))

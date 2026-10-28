@@ -71,7 +71,8 @@ use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{
-    Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start, validate_start,
+    Debounced, Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start,
+    validate_start,
 };
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions, WorkflowKey};
 
@@ -423,7 +424,7 @@ impl Client {
             self.connection().serializer().encoding(),
         );
         let input = encode_input(&input, &encoding)?;
-        self.enqueue_encoded(&workflow.into(), &input, encoding, options)
+        self.enqueue_encoded(&workflow.into(), &input, encoding, options, None)
             .await
     }
 
@@ -453,20 +454,30 @@ impl Client {
     ) -> Result<WorkflowHandle<R, E>> {
         options.validate()?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
-        self.enqueue_encoded(&workflow.into(), &input, PayloadEncoding::Portable, options)
-            .await
+        self.enqueue_encoded(
+            &workflow.into(),
+            &input,
+            PayloadEncoding::Portable,
+            options,
+            None,
+        )
+        .await
     }
 
     /// The enqueue both public forms share, from an input already encoded in `encoding`.
     ///
     /// The queue options are validated by the caller, before it encodes the input: an enqueue no
     /// queue could honour should cost a round trip, not a row, and not an encoding either.
-    async fn enqueue_encoded<R, E>(
+    ///
+    /// `debounce` marks the row a debounced one, which only a
+    /// [`DebouncerClient`](crate::DebouncerClient) asks for.
+    pub(crate) async fn enqueue_encoded<R, E>(
         &self,
         workflow: &WorkflowKey,
         input: &str,
         encoding: PayloadEncoding,
         options: EnqueueOptions<'_>,
+        debounce: Option<Debounced>,
     ) -> Result<WorkflowHandle<R, E>> {
         let attributes = encode_attributes(options.attributes)?;
         // Generated once, outside the retry below: a second attempt under a fresh id would enqueue
@@ -504,6 +515,8 @@ impl Client {
             timeout: options.timeout,
             deadline: None,
             attributes: attributes.as_deref(),
+            is_debounced: debounce.is_some(),
+            debounce_timeout: debounce.and_then(|debounce| debounce.timeout),
             // Always `Some`: a client cannot run a workflow, so every enqueue it makes names a
             // queue — which is the difference from `start_with`, where the same base takes `None`.
             ..new_row(workflow_id, Some(&options.queue))
@@ -850,7 +863,7 @@ pub struct EnqueueOptions<'a> {
 impl<'a> EnqueueOptions<'a> {
     /// Refuses an enqueue no row could hold, with the check every start makes — see
     /// [`validate_start`].
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         validate_start(Some(&self.queue), self.timeout)
     }
 
