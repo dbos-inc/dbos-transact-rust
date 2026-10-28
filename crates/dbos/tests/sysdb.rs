@@ -10,7 +10,9 @@ use dbos::sysdb::types::{
     ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
     WorkflowRecord, WorkflowStatus, WrittenBy,
 };
-use dbos::sysdb::{BackendErrorKind, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase};
+use dbos::sysdb::{
+    BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
+};
 
 use dbos_test_support as support;
 use dbos_test_support::{Backend, owner_token, test_database};
@@ -544,7 +546,7 @@ async fn an_owner_is_generated_when_none_is_supplied() {
 /// dropped from the `INSERT` and nothing would notice.
 #[tokio::test]
 async fn every_settable_field_round_trips() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     let written = NewWorkflow {
         class_name: Some("Checkout"),
         config_name: Some("primary"),
@@ -554,7 +556,7 @@ async fn every_settable_field_round_trips() {
         queue_partition_key: Some("eu-west"),
         delay: Some(std::time::Duration::from_secs(60)),
         is_debounced: true,
-        debounce_deadline: Some(Timestamp::from_epoch_ms(1_700_000_020_000)),
+        debounce_timeout: Some(std::time::Duration::from_secs(120)),
         timeout: Some(std::time::Duration::from_secs(30)),
         deadline: Some(Timestamp::from_epoch_ms(1_700_000_030_000)),
         application_id: Some("app-1"),
@@ -571,7 +573,7 @@ async fn every_settable_field_round_trips() {
     sys.init_workflow(&workflow("wf-parent"), None)
         .await
         .expect("the parent could not be created");
-    let before = Timestamp::now();
+    let before = db_now_ms(&db).await;
     let init = sys
         .init_workflow(
             &written,
@@ -606,7 +608,15 @@ async fn every_settable_field_round_trips() {
         written.queue_partition_key
     );
     assert!(read.is_debounced);
-    assert_eq!(read.debounce_deadline, written.debounce_deadline);
+    // Both durations come back as instants on one reading of the database clock.
+    let debounce_deadline = read
+        .debounce_deadline
+        .expect("a debounce deadline")
+        .as_epoch_ms();
+    assert_eq!(
+        debounce_deadline - read.delay_until.expect("a delay").as_epoch_ms(),
+        60_000
+    );
     assert_eq!(read.timeout, written.timeout);
     assert_eq!(read.deadline, written.deadline);
     assert_eq!(read.executor_id.as_deref(), written.executor_id);
@@ -631,12 +641,12 @@ async fn every_settable_field_round_trips() {
         read.attributes,
     );
 
-    // The delay is a duration in, an instant out, stamped against the database layer's clock.
+    // The delay is a duration in, an instant out, stamped against the database clock.
     let delay_until = read.delay_until.expect("a delay should have been stamped");
-    let offset = delay_until.as_epoch_ms() - before.as_epoch_ms();
+    let offset = delay_until.as_epoch_ms() - before;
     assert!(
         (60_000..70_000).contains(&offset),
-        "delay_until should be ~60s from now, was {offset}ms",
+        "delay_until should be ~60s after the insert on the database clock, was {offset}ms",
     );
 
     // Columns the caller cannot set, and which creation must therefore leave alone.
@@ -651,7 +661,7 @@ async fn every_settable_field_round_trips() {
         read.owner_xid.is_none(),
         "a delayed workflow is owned by nobody until a claim"
     );
-    assert!(read.created_at.as_epoch_ms() >= before.as_epoch_ms());
+    assert!(read.created_at.as_epoch_ms() >= before);
     assert_eq!(read.created_at, read.updated_at);
 }
 
@@ -3125,7 +3135,7 @@ async fn reenqueue_for_recovery_is_scoped_by_executor_and_version() {
 /// A delay can be moved while the workflow is held, and not after it is released.
 #[tokio::test]
 async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     let wf = NewWorkflow {
         queue_name: Some("orders"),
         delay: Some(std::time::Duration::from_secs(3600)),
@@ -3151,8 +3161,8 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
     let read = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
     assert_eq!(read.delay_until, Some(Timestamp::from_epoch_ms(9_000_000)));
 
-    // A relative delay resolves against the system database layer's clock, not the caller's.
-    let before = Timestamp::now();
+    // A relative delay resolves against the database clock, not the caller's.
+    let before = db_now_ms(&db).await;
     sys.set_workflow_delay(
         "wf-delayed",
         WorkflowDelay::For(std::time::Duration::from_secs(60)),
@@ -3160,11 +3170,12 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
     )
     .await
     .unwrap();
+    let after = db_now_ms(&db).await;
     let read = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
-    let offset = read.delay_until.unwrap().as_epoch_ms() - before.as_epoch_ms();
+    let release = read.delay_until.unwrap().as_epoch_ms();
     assert!(
-        (60_000..70_000).contains(&offset),
-        "expected ~60s from now, got {offset}ms",
+        (before + 60_000..=after + 60_000).contains(&release),
+        "expected 60s after the write on the database clock, got {release}",
     );
 
     // A workflow that is not DELAYED is left alone: pushing its delay out cannot recall it.
@@ -3240,6 +3251,183 @@ async fn releasing_a_delayed_workflow_clears_only_the_debounce_key() {
 
     let held = sys.get_workflow("wf-still-held").await.unwrap().unwrap();
     assert_eq!(held.status, WorkflowStatus::Delayed);
+}
+
+/// The release compares each delay with the database clock, the one the delay was resolved
+/// against: a row due a moment before the database's `now()` is released, one due after it is not.
+#[tokio::test]
+async fn the_release_is_decided_by_the_database_clock() {
+    let (sys, db) = sysdb().await;
+    for id in ["wf-due", "wf-not-yet"] {
+        let wf = NewWorkflow {
+            queue_name: Some("orders"),
+            delay: Some(std::time::Duration::from_secs(3600)),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None).await.unwrap();
+    }
+    let now = db_now_ms(&db).await;
+    let pool = db.pool().await;
+    for (id, at) in [("wf-due", now - 1), ("wf-not-yet", now + 60_000)] {
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_status" SET delay_until_epoch_ms = $2
+               WHERE workflow_uuid = $1"#,
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(sys.transition_delayed_workflows().await.unwrap(), 1);
+    let status = |id| {
+        let sys = &sys;
+        async move { sys.get_workflow(id).await.unwrap().unwrap().status }
+    };
+    assert_eq!(status("wf-due").await, WorkflowStatus::Enqueued);
+    assert_eq!(status("wf-not-yet").await, WorkflowStatus::Delayed);
+}
+
+/// A migrated system database whose clock is `seconds` off this process's, or `None` on
+/// CockroachDB, whose clock can't be shifted.
+async fn skewed_sysdb(seconds: i64) -> Option<(PostgresSystemDatabase, support::TestDatabase)> {
+    let db = support::skewed_database(seconds).await?;
+    let pool = db.pool().await;
+    dbos::sysdb::migrations::runner::run(&pool, DEFAULT_SCHEMA, true)
+        .await
+        .expect("migrating the skewed database failed");
+    Some((
+        PostgresSystemDatabase::from_pool(pool, &Settings::default()),
+        db,
+    ))
+}
+
+/// **Delays and debounce deadlines hold however far the database's clock is from this
+/// process's.** The offset is an hour, far beyond any delay here, so an instant resolved or a
+/// release decided on the process's clock would land an hour from where these expect it.
+async fn delays_hold_with_the_database_clock_off_by(seconds: i64) {
+    let Some((sys, db)) = skewed_sysdb(seconds).await else {
+        return;
+    };
+    let minute = 60_000;
+    let within = |what: &str, at: i64, from: (i64, i64), offset: i64| {
+        assert!(
+            (from.0 + offset..=from.1 + offset).contains(&at),
+            "{what} at {at}, outside {}..={} on the database clock",
+            from.0 + offset,
+            from.1 + offset,
+        );
+    };
+
+    // The insert: the delay and the debounce deadline, both from the database clock.
+    let before = db_now_ms(&db).await;
+    enqueue_debounced(
+        &sys,
+        "wf-debounced",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        Some(std::time::Duration::from_secs(600)),
+    )
+    .await;
+    let after = db_now_ms(&db).await;
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    within(
+        "the release",
+        read.delay_until.unwrap().as_epoch_ms(),
+        (before, after),
+        minute,
+    );
+    within(
+        "the debounce deadline",
+        read.debounce_deadline.unwrap().as_epoch_ms(),
+        (before, after),
+        10 * minute,
+    );
+
+    // A bounce: the period from the bounce, on the same clock.
+    let before = db_now_ms(&db).await;
+    sys.debounce_delayed_workflow(
+        &bounce("checkout", "cart-1", std::time::Duration::from_secs(120)),
+        None,
+    )
+    .await
+    .unwrap();
+    let after = db_now_ms(&db).await;
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    within(
+        "the bounced release",
+        read.delay_until.unwrap().as_epoch_ms(),
+        (before, after),
+        2 * minute,
+    );
+
+    // Moving a delay: a relative one from the write, on the same clock.
+    let before = db_now_ms(&db).await;
+    sys.set_workflow_delay(
+        "wf-debounced",
+        WorkflowDelay::For(std::time::Duration::from_secs(180)),
+        None,
+    )
+    .await
+    .unwrap();
+    let after = db_now_ms(&db).await;
+    let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
+    within(
+        "the moved release",
+        read.delay_until.unwrap().as_epoch_ms(),
+        (before, after),
+        3 * minute,
+    );
+
+    // The release: a row due by the database clock goes, and one that is not stays, whatever this
+    // process's clock says. With the database ahead, the first is an hour from due here; with it
+    // behind, the second is long past due here. Either way one row would go the wrong way if the
+    // release read this process's clock.
+    for id in ["wf-due", "wf-not-due"] {
+        let wf = NewWorkflow {
+            queue_name: Some("orders"),
+            delay: Some(std::time::Duration::from_secs(3600)),
+            ..NewWorkflow::new(id)
+        };
+        sys.init_workflow(&wf, None).await.unwrap();
+    }
+    let db_now = db_now_ms(&db).await;
+    let pool = db.pool().await;
+    for (id, at) in [("wf-due", db_now - 1_000), ("wf-not-due", db_now + minute)] {
+        sqlx::query(
+            r#"UPDATE "dbos"."workflow_status" SET delay_until_epoch_ms = $2
+               WHERE workflow_uuid = $1"#,
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sys.transition_delayed_workflows().await.unwrap();
+    let status = |id| {
+        let sys = &sys;
+        async move { sys.get_workflow(id).await.unwrap().unwrap().status }
+    };
+    assert_eq!(status("wf-due").await, WorkflowStatus::Enqueued);
+    assert_eq!(status("wf-not-due").await, WorkflowStatus::Delayed);
+    assert_eq!(
+        status("wf-debounced").await,
+        WorkflowStatus::Delayed,
+        "a release three minutes out on the database clock stays"
+    );
+}
+
+#[tokio::test]
+async fn delays_hold_with_the_database_clock_ahead() {
+    delays_hold_with_the_database_clock_off_by(3600).await;
+}
+
+#[tokio::test]
+async fn delays_hold_with_the_database_clock_behind() {
+    delays_hold_with_the_database_clock_off_by(-3600).await;
 }
 
 /// A second workflow cannot take a deduplication key another already holds on the same queue.
@@ -6574,11 +6762,9 @@ async fn a_fork_timeout_that_cannot_be_stored_is_refused() {
     );
 }
 
-/// A workflow timeout or delay that cannot be stored is refused rather than truncated, and the
-/// refusal writes nothing.
-///
-/// Three ways to get there: a timeout and a delay too long to be milliseconds in an `i64` at all,
-/// and a delay that fits on its own but carries `now` past the largest instant.
+/// A workflow timeout or delay too long to be milliseconds in an `i64` is refused rather than
+/// truncated, and the refusal writes nothing. One that fits but carries the database's `now` past
+/// the largest instant is not refused: it saturates there, a release that never comes.
 #[tokio::test]
 async fn a_workflow_timeout_or_delay_that_cannot_be_stored_is_refused() {
     let (sys, _db) = sysdb().await;
@@ -6596,14 +6782,6 @@ async fn a_workflow_timeout_or_delay_that_cannot_be_stored_is_refused() {
                 queue_name: Some("orders"),
                 delay: Some(std::time::Duration::MAX),
                 ..workflow("wf-huge-delay")
-            },
-        ),
-        (
-            "delay",
-            NewWorkflow {
-                queue_name: Some("orders"),
-                delay: Some(std::time::Duration::from_millis(i64::MAX as u64)),
-                ..workflow("wf-overflowing-delay")
             },
         ),
     ];
@@ -6624,10 +6802,25 @@ async fn a_workflow_timeout_or_delay_that_cannot_be_stored_is_refused() {
         .await
         .unwrap();
     assert!(all.is_empty(), "a refused workflow must leave no row");
+
+    let overflowing = NewWorkflow {
+        queue_name: Some("orders"),
+        delay: Some(std::time::Duration::from_millis(i64::MAX as u64)),
+        ..workflow("wf-overflowing-delay")
+    };
+    sys.init_workflow(&overflowing, None).await.unwrap();
+    let read = sys
+        .get_workflow("wf-overflowing-delay")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.status, WorkflowStatus::Delayed);
+    assert_eq!(read.delay_until, Some(Timestamp::from_epoch_ms(i64::MAX)));
 }
 
-/// A relative delay whose release instant cannot be stored is refused, and the row keeps the
-/// delay it had.
+/// A relative delay too long to be milliseconds in an `i64` is refused, and the row keeps the delay
+/// it had. One that fits but carries the database's `now` past the largest instant is accepted and
+/// saturates there, a release that never comes.
 #[tokio::test]
 async fn a_moved_delay_that_cannot_be_stored_is_refused() {
     let (sys, _db) = sysdb().await;
@@ -6660,6 +6853,20 @@ async fn a_moved_delay_that_cannot_be_stored_is_refused() {
         "a refused delay moved the row"
     );
     assert_eq!(after.status, WorkflowStatus::Delayed);
+
+    sys.set_workflow_delay(
+        "wf-delayed",
+        WorkflowDelay::For(std::time::Duration::from_millis(i64::MAX as u64)),
+        None,
+    )
+    .await
+    .expect("a delay that fits in milliseconds is accepted");
+    let saturated = sys.get_workflow("wf-delayed").await.unwrap().unwrap();
+    assert_eq!(
+        saturated.delay_until,
+        Some(Timestamp::from_epoch_ms(i64::MAX))
+    );
+    assert_eq!(saturated.status, WorkflowStatus::Delayed);
 }
 
 /// A durable sleep whose wake time cannot be stored is refused, and records the refusal rather
@@ -12646,7 +12853,7 @@ async fn enqueue_debounced(
     name: &str,
     key: &str,
     delay: std::time::Duration,
-    deadline: Option<Timestamp>,
+    debounce_timeout: Option<std::time::Duration>,
 ) {
     let wf = NewWorkflow {
         name: Some(name),
@@ -12654,7 +12861,7 @@ async fn enqueue_debounced(
         deduplication_id: Some(key),
         is_debounced: true,
         delay: Some(delay),
-        debounce_deadline: deadline,
+        debounce_timeout,
         input: Some("\"first\""),
         application_version: Some("v1"),
         ..NewWorkflow::new(id)
@@ -12662,14 +12869,25 @@ async fn enqueue_debounced(
     sys.init_workflow(&wf, None).await.unwrap();
 }
 
-fn bounce<'a>(name: &'a str, key: &'a str, delay_until: Timestamp) -> DebounceRequest<'a> {
+/// A bounce's period where its length does not matter to the test.
+const AN_HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The database clock, in epoch milliseconds: what delays and debounce deadlines resolve against.
+async fn db_now_ms(db: &support::TestDatabase) -> i64 {
+    sqlx::query_scalar("SELECT (EXTRACT(epoch FROM now()) * 1000)::bigint")
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap()
+}
+
+fn bounce<'a>(name: &'a str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
     DebounceRequest {
         workflow_name: name,
         class_name: None,
         config_name: None,
         queue_name: "orders",
         deduplication_id: key,
-        delay_until,
+        period,
         inputs: Some("\"later\""),
         serialization: None,
         application_name: None,
@@ -12709,7 +12927,7 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     let west = DebounceRequest {
         class_name: Some("Checkout"),
         config_name: Some("west"),
-        ..bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000))
+        ..bounce("checkout", "cart-1", AN_HOUR)
     };
     match sys.debounce_delayed_workflow(&west, None).await.unwrap() {
         Debounce::Held(holder) => {
@@ -12722,12 +12940,9 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
 
     // An unclassed bounce is a third identity again, not a match for either.
     assert!(matches!(
-        sys.debounce_delayed_workflow(
-            &bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
-            None
-        )
-        .await
-        .unwrap(),
+        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", AN_HOUR), None)
+            .await
+            .unwrap(),
         Debounce::Held(_)
     ));
 
@@ -12735,7 +12950,7 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     let east = DebounceRequest {
         class_name: Some("Checkout"),
         config_name: Some("east"),
-        ..bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000))
+        ..bounce("checkout", "cart-1", AN_HOUR)
     };
     assert_eq!(
         sys.debounce_delayed_workflow(&east, None).await.unwrap(),
@@ -12752,7 +12967,7 @@ async fn a_bounce_refuses_an_empty_class_or_instance() {
     let (sys, _db) = sysdb().await;
     let request = DebounceRequest {
         class_name: Some(""),
-        ..bounce("checkout", "cart-1", Timestamp::from_epoch_ms(9_000_000))
+        ..bounce("checkout", "cart-1", AN_HOUR)
     };
     assert!(matches!(
         sys.debounce_delayed_workflow(&request, None).await,
@@ -12763,7 +12978,7 @@ async fn a_bounce_refuses_an_empty_class_or_instance() {
 /// A bounce pushes the release out and replaces the inputs.
 #[tokio::test]
 async fn a_bounce_extends_the_delay_and_replaces_the_inputs() {
-    let (sys, _db) = sysdb().await;
+    let (sys, db) = sysdb().await;
     enqueue_debounced(
         &sys,
         "wf-debounced",
@@ -12774,18 +12989,27 @@ async fn a_bounce_extends_the_delay_and_replaces_the_inputs() {
     )
     .await;
 
-    let pushed_to = Timestamp::from_epoch_ms(9_000_000_000);
+    // The period counts from the bounce, on the database clock.
+    let before = db_now_ms(&db).await;
     assert_eq!(
-        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", pushed_to), None)
+        sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", AN_HOUR), None)
             .await
             .unwrap(),
         Debounce::Bounced {
             workflow_id: "wf-debounced".to_owned()
         },
     );
+    let after = db_now_ms(&db).await;
 
     let read = sys.get_workflow("wf-debounced").await.unwrap().unwrap();
-    assert_eq!(read.delay_until, Some(pushed_to));
+    let release = read.delay_until.unwrap().as_epoch_ms();
+    let hour = AN_HOUR.as_millis() as i64;
+    assert!(
+        (before + hour..=after + hour).contains(&release),
+        "released at {release}, outside {}..={}",
+        before + hour,
+        after + hour
+    );
     assert_eq!(read.input.as_deref(), Some("\"later\""));
     assert_eq!(read.status, WorkflowStatus::Delayed);
 }
@@ -12796,36 +13020,72 @@ async fn a_bounce_extends_the_delay_and_replaces_the_inputs() {
 #[tokio::test]
 async fn a_bounce_cannot_push_past_the_debounce_deadline() {
     let (sys, _db) = sysdb().await;
-    let deadline = Timestamp::from_epoch_ms(5_000_000_000);
     enqueue_debounced(
         &sys,
         "wf-capped",
         "checkout",
         "cart-1",
         std::time::Duration::from_secs(60),
-        Some(deadline),
+        Some(std::time::Duration::from_secs(120)),
     )
     .await;
 
-    sys.debounce_delayed_workflow(
-        &bounce(
-            "checkout",
-            "cart-1",
-            Timestamp::from_epoch_ms(9_000_000_000),
-        ),
-        None,
-    )
-    .await
-    .unwrap();
+    sys.debounce_delayed_workflow(&bounce("checkout", "cart-1", AN_HOUR), None)
+        .await
+        .unwrap();
 
+    let read = sys.get_workflow("wf-capped").await.unwrap().unwrap();
+    assert!(read.debounce_deadline.is_some());
     assert_eq!(
-        sys.get_workflow("wf-capped")
-            .await
-            .unwrap()
-            .unwrap()
-            .delay_until,
-        Some(deadline),
+        read.delay_until, read.debounce_deadline,
         "the deadline caps the push, so the workflow still runs",
+    );
+}
+
+/// The insert resolves the delay and the debounce deadline from one reading of the database
+/// clock, so a delay longer than the debounce timeout is released at the deadline exactly, and a
+/// shorter one lands exactly the difference before it.
+#[tokio::test]
+async fn an_insert_resolves_the_delay_and_the_debounce_deadline_from_one_clock_reading() {
+    let (sys, db) = sysdb().await;
+    let before = db_now_ms(&db).await;
+    enqueue_debounced(
+        &sys,
+        "wf-short",
+        "checkout",
+        "cart-1",
+        std::time::Duration::from_secs(60),
+        Some(std::time::Duration::from_secs(3600)),
+    )
+    .await;
+    enqueue_debounced(
+        &sys,
+        "wf-long",
+        "checkout",
+        "cart-2",
+        std::time::Duration::from_secs(7200),
+        Some(std::time::Duration::from_secs(600)),
+    )
+    .await;
+    let after = db_now_ms(&db).await;
+
+    let short = sys.get_workflow("wf-short").await.unwrap().unwrap();
+    let (release, deadline) = (
+        short.delay_until.unwrap().as_epoch_ms(),
+        short.debounce_deadline.unwrap().as_epoch_ms(),
+    );
+    assert_eq!(deadline - release, 3_540_000, "the two share one reading");
+    assert!(
+        (before + 60_000..=after + 60_000).contains(&release),
+        "released at {release}, not 60s after the insert on the database clock"
+    );
+
+    let long = sys.get_workflow("wf-long").await.unwrap().unwrap();
+    assert_eq!(long.delay_until, long.debounce_deadline, "capped exactly");
+    assert!(
+        (before + 600_000..=after + 600_000)
+            .contains(&long.debounce_deadline.unwrap().as_epoch_ms()),
+        "the deadline is the timeout after the insert on the database clock"
     );
 }
 
@@ -12845,10 +13105,7 @@ async fn a_key_collision_reports_the_holder() {
 
     // Same key, different workflow — the `"a" + "b-c"` against `"a-b" + "c"` case.
     let result = sys
-        .debounce_delayed_workflow(
-            &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
-            None,
-        )
+        .debounce_delayed_workflow(&bounce("refund", "cart-1", AN_HOUR), None)
         .await
         .unwrap();
     match result {
@@ -12881,16 +13138,9 @@ async fn an_unheld_key_is_reported_as_unheld() {
         .unwrap();
 
     assert_eq!(
-        sys.debounce_delayed_workflow(
-            &bounce(
-                "checkout",
-                "never-used",
-                Timestamp::from_epoch_ms(9_000_000)
-            ),
-            None
-        )
-        .await
-        .unwrap(),
+        sys.debounce_delayed_workflow(&bounce("checkout", "never-used", AN_HOUR), None)
+            .await
+            .unwrap(),
         Debounce::Unheld,
     );
 }
@@ -12933,10 +13183,7 @@ async fn a_bounce_stays_within_an_application() {
 
     // Beta's is reported, not extended.
     let result = alpha
-        .debounce_delayed_workflow(
-            &bounce("checkout", "beta-key", Timestamp::from_epoch_ms(9_000_000)),
-            None,
-        )
+        .debounce_delayed_workflow(&bounce("checkout", "beta-key", AN_HOUR), None)
         .await
         .unwrap();
     match result {
@@ -12949,10 +13196,7 @@ async fn a_bounce_stays_within_an_application() {
     // The unclaimed one is extended and claimed in the same statement.
     assert_eq!(
         alpha
-            .debounce_delayed_workflow(
-                &bounce("checkout", "free-key", Timestamp::from_epoch_ms(9_000_000)),
-                None
-            )
+            .debounce_delayed_workflow(&bounce("checkout", "free-key", AN_HOUR), None)
             .await
             .unwrap(),
         Debounce::Bounced {
@@ -12993,10 +13237,9 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
     )
     .await;
 
-    let pushed_to = Timestamp::from_epoch_ms(9_000_000_000);
     let first = sys
         .debounce_delayed_workflow(
-            &bounce("checkout", "cart-1", pushed_to),
+            &bounce("checkout", "cart-1", AN_HOUR),
             Some(support::step_caller(
                 "wf-caller",
                 0,
@@ -13036,11 +13279,7 @@ async fn a_bounce_inside_a_workflow_is_a_step_and_replays() {
 
     let replayed = sys
         .debounce_delayed_workflow(
-            &bounce(
-                "checkout",
-                "cart-1",
-                Timestamp::from_epoch_ms(7_000_000_000),
-            ),
+            &bounce("checkout", "cart-1", 2 * AN_HOUR),
             Some(support::step_caller(
                 "wf-caller",
                 0,
@@ -13080,7 +13319,7 @@ async fn a_replayed_bounce_reports_the_original_holder() {
 
     let first = sys
         .debounce_delayed_workflow(
-            &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
+            &bounce("refund", "cart-1", AN_HOUR),
             Some(support::step_caller(
                 "wf-caller",
                 0,
@@ -13099,7 +13338,7 @@ async fn a_replayed_bounce_reports_the_original_holder() {
 
     let replayed = sys
         .debounce_delayed_workflow(
-            &bounce("refund", "cart-1", Timestamp::from_epoch_ms(9_000_000)),
+            &bounce("refund", "cart-1", AN_HOUR),
             Some(support::step_caller(
                 "wf-caller",
                 0,
@@ -13552,14 +13791,7 @@ async fn a_bounce_writes_the_inputs_to_the_payload_table() {
     enqueue_debounced(&sys, "wf-held", "checkout", "key-1", delay, None).await;
 
     let bounced = sys
-        .debounce_delayed_workflow(
-            &bounce(
-                "checkout",
-                "key-1",
-                Timestamp::now().checked_add(delay).unwrap(),
-            ),
-            None,
-        )
+        .debounce_delayed_workflow(&bounce("checkout", "key-1", delay), None)
         .await
         .unwrap();
     assert!(matches!(bounced, Debounce::Bounced { .. }));

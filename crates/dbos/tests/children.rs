@@ -702,40 +702,38 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
     dbos.shutdown().await;
 }
 
-/// **A child start refused for a delay that carries it past the largest instant is recorded too**,
-/// and replays the same.
+/// **A child start the insert refuses for its arguments is recorded too**, and replays the same.
 ///
-/// Whether the delay fits depends on the clock when the start runs, so a replay on a host whose
-/// clock is behind could go ahead with the start the first run refused. The delay is shared with
-/// the test and shortened before the replay, standing in for that clock: a fork that copies the
-/// start's checkpoint still takes the refused branch and creates no child, and a fork that runs the
-/// start again, as a control, starts the child.
+/// An empty deduplication id passes the start's own checks and is refused by the insert, as
+/// `InvalidInput`. The key is shared with the test and made valid before the replay, standing in
+/// for a refusal the replay would not reach (or a record an earlier version wrote): a fork that
+/// copies the start's checkpoint still takes the refused branch and creates no child, and a fork
+/// that runs the start again, as a control, starts the child.
 #[tokio::test]
-async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_would_fit() {
-    use std::sync::atomic::AtomicU64;
+async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_would_succeed() {
+    use std::sync::Mutex;
 
     let db = test_database().await;
-    let dbos = DBOS::new(config("child-delay-error-app", &db));
+    let dbos = DBOS::new(config("child-insert-error-app", &db));
     let child = dbos
         .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
         .unwrap();
-    // Fits in milliseconds, so the start's own checks pass it, but no clock can add it to now.
-    let delay_ms = Arc::new(AtomicU64::new(i64::MAX as u64));
+    let key = Arc::new(Mutex::new(String::new()));
     let parent = dbos
         .register_workflow("parent", {
             let child = child.clone();
-            let delay_ms = Arc::clone(&delay_ms);
+            let key = Arc::clone(&key);
             move |()| {
                 let child = child.clone();
-                let delay = Duration::from_millis(delay_ms.load(Ordering::SeqCst));
+                let key = key.lock().unwrap().clone();
                 async move {
                     let started = child
                         .start_with(
                             (),
                             StartOptions {
                                 queue: Some(Enqueue {
-                                    delay: Some(delay),
-                                    ..Enqueue::new("delay-error-queue")
+                                    deduplication_id: Some(&key),
+                                    ..Enqueue::new("insert-error-queue")
                                 }),
                                 ..StartOptions::default()
                             },
@@ -752,7 +750,7 @@ async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_wo
         .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    let id = "the-delay-refused-parent";
+    let id = "the-insert-refused-parent";
     let first = parent
         .run_with(
             (),
@@ -765,7 +763,8 @@ async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_wo
         .expect("the parent failed");
     assert!(
         first.starts_with(
-            "refused: invalid argument to enqueue a workflow: queue `delay-error-queue`: `delay`"
+            "refused: invalid argument to enqueue a workflow: queue `insert-error-queue`: \
+             `deduplication_id`"
         ),
         "{first}"
     );
@@ -783,10 +782,10 @@ async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_wo
         steps[0]
     );
 
-    delay_ms.store(60_000, Ordering::SeqCst);
+    *key.lock().unwrap() = "a-valid-key".to_owned();
 
     // A fork from step 1 copies the start's checkpoint, so the start replays and must return the
-    // first run's refusal again rather than start the child with a delay that now fits.
+    // first run's refusal again rather than start the child with a key that is now valid.
     let replayed = dbos
         .fork::<String, Error>(id, 1)
         .await
@@ -806,7 +805,7 @@ async fn a_child_start_refused_for_its_delay_replays_its_error_when_the_delay_wo
         "the replay started the child"
     );
 
-    // A fork from step 0 runs the start again, and with a delay that fits it goes ahead.
+    // A fork from step 0 runs the start again, and with a valid key it goes ahead.
     let rerun = dbos
         .fork::<String, Error>(id, 0)
         .await

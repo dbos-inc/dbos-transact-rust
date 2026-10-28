@@ -497,10 +497,10 @@ impl<'a> Enqueue<'a> {
     ///   [`i32::MAX`] because the column is a signed 32-bit integer.
     /// - **A delay must be more than zero, and fit in milliseconds as a 64-bit integer.** A zero
     ///   delay is a caller that meant `None`. Neither rule reads a clock, so a replay decides it as
-    ///   the first run did. A delay that fits but carries `now` past the largest instant is refused
-    ///   by the system database when it resolves the delay, and reported as the same
-    ///   [`Error::InvalidArgument`] by [`refused_start`]. The system database also refuses
-    ///   everything here again for its own callers.
+    ///   the first run did. A delay that fits is never refused for the instant it reaches: the
+    ///   system database resolves it against its own clock and saturates at the largest instant,
+    ///   a release that never comes. The system database also refuses everything here again for
+    ///   its own callers, reported as the same [`Error::InvalidArgument`] by [`refused_start`].
     ///
     /// Each is an [`Error::InvalidArgument`] to [`ENQUEUE_OPERATION`] naming the queue, through
     /// [`start_refusal`].
@@ -576,15 +576,14 @@ fn start_refusal(queue: Option<&str>, detail: String) -> Error {
 /// A start's error, with the system database's refusal of its arguments reported as the start's
 /// own, through [`start_refusal`].
 ///
-/// Chiefly the refusal only the insert can make: a delay that fits in milliseconds but carries the
-/// release time past the largest instant, which depends on the clock. A child start records that
-/// refusal at its parent's step as the system database's error, so a replay reads it back in the
-/// same form and this maps it the same way. **The refusal is what replays; its wording is not
-/// recorded.** The operation and the queue in the detail come from the call making it, so a replay
-/// fails as the first run did, with the same variant, field and reason, and names its own queue if
-/// its options name a different one. Also every other value of the row the caller supplied
-/// and the insert refuses — an empty `workflow_id`, `deduplication_id` or `partition_key` — named
-/// as the start's API spells it, which is not always the column's name.
+/// Every value of the row the caller supplied and the insert refuses — an empty `workflow_id`,
+/// `deduplication_id` or `partition_key`, a duration too long to store — named as the start's API
+/// spells it, which is not always the column's name. A child start records such a refusal at its
+/// parent's step as the system database's error, so a replay reads it back in the same form and
+/// this maps it the same way. **The refusal is what replays; its wording is not recorded.** The
+/// operation and the queue in the detail come from the call making it, so a replay fails as the
+/// first run did, with the same variant, field and reason, and names its own queue if its options
+/// name a different one.
 pub(crate) fn refused_start(queue: Option<&str>, error: Error) -> Error {
     match error {
         Error::SystemDatabase(crate::sysdb::Error::InvalidInput { field, detail }) => {
@@ -1735,13 +1734,13 @@ impl StartPlacement {
 ///   workflow of another function, class or config, and once that row is deleted the same start
 ///   would go ahead.
 ///
-/// One more depends on the clock rather than on another row:
+/// One more is recorded although it depends only on the start's arguments:
 ///
-/// - [`InvalidInput`](crate::sysdb::Error::InvalidInput): a delay that fits in milliseconds but
-///   carries the release time past the largest instant a row can hold. Whether it does depends on
-///   when the start runs, so a replay on a host whose clock is behind could go ahead with it. The
-///   other `InvalidInput`s a start can reach depend only on its arguments, and recording one of
-///   those changes nothing, since the replay would refuse it the same way.
+/// - [`InvalidInput`](crate::sysdb::Error::InvalidInput): a value of the row the insert refuses.
+///   The replay would refuse it the same way, so recording it changes nothing, and it stays in
+///   the list so a record an earlier version wrote still reads back as a start error. A delay
+///   that once could be refused by the clock no longer can: the insert resolves it on the
+///   database clock and saturates.
 ///
 /// Without the record, the replay would start the child and the parent would take the other branch
 /// from the one it took after the error. Every other error a start can return is one of:
@@ -2398,9 +2397,8 @@ mod tests {
                     && detail == "queue `q`: `delay` must fit in milliseconds as a 64-bit integer"),
             "got {delay:?}"
         );
-        // Fits in milliseconds, and would carry now past the largest instant. That rule reads the
-        // clock, so it is not this check's: the system database applies it when it resolves the
-        // delay.
+        // Fits in milliseconds, however far past now it lands: the system database resolves it
+        // on its own clock and saturates at the largest instant.
         assert!(
             Enqueue {
                 delay: Some(Duration::from_millis(i64::MAX as u64)),

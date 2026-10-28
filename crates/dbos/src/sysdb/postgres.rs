@@ -1877,9 +1877,11 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// everywhere.
 ///
 /// Workflow deadlines are on this clock too: a timeout becomes one at the insert or the claim, and
-/// the sweep and a run's own timeout compare against it. Times a caller supplies or resolves still
-/// come from the process clock: delays, step timings, durable sleep, and the `version_timestamp` a
-/// promotion writes.
+/// the sweep and a run's own timeout compare against it. So are relative delays and debounce
+/// deadlines, which the write resolves from durations and the release sweep compares against.
+/// Times a caller supplies or resolves still come from the process clock: an absolute delay
+/// ([`WorkflowDelay::Until`]), step timings, durable sleep, and the `version_timestamp` a promotion
+/// writes.
 ///
 /// `now()` is the *transaction's* start time, not the statement's, which is what makes a cutoff
 /// and the stamp taken later in the same transaction agree on one instant.
@@ -3227,26 +3229,20 @@ impl SystemDatabase for PostgresSystemDatabase {
         // timeout is read the same way, so a retried insert starts the budget when it lands, which
         // is also when the workflow can first start.
         //
-        // The delay is the exception. It is a duration resolved to an instant, so it is read once
-        // here, outside the retry: re-reading it on every attempt would release the workflow late
-        // by however long the retries took, and `with_retry` starts at a one-second backoff. It
-        // comes from this process's clock and is compared against the supervisor's.
+        // The delay and the debounce deadline are read the same way, for the same reason and one
+        // more: the release sweep compares them against the database clock, so resolving them on
+        // any other clock would move the release by the skew between the two. A retry happens only
+        // when the earlier attempt did not commit (a lost acknowledgement finds the row and takes
+        // the conflict arm, which writes nothing), so a delay counted from the attempt that lands
+        // is counted from when the row exists. Both saturate; see `now_ms_plus_sql`.
         //
-        // TODO(dbos-team): UPSTREAM item 22. The delay should resolve against the database clock,
-        // read once outside the retry.
-        //
-        // `validate` has already refused a delay or a timeout too long to store as milliseconds,
-        // but a delay that fits can still carry `now` past the largest instant, which only the
-        // resolution can see. Both are settled here, before the retry and before any write.
-        let now = Timestamp::now();
-        let delay_until = workflow
-            .delay
-            .map(|d| WorkflowDelay::For(d).resolve(now))
-            .transpose()?;
-        let timeout_ms = workflow
-            .timeout
-            .map(|d| duration_to_ms("timeout", d))
-            .transpose()?;
+        // `validate` has already refused a duration too long to store as milliseconds.
+        let to_ms = |field, duration: Option<Duration>| {
+            duration.map(|d| duration_to_ms(field, d)).transpose()
+        };
+        let timeout_ms = to_ms("timeout", workflow.timeout)?;
+        let delay_ms = to_ms("delay", workflow.delay)?;
+        let debounce_timeout_ms = to_ms("debounce_timeout", workflow.debounce_timeout)?;
 
         // Shared references only, so each attempt's future borrows the method rather than the
         // closure. See `with_retry`.
@@ -3299,7 +3295,14 @@ impl SystemDatabase for PostgresSystemDatabase {
             //
             // The deadline saturates rather than overflowing; see `now_ms_plus_sql`. The cast
             // fixes the parameter's type for the arithmetic on both backends.
+            //
+            // The release is the delay from now, capped at the debounce deadline. Every `now()`
+            // in the statement is one reading, so a delay longer than the debounce timeout lands
+            // on the deadline exactly. Both are known non-NULL in the `LEAST` arm, which keeps it
+            // clear of the backends' different treatment of a NULL argument.
             let deadline_from_timeout = now_ms_plus_sql("$18::bigint");
+            let delay_until = now_ms_plus_sql("$10::bigint");
+            let debounce_deadline = now_ms_plus_sql("$25::bigint");
             let row = sqlx::query(AssertSqlSafe(format!(
                 "INSERT INTO {workflow_table} (workflow_uuid, status, \
                  name, class_name, config_name, \
@@ -3310,11 +3313,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                  workflow_timeout_ms, workflow_deadline_epoch_ms, \
                  parent_workflow_id, owner_xid, serialization, attributes, schedule_name, \
                  debounce_deadline_epoch_ms, is_debounced, application_name, creator_xid) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                 CASE WHEN $10::bigint IS NULL THEN NULL \
+                      WHEN $25::bigint IS NULL THEN {delay_until} \
+                      ELSE LEAST({delay_until}, {debounce_deadline}) END, \
+                 $11, $12, $13, $14, $15, $16, \
                  {NOW_MS_SQL}, {NOW_MS_SQL}, $17, $18, \
                  COALESCE($19, CASE WHEN $2 = 'PENDING' THEN {deadline_from_timeout} END), \
-                 $20, CASE WHEN $2 = 'PENDING' THEN $21 END, $22, $23::jsonb, $24, $25, $26, \
-                 $27, $21) \
+                 $20, CASE WHEN $2 = 'PENDING' THEN $21 END, $22, $23::jsonb, $24, \
+                 {debounce_deadline}, $26, $27, $21) \
                  ON CONFLICT (workflow_uuid) DO UPDATE SET \
                    creator_xid = {workflow_table}.creator_xid \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
@@ -3330,7 +3337,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.deduplication_id)
             .bind(workflow.priority)
             .bind(workflow.queue_partition_key)
-            .bind(delay_until.map(Timestamp::as_epoch_ms))
+            .bind(delay_ms)
             // TypeScript and Go send `""` rather than null when there is no auth context, and
             // Java normalises it on the way in for that reason. Storing both spellings would
             // make an `authenticated_user IS NULL` filter miss rows another SDK wrote.
@@ -3350,7 +3357,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             .bind(workflow.serialization)
             .bind(workflow.attributes)
             .bind(workflow.schedule_name)
-            .bind(workflow.debounce_deadline.map(Timestamp::as_epoch_ms))
+            .bind(debounce_timeout_ms)
             .bind(workflow.is_debounced)
             // Both Python and TypeScript apply the application name fallback a layer up, in the
             // executor and the client. It is here so that this layer can stand alone.
@@ -4073,20 +4080,30 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let workflow_table = &self.tables.workflow_status;
-        // Resolved once, outside the retry, so a relative delay does not creep further out with
-        // each attempt, as on `init_workflow`.
+        // A relative delay is resolved by the statement, against the database clock the release
+        // sweep compares it with, as on `init_workflow`; an absolute one is written as given.
+        // Exactly one of the two is bound.
         //
-        // A relative delay is stamped by *this* process, and released by whichever supervisor
-        // next runs, against *its* clock — so a skewed operator host moves a release time the
-        // whole fleet honours.
+        // Unlike `init_workflow`'s insert, this `UPDATE` is not idempotent across a retry: an
+        // attempt that committed but lost its acknowledgement is applied again by the next, with a
+        // later `now()`. The release then lands the delay after the last write, later than after
+        // the first by however long the retries took; `with_retry` sets no attempt limit, so after
+        // a long outage that can be the whole outage. Accepted rather than paying a round trip to
+        // read the clock once outside the retry: the outcome is the delay counted from a write
+        // that landed, as if the caller had made the call again. With a `caller` the retry finds
+        // the recorded step instead.
         //
-        // TODO(dbos-team): UPSTREAM item 22, as on `init_workflow`.
-        let now = Timestamp::now();
-        // An instant that cannot be stored is refused inside the step, not here: whether it fits
-        // depends on the clock, so a replay must read back what the first run recorded rather
-        // than decide again. The step records the refusal like any other failure.
-        let delay_until = delay.resolve(now).map(Timestamp::as_epoch_ms);
-        let delay_until = &delay_until;
+        // A relative delay too long to store as milliseconds is refused inside the step, so a
+        // first run records the refusal and a replay reads it back, as for any other failure.
+        let delay = match delay {
+            WorkflowDelay::For(duration) => {
+                duration_to_ms("delay", duration).map(|ms| (None, Some(ms)))
+            }
+            WorkflowDelay::Until(instant) => Ok((Some(instant.as_epoch_ms()), None)),
+        };
+        let delay = &delay;
+        let delay_until_from_delay = now_ms_plus_sql("$3::bigint");
+        let delay_until_from_delay = delay_until_from_delay.as_str();
         let workflow_table = workflow_table.as_str();
         let started_at = Timestamp::now();
 
@@ -4098,16 +4115,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                 |mut conn| async move {
                     // The step runs this only when nothing is recorded, so only a first run is
                     // refused; a replay reads back the refusal it recorded.
-                    let delay_until = delay_until.clone()?;
+                    let (until_ms, delay_ms) = delay.clone()?;
                     // `status = 'DELAYED'` is the guard: a released workflow is running or
                     // queued, and pushing its delay out would not recall it.
                     sqlx::query(AssertSqlSafe(format!(
                         "UPDATE {workflow_table} \
-                         SET delay_until_epoch_ms = $2, updated_at = {NOW_MS_SQL} \
+                         SET delay_until_epoch_ms = COALESCE($2::bigint, {delay_until_from_delay}), \
+                             updated_at = {NOW_MS_SQL} \
                          WHERE workflow_uuid = $1 AND status = 'DELAYED'"
                     )))
                     .bind(workflow_id)
-                    .bind(delay_until)
+                    .bind(until_ms)
+                    .bind(delay_ms)
                     .execute(&mut *conn)
                     .await?;
                     Ok((conn, ()))
@@ -4286,16 +4305,12 @@ impl SystemDatabase for PostgresSystemDatabase {
             &self.retry,
             "transition_delayed_workflows",
             move || async move {
-                // The clock is read per attempt on purpose: this is a sweep, not a write a caller
-                // is holding an identity for, and a retry should release whatever has since come
-                // due rather than replay a stale cutoff.
+                // The cutoff is the database clock, the one this layer resolves every relative
+                // delay against (see `init_workflow`), so a delay ends at the same instant
+                // whichever executor runs the release. It is read per attempt on purpose: this is a sweep, not a
+                // write a caller is holding an identity for, and a retry should release whatever
+                // has since come due rather than replay a stale cutoff.
                 //
-                // The cutoff is this supervisor's own clock, a process clock as delays are, but
-                // usually not the process that resolved the delay: this compares a reading taken
-                // here against an instant some other process resolved (UPSTREAM item 22, see
-                // `init_workflow`). `updated_at` is a stamp rather than a comparison, so it comes
-                // from the database.
-                let now = Timestamp::now().as_epoch_ms();
                 // Clearing the debounce key belongs in this statement, not a second one. The id
                 // is held only while the workflow is DELAYED; once released the workflow is
                 // committed to running, and a later debounce with the same key must start a
@@ -4304,12 +4319,11 @@ impl SystemDatabase for PostgresSystemDatabase {
                     "UPDATE {workflow_table} SET status = 'ENQUEUED', updated_at = {NOW_MS_SQL}, \
                      deduplication_id = CASE WHEN is_debounced THEN NULL \
                                              ELSE deduplication_id END \
-                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= $1 \
-                       AND ($2::text IS NULL \
-                            OR application_name = $2 \
+                     WHERE status = 'DELAYED' AND delay_until_epoch_ms <= {NOW_MS_SQL} \
+                       AND ($1::text IS NULL \
+                            OR application_name = $1 \
                             OR application_name IS NULL)"
                 )))
-                .bind(now)
                 .bind(application_name)
                 .execute(pool)
                 .await?
@@ -7265,6 +7279,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         let application_name = request
             .application_name
             .or(self.application_name.as_deref());
+        // `validate` has refused a period too long to store; the sum saturates, see
+        // `now_ms_plus_sql`.
+        let period_ms = duration_to_ms("period", request.period)?;
+        let delay_until = now_ms_plus_sql("$4::bigint");
+        let delay_until = delay_until.as_str();
 
         // Read once, outside the retry, so the duration spans every attempt rather than only the
         // one that landed. `run_transactional_step` stamps the completion on the far side of the
@@ -7304,13 +7323,22 @@ impl SystemDatabase for PostgresSystemDatabase {
                         // These stay Rust comments. A `\` continuation strips the newline, so a
                         // `--` comment inside the string would comment out the rest of the
                         // statement.
+                        //
+                        // The new release is the period from now on the database clock, which the
+                        // deadline was resolved against and the release sweep compares with. `now()`
+                        // is the transaction's start, so a bounce that waits on the row's lock
+                        // counts its period from before the wait. A retry after a lost
+                        // acknowledgement bounces again with a later `now()`, which pushes the
+                        // release to the period after the last bounce, as a debounce means; later
+                        // than after the first by however long the retries took, which with no
+                        // attempt limit can be a whole outage.
                         let bounced: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
                              SET delay_until_epoch_ms = CASE \
                                      WHEN debounce_deadline_epoch_ms IS NOT NULL \
-                                      AND debounce_deadline_epoch_ms < $4 \
+                                      AND debounce_deadline_epoch_ms < {delay_until} \
                                      THEN debounce_deadline_epoch_ms \
-                                     ELSE $4 \
+                                     ELSE {delay_until} \
                                  END, \
                                  serialization = $5, \
                                  updated_at = {NOW_MS_SQL}, \
@@ -7326,7 +7354,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(request.workflow_name)
                         .bind(request.queue_name)
                         .bind(request.deduplication_id)
-                        .bind(request.delay_until.as_epoch_ms())
+                        .bind(period_ms)
                         .bind(request.serialization)
                         .bind(application_name)
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL
