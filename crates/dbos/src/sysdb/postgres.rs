@@ -3405,6 +3405,9 @@ impl PostgresSystemDatabase {
 
             // Same id, different function: a programming error rather than a race, because the id
             // is how every implementation decides two attempts are the same workflow.
+            //
+            // A stored `''` is absent, as `NULL` is: other SDKs write either for a free function
+            // or an unconfigured one, and this layer never stores `''` itself.
             for (field, stored, offered) in [
                 (
                     "function name",
@@ -3414,7 +3417,7 @@ impl PostgresSystemDatabase {
                 ("class name", row.try_get("class_name")?, &workflow.class_name),
                 ("config name", row.try_get("config_name")?, &workflow.config_name),
             ] {
-                if stored.as_deref() != offered.as_deref() {
+                if stored.as_deref().filter(|stored| !stored.is_empty()) != offered.as_deref() {
                     return Err(Error::ConflictingWorkflow {
                         workflow_id: workflow.workflow_id.to_owned(),
                         detail: format!(
@@ -7407,7 +7410,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                                     OR application_name IS NULL) \
                              RETURNING workflow_uuid"
                         )))
-                        .bind(&request.workflow.name)
+                        .bind(request.workflow.name())
                         .bind(request.queue_name)
                         .bind(request.deduplication_id)
                         .bind(period_ms)
@@ -7417,9 +7420,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                         // the enqueue stored rather than matching nothing, as `=` would; and
                         // `NULLIF`, so a row that spells one `''` is absent too, as
                         // `WorkflowKey::from_row` reads it. The request's own parts are never
-                        // `""`: `DebounceRequest::validate` refuses that.
-                        .bind(request.workflow.class_name.as_deref())
-                        .bind(request.workflow.config_name.as_deref())
+                        // `""`: a `WorkflowKey` holds none.
+                        .bind(request.workflow.class_name())
+                        .bind(request.workflow.config_name())
                         .fetch_optional(&mut *tx)
                         .await?;
 

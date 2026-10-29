@@ -956,7 +956,7 @@ where
     /// context and the connection, neither of which the child has any say in — which is the whole
     /// of why the second id can be taken before the first call has run.
     pub fn run_with<'a>(&'a self, input: P, options: RunOptions<'a>) -> PendingRun<'a, R, E> {
-        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        let name: Arc<str> = Arc::from(self.key().name());
         let options: StartOptions<'a> = options.into();
         // Carried into the future by `placed`, as [`start_with`](Self::start_with) carries its
         // own: a run that could not be placed claimed neither id, so there is no await to place
@@ -1143,7 +1143,7 @@ where
     pub fn start_with<'a>(&'a self, input: P, options: StartOptions<'a>) -> PendingStart<'a, R, E> {
         // The workflow's bare name, which is what the start records against the parent and
         // therefore what a refusal should call this call.
-        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        let name: Arc<str> = Arc::from(self.key().name());
         // **A refusal is carried into the future rather than returned**, which is what `placed`
         // does with a build that failed — so `start(..).await?` reads as it always did and a
         // caller has one operator to write rather than two. Nothing was claimed on the way to any
@@ -1350,7 +1350,7 @@ pub(crate) async fn create<R, E>(
     // A replay of this position finds the child it already started, or the error its start
     // returned, instead of trying the start again.
     if let Some(parent) = &parent
-        && let Some(child) = parent.check_child(executor, &key.name).await?
+        && let Some(child) = parent.check_child(executor, key.name()).await?
     {
         tracing::debug!(
             parent_workflow_id = parent.workflow_id(),
@@ -1402,9 +1402,9 @@ pub(crate) async fn create<R, E>(
         .as_deref()
         .is_some_and(|name| name != executor.app_name());
     let new = NewWorkflow {
-        name: Some(&key.name),
-        class_name: key.class_name.as_deref(),
-        config_name: key.config_name.as_deref(),
+        name: Some(key.name()),
+        class_name: key.class_name(),
+        config_name: key.config_name(),
         input: input.as_deref(),
         serialization: Some(encoding.name()),
         executor_id: Some(executor.executor_id()),
@@ -1441,7 +1441,7 @@ pub(crate) async fn create<R, E>(
             step_id: parent.step_id,
             // The step name is the child workflow's bare name; see `Parent::record_child`,
             // which records the joined case under the same one.
-            step_name: &key.name,
+            step_name: key.name(),
             started_at,
             owner_xid: parent.owner_xid(),
         }),
@@ -1455,7 +1455,7 @@ pub(crate) async fn create<R, E>(
             return Err(match &parent {
                 Some(parent) => {
                     parent
-                        .record_start_error(executor, error, &key.name, started_at)
+                        .record_start_error(executor, error, key.name(), started_at)
                         .await
                 }
                 None => Error::SystemDatabase(error),
@@ -1479,7 +1479,7 @@ pub(crate) async fn create<R, E>(
         Ok(Submitted::Joined(holder)) => {
             if let Some(parent) = &parent {
                 parent
-                    .record_child(executor, &holder, &key.name, started_at)
+                    .record_child(executor, &holder, key.name(), started_at)
                     .await?;
             }
             // The holder's row was just read to find it, so a missing one from here is a

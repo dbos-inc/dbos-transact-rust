@@ -491,6 +491,35 @@ async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
     client.close().await;
 }
 
+/// A key's empty class or config is absent, and is written as `NULL`.
+#[tokio::test]
+async fn an_enqueued_key_writes_an_empty_class_or_config_as_null() {
+    let db = test_database().await;
+    let client = client("client-keys", &db).await;
+
+    let handle: WorkflowHandle<()> = client
+        .enqueue_with(
+            WorkflowKey::instance("never_registered", "", ""),
+            (),
+            EnqueueOptions {
+                workflow_id: Some("blank-key"),
+                ..EnqueueOptions::new("work")
+            },
+        )
+        .await
+        .unwrap();
+    let row = reader(&db)
+        .await
+        .get_workflow(handle.workflow_id())
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.class_name, None);
+    assert_eq!(row.config_name, None);
+
+    client.close().await;
+}
+
 /// An enqueue no queue could honour costs a round trip, not a row.
 #[tokio::test]
 async fn an_impossible_enqueue_is_refused_before_it_is_written() {

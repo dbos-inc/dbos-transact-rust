@@ -921,6 +921,32 @@ async fn a_key_held_by_a_workflow_that_is_not_debounced_is_refused() {
     dbos.shutdown().await;
 }
 
+/// A config with no class holds its own debounce, apart from the free function of the same name:
+/// its deduplication id keeps the config.
+#[tokio::test]
+async fn a_config_with_no_class_debounces_apart_from_the_free_function() {
+    let db = test_database().await;
+    let client = client(None, &db).await;
+    let reader = reader(&db).await;
+    let queue = "unclassed-queue";
+    let free = DebouncerClient::new(&client, "echo", EnqueueOptions::new(queue));
+    let unclassed = DebouncerClient::new(
+        &client,
+        WorkflowKey::instance("echo", "", "eu"),
+        EnqueueOptions::new(queue),
+    );
+
+    let a: WorkflowHandle<u32> = free.debounce("key", FOREVER, 1).await.unwrap();
+    let b: WorkflowHandle<u32> = unclassed.debounce("key", FOREVER, 2).await.unwrap();
+    assert_ne!(a.workflow_id(), b.workflow_id());
+    let held = row(&reader, b.workflow_id()).await;
+    assert_eq!(held.class_name, None);
+    assert_eq!(held.config_name.as_deref(), Some("eu"));
+    assert_eq!(held.deduplication_id.as_deref(), Some("echo//eu-key"));
+
+    client.close().await;
+}
+
 /// `"colw"` with key `"b-k"` and `"colw-b"` with key `"k"` spell the same deduplication id. The
 /// second debounce fails rather than overwrite the first's workflow, which a same-workflow bounce
 /// still coalesces onto.

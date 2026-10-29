@@ -277,7 +277,7 @@ impl ScheduleSpec {
                 detail: "a schedule needs a name".to_owned(),
             });
         }
-        if self.workflow.config_name.is_some() {
+        if self.workflow.config_name().is_some() {
             return Err(refuse(format!(
                 "the configured instance {} cannot be scheduled",
                 self.workflow
@@ -296,13 +296,13 @@ impl ScheduleSpec {
     /// the system database.
     fn as_new<'a>(&'a self, context: &'a str) -> NewSchedule<'a> {
         NewSchedule {
-            workflow_class_name: self.workflow.class_name.as_deref(),
+            workflow_class_name: self.workflow.class_name(),
             context,
             automatic_backfill: self.automatic_backfill,
             cron_timezone: self.cron_timezone.as_deref(),
             queue_name: self.queue_name.as_deref(),
             application_name: self.app_name.as_deref(),
-            ..NewSchedule::new(&self.schedule_name, &self.workflow.name, &self.schedule)
+            ..NewSchedule::new(&self.schedule_name, self.workflow.name(), &self.schedule)
         }
     }
 }
@@ -1151,7 +1151,12 @@ impl Connection {
         let queue = Enqueue::new(record.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE));
         let new = NewWorkflow {
             name: Some(&record.workflow_name),
-            class_name: record.workflow_class_name.as_deref(),
+            // Read as `prepare_firing` resolves the workflow: a schedule another SDK wrote with a
+            // `''` class runs the free function, rather than being refused on every tick.
+            class_name: record
+                .workflow_class_name
+                .as_deref()
+                .filter(|class| !class.is_empty()),
             input: Some(&input),
             serialization: Some(encoding.name()),
             executor_id: None,
@@ -1319,11 +1324,7 @@ mod tests {
         assert_eq!(schedule.schedule_name(), "nightly");
         assert_eq!(
             schedule.workflow(),
-            &WorkflowKey {
-                name: "report".into(),
-                class_name: Some("Reports".into()),
-                config_name: None,
-            }
+            &WorkflowKey::method("report", "Reports")
         );
         assert_eq!(schedule.schedule(), "0 0 2 * * *");
         assert_eq!(schedule.status(), ScheduleStatus::Paused);

@@ -120,6 +120,37 @@ async fn a_missing_workflow_reads_as_none() {
     assert!(sys.get_workflow("nobody-here").await.unwrap().is_none());
 }
 
+/// A row another SDK wrote with `''` for an absent class or config is the same workflow as one
+/// submitted with neither, not a conflict; a real class still conflicts.
+#[tokio::test]
+async fn a_stored_empty_class_or_config_is_absent_when_resubmitting() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(&workflow("wf-blank"), None)
+        .await
+        .unwrap();
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_status SET class_name = '', config_name = '' \
+         WHERE workflow_uuid = 'wf-blank'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    sys.init_workflow(&workflow("wf-blank"), None)
+        .await
+        .expect("an empty class and config are absent");
+
+    let classed = NewWorkflow {
+        class_name: Some("Checkout"),
+        ..workflow("wf-blank")
+    };
+    assert!(matches!(
+        sys.init_workflow(&classed, None).await,
+        Err(Error::ConflictingWorkflow { .. })
+    ));
+}
+
 /// Inserting the same id twice leaves the first row alone.
 ///
 /// A retried enqueue must not reset a workflow that is already running or finished, so the
@@ -13019,22 +13050,6 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
             workflow_id: "wf-east".to_owned()
         }
     );
-}
-
-/// An empty class or instance is absent rather than a value, so a bounce carrying one is refused
-/// instead of matching nothing and reporting a held key unheld.
-#[tokio::test]
-async fn a_bounce_refuses_an_empty_class_or_instance() {
-    let (sys, _db) = sysdb().await;
-    let empty_class = WorkflowKey {
-        class_name: Some(String::new()),
-        ..WorkflowKey::new("checkout")
-    };
-    let request = bounce_as(&empty_class, "cart-1", AN_HOUR);
-    assert!(matches!(
-        sys.debounce_delayed_workflow(&request, None).await,
-        Err(Error::InvalidInput { ref field, .. }) if field == "workflow.class_name"
-    ));
 }
 
 /// A row that spells an absent class or instance `''` rather than NULL is the same workflow as

@@ -352,14 +352,21 @@ impl fmt::Display for WorkflowStatus {
 /// keys on the name alone with instances in a separate map, Go on a derived FQN qualified by the
 /// config name, Java on the whole `{name}/{class}/{instance}` string — but all three *store* these
 /// three columns, so keying on them directly is the shape that reads back from any of them.
+///
+/// **One spelling of absence.** The columns spell an absent class or config both as `NULL` and as
+/// `''`, so every constructor stores an empty class or config as `None`. Two keys naming the same
+/// workflow are therefore equal however they were built, and the fields are private so that holds.
+///
+/// A config with no class is a key, because a row can hold one, but nothing registers under it: a
+/// configured instance belongs to a class. An empty name is likewise a key that names nothing.
+/// [`DBOS::register_workflow`](crate::DBOS::register_workflow) refuses both.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct WorkflowKey {
-    /// The workflow's name. Required.
-    pub name: String,
-    /// The class a method-workflow belongs to; `None` for a free function.
-    pub class_name: Option<String>,
-    /// The configured instance this registration is bound to; `None` unless instance-bound.
-    pub config_name: Option<String>,
+    name: String,
+    #[serde(deserialize_with = "absent_if_empty")]
+    class_name: Option<String>,
+    #[serde(deserialize_with = "absent_if_empty")]
+    config_name: Option<String>,
 }
 
 impl WorkflowKey {
@@ -372,7 +379,30 @@ impl WorkflowKey {
         }
     }
 
-    /// Rebuilds a key from a status row, treating `NULL` and `""` alike.
+    /// A class-bound workflow's key, with no configured instance. An empty class is a free
+    /// function's key.
+    pub fn method(name: impl Into<String>, class_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            class_name: present(class_name.into()),
+            config_name: None,
+        }
+    }
+
+    /// A configured instance's key. An empty config is a method's key.
+    pub fn instance(
+        name: impl Into<String>,
+        class_name: impl Into<String>,
+        config_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            class_name: present(class_name.into()),
+            config_name: present(config_name.into()),
+        }
+    }
+
+    /// Rebuilds a key from a status row's columns, treating `NULL` and `""` alike.
     ///
     /// Recovery is not why. A workflow belongs to one language from start to finish, so a row this
     /// executor recovers was written by this executor's own SDK and spells absence the one way
@@ -397,30 +427,35 @@ impl WorkflowKey {
         }
     }
 
-    /// A class-bound workflow's key, with no configured instance.
-    pub fn method(name: impl Into<String>, class_name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            class_name: Some(class_name.into()),
-            config_name: None,
-        }
+    /// The workflow's name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// A configured instance's key.
-    ///
-    /// A config name never appears without a class name — true in every reference, and enforced
-    /// here rather than left to produce a key nothing can resolve.
-    pub fn instance(
-        name: impl Into<String>,
-        class_name: impl Into<String>,
-        config_name: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            class_name: Some(class_name.into()),
-            config_name: Some(config_name.into()),
-        }
+    /// The class a method-workflow belongs to; `None` for a free function.
+    pub fn class_name(&self) -> Option<&str> {
+        self.class_name.as_deref()
     }
+
+    /// The configured instance this key is bound to; `None` unless instance-bound.
+    pub fn config_name(&self) -> Option<&str> {
+        self.config_name.as_deref()
+    }
+}
+
+/// A stored class or config, with `""` read as absent, so a deserialized key holds the one
+/// spelling of absence the constructors do.
+fn absent_if_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(value.and_then(present))
+}
+
+/// `Some` unless empty, the one spelling of absence a key holds.
+fn present(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// A free function's key, so a name alone stands for one wherever a key is taken.
@@ -467,12 +502,15 @@ impl WorkflowRecord {
     }
 }
 
+/// `name`, `name/class` or `name/class/config`, for people to read. A config with no class keeps
+/// its place as `name//config`, so it is never mistaken for a class.
 impl std::fmt::Display for WorkflowKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (&self.class_name, &self.config_name) {
             (Some(class), Some(config)) => write!(f, "{}/{class}/{config}", self.name),
             (Some(class), None) => write!(f, "{}/{class}", self.name),
-            _ => f.write_str(&self.name),
+            (None, Some(config)) => write!(f, "{}//{config}", self.name),
+            (None, None) => f.write_str(&self.name),
         }
     }
 }
@@ -843,6 +881,47 @@ impl<'a> NewWorkflow<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every way of building a key stores an empty class or config as absent, so keys naming the
+    /// same workflow are equal however they were built.
+    #[test]
+    fn a_key_holds_one_spelling_of_absence() {
+        let free = WorkflowKey::new("f");
+        assert_eq!(WorkflowKey::method("f", ""), free);
+        assert_eq!(WorkflowKey::instance("f", "", ""), free);
+        assert_eq!(WorkflowKey::from_row("f", Some(""), Some("")), free);
+        assert_eq!(
+            WorkflowKey::instance("f", "C", ""),
+            WorkflowKey::method("f", "C")
+        );
+
+        let unclassed = WorkflowKey::instance("f", "", "eu");
+        assert_eq!(unclassed, WorkflowKey::from_row("f", None, Some("eu")));
+        assert_eq!(unclassed.class_name(), None);
+        assert_eq!(unclassed.config_name(), Some("eu"));
+    }
+
+    /// The display keeps a config with no class apart from a class.
+    #[test]
+    fn a_key_displays_each_part_in_its_place() {
+        assert_eq!(WorkflowKey::new("f").to_string(), "f");
+        assert_eq!(WorkflowKey::method("f", "C").to_string(), "f/C");
+        assert_eq!(WorkflowKey::instance("f", "C", "eu").to_string(), "f/C/eu");
+        assert_eq!(WorkflowKey::instance("f", "", "eu").to_string(), "f//eu");
+    }
+
+    /// A stored key that spells absence `""` reads back as one that spells it `None`.
+    #[test]
+    fn a_deserialized_key_holds_one_spelling_of_absence() {
+        let key: WorkflowKey =
+            serde_json::from_str(r#"{"name":"f","class_name":"","config_name":null}"#).unwrap();
+        assert_eq!(key, WorkflowKey::new("f"));
+        let back: WorkflowKey = serde_json::from_str(
+            &serde_json::to_string(&WorkflowKey::instance("f", "C", "eu")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(back, WorkflowKey::instance("f", "C", "eu"));
+    }
 
     /// The millisecond conversion either side of `time`, which is the part this crate owns.
     #[test]
@@ -2054,14 +2133,15 @@ pub struct DebounceRequest<'a> {
 impl DebounceRequest<'_> {
     /// Rejects the values no writer could have stored, so a bounce cannot silently match nothing.
     ///
-    /// The same rule [`NewWorkflow::validate`] applies on the way in: an empty class or instance
-    /// is absent rather than a value, and matching one would find no row and report the key unheld
-    /// — indistinguishable from a key nobody holds. The period is held to the rule `delay` is: a
-    /// positive duration that fits in milliseconds.
+    /// The same rule [`NewWorkflow::validate`] applies on the way in: an empty value is absent
+    /// rather than a value, and matching one would find no row and report the key unheld —
+    /// indistinguishable from a key nobody holds. A [`WorkflowKey`] never holds an empty class or
+    /// config. The period is held to the rule `delay` is: a positive duration that fits in
+    /// milliseconds.
     pub fn validate(&self) -> Result<(), Error> {
         validate_positive_duration("period", self.period)?;
         for (field, value) in [
-            ("workflow.name", self.workflow.name.as_str()),
+            ("workflow.name", self.workflow.name()),
             ("queue_name", self.queue_name),
             ("deduplication_id", self.deduplication_id),
         ] {
@@ -2073,8 +2153,6 @@ impl DebounceRequest<'_> {
             }
         }
         for (field, value) in [
-            ("workflow.class_name", self.workflow.class_name.as_deref()),
-            ("workflow.config_name", self.workflow.config_name.as_deref()),
             ("inputs", self.inputs),
             ("serialization", self.serialization),
             ("application_name", self.application_name),

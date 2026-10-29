@@ -124,8 +124,8 @@ async fn schedules_are_created_read_listed_and_deleted() {
         .await
         .unwrap()
         .expect("the schedule is missing");
-    assert_eq!(record.workflow().name, "crud-workflow");
-    assert_eq!(record.workflow().class_name, None);
+    assert_eq!(record.workflow().name(), "crud-workflow");
+    assert_eq!(record.workflow().class_name(), None);
     assert_eq!(record.schedule(), spec.schedule);
     assert_eq!(record.status(), ScheduleStatus::Active);
     assert_eq!(record.decode_context::<String>().unwrap(), "ctx");
@@ -313,7 +313,7 @@ async fn updating_a_schedule_changes_only_what_it_names() {
     assert_eq!(after.queue_name(), Some("update-queue"));
     // What the change did not name, and what is not a change's to make.
     assert_eq!(after.id(), before.id());
-    assert_eq!(after.workflow().name, before.workflow().name);
+    assert_eq!(after.workflow().name(), before.workflow().name());
     assert_eq!(after.status(), ScheduleStatus::Paused);
     assert!(!after.automatic_backfill());
 
@@ -781,6 +781,49 @@ async fn a_trigger_runs_the_workflow_now() {
         .await
         .unwrap_err();
     assert!(matches!(error, Error::SystemDatabase(_)), "{error}");
+    dbos.shutdown().await;
+}
+
+/// A schedule another SDK stored with a `''` class runs the free function of that name, rather
+/// than being refused on every tick.
+#[tokio::test]
+async fn a_schedule_stored_with_an_empty_class_runs_the_free_function() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("sched-blank-class-app", &db));
+    let (workflow, seen) = recorder(&dbos, "blank-class-workflow");
+    dbos.launch().await.expect("launch failed");
+
+    let spec = ScheduleSpec::new(
+        "blank-class",
+        &workflow,
+        daily_far_from_now(),
+        &"blank".to_owned(),
+    )
+    .unwrap();
+    dbos.create_schedule(&spec).await.unwrap();
+    let mut conn = db.admin_connection().await;
+    sqlx::query(sqlx::AssertSqlSafe(
+        "UPDATE dbos.workflow_schedules SET workflow_class_name = '' \
+         WHERE schedule_name = 'blank-class'",
+    ))
+    .execute(&mut conn)
+    .await
+    .unwrap();
+
+    let handle = dbos
+        .trigger_schedule::<(), EngineOnly>("blank-class")
+        .await
+        .unwrap();
+    let run_id = handle.workflow_id().to_owned();
+    handle.result().await.expect("the triggered run failed");
+    assert_eq!(contexts(&seen), ["blank"]);
+    let run = reader(&db)
+        .await
+        .get_workflow(&run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.class_name, None, "the run is written with no class");
     dbos.shutdown().await;
 }
 

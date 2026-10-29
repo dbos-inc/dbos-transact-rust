@@ -102,6 +102,23 @@ struct State {
     frozen: bool,
 }
 
+/// [`Error::InvalidArgument`] for a key nothing can be registered as: one with an empty name, or
+/// with a config but no class, since a configured instance belongs to a class. Either can be
+/// read from a row, which is why [`WorkflowKey`] holds them at all.
+fn refuse_unregistrable(key: &WorkflowKey) -> Result<()> {
+    let detail = if key.name().is_empty() {
+        "a workflow needs a name"
+    } else if key.config_name().is_some() && key.class_name().is_none() {
+        "a configured instance needs a class"
+    } else {
+        return Ok(());
+    };
+    Err(Error::InvalidArgument {
+        operation: "register a workflow".into(),
+        detail: format!("{detail}, got `{key}`"),
+    })
+}
+
 /// A registry frozen at launch.
 pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, RegisteredWorkflow>>;
 
@@ -186,7 +203,7 @@ impl<P, R, E> WorkflowRef<P, R, E> {
 
     /// The workflow's name.
     pub fn name(&self) -> &str {
-        &self.key.name
+        self.key.name()
     }
 
     /// The instance this workflow is registered with.
@@ -290,6 +307,7 @@ impl DBOS {
         E: DurableError,
     {
         let key = key.into();
+        refuse_unregistrable(&key)?;
         let workflow = Arc::new(workflow);
         let erased: ErasedWorkflow =
             Arc::new(move |input: Option<String>, encoding: PayloadEncoding| {
@@ -501,6 +519,28 @@ mod tests {
         dbos.register_workflow("after", takes_nothing)
             .expect("releasing the snapshot reopens registration");
         assert_eq!(dbos.registry().snapshot().len(), 2);
+    }
+
+    /// An empty name, or a config with no class, names nothing a workflow could be registered as.
+    #[test]
+    fn a_key_naming_nothing_is_refused() {
+        let dbos = dbos();
+        for (key, part) in [
+            (WorkflowKey::new(""), "needs a name"),
+            (
+                WorkflowKey::instance("unclassed", "", "eu"),
+                "needs a class",
+            ),
+        ] {
+            match dbos.register_workflow(key, takes_one) {
+                Err(Error::InvalidArgument { detail, .. }) => {
+                    assert!(detail.contains(part), "{detail}");
+                }
+                Err(other) => panic!("expected InvalidArgument, got {other}"),
+                Ok(_) => panic!("registered a key naming nothing"),
+            }
+        }
+        assert!(dbos.registry().snapshot().is_empty());
     }
 
     #[test]

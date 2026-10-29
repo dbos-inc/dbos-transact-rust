@@ -57,7 +57,8 @@ const DEBOUNCE_OPERATION: &str = "debounce a workflow";
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// The deduplication id a debounce of `key` holds for `workflow`: `<workflow>-<key>`, with the
-/// workflow spelled as its key displays — `name`, `name/class` or `name/class/config`.
+/// workflow spelled `name`, `name/class`, `name/class/config`, or `name//config` for a config with
+/// no class.
 ///
 /// The whole key, so two configured instances of one class, or a method and a free function of
 /// the same name, debounce one key independently rather than colliding on it. The parts are
@@ -66,10 +67,17 @@ const RETRY_PAUSE: Duration = Duration::from_millis(100);
 /// Such a collision is refused rather than extended: [`classify`] compares the holder's whole key.
 ///
 /// **The one place the spelling is written**, so changing it is a change here and nowhere else.
-/// Only a debounce that spells the id this way finds a workflow another debounce of the key
-/// started.
+/// It is stored, and only a debounce that spells the id this way finds a workflow another debounce
+/// of the key started, so it is spelled from the key's parts rather than from its
+/// [`Display`](std::fmt::Display), which is for people to read.
 pub(crate) fn deduplication_id(workflow: &WorkflowKey, key: &str) -> String {
-    format!("{workflow}-{key}")
+    let name = workflow.name();
+    match (workflow.class_name(), workflow.config_name()) {
+        (None, None) => format!("{name}-{key}"),
+        (Some(class), None) => format!("{name}/{class}-{key}"),
+        (Some(class), Some(config)) => format!("{name}/{class}/{config}-{key}"),
+        (None, Some(config)) => format!("{name}//{config}-{key}"),
+    }
 }
 
 /// What one debounce says beyond its key, period and input — see
@@ -764,6 +772,17 @@ impl<'a> DebouncerClient<'a> {
 mod tests {
     use super::*;
     use crate::sysdb::types::DebounceHolder;
+
+    /// Each shape of key spells its own deduplication id, the stored form a later debounce of the
+    /// key must reproduce.
+    #[test]
+    fn each_key_spells_its_deduplication_id() {
+        let id = |workflow: WorkflowKey| deduplication_id(&workflow, "k");
+        assert_eq!(id(WorkflowKey::new("f")), "f-k");
+        assert_eq!(id(WorkflowKey::method("f", "C")), "f/C-k");
+        assert_eq!(id(WorkflowKey::instance("f", "C", "eu")), "f/C/eu-k");
+        assert_eq!(id(WorkflowKey::instance("f", "", "eu")), "f//eu-k");
+    }
 
     fn holder(name: &str, is_debounced: bool, app: Option<&str>) -> Debounce {
         Debounce::Held(DebounceHolder {

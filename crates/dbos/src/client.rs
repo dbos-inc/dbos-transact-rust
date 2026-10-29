@@ -492,9 +492,9 @@ impl Client {
         };
 
         let new = NewWorkflow {
-            name: Some(&workflow.name),
-            class_name: workflow.class_name.as_deref(),
-            config_name: workflow.config_name.as_deref(),
+            name: Some(workflow.name()),
+            class_name: workflow.class_name(),
+            config_name: workflow.config_name(),
             input: Some(input),
             serialization: Some(encoding.name()),
             // **Nobody claims it.** A client runs nothing, and a queued row's executor is stamped
