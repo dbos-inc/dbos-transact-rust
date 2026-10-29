@@ -3199,6 +3199,9 @@ impl PostgresSystemDatabase {
 impl PostgresSystemDatabase {
     /// Whether the row `init_workflow` met is a child `caller`'s parent started at a step it no
     /// longer records: one a rewind left behind, which the replayed parent adopts.
+    ///
+    /// A record at the caller's own step is this start's, written by an adoption whose commit
+    /// acknowledgement was lost, so it does not count: the retry adopts again, idempotently.
     async fn is_rewound_child(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -3218,10 +3221,11 @@ impl PostgresSystemDatabase {
         // `INT8` on CockroachDB.
         let recorded: bool = sqlx::query_scalar(AssertSqlSafe(format!(
             "SELECT EXISTS (SELECT 1 FROM {steps_table} \
-             WHERE workflow_uuid = $1 AND child_workflow_id = $2)"
+             WHERE workflow_uuid = $1 AND child_workflow_id = $2 AND function_id <> $3)"
         )))
         .bind(caller.parent_workflow_id)
         .bind(workflow_id)
+        .bind(caller.step_id)
         .fetch_one(&mut **tx)
         .await?;
         Ok(!recorded)
@@ -9456,6 +9460,13 @@ mod tests {
             .await
             .expect("the replayed parent adopts its own child");
         assert!(!adopted.should_execute, "adopted, not run again");
+        // The same call again, as a retry after the adoption's commit acknowledgement was lost
+        // sends: its own record at its own step, which is not a reuse.
+        let retried = sys
+            .init_workflow_as(&child, at("parent-a", 1), reject, "replay")
+            .await
+            .expect("a retried adoption adopts again");
+        assert!(!retried.should_execute);
         assert!(
             in_use(
                 sys.init_workflow_as(&child, at("parent-b", 1), reject, "other")
