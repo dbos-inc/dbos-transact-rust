@@ -95,9 +95,10 @@ use super::types::{
     PollingConcurrency, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
     RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
     StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue,
-    UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowOwner, WorkflowRecord,
-    WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms, duration_from_secs,
-    duration_to_ms, encode_step_value, is_valid_application_name, validate_attributes,
+    UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy,
+    WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
+    duration_from_secs, duration_to_ms, encode_step_value, is_valid_application_name,
+    validate_attributes,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -3196,6 +3197,36 @@ impl PostgresSystemDatabase {
 }
 
 impl PostgresSystemDatabase {
+    /// Whether the row `init_workflow` met is a child `caller`'s parent started at a step it no
+    /// longer records: one a rewind left behind, which the replayed parent adopts.
+    async fn is_rewound_child(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        caller: Option<InitWorkflowCaller<'_>>,
+        row: &sqlx::postgres::PgRow,
+        workflow_id: &str,
+    ) -> Result<bool, Error> {
+        let Some(caller) = caller else {
+            return Ok(false);
+        };
+        let stored_parent: Option<String> = row.try_get("parent_workflow_id")?;
+        if stored_parent.as_deref() != Some(caller.parent_workflow_id) {
+            return Ok(false);
+        }
+        let steps_table = self.tables.operation_outputs.as_str();
+        // `EXISTS`, a boolean on both backends: a bare `SELECT 1` is `INT4` on PostgreSQL and
+        // `INT8` on CockroachDB.
+        let recorded: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM {steps_table} \
+             WHERE workflow_uuid = $1 AND child_workflow_id = $2)"
+        )))
+        .bind(caller.parent_workflow_id)
+        .bind(workflow_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(!recorded)
+    }
+
     /// [`init_workflow`](SystemDatabase::init_workflow), presenting `creator_xid` as the call's
     /// creator token.
     ///
@@ -3205,6 +3236,7 @@ impl PostgresSystemDatabase {
         &self,
         workflow: &NewWorkflow<'_>,
         caller: Option<InitWorkflowCaller<'_>>,
+        reuse_policy: WorkflowIdReusePolicy,
         creator_xid: &str,
     ) -> Result<WorkflowInitResult, Error> {
         workflow.validate()?;
@@ -3324,6 +3356,7 @@ impl PostgresSystemDatabase {
                    creator_xid = {workflow_table}.creator_xid \
                  RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, \
                  deduplication_id, workflow_deadline_epoch_ms, creator_xid, serialization, \
+                 parent_workflow_id, \
                  created_at = {NOW_MS_SQL} AS inserted, \
                  (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint AS db_now"
             )))
@@ -3402,6 +3435,32 @@ impl PostgresSystemDatabase {
             let stored_creator: Option<String> = row.try_get("creator_xid")?;
             let deadline: Option<i64> = row.try_get("workflow_deadline_epoch_ms")?;
             let serialization: Option<String> = row.try_get("serialization")?;
+
+            // **Another caller's workflow under an id this caller needs new.** Decided by the
+            // creator token rather than by whether this statement inserted: a retry after a lost
+            // commit acknowledgement finds its own row, which is not a reuse. Checked before
+            // anything else about the row, so an id taken by a different function is in use too,
+            // and before the input, so a refused start writes nothing.
+            //
+            // **Except the parent's own child, started at a step the parent no longer records.**
+            // A rewind deletes a parent's step records from its rewind point on and keeps the
+            // children they named, so the replayed parent re-reaches the start and must adopt the
+            // child it started before, as it would under `ReturnExisting`. A start of the same id
+            // at another step of the same run still finds that step's record, and is refused.
+            if reuse_policy == WorkflowIdReusePolicy::Reject
+                && stored_creator.as_deref() != Some(creator_xid)
+                && !self
+                    .is_rewound_child(&mut tx, caller, &row, workflow.workflow_id)
+                    .await?
+            {
+                let name: Option<String> = row.try_get("name")?;
+                return Err(Error::WorkflowIdInUse {
+                    workflow_id: workflow.workflow_id.to_owned(),
+                    status,
+                    // A stored `''` is absent, as below.
+                    name: name.filter(|name| !name.is_empty()),
+                });
+            }
 
             // Same id, different function: a programming error rather than a race, because the id
             // is how every implementation decides two attempts are the same workflow.
@@ -3547,6 +3606,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         workflow: &NewWorkflow,
         caller: Option<InitWorkflowCaller<'_>>,
+        reuse_policy: WorkflowIdReusePolicy,
     ) -> Result<WorkflowInitResult, Error> {
         // The creator token is per logical attempt, not per statement, so it is generated here,
         // outside the retry. If a commit acknowledgement is lost, the retry must present the same
@@ -3554,7 +3614,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         // row, which would report `should_execute: false` for a workflow this caller does in fact
         // own.
         let creator_xid = uuid::Uuid::new_v4().to_string();
-        self.init_workflow_as(workflow, caller, &creator_xid).await
+        self.init_workflow_as(workflow, caller, reuse_policy, &creator_xid)
+            .await
     }
 
     async fn database_time(&self) -> Result<DatabaseTime, Error> {
@@ -8287,6 +8348,7 @@ mod tests {
     };
     use crate::sysdb::types::{
         EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Timestamp,
+        WorkflowIdReusePolicy, WorkflowStatus,
     };
     use crate::sysdb::{BackendError, BackendErrorKind, Error, SystemDatabase};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -8517,6 +8579,7 @@ mod tests {
                 ..NewWorkflow::new("wf-caller")
             },
             None,
+            WorkflowIdReusePolicy::ReturnExisting,
         )
         .await
         .expect("init_workflow failed");
@@ -9132,9 +9195,13 @@ mod tests {
         .await
         .expect("connect failed");
 
-        sys.init_workflow(&NewWorkflow::new("wf-idle"), None)
-            .await
-            .unwrap();
+        sys.init_workflow(
+            &NewWorkflow::new("wf-idle"),
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
+        )
+        .await
+        .unwrap();
         let table = sys.tables.workflow_status.as_str();
         let mut idle = sys.pool.begin().await.unwrap();
         sqlx::query(AssertSqlSafe(format!(
@@ -9186,7 +9253,7 @@ mod tests {
         };
 
         let first = sys
-            .init_workflow_as(&wf, None, "creator")
+            .init_workflow_as(&wf, None, WorkflowIdReusePolicy::ReturnExisting, "creator")
             .await
             .expect("the insert failed");
         assert!(first.should_execute);
@@ -9210,7 +9277,7 @@ mod tests {
 
         // The same token: the first attempt's commit landed, but its caller never heard.
         let retried = sys
-            .init_workflow_as(&wf, None, "creator")
+            .init_workflow_as(&wf, None, WorkflowIdReusePolicy::ReturnExisting, "creator")
             .await
             .expect("the retry failed");
         assert!(retried.should_execute, "the retry recognises its own row");
@@ -9222,5 +9289,179 @@ mod tests {
             "the bounce's input"
         );
         assert_eq!(row.serialization.as_deref(), Some(PORTABLE_JSON));
+    }
+
+    /// `Reject` refuses another caller's workflow under the id, whatever its status, and writes
+    /// nothing; it does not refuse a retry that finds this caller's own row after a lost commit
+    /// acknowledgement. `ReturnExisting` joins.
+    #[tokio::test]
+    async fn a_rejecting_insert_refuses_another_callers_workflow_but_not_its_own_retry() {
+        let db = dbos_test_support::test_database().await;
+        let pool = db.pool().await;
+        let sys = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+        let first = NewWorkflow {
+            name: Some("charge"),
+            input: Some("\"first\""),
+            serialization: Some("rust_serde"),
+            ..NewWorkflow::new("wf-taken")
+        };
+        let second = NewWorkflow {
+            input: Some("\"second\""),
+            ..first.clone()
+        };
+        let reject = WorkflowIdReusePolicy::Reject;
+
+        // A fresh id is not in use.
+        let created = sys
+            .init_workflow_as(&first, None, reject, "creator")
+            .await
+            .expect("the insert failed");
+        assert!(created.should_execute);
+
+        // The same token, as a retry after a lost acknowledgement sends: its own row, not a reuse.
+        let retried = sys
+            .init_workflow_as(&first, None, reject, "creator")
+            .await
+            .expect("a retry of the insert that created the row is not a reuse");
+        assert!(retried.should_execute, "the retry recognises its own row");
+
+        // Another caller joins by default.
+        let joined = sys
+            .init_workflow_as(
+                &second,
+                None,
+                WorkflowIdReusePolicy::ReturnExisting,
+                "joiner",
+            )
+            .await
+            .expect("the join failed");
+        assert!(!joined.should_execute, "a joiner does not run the workflow");
+
+        let before = sys.get_workflow("wf-taken").await.unwrap().unwrap();
+        for status in [
+            WorkflowStatus::Pending,
+            WorkflowStatus::Success,
+            WorkflowStatus::Error,
+        ] {
+            sqlx::query("UPDATE dbos.workflow_status SET status = $1 WHERE workflow_uuid = $2")
+                .bind(status.as_str())
+                .bind("wf-taken")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let refused = sys
+                .init_workflow_as(&second, None, reject, "rejecter")
+                .await;
+            assert_eq!(
+                refused.map(|_| ()),
+                Err(Error::WorkflowIdInUse {
+                    workflow_id: "wf-taken".to_owned(),
+                    status,
+                    name: Some("charge".to_owned()),
+                }),
+            );
+        }
+        let after = sys.get_workflow("wf-taken").await.unwrap().unwrap();
+
+        // A name another SDK stored as `''` is reported absent.
+        sqlx::query("UPDATE dbos.workflow_status SET name = '' WHERE workflow_uuid = 'wf-taken'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let nameless = NewWorkflow {
+            name: None,
+            ..second.clone()
+        };
+        assert!(matches!(
+            sys.init_workflow_as(&nameless, None, reject, "rejecter")
+                .await,
+            Err(Error::WorkflowIdInUse { name: None, .. })
+        ));
+        assert_eq!(
+            after.input.as_deref(),
+            Some("\"first\""),
+            "the input is the first's"
+        );
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "a refusal writes nothing"
+        );
+    }
+
+    /// Under `Reject`, a parent's own child that the parent no longer records (a rewind erased the
+    /// step that started it) is adopted; one it still records, started again at another step, is
+    /// a reuse, and so is any other parent's start of the id.
+    #[tokio::test]
+    async fn a_rejecting_child_start_adopts_only_its_parents_unrecorded_child() {
+        use crate::sysdb::types::{InitWorkflowCaller, WorkflowInitResult};
+
+        let db = dbos_test_support::test_database().await;
+        let pool = db.pool().await;
+        let sys = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+        let reject = WorkflowIdReusePolicy::Reject;
+        let mut owners = std::collections::HashMap::new();
+        for parent in ["parent-a", "parent-b"] {
+            let created = sys
+                .init_workflow(
+                    &NewWorkflow::new(parent),
+                    None,
+                    WorkflowIdReusePolicy::ReturnExisting,
+                )
+                .await
+                .unwrap();
+            owners.insert(parent, created.creator_xid);
+        }
+        let child = NewWorkflow {
+            name: Some("child"),
+            ..NewWorkflow::new("the-child")
+        };
+        let at = |parent_workflow_id: &'static str, step_id| {
+            Some(InitWorkflowCaller {
+                parent_workflow_id,
+                owner_xid: &owners[parent_workflow_id],
+                step_id,
+                step_name: "child",
+                started_at: Timestamp::now(),
+            })
+        };
+        let in_use = |result: Result<WorkflowInitResult, Error>| {
+            matches!(result, Err(Error::WorkflowIdInUse { .. }))
+        };
+
+        sys.init_workflow_as(&child, at("parent-a", 1), reject, "first")
+            .await
+            .expect("a fresh id is not in use");
+        assert!(
+            in_use(
+                sys.init_workflow_as(&child, at("parent-a", 3), reject, "again")
+                    .await
+            ),
+            "the parent still records the child, so another start of the id is a reuse"
+        );
+        assert!(
+            in_use(
+                sys.init_workflow_as(&child, at("parent-b", 1), reject, "other")
+                    .await
+            ),
+            "another parent's start is a reuse"
+        );
+
+        // What a rewind of `parent-a` to before the start leaves: the child, and no record of it.
+        sqlx::query("DELETE FROM dbos.operation_outputs WHERE workflow_uuid = 'parent-a'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let adopted = sys
+            .init_workflow_as(&child, at("parent-a", 1), reject, "replay")
+            .await
+            .expect("the replayed parent adopts its own child");
+        assert!(!adopted.should_execute, "adopted, not run again");
+        assert!(
+            in_use(
+                sys.init_workflow_as(&child, at("parent-b", 1), reject, "other")
+                    .await
+            ),
+            "the adoption is the parent's alone"
+        );
     }
 }

@@ -182,7 +182,7 @@ pub use stream::{
 #[cfg(feature = "engine")]
 pub use sysdb::types::{
     Change, IdleTransactionTimeout, PollingConcurrency, QualifiedWorkflowName, RateLimit,
-    ScheduleFilter, ScheduleStatus, WorkflowDelay,
+    ScheduleFilter, ScheduleStatus, WorkflowDelay, WorkflowIdReusePolicy,
 };
 // Re-exported because [`cancellation_token`] hands one back: naming what it returns should not
 // oblige an application to declare `tokio-util` itself. It is the same foreign type either way, so

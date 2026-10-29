@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
-use dbos::sysdb::types::{NewWorkflow, Outcome, Timestamp, WorkflowStatus};
+use dbos::sysdb::types::{NewWorkflow, Outcome, Timestamp, WorkflowIdReusePolicy, WorkflowStatus};
 use dbos::{
     Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout,
 };
@@ -346,6 +346,7 @@ async fn insert_expired(sys: &PostgresSystemDatabase, id: &str, queue: Option<&s
             ..NewWorkflow::new(id)
         },
         None,
+        WorkflowIdReusePolicy::ReturnExisting,
     )
     .await
     .expect("insert failed");
@@ -624,6 +625,7 @@ async fn starting_a_timed_out_workflow_again_does_not_rerun_it() {
                 ..NewWorkflow::new("swept")
             },
             None,
+            WorkflowIdReusePolicy::ReturnExisting,
         )
         .await
         .expect("insert failed");

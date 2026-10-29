@@ -86,8 +86,8 @@ use types::{
     NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp,
-    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowInitResult,
-    WorkflowOwner, WorkflowRecord, WrittenBy,
+    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy,
+    WorkflowInitResult, WorkflowOwner, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -156,10 +156,15 @@ pub trait SystemDatabase: Send + Sync {
     /// This is the shape [`fork_workflows`](Self::fork_workflows) and the management calls already
     /// use — the checkpoint committing with the operation it records — reaching the one operation
     /// that creates a workflow.
+    ///
+    /// `reuse_policy` says what the insert does when the id already names another caller's
+    /// workflow: join it, or refuse with [`Error::WorkflowIdInUse`] before writing anything. A
+    /// retry that finds this call's own row after a lost commit acknowledgement is not a reuse.
     async fn init_workflow(
         &self,
         workflow: &NewWorkflow,
         caller: Option<InitWorkflowCaller<'_>>,
+        reuse_policy: WorkflowIdReusePolicy,
     ) -> Result<WorkflowInitResult, Error>;
 
     /// The database's clock as of this call, paired with the moment the answer arrived: what a

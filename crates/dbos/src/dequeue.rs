@@ -1006,6 +1006,7 @@ mod tests {
                     ..crate::sysdb::types::NewWorkflow::new("wf-reclaimed")
                 },
                 None,
+                crate::sysdb::types::WorkflowIdReusePolicy::ReturnExisting,
             )
             .await
             .unwrap();
@@ -1111,6 +1112,7 @@ mod tests {
                         ..crate::sysdb::types::NewWorkflow::new(&id)
                     },
                     None,
+                    crate::sysdb::types::WorkflowIdReusePolicy::ReturnExisting,
                 )
                 .await
                 .unwrap();
@@ -1139,6 +1141,7 @@ mod tests {
                     ..crate::sysdb::types::NewWorkflow::new("wf-started-elsewhere")
                 },
                 None,
+                crate::sysdb::types::WorkflowIdReusePolicy::ReturnExisting,
             )
             .await
             .unwrap();

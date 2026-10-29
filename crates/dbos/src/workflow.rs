@@ -22,8 +22,8 @@ use crate::registry::{QualifiedWorkflowName, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
-    StepCaller, StepTiming, Timestamp, WorkflowInitResult, decode_step_value, encode_step_value,
-    validate_positive_duration,
+    StepCaller, StepTiming, Timestamp, WorkflowIdReusePolicy, WorkflowInitResult,
+    decode_step_value, encode_step_value, validate_positive_duration,
 };
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
@@ -228,8 +228,14 @@ pub struct RunOptions<'a> {
     /// The workflow's id, in place of a generated one.
     ///
     /// A caller-supplied id is an idempotency key: starting the same id twice joins the workflow
-    /// already running — or already finished — rather than failing the second caller.
+    /// already running — or already finished — rather than failing the second caller, unless
+    /// [`workflow_id_reuse_policy`](Self::workflow_id_reuse_policy) says to refuse.
     pub workflow_id: Option<&'a str>,
+    /// What the start does when the id already names another caller's workflow: join it (the
+    /// default), or refuse with [`WorkflowIdInUse`](crate::sysdb::Error::WorkflowIdInUse).
+    /// [`Reject`](WorkflowIdReusePolicy::Reject) needs a [`workflow_id`](Self::workflow_id), and
+    /// is refused as [`Error::InvalidArgument`] without one.
+    pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
     /// How long the whole workflow may take, and whether it takes a parent's budget when it names
     /// none of its own. Defaults to [`Timeout::Inherit`].
     ///
@@ -274,6 +280,9 @@ pub struct StartOptions<'a> {
     /// The workflow's id, in place of a generated one, and an idempotency key — see
     /// [`RunOptions::workflow_id`].
     pub workflow_id: Option<&'a str>,
+    /// What the start does when the id already names another caller's workflow — see
+    /// [`RunOptions::workflow_id_reuse_policy`].
+    pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
     /// How long the whole workflow may take, and what it does about a parent's budget — see
     /// [`RunOptions::timeout`].
     pub timeout: Timeout,
@@ -607,9 +616,14 @@ fn api_field(field: &str) -> &str {
     }
 }
 
-/// Refuses a start's arguments that no row could hold: its enqueue's, through
+/// Refuses a start's arguments that no row could hold, or that mean nothing together:
+/// [`WorkflowIdReusePolicy::Reject`] without a `workflow_id`, its enqueue's, through
 /// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds. Each is
 /// an [`Error::InvalidArgument`], through [`start_refusal`].
+///
+/// A reuse policy is about an id the caller chose, so `Reject` needs one: with none, a root start
+/// has a fresh id nothing can have taken, and a child's is derived from its parent's, an id the
+/// caller never asked to be new.
 ///
 /// The one check every surface that starts or enqueues a workflow makes before it writes
 /// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
@@ -619,7 +633,17 @@ fn api_field(field: &str) -> &str {
 pub(crate) fn validate_start(
     enqueue: Option<&Enqueue<'_>>,
     timeout: Option<Duration>,
+    workflow_id: Option<&str>,
+    reuse_policy: WorkflowIdReusePolicy,
 ) -> Result<()> {
+    if reuse_policy == WorkflowIdReusePolicy::Reject && workflow_id.is_none() {
+        return Err(start_refusal(
+            enqueue.map(|enqueue| enqueue.name),
+            "`WorkflowIdReusePolicy::Reject` needs a `workflow_id`: the policy is about an id the \
+             caller chose"
+                .to_owned(),
+        ));
+    }
     if let Some(enqueue) = enqueue {
         enqueue.validate()?;
     }
@@ -676,6 +700,7 @@ pub(crate) struct OwnedStart {
     /// The id the child will have, resolved before the task is spawned — see
     /// [`child_workflow_id`] for why it is settled at the call rather than in the task.
     pub(crate) workflow_id: String,
+    pub(crate) workflow_id_reuse_policy: WorkflowIdReusePolicy,
     pub(crate) timeout: Timeout,
     pub(crate) queue: Option<OwnedEnqueue>,
     pub(crate) input: Option<String>,
@@ -775,10 +800,11 @@ pub(crate) async fn init_or_join(
     conn: &Connection,
     new: &NewWorkflow<'_>,
     policy: DuplicationPolicy,
+    reuse_policy: WorkflowIdReusePolicy,
     caller: Option<InitWorkflowCaller<'_>>,
 ) -> Result<Submitted> {
     loop {
-        match conn.sysdb().init_workflow(new, caller).await {
+        match conn.sysdb().init_workflow(new, caller, reuse_policy).await {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
             // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
@@ -834,6 +860,7 @@ impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
     fn from(options: RunOptions<'a>) -> Self {
         Self {
             workflow_id: options.workflow_id,
+            workflow_id_reuse_policy: options.workflow_id_reuse_policy,
             timeout: options.timeout,
             attributes: options.attributes,
             queue: None,
@@ -1031,7 +1058,12 @@ where
         // Borrowed rather than moved, because `options` is read again by the run, and **validated
         // before anything is written and before the counter moves**: an enqueue no queue could
         // honour should cost a round trip, not a row and not a step id.
-        validate_start(options.queue.as_ref(), options.timeout.budget())?;
+        validate_start(
+            options.queue.as_ref(),
+            options.timeout.budget(),
+            options.workflow_id,
+            options.workflow_id_reuse_policy,
+        )?;
         let placement = StepPlacement::of(executor.connection(), "starting a workflow")?;
         if matches!(placement, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
@@ -1224,6 +1256,7 @@ where
         };
         let request = OwnedStart {
             workflow_id: workflow_id.clone(),
+            workflow_id_reuse_policy: options.workflow_id_reuse_policy,
             timeout: options.timeout,
             queue: options.queue.as_ref().map(OwnedEnqueue::from),
             input: Some(encode_input(&input, &encoding)?),
@@ -1328,6 +1361,7 @@ pub(crate) async fn create<R, E>(
     // what keeps a start from copying its own arguments.
     let OwnedStart {
         workflow_id,
+        workflow_id_reuse_policy,
         timeout,
         queue,
         input,
@@ -1430,6 +1464,7 @@ pub(crate) async fn create<R, E>(
         enqueue.map_or(DuplicationPolicy::Reject, |enqueue| {
             enqueue.duplication_policy
         }),
+        workflow_id_reuse_policy,
         // **The parent's record of the start travels with the row, so the two commit
         // together.** A start is one durable act: either this parent started this child and
         // both rows say so, or neither exists. Written as two statements it had a window —
@@ -1791,6 +1826,8 @@ impl StartPlacement {
 /// - [`ConflictingWorkflow`](crate::sysdb::Error::ConflictingWorkflow): the chosen child id names a
 ///   workflow of another function, class or config, and once that row is deleted the same start
 ///   would go ahead.
+/// - [`WorkflowIdInUse`](crate::sysdb::Error::WorkflowIdInUse): the start refused an id that was
+///   taken, and once that row is deleted the same start would go ahead.
 ///
 /// One more is recorded although it depends only on the start's arguments:
 ///
@@ -1813,6 +1850,7 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
         error,
         crate::sysdb::Error::QueueDeduplicated { .. }
             | crate::sysdb::Error::ConflictingWorkflow { .. }
+            | crate::sysdb::Error::WorkflowIdInUse { .. }
             | crate::sysdb::Error::InvalidInput { .. }
     )
 }
@@ -1823,8 +1861,12 @@ fn should_record_start_error(error: &crate::sysdb::Error) -> bool {
 /// name, so [`check_child`](Parent::check_child) can tell a recorded start error from a plain
 /// step's error by that key, before reading it as the type. A unit test keeps this list and the
 /// predicate in step.
-const RECORDED_START_ERRORS: [&str; 3] =
-    ["QueueDeduplicated", "ConflictingWorkflow", "InvalidInput"];
+const RECORDED_START_ERRORS: [&str; 4] = [
+    "QueueDeduplicated",
+    "ConflictingWorkflow",
+    "WorkflowIdInUse",
+    "InvalidInput",
+];
 
 /// Whether `value`, a recorded step error, has the shape of a recorded start error.
 fn is_recorded_start_error(value: &serde_json::Value) -> bool {
@@ -2445,8 +2487,16 @@ mod tests {
             .validate()
             .is_ok()
         );
-        assert!(validate_start(None, Some(fits)).is_ok());
-        assert!(validate_start(None, None).is_ok());
+        assert!(
+            validate_start(
+                None,
+                Some(fits),
+                None,
+                WorkflowIdReusePolicy::ReturnExisting
+            )
+            .is_ok()
+        );
+        assert!(validate_start(None, None, None, WorkflowIdReusePolicy::ReturnExisting).is_ok());
 
         let delay = Enqueue {
             delay: Some(Duration::MAX),
@@ -2476,6 +2526,8 @@ mod tests {
                 ..Enqueue::new("q")
             }),
             Some(fits),
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
         );
         assert!(
             matches!(&both, Err(Error::InvalidArgument { operation, detail })
@@ -2484,7 +2536,12 @@ mod tests {
         );
 
         // A queued start's timeout is the enqueue's argument, and names its queue.
-        let queued = validate_start(Some(&Enqueue::new("q")), Some(Duration::MAX));
+        let queued = validate_start(
+            Some(&Enqueue::new("q")),
+            Some(Duration::MAX),
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
+        );
         assert!(
             matches!(&queued, Err(Error::InvalidArgument { operation, detail })
                 if operation == ENQUEUE_OPERATION
@@ -2492,7 +2549,12 @@ mod tests {
             "got {queued:?}"
         );
 
-        let timeout = validate_start(None, Some(Duration::MAX));
+        let timeout = validate_start(
+            None,
+            Some(Duration::MAX),
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
+        );
         assert!(
             matches!(&timeout, Err(Error::InvalidArgument { operation, detail })
                 if operation == START_OPERATION
@@ -2513,7 +2575,12 @@ mod tests {
                     && detail == "queue `q`: `delay` must be a positive, non-zero duration"),
             "got {delay:?}"
         );
-        let timeout = validate_start(None, Some(Duration::ZERO));
+        let timeout = validate_start(
+            None,
+            Some(Duration::ZERO),
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
+        );
         assert!(
             matches!(&timeout, Err(Error::InvalidArgument { operation, detail })
                 if operation == START_OPERATION
@@ -2535,6 +2602,11 @@ mod tests {
             crate::sysdb::Error::ConflictingWorkflow {
                 workflow_id: "w".to_owned(),
                 detail: "d".to_owned(),
+            },
+            crate::sysdb::Error::WorkflowIdInUse {
+                workflow_id: "w".to_owned(),
+                status: crate::sysdb::types::WorkflowStatus::Success,
+                name: Some("n".to_owned()),
             },
             crate::sysdb::Error::InvalidInput {
                 field: "f".into(),

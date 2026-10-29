@@ -67,7 +67,7 @@ use crate::serialization::{
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     Change, NewSchedule, NewWorkflow, ScheduleFilter, ScheduleRecord, ScheduleStatus,
-    ScheduleUpdate, Timestamp, step_names,
+    ScheduleUpdate, Timestamp, WorkflowIdReusePolicy, step_names,
 };
 use crate::workflow::{DuplicationPolicy, Enqueue, init_or_join, new_row};
 
@@ -1165,7 +1165,16 @@ impl Connection {
             schedule_name: Some(&record.schedule_name),
             ..new_row(workflow_id, Some(&queue))
         };
-        init_or_join(self, &new, DuplicationPolicy::Reject, None).await?;
+        // A tick's id is derived from the schedule and the time, so a tick another executor
+        // already enqueued is joined rather than refused.
+        init_or_join(
+            self,
+            &new,
+            DuplicationPolicy::Reject,
+            WorkflowIdReusePolicy::ReturnExisting,
+            None,
+        )
+        .await?;
         tracing::debug!(
             schedule = record.schedule_name,
             workflow_id,

@@ -874,7 +874,11 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new(id), None)
+            .init_workflow(
+                &NewWorkflow::new(id),
+                None,
+                crate::sysdb::types::WorkflowIdReusePolicy::ReturnExisting,
+            )
             .await
             .expect("could not create the workflow row");
         crate::context::own_for_test(&db, id).await;
@@ -1404,7 +1408,11 @@ mod tests {
         dbos.executor("test")
             .expect("launched")
             .sysdb()
-            .init_workflow(&NewWorkflow::new("wf-thief"), None)
+            .init_workflow(
+                &NewWorkflow::new("wf-thief"),
+                None,
+                crate::sysdb::types::WorkflowIdReusePolicy::ReturnExisting,
+            )
             .await
             .expect("could not create the second workflow row");
 

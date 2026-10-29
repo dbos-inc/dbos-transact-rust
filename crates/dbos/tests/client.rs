@@ -18,7 +18,7 @@ use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
     EnqueueOptions, Error, Fork, ForkOptions, PortableWorkflowArgs, QualifiedWorkflowName,
     QueueChange, QueueConflict, QueueOptions, SendMessage, SendOptions, StartOptions,
-    WorkflowHandle,
+    WorkflowHandle, WorkflowIdReusePolicy,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -228,6 +228,7 @@ async fn every_option_reaches_the_row() {
             (),
             EnqueueOptions {
                 workflow_id: Some("fully-specified"),
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
                 app_name: Some("some-other-app"),
                 app_version: Some("v1.2.3"),
                 timeout: Some(Duration::from_secs(90)),
@@ -546,6 +547,94 @@ async fn an_enqueued_key_writes_an_empty_class_or_config_as_null() {
         .expect("the row is missing");
     assert_eq!(row.class_name, None);
     assert_eq!(row.config_name, None);
+
+    client.close().await;
+}
+
+/// A client enqueue with `WorkflowIdReusePolicy::Reject` refuses an id another enqueue took, and
+/// leaves that workflow as it was; the default joins it.
+#[tokio::test]
+async fn a_rejecting_client_enqueue_refuses_a_taken_id() {
+    let db = test_database().await;
+    let client = client("client-reuse-policy", &db).await;
+    let id = "client-taken-id";
+    let options = |policy| EnqueueOptions {
+        workflow_id: Some(id),
+        workflow_id_reuse_policy: policy,
+        ..EnqueueOptions::new("work")
+    };
+
+    client
+        .enqueue_with::<_, (), EngineOnly>(
+            "never_registered",
+            1,
+            options(WorkflowIdReusePolicy::Reject),
+        )
+        .await
+        .expect("a fresh id is not in use");
+    let before = reader(&db)
+        .await
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+
+    let refused = client
+        .enqueue_with::<_, (), EngineOnly>(
+            "never_registered",
+            2,
+            options(WorkflowIdReusePolicy::Reject),
+        )
+        .await;
+    assert!(
+        matches!(
+            &refused,
+            Err(Error::SystemDatabase(SysdbError::WorkflowIdInUse {
+                workflow_id,
+                status: WorkflowStatus::Enqueued,
+                name: Some(name),
+            })) if workflow_id == id && name == "never_registered"
+        ),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    let joined = client
+        .enqueue_with::<_, (), EngineOnly>(
+            "never_registered",
+            3,
+            options(WorkflowIdReusePolicy::ReturnExisting),
+        )
+        .await
+        .expect("the default joins");
+    assert_eq!(joined.workflow_id(), id);
+
+    let after = reader(&db)
+        .await
+        .get_workflow(id)
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(after.input, before.input, "the first enqueue's input");
+    assert_eq!(after.updated_at, before.updated_at, "nothing was written");
+
+    // `Reject` is about an id the caller chose, and is refused without one.
+    let refused = client
+        .enqueue_with::<_, (), EngineOnly>(
+            "never_registered",
+            4,
+            EnqueueOptions {
+                workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
+                ..EnqueueOptions::new("work")
+            },
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. })
+            if detail == "queue `work`: `WorkflowIdReusePolicy::Reject` needs a `workflow_id`: \
+                          the policy is about an id the caller chose"),
+        "{:?}",
+        refused.map(|_| ())
+    );
 
     client.close().await;
 }
