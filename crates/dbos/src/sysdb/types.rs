@@ -827,14 +827,15 @@ impl<'a> NewWorkflow<'a> {
     /// The two auth fields are exempt: TypeScript and Go send `""` rather than null when there
     /// is no auth context, so those are normalised at write time instead of rejected.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.workflow_id.is_empty() {
-            return Err(Error::InvalidInput {
-                field: "workflow_id".into(),
-                detail: "must not be empty".to_owned(),
-            });
+        for (field, value) in [("workflow_id", Some(self.workflow_id)), ("name", self.name)] {
+            if value == Some("") {
+                return Err(Error::InvalidInput {
+                    field: field.into(),
+                    detail: "must not be empty".to_owned(),
+                });
+            }
         }
         for (field, value) in [
-            ("name", &self.name),
             ("class_name", &self.class_name),
             ("config_name", &self.config_name),
             ("queue_name", &self.queue_name),

@@ -71,8 +71,8 @@ use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{
-    Debounced, Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start,
-    validate_start,
+    Debounced, ENQUEUE_OPERATION, Enqueue, Submitted, encode_attributes, init_or_join, new_row,
+    refused_start, validate_start,
 };
 use crate::{QualifiedWorkflowName, Queue, QueueChange, QueueConflict, QueueOptions};
 
@@ -417,15 +417,16 @@ impl Client {
     where
         P: Serialize,
     {
+        let workflow = workflow.into();
         // Refused before the input is encoded, as before anything is written: an enqueue no queue
         // could honour should not spend the encoding either.
-        options.validate()?;
+        options.validate(&workflow)?;
         let encoding = PayloadEncoding::resolve(
             options.queue.serialization,
             self.connection().serializer().encoding(),
         );
         let input = encode_input(&input, &encoding)?;
-        self.enqueue_encoded(&workflow.into(), &input, encoding, options, None)
+        self.enqueue_encoded(&workflow, &input, encoding, options, None)
             .await
     }
 
@@ -453,16 +454,11 @@ impl Client {
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        options.validate()?;
+        let workflow = workflow.into();
+        options.validate(&workflow)?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
-        self.enqueue_encoded(
-            &workflow.into(),
-            &input,
-            PayloadEncoding::Portable,
-            options,
-            None,
-        )
-        .await
+        self.enqueue_encoded(&workflow, &input, PayloadEncoding::Portable, options, None)
+            .await
     }
 
     /// The enqueue both public forms share, from an input already encoded in `encoding`.
@@ -862,9 +858,19 @@ pub struct EnqueueOptions<'a> {
 }
 
 impl<'a> EnqueueOptions<'a> {
-    /// Refuses an enqueue no row could hold, with the check every start makes — see
-    /// [`validate_start`].
-    pub(crate) fn validate(&self) -> Result<()> {
+    /// Refuses an enqueue of `workflow` no row could hold: a workflow with no name, which nothing
+    /// could ever dequeue, and what every start checks — see [`validate_start`].
+    ///
+    /// The name is checked here because a client takes it from its caller. A
+    /// [`QualifiedWorkflowName`] can hold an empty one, since a row can; an executor's starts take
+    /// theirs from a registration, which refuses it.
+    pub(crate) fn validate(&self, workflow: &QualifiedWorkflowName) -> Result<()> {
+        if workflow.name().is_empty() {
+            return Err(Error::InvalidArgument {
+                operation: ENQUEUE_OPERATION.into(),
+                detail: format!("queue `{}`: `workflow` must not be empty", self.queue.name),
+            });
+        }
         validate_start(Some(&self.queue), self.timeout)
     }
 

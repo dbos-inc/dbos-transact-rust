@@ -277,6 +277,11 @@ impl ScheduleSpec {
                 detail: "a schedule needs a name".to_owned(),
             });
         }
+        if self.workflow.name().is_empty() {
+            return Err(refuse(
+                "`workflow` must not be empty: nothing could run the schedule".to_owned(),
+            ));
+        }
         if self.workflow.config_name().is_some() {
             return Err(refuse(format!(
                 "the configured instance {} cannot be scheduled",

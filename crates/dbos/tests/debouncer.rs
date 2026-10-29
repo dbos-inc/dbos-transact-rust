@@ -921,6 +921,26 @@ async fn a_key_held_by_a_workflow_that_is_not_debounced_is_refused() {
     dbos.shutdown().await;
 }
 
+/// A client debounce of a workflow with no name is refused before it bounces or writes anything.
+#[tokio::test]
+async fn a_client_debounce_of_a_nameless_workflow_is_refused() {
+    let db = test_database().await;
+    let client = client(None, &db).await;
+    let reader = reader(&db).await;
+
+    let debouncer = DebouncerClient::new(&client, "", EnqueueOptions::new("nameless-queue"));
+    let refused = debouncer.debounce::<_, u32, Error>("key", PERIOD, 1).await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. })
+            if detail == "queue `nameless-queue`: `workflow` must not be empty"),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    assert!(rows_named(&reader, "").await.is_empty(), "nothing written");
+
+    client.close().await;
+}
+
 /// A config with no class holds its own debounce, apart from the free function of the same name:
 /// its deduplication id keeps the config.
 #[tokio::test]

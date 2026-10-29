@@ -709,7 +709,7 @@ impl<'a> DebouncerClient<'a> {
     {
         refuse_stored_workflow_id(self.options.workflow_id, "DebouncerClient::debounce_with")?;
         refuse_owned_options(&self.options.queue)?;
-        self.options.validate()?;
+        self.options.validate(&self.workflow)?;
         refuse_durations(period, self.debounce_timeout)?;
         refuse_app_name(self.options.app_name)?;
 

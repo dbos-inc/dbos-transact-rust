@@ -16,8 +16,9 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, Fork, ForkOptions, QualifiedWorkflowName, QueueChange, QueueConflict,
-    QueueOptions, SendMessage, SendOptions, StartOptions, WorkflowHandle,
+    EnqueueOptions, Error, Fork, ForkOptions, PortableWorkflowArgs, QualifiedWorkflowName,
+    QueueChange, QueueConflict, QueueOptions, SendMessage, SendOptions, StartOptions,
+    WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -487,6 +488,35 @@ async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
             refused.map(|_| ())
         );
     }
+
+    // A workflow with no name, which nothing could dequeue, from either enqueue.
+    let expected = "queue `work`: `workflow` must not be empty";
+    let refused = client
+        .enqueue_with::<_, (), EngineOnly>("", (), EnqueueOptions::new("work"))
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail == expected),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    let refused = client
+        .enqueue_portable::<(), EngineOnly>(
+            QualifiedWorkflowName::method("", "Billing"),
+            PortableWorkflowArgs::default(),
+            EnqueueOptions::new("work"),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail == expected),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    let rows = reader(&db)
+        .await
+        .list_workflows(&Default::default(), None)
+        .await
+        .expect("read failed");
+    assert!(rows.is_empty(), "nothing was written");
 
     client.close().await;
 }

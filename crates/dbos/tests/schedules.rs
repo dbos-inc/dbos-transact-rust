@@ -827,6 +827,31 @@ async fn a_schedule_stored_with_an_empty_class_runs_the_free_function() {
     dbos.shutdown().await;
 }
 
+/// A client's schedule for a workflow with no name is refused, rather than stored to be refused on
+/// every tick.
+#[tokio::test]
+async fn a_schedule_for_a_nameless_workflow_is_refused() {
+    let db = test_database().await;
+    let client = client(None, &db).await;
+
+    let spec =
+        ScheduleSpec::for_workflow("nameless", "", daily_far_from_now(), &"x".to_owned()).unwrap();
+    let refused = client.create_schedule(&spec).await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. })
+            if detail.starts_with("schedule `nameless`: `workflow` must not be empty")),
+        "{refused:?}"
+    );
+    assert!(
+        client
+            .list_schedules(&Default::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    client.close().await;
+}
+
 #[tokio::test]
 async fn a_restart_catches_up_on_missed_ticks_when_asked() {
     let db = test_database().await;
