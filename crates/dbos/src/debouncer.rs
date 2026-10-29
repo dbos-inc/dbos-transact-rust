@@ -129,13 +129,13 @@ fn classify(
         Debounce::Bounced { workflow_id } => BounceAction::Coalesce(workflow_id),
         Debounce::Unheld => BounceAction::Enqueue,
         Debounce::Held(holder) => {
-            let same_workflow = holder.workflow_name.as_deref().is_some_and(|name| {
-                QualifiedWorkflowName::from_row(
-                    name,
-                    holder.class_name.as_deref(),
-                    holder.config_name.as_deref(),
-                ) == *workflow
-            });
+            // Part by part, with `''` absent as `QualifiedWorkflowName::from_row` reads it.
+            fn present(part: Option<&str>) -> Option<&str> {
+                part.filter(|part| !part.is_empty())
+            }
+            let same_workflow = holder.workflow_name.as_deref() == Some(workflow.name())
+                && present(holder.class_name.as_deref()) == workflow.class_name()
+                && present(holder.config_name.as_deref()) == workflow.config_name();
             let another_app = matches!(
                 (target_app, holder.application_name.as_deref()),
                 (Some(target), Some(owner)) if target != owner

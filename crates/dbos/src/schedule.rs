@@ -1155,13 +1155,8 @@ impl Connection {
         )?;
         let queue = Enqueue::new(record.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE));
         let new = NewWorkflow {
-            name: Some(&record.workflow_name),
-            // Read as `prepare_firing` resolves the workflow: a schedule another SDK wrote with a
-            // `''` class runs the free function, rather than being refused on every tick.
-            class_name: record
-                .workflow_class_name
-                .as_deref()
-                .filter(|class| !class.is_empty()),
+            name: Some(firing.workflow.name()),
+            class_name: firing.workflow.class_name(),
             input: Some(&input),
             serialization: Some(encoding.name()),
             executor_id: None,
@@ -1192,6 +1187,9 @@ pub(crate) struct Firing {
     /// How the workflow is registered to encode, or [`SerializationFormat::Default`] where the
     /// firing handle has no registration to read: a client, or an executor without the workflow.
     serialization: SerializationFormat,
+    /// The workflow each run starts, read from the schedule's columns, so a class stored as `''`
+    /// is absent.
+    workflow: QualifiedWorkflowName,
 }
 
 impl Connection {
@@ -1226,13 +1224,13 @@ impl Connection {
         // Decoded to a value and encoded again inside each input, rather than spliced in as text,
         // so a context that cannot be read fails here rather than in every run.
         let context = decode_context(&record.context, self.serializer())?;
-        let key = QualifiedWorkflowName::from_row(
+        let workflow = QualifiedWorkflowName::from_row(
             record.workflow_name.as_str(),
             record.workflow_class_name.as_deref(),
             None,
         );
         let serialization = workflows
-            .and_then(|workflows| workflows.get(&key))
+            .and_then(|workflows| workflows.get(&workflow))
             .map_or(SerializationFormat::Default, |registered| {
                 registered.serialization
             });
@@ -1241,6 +1239,7 @@ impl Connection {
             version,
             context,
             serialization,
+            workflow,
         })
     }
 }

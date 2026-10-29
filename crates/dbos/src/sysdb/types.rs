@@ -363,9 +363,9 @@ impl fmt::Display for WorkflowStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct QualifiedWorkflowName {
     name: String,
-    #[serde(deserialize_with = "absent_if_empty")]
+    #[serde(default, deserialize_with = "absent_if_empty")]
     class_name: Option<String>,
-    #[serde(deserialize_with = "absent_if_empty")]
+    #[serde(default, deserialize_with = "absent_if_empty")]
     config_name: Option<String>,
 }
 
@@ -419,11 +419,10 @@ impl QualifiedWorkflowName {
         class_name: Option<&str>,
         config_name: Option<&str>,
     ) -> Self {
-        let absent = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
         Self {
             name: name.into(),
-            class_name: absent(class_name),
-            config_name: absent(config_name),
+            class_name: class_name.map(str::to_owned).and_then(present),
+            config_name: config_name.map(str::to_owned).and_then(present),
         }
     }
 
@@ -931,6 +930,12 @@ mod tests {
         let key: QualifiedWorkflowName =
             serde_json::from_str(r#"{"name":"f","class_name":"","config_name":null}"#).unwrap();
         assert_eq!(key, QualifiedWorkflowName::new("f"));
+        let bare: QualifiedWorkflowName = serde_json::from_str(r#"{"name":"f"}"#).unwrap();
+        assert_eq!(
+            bare,
+            QualifiedWorkflowName::new("f"),
+            "a missing part is absent"
+        );
         let back: QualifiedWorkflowName = serde_json::from_str(
             &serde_json::to_string(&QualifiedWorkflowName::instance("f", "C", "eu")).unwrap(),
         )
