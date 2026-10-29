@@ -6,9 +6,9 @@ use dbos::sysdb::types::{
     AppScope, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, DequeueStop,
     EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
     NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
-    QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom, RewindOptions, ScheduleFilter,
-    ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp, WorkflowDelay, WorkflowFilter,
-    WorkflowKey, WorkflowRecord, WorkflowStatus, WrittenBy,
+    QualifiedWorkflowName, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
+    RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp,
+    WorkflowDelay, WorkflowFilter, WorkflowRecord, WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{
     BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
@@ -12912,11 +12912,15 @@ async fn db_now_ms(db: &support::TestDatabase) -> i64 {
 }
 
 fn bounce<'a>(name: &str, key: &'a str, period: std::time::Duration) -> DebounceRequest<'a> {
-    bounce_as(Box::leak(Box::new(WorkflowKey::new(name))), key, period)
+    bounce_as(
+        Box::leak(Box::new(QualifiedWorkflowName::new(name))),
+        key,
+        period,
+    )
 }
 
 fn bounce_as<'a>(
-    workflow: &'a WorkflowKey,
+    workflow: &'a QualifiedWorkflowName,
     key: &'a str,
     period: std::time::Duration,
 ) -> DebounceRequest<'a> {
@@ -13022,7 +13026,7 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     enqueue_debounced_instance(&sys, "wf-east", "Checkout", "east", "cart-1").await;
 
     // Same name and class, a different instance: a collision, not a bounce.
-    let west_key = WorkflowKey::instance("checkout", "Checkout", "west");
+    let west_key = QualifiedWorkflowName::instance("checkout", "Checkout", "west");
     let west = bounce_as(&west_key, "cart-1", AN_HOUR);
     match sys.debounce_delayed_workflow(&west, None).await.unwrap() {
         Debounce::Held(holder) => {
@@ -13042,7 +13046,7 @@ async fn a_bounce_matches_the_class_and_configured_instance() {
     ));
 
     // The east instance's own bounce lands.
-    let east_key = WorkflowKey::instance("checkout", "Checkout", "east");
+    let east_key = QualifiedWorkflowName::instance("checkout", "Checkout", "east");
     let east = bounce_as(&east_key, "cart-1", AN_HOUR);
     assert_eq!(
         sys.debounce_delayed_workflow(&east, None).await.unwrap(),
@@ -13100,7 +13104,7 @@ async fn a_bounce_extends_a_row_that_spells_an_absent_class_or_instance_empty() 
             workflow_id: "wf-blank".to_owned()
         },
     );
-    let method = WorkflowKey::method("refund", "Checkout");
+    let method = QualifiedWorkflowName::method("refund", "Checkout");
     assert_eq!(
         sys.debounce_delayed_workflow(&bounce_as(&method, "cart-2", AN_HOUR), None)
             .await

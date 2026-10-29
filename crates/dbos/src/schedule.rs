@@ -59,7 +59,7 @@ use crate::cron::{CronSchedule, firing_id, trigger_id};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::DBOS;
-use crate::registry::{Snapshot, WorkflowKey, WorkflowRef};
+use crate::registry::{QualifiedWorkflowName, Snapshot, WorkflowRef};
 use crate::serialization::{
     Floats, NonFinite, PayloadEncoding, SerializationFormat, Serializer, decode, encode,
     encode_input,
@@ -198,7 +198,7 @@ pub struct ScheduleSpec {
     /// The workflow each tick enqueues.
     ///
     /// A configured instance cannot be scheduled: the table has no column for one.
-    pub workflow: WorkflowKey,
+    pub workflow: QualifiedWorkflowName,
     /// The context each tick is called with.
     context: serde_json::Value,
     /// Whether an executor picking the schedule up — after a restart, or a deploy — first enqueues
@@ -229,7 +229,7 @@ impl ScheduleSpec {
     where
         C: Serialize,
     {
-        Self::for_workflow(schedule_name, workflow.key(), schedule, context)
+        Self::for_workflow(schedule_name, workflow.qualified_name(), schedule, context)
     }
 
     /// [`new`](Self::new) for a workflow named rather than held, which is what a
@@ -239,7 +239,7 @@ impl ScheduleSpec {
     /// deserialization failure in each run.
     pub fn for_workflow<C>(
         schedule_name: impl Into<String>,
-        workflow: impl Into<WorkflowKey>,
+        workflow: impl Into<QualifiedWorkflowName>,
         schedule: impl Into<String>,
         context: &C,
     ) -> Result<Self>
@@ -381,7 +381,7 @@ impl ScheduleChange<'_> {
 pub struct Schedule {
     id: String,
     schedule_name: String,
-    workflow: WorkflowKey,
+    workflow: QualifiedWorkflowName,
     schedule: String,
     status: ScheduleStatus,
     context: String,
@@ -432,7 +432,7 @@ impl Schedule {
     /// Builds the read view from a row, read by a handle configured with `serializer`.
     pub(crate) fn from_record(record: ScheduleRecord, serializer: &Serializer) -> Self {
         Self {
-            workflow: WorkflowKey::from_row(
+            workflow: QualifiedWorkflowName::from_row(
                 record.workflow_name,
                 record.workflow_class_name.as_deref(),
                 None,
@@ -464,7 +464,7 @@ impl Schedule {
     }
 
     /// The workflow each tick enqueues.
-    pub fn workflow(&self) -> &WorkflowKey {
+    pub fn workflow(&self) -> &QualifiedWorkflowName {
         &self.workflow
     }
 
@@ -776,7 +776,7 @@ impl DBOS {
 /// application written in another language.
 fn refuse_unregistered(
     executor: &crate::Executor,
-    workflow: &WorkflowKey,
+    workflow: &QualifiedWorkflowName,
     operation: &'static str,
 ) -> Result<()> {
     if executor.workflows().contains_key(workflow) {
@@ -1221,7 +1221,7 @@ impl Connection {
         // Decoded to a value and encoded again inside each input, rather than spliced in as text,
         // so a context that cannot be read fails here rather than in every run.
         let context = decode_context(&record.context, self.serializer())?;
-        let key = WorkflowKey::from_row(
+        let key = QualifiedWorkflowName::from_row(
             record.workflow_name.as_str(),
             record.workflow_class_name.as_deref(),
             None,
@@ -1290,7 +1290,7 @@ mod tests {
     /// float, so one is refused rather than stored as `null`, whichever way the context is written.
     #[test]
     fn a_non_finite_float_in_a_context_is_refused() {
-        let key = WorkflowKey::new("report");
+        let key = QualifiedWorkflowName::new("report");
         assert!(ScheduleSpec::for_workflow("nan", key.clone(), "0 * * * * *", &f64::NAN).is_err());
         assert!(ScheduleSpec::for_workflow("ok", key, "0 * * * * *", &1.5f64).is_ok());
 
@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(schedule.schedule_name(), "nightly");
         assert_eq!(
             schedule.workflow(),
-            &WorkflowKey::method("report", "Reports")
+            &QualifiedWorkflowName::method("report", "Reports")
         );
         assert_eq!(schedule.schedule(), "0 0 2 * * *");
         assert_eq!(schedule.status(), ScheduleStatus::Paused);
@@ -1491,7 +1491,7 @@ mod tests {
             },
             &Serializer::RustSerde,
         );
-        assert_eq!(schedule.workflow(), &WorkflowKey::new("w"));
+        assert_eq!(schedule.workflow(), &QualifiedWorkflowName::new("w"));
         assert_eq!(schedule.last_fired_at(), None);
     }
 
@@ -1544,7 +1544,7 @@ mod tests {
 
         let instance = ScheduleSpec::for_workflow(
             "s",
-            WorkflowKey::instance("w", "Class", "config"),
+            QualifiedWorkflowName::instance("w", "Class", "config"),
             "* * * * *",
             &(),
         )

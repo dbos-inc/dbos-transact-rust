@@ -15,8 +15,8 @@ use dbos::sysdb::types::{WorkflowFilter, WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{Error as SysdbError, INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
     Client, ClientConfig, Config, DBOS, DebounceOptions, Debouncer, DebouncerClient,
-    DuplicationPolicy, Enqueue, EnqueueOptions, Error, QueueConflict, QueueOptions, RunOptions,
-    SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowKey,
+    DuplicationPolicy, Enqueue, EnqueueOptions, Error, QualifiedWorkflowName, QueueConflict,
+    QueueOptions, RunOptions, SerializationFormat, StartOptions, Timeout, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -932,7 +932,7 @@ async fn a_config_with_no_class_debounces_apart_from_the_free_function() {
     let free = DebouncerClient::new(&client, "echo", EnqueueOptions::new(queue));
     let unclassed = DebouncerClient::new(
         &client,
-        WorkflowKey::instance("echo", "", "eu"),
+        QualifiedWorkflowName::instance("echo", "", "eu"),
         EnqueueOptions::new(queue),
     );
 
@@ -1480,7 +1480,7 @@ async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
     let db = test_database().await;
     let app = "debounce-instance-app";
     let dbos = DBOS::new(config(app, &db));
-    let key = |config: &str| WorkflowKey::instance("echo", "Billing", config);
+    let key = |config: &str| QualifiedWorkflowName::instance("echo", "Billing", config);
     let eu = dbos
         .register_workflow(key("eu"), |x: u32| async move { Ok::<u32, Error>(x) })
         .unwrap();
@@ -1496,7 +1496,7 @@ async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
     let eu_debouncer = Debouncer::new(&eu);
     let first = eu_debouncer.debounce("key", FOREVER, 1).await.unwrap();
     let held = row(&reader, first.workflow_id()).await;
-    assert_eq!(held.key(), Some(key("eu")));
+    assert_eq!(held.qualified_name(), Some(key("eu")));
     assert_eq!(
         held.deduplication_id.as_deref(),
         Some("echo/Billing/eu-key")

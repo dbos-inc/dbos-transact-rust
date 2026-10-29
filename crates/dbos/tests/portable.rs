@@ -13,9 +13,9 @@ use serde_json::{Map, Value, json};
 
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
-    PortableWorkflowArgs, QueueConflict, QueueOptions, ScheduleSpec, ScheduledWorkflowInput,
-    SendMessage, SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowKey,
-    WorkflowOptions, WriteStreamOptions,
+    PortableWorkflowArgs, QualifiedWorkflowName, QueueConflict, QueueOptions, ScheduleSpec,
+    ScheduledWorkflowInput, SendMessage, SendOptions, SerializationFormat, SetEventOptions,
+    StartOptions, WorkflowOptions, WriteStreamOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -111,7 +111,7 @@ fn expected_output() -> CanonicalOutput {
 async fn launch_canonical(app_name: &str, db: &TestDatabase) -> DBOS {
     let dbos = DBOS::new(config(app_name, db));
     dbos.register_workflow_with(
-        WorkflowKey::method("canonicalWorkflow", "interop"),
+        QualifiedWorkflowName::method("canonicalWorkflow", "interop"),
         portable(),
         |(text, num, dt, items, meta, flag, empty): CanonicalInput| async move {
             dbos::set_event(
@@ -171,7 +171,7 @@ async fn the_canonical_workflow_writes_the_golden_rows() {
     let args: PortableWorkflowArgs = serde_json::from_str(GOLDEN_INPUTS_JSON).unwrap();
     let handle = client
         .enqueue_portable::<CanonicalOutput, EngineOnly>(
-            WorkflowKey::method("canonicalWorkflow", "interop"),
+            QualifiedWorkflowName::method("canonicalWorkflow", "interop"),
             args,
             EnqueueOptions::new(QUEUE),
         )

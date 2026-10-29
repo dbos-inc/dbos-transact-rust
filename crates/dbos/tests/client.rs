@@ -16,8 +16,8 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, Fork, ForkOptions, QueueChange, QueueConflict, QueueOptions,
-    SendMessage, SendOptions, StartOptions, WorkflowHandle, WorkflowKey,
+    EnqueueOptions, Error, Fork, ForkOptions, QualifiedWorkflowName, QueueChange, QueueConflict,
+    QueueOptions, SendMessage, SendOptions, StartOptions, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -211,15 +211,15 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
 /// Everything an enqueue may say reaches the row it writes.
 ///
 /// One workflow rather than one per option, because what is being checked is the mapping — every
-/// part of the `WorkflowKey` and every field of `EnqueueOptions` and `Enqueue` landing in the
-/// column it names.
+/// part of the `QualifiedWorkflowName` and every field of `EnqueueOptions` and `Enqueue` landing in
+/// the column it names.
 #[tokio::test]
 async fn every_option_reaches_the_row() {
     let db = test_database().await;
     let client = client("client-options", &db).await;
     let mut attributes = serde_json::Map::new();
     attributes.insert("tenant".to_owned(), serde_json::json!("acme"));
-    let billing = WorkflowKey::instance("charge", "Billing", "eu");
+    let billing = QualifiedWorkflowName::instance("charge", "Billing", "eu");
 
     let handle: WorkflowHandle<()> = client
         .enqueue_with(
@@ -253,7 +253,7 @@ async fn every_option_reaches_the_row() {
     assert_eq!(row.name.as_deref(), Some("charge"));
     assert_eq!(row.class_name.as_deref(), Some("Billing"));
     assert_eq!(row.config_name.as_deref(), Some("eu"));
-    assert_eq!(row.key(), Some(billing));
+    assert_eq!(row.qualified_name(), Some(billing));
     assert_eq!(
         row.app_name.as_deref(),
         Some("some-other-app"),
@@ -499,7 +499,7 @@ async fn an_enqueued_key_writes_an_empty_class_or_config_as_null() {
 
     let handle: WorkflowHandle<()> = client
         .enqueue_with(
-            WorkflowKey::instance("never_registered", "", ""),
+            QualifiedWorkflowName::instance("never_registered", "", ""),
             (),
             EnqueueOptions {
                 workflow_id: Some("blank-key"),
