@@ -729,7 +729,7 @@ async fn dispatch(
     clock: DatabaseTime,
     slot: Option<Slot>,
 ) -> crate::Result<()> {
-    let Some(key) = row.key() else {
+    let Some(key) = row.qualified_name() else {
         tracing::warn!(
             workflow_id = row.workflow_id,
             "the row names no workflow; skipped"

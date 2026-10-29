@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{DurableError, EncodedError, EngineOnly, Failure};
 use crate::serialization::{PayloadEncoding, SerializationFormat, decode_input, encode};
-pub(crate) use crate::sysdb::types::WorkflowKey;
+pub(crate) use crate::sysdb::types::QualifiedWorkflowName;
 use crate::{DBOS, Error, Result};
 
 /// A boxed future, spelled here rather than pulled from `futures` for one type alias.
@@ -97,32 +97,49 @@ pub(crate) struct Registry {
 /// window, because the slot is not what registration races.
 #[derive(Default)]
 struct State {
-    workflows: HashMap<WorkflowKey, RegisteredWorkflow>,
+    workflows: HashMap<QualifiedWorkflowName, RegisteredWorkflow>,
     /// Set when a snapshot is taken, cleared when the executor it was taken for goes away.
     frozen: bool,
 }
 
+/// [`Error::InvalidArgument`] for a name nothing can be registered as: one that is empty, or
+/// with a config but no class, since a configured instance belongs to a class. Either can be
+/// read from a row, which is why [`QualifiedWorkflowName`] holds them at all.
+fn refuse_unregistrable(name: &QualifiedWorkflowName) -> Result<()> {
+    let detail = if name.name().is_empty() {
+        "a workflow needs a name"
+    } else if name.config_name().is_some() && name.class_name().is_none() {
+        "a configured instance needs a class"
+    } else {
+        return Ok(());
+    };
+    Err(Error::InvalidArgument {
+        operation: "register a workflow".into(),
+        detail: format!("{detail}, got `{name}`"),
+    })
+}
+
 /// A registry frozen at launch.
-pub(crate) type Snapshot = Arc<HashMap<WorkflowKey, RegisteredWorkflow>>;
+pub(crate) type Snapshot = Arc<HashMap<QualifiedWorkflowName, RegisteredWorkflow>>;
 
 impl Registry {
-    /// Registers `workflow` under `key`, refusing a second registration of the same identity.
+    /// Registers `workflow` under `name`, refusing a second registration of the same identity.
     ///
     /// Uniqueness is on the whole triple, which is Java's model and the strictest of the three:
     /// a name that resolves to two functions is a workflow that recovers as the wrong one.
     ///
     /// Refuses outright once frozen. The operation is named here rather than passed in because
     /// registration is the only thing that inserts.
-    fn insert(&self, key: WorkflowKey, workflow: RegisteredWorkflow) -> Result<()> {
+    fn insert(&self, name: QualifiedWorkflowName, workflow: RegisteredWorkflow) -> Result<()> {
         let mut state = self.write();
         if state.frozen {
             return Err(Error::AlreadyLaunched {
                 operation: "register_workflow".into(),
             });
         }
-        match state.workflows.entry(key) {
+        match state.workflows.entry(name) {
             Entry::Occupied(taken) => Err(Error::AlreadyRegistered {
-                key: taken.key().clone(),
+                workflow: taken.key().clone(),
             }),
             Entry::Vacant(slot) => {
                 slot.insert(workflow);
@@ -167,7 +184,7 @@ impl Registry {
 /// than at every invocation by string.
 pub struct WorkflowRef<P, R, E = EngineOnly> {
     dbos: DBOS,
-    key: Arc<WorkflowKey>,
+    name: Arc<QualifiedWorkflowName>,
     /// How a start writes this workflow unless it chooses otherwise.
     serialization: SerializationFormat,
     /// `E` is the *application's* error type, the one inside [`Error::Application`], so a workflow
@@ -179,14 +196,14 @@ pub struct WorkflowRef<P, R, E = EngineOnly> {
 }
 
 impl<P, R, E> WorkflowRef<P, R, E> {
-    /// The identity this workflow was registered under.
-    pub fn key(&self) -> &WorkflowKey {
-        &self.key
+    /// The name this workflow was registered under, with its class and config.
+    pub fn qualified_name(&self) -> &QualifiedWorkflowName {
+        &self.name
     }
 
-    /// The workflow's name.
+    /// The workflow's bare name, without its class or config.
     pub fn name(&self) -> &str {
-        &self.key.name
+        self.name.name()
     }
 
     /// The instance this workflow is registered with.
@@ -206,7 +223,7 @@ impl<P, R, E> Clone for WorkflowRef<P, R, E> {
     fn clone(&self) -> Self {
         Self {
             dbos: self.dbos.clone(),
-            key: Arc::clone(&self.key),
+            name: Arc::clone(&self.name),
             serialization: self.serialization,
             types: PhantomData,
         }
@@ -216,18 +233,18 @@ impl<P, R, E> Clone for WorkflowRef<P, R, E> {
 impl<P, R, E> std::fmt::Debug for WorkflowRef<P, R, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkflowRef")
-            .field("key", &self.key.to_string())
+            .field("name", &self.name.to_string())
             .finish_non_exhaustive()
     }
 }
 
 impl DBOS {
-    /// Registers a workflow under `key`, returning a typed handle to it.
+    /// Registers a workflow under `name`, returning a typed handle to it.
     ///
-    /// The key is the workflow's identity: a name alone for a free function, a
-    /// [`WorkflowKey::method`] for a class-bound one, or a [`WorkflowKey::instance`] for a
-    /// configured instance. Its name, class and config are what a [`Client`](crate::Client)
-    /// enqueues by and what dequeue resolves a row against.
+    /// The name is the workflow's identity: a bare name for a free function, a
+    /// [`QualifiedWorkflowName::method`] for a class-bound one, or a
+    /// [`QualifiedWorkflowName::instance`] for a configured instance. Its name, class and config
+    /// are what a [`Client`](crate::Client) enqueues by and what dequeue resolves a row against.
     ///
     /// Only before [`launch`](DBOS::launch): the executor holds a snapshot of the registry, so a
     /// registration afterwards would be invisible to recovery and to dequeue — which is worse than
@@ -248,7 +265,7 @@ impl DBOS {
     /// leaks one instance, which for a process that launches once is a bounded cost.
     pub fn register_workflow<P, R, E, F, Fut>(
         &self,
-        key: impl Into<WorkflowKey>,
+        name: impl Into<QualifiedWorkflowName>,
         workflow: F,
     ) -> Result<WorkflowRef<P, R, E>>
     where
@@ -258,7 +275,7 @@ impl DBOS {
         R: Serialize + DeserializeOwned + Send + 'static,
         E: DurableError,
     {
-        self.register_workflow_with(key, WorkflowOptions::default(), workflow)
+        self.register_workflow_with(name, WorkflowOptions::default(), workflow)
     }
 
     /// [`register_workflow`](DBOS::register_workflow), with [`WorkflowOptions`].
@@ -278,7 +295,7 @@ impl DBOS {
     /// ```
     pub fn register_workflow_with<P, R, E, F, Fut>(
         &self,
-        key: impl Into<WorkflowKey>,
+        name: impl Into<QualifiedWorkflowName>,
         options: WorkflowOptions,
         workflow: F,
     ) -> Result<WorkflowRef<P, R, E>>
@@ -289,7 +306,8 @@ impl DBOS {
         R: Serialize + DeserializeOwned + Send + 'static,
         E: DurableError,
     {
-        let key = key.into();
+        let name = name.into();
+        refuse_unregistrable(&name)?;
         let workflow = Arc::new(workflow);
         let erased: ErasedWorkflow =
             Arc::new(move |input: Option<String>, encoding: PayloadEncoding| {
@@ -334,16 +352,16 @@ impl DBOS {
             });
 
         self.registry().insert(
-            key.clone(),
+            name.clone(),
             RegisteredWorkflow {
                 body: erased,
                 serialization: options.serialization,
             },
         )?;
-        tracing::debug!(workflow = %key, "registered a workflow");
+        tracing::debug!(workflow = %name, "registered a workflow");
         Ok(WorkflowRef {
             dbos: self.clone(),
-            key: Arc::new(key),
+            name: Arc::new(name),
             serialization: options.serialization,
             types: PhantomData,
         })
@@ -394,7 +412,7 @@ mod tests {
 
         let snapshot = dbos.registry().snapshot();
         let erased = &snapshot
-            .get(&WorkflowKey::new("double"))
+            .get(&QualifiedWorkflowName::new("double"))
             .expect("registered")
             .body;
         assert_eq!(
@@ -412,7 +430,7 @@ mod tests {
 
         let snapshot = dbos.registry().snapshot();
         let erased = &snapshot
-            .get(&WorkflowKey::new("nothing"))
+            .get(&QualifiedWorkflowName::new("nothing"))
             .expect("registered")
             .body;
         // The row for a zero-argument workflow has a NULL input; it must not need a `"null"`.
@@ -429,7 +447,7 @@ mod tests {
 
         let snapshot = dbos.registry().snapshot();
         let erased = &snapshot
-            .get(&WorkflowKey::new("double"))
+            .get(&QualifiedWorkflowName::new("double"))
             .expect("registered")
             .body;
         let err = erased(Some("\"not a number\"".to_owned()), PayloadEncoding::Native)
@@ -457,7 +475,7 @@ mod tests {
 
         let snapshot = dbos.registry().snapshot();
         let erased = &snapshot
-            .get(&WorkflowKey::new("not_a_number"))
+            .get(&QualifiedWorkflowName::new("not_a_number"))
             .expect("registered")
             .body;
         let err = erased(None, PayloadEncoding::Portable).await.unwrap_err();
@@ -503,14 +521,36 @@ mod tests {
         assert_eq!(dbos.registry().snapshot().len(), 2);
     }
 
+    /// An empty name, or a config with no class, names nothing a workflow could be registered as.
+    #[test]
+    fn a_key_naming_nothing_is_refused() {
+        let dbos = dbos();
+        for (key, part) in [
+            (QualifiedWorkflowName::new(""), "needs a name"),
+            (
+                QualifiedWorkflowName::instance("unclassed", "", "eu"),
+                "needs a class",
+            ),
+        ] {
+            match dbos.register_workflow(key, takes_one) {
+                Err(Error::InvalidArgument { detail, .. }) => {
+                    assert!(detail.contains(part), "{detail}");
+                }
+                Err(other) => panic!("expected InvalidArgument, got {other}"),
+                Ok(_) => panic!("registered a key naming nothing"),
+            }
+        }
+        assert!(dbos.registry().snapshot().is_empty());
+    }
+
     #[test]
     fn one_identity_registers_once() {
         let dbos = dbos();
-        let key = WorkflowKey::instance("same", "Checkout", "eu");
+        let key = QualifiedWorkflowName::instance("same", "Checkout", "eu");
         dbos.register_workflow(&key, takes_nothing).unwrap();
         let err = dbos.register_workflow(&key, takes_nothing).unwrap_err();
         match err {
-            Error::AlreadyRegistered { key: taken } => assert_eq!(taken, key),
+            Error::AlreadyRegistered { workflow: taken } => assert_eq!(taken, key),
             other => panic!("expected AlreadyRegistered, got {other}"),
         }
     }
@@ -520,7 +560,7 @@ mod tests {
         let dbos = dbos();
         dbos.register_workflow("shared", takes_nothing).unwrap();
         dbos.register_workflow(
-            WorkflowKey::instance("shared", "Checkout", "eu"),
+            QualifiedWorkflowName::instance("shared", "Checkout", "eu"),
             takes_nothing,
         )
         .unwrap();
@@ -531,21 +571,27 @@ mod tests {
     fn a_row_written_with_empty_strings_resolves_to_the_same_key_as_one_written_with_nulls() {
         // Some SDKs spell absence `""` where Python writes NULL, and both must find this
         // registration.
-        let free = WorkflowKey::new("checkout");
-        assert_eq!(WorkflowKey::from_row("checkout", None, None), free);
-        assert_eq!(WorkflowKey::from_row("checkout", Some(""), Some("")), free);
+        let free = QualifiedWorkflowName::new("checkout");
+        assert_eq!(
+            QualifiedWorkflowName::from_row("checkout", None, None),
+            free
+        );
+        assert_eq!(
+            QualifiedWorkflowName::from_row("checkout", Some(""), Some("")),
+            free
+        );
     }
 
     #[test]
     fn a_name_converts_to_a_free_functions_key() {
-        let free = WorkflowKey::new("checkout");
+        let free = QualifiedWorkflowName::new("checkout");
         let name = "checkout".to_owned();
-        assert_eq!(WorkflowKey::from("checkout"), free);
-        assert_eq!(WorkflowKey::from(&name), free);
-        assert_eq!(WorkflowKey::from(name), free);
+        assert_eq!(QualifiedWorkflowName::from("checkout"), free);
+        assert_eq!(QualifiedWorkflowName::from(&name), free);
+        assert_eq!(QualifiedWorkflowName::from(name), free);
 
-        let instance = WorkflowKey::instance("checkout", "Checkout", "eu");
-        assert_eq!(WorkflowKey::from(&instance), instance);
+        let instance = QualifiedWorkflowName::instance("checkout", "Checkout", "eu");
+        assert_eq!(QualifiedWorkflowName::from(&instance), instance);
     }
 
     #[test]
@@ -562,22 +608,33 @@ mod tests {
             "name": "checkout", "class_name": "Checkout", "config_name": "eu",
         }));
         assert_eq!(
-            instance.key(),
-            Some(WorkflowKey::instance("checkout", "Checkout", "eu"))
+            instance.qualified_name(),
+            Some(QualifiedWorkflowName::instance(
+                "checkout", "Checkout", "eu"
+            ))
         );
         let blank = record(serde_json::json!({
             "name": "checkout", "class_name": "", "config_name": "",
         }));
-        assert_eq!(blank.key(), Some(WorkflowKey::new("checkout")));
-        assert_eq!(record(serde_json::json!({})).key(), None);
-        assert_eq!(record(serde_json::json!({ "name": "" })).key(), None);
+        assert_eq!(
+            blank.qualified_name(),
+            Some(QualifiedWorkflowName::new("checkout"))
+        );
+        assert_eq!(record(serde_json::json!({})).qualified_name(), None);
+        assert_eq!(
+            record(serde_json::json!({ "name": "" })).qualified_name(),
+            None
+        );
     }
 
     #[test]
     fn a_key_displays_as_the_triple_the_references_spell() {
-        assert_eq!(WorkflowKey::new("checkout").to_string(), "checkout");
         assert_eq!(
-            WorkflowKey::instance("checkout", "Checkout", "eu").to_string(),
+            QualifiedWorkflowName::new("checkout").to_string(),
+            "checkout"
+        );
+        assert_eq!(
+            QualifiedWorkflowName::instance("checkout", "Checkout", "eu").to_string(),
             "checkout/Checkout/eu"
         );
     }

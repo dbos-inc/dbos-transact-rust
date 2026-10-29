@@ -18,7 +18,7 @@ use crate::context::Ctx;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result, refusal_detail};
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
-use crate::registry::{WorkflowKey, WorkflowRef};
+use crate::registry::{QualifiedWorkflowName, WorkflowRef};
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
@@ -956,7 +956,7 @@ where
     /// context and the connection, neither of which the child has any say in — which is the whole
     /// of why the second id can be taken before the first call has run.
     pub fn run_with<'a>(&'a self, input: P, options: RunOptions<'a>) -> PendingRun<'a, R, E> {
-        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        let name: Arc<str> = Arc::from(self.name());
         let options: StartOptions<'a> = options.into();
         // Carried into the future by `placed`, as [`start_with`](Self::start_with) carries its
         // own: a run that could not be placed claimed neither id, so there is no await to place
@@ -1143,7 +1143,7 @@ where
     pub fn start_with<'a>(&'a self, input: P, options: StartOptions<'a>) -> PendingStart<'a, R, E> {
         // The workflow's bare name, which is what the start records against the parent and
         // therefore what a refusal should call this call.
-        let name: Arc<str> = Arc::from(self.key().name.as_str());
+        let name: Arc<str> = Arc::from(self.name());
         // **A refusal is carried into the future rather than returned**, which is what `placed`
         // does with a build that failed — so `start(..).await?` reads as it always did and a
         // caller has one operator to write rather than two. Nothing was claimed on the way to any
@@ -1238,7 +1238,7 @@ where
         let creating = create::<R, E>(
             Arc::clone(&executor),
             placement,
-            self.key().clone(),
+            self.qualified_name().clone(),
             request,
         )
         .instrument(tracing::Span::current());
@@ -1318,7 +1318,7 @@ pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement
 pub(crate) async fn create<R, E>(
     executor: Arc<Executor>,
     placement: StepPlacement,
-    key: WorkflowKey,
+    key: QualifiedWorkflowName,
     request: OwnedStart,
 ) -> Result<WorkflowHandle<R, E>> {
     let placed = StartPlacement::of(executor, placement);
@@ -1350,7 +1350,7 @@ pub(crate) async fn create<R, E>(
     // A replay of this position finds the child it already started, or the error its start
     // returned, instead of trying the start again.
     if let Some(parent) = &parent
-        && let Some(child) = parent.check_child(executor, &key.name).await?
+        && let Some(child) = parent.check_child(executor, key.name()).await?
     {
         tracing::debug!(
             parent_workflow_id = parent.workflow_id(),
@@ -1402,9 +1402,9 @@ pub(crate) async fn create<R, E>(
         .as_deref()
         .is_some_and(|name| name != executor.app_name());
     let new = NewWorkflow {
-        name: Some(&key.name),
-        class_name: key.class_name.as_deref(),
-        config_name: key.config_name.as_deref(),
+        name: Some(key.name()),
+        class_name: key.class_name(),
+        config_name: key.config_name(),
         input: input.as_deref(),
         serialization: Some(encoding.name()),
         executor_id: Some(executor.executor_id()),
@@ -1441,7 +1441,7 @@ pub(crate) async fn create<R, E>(
             step_id: parent.step_id,
             // The step name is the child workflow's bare name; see `Parent::record_child`,
             // which records the joined case under the same one.
-            step_name: &key.name,
+            step_name: key.name(),
             started_at,
             owner_xid: parent.owner_xid(),
         }),
@@ -1455,7 +1455,7 @@ pub(crate) async fn create<R, E>(
             return Err(match &parent {
                 Some(parent) => {
                     parent
-                        .record_start_error(executor, error, &key.name, started_at)
+                        .record_start_error(executor, error, key.name(), started_at)
                         .await
                 }
                 None => Error::SystemDatabase(error),
@@ -1479,7 +1479,7 @@ pub(crate) async fn create<R, E>(
         Ok(Submitted::Joined(holder)) => {
             if let Some(parent) = &parent {
                 parent
-                    .record_child(executor, &holder, &key.name, started_at)
+                    .record_child(executor, &holder, key.name(), started_at)
                     .await?;
             }
             // The holder's row was just read to find it, so a missing one from here is a
@@ -2057,7 +2057,7 @@ impl Parent<'_> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_execution(
     executor: &Arc<Executor>,
-    key: WorkflowKey,
+    key: QualifiedWorkflowName,
     workflow_id: String,
     owner_xid: String,
     input: Option<String>,
@@ -2220,7 +2220,7 @@ async fn time_out(
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     executor: &Executor,
-    key: &WorkflowKey,
+    key: &QualifiedWorkflowName,
     workflow_id: &str,
     input: Option<String>,
     encoding: PayloadEncoding,
@@ -2231,7 +2231,11 @@ async fn execute(
     let workflow = executor
         .workflows()
         .get(key)
-        .ok_or_else(|| Failure::Control(Error::NotRegistered { key: key.clone() }))?
+        .ok_or_else(|| {
+            Failure::Control(Error::NotRegistered {
+                workflow: key.clone(),
+            })
+        })?
         .body
         .clone();
 

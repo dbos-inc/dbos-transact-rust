@@ -27,9 +27,9 @@
 //!
 //! **It never runs a workflow.** There is no registry behind it, so a workflow it enqueues is one
 //! *some other process* is expected to have registered — it names the workflow by its
-//! [`WorkflowKey`], and the row waits on its queue until an executor that registered that key
-//! dequeues it. A key nothing registers is not an error here and cannot be: the client has no way
-//! to know, and the whole point is that the code lives elsewhere.
+//! [`QualifiedWorkflowName`], and the row waits on its queue until an executor that registered that
+//! name dequeues it. A name nothing registers is not an error here and cannot be: the client has no
+//! way to know, and the whole point is that the code lives elsewhere.
 //!
 //! **It never migrates**, and refuses a database no application has created. Connecting with
 //! migrations off verifies the schema rather than ignoring it, so a missing or outdated one is
@@ -51,7 +51,7 @@
 //! A client's binary is not the application's.
 //!
 //! What this module holds is the part that is a client's alone: connecting without an executor,
-//! and enqueueing a workflow by its key. The surfaces a client shares with an application live with
+//! and enqueueing a workflow by its name. The surfaces a client shares with an application live with
 //! their types — the queue operations in [`queue`](crate::queue), messages in
 //! [`message`](crate::message), events in [`event`](crate::event), and workflow management in
 //! [`management`](crate::management).
@@ -71,10 +71,10 @@ use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode
 use crate::sysdb::DEFAULT_SCHEMA;
 use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
 use crate::workflow::{
-    Debounced, Enqueue, Submitted, encode_attributes, init_or_join, new_row, refused_start,
-    validate_start,
+    Debounced, ENQUEUE_OPERATION, Enqueue, Submitted, encode_attributes, init_or_join, new_row,
+    refused_start, validate_start,
 };
-use crate::{Queue, QueueChange, QueueConflict, QueueOptions, WorkflowKey};
+use crate::{QualifiedWorkflowName, Queue, QueueChange, QueueConflict, QueueOptions};
 
 /// Everything a [`Client`] needs.
 ///
@@ -354,10 +354,11 @@ impl Client {
     /// have the code. The handle is a polling one, because the process that asks is by definition
     /// not the one that runs it.
     ///
-    /// `workflow` is the [`WorkflowKey`] it was registered under. A free function's name alone
-    /// converts into one; a workflow registered under a class, or a class and a configured
-    /// instance, is named by [`WorkflowKey::method`] or [`WorkflowKey::instance`], because the
-    /// registration is identified by all three parts.
+    /// `workflow` is the [`QualifiedWorkflowName`] it was registered under. A free function's name
+    /// alone converts into one; a workflow registered under a class, or a class and a configured
+    /// instance, is named by [`QualifiedWorkflowName::method`] or
+    /// [`QualifiedWorkflowName::instance`], because the registration is identified by all three
+    /// parts.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
@@ -365,7 +366,7 @@ impl Client {
     ///     client.enqueue("send_email", "email-queue", "hello").await?;
     /// let sent = handle.result().await?;
     ///
-    /// let billing = dbos::WorkflowKey::instance("charge", "Billing", "eu");
+    /// let billing = dbos::QualifiedWorkflowName::instance("charge", "Billing", "eu");
     /// let charged: dbos::WorkflowHandle<u64> = client.enqueue(billing, "billing", 42).await?;
     /// # Ok(()) }
     /// ```
@@ -384,7 +385,7 @@ impl Client {
     /// it is not.
     pub async fn enqueue<P, R, E>(
         &self,
-        workflow: impl Into<WorkflowKey>,
+        workflow: impl Into<QualifiedWorkflowName>,
         queue: &str,
         input: P,
     ) -> Result<WorkflowHandle<R, E>>
@@ -409,22 +410,23 @@ impl Client {
     /// [`enqueue_portable`](Self::enqueue_portable).
     pub async fn enqueue_with<P, R, E>(
         &self,
-        workflow: impl Into<WorkflowKey>,
+        workflow: impl Into<QualifiedWorkflowName>,
         input: P,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>>
     where
         P: Serialize,
     {
+        let workflow = workflow.into();
         // Refused before the input is encoded, as before anything is written: an enqueue no queue
         // could honour should not spend the encoding either.
-        options.validate()?;
+        options.validate(&workflow)?;
         let encoding = PayloadEncoding::resolve(
             options.queue.serialization,
             self.connection().serializer().encoding(),
         );
         let input = encode_input(&input, &encoding)?;
-        self.enqueue_encoded(&workflow.into(), &input, encoding, options, None)
+        self.enqueue_encoded(&workflow, &input, encoding, options, None)
             .await
     }
 
@@ -448,20 +450,15 @@ impl Client {
     /// ```
     pub async fn enqueue_portable<R, E>(
         &self,
-        workflow: impl Into<WorkflowKey>,
+        workflow: impl Into<QualifiedWorkflowName>,
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
-        options.validate()?;
+        let workflow = workflow.into();
+        options.validate(&workflow)?;
         let input = encode(&args, &PayloadEncoding::Portable, "argument")?;
-        self.enqueue_encoded(
-            &workflow.into(),
-            &input,
-            PayloadEncoding::Portable,
-            options,
-            None,
-        )
-        .await
+        self.enqueue_encoded(&workflow, &input, PayloadEncoding::Portable, options, None)
+            .await
     }
 
     /// The enqueue both public forms share, from an input already encoded in `encoding`.
@@ -473,7 +470,7 @@ impl Client {
     /// [`DebouncerClient`](crate::DebouncerClient) asks for.
     pub(crate) async fn enqueue_encoded<R, E>(
         &self,
-        workflow: &WorkflowKey,
+        workflow: &QualifiedWorkflowName,
         input: &str,
         encoding: PayloadEncoding,
         options: EnqueueOptions<'_>,
@@ -492,9 +489,9 @@ impl Client {
         };
 
         let new = NewWorkflow {
-            name: Some(&workflow.name),
-            class_name: workflow.class_name.as_deref(),
-            config_name: workflow.config_name.as_deref(),
+            name: Some(workflow.name()),
+            class_name: workflow.class_name(),
+            config_name: workflow.config_name(),
             input: Some(input),
             serialization: Some(encoding.name()),
             // **Nobody claims it.** A client runs nothing, and a queued row's executor is stamped
@@ -861,9 +858,19 @@ pub struct EnqueueOptions<'a> {
 }
 
 impl<'a> EnqueueOptions<'a> {
-    /// Refuses an enqueue no row could hold, with the check every start makes — see
-    /// [`validate_start`].
-    pub(crate) fn validate(&self) -> Result<()> {
+    /// Refuses an enqueue of `workflow` no row could hold: a workflow with no name, which nothing
+    /// could ever dequeue, and what every start checks — see [`validate_start`].
+    ///
+    /// The name is checked here because a client takes it from its caller. A
+    /// [`QualifiedWorkflowName`] can hold an empty one, since a row can; an executor's starts take
+    /// theirs from a registration, which refuses it.
+    pub(crate) fn validate(&self, workflow: &QualifiedWorkflowName) -> Result<()> {
+        if workflow.name().is_empty() {
+            return Err(Error::InvalidArgument {
+                operation: ENQUEUE_OPERATION.into(),
+                detail: format!("queue `{}`: `workflow` must not be empty", self.queue.name),
+            });
+        }
         validate_start(Some(&self.queue), self.timeout)
     }
 

@@ -3405,6 +3405,9 @@ impl PostgresSystemDatabase {
 
             // Same id, different function: a programming error rather than a race, because the id
             // is how every implementation decides two attempts are the same workflow.
+            //
+            // A stored `''` is absent, as `NULL` is: other SDKs write either for a free function
+            // or an unconfigured one, and this layer never stores `''` itself.
             for (field, stored, offered) in [
                 (
                     "function name",
@@ -3414,7 +3417,7 @@ impl PostgresSystemDatabase {
                 ("class name", row.try_get("class_name")?, &workflow.class_name),
                 ("config name", row.try_get("config_name")?, &workflow.config_name),
             ] {
-                if stored.as_deref() != offered.as_deref() {
+                if stored.as_deref().filter(|stored| !stored.is_empty()) != offered.as_deref() {
                     return Err(Error::ConflictingWorkflow {
                         workflow_id: workflow.workflow_id.to_owned(),
                         detail: format!(
@@ -7407,7 +7410,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                                     OR application_name IS NULL) \
                              RETURNING workflow_uuid"
                         )))
-                        .bind(&request.workflow.name)
+                        .bind(request.workflow.name())
                         .bind(request.queue_name)
                         .bind(request.deduplication_id)
                         .bind(period_ms)
@@ -7416,10 +7419,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                         // `IS NOT DISTINCT FROM`, so an absent class or instance matches the NULL
                         // the enqueue stored rather than matching nothing, as `=` would; and
                         // `NULLIF`, so a row that spells one `''` is absent too, as
-                        // `WorkflowKey::from_row` reads it. The request's own parts are never
-                        // `""`: `DebounceRequest::validate` refuses that.
-                        .bind(request.workflow.class_name.as_deref())
-                        .bind(request.workflow.config_name.as_deref())
+                        // `QualifiedWorkflowName::from_row` reads it. The request's own parts are
+                        // never `""`: a `QualifiedWorkflowName` holds none.
+                        .bind(request.workflow.class_name())
+                        .bind(request.workflow.config_name())
                         .fetch_optional(&mut *tx)
                         .await?;
 
@@ -9165,7 +9168,7 @@ mod tests {
     #[tokio::test]
     async fn a_retried_insert_keeps_the_input_a_bounce_wrote_since() {
         use crate::sysdb::PORTABLE_JSON;
-        use crate::sysdb::types::{Debounce, DebounceRequest, WorkflowKey};
+        use crate::sysdb::types::{Debounce, DebounceRequest, QualifiedWorkflowName};
         use std::time::Duration;
 
         let db = dbos_test_support::test_database().await;
@@ -9188,7 +9191,7 @@ mod tests {
             .expect("the insert failed");
         assert!(first.should_execute);
 
-        let key = WorkflowKey::new("digest");
+        let key = QualifiedWorkflowName::new("digest");
         let bounce = DebounceRequest {
             workflow: &key,
             queue_name: "orders",

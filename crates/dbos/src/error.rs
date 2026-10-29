@@ -18,7 +18,7 @@
 //! [`Error::SystemDatabase`] cannot also be a `#[from]` — that pair *does* overlap, at
 //! `Error<sysdb::Error>` — so engine code names the variant, `.map_err(Error::SystemDatabase)?`.
 
-use crate::registry::WorkflowKey;
+use crate::registry::QualifiedWorkflowName;
 use crate::serialization::{PayloadEncoding, decode_error, encode_error};
 use std::borrow::Cow;
 
@@ -214,10 +214,11 @@ pub enum Error<E = EngineOnly> {
     /// Uniqueness is on the whole `(name, class_name, config_name)` triple. A name resolving to
     /// two functions is a workflow that recovers as the wrong one, which is why this is an error
     /// rather than a last-registration-wins.
-    #[error("a workflow is already registered as {key}")]
+    #[error("a workflow is already registered as {workflow}")]
     AlreadyRegistered {
-        /// The identity that was registered twice.
-        key: WorkflowKey,
+        /// The name that was registered twice.
+        #[serde(alias = "key")]
+        workflow: QualifiedWorkflowName,
     },
 
     /// A value could not be encoded for the database.
@@ -276,10 +277,11 @@ pub enum Error<E = EngineOnly> {
     /// In-process this cannot happen — a `WorkflowRef` comes from a registration. It is reachable
     /// through recovery and dequeue, where the name comes from a row and the code that registered
     /// it may be gone.
-    #[error("no workflow is registered as {key}")]
+    #[error("no workflow is registered as {workflow}")]
     NotRegistered {
-        /// The identity that was looked up.
-        key: WorkflowKey,
+        /// The name that was looked up.
+        #[serde(alias = "key")]
+        workflow: QualifiedWorkflowName,
     },
 
     /// A workflow id resolved to no row at all.
@@ -646,7 +648,7 @@ impl<E> Error<E> {
             Error::InvalidArgument { operation, detail } => {
                 Error::InvalidArgument { operation, detail }
             }
-            Error::AlreadyRegistered { key } => Error::AlreadyRegistered { key },
+            Error::AlreadyRegistered { workflow } => Error::AlreadyRegistered { workflow },
             Error::Serialization {
                 what,
                 message,
@@ -666,7 +668,7 @@ impl<E> Error<E> {
                 source,
             },
             Error::UnknownSerialization { name } => Error::UnknownSerialization { name },
-            Error::NotRegistered { key } => Error::NotRegistered { key },
+            Error::NotRegistered { workflow } => Error::NotRegistered { workflow },
             Error::WorkflowNotFound { workflow_id } => Error::WorkflowNotFound { workflow_id },
             Error::Interrupted { workflow_id } => Error::Interrupted { workflow_id },
             Error::WorkflowFailed {
@@ -941,6 +943,24 @@ mod tests {
         };
         assert_eq!(back, CardDeclined { attempts: 3 }, "the field survives");
         assert_eq!(error.to_string(), back.to_string());
+    }
+
+    /// An error checkpointed before its workflow field was named `workflow` still replays.
+    #[test]
+    fn a_registration_error_recorded_as_key_still_decodes() {
+        for (json, expected) in [
+            (
+                r#"{"NotRegistered":{"key":{"name":"f","class_name":"C","config_name":null}}}"#,
+                "no workflow is registered as f/C",
+            ),
+            (
+                r#"{"AlreadyRegistered":{"key":{"name":"f","class_name":null,"config_name":null}}}"#,
+                "a workflow is already registered as f",
+            ),
+        ] {
+            let back: Error = serde_json::from_str(json).unwrap();
+            assert_eq!(back.to_string(), expected);
+        }
     }
 
     /// `?` on the application's own error needs no impl from the application.

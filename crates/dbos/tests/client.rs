@@ -16,8 +16,9 @@ use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
-    EnqueueOptions, Error, Fork, ForkOptions, QueueChange, QueueConflict, QueueOptions,
-    SendMessage, SendOptions, StartOptions, WorkflowHandle, WorkflowKey,
+    EnqueueOptions, Error, Fork, ForkOptions, PortableWorkflowArgs, QualifiedWorkflowName,
+    QueueChange, QueueConflict, QueueOptions, SendMessage, SendOptions, StartOptions,
+    WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -211,15 +212,15 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
 /// Everything an enqueue may say reaches the row it writes.
 ///
 /// One workflow rather than one per option, because what is being checked is the mapping — every
-/// part of the `WorkflowKey` and every field of `EnqueueOptions` and `Enqueue` landing in the
-/// column it names.
+/// part of the `QualifiedWorkflowName` and every field of `EnqueueOptions` and `Enqueue` landing in
+/// the column it names.
 #[tokio::test]
 async fn every_option_reaches_the_row() {
     let db = test_database().await;
     let client = client("client-options", &db).await;
     let mut attributes = serde_json::Map::new();
     attributes.insert("tenant".to_owned(), serde_json::json!("acme"));
-    let billing = WorkflowKey::instance("charge", "Billing", "eu");
+    let billing = QualifiedWorkflowName::instance("charge", "Billing", "eu");
 
     let handle: WorkflowHandle<()> = client
         .enqueue_with(
@@ -253,7 +254,7 @@ async fn every_option_reaches_the_row() {
     assert_eq!(row.name.as_deref(), Some("charge"));
     assert_eq!(row.class_name.as_deref(), Some("Billing"));
     assert_eq!(row.config_name.as_deref(), Some("eu"));
-    assert_eq!(row.key(), Some(billing));
+    assert_eq!(row.qualified_name(), Some(billing));
     assert_eq!(
         row.app_name.as_deref(),
         Some("some-other-app"),
@@ -487,6 +488,64 @@ async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
             refused.map(|_| ())
         );
     }
+
+    // A workflow with no name, which nothing could dequeue, from either enqueue.
+    let expected = "queue `work`: `workflow` must not be empty";
+    let refused = client
+        .enqueue_with::<_, (), EngineOnly>("", (), EnqueueOptions::new("work"))
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail == expected),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    let refused = client
+        .enqueue_portable::<(), EngineOnly>(
+            QualifiedWorkflowName::method("", "Billing"),
+            PortableWorkflowArgs::default(),
+            EnqueueOptions::new("work"),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidArgument { detail, .. }) if detail == expected),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    let rows = reader(&db)
+        .await
+        .list_workflows(&Default::default(), None)
+        .await
+        .expect("read failed");
+    assert!(rows.is_empty(), "nothing was written");
+
+    client.close().await;
+}
+
+/// A key's empty class or config is absent, and is written as `NULL`.
+#[tokio::test]
+async fn an_enqueued_key_writes_an_empty_class_or_config_as_null() {
+    let db = test_database().await;
+    let client = client("client-keys", &db).await;
+
+    let handle: WorkflowHandle<()> = client
+        .enqueue_with(
+            QualifiedWorkflowName::instance("never_registered", "", ""),
+            (),
+            EnqueueOptions {
+                workflow_id: Some("blank-key"),
+                ..EnqueueOptions::new("work")
+            },
+        )
+        .await
+        .unwrap();
+    let row = reader(&db)
+        .await
+        .get_workflow(handle.workflow_id())
+        .await
+        .expect("read failed")
+        .expect("the row is missing");
+    assert_eq!(row.class_name, None);
+    assert_eq!(row.config_name, None);
 
     client.close().await;
 }

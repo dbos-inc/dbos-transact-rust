@@ -38,7 +38,7 @@ use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::instance::Executor;
-use crate::registry::{WorkflowKey, WorkflowRef};
+use crate::registry::{QualifiedWorkflowName, WorkflowRef};
 use crate::serialization::{PayloadEncoding, encode_input};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
@@ -57,19 +57,28 @@ const DEBOUNCE_OPERATION: &str = "debounce a workflow";
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// The deduplication id a debounce of `key` holds for `workflow`: `<workflow>-<key>`, with the
-/// workflow spelled as its key displays — `name`, `name/class` or `name/class/config`.
+/// workflow spelled `name`, `name/class`, `name/class/config`, or `name//config` for a config with
+/// no class.
 ///
-/// The whole key, so two configured instances of one class, or a method and a free function of
-/// the same name, debounce one key independently rather than colliding on it. The parts are
+/// The whole name, so two configured instances of one class, or a method and a free function of
+/// the same bare name, debounce one key independently rather than colliding on it. The parts are
 /// joined without escaping, so names that contain `/` or `-` can still spell the same id — a free
 /// function `a/b` and a method `a` of class `b`, or `a` with key `b-c` and `a-b` with key `c`.
-/// Such a collision is refused rather than extended: [`classify`] compares the holder's whole key.
+/// Such a collision is refused rather than extended: [`classify`] compares the holder's whole
+/// name.
 ///
 /// **The one place the spelling is written**, so changing it is a change here and nowhere else.
-/// Only a debounce that spells the id this way finds a workflow another debounce of the key
-/// started.
-pub(crate) fn deduplication_id(workflow: &WorkflowKey, key: &str) -> String {
-    format!("{workflow}-{key}")
+/// It is stored, and only a debounce that spells the id this way finds a workflow another debounce
+/// of the key started, so it is spelled from the key's parts rather than from its
+/// [`Display`](std::fmt::Display), which is for people to read.
+pub(crate) fn deduplication_id(workflow: &QualifiedWorkflowName, key: &str) -> String {
+    let name = workflow.name();
+    match (workflow.class_name(), workflow.config_name()) {
+        (None, None) => format!("{name}-{key}"),
+        (Some(class), None) => format!("{name}/{class}-{key}"),
+        (Some(class), Some(config)) => format!("{name}/{class}/{config}-{key}"),
+        (None, Some(config)) => format!("{name}//{config}-{key}"),
+    }
 }
 
 /// What one debounce says beyond its key, period and input — see
@@ -111,18 +120,22 @@ enum BounceAction {
 /// another app owns, which the bounce never extends — retrying it would spin until the holder
 /// left. A holder with no owner, or a debounce acting for no app, cannot be told apart that way,
 /// and is retried.
-fn classify(outcome: Debounce, workflow: &WorkflowKey, target_app: Option<&str>) -> BounceAction {
+fn classify(
+    outcome: Debounce,
+    workflow: &QualifiedWorkflowName,
+    target_app: Option<&str>,
+) -> BounceAction {
     match outcome {
         Debounce::Bounced { workflow_id } => BounceAction::Coalesce(workflow_id),
         Debounce::Unheld => BounceAction::Enqueue,
         Debounce::Held(holder) => {
-            let same_workflow = holder.workflow_name.as_deref().is_some_and(|name| {
-                WorkflowKey::from_row(
-                    name,
-                    holder.class_name.as_deref(),
-                    holder.config_name.as_deref(),
-                ) == *workflow
-            });
+            // Part by part, with `''` absent as `QualifiedWorkflowName::from_row` reads it.
+            fn present(part: Option<&str>) -> Option<&str> {
+                part.filter(|part| !part.is_empty())
+            }
+            let same_workflow = holder.workflow_name.as_deref() == Some(workflow.name())
+                && present(holder.class_name.as_deref()) == workflow.class_name()
+                && present(holder.config_name.as_deref()) == workflow.config_name();
             let another_app = matches!(
                 (target_app, holder.application_name.as_deref()),
                 (Some(target), Some(owner)) if target != owner
@@ -142,7 +155,7 @@ fn classify(outcome: Debounce, workflow: &WorkflowKey, target_app: Option<&str>)
 /// Both debouncers drive their loops through this, so a bounce is asked for and answered the same
 /// way from an app and from a client.
 struct Bounce<'a> {
-    workflow: &'a WorkflowKey,
+    workflow: &'a QualifiedWorkflowName,
     queue_name: &'a str,
     deduplication_id: String,
     period: Duration,
@@ -454,7 +467,7 @@ where
         input: P,
         options: DebounceOptions<'b>,
     ) -> PendingStart<'b, R, E> {
-        let deduplication_id = deduplication_id(self.workflow.key(), key);
+        let deduplication_id = deduplication_id(self.workflow.qualified_name(), key);
         let built = self
             .place(period)
             .map(|(executor, bounce, start)| ((executor, start), bounce));
@@ -512,7 +525,7 @@ where
         call: DebounceOptions<'_>,
     ) -> Result<WorkflowHandle<R, E>> {
         let conn = executor.connection();
-        let key: &WorkflowKey = self.workflow.key();
+        let name: &QualifiedWorkflowName = self.workflow.qualified_name();
         let queue = self
             .options
             .queue
@@ -528,7 +541,7 @@ where
             ),
         );
         let bounce = Bounce {
-            workflow: key,
+            workflow: name,
             queue_name: queue.name,
             deduplication_id,
             period,
@@ -589,7 +602,7 @@ where
                     // takes the same branch. The replayed form of that error is the same variant,
                     // read back from the start's record.
                     let created =
-                        create::<R, E>(Arc::clone(&executor), start, key.clone(), request)
+                        create::<R, E>(Arc::clone(&executor), start, name.clone(), request)
                             .await
                             .map_err(|error| refused_start(Some(queue.name), error));
                     if !lost_the_key(&created) {
@@ -624,8 +637,9 @@ where
 /// # Ok(()) }
 /// ```
 ///
-/// [`workflow`](Self::workflow) is the workflow's key, as [`Client::enqueue`] takes it: a name for
-/// a free function, or a [`WorkflowKey`] naming its class and configured instance.
+/// [`workflow`](Self::workflow) is the workflow's name, as [`Client::enqueue`] takes it: a bare
+/// name for a free function, or a [`QualifiedWorkflowName`] naming its class and configured
+/// instance.
 /// [`options`](Self::options) describes every workflow a debounce enqueues, as it would for
 /// [`Client::enqueue_with`]: its queue (and the key's scope), an app version, a timeout and
 /// attributes. Its [`app_name`](EnqueueOptions::app_name), or else the
@@ -640,7 +654,7 @@ pub struct DebouncerClient<'a> {
     /// The client to debounce through.
     pub client: Client,
     /// The workflow, by the key it is registered under.
-    pub workflow: WorkflowKey,
+    pub workflow: QualifiedWorkflowName,
     /// What to say about every workflow a debounce enqueues.
     pub options: EnqueueOptions<'a>,
     /// The longest a workflow may be held back, counted from the debounce that enqueued it — see
@@ -652,7 +666,7 @@ impl<'a> DebouncerClient<'a> {
     /// Debounces `workflow` as `options` would enqueue it, with no timeout.
     pub fn new(
         client: &Client,
-        workflow: impl Into<WorkflowKey>,
+        workflow: impl Into<QualifiedWorkflowName>,
         options: EnqueueOptions<'a>,
     ) -> Self {
         Self {
@@ -695,7 +709,7 @@ impl<'a> DebouncerClient<'a> {
     {
         refuse_stored_workflow_id(self.options.workflow_id, "DebouncerClient::debounce_with")?;
         refuse_owned_options(&self.options.queue)?;
-        self.options.validate()?;
+        self.options.validate(&self.workflow)?;
         refuse_durations(period, self.debounce_timeout)?;
         refuse_app_name(self.options.app_name)?;
 
@@ -765,6 +779,23 @@ mod tests {
     use super::*;
     use crate::sysdb::types::DebounceHolder;
 
+    /// Each shape of key spells its own deduplication id, the stored form a later debounce of the
+    /// key must reproduce.
+    #[test]
+    fn each_key_spells_its_deduplication_id() {
+        let id = |workflow: QualifiedWorkflowName| deduplication_id(&workflow, "k");
+        assert_eq!(id(QualifiedWorkflowName::new("f")), "f-k");
+        assert_eq!(id(QualifiedWorkflowName::method("f", "C")), "f/C-k");
+        assert_eq!(
+            id(QualifiedWorkflowName::instance("f", "C", "eu")),
+            "f/C/eu-k"
+        );
+        assert_eq!(
+            id(QualifiedWorkflowName::instance("f", "", "eu")),
+            "f//eu-k"
+        );
+    }
+
     fn holder(name: &str, is_debounced: bool, app: Option<&str>) -> Debounce {
         Debounce::Held(DebounceHolder {
             workflow_id: "holder".to_owned(),
@@ -780,7 +811,7 @@ mod tests {
     /// `a_bounce_is_classified_by_its_holder`.
     #[test]
     fn the_deduplication_id_is_the_workflow_then_the_key() {
-        let free = |name: &str| WorkflowKey::new(name);
+        let free = |name: &str| QualifiedWorkflowName::new(name);
         assert_eq!(deduplication_id(&free("wf"), "key"), "wf-key");
         assert_eq!(
             deduplication_id(&free("a"), "b-c"),
@@ -788,20 +819,20 @@ mod tests {
         );
     }
 
-    /// The whole key is in the id, so a method, its configured instances and a free function of
-    /// the same name each hold a key of their own.
+    /// The whole name is in the id, so a method, its configured instances and a free function of
+    /// the same bare name each hold a key of their own.
     #[test]
-    fn the_deduplication_id_spells_the_whole_key() {
-        let eu = WorkflowKey::instance("wf", "Billing", "eu");
-        let us = WorkflowKey::instance("wf", "Billing", "us");
-        let method = WorkflowKey::method("wf", "Billing");
+    fn the_deduplication_id_spells_the_whole_name() {
+        let eu = QualifiedWorkflowName::instance("wf", "Billing", "eu");
+        let us = QualifiedWorkflowName::instance("wf", "Billing", "us");
+        let method = QualifiedWorkflowName::method("wf", "Billing");
         assert_eq!(deduplication_id(&eu, "key"), "wf/Billing/eu-key");
         assert_eq!(deduplication_id(&method, "key"), "wf/Billing-key");
         let ids = [
             deduplication_id(&eu, "key"),
             deduplication_id(&us, "key"),
             deduplication_id(&method, "key"),
-            deduplication_id(&WorkflowKey::new("wf"), "key"),
+            deduplication_id(&QualifiedWorkflowName::new("wf"), "key"),
         ];
         let distinct: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(distinct.len(), ids.len(), "{ids:?}");
@@ -809,7 +840,7 @@ mod tests {
 
     #[test]
     fn a_bounce_is_classified_by_its_holder() {
-        let wf = WorkflowKey::new("wf");
+        let wf = QualifiedWorkflowName::new("wf");
         assert_eq!(
             classify(
                 Debounce::Bounced {
@@ -834,7 +865,7 @@ mod tests {
             BounceAction::Refuse("holder".to_owned())
         );
         // Another configured instance of the same class and name.
-        let east = WorkflowKey::instance("wf", "Billing", "east");
+        let east = QualifiedWorkflowName::instance("wf", "Billing", "east");
         let west = Debounce::Held(DebounceHolder {
             workflow_id: "holder".to_owned(),
             is_debounced: true,
