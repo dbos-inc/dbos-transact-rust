@@ -2358,6 +2358,14 @@ async fn an_unhonourable_queue_configuration_is_refused() {
             "`partition_concurrency` must be at least 1",
         ),
         (
+            "no workflows at all per partition in one process",
+            QueueOptions {
+                partition_worker_concurrency: Some(0),
+                ..QueueOptions::default()
+            },
+            "`partition_worker_concurrency` must be at least 1",
+        ),
+        (
             "a per-partition rate limit over no window",
             QueueOptions {
                 partition_rate_limit: Some(RateLimit {

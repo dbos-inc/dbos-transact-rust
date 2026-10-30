@@ -240,6 +240,11 @@ pub struct QueueOptions {
     /// The per-partition counterpart of [`worker_concurrency`](Self::worker_concurrency), counted
     /// locally the same way, and may exceed neither that nor
     /// [`partition_concurrency`](Self::partition_concurrency).
+    ///
+    /// At least 1, so a queue carrying it cannot be paused through `worker_concurrency` or
+    /// `concurrency`, both of which it may not exceed. To pause one, clear this and set
+    /// `worker_concurrency` to 0 in a single [`QueueChange`]. If this is the queue's only
+    /// per-partition limit, clearing it also un-partitions the queue until it is set again.
     pub partition_worker_concurrency: Option<i32>,
     /// How fast this queue's workflows may start within one partition, or `None` for unthrottled.
     ///
