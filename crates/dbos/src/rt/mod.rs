@@ -159,7 +159,17 @@ pub fn timeout<F: Future>(
 /// [`timeout`], with the deadline given as an instant.
 ///
 /// The future is polled before the timer, so one that is ready at the deadline keeps its output.
+///
+/// On tokio this is tokio's own `timeout_at`, not the race below, because of tokio's cooperative
+/// budget. A future that spends a task's whole budget each poll — draining a channel that is
+/// always ready — would leave a tokio timer polled after it returning `Pending` every time, so
+/// the deadline would never fire. Tokio's polls its timer outside the budget for exactly that
+/// case. The other runtimes have no budget.
 pub async fn timeout_at<F: Future>(deadline: Instant, future: F) -> Result<F::Output, Elapsed> {
+    #[cfg(feature = "runtime-tokio")]
+    if with_tokio::available() {
+        return with_tokio::timeout_at(deadline, future).await;
+    }
     let mut future = std::pin::pin!(future);
     let mut expiry = std::pin::pin!(sleep_until(deadline));
     std::future::poll_fn(|cx| {
@@ -353,6 +363,34 @@ mod tests {
 
     async fn an_unbounded_timeout_does_not_overflow() {
         assert_eq!(super::timeout(Duration::MAX, async { 1 }).await, Ok(1));
+    }
+
+    /// Tokio only: its cooperative budget is what would starve the timer. The inner future never
+    /// finishes, and every `recv` is ready until the budget runs out. Driven on a thread of its
+    /// own, so a timer that never fires fails the test instead of hanging it.
+    #[test]
+    fn a_future_that_spends_tokios_budget_still_times_out() {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            let elapsed = runtime.block_on(async {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let busy = async move {
+                    while tx.send(()).is_ok() {
+                        rx.recv().await;
+                    }
+                };
+                super::timeout(Duration::from_millis(20), busy).await
+            });
+            let _ = done.send(elapsed);
+        });
+        let elapsed = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the timeout never fired");
+        assert_eq!(elapsed, Err(super::Elapsed));
     }
 
     /// Tokio only, because only tokio's runtime can be dropped: what a runtime shutting down does

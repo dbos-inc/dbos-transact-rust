@@ -28,3 +28,13 @@ where
 pub(super) async fn sleep_until(deadline: Instant) {
     tokio::time::sleep_until(deadline.into()).await;
 }
+
+/// Tokio's own, so that its cooperative budget cannot starve the timer; see `rt::timeout_at`.
+pub(super) async fn timeout_at<F: Future>(
+    deadline: Instant,
+    future: F,
+) -> Result<F::Output, super::Elapsed> {
+    tokio::time::timeout_at(deadline.into(), future)
+        .await
+        .map_err(|_| super::Elapsed)
+}
