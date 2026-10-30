@@ -9,7 +9,8 @@
 //! and for the same reason: features unify across the dependency graph, so an application on
 //! another runtime cannot stop some dependency of its own from enabling `runtime-tokio` too.
 //! Enabling several is therefore allowed. When the caller is inside a tokio runtime, tokio is
-//! used; otherwise the next enabled backend is. Only enabling none is an error.
+//! used; otherwise `async-global-executor` if it is enabled, then smol — `sqlx`'s own order, so
+//! its tasks and this crate's land on the same executor. Only enabling none is an error.
 //!
 //! What a backend supplies is the operation every runtime agrees on — spawn this future and
 //! forget it — and a timer. Joining, aborting and panic reporting are built over that in
@@ -20,8 +21,28 @@
 #![cfg_attr(not(feature = "engine"), allow(dead_code, unused_imports))]
 
 mod task;
+#[cfg(feature = "runtime-async-global-executor")]
+mod with_async_global_executor;
+#[cfg(any(feature = "runtime-smol", feature = "runtime-async-global-executor"))]
+mod with_async_io;
+// Not when `async-global-executor` is enabled too: that one is preferred, and smol's spawn would
+// never be called.
+#[cfg(all(
+    feature = "runtime-smol",
+    not(feature = "runtime-async-global-executor")
+))]
+mod with_smol;
 #[cfg(feature = "runtime-tokio")]
 mod with_tokio;
+
+/// The executor a task goes to when the caller is not in a tokio runtime.
+#[cfg(feature = "runtime-async-global-executor")]
+use with_async_global_executor as global;
+#[cfg(all(
+    feature = "runtime-smol",
+    not(feature = "runtime-async-global-executor")
+))]
+use with_smol as global;
 
 use std::future::Future;
 use std::task::Poll;
@@ -29,10 +50,14 @@ use std::time::{Duration, Instant};
 
 pub(crate) use task::{AbortHandle, JoinHandle};
 
-#[cfg(not(feature = "runtime-tokio"))]
+#[cfg(not(any(
+    feature = "runtime-tokio",
+    feature = "runtime-smol",
+    feature = "runtime-async-global-executor"
+)))]
 compile_error!(
-    "dbos needs an async runtime: enable the `runtime-tokio` feature (on by default; check \
-     `default-features = false`)"
+    "dbos needs an async runtime: enable one of the features `runtime-tokio` (the default; check \
+     for `default-features = false`), `runtime-smol` or `runtime-async-global-executor`"
 );
 
 /// Where a task is spawned: the runtime a caller was on when this was taken.
@@ -48,10 +73,14 @@ enum Backend {
     #[cfg(feature = "runtime-tokio")]
     #[allow(clippy::disallowed_types)]
     Tokio(tokio::runtime::Handle),
+    /// The process-wide executor of whichever non-tokio runtime is enabled; see `global`.
+    #[cfg(any(feature = "runtime-smol", feature = "runtime-async-global-executor"))]
+    Global,
 }
 
 impl Spawner {
-    /// The runtime the caller is on.
+    /// The runtime the caller is on: tokio if it is in a tokio runtime, and otherwise the
+    /// enabled non-tokio runtime, whose executor is global and so always there.
     ///
     /// # Panics
     ///
@@ -63,6 +92,9 @@ impl Spawner {
         if let Some(handle) = with_tokio::current() {
             return Self(Backend::Tokio(handle));
         }
+        #[cfg(any(feature = "runtime-smol", feature = "runtime-async-global-executor"))]
+        return Self(Backend::Global);
+        #[cfg(not(any(feature = "runtime-smol", feature = "runtime-async-global-executor")))]
         missing_runtime()
     }
 
@@ -78,6 +110,8 @@ impl Spawner {
         match self.0 {
             #[cfg(feature = "runtime-tokio")]
             Backend::Tokio(ref runtime) => with_tokio::spawn_detached(runtime, task),
+            #[cfg(any(feature = "runtime-smol", feature = "runtime-async-global-executor"))]
+            Backend::Global => global::spawn_detached(task),
         }
         handle
     }
@@ -107,6 +141,9 @@ pub(crate) async fn sleep_until(deadline: Instant) {
     if with_tokio::available() {
         return with_tokio::sleep_until(deadline).await;
     }
+    #[cfg(any(feature = "runtime-smol", feature = "runtime-async-global-executor"))]
+    return with_async_io::sleep_until(deadline).await;
+    #[cfg(not(any(feature = "runtime-smol", feature = "runtime-async-global-executor")))]
     missing_runtime()
 }
 
@@ -181,11 +218,13 @@ fn after(duration: Duration) -> Instant {
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
 }
 
+#[cfg(not(any(feature = "runtime-smol", feature = "runtime-async-global-executor")))]
 #[track_caller]
 fn missing_runtime() -> ! {
     panic!(
         "dbos needs an async runtime, and none of the enabled ones is available here: call it \
-         from within a tokio runtime"
+         from within a tokio runtime, or enable `runtime-smol` or \
+         `runtime-async-global-executor`"
     )
 }
 
@@ -195,12 +234,44 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    #[tokio::test]
+    /// Runs each scenario twice: in a tokio runtime, and — when a non-tokio runtime is enabled —
+    /// on a plain thread, where `rt` has to fall back to that runtime's executor and timers.
+    macro_rules! on_each_runtime {
+        ($($scenario:ident),* $(,)?) => {
+            mod on_tokio {
+                $(
+                    #[tokio::test]
+                    async fn $scenario() {
+                        super::$scenario().await;
+                    }
+                )*
+            }
+            #[cfg(any(feature = "runtime-smol", feature = "runtime-async-global-executor"))]
+            mod off_tokio {
+                $(
+                    #[test]
+                    fn $scenario() {
+                        async_io::block_on(super::$scenario());
+                    }
+                )*
+            }
+        };
+    }
+
+    on_each_runtime!(
+        joining_gives_the_output,
+        dropping_the_handle_detaches_the_task,
+        an_aborted_task_is_dropped_and_reports_finished,
+        a_panic_reaches_the_joiner,
+        a_ready_future_beats_a_passed_deadline,
+        a_sleep_waits_out_its_duration,
+        an_unbounded_timeout_does_not_overflow,
+    );
+
     async fn joining_gives_the_output() {
         assert_eq!(super::spawn(async { 7 }).await.expect("it completes"), 7);
     }
 
-    #[tokio::test]
     async fn dropping_the_handle_detaches_the_task() {
         let (done, finished) = tokio::sync::oneshot::channel();
         drop(super::spawn(async move {
@@ -213,20 +284,6 @@ mod tests {
             .expect("and finished");
     }
 
-    #[tokio::test]
-    async fn a_task_aborted_before_it_starts_is_never_polled() {
-        let polled = Arc::new(AtomicBool::new(false));
-        let task = {
-            let polled = Arc::clone(&polled);
-            super::Spawner::current().spawn(async move { polled.store(true, Ordering::SeqCst) })
-        };
-        task.abort();
-        let joined = task.await;
-        assert!(joined.expect_err("it was aborted").is_cancelled());
-        assert!(!polled.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
     async fn an_aborted_task_is_dropped_and_reports_finished() {
         let (dropped, gone) = tokio::sync::oneshot::channel::<()>();
         let task = super::spawn(async move {
@@ -244,14 +301,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
     async fn a_panic_reaches_the_joiner() {
         let joined = super::spawn(async { panic!("boom") }).await;
         let payload = joined.expect_err("it panicked").into_panic();
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
 
-    #[tokio::test]
     async fn a_ready_future_beats_a_passed_deadline() {
         let past = Instant::now() - Duration::from_secs(1);
         assert_eq!(super::timeout_at(past, async { 1 }).await, Ok(1));
@@ -261,8 +316,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    async fn a_sleep_waits_out_its_duration() {
+        let started = Instant::now();
+        super::sleep(Duration::from_millis(20)).await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
     async fn an_unbounded_timeout_does_not_overflow() {
         assert_eq!(super::timeout(Duration::MAX, async { 1 }).await, Ok(1));
+    }
+
+    /// Tokio only: a current-thread runtime is what makes "before it starts" certain. On a global
+    /// executor the task may be running on another thread before `abort` is reached.
+    #[tokio::test]
+    async fn a_task_aborted_before_it_starts_is_never_polled() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let task = {
+            let polled = Arc::clone(&polled);
+            super::Spawner::current().spawn(async move { polled.store(true, Ordering::SeqCst) })
+        };
+        task.abort();
+        let joined = task.await;
+        assert!(joined.expect_err("it was aborted").is_cancelled());
+        assert!(!polled.load(Ordering::SeqCst));
     }
 }

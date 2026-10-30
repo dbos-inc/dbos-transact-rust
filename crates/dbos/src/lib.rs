@@ -58,8 +58,10 @@
 //! - `macros` *(default)* — [`select_step!`], the durable race, which is a procedural macro and so
 //!   costs `syn` and `quote` at build time. Implies `engine`, because the expansion is engine
 //!   code; nothing it generates reaches the binary.
-//! - `runtime-tokio` *(default)* — runs on tokio. The crate spawns its background tasks and sets
-//!   its timers on the async runtime this names, and needs one.
+//! - `runtime-tokio` *(default)*, `runtime-smol`, `runtime-async-global-executor` — the async
+//!   runtime the crate spawns its background tasks and sets its timers on, which it needs one of.
+//!   Several may be enabled: tokio is used when the caller is in a tokio runtime, and otherwise
+//!   `async-global-executor`, then smol.
 
 #![forbid(unsafe_code)]
 // Spawning and timers go through `rt`, which picks the runtime; `clippy.toml` names what that

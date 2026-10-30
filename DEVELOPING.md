@@ -48,13 +48,17 @@ cargo deny check
 
 ## Features
 
-`dbos` has three features, all on by default:
+`dbos` has three default features:
 
 | Feature | Covers |
 | --- | --- |
 | `engine` | The durable execution engine: lifecycle, registry, contexts, workflows, steps, events, recovery, queues, scheduler, messaging, client |
 | `macros` | Re-exports the attribute macros and `select_step!` from `dbos-macros`. Implies `engine` |
 | `runtime-tokio` | The async runtime the crate spawns tasks and sets timers on. A runtime is required, with or without `engine` |
+
+`runtime-smol` and `runtime-async-global-executor` are the off-by-default alternatives. Several
+may be enabled at once: tokio is used when the caller is in a tokio runtime, and otherwise
+`async-global-executor`, then smol.
 
 Spawning and timers go through `crate::rt`, never tokio directly. `crates/dbos/clippy.toml` lists
 what that rules out, and `cargo clippy` enforces it for the library (the integration tests are

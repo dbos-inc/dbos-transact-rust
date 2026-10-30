@@ -91,6 +91,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p dbos --no-default-features --features runtime-tokio
 
+  runtimes:
+    name: Builds on ${{ matrix.runtime }}
+    runs-on: ubuntu-latest
+    # The non-tokio runtimes, each alone, with and without the engine. Alone is the point: tokio
+    # leaves the build with `tokio/time`, so a `tokio::time` call that bypassed `crate::rt` fails to
+    # compile here, where everywhere else it would compile and only panic at run time on another
+    # runtime. Not `--all-targets`, whose dev-dependencies would put `tokio/time` back.
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [smol, async-global-executor]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p dbos --no-default-features --features engine,macros,runtime-${{ matrix.runtime }}
+      - run: cargo check -p dbos --no-default-features --features runtime-${{ matrix.runtime }}
+
   test:
     name: Test (${{ matrix.backend }})
     runs-on: ubuntu-latest

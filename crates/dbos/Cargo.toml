@@ -40,6 +40,14 @@ macros = ["engine", "dep:dbos-macros"]
 # Only spawning and timers depend on it. `tokio` stays a dependency whatever is chosen, for its
 # `sync` primitives and macros, which run on any executor.
 runtime-tokio = ["sqlx/runtime-tokio", "tokio/rt", "tokio/time"]
+runtime-smol = ["sqlx/runtime-smol", "dep:smol", "dep:async-io"]
+# A global executor over `async-executor`, like smol's own, and the one async-std ran on.
+# `async-io` supplies the timers.
+runtime-async-global-executor = [
+    "sqlx/runtime-async-global-executor",
+    "dep:async-global-executor",
+    "dep:async-io",
+]
 
 [dependencies]
 # `select_step!`, behind the `macros` feature. The `=` version lock lives in the workspace
@@ -98,6 +106,13 @@ jiff = { version = "0.2", optional = true }
 # lets an application's serializer see each value's real type, without the engine monomorphizing
 # its code. Engine-only, like the serializer it serves; never named in this crate's public API.
 erased-serde = { version = "0.4", default-features = false, features = ["std"], optional = true }
+# The non-tokio runtimes, each behind its `runtime-*` feature, at the versions `sqlx` asks for on
+# them so that the build carries one copy of each.
+smol = { version = "2", default-features = false, optional = true }
+async-global-executor = { version = "3.1", default-features = false, features = [
+    "async-io",
+], optional = true }
+async-io = { version = "2.4", optional = true }
 
 [dev-dependencies]
 # A format that is not human-readable, which serde types such as `Ipv4Addr` serialize differently
