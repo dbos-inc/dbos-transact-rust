@@ -133,7 +133,8 @@ sqlx = { version = "0.9", default-features = false, features = [
     "tls-rustls",
     "postgres",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+# `test-util` for the paused clock, which `rt`'s tests use to check its deadlines follow tokio's.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 
 [lints.clippy]
 # Denied instead where it applies: for the library in `src/lib.rs`, and in each integration test

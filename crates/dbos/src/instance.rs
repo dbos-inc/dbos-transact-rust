@@ -261,7 +261,7 @@ impl Executor {
         self.stopping.cancel();
         let draining = !workflow_completion_timeout.is_zero();
         if draining {
-            let deadline = Instant::now() + workflow_completion_timeout;
+            let deadline = crate::rt::now() + workflow_completion_timeout;
             // Waited on before the drain, not alongside it: a dequeue mid-dispatch is about to add
             // to the set the drain is watching, and a drain that saw it empty first would finish
             // before that workflow started.
@@ -309,7 +309,7 @@ impl Executor {
     /// cancelled by [`stop`](Self::stop), after this returns.
     async fn drain(&self, deadline: Instant) {
         loop {
-            let report_at = (Instant::now() + DRAIN_REPORT_INTERVAL).min(deadline);
+            let report_at = (crate::rt::now() + DRAIN_REPORT_INTERVAL).min(deadline);
             if self.workflow_tasks.wait_all_until(report_at).await || report_at >= deadline {
                 return;
             }

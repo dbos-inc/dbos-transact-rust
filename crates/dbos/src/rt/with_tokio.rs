@@ -38,3 +38,8 @@ pub(super) async fn timeout_at<F: Future>(
         .await
         .map_err(|_| super::Elapsed)
 }
+
+/// Tokio's clock, which a paused test clock moves; see `rt::now`.
+pub(super) fn now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}

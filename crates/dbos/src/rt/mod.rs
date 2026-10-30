@@ -229,10 +229,24 @@ pub fn fallback() -> Option<&'static str> {
     }
 }
 
-/// `duration` from now, or a deadline far enough out to mean "never" where adding would overflow
-/// — `Duration::MAX` is a legitimate way to ask for no deadline.
+/// Now, on the clock this crate's timers run on: what a deadline for [`sleep_until`] or
+/// [`timeout_at`] should be measured from.
+///
+/// On tokio that is tokio's clock, which a test can pause and advance with
+/// `tokio::time::pause`, and which then runs apart from the real one. A deadline taken from the
+/// real clock would already be in its past, and fire at once. Off tokio it is the real clock.
+pub(crate) fn now() -> Instant {
+    #[cfg(feature = "runtime-tokio")]
+    if with_tokio::available() {
+        return with_tokio::now();
+    }
+    Instant::now()
+}
+
+/// `duration` from [`now`], or a deadline far enough out to mean "never" where adding would
+/// overflow — `Duration::MAX` is a legitimate way to ask for no deadline.
 fn after(duration: Duration) -> Instant {
-    let now = Instant::now();
+    let now = now();
     now.checked_add(duration)
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30))
 }
@@ -391,6 +405,22 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the timeout never fired");
         assert_eq!(elapsed, Err(super::Elapsed));
+    }
+
+    /// Tokio only: a paused clock, an hour ahead of the real one, is what a deadline taken from
+    /// the real clock would already be behind.
+    #[tokio::test(start_paused = true)]
+    async fn deadlines_follow_tokios_clock() {
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        let started = super::now();
+        super::sleep(Duration::from_secs(60)).await;
+        assert!(super::now() - started >= Duration::from_secs(60));
+        let timed_out = super::now();
+        assert_eq!(
+            super::timeout(Duration::from_secs(60), std::future::pending::<()>()).await,
+            Err(super::Elapsed)
+        );
+        assert!(super::now() - timed_out >= Duration::from_secs(60));
     }
 
     /// Tokio only, because only tokio's runtime can be dropped: what a runtime shutting down does
