@@ -184,11 +184,23 @@ pub struct QueueOptions {
     ///
     /// Spelled as the column is. Nothing re-scopes a limit, so this one is fleet-wide whatever
     /// else the queue carries, partition limits included.
+    ///
+    /// **`Some(0)` pauses the queue** across the fleet: nothing is dequeued from it until an
+    /// update raises the limit. It cannot sit below
+    /// [`worker_concurrency`](Self::worker_concurrency), so pausing a queue that carries one
+    /// means zeroing that too. Nor can it sit below a per-partition concurrency limit, which must
+    /// be at least 1, so a queue carrying one cannot be paused through this field; pause it
+    /// through `worker_concurrency` instead.
     pub concurrency: Option<i32>,
     /// How many of this queue's workflows may run at once in **this** process.
     ///
     /// Counted locally, which is why it is the cheap limit: a process knows what it is running
     /// without asking the database. The starter app's Queues tab is this field.
+    ///
+    /// **`Some(0)` pauses the queue on every executor**, since each one holds itself to this
+    /// limit: nothing is dequeued from it until an update raises the limit. It cannot sit below
+    /// [`partition_worker_concurrency`](Self::partition_worker_concurrency), which must be at
+    /// least 1, so a queue carrying one cannot be paused through this field.
     pub worker_concurrency: Option<i32>,
     /// How often this queue is polled when it is quiet.
     ///
@@ -228,6 +240,11 @@ pub struct QueueOptions {
     /// The per-partition counterpart of [`worker_concurrency`](Self::worker_concurrency), counted
     /// locally the same way, and may exceed neither that nor
     /// [`partition_concurrency`](Self::partition_concurrency).
+    ///
+    /// At least 1, so a queue carrying it cannot be paused through `worker_concurrency` or
+    /// `concurrency`, both of which it may not exceed. To pause one, clear this and set
+    /// `worker_concurrency` to 0 in a single [`QueueChange`]. If this is the queue's only
+    /// per-partition limit, clearing it also un-partitions the queue until it is set again.
     pub partition_worker_concurrency: Option<i32>,
     /// How fast this queue's workflows may start within one partition, or `None` for unthrottled.
     ///
@@ -341,20 +358,18 @@ pub enum QueueConflict {
 
 /// Rejects a queue configuration that cannot mean anything.
 ///
-/// Its own function because every reference has one — Go's `validateQueueConfig`, Python's
-/// `Queue._validate_queue`, TypeScript's `validateQueueParams` — and because the rate limit and
-/// the partitioning rules put most of their checks here rather than anywhere else.
+/// Its own function because the rate limit and the partitioning rules put most of their checks
+/// here rather than anywhere else.
 ///
-/// Two of these come from a minority of the references, and both are worth having:
-///
-/// - **The limits must be positive**, which only Java checks. It matters more here than there,
-///   because the dequeue clamps its budgets with `.max(0)`: a `Some(0)` reaches the database, is
-///   read back as a limit of nothing, and leaves a queue that silently never dequeues, with no
-///   error and nothing in the log to explain it.
-/// - **A fleet-wide limit cannot be below a per-process one**, which all four references check —
-///   Java's is in `QueueRegistry.register`. The pair is incoherent rather than merely
-///   useless: the smaller number wins in the dequeue, so the configuration does not say what it
-///   appears to say.
+/// - **A queue-wide limit of 0 pauses the queue; a negative one is refused.** `concurrency` or
+///   `worker_concurrency` at `Some(0)` leaves no room, so nothing is dequeued until an update
+///   raises it. The per-partition limits and the rate limits must be at least 1: a partition is
+///   paused by pausing its queue, not one key at a time.
+/// - **A fleet-wide limit cannot be below a per-process one.** The pair is incoherent rather than
+///   merely useless: the smaller number wins in the dequeue, so the configuration does not say
+///   what it appears to say. So a queue with `worker_concurrency` set is paused through
+///   `concurrency` only if `worker_concurrency` is 0 too, and a queue with a per-partition
+///   concurrency limit cannot be paused through `concurrency` at all.
 fn validate(name: &str, options: &QueueOptions) -> Result<()> {
     validate_fields(options)
         .map_err(|(_, detail)| Error::Config(format!("queue `{name}`: {detail}")))
@@ -370,19 +385,19 @@ fn validate_fields(options: &QueueOptions) -> StdResult<(), (Cow<'static, str>, 
     let refuse = |field: &'static str, message: String| Err((Cow::Borrowed(field), message));
 
     if let Some(global) = options.concurrency
-        && global < 1
+        && global < 0
     {
         return refuse(
             "concurrency",
-            format!("`concurrency` must be at least 1, got {global}"),
+            format!("`concurrency` must not be negative, got {global}"),
         );
     }
     if let Some(worker) = options.worker_concurrency
-        && worker < 1
+        && worker < 0
     {
         return refuse(
             "worker_concurrency",
-            format!("`worker_concurrency` must be at least 1, got {worker}"),
+            format!("`worker_concurrency` must not be negative, got {worker}"),
         );
     }
     if let (Some(worker), Some(global)) = (options.worker_concurrency, options.concurrency)
