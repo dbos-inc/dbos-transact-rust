@@ -291,7 +291,7 @@ impl ClientConfig {
 ///
 /// **It holds a connection and nothing else.** Not an executor: an executor is the machinery for
 /// *running* workflows — an id, a version and an application name to stamp claims with, a runtime
-/// to spawn onto, a registry to resolve names through, a task set to shut down — and a client does
+/// to spawn onto, a registry to resolve names through, task sets to shut down — and a client does
 /// none of that. Java draws the same line, its `DBOSClient` holding a `SystemDatabase` and a
 /// serializer; the operations both surfaces share are methods on the connection, so calling one
 /// here costs no executor and implies none.

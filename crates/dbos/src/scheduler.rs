@@ -23,7 +23,7 @@ use crate::dequeue::random_unit;
 use crate::error::Result;
 use crate::schedule::Firing;
 use crate::sysdb::types::{ScheduleFilter, ScheduleRecord, ScheduleStatus, Timestamp};
-use crate::workflow::spawn_tracked;
+use crate::workflow::{Role, spawn_tracked};
 
 /// How long after launch the schedules are polled fast.
 ///
@@ -41,6 +41,8 @@ const MAX_JITTER: Duration = Duration::from_secs(10);
 pub(crate) fn spawn(executor: Arc<Executor>, polling_interval: Duration) {
     spawn_tracked(
         &executor,
+        Role::Producer,
+        "scheduler".to_owned(),
         poll_schedules(Arc::clone(&executor), polling_interval)
             .instrument(tracing::info_span!("scheduler")),
     );
@@ -89,10 +91,11 @@ impl Task {
 }
 
 /// Lists the schedules every polling interval and hands each listing to [`reconcile_schedules`],
-/// forever.
+/// until shutdown.
 ///
-/// Ended by shutdown aborting it, which aborts the per-schedule tasks with it: every one is
-/// spawned through [`spawn_tracked`].
+/// Every task here is a [`Role::Producer`], and each stops at its next wait once shutdown has
+/// begun: see [`Executor::pace`]. One still mid-pass at the shutdown deadline is aborted, which
+/// loses nothing — a tick's enqueue is one transaction under an id derived from the tick.
 async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
     let fast_until = std::time::Instant::now() + STARTUP_FAST_POLL_DURATION;
     let mut running: HashMap<String, Running> = HashMap::new();
@@ -112,7 +115,9 @@ async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
         } else {
             polling_interval
         };
-        tokio::time::sleep(wait).await;
+        if !executor.pace(wait).await {
+            return;
+        }
     }
 }
 
@@ -170,6 +175,9 @@ async fn reconcile_schedules(
                         current.task = Task::Unfireable;
                         continue;
                     }
+                    // Shutdown has begun, so nothing is restarted. Only a reconcile already running
+                    // when it began can see this.
+                    Ok(Ended::Stopped) => continue,
                     // It found its row replaced or redefined before this poll saw it, and the row
                     // is back as it was: restarted like any start.
                     Ok(Ended::Superseded) | Err(_) => true,
@@ -194,6 +202,8 @@ async fn reconcile_schedules(
         let record = Arc::new(record);
         let task = spawn_tracked(
             executor,
+            Role::Producer,
+            format!("schedule {}", record.schedule_name),
             run_schedule(Arc::clone(executor), Arc::clone(&record), catch_up).instrument(span),
         );
         running.insert(
@@ -214,6 +224,8 @@ enum Ended {
     /// The row under the schedule's name is no longer the one the task was started for — deleted,
     /// replaced or redefined since the reconciler last looked.
     Superseded,
+    /// Shutdown began.
+    Stopped,
 }
 
 /// How long a task trusts what it last read about its schedule before reading it again.
@@ -227,7 +239,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// The longest wait between attempts at a tick that failed.
 const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Sleeps to each tick of a schedule and enqueues its run, until aborted or superseded.
+/// Sleeps to each tick of a schedule and enqueues its run, until superseded or shutdown.
 ///
 /// **Ticks are walked from the previous tick, not from the clock**, so a task that wakes late —
 /// a stalled runtime, a slow enqueue — fires the ticks it overslept rather than skipping them.
@@ -278,7 +290,9 @@ async fn run_schedule(
         };
         cursor = tick.timestamp();
         let until = Duration::try_from(cursor.duration_since(Instant::now())).unwrap_or_default();
-        tokio::time::sleep(until + jitter(until)).await;
+        if !executor.pace(until + jitter(until)).await {
+            return Ended::Stopped;
+        }
 
         let workflow_id = firing_id(&record.schedule_name, &tick);
         let next_tick = cron.next_after(cursor).map(|next| next.timestamp());
@@ -345,7 +359,9 @@ async fn run_schedule(
                         "could not fire schedule `{}`; retrying",
                         record.schedule_name
                     );
-                    tokio::time::sleep(wait).await;
+                    if !executor.pace(wait).await {
+                        return Ended::Stopped;
+                    }
                     wait = (wait * 2).min(MAX_RETRY_INTERVAL);
                     // Read again on the next attempt: the failure may have been the row changing.
                     fresh = None;

@@ -111,10 +111,10 @@
 //!
 //! That also keeps this crate clear of go #426, where shutdown's context cancellation reached the
 //! *durable* cancel path and marked in-flight workflows `CANCELLED` instead of leaving them
-//! `PENDING` for recovery. Rust's shutdown aborts tasks and says so — see `Tasks::abort_all`,
-//! whose rows stay `PENDING` — and durable cancellation is only ever this module, or a timeout (the
-//! timeout sweep, or an execution whose deadline has passed), writing to the database. Shutdown
-//! reaches neither, so there is no shutdown cause to tag.
+//! `PENDING` for recovery. Rust's shutdown waits for workflows or aborts their tasks, and says so —
+//! see `Tasks::abort_all`, whose rows stay `PENDING` — and durable cancellation is only ever this
+//! module, or a timeout (the timeout sweep, or an execution whose deadline has passed), writing to
+//! the database. Shutdown reaches neither, so there is no shutdown cause to tag.
 
 use std::collections::HashSet;
 use std::sync::Arc;
