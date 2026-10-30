@@ -81,24 +81,24 @@ struct Shared {
 /// An owned permission to join a task: awaiting it gives the task's output, or how it failed.
 ///
 /// Dropping it detaches the task, which runs on.
-pub(crate) struct JoinHandle<T> {
+pub struct JoinHandle<T> {
     result: oneshot::Receiver<Result<T, JoinError>>,
     abort: AbortHandle,
 }
 
 impl<T> JoinHandle<T> {
     /// Cancels the task at its next suspension point; at once if it has not started.
-    pub(crate) fn abort(&self) {
+    pub fn abort(&self) {
         self.abort.abort();
     }
 
     /// A handle that can abort the task without being able to join it.
-    pub(crate) fn abort_handle(&self) -> AbortHandle {
+    pub fn abort_handle(&self) -> AbortHandle {
         self.abort.clone()
     }
 
     /// Whether the task has ended — completed, panicked, or been cancelled.
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.abort.is_finished()
     }
 }
@@ -117,23 +117,23 @@ impl<T> Future for JoinHandle<T> {
 
 /// Aborts a task, without the right to join it.
 #[derive(Clone)]
-pub(crate) struct AbortHandle(Arc<Shared>);
+pub struct AbortHandle(Arc<Shared>);
 
 impl AbortHandle {
     /// Cancels the task at its next suspension point; at once if it has not started. Aborting
     /// a task that has finished does nothing.
-    pub(crate) fn abort(&self) {
+    pub fn abort(&self) {
         self.0.abort.cancel();
     }
 
     /// Whether the task has ended — completed, panicked, or been cancelled.
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.0.finished.load(Ordering::Acquire)
     }
 }
 
 /// Why joining a task gave no output: it was aborted, or it panicked.
-pub(crate) struct JoinError(Repr);
+pub struct JoinError(Repr);
 
 enum Repr {
     Cancelled,
@@ -141,11 +141,11 @@ enum Repr {
 }
 
 impl JoinError {
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         matches!(self.0, Repr::Cancelled)
     }
 
-    pub(crate) fn is_panic(&self) -> bool {
+    pub fn is_panic(&self) -> bool {
         matches!(self.0, Repr::Panic(_))
     }
 
@@ -155,7 +155,7 @@ impl JoinError {
     ///
     /// When the task was cancelled rather than panicked.
     #[track_caller]
-    pub(crate) fn into_panic(self) -> Box<dyn Any + Send + 'static> {
+    pub fn into_panic(self) -> Box<dyn Any + Send + 'static> {
         match self.0 {
             Repr::Panic(payload) => payload,
             Repr::Cancelled => panic!("`into_panic` on a task that was cancelled"),

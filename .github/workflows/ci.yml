@@ -109,6 +109,45 @@ jobs:
       - run: cargo check -p dbos --no-default-features --features engine,macros,runtime-${{ matrix.runtime }}
       - run: cargo check -p dbos --no-default-features --features runtime-${{ matrix.runtime }}
 
+  test-runtimes:
+    name: Test on ${{ matrix.runtime }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # A subset of the suite, against Postgres only, on each non-tokio runtime. What varies by
+    # runtime is spawning, timers and the task handles built over them, so the subset is the
+    # binaries that lean on those: the lifecycle and shutdown, recovery, the dequeue loop and the
+    # scheduler, timeouts and durable sleep, and the notification paths. The rest of the suite
+    # exercises the database far more than the runtime, and runs on tokio in `test`.
+    #
+    # Each of these binaries' tests uses `#[dbos_test_support::test]`, which runs it where
+    # `DBOS_TEST_RUNTIME` says and fails if the build would put it anywhere else. Adding a binary
+    # here means moving its tests to that attribute and its spawns and timers to `dbos::__rt`.
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [smol, async-global-executor]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        env:
+          DBOS_TEST_RUNTIME: ${{ matrix.runtime }}
+        run: >-
+          cargo test -p dbos --features runtime-${{ matrix.runtime }} --no-fail-fast
+          --test events --test handles --test lifecycle --test messages --test queues
+          --test recovery --test schedules --test shutdown --test sleep --test timeouts
+          --test workflows
+      - name: No containers left behind
+        run: |
+          filter='label=dev.dbos.test-harness=true'
+          remaining=$(docker ps -aq --filter "$filter" | wc -l)
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::$remaining test container(s) left behind by the suite"
+            docker ps -a --filter "$filter"
+            exit 1
+          fi
+
   test:
     name: Test (${{ matrix.backend }})
     runs-on: ubuntu-latest

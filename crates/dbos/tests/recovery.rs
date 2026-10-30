@@ -42,7 +42,7 @@ async fn await_status(
     workflow_id: &str,
     status: WorkflowStatus,
 ) -> WorkflowRecord {
-    tokio::time::timeout(DEADLINE, async {
+    dbos::__rt::timeout(DEADLINE, async {
         loop {
             let row = reader
                 .get_workflow(workflow_id)
@@ -52,7 +52,7 @@ async fn await_status(
             if row.status == status {
                 return row;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -64,7 +64,7 @@ async fn await_status(
 /// The workflow runs two steps, signals, and blocks; `shutdown` abandons it exactly there. The
 /// relaunch must recover it, replay both steps from their checkpoints without entering either
 /// body, run the remainder, and record the outcome.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
     let one = Arc::new(AtomicU32::new(0));
     let two = Arc::new(AtomicU32::new(0));
@@ -106,8 +106,8 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
     dbos.launch().await.expect("launch failed");
 
     // Run to the gate, then abandon: shutdown aborts the task and the row stays PENDING.
-    let running = tokio::spawn(async move { resumes.run(()).await });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    let running = dbos::__rt::spawn(async move { resumes.run(()).await });
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
     dbos.shutdown().await;
@@ -137,7 +137,7 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
     // The relaunch is the crash-and-resume demo: recovery lists the workflow before launch
     // returns and re-executes it in the background.
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered workflow never reached its gate again");
     release_gate.notify_one();
@@ -162,7 +162,7 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
 /// The first instance registers two workflows and abandons both. The second registers only one —
 /// the other's code was "removed" — and its launch must recover the one it knows and leave the
 /// other PENDING, rather than failing the sweep.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_unregistered_workflow_is_skipped_and_the_rest_recover() {
     let gate = Arc::new(tokio::sync::Notify::new());
     let entered = Arc::new(tokio::sync::Notify::new());
@@ -190,10 +190,10 @@ async fn an_unregistered_workflow_is_skipped_and_the_rest_recover() {
     first.launch().await.expect("launch failed");
 
     for workflow in [
-        tokio::spawn(async move { ghost.run(()).await }),
-        tokio::spawn(async move { keeper.run(()).await }),
+        dbos::__rt::spawn(async move { ghost.run(()).await }),
+        dbos::__rt::spawn(async move { keeper.run(()).await }),
     ] {
-        tokio::time::timeout(DEADLINE, entered.notified())
+        dbos::__rt::timeout(DEADLINE, entered.notified())
             .await
             .expect("a workflow never started");
         // Not awaited further: both block at the gate until shutdown interrupts them.
@@ -241,7 +241,7 @@ async fn an_unregistered_workflow_is_skipped_and_the_rest_recover() {
 /// A workflow cut down mid-flight comes back on [`INTERNAL_QUEUE`] rather than being executed by
 /// the process that found it. That is what makes a repeat sweep harmless, lets any executor on
 /// the version pick the work up, and turns "how many at once" into the queue's question.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
     let db = test_database().await;
     let reader = reader(&db).await;
@@ -262,7 +262,7 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
                     entered.fetch_add(1, Ordering::SeqCst);
                     reached.notify_one();
                     // Long enough that shutdown catches it mid-flight.
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    dbos::__rt::sleep(Duration::from_secs(30)).await;
                     Ok::<u32, Error>(1)
                 }
             })
@@ -283,7 +283,7 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
         )
         .await
         .expect("start failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never entered its body");
     await_status(&reader, id, WorkflowStatus::Pending).await;
@@ -295,7 +295,7 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
     let (second, _workflow) = build(&db);
     second.launch().await.expect("relaunch failed");
 
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow did not run again after being recovered");
     assert_eq!(entered.load(Ordering::SeqCst), 2);
@@ -316,7 +316,7 @@ async fn a_recovered_workflow_comes_back_through_the_internal_queue() {
 /// workflow; the first then finishes its step and finds the position already taken. Its caller
 /// must get the workflow's recorded outcome, which is the second execution's, rather than a
 /// system-database error for a workflow that succeeded.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
     let entered = Arc::new(AtomicU32::new(0));
     let reached_gate = Arc::new(tokio::sync::Notify::new());
@@ -378,7 +378,7 @@ async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
         )
         .await
         .expect("start failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the first execution never entered its step");
 
@@ -389,7 +389,7 @@ async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
     assert_eq!(row.output.as_deref(), Some("\"second\""));
 
     release_gate.notify_one();
-    let result = tokio::time::timeout(DEADLINE, handle.result())
+    let result = dbos::__rt::timeout(DEADLINE, handle.result())
         .await
         .expect("the losing execution never returned");
     assert_eq!(
@@ -427,7 +427,7 @@ async fn the_loser_of_a_step_checkpoint_race_returns_the_winners_outcome() {
 /// loses, that execution waits for the second's outcome — and the next workflow on the queue must
 /// still run on the first instance meanwhile, which it can only do if the waiting execution has
 /// let its slot go.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
     const QUEUE: &str = "race-queue";
 
@@ -509,14 +509,14 @@ async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
     racy.start_with((), enqueue("racy-1"))
         .await
         .expect("enqueue failed");
-    tokio::time::timeout(DEADLINE, reached_step.notified())
+    dbos::__rt::timeout(DEADLINE, reached_step.notified())
         .await
         .expect("the first instance never ran the step");
 
     // Same executor id, so this launch returns the running workflow to its queue, and the second
     // instance — the one with a free slot — dequeues it.
     let (second, _racy, _next) = build(&db).await;
-    tokio::time::timeout(DEADLINE, winner_holding.notified())
+    dbos::__rt::timeout(DEADLINE, winner_holding.notified())
         .await
         .expect("the second instance never recorded the step");
 
@@ -525,7 +525,7 @@ async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
         .await
         .expect("enqueue failed");
     // The second instance's one slot is held by the winner, so only the first can run this.
-    tokio::time::timeout(
+    dbos::__rt::timeout(
         Duration::from_secs(20),
         await_status(&reader, "next-1", WorkflowStatus::Success),
     )
@@ -561,7 +561,7 @@ async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
 ///
 /// A second workflow is abandoned at the shutdown for the relaunch to recover, so the test knows
 /// the relaunch's recovery has run before it looks.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflow_whose_result_cannot_be_encoded_is_not_recovered() {
     let runs = Arc::new(AtomicU32::new(0));
     let witness_runs = Arc::new(AtomicU32::new(0));
@@ -606,7 +606,7 @@ async fn a_workflow_whose_result_cannot_be_encoded_is_not_recovered() {
 
     let handle = unencodable.start(()).await.expect("start failed");
     let workflow_id = handle.workflow_id().to_owned();
-    let error = tokio::time::timeout(DEADLINE, handle.result())
+    let error = dbos::__rt::timeout(DEADLINE, handle.result())
         .await
         .expect("the workflow finishes")
         .unwrap_err();
@@ -617,7 +617,7 @@ async fn a_workflow_whose_result_cannot_be_encoded_is_not_recovered() {
 
     let abandoned = witness.start(()).await.expect("start failed");
     let witness_id = abandoned.workflow_id().to_owned();
-    tokio::time::timeout(DEADLINE, entered.notified())
+    dbos::__rt::timeout(DEADLINE, entered.notified())
         .await
         .expect("the witness never started");
     dbos.shutdown().await;
@@ -652,7 +652,7 @@ async fn a_workflow_whose_result_cannot_be_encoded_is_not_recovered() {
 /// **A step whose result its encoding refuses is not run again by recovery.** The refusal is the
 /// step's recorded error, so a workflow that handles it and carries on, and is then abandoned and
 /// recovered, replays the step from its row rather than repeating its side effects.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_step_whose_result_cannot_be_encoded_is_not_run_again_on_recovery() {
     let runs = Arc::new(AtomicU32::new(0));
     let reached_gate = Arc::new(tokio::sync::Notify::new());
@@ -695,8 +695,8 @@ async fn a_step_whose_result_cannot_be_encoded_is_not_run_again_on_recovery() {
     dbos.launch().await.expect("launch failed");
 
     // Run to the gate, then abandon: shutdown aborts the task and the row stays PENDING.
-    let running = tokio::spawn(async move { handles_it.run(()).await });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    let running = dbos::__rt::spawn(async move { handles_it.run(()).await });
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
     dbos.shutdown().await;
@@ -723,7 +723,7 @@ async fn a_step_whose_result_cannot_be_encoded_is_not_run_again_on_recovery() {
     assert_eq!(step.step_id, 0, "the refused step is checkpointed");
 
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered workflow never reached its gate again");
     release_gate.notify_one();

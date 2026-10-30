@@ -27,7 +27,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 }
 
 /// A body that outlives its timeout fails the step, and the failure is recorded.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_step_that_hangs_is_stopped_at_its_timeout() {
     let db = test_database().await;
     let dbos = DBOS::new(config("timeout-app", &db));
@@ -38,7 +38,7 @@ async fn a_step_that_hangs_is_stopped_at_its_timeout() {
                 ..Default::default()
             };
             dbos::step_with("sleeps", options, || async {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                dbos::__rt::sleep(Duration::from_secs(30)).await;
                 Ok::<u32, dbos::Error>(1)
             })
             .await
@@ -73,7 +73,7 @@ async fn a_step_that_hangs_is_stopped_at_its_timeout() {
 ///
 /// This is the half TypeScript cannot do: it abandons a timed-out attempt and lets it settle
 /// unobserved. A dropped Rust future stops at its next suspension point.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_timed_out_body_stops_rather_than_continuing() {
     let db = test_database().await;
     let dbos = DBOS::new(config("dropped-app", &db));
@@ -90,7 +90,7 @@ async fn a_timed_out_body_stops_rather_than_continuing() {
                 dbos::step_with("sleeps", options, || {
                     let finished = Arc::clone(&finished);
                     async move {
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        dbos::__rt::sleep(Duration::from_millis(300)).await;
                         // Never reached: the future is dropped long before this line.
                         finished.store(true, Ordering::SeqCst);
                         Ok::<u32, dbos::Error>(1)
@@ -104,7 +104,7 @@ async fn a_timed_out_body_stops_rather_than_continuing() {
 
     workflow.run(()).await.expect_err("the workflow succeeded");
     // Well past when the body would have finished had it kept running.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    dbos::__rt::sleep(Duration::from_millis(500)).await;
     assert!(
         !finished.load(Ordering::SeqCst),
         "the timed-out body kept running after its future was dropped"
@@ -114,7 +114,7 @@ async fn a_timed_out_body_stops_rather_than_continuing() {
 }
 
 /// A timeout is an ordinary retryable failure, and each attempt gets a fresh one.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_timed_out_attempt_is_retried_with_a_fresh_timeout() {
     let db = test_database().await;
     let dbos = DBOS::new(config("retry-timeout-app", &db));
@@ -138,7 +138,7 @@ async fn a_timed_out_attempt_is_retried_with_a_fresh_timeout() {
                         // The first two attempts hang; the third returns at once. A shared budget
                         // rather than a per-attempt one would never reach the third.
                         if attempt < 3 {
-                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            dbos::__rt::sleep(Duration::from_secs(30)).await;
                         }
                         Ok::<u32, dbos::Error>(attempt)
                     }
@@ -156,7 +156,7 @@ async fn a_timed_out_attempt_is_retried_with_a_fresh_timeout() {
 }
 
 /// Exhausting the policy on timeouts reports one per attempt.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn every_attempt_timing_out_reports_each_timeout() {
     let db = test_database().await;
     let dbos = DBOS::new(config("all-timeout-app", &db));
@@ -170,7 +170,7 @@ async fn every_attempt_timing_out_reports_each_timeout() {
                 ..Default::default()
             };
             dbos::step_with("hangs", options, || async {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                dbos::__rt::sleep(Duration::from_secs(30)).await;
                 Ok::<u32, dbos::Error>(1)
             })
             .await
@@ -197,7 +197,7 @@ async fn every_attempt_timing_out_reports_each_timeout() {
 }
 
 /// A step that finishes inside its timeout is unaffected by the option existing.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_step_within_its_timeout_is_unaffected() {
     let db = test_database().await;
     let dbos = DBOS::new(config("within-app", &db));
@@ -221,7 +221,7 @@ async fn a_step_within_its_timeout_is_unaffected() {
 ///
 /// The cancellation is written straight to the database, standing in for Conductor, a client, or
 /// another SDK sharing the system database — none of which this process hears from directly.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
@@ -245,7 +245,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
                     let entered = Arc::clone(&entered);
                     async move {
                         entered.notify_one();
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        dbos::__rt::sleep(Duration::from_secs(30)).await;
                         Ok::<u32, dbos::Error>(1)
                     }
                 })
@@ -296,7 +296,7 @@ async fn a_preemptible_step_stops_when_the_workflow_is_cancelled_elsewhere() {
 }
 
 /// Preemption is off by default, so an ordinary step is not watched.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_plain_step_is_not_preemptible() {
     let db = test_database().await;
     let dbos = DBOS::new(config("not-preempt-app", &db));
@@ -314,7 +314,7 @@ async fn a_plain_step_is_not_preemptible() {
 }
 
 /// The token fires before the future is dropped, so detached work can be told.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn the_cancellation_token_fires_before_the_body_is_dropped() {
     let db = test_database().await;
     let dbos = DBOS::new(config("token-app", &db));
@@ -334,11 +334,11 @@ async fn the_cancellation_token_fires_before_the_body_is_dropped() {
                         let token = dbos::cancellation_token();
                         // Work the runtime could not stop by dropping this future: it lives on a
                         // task of its own and only the token can reach it.
-                        let watcher = tokio::spawn(async move {
+                        let watcher = dbos::__rt::spawn(async move {
                             token.cancelled().await;
                             observed.store(true, Ordering::SeqCst);
                         });
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        dbos::__rt::sleep(Duration::from_secs(30)).await;
                         drop(watcher);
                         Ok::<u32, dbos::Error>(1)
                     }
@@ -350,7 +350,7 @@ async fn the_cancellation_token_fires_before_the_body_is_dropped() {
     dbos.launch().await.expect("launch failed");
 
     workflow.run(()).await.expect_err("the workflow succeeded");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    dbos::__rt::sleep(Duration::from_millis(100)).await;
     assert!(
         observed.load(Ordering::SeqCst),
         "detached work was never told the step had timed out"
@@ -366,7 +366,7 @@ async fn the_cancellation_token_fires_before_the_body_is_dropped() {
 /// other ways: a caller dropping it, or a combinator dropping it as a losing branch. Those must
 /// fire it too, even for a step with neither watchdog. Here the step is raced against a signal it
 /// sends itself, so it is dropped while parked inside its own body.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_dropped_step_fires_its_cancellation_token() {
     let db = test_database().await;
     let dbos = DBOS::new(config("dropped-token-app", &db));
@@ -388,7 +388,7 @@ async fn a_dropped_step_fires_its_cancellation_token() {
                         let started = started.take();
                         async move {
                             let token = dbos::cancellation_token();
-                            tokio::spawn(async move {
+                            dbos::__rt::spawn(async move {
                                 token.cancelled().await;
                                 released.notify_one();
                             });
@@ -408,7 +408,7 @@ async fn a_dropped_step_fires_its_cancellation_token() {
     dbos.launch().await.expect("launch failed");
 
     workflow.run(()).await.expect("the workflow failed");
-    tokio::time::timeout(Duration::from_secs(5), released.notified())
+    dbos::__rt::timeout(Duration::from_secs(5), released.notified())
         .await
         .expect("the dropped step's token never fired");
 
@@ -419,7 +419,7 @@ async fn a_dropped_step_fires_its_cancellation_token() {
 /// not that the step is over: a body that reached an outcome had its chance to clean up, and work
 /// it deliberately left running is not the engine's to stop. Both return paths are checked — a
 /// plain step, and one carrying a watchdog it finished well inside.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_completed_step_leaves_its_cancellation_token_alone() {
     let db = test_database().await;
     let dbos = DBOS::new(config("completed-token-app", &db));

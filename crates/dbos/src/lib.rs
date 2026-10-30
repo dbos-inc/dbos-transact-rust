@@ -342,6 +342,19 @@ pub use workflow::{
     StartOptions, Timeout,
 };
 
+/// The async runtime seam, for this workspace's tests and **not public API**.
+///
+/// A test binary is another crate, and a test that is to run on more than one runtime has to
+/// spawn and sleep the way the library does rather than through tokio. Not gated on `engine`,
+/// because the test harness uses it and the harness builds without the engine.
+#[doc(hidden)]
+pub mod __rt {
+    pub use crate::rt::{
+        AbortHandle, Elapsed, JoinError, JoinHandle, fallback, sleep, sleep_until, spawn, timeout,
+        timeout_at, yield_now,
+    };
+}
+
 /// What [`select_step!`](crate::select_step) expands into, and **not public API**.
 ///
 /// A procedural macro has no `$crate`, so its expansion has to name an absolute path that the

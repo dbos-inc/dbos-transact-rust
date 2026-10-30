@@ -16,10 +16,6 @@
 //! forget it — and a timer. Joining, aborting and panic reporting are built over that in
 //! [`task`], so a [`JoinHandle`] means the same thing whichever runtime ran the task.
 
-// Joining, aborting and panics are the engine's: the system database layer spawns its listener
-// and stops it, and never joins.
-#![cfg_attr(not(feature = "engine"), allow(dead_code, unused_imports))]
-
 mod task;
 #[cfg(feature = "runtime-async-global-executor")]
 mod with_async_global_executor;
@@ -48,7 +44,7 @@ use std::future::Future;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-pub(crate) use task::{AbortHandle, JoinHandle};
+pub use task::{AbortHandle, JoinError, JoinHandle};
 
 #[cfg(not(any(
     feature = "runtime-tokio",
@@ -117,9 +113,10 @@ impl Spawner {
     }
 }
 
-/// Spawns `future` on the caller's runtime. See [`Spawner::spawn`].
+/// Spawns `future` on the caller's runtime, returning a handle to join or abort it. Dropping
+/// the handle detaches the task, which runs on.
 #[track_caller]
-pub(crate) fn spawn<F>(future: F) -> JoinHandle<F::Output>
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -131,12 +128,12 @@ where
 ///
 /// The deadline is taken now, when this is called, rather than when the future is first polled —
 /// as `tokio::time::sleep` does.
-pub(crate) fn sleep(duration: Duration) -> impl Future<Output = ()> + Send {
+pub fn sleep(duration: Duration) -> impl Future<Output = ()> + Send {
     sleep_until(after(duration))
 }
 
 /// Waits until `deadline`; at once if it has passed.
-pub(crate) async fn sleep_until(deadline: Instant) {
+pub async fn sleep_until(deadline: Instant) {
     #[cfg(feature = "runtime-tokio")]
     if with_tokio::available() {
         return with_tokio::sleep_until(deadline).await;
@@ -152,7 +149,7 @@ pub(crate) async fn sleep_until(deadline: Instant) {
 /// The deadline is taken now, when this is called, as `tokio::time::timeout` does. Dropping the
 /// future at the deadline is the whole of the cancellation, so this is no stronger than the
 /// future's own cancellation safety.
-pub(crate) fn timeout<F: Future>(
+pub fn timeout<F: Future>(
     duration: Duration,
     future: F,
 ) -> impl Future<Output = Result<F::Output, Elapsed>> {
@@ -162,10 +159,7 @@ pub(crate) fn timeout<F: Future>(
 /// [`timeout`], with the deadline given as an instant.
 ///
 /// The future is polled before the timer, so one that is ready at the deadline keeps its output.
-pub(crate) async fn timeout_at<F: Future>(
-    deadline: Instant,
-    future: F,
-) -> Result<F::Output, Elapsed> {
+pub async fn timeout_at<F: Future>(deadline: Instant, future: F) -> Result<F::Output, Elapsed> {
     let mut future = std::pin::pin!(future);
     let mut expiry = std::pin::pin!(sleep_until(deadline));
     std::future::poll_fn(|cx| {
@@ -179,7 +173,7 @@ pub(crate) async fn timeout_at<F: Future>(
 
 /// A [`timeout`] whose deadline passed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Elapsed;
+pub struct Elapsed;
 
 impl std::fmt::Display for Elapsed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -193,10 +187,7 @@ impl std::error::Error for Elapsed {}
 ///
 /// Needs no reactor: wake at once and return `Pending` a single time, which puts the task at the
 /// back of the run queue on every executor.
-///
-/// Only the tests yield, for now.
-#[cfg(test)]
-pub(crate) async fn yield_now() {
+pub async fn yield_now() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {
         if yielded {
@@ -208,6 +199,20 @@ pub(crate) async fn yield_now() {
         }
     })
     .await;
+}
+
+/// The runtime a caller outside tokio gets, by the name of its feature without `runtime-`; `None`
+/// in a build with no non-tokio runtime.
+///
+/// For the test harness, which runs a test off tokio and checks it is landing where it was told.
+pub fn fallback() -> Option<&'static str> {
+    if cfg!(feature = "runtime-async-global-executor") {
+        Some("async-global-executor")
+    } else if cfg!(feature = "runtime-smol") {
+        Some("smol")
+    } else {
+        None
+    }
 }
 
 /// `duration` from now, or a deadline far enough out to mean "never" where adding would overflow

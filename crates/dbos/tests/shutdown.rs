@@ -46,7 +46,7 @@ async fn await_status(
     workflow_id: &str,
     status: WorkflowStatus,
 ) -> WorkflowRecord {
-    tokio::time::timeout(DEADLINE, async {
+    dbos::__rt::timeout(DEADLINE, async {
         loop {
             let row = reader
                 .get_workflow(workflow_id)
@@ -56,7 +56,7 @@ async fn await_status(
             if row.status == status {
                 return row;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -74,7 +74,7 @@ fn draining(timeout: Duration) -> ShutdownOptions {
 ///
 /// The instance stays launched while it waits, and shutdown does not return until the workflow
 /// has finished.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_draining_shutdown_lets_a_running_workflow_finish() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -105,7 +105,7 @@ async fn a_draining_shutdown_lets_a_running_workflow_finish() {
     dbos.launch().await.expect("launch failed");
 
     let id = "drained";
-    let running = tokio::spawn(async move {
+    let running = dbos::__rt::spawn(async move {
         parent
             .run_with(
                 (),
@@ -116,17 +116,17 @@ async fn a_draining_shutdown_lets_a_running_workflow_finish() {
             )
             .await
     });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
 
     let started = Instant::now();
-    let mut shutdown = tokio::spawn({
+    let mut shutdown = dbos::__rt::spawn({
         let dbos = dbos.clone();
         async move { dbos.shutdown_with(draining(Duration::from_secs(30))).await }
     });
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), &mut shutdown)
+        dbos::__rt::timeout(Duration::from_millis(500), &mut shutdown)
             .await
             .is_err(),
         "shutdown returned while a workflow was still running"
@@ -137,7 +137,7 @@ async fn a_draining_shutdown_lets_a_running_workflow_finish() {
     );
 
     release_gate.notify_one();
-    tokio::time::timeout(DEADLINE, shutdown)
+    dbos::__rt::timeout(DEADLINE, shutdown)
         .await
         .expect("shutdown never returned")
         .expect("shutdown panicked");
@@ -174,7 +174,7 @@ async fn a_draining_shutdown_lets_a_running_workflow_finish() {
 ///
 /// The queue's worker is running before shutdown begins, so both halves of the loop are stopped
 /// here: the supervisor, which would spawn a worker, and the worker, which would claim the row.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn nothing_is_dequeued_once_shutdown_begins() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -231,17 +231,17 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
     assert_eq!(ran.load(Ordering::SeqCst), 1);
 
     // Something for the shutdown to wait on, so it is still draining when the enqueue lands.
-    let holding = tokio::spawn(async move { holder.run(()).await });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    let holding = dbos::__rt::spawn(async move { holder.run(()).await });
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the holder never reached its gate");
 
-    let shutdown = tokio::spawn({
+    let shutdown = dbos::__rt::spawn({
         let dbos = dbos.clone();
         async move { dbos.shutdown_with(draining(Duration::from_secs(30))).await }
     });
     // Long enough for a dequeue already in flight when shutdown began to have finished.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    dbos::__rt::sleep(Duration::from_millis(500)).await;
 
     let id = "enqueued-while-draining";
     queued
@@ -256,7 +256,7 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
         .await
         .expect("the enqueue failed");
     // Several of the queue's polling intervals: a dequeue loop still running would have taken it.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
 
     let reader = reader(&db).await;
     let row = reader
@@ -271,7 +271,7 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
     );
 
     release_gate.notify_one();
-    tokio::time::timeout(DEADLINE, shutdown)
+    dbos::__rt::timeout(DEADLINE, shutdown)
         .await
         .expect("shutdown never returned")
         .expect("shutdown panicked");
@@ -295,7 +295,7 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
 
 /// A workflow still running at the deadline is cancelled there and left `PENDING`, and a relaunch
 /// recovers it from its last checkpoint.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflow_that_outlasts_the_timeout_is_cancelled_and_recovered() {
     let steps_run = Arc::new(AtomicU32::new(0));
     let reached_gate = Arc::new(tokio::sync::Notify::new());
@@ -328,7 +328,7 @@ async fn a_workflow_that_outlasts_the_timeout_is_cancelled_and_recovered() {
     dbos.launch().await.expect("launch failed");
 
     let id = "outlasts-the-timeout";
-    let running = tokio::spawn(async move {
+    let running = dbos::__rt::spawn(async move {
         slow.run_with(
             (),
             RunOptions {
@@ -338,13 +338,13 @@ async fn a_workflow_that_outlasts_the_timeout_is_cancelled_and_recovered() {
         )
         .await
     });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
 
     let timeout = Duration::from_millis(500);
     let started = Instant::now();
-    tokio::time::timeout(DEADLINE, dbos.shutdown_with(draining(timeout)))
+    dbos::__rt::timeout(DEADLINE, dbos.shutdown_with(draining(timeout)))
         .await
         .expect("shutdown never returned");
     assert!(
@@ -363,7 +363,7 @@ async fn a_workflow_that_outlasts_the_timeout_is_cancelled_and_recovered() {
     assert_eq!(row.status, WorkflowStatus::Pending, "cancelled, not marked");
 
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered workflow never reached its gate again");
     release_gate.notify_one();
@@ -380,7 +380,7 @@ async fn a_workflow_that_outlasts_the_timeout_is_cancelled_and_recovered() {
 
 /// A caller that stops waiting for shutdown does not stop the shutdown: the drain goes on, the
 /// workflow finishes, and the instance ends up shut down rather than half-stopped.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn dropping_the_shutdown_future_does_not_cut_the_shutdown_short() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -401,13 +401,13 @@ async fn dropping_the_shutdown_future_does_not_cut_the_shutdown_short() {
     };
     dbos.launch().await.expect("launch failed");
 
-    let running = tokio::spawn(async move { held.run(()).await });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    let running = dbos::__rt::spawn(async move { held.run(()).await });
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
 
     assert!(
-        tokio::time::timeout(
+        dbos::__rt::timeout(
             Duration::from_millis(500),
             dbos.shutdown_with(draining(Duration::from_secs(30)))
         )
@@ -422,9 +422,9 @@ async fn dropping_the_shutdown_future_does_not_cut_the_shutdown_short() {
         .expect("the task panicked")
         .expect("the workflow was cut short with the caller's wait");
     assert_eq!(output, 7);
-    tokio::time::timeout(DEADLINE, async {
+    dbos::__rt::timeout(DEADLINE, async {
         while dbos.is_launched() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            dbos::__rt::sleep(Duration::from_millis(50)).await;
         }
     })
     .await

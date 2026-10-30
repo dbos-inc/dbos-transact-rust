@@ -84,7 +84,7 @@ async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
         if condition() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        dbos::__rt::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out waiting for {what}");
 }
@@ -101,7 +101,7 @@ fn at(rfc3339: &str) -> SystemTime {
     SystemTime::from(rfc3339.parse::<jiff::Timestamp>().unwrap())
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn schedules_are_created_read_listed_and_deleted() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-crud-app", &db));
@@ -239,7 +239,7 @@ async fn schedules_are_created_read_listed_and_deleted() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn pausing_and_resuming_toggle_the_status_and_name_a_missing_schedule() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-pause-app", &db));
@@ -273,7 +273,7 @@ async fn pausing_and_resuming_toggle_the_status_and_name_a_missing_schedule() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn updating_a_schedule_changes_only_what_it_names() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-update-app", &db));
@@ -367,7 +367,7 @@ async fn updating_a_schedule_changes_only_what_it_names() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn applying_schedules_creates_and_replaces_and_keeps_runtime_state() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-apply-app", &db));
@@ -419,7 +419,7 @@ async fn applying_schedules_creates_and_replaces_and_keeps_runtime_state() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn schedule_calls_from_inside_a_workflow_are_steps_and_batches_are_refused() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-steps-app", &db));
@@ -509,7 +509,7 @@ async fn schedule_calls_from_inside_a_workflow_are_steps_and_batches_are_refused
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_schedule_fires_on_its_timezone_and_records_each_tick() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-fire-app", &db));
@@ -578,7 +578,7 @@ async fn a_schedule_fires_on_its_timezone_and_records_each_tick() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn pausing_or_deleting_a_schedule_stops_it_and_resuming_restarts_it() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-stop-app", &db));
@@ -591,9 +591,9 @@ async fn pausing_or_deleting_a_schedule_stops_it_and_resuming_restarts_it() {
 
     dbos.pause_schedule("stoppable").await.unwrap();
     // A poll to notice, and a tick already in flight to land.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
     let paused_at = contexts(&seen).len();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
     assert_eq!(contexts(&seen).len(), paused_at, "a paused schedule fired");
 
     dbos.resume_schedule("stoppable").await.unwrap();
@@ -603,9 +603,9 @@ async fn pausing_or_deleting_a_schedule_stops_it_and_resuming_restarts_it() {
     .await;
 
     dbos.delete_schedule("stoppable").await.unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
     let deleted_at = contexts(&seen).len();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         contexts(&seen).len(),
         deleted_at,
@@ -615,7 +615,7 @@ async fn pausing_or_deleting_a_schedule_stops_it_and_resuming_restarts_it() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn changing_a_schedules_definition_restarts_it_with_the_new_one() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-restart-app", &db));
@@ -631,7 +631,7 @@ async fn changing_a_schedules_definition_restarts_it_with_the_new_one() {
     )
     .unwrap();
     dbos.create_schedule(&spec).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    dbos::__rt::sleep(Duration::from_secs(2)).await;
     assert!(contexts(&seen).is_empty());
 
     dbos.update_schedule(
@@ -653,7 +653,7 @@ async fn changing_a_schedules_definition_restarts_it_with_the_new_one() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_backfill_enqueues_each_tick_once_on_the_schedules_wall_clock() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-backfill-app", &db));
@@ -747,7 +747,7 @@ async fn a_backfill_enqueues_each_tick_once_on_the_schedules_wall_clock() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_trigger_runs_the_workflow_now() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-trigger-app", &db));
@@ -786,7 +786,7 @@ async fn a_trigger_runs_the_workflow_now() {
 
 /// A schedule another SDK stored with a `''` class runs the free function of that name, rather
 /// than being refused on every tick.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_schedule_stored_with_an_empty_class_runs_the_free_function() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-blank-class-app", &db));
@@ -829,7 +829,7 @@ async fn a_schedule_stored_with_an_empty_class_runs_the_free_function() {
 
 /// A client's schedule for a workflow with no name is refused, rather than stored to be refused on
 /// every tick.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_schedule_for_a_nameless_workflow_is_refused() {
     let db = test_database().await;
     let client = client(None, &db).await;
@@ -852,7 +852,7 @@ async fn a_schedule_for_a_nameless_workflow_is_refused() {
     client.close().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_restart_catches_up_on_missed_ticks_when_asked() {
     let db = test_database().await;
 
@@ -892,7 +892,7 @@ async fn a_restart_catches_up_on_missed_ticks_when_asked() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_schedule_on_a_named_queue_needs_the_queue_and_runs_on_it() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-queue-app", &db));
@@ -931,7 +931,7 @@ async fn a_schedule_on_a_named_queue_needs_the_queue_and_runs_on_it() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_application_fires_its_own_schedules_and_unclaimed_ones_only() {
     let db = test_database().await;
 
@@ -966,7 +966,7 @@ async fn an_application_fires_its_own_schedules_and_unclaimed_ones_only() {
         seen.contains(&"ours".to_owned()) && seen.contains(&"unclaimed".to_owned())
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    dbos::__rt::sleep(Duration::from_secs(2)).await;
     assert!(
         !contexts(&seen).contains(&"theirs".to_owned()),
         "fired another application's schedule"
@@ -996,7 +996,7 @@ async fn an_application_fires_its_own_schedules_and_unclaimed_ones_only() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_run_is_stamped_with_the_owners_latest_version() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-version-app", &db));
@@ -1026,7 +1026,7 @@ async fn a_run_is_stamped_with_the_owners_latest_version() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_client_manages_backfills_and_triggers_schedules() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-client-app", &db));
@@ -1112,7 +1112,7 @@ async fn a_client_manages_backfills_and_triggers_schedules() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
     let db = test_database().await;
 
@@ -1149,7 +1149,7 @@ async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
 
     // Several polls over the unfireable schedule, so the reconciler has to look at its ended task
     // more than once.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
     let healthy = ScheduleSpec::new("healthy", &workflow, EVERY_SECOND, &"ok".to_owned()).unwrap();
     dbos.create_schedule(&healthy).await.unwrap();
     eventually("a schedule created afterwards to fire", || {
@@ -1174,7 +1174,7 @@ async fn a_schedule_no_executor_can_fire_does_not_stop_the_others() {
     dbos.shutdown().await;
 }
 
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_replayed_create_returns_what_it_recorded_even_if_its_queue_is_gone() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-replay-app", &db));
@@ -1239,7 +1239,7 @@ async fn a_replayed_create_returns_what_it_recorded_even_if_its_queue_is_gone() 
 /// The refusal is the step's answer, and the workflow branches on it. If the refusal were not
 /// recorded, a replay after the holder was deleted would create the schedule and take the other
 /// branch.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_refused_create_replays_its_refusal_after_the_name_is_freed() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-refused-app", &db));
@@ -1318,7 +1318,7 @@ async fn a_refused_create_replays_its_refusal_after_the_name_is_freed() {
 ///
 /// The refusal is the call's answer, recorded at its step, so no later recovery could do better:
 /// the workflow ends `ERROR` rather than staying `PENDING` to be recovered into the same answer.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflow_returning_a_refused_create_ends_in_error() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sched-propagate-app", &db));

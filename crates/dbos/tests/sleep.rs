@@ -25,7 +25,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 }
 
 /// A sleep waits, and is checkpointed as a step of its own.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_sleep_waits_and_is_checkpointed() {
     let db = test_database().await;
     let dbos = DBOS::new(config("sleep-app", &db));
@@ -61,7 +61,7 @@ async fn a_sleep_waits_and_is_checkpointed() {
 }
 
 /// The point of the feature: a replay resumes at the *original* wake time, not a fresh one.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_replayed_sleep_does_not_start_its_clock_again() {
     let db = test_database().await;
     let dbos = DBOS::new(config("replay-sleep-app", &db));
@@ -103,7 +103,7 @@ async fn a_replayed_sleep_does_not_start_its_clock_again() {
 
 /// Outside a workflow it is a plain sleep, so a function built from steps and sleeps stays
 /// callable.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_sleep_outside_a_workflow_waits_plainly() {
     let before = std::time::Instant::now();
     dbos::sleep::<dbos::Error>(Duration::from_millis(50))
@@ -116,7 +116,7 @@ async fn a_sleep_outside_a_workflow_waits_plainly() {
 ///
 /// Inside a workflow the refusal must move no counter: the step written after it takes the id the
 /// sleep would have had, and nothing is recorded for the sleep itself.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_sleep_that_cannot_be_recorded_is_refused_and_spends_no_step_id() {
     let db = test_database().await;
     let dbos = DBOS::new(config("refused-sleep-app", &db));

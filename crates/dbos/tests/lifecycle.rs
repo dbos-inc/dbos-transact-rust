@@ -39,7 +39,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 }
 
 /// Launching connects, and the instance reports the identity it resolved.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn launching_resolves_an_identity() {
     let (dbos, _db) = launched("lifecycle-app").await;
 
@@ -60,7 +60,7 @@ async fn launching_resolves_an_identity() {
 }
 
 /// Launch registers the running version, which is what makes an executor visible to a deploy.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn launching_registers_the_application_version() {
     let (dbos, db) = launched("version-app").await;
     let version = dbos.app_version().expect("launched");
@@ -78,7 +78,7 @@ async fn launching_registers_the_application_version() {
 }
 
 /// Registering is idempotent on the name, so a restart does not accumulate rows.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn relaunching_registers_the_same_version_once() {
     let (dbos, db) = launched("relaunch-app").await;
     let version = dbos.app_version().expect("launched");
@@ -107,7 +107,7 @@ async fn relaunching_registers_the_same_version_once() {
 }
 
 /// Relaunching in one process is supported, which is why the instance is not a type-state.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_instance_outlives_the_executor_it_launched() {
     let (dbos, _db) = launched("outlive-app").await;
     let first = dbos.executor_id().expect("launched");
@@ -123,7 +123,7 @@ async fn an_instance_outlives_the_executor_it_launched() {
 
 /// Launching twice is a warning and a no-op, not an error: the usual cause is two entry points
 /// both being defensive.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn launching_twice_is_idempotent() {
     let (dbos, _db) = launched("idempotent-app").await;
     let version = dbos.app_version().expect("launched");
@@ -137,7 +137,7 @@ async fn launching_twice_is_idempotent() {
 }
 
 /// Shutting down twice is equally uneventful.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn shutting_down_twice_is_idempotent() {
     let (dbos, _db) = launched("shutdown-app").await;
     dbos.shutdown().await;
@@ -147,7 +147,7 @@ async fn shutting_down_twice_is_idempotent() {
 
 /// The configured version is used as given: DBOS computes none, so what the application says is
 /// what every row it writes is stamped with.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_explicit_application_version_is_used_as_given() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
@@ -169,7 +169,7 @@ async fn an_explicit_application_version_is_used_as_given() {
 }
 
 /// An explicit executor id identifies this process among the executors sharing a database.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_explicit_executor_id_is_used_as_given() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
@@ -184,7 +184,7 @@ async fn an_explicit_executor_id_is_used_as_given() {
 /// Two applications sharing a database each register their own version, and neither claims the
 /// other's — the ownership half of per-application version rows, exercised end to end rather than
 /// argued from the column.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn two_applications_sharing_a_database_own_their_own_versions() {
     let db = test_database().await;
     let one = DBOS::new(Config {
@@ -214,7 +214,7 @@ async fn two_applications_sharing_a_database_own_their_own_versions() {
 }
 
 /// Registration is a before-launch activity, because the executor holds a snapshot.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn registering_after_launch_is_refused() {
     async fn noop(_: ()) -> dbos::Result<()> {
         Ok(())
@@ -245,7 +245,7 @@ async fn registering_after_launch_is_refused() {
 
 /// Configuration is checked before anything is connected, so a bad name fails fast rather than
 /// after a pool and a migration run.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_invalid_application_name_is_refused_at_launch() {
     let db = test_database().await;
     let dbos = DBOS::new(config("Not A Valid Name", &db));
@@ -272,7 +272,7 @@ async fn an_invalid_application_name_is_refused_at_launch() {
 /// and on Postgres with `use_listen_notify: false`. So the assertion is trivially satisfied on the
 /// Cockroach leg rather than proving anything there, and it is left running because "no
 /// connections leaked" is still true and still worth asserting on both.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_launch_that_fails_after_connecting_closes_the_database() {
     /// Tags the connections this test opens, so they can be told from every other test's on the
     /// shared server.
@@ -304,17 +304,17 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
 
     // The server drops a session shortly after its client goes away, so this is a bounded wait
     // rather than a single look. A leak never converges; a close does, immediately.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let open = db.connection_count(TAG).await;
         if open == 0 {
             break;
         }
         assert!(
-            tokio::time::Instant::now() < deadline,
+            std::time::Instant::now() < deadline,
             "{open} connections from three failed launches are still open"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        dbos::__rt::sleep(Duration::from_millis(100)).await;
     }
 
     holder.shutdown().await;
@@ -326,7 +326,7 @@ async fn a_launch_that_fails_after_connecting_closes_the_database() {
 /// landing where the executor will not see it. Nothing holds that snapshot when the launch then
 /// fails, so the door has to open again — otherwise one bad configuration would make the instance
 /// permanently unregistrable, a worse failure than the one that caused it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_failed_launch_leaves_registration_open() {
     async fn noop(_: ()) -> dbos::Result<()> {
         Ok(())
@@ -346,7 +346,7 @@ async fn a_failed_launch_leaves_registration_open() {
 }
 
 /// A failed launch leaves the instance launchable, rather than poisoned.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_failed_launch_can_be_followed_by_a_good_one() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
