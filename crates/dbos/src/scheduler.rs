@@ -94,8 +94,9 @@ impl Task {
 /// until shutdown.
 ///
 /// Every task here is a [`Role::Producer`], and each stops at its next wait once shutdown has
-/// begun: see [`Executor::pace`]. One still mid-pass at the shutdown deadline is aborted, which
-/// loses nothing — a tick's enqueue is one transaction under an id derived from the tick.
+/// begun: see [`Executor::wait_for_next_pass`]. One still mid-pass at the shutdown deadline is
+/// aborted, which loses nothing — a tick's enqueue is one transaction under an id derived from the
+/// tick.
 async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
     let fast_until = std::time::Instant::now() + STARTUP_FAST_POLL_DURATION;
     let mut running: HashMap<String, Running> = HashMap::new();
@@ -115,7 +116,7 @@ async fn poll_schedules(executor: Arc<Executor>, polling_interval: Duration) {
         } else {
             polling_interval
         };
-        if !executor.pace(wait).await {
+        if !executor.wait_for_next_pass(wait).await {
             return;
         }
     }
@@ -290,7 +291,7 @@ async fn run_schedule(
         };
         cursor = tick.timestamp();
         let until = Duration::try_from(cursor.duration_since(Instant::now())).unwrap_or_default();
-        if !executor.pace(until + jitter(until)).await {
+        if !executor.wait_for_next_pass(until + jitter(until)).await {
             return Ended::Stopped;
         }
 
@@ -359,7 +360,7 @@ async fn run_schedule(
                         "could not fire schedule `{}`; retrying",
                         record.schedule_name
                     );
-                    if !executor.pace(wait).await {
+                    if !executor.wait_for_next_pass(wait).await {
                         return Ended::Stopped;
                     }
                     wait = (wait * 2).min(MAX_RETRY_INTERVAL);

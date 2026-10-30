@@ -156,7 +156,7 @@ impl Executor {
     /// producers stop here, between passes, rather than wherever an abort would land: a dequeue
     /// whose claim has committed goes on to start what it claimed, so a graceful shutdown drains
     /// those workflows instead of leaving them `PENDING` and unstarted.
-    pub(crate) async fn pace(&self, duration: Duration) -> bool {
+    pub(crate) async fn wait_for_next_pass(&self, duration: Duration) -> bool {
         // Biased, with the token first: a wait that has already elapsed — a schedule catching up
         // waits for nothing — would otherwise win half the time and run one more pass.
         tokio::select! {
