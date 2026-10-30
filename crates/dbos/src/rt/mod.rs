@@ -341,13 +341,16 @@ mod tests {
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
 
-    async fn a_panic_dropping_an_aborted_body_reaches_the_joiner() {
-        struct PanicsOnDrop;
-        impl Drop for PanicsOnDrop {
-            fn drop(&mut self) {
-                panic!("in drop");
-            }
+    /// A body's guard whose `Drop` panics.
+    struct PanicsOnDrop;
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            panic!("in drop");
         }
+    }
+
+    async fn a_panic_dropping_an_aborted_body_reaches_the_joiner() {
         let (started, running) = tokio::sync::oneshot::channel();
         let task = super::spawn(async move {
             let _guard = PanicsOnDrop;
@@ -462,6 +465,37 @@ mod tests {
                 .block_on(task);
             assert!(joined.expect_err("it never completed").is_cancelled());
         }
+    }
+
+    /// Tokio only, like the test above: a body its runtime drops is dropped by `Running`'s `Drop`,
+    /// not by the task's own end, and a panic there is the task's panic all the same.
+    #[test]
+    // The block hands back the task's handle unawaited, on purpose: it is joined after the
+    // runtime that ran it is gone.
+    #[allow(clippy::async_yields_async)]
+    fn a_panic_dropping_a_body_its_runtime_drops_reaches_the_joiner() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let task = runtime.block_on(async {
+            let (started, running) = tokio::sync::oneshot::channel();
+            let task = super::spawn(async move {
+                let _guard = PanicsOnDrop;
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            });
+            running.await.expect("the task started");
+            task
+        });
+        drop(runtime);
+        assert!(task.is_finished());
+        let joined = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+            .block_on(task);
+        let payload = joined.expect_err("it never completed").into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"in drop"));
     }
 
     /// Tokio only: a current-thread runtime is what makes "before it starts" certain. On a global

@@ -9,7 +9,7 @@
 //! The future a backend runs is a wrapper around the caller's: it races the body against a
 //! [`CancellationToken`] for abort, catches a panic out of the body or out of dropping it, and
 //! sends what happened down a `oneshot` to whoever holds the [`JoinHandle`]. A runtime dropping
-//! the wrapper unfinished still marks the task finished, and the joiner sees a cancellation.
+//! the wrapper unfinished ends the task the same way, through `Running`'s `Drop`.
 
 use std::any::Any;
 use std::future::Future;
@@ -35,28 +35,21 @@ where
 {
     let shared = Arc::new(Shared::default());
     let (report, result) = oneshot::channel();
-    let finish = Finish {
+    let mut running = Running {
+        body: Some(Box::pin(future)),
         shared: Arc::clone(&shared),
         report: Some(report),
     };
-    // One value, body first, so that a task its runtime drops before the first poll — when the
-    // wrapper's locals do not exist yet and only what it captured is dropped — still drops the body
-    // before `finish` marks it finished. A tuple's fields drop in order; separate captures have
-    // no order anyone promises.
-    let captured = (future, finish);
     let task = async move {
-        let (future, finish) = captured;
-        // `Some` until dropped, so the drop can be made explicit below. Declared after `finish`,
-        // so dropped before it if the runtime drops the task part-way.
-        let mut body = std::pin::pin!(Some(future));
         let outcome = {
-            let mut aborted = std::pin::pin!(finish.shared.abort.cancelled());
+            let mut aborted = std::pin::pin!(running.shared.abort.cancelled());
+            let body = &mut running.body;
             std::future::poll_fn(|cx| {
                 // Abort first, so a task aborted before its first poll is never polled.
                 if aborted.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(Err(JoinError(Repr::Cancelled)));
                 }
-                let body = body.as_mut().as_pin_mut().expect("polled until it ends");
+                let body = body.as_mut().expect("polled until it ends").as_mut();
                 // A panic unwinds out of the body's `poll` — dropping its live locals on the way,
                 // inside the unwind — and is stopped here, so it reaches the joiner rather than
                 // the runtime.
@@ -67,16 +60,7 @@ where
             })
             .await
         };
-        // Dropped here, before the task reports finishing, as tokio orders it: a joiner that sees
-        // the result can rely on the body — its locals, its guards — being gone. Inside
-        // `catch_unwind` because an aborted body is dropped mid-flight, and a `Drop` that panics
-        // then is the task's panic, as tokio reports it, rather than one that escapes to the
-        // runtime and leaves the joiner told the task was cancelled.
-        let outcome = match std::panic::catch_unwind(AssertUnwindSafe(|| body.as_mut().set(None))) {
-            Ok(()) => outcome,
-            Err(payload) => Err(JoinError(Repr::Panic(payload))),
-        };
-        finish.complete(outcome);
+        running.finish(outcome);
     };
     (
         task,
@@ -87,21 +71,39 @@ where
     )
 }
 
-/// Marks a task finished however it ends, and reports its outcome when it has one.
+/// A task's body, and what ends it: the one place a task finishes, however it ends.
 ///
-/// A guard rather than a line at the end of the task, because the end is not the only way out: a
-/// runtime shutting down drops its tasks unfinished, at a suspension point or before their first
-/// poll. Tokio counts those as finished, and so must this — `is_finished` is what the executor's
-/// task sets and the system database's listener restart rely on, and a task that stayed
-/// unfinished forever would look running to them forever. The sender goes with the guard, and the
-/// joiner reads its going as a cancellation.
-struct Finish<T> {
+/// The task's own end is not the only way out. A runtime shutting down drops its tasks unfinished,
+/// at a suspension point or before their first poll, and then only `Drop` runs. So `Drop` ends the
+/// task the same way the task's end does, in the same order, as tokio orders it:
+///
+/// 1. **The body is dropped**, inside `catch_unwind`. A `Drop` of the body's that panics — an
+///    aborted body is dropped mid-flight, guards and all — is the task's panic, as tokio reports
+///    it, not one that escapes to the runtime and leaves the joiner told the task was cancelled.
+/// 2. **The task is marked finished.** Tokio counts a task its runtime dropped as finished, and so
+///    must this: `is_finished` is what the executor's task sets and the system database's listener
+///    restart rely on, and a task left unfinished would look running to them forever.
+/// 3. **The outcome is sent**, so a joiner that sees it can rely on the body being gone. A task
+///    the runtime dropped has none, and is reported as cancelled unless its drop panicked.
+///
+/// The body is boxed because dropping it here, from `&mut self`, means moving it out of a pinned
+/// place, which only a `Box` allows without `unsafe`. It costs an allocation per task.
+struct Running<F: Future> {
+    body: Option<Pin<Box<F>>>,
     shared: Arc<Shared>,
-    report: Option<oneshot::Sender<Result<T, JoinError>>>,
+    report: Option<oneshot::Sender<Result<F::Output, JoinError>>>,
 }
 
-impl<T> Finish<T> {
-    fn complete(mut self, outcome: Result<T, JoinError>) {
+impl<F: Future> Running<F> {
+    /// Ends the task with `outcome`, unless dropping the body panics, which ends it with that.
+    fn finish(&mut self, outcome: Result<F::Output, JoinError>) {
+        let outcome = match self.body.take() {
+            Some(body) => match std::panic::catch_unwind(AssertUnwindSafe(|| drop(body))) {
+                Ok(()) => outcome,
+                Err(payload) => Err(JoinError(Repr::Panic(payload))),
+            },
+            None => outcome,
+        };
         self.shared.finished.store(true, Ordering::Release);
         if let Some(report) = self.report.take() {
             // Nobody joining is the ordinary case of a detached task.
@@ -110,9 +112,12 @@ impl<T> Finish<T> {
     }
 }
 
-impl<T> Drop for Finish<T> {
+impl<F: Future> Drop for Running<F> {
     fn drop(&mut self) {
-        self.shared.finished.store(true, Ordering::Release);
+        // Still holding the sender only when the runtime dropped the task before it ended.
+        if self.report.is_some() {
+            self.finish(Err(JoinError(Repr::Cancelled)));
+        }
     }
 }
 
