@@ -243,8 +243,8 @@ where
 /// Logs a panic escaping a workflow body, from inside the unwind.
 ///
 /// A panic is deliberately not an outcome — nothing is recorded and the row stays `PENDING`, the
-/// same as a crash — but it must not be *silent*. Tokio parks the panic in the `JoinHandle`, and a
-/// caller that dropped its future never joins it, so without this the only evidence would be the
+/// same as a crash — but it must not be *silent*. The task parks the panic in its
+/// [`JoinHandle`](crate::rt::JoinHandle), and a caller that dropped its future never joins it, so without this the only evidence would be the
 /// panic hook's stderr line: no workflow id, nothing about the durable consequence.
 ///
 /// A drop guard because the unwind is the only place the case can be observed: an async block's
@@ -1265,7 +1265,7 @@ where
     /// so a start driven by anything that abandons a branch, a `select!` or a `timeout`, could be
     /// dropped between creating a child and spawning it and leave a workflow that exists, is
     /// recorded, and that nothing is running until the process next launches. Detached, the drop
-    /// takes the [`JoinHandle`](tokio::task::JoinHandle) and leaves the work: the child is
+    /// takes the [`JoinHandle`](crate::rt::JoinHandle) and leaves the work: the child is
     /// created, its start is recorded, and it runs. What the caller loses by dropping is the
     /// handle, which is [`select_workflow!`](macro@crate::select_workflow)'s existing rule — a
     /// workflow runs whether or not anything is watching it — rather than a new hazard of its own.

@@ -95,8 +95,8 @@ impl Executor {
             executor_id,
             app_version,
             app_id,
-            // The runtime is the executor's, taken here. `start` is `async`, so a
-            // runtime is necessarily current.
+            // The runtime is the executor's, taken here. `start` is `async`, so some runtime is
+            // running it; this panics only if it is one this build was not given a feature for.
             runtime: crate::rt::Spawner::current(),
             workflows,
             app_name,
