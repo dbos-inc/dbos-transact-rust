@@ -111,8 +111,8 @@ impl Tasks {
 
     /// [`wait`](Self::wait), bounded by `deadline`: reports whether every task ended before it.
     ///
-    /// Returns as soon as the last task ends, not at the deadline. Nothing is cancelled, at the deadline or before it: what is still running is left to
-    /// [`abort_all`](Self::abort_all).
+    /// Returns as soon as the last task ends, not at the deadline. Nothing is cancelled, at the
+    /// deadline or before it: what is still running is left to [`abort_all`](Self::abort_all).
     pub(crate) async fn wait_until(&self, deadline: tokio::time::Instant) -> bool {
         tokio::time::timeout_at(deadline, self.wait()).await.is_ok()
     }
