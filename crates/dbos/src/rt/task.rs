@@ -7,8 +7,9 @@
 //! on every runtime, by asking each one only to run a future to the end.
 //!
 //! The future a backend runs is a wrapper around the caller's: it races the body against a
-//! [`CancellationToken`] for abort, catches a panic out of the body, and sends what happened down
-//! a `oneshot` to whoever holds the [`JoinHandle`].
+//! [`CancellationToken`] for abort, catches a panic out of the body or out of dropping it, and
+//! sends what happened down a `oneshot` to whoever holds the [`JoinHandle`]. A runtime dropping
+//! the wrapper unfinished still marks the task finished, and the joiner sees a cancellation.
 
 use std::any::Any;
 use std::future::Future;
@@ -34,34 +35,48 @@ where
 {
     let shared = Arc::new(Shared::default());
     let (report, result) = oneshot::channel();
-    let task = {
-        let shared = Arc::clone(&shared);
-        async move {
-            // In a block of its own so the body is dropped — its locals, its guards — before the
-            // task reports finishing, as tokio orders it: a joiner that sees the result can rely
-            // on the body being gone.
-            let outcome = {
-                let mut aborted = std::pin::pin!(shared.abort.cancelled());
-                let mut body = std::pin::pin!(future);
-                std::future::poll_fn(|cx| {
-                    // Abort first, so a task aborted before its first poll is never polled.
-                    if aborted.as_mut().poll(cx).is_ready() {
-                        return Poll::Ready(Err(JoinError(Repr::Cancelled)));
-                    }
-                    // A panic unwinds out of the body's `poll` — dropping its live locals on the
-                    // way, inside the unwind — and is stopped here, so it reaches the joiner
-                    // rather than the runtime.
-                    match std::panic::catch_unwind(AssertUnwindSafe(|| body.as_mut().poll(cx))) {
-                        Ok(poll) => poll.map(Ok),
-                        Err(payload) => Poll::Ready(Err(JoinError(Repr::Panic(payload)))),
-                    }
-                })
-                .await
-            };
-            shared.finished.store(true, Ordering::Release);
-            // Nobody joining is the ordinary case of a detached task.
-            let _ = report.send(outcome);
-        }
+    let finish = Finish {
+        shared: Arc::clone(&shared),
+        report: Some(report),
+    };
+    // One value, body first, so that a task its runtime drops before the first poll — when the
+    // wrapper's locals do not exist yet and only what it captured is dropped — still drops the body
+    // before `finish` marks it finished. A tuple's fields drop in order; separate captures have
+    // no order anyone promises.
+    let captured = (future, finish);
+    let task = async move {
+        let (future, finish) = captured;
+        // `Some` until dropped, so the drop can be made explicit below. Declared after `finish`,
+        // so dropped before it if the runtime drops the task part-way.
+        let mut body = std::pin::pin!(Some(future));
+        let outcome = {
+            let mut aborted = std::pin::pin!(finish.shared.abort.cancelled());
+            std::future::poll_fn(|cx| {
+                // Abort first, so a task aborted before its first poll is never polled.
+                if aborted.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(JoinError(Repr::Cancelled)));
+                }
+                let body = body.as_mut().as_pin_mut().expect("polled until it ends");
+                // A panic unwinds out of the body's `poll` — dropping its live locals on the way,
+                // inside the unwind — and is stopped here, so it reaches the joiner rather than
+                // the runtime.
+                match std::panic::catch_unwind(AssertUnwindSafe(|| body.poll(cx))) {
+                    Ok(poll) => poll.map(Ok),
+                    Err(payload) => Poll::Ready(Err(JoinError(Repr::Panic(payload)))),
+                }
+            })
+            .await
+        };
+        // Dropped here, before the task reports finishing, as tokio orders it: a joiner that sees
+        // the result can rely on the body — its locals, its guards — being gone. Inside
+        // `catch_unwind` because an aborted body is dropped mid-flight, and a `Drop` that panics
+        // then is the task's panic, as tokio reports it, rather than one that escapes to the
+        // runtime and leaves the joiner told the task was cancelled.
+        let outcome = match std::panic::catch_unwind(AssertUnwindSafe(|| body.as_mut().set(None))) {
+            Ok(()) => outcome,
+            Err(payload) => Err(JoinError(Repr::Panic(payload))),
+        };
+        finish.complete(outcome);
     };
     (
         task,
@@ -70,6 +85,35 @@ where
             abort: AbortHandle(shared),
         },
     )
+}
+
+/// Marks a task finished however it ends, and reports its outcome when it has one.
+///
+/// A guard rather than a line at the end of the task, because the end is not the only way out: a
+/// runtime shutting down drops its tasks unfinished, at a suspension point or before their first
+/// poll. Tokio counts those as finished, and so must this — `is_finished` is what the executor's
+/// task sets and the system database's listener restart rely on, and a task that stayed
+/// unfinished forever would look running to them forever. The sender goes with the guard, and the
+/// joiner reads its going as a cancellation.
+struct Finish<T> {
+    shared: Arc<Shared>,
+    report: Option<oneshot::Sender<Result<T, JoinError>>>,
+}
+
+impl<T> Finish<T> {
+    fn complete(mut self, outcome: Result<T, JoinError>) {
+        self.shared.finished.store(true, Ordering::Release);
+        if let Some(report) = self.report.take() {
+            // Nobody joining is the ordinary case of a detached task.
+            let _ = report.send(outcome);
+        }
+    }
+}
+
+impl<T> Drop for Finish<T> {
+    fn drop(&mut self) {
+        self.shared.finished.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Default)]

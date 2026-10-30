@@ -272,6 +272,7 @@ mod tests {
         dropping_the_handle_detaches_the_task,
         an_aborted_task_is_dropped_and_reports_finished,
         a_panic_reaches_the_joiner,
+        a_panic_dropping_an_aborted_body_reaches_the_joiner,
         a_ready_future_beats_a_passed_deadline,
         a_sleep_waits_out_its_duration,
         an_unbounded_timeout_does_not_overflow,
@@ -316,6 +317,25 @@ mod tests {
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom"));
     }
 
+    async fn a_panic_dropping_an_aborted_body_reaches_the_joiner() {
+        struct PanicsOnDrop;
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                panic!("in drop");
+            }
+        }
+        let (started, running) = tokio::sync::oneshot::channel();
+        let task = super::spawn(async move {
+            let _guard = PanicsOnDrop;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        running.await.expect("the body started");
+        task.abort();
+        let payload = task.await.expect_err("it was aborted").into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"in drop"));
+    }
+
     async fn a_ready_future_beats_a_passed_deadline() {
         let past = Instant::now() - Duration::from_secs(1);
         assert_eq!(super::timeout_at(past, async { 1 }).await, Ok(1));
@@ -333,6 +353,37 @@ mod tests {
 
     async fn an_unbounded_timeout_does_not_overflow() {
         assert_eq!(super::timeout(Duration::MAX, async { 1 }).await, Ok(1));
+    }
+
+    /// Tokio only, because only tokio's runtime can be dropped: what a runtime shutting down does
+    /// to the tasks still on it, whether or not they have been polled.
+    #[test]
+    fn a_task_its_runtime_drops_reports_finished_and_cancelled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let (unpolled, polled) = runtime.block_on(async {
+            let unpolled = super::spawn(std::future::pending::<()>());
+            let polled = super::spawn(std::future::pending::<()>());
+            // Let the second one run to its first suspension; the first was spawned too, so
+            // whether it ran is the scheduler's business — the point is that one surely did.
+            super::sleep(std::time::Duration::from_millis(10)).await;
+            (unpolled, polled)
+        });
+        assert!(!unpolled.is_finished() && !polled.is_finished());
+        drop(runtime);
+        for task in [unpolled, polled] {
+            assert!(
+                task.is_finished(),
+                "a dropped task is finished, as tokio counts it"
+            );
+            let joined = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime")
+                .block_on(task);
+            assert!(joined.expect_err("it never completed").is_cancelled());
+        }
     }
 
     /// Tokio only: a current-thread runtime is what makes "before it starts" certain. On a global
