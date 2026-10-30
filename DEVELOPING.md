@@ -108,8 +108,11 @@ only, on each non-tokio runtime. The list is in the `test-runtimes` job of `ci.y
 locally, build with that runtime's feature and name it:
 
 ```bash
-DBOS_TEST_RUNTIME=smol cargo test -p dbos --features runtime-smol --test shutdown
+DBOS_TEST_RUNTIME=smol SMOL_THREADS=4 cargo test -p dbos --features runtime-smol --test shutdown
 ```
+
+`SMOL_THREADS` because smol's executor otherwise runs on a single thread, which hides the
+concurrency the other runtimes have.
 
 The feature is what makes `dbos` use smol outside tokio; the variable takes the test outside
 tokio. They must agree, and a test fails at once if they do not. In those binaries, spawn and

@@ -126,10 +126,20 @@ jobs:
       fail-fast: false
       matrix:
         runtime: [smol, async-global-executor]
+    env:
+      # smol's global executor runs one thread unless told otherwise, which would leave this leg
+      # testing far less concurrency than async-global-executor's, at a thread per CPU. Four is
+      # what a GitHub runner has. async-global-executor ignores it.
+      SMOL_THREADS: 4
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The runtime layer's own tests, which run each scenario off tokio too. The `test` job runs
+      # them with `--all-features`, where the fallback is async-global-executor and smol's
+      # backend is not even compiled, so this is the only place smol's is tested directly.
+      - name: Test the runtime layer
+        run: 'cargo test -p dbos --features runtime-${{ matrix.runtime }} --lib -- rt::'
       - name: Test
         env:
           DBOS_TEST_RUNTIME: ${{ matrix.runtime }}
