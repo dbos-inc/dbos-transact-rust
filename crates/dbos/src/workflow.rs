@@ -42,14 +42,14 @@ pub(crate) const MAX_RECOVERY_ATTEMPTS: i64 = 100;
 #[derive(Default)]
 pub(crate) struct Tasks {
     state: Mutex<State>,
-    /// Woken as each task's future is dropped, so [`quiet`](Tasks::quiet) can wait for the last one
-    /// out without polling for it.
+    /// Woken as each task's future is dropped, so [`all_ended`](Tasks::all_ended) can wait for the
+    /// last one out without polling for it.
     ended: tokio::sync::Notify,
 }
 
 #[derive(Default)]
 struct State {
-    /// Each task's abort handle, with what to call it in a log: the workflow id, for a workflow.
+    /// Each task's abort handle, with what to call it in a log: the workflow id, for an execution.
     running: Vec<(AbortHandle, String)>,
     /// How many spawned futures exist and have not been dropped.
     live: usize,
@@ -113,8 +113,8 @@ impl Tasks {
     ///
     /// Nothing is cancelled, at the deadline or before it: what is still running is left to
     /// [`abort_all`](Self::abort_all).
-    pub(crate) async fn quiet_by(&self, deadline: tokio::time::Instant) -> bool {
-        tokio::time::timeout_at(deadline, self.quiet())
+    pub(crate) async fn ended_by(&self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::timeout_at(deadline, self.all_ended())
             .await
             .is_ok()
     }
@@ -144,12 +144,12 @@ impl Tasks {
             }
             cancelled
         };
-        self.quiet().await;
+        self.all_ended().await;
         cancelled
     }
 
     /// Waits until no task's future is left alive.
-    async fn quiet(&self) {
+    async fn all_ended(&self) {
         loop {
             // Registered before the count is read, so a task ending in between is not missed:
             // `notify_waiters` wakes only those already waiting.
@@ -211,7 +211,7 @@ impl Drop for TaskGuard {
 /// count, and never misses it through both.
 ///
 /// `label` is what shutdown calls the task when it reports one it is waiting on or cancelled: the
-/// workflow id, for a workflow.
+/// workflow id, for an execution.
 pub(crate) fn spawn_tracked<F>(
     executor: &Arc<Executor>,
     role: Role,
@@ -1328,7 +1328,10 @@ where
         };
 
         let queue = options.queue.as_ref().map(|enqueue| enqueue.name);
-        match spawn_tracked(&executor, Role::Workflow, workflow_id.clone(), creating).await {
+        // Labelled apart from the execution it spawns, which carries the bare id: both can be
+        // running at once, and shutdown's logs would otherwise name the workflow twice.
+        let label = format!("start {workflow_id}");
+        match spawn_tracked(&executor, Role::Workflow, label, creating).await {
             Ok(started) => started.map_err(|error| refused_start(queue, error)),
             // Only shutdown aborts this task, and what the abort leaves behind depends on where
             // it landed. Before the transaction committed, nothing was written and the start did
@@ -2775,9 +2778,9 @@ mod tests {
     }
 
     /// The drain's wait: it gives up at the deadline without cancelling anything, and reports a
-    /// set that has emptied as quiet.
+    /// set that has emptied as ended.
     #[tokio::test]
-    async fn quiet_by_gives_up_at_the_deadline_and_cancels_nothing() {
+    async fn ended_by_gives_up_at_the_deadline_and_cancels_nothing() {
         let tasks = Tasks::default();
         tasks.arrived();
         let task = tokio::spawn(std::future::pending::<()>());
@@ -2785,15 +2788,15 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         assert!(
-            !tasks.quiet_by(deadline).await,
-            "a live task was reported quiet"
+            !tasks.ended_by(deadline).await,
+            "a live task was reported ended"
         );
         assert!(!task.is_finished(), "the wait cancelled the task");
         assert_eq!(tasks.running(), ["wf-slow"]);
 
         task.abort();
         tasks.departed();
-        assert!(tasks.quiet_by(tokio::time::Instant::now()).await);
+        assert!(tasks.ended_by(tokio::time::Instant::now()).await);
     }
 
     /// The race between spawning a workflow and registering it: one that arrives after the sweep

@@ -171,6 +171,9 @@ async fn a_draining_shutdown_lets_a_running_workflow_finish() {
 
 /// Once shutdown has begun, a workflow put on a queue stays there: the dequeue loop has stopped,
 /// though the instance is still launched and the enqueue itself succeeds.
+///
+/// The queue's worker is running before shutdown begins, so both halves of the loop are stopped
+/// here: the supervisor, which would spawn a worker, and the worker, which would claim the row.
 #[tokio::test]
 async fn nothing_is_dequeued_once_shutdown_begins() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
@@ -210,6 +213,22 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
     )
     .await
     .expect("queue registration failed");
+
+    // One run through the queue, so its worker exists by the time shutdown begins.
+    queued
+        .start_with(
+            (),
+            StartOptions {
+                queue: Some(Enqueue::new("drain-queue")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the warm-up enqueue failed")
+        .result()
+        .await
+        .expect("the warm-up run failed");
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
 
     // Something for the shutdown to wait on, so it is still draining when the enqueue lands.
     let holding = tokio::spawn(async move { holder.run(()).await });
@@ -261,7 +280,7 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
         .expect("the task panicked")
         .expect("the holder failed");
 
-    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "only the warm-up ran");
     let row = reader
         .get_workflow(id)
         .await

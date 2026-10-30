@@ -234,10 +234,10 @@ impl Executor {
     /// Stops this executor starting workflows, waits up to `workflow_completion_timeout` for those
     /// running to finish, and cancels whatever is still running at the deadline.
     ///
-    /// The first half of shutdown; [`close`](Self::close) is the second. Here rather than in
-    /// [`DBOS::shutdown_with`] because this is where the things being stopped live. Teardown that
-    /// grows a step at a time wants one place to grow, which is also how Java draws it —
-    /// `DBOS.shutdown()` calls `DBOSExecutor.close()` and knows nothing about what that entails.
+    /// The first half of shutdown; [`close`](Self::close) is the second, and the instance stops
+    /// holding the executor between the two. Here rather than in [`DBOS::shutdown_with`] because
+    /// this is where the things being stopped live, and teardown that grows a step at a time
+    /// wants one place to grow.
     ///
     /// **The producers stop first**, so the set being drained cannot grow underneath the drain: a
     /// dequeue that had already claimed work when shutdown began starts it, and that workflow is
@@ -264,7 +264,7 @@ impl Executor {
             // Waited on before the drain, not alongside it: a dequeue mid-dispatch is about to add
             // to the set the drain is watching, and a drain that saw it empty first would finish
             // before that workflow started.
-            if self.producer_tasks.quiet_by(deadline).await {
+            if self.producer_tasks.ended_by(deadline).await {
                 self.drain(deadline).await;
             }
         }
@@ -309,7 +309,7 @@ impl Executor {
     async fn drain(&self, deadline: tokio::time::Instant) {
         loop {
             let report_at = (tokio::time::Instant::now() + DRAIN_REPORT_INTERVAL).min(deadline);
-            if self.workflow_tasks.quiet_by(report_at).await || report_at >= deadline {
+            if self.workflow_tasks.ended_by(report_at).await || report_at >= deadline {
                 return;
             }
             let running = self.workflow_tasks.running();
@@ -547,7 +547,8 @@ impl DBOS {
     /// can still call into it.
     ///
     /// A workflow that waits on a child it *enqueued* waits out the timeout: the child is not
-    /// dequeued here once shutdown has begun.
+    /// dequeued here once shutdown has begun. So does a workflow that calls this itself, since it
+    /// is one of the workflows being waited for; it is then cancelled and stays `PENDING`.
     ///
     /// **Idempotent**: shutting down an instance that is not launched does nothing, and a second
     /// call made while the first is waiting returns once the first has finished.
