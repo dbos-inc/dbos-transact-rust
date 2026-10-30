@@ -264,7 +264,7 @@ impl Executor {
             // Waited on before the drain, not alongside it: a dequeue mid-dispatch is about to add
             // to the set the drain is watching, and a drain that saw it empty first would finish
             // before that workflow started.
-            if self.producer_tasks.ended_by(deadline).await {
+            if self.producer_tasks.wait_until(deadline).await {
                 self.drain(deadline).await;
             }
         }
@@ -309,7 +309,7 @@ impl Executor {
     async fn drain(&self, deadline: tokio::time::Instant) {
         loop {
             let report_at = (tokio::time::Instant::now() + DRAIN_REPORT_INTERVAL).min(deadline);
-            if self.workflow_tasks.ended_by(report_at).await || report_at >= deadline {
+            if self.workflow_tasks.wait_until(report_at).await || report_at >= deadline {
                 return;
             }
             let running = self.workflow_tasks.running();
