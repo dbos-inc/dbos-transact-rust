@@ -39,6 +39,12 @@
 //! integration test binaries, so anything it tests has to be `pub` — the crate boundary,
 //! not the design, would decide the public API. As a dev-dependency it is reachable from
 //! `#[cfg(test)]` code in `src/` too, which is where a test of a crate-private thing belongs.
+//!
+//! **The harness runs under any async runtime**, because some tests run on more than one:
+//! [`test`] picks the runtime from `DBOS_TEST_RUNTIME` (see [`block_on`]). That rules out
+//! tokio-only calls here, including testcontainers' async API, whose container removal needs a
+//! tokio runtime. Its blocking API carries a private tokio runtime of its own instead, and the
+//! harness drives it from a thread of its own; see `off_runtime`.
 
 use std::future::Future;
 use std::io::Write;
@@ -52,8 +58,8 @@ use sqlx::AssertSqlSafe;
 use sqlx::ConnectOptions;
 use sqlx::postgres::PgConnectOptions;
 use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 use tokio::sync::Mutex;
 
 /// Pinned: what Go and TypeScript run CI against, and the oldest server the migrations
@@ -466,7 +472,7 @@ pub struct TestServer {
     /// What this server spent, written out when it shuts down. See [`TIMINGS_ENV`].
     timings: Timings,
     /// Held to keep the container alive; removal is tied to this field's `Drop`.
-    _container: ContainerAsync<GenericImage>,
+    _container: ServerContainer,
 }
 
 impl Drop for TestServer {
@@ -518,6 +524,84 @@ impl<T> Default for SharedSlot<T> {
 }
 
 static SHARED: SharedSlot<TestServer> = SharedSlot::new();
+
+/// A container from testcontainers' blocking API, removed off any async runtime when dropped.
+///
+/// Dropping a [`Container`] removes it through its private tokio runtime's `block_on`, which
+/// panics inside another tokio runtime — and the last test to let go of the server is inside one.
+struct ServerContainer(Option<Container<GenericImage>>);
+
+impl ServerContainer {
+    fn get(&self) -> &Container<GenericImage> {
+        self.0.as_ref().expect("present until dropped")
+    }
+
+    fn id(&self) -> &str {
+        self.get().id()
+    }
+}
+
+impl Drop for ServerContainer {
+    fn drop(&mut self) {
+        if let Some(container) = self.0.take() {
+            off_runtime(move || drop(container));
+        }
+    }
+}
+
+/// Runs `work` on a thread of its own, and waits for it.
+///
+/// For testcontainers' blocking API, every call of which is a `block_on` on its private tokio
+/// runtime and so panics on a thread already inside a tokio runtime. A fresh thread is inside
+/// none, whichever runtime the test is on. The caller's thread is blocked meanwhile, which is a
+/// test's own thread with nothing else to do.
+fn off_runtime<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| match scope.spawn(work).join() {
+        Ok(output) => output,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
+/// The environment variable naming the runtime a [`test`] runs on: `tokio` (the default, also
+/// when unset), `smol`, or `async-global-executor`.
+///
+/// Anything but tokio runs the test outside tokio, where `dbos` falls back to the non-tokio
+/// runtime it was built with — which depends on its features, not on this variable. So a
+/// non-tokio value is a claim about the build, and [`block_on`] checks it: a run that says `smol`
+/// but would land on another runtime fails rather than passing on the wrong one.
+pub const RUNTIME_ENV: &str = "DBOS_TEST_RUNTIME";
+
+/// Runs an `async fn` test on an async test attribute's behalf: on tokio, or on `dbos`'s
+/// non-tokio runtime, as [`RUNTIME_ENV`] says.
+///
+/// Tokio's is a current-thread runtime, the same one `#[tokio::test]` builds, so a test moved
+/// from that attribute to [`test`] runs exactly as before unless told otherwise. Off tokio the
+/// test body runs on the calling thread under `async-io`, and what it spawns goes to the
+/// runtime's global executor. async-global-executor's runs a thread per CPU; smol's runs one
+/// unless `SMOL_THREADS` asks for more, which CI's smol leg does.
+pub fn block_on<F: Future>(test: F) -> F::Output {
+    match std::env::var(RUNTIME_ENV).ok().as_deref() {
+        None | Some("" | "tokio") => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build a tokio runtime")
+            .block_on(test),
+        Some(runtime) => {
+            let fallback = dbos::__rt::fallback();
+            assert_eq!(
+                fallback,
+                Some(runtime),
+                "{RUNTIME_ENV}={runtime}, but outside tokio this build of dbos runs on \
+                 {fallback:?}: build it with `--features runtime-{runtime}` and no other non-tokio \
+                 runtime"
+            );
+            async_io::block_on(test)
+        }
+    }
+}
+
+/// Runs an `async fn` test through [`block_on`], on the runtime [`RUNTIME_ENV`] names.
+pub use dbos_test_macros::test;
 
 /// The CockroachDB schema dump, kept for the life of the process rather than the server.
 ///
@@ -602,56 +686,61 @@ impl TestServer {
     async fn start(backend: Backend) -> Self {
         let timings = Timings::new();
         let booting = Instant::now();
-        let container = match backend {
-            Backend::Postgres => {
-                GenericImage::new(POSTGRES_IMAGE.0, POSTGRES_IMAGE.1)
-                    .with_exposed_port(POSTGRES_PORT.tcp())
-                    // The readiness poll below is the real gate. This message is only a
-                    // cheap first filter: Postgres logs it once while initialising the
-                    // data directory and again once it is actually listening, so waiting
-                    // on it alone is a well-known way to connect too early.
-                    .with_wait_for(WaitFor::message_on_stderr(
-                        "database system is ready to accept connections",
-                    ))
-                    .with_env_var("POSTGRES_PASSWORD", "dbos")
-                    .with_labels([CONTAINER_LABEL])
-                    .start()
-                    .await
-            }
-            Backend::Cockroach => {
-                GenericImage::new(COCKROACH_IMAGE.0, COCKROACH_IMAGE.1)
-                    .with_exposed_port(COCKROACH_PORT.tcp())
-                    // An in-memory store, because nothing here outlives the container and
-                    // CockroachDB's cost is dominated by DDL: the corpus is dozens of online
-                    // schema changes, replayed in full to build a process's baseline and again
-                    // for every migration test. Measured at roughly half the CockroachDB leg's
-                    // wall clock, and two seconds off container startup besides.
-                    //
-                    // The size is a ceiling rather than a reservation. The suite's data is a few
-                    // thousand rows; the headroom is for CockroachDB's own system ranges and the
-                    // MVCC garbage a run leaves behind.
-                    .with_cmd([
-                        "start-single-node",
-                        "--insecure",
-                        "--store=type=mem,size=2GiB",
-                    ])
-                    .with_labels([CONTAINER_LABEL])
-                    .start()
-                    .await
-            }
-        }
-        .expect("failed to start the database container — is Docker running?");
+        // Wrapped before anything else can fail, so that a panic from here on drops it off the
+        // runtime rather than on this thread, where removal would panic again mid-unwind.
+        let container = ServerContainer(Some(
+            off_runtime(move || match backend {
+                Backend::Postgres => {
+                    GenericImage::new(POSTGRES_IMAGE.0, POSTGRES_IMAGE.1)
+                        .with_exposed_port(POSTGRES_PORT.tcp())
+                        // The readiness poll below is the real gate. This message is only a
+                        // cheap first filter: Postgres logs it once while initialising the
+                        // data directory and again once it is actually listening, so waiting
+                        // on it alone is a well-known way to connect too early.
+                        .with_wait_for(WaitFor::message_on_stderr(
+                            "database system is ready to accept connections",
+                        ))
+                        .with_env_var("POSTGRES_PASSWORD", "dbos")
+                        .with_labels([CONTAINER_LABEL])
+                        .start()
+                }
+                Backend::Cockroach => {
+                    GenericImage::new(COCKROACH_IMAGE.0, COCKROACH_IMAGE.1)
+                        .with_exposed_port(COCKROACH_PORT.tcp())
+                        // An in-memory store, because nothing here outlives the container and
+                        // CockroachDB's cost is dominated by DDL: the corpus is dozens of online
+                        // schema changes, replayed in full to build a process's baseline and again
+                        // for every migration test. Measured at roughly half the CockroachDB leg's
+                        // wall clock, and two seconds off container startup besides.
+                        //
+                        // The size is a ceiling rather than a reservation. The suite's data is a few
+                        // thousand rows; the headroom is for CockroachDB's own system ranges and the
+                        // MVCC garbage a run leaves behind.
+                        .with_cmd([
+                            "start-single-node",
+                            "--insecure",
+                            "--store=type=mem,size=2GiB",
+                        ])
+                        .with_labels([CONTAINER_LABEL])
+                        .start()
+                }
+            })
+            .expect("failed to start the database container — is Docker running?"),
+        ));
         Timings::add(&timings.boot_nanos, booting.elapsed());
 
-        let host = container
-            .get_host()
-            .await
-            .expect("container host unavailable")
-            .to_string();
-        let port = container
-            .get_host_port_ipv4(backend.port())
-            .await
-            .expect("container port unavailable");
+        let (host, port) = off_runtime(|| {
+            let host = container
+                .get()
+                .get_host()
+                .expect("container host unavailable")
+                .to_string();
+            let port = container
+                .get()
+                .get_host_port_ipv4(backend.port())
+                .expect("container port unavailable");
+            (host, port)
+        });
 
         let server = TestServer {
             backend,
@@ -686,7 +775,7 @@ impl TestServer {
                 }
                 Err(e) => last_error = Some(e),
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
         panic!(
             "{:?} did not accept connections within {:?}: {}",
@@ -775,7 +864,7 @@ impl TestServer {
                 // `object_in_use` — someone is still connected to the template.
                 Err(e) if template.is_some() && has_code(&e, "55006") => {
                     last_error = Some(e);
-                    tokio::time::sleep(TEMPLATE_RETRY_WAIT).await;
+                    dbos::__rt::sleep(TEMPLATE_RETRY_WAIT).await;
                 }
                 Err(e) => panic!("failed to create database {name}: {e}"),
             }

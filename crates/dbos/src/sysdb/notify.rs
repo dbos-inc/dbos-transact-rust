@@ -337,7 +337,7 @@ mod tests {
         // Woken by the other pair's write. The waiter re-checks the database and finds nothing for
         // itself, which is what a hint-only wakeup licenses.
         registry.wake(&message_key("a::b", Some("c")));
-        tokio::time::timeout(Duration::from_secs(5), waiter.notified())
+        crate::rt::timeout(Duration::from_secs(5), waiter.notified())
             .await
             .expect("a colliding key should still wake, harmlessly");
     }
@@ -388,12 +388,12 @@ mod tests {
     async fn a_parked_waiter_is_woken_by_a_later_write() {
         let registry = Arc::new(Registry::default());
         let mut subscription = registry.subscribe(event_key("wf-1", "k"));
-        let waiting = tokio::spawn(async move { subscription.notified().await });
+        let waiting = crate::rt::spawn(async move { subscription.notified().await });
         // Long enough for the task to be parked rather than not yet scheduled.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        crate::rt::sleep(Duration::from_millis(50)).await;
 
         registry.wake(&event_key("wf-1", "k"));
-        tokio::time::timeout(Duration::from_secs(5), waiting)
+        crate::rt::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("a parked waiter was never woken")
             .unwrap();
@@ -411,7 +411,7 @@ mod tests {
         // The write lands here — after the subscription, before the wait.
         registry.wake(&event_key("wf-1", "k"));
 
-        tokio::time::timeout(Duration::from_secs(5), subscription.notified())
+        crate::rt::timeout(Duration::from_secs(5), subscription.notified())
             .await
             .expect("a wakeup during the look was dropped");
     }

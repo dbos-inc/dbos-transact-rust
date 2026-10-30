@@ -82,11 +82,82 @@ jobs:
     # `-p dbos` because the check is about one crate: run over the workspace, any member
     # asking for `dbos`'s defaults would unify `engine` back on and the gate would pass
     # whatever happened. `dbos-test-support` declines them for the same reason.
+    #
+    # A runtime is named because the crate needs one whatever else is off; the runtime is not
+    # part of the engine, so naming it leaves the boundary being checked where it was.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p dbos --no-default-features
+      - run: cargo check -p dbos --no-default-features --features runtime-tokio
+
+  runtimes:
+    name: Builds on ${{ matrix.runtime }}
+    runs-on: ubuntu-latest
+    # The non-tokio runtimes, each alone, with and without the engine. Alone is the point: tokio
+    # leaves the build with `tokio/time`, so a `tokio::time` call that bypassed `crate::rt` fails to
+    # compile here, where everywhere else it would compile and only panic at run time on another
+    # runtime. Not `--all-targets`, whose dev-dependencies would put `tokio/time` back.
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [smol, async-global-executor]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p dbos --no-default-features --features engine,macros,runtime-${{ matrix.runtime }}
+      - run: cargo check -p dbos --no-default-features --features runtime-${{ matrix.runtime }}
+
+  test-runtimes:
+    name: Test on ${{ matrix.runtime }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # A subset of the suite, against Postgres only, on each non-tokio runtime. What varies by
+    # runtime is spawning, timers and the task handles built over them, so the subset is the
+    # binaries that lean on those: the lifecycle and shutdown, recovery, the dequeue loop and the
+    # scheduler, timeouts and durable sleep, and the notification paths. The rest of the suite
+    # exercises the database far more than the runtime, and runs on tokio in `test`.
+    #
+    # Each of these binaries' tests uses `#[dbos_test_support::test]`, which runs it where
+    # `DBOS_TEST_RUNTIME` says and fails if the build would put it anywhere else. Adding a binary
+    # here means moving its tests to that attribute, its spawns and timers to `dbos::__rt`, and
+    # adding the `#![deny]` of clippy's disallowed lints the others carry.
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [smol, async-global-executor]
+    env:
+      # smol's global executor runs one thread unless told otherwise, which would leave this leg
+      # testing far less concurrency than async-global-executor's, at a thread per CPU. Four is
+      # what a GitHub runner has. async-global-executor ignores it.
+      SMOL_THREADS: 4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The runtime layer's own tests, which run each scenario off tokio too. The `test` job runs
+      # them with `--all-features`, where the fallback is async-global-executor and smol's
+      # backend is not even compiled, so this is the only place smol's is tested directly.
+      - name: Test the runtime layer
+        run: 'cargo test -p dbos --features runtime-${{ matrix.runtime }} --lib -- rt::'
+      - name: Test
+        env:
+          DBOS_TEST_RUNTIME: ${{ matrix.runtime }}
+        run: >-
+          cargo test -p dbos --features runtime-${{ matrix.runtime }} --no-fail-fast
+          --test events --test handles --test lifecycle --test messages --test queues
+          --test recovery --test schedules --test shutdown --test sleep --test timeouts
+          --test workflows
+      - name: No containers left behind
+        run: |
+          filter='label=dev.dbos.test-harness=true'
+          remaining=$(docker ps -aq --filter "$filter" | wc -l)
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::$remaining test container(s) left behind by the suite"
+            docker ps -a --filter "$filter"
+            exit 1
+          fi
 
   test:
     name: Test (${{ matrix.backend }})

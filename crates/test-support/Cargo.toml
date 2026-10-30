@@ -16,13 +16,20 @@ publish = false
 # `default-features = false` is load-bearing, not tidiness: `cargo check --no-default-features`
 # selects every workspace member, and a request for `dbos`'s defaults from here would unify
 # `engine` back on and leave the boundary gate asserting nothing. The harness needs only the
-# system database layer, which is the half that gate exists to protect.
-dbos = { path = "../dbos", default-features = false }
+# system database layer, which is the half that gate exists to protect — and a runtime, which
+# that layer needs as much as the engine does.
+dbos = { path = "../dbos", default-features = false, features = ["runtime-tokio"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
 ] }
 serde_json = "1"
-testcontainers = "0.27"
-tokio = { version = "1", features = ["time", "sync"] }
+# The blocking API, which carries a tokio runtime of its own rather than needing the caller's: what
+# lets the harness serve a test on a runtime that is not tokio.
+testcontainers = { version = "0.27", features = ["blocking"] }
+# `rt` for the runtime a tokio test runs on; `sync` for the harness's own locks, which run on any.
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+# What a test off tokio is driven with; `dbos`'s non-tokio runtimes take their timers from it too.
+async-io = "2.4"
+dbos-test-macros = { path = "../test-macros" }

@@ -1,5 +1,9 @@
 //! Running workflows, against real databases.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,7 +44,7 @@ async fn greet(_: ()) -> dbos::Result<String> {
 
 /// `WorkflowIdReusePolicy::Reject` refuses a start or an enqueue whose id is taken, even by a
 /// finished workflow, and runs nothing; the default joins the workflow that has it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_rejecting_start_or_enqueue_refuses_a_taken_id() {
     let db = test_database().await;
     let dbos = DBOS::new(config("reuse-policy-app", &db));
@@ -128,7 +132,7 @@ async fn a_rejecting_start_or_enqueue_refuses_a_taken_id() {
 }
 
 /// The ordinary case: a workflow runs, returns, and its row records what it returned.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflow_runs_and_records_its_output() {
     let db = test_database().await;
     let dbos = DBOS::new(config("run-app", &db));
@@ -161,7 +165,7 @@ async fn a_workflow_runs_and_records_its_output() {
 
 /// A value only the insert checks is refused as the start's argument too: to "start a workflow"
 /// for a start that names no queue, and with nothing written.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_start_with_an_empty_workflow_id_is_refused_as_an_argument() {
     let db = test_database().await;
     let dbos = DBOS::new(config("empty-id-app", &db));
@@ -200,7 +204,7 @@ async fn a_start_with_an_empty_workflow_id_is_refused_as_an_argument() {
 /// Searchable metadata is a property of the workflow rather than of the queue it waited on, and
 /// TypeScript and Python both attach it on the start path too. The child is here because nothing
 /// propagates: a child carries what its own call names, and this one names nothing.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_started_workflow_carries_the_attributes_it_was_given() {
     let db = test_database().await;
     let dbos = DBOS::new(config("attributes-app", &db));
@@ -258,7 +262,7 @@ async fn a_started_workflow_carries_the_attributes_it_was_given() {
 }
 
 /// A zero-argument workflow stores no input, and must not need a literal `null` to run.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_zero_argument_workflow_records_no_input() {
     let db = test_database().await;
     let dbos = DBOS::new(config("noarg-app", &db));
@@ -286,7 +290,7 @@ async fn a_zero_argument_workflow_records_no_input() {
 ///
 /// This is the point of the error being a type parameter: `CardDeclined` comes back as
 /// `CardDeclined`, matchable, rather than as a name and a message describing it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_application_error_type_round_trips_as_itself() {
     // Two derives and nothing else. No variant holding a `dbos::Error`, no `From` impl, no trait
     // to implement: the engine wraps this type rather than this type making room for the engine.
@@ -343,7 +347,7 @@ async fn an_application_error_type_round_trips_as_itself() {
 /// The case a library error lands in: a third party's type has no serde derives and cannot cross a
 /// column, so it becomes the workflow's own error where the two meet. One `map_err` at the call
 /// site, and everything downstream — the row, the replay, the caller — gets full fidelity.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_foreign_error_is_converted_at_the_boundary() {
     // Somebody else's error type: `Debug + Display` and nothing more.
     #[derive(Debug, thiserror::Error)]
@@ -408,7 +412,7 @@ async fn a_foreign_error_is_converted_at_the_boundary() {
 /// through the workflow body, and the workflow had not failed — the database had. Recording ERROR
 /// would assert something false about work that could still be finished, and the row is the only
 /// copy of that fact.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_database_failure_is_not_the_workflows_outcome() {
     async fn blips(_: ()) -> dbos::Result<()> {
         Err(Error::SystemDatabase(dbos::sysdb::Error::Backend(
@@ -448,7 +452,7 @@ async fn a_database_failure_is_not_the_workflows_outcome() {
 }
 
 /// Steps inside a real `run` are checkpointed under the workflow that ran them.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflow_records_the_steps_it_took() {
     async fn three_steps(_: ()) -> dbos::Result<u32> {
         let mut total = 0;
@@ -491,7 +495,7 @@ async fn a_workflow_records_the_steps_it_took() {
 }
 
 /// A step's error type round-trips the same way, so a replay resumes with the error it recorded.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_step_error_type_round_trips_as_itself() {
     #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
     enum ChargeError {
@@ -552,7 +556,7 @@ async fn a_step_error_type_round_trips_as_itself() {
 ///
 /// The row staying PENDING is the point — a panic is treated as a crash, not a failure, so a
 /// later executor recovers the workflow instead of it being permanently failed by a bug.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_panicking_workflow_leaves_its_row_pending() {
     async fn explodes(_: ()) -> dbos::Result<()> {
         panic!("a bug, not an outcome")
@@ -564,7 +568,7 @@ async fn a_panicking_workflow_leaves_its_row_pending() {
     dbos.launch().await.expect("launch failed");
 
     // On its own task, because the panic is re-raised in the awaiting caller.
-    let joined = tokio::spawn(async move { explodes.run(()).await }).await;
+    let joined = dbos::__rt::spawn(async move { explodes.run(()).await }).await;
     let panicked = joined.expect_err("the panic must reach the awaiting caller");
     assert!(panicked.is_panic(), "{panicked}");
 
@@ -584,7 +588,7 @@ async fn a_panicking_workflow_leaves_its_row_pending() {
 }
 
 /// The workflow is recorded before its body runs, which is what makes a crash recoverable.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn the_row_exists_before_the_body_starts() {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -605,7 +609,7 @@ async fn the_row_exists_before_the_body_starts() {
     };
     dbos.launch().await.expect("launch failed");
 
-    let running = tokio::spawn(async move { blocked.run(()).await });
+    let running = dbos::__rt::spawn(async move { blocked.run(()).await });
     started.notified().await;
 
     let rows = reader(&db)
@@ -629,7 +633,7 @@ async fn the_row_exists_before_the_body_starts() {
 }
 
 /// Shutdown cancels what is still running and leaves it PENDING for a later executor.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn shutdown_cancels_a_running_workflow_and_leaves_it_pending() {
     let started = Arc::new(tokio::sync::Notify::new());
     let finished = Arc::new(AtomicU32::new(0));
@@ -642,7 +646,7 @@ async fn shutdown_cancels_a_running_workflow_and_leaves_it_pending() {
             let (started, finished) = (Arc::clone(&started), Arc::clone(&finished));
             async move {
                 started.notify_one();
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                dbos::__rt::sleep(Duration::from_secs(3600)).await;
                 finished.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, dbos::Error>(())
             }
@@ -651,7 +655,7 @@ async fn shutdown_cancels_a_running_workflow_and_leaves_it_pending() {
     };
     dbos.launch().await.expect("launch failed");
 
-    let running = tokio::spawn(async move { forever.run(()).await });
+    let running = dbos::__rt::spawn(async move { forever.run(()).await });
     started.notified().await;
 
     dbos.shutdown().await;
@@ -680,7 +684,7 @@ async fn shutdown_cancels_a_running_workflow_and_leaves_it_pending() {
 
 /// Dropping the returned future does not stop the workflow — awaiting is a convenience over a
 /// durable run, not the thing that makes it durable.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn dropping_the_future_does_not_stop_the_workflow() {
     let started = Arc::new(tokio::sync::Notify::new());
     let db = test_database().await;
@@ -691,7 +695,7 @@ async fn dropping_the_future_does_not_stop_the_workflow() {
             let started = Arc::clone(&started);
             async move {
                 started.notify_one();
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                dbos::__rt::sleep(Duration::from_millis(200)).await;
                 Ok::<_, dbos::Error>(7u32)
             }
         })
@@ -710,7 +714,7 @@ async fn dropping_the_future_does_not_stop_the_workflow() {
 
     let reader = reader(&db).await;
     for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        dbos::__rt::sleep(Duration::from_millis(100)).await;
         let rows = reader
             .list_workflows(&Default::default(), None)
             .await
@@ -725,7 +729,7 @@ async fn dropping_the_future_does_not_stop_the_workflow() {
 }
 
 /// A workflow started against an instance that is not launched is an error, not a panic.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn running_before_launch_is_refused() {
     let db = test_database().await;
     let dbos = DBOS::new(config("unlaunched-app", &db));

@@ -48,18 +48,27 @@ cargo deny check
 
 ## Features
 
-`dbos` has two features, both on by default:
+`dbos` has three default features:
 
 | Feature | Covers |
 | --- | --- |
 | `engine` | The durable execution engine: lifecycle, registry, contexts, workflows, steps, events, recovery, queues, scheduler, messaging, client |
 | `macros` | Re-exports the attribute macros and `select_step!` from `dbos-macros`. Implies `engine` |
+| `runtime-tokio` | The async runtime the crate spawns tasks and sets timers on. A runtime is required, with or without `engine` |
+
+`runtime-smol` and `runtime-async-global-executor` are the off-by-default alternatives. Several
+may be enabled at once: tokio is used when the caller is in a tokio runtime, and otherwise
+`async-global-executor`, then smol.
+
+Spawning and timers go through `crate::rt`, never tokio directly. `crates/dbos/clippy.toml` lists
+what that rules out, and `cargo clippy` enforces it for the library (the integration tests are
+exempt).
 
 With `engine` off, what remains is the system database and Conductor layers, the surface a future
 FFI host would consume. That boundary is a standing CI gate rather than a convention:
 
 ```bash
-cargo check -p dbos --no-default-features
+cargo check -p dbos --no-default-features --features runtime-tokio
 ```
 
 Note the `-p dbos`. Run over the whole workspace, any member asking for `dbos`'s default features
@@ -77,11 +86,12 @@ Each file under `crates/dbos/tests/` compiles to its own binary, and the first t
 rest, so CI passes `--no-fail-fast`. Use it locally too when you want the whole picture rather
 than the first failure.
 
-The harness recognises three environment variables:
+The harness recognises four environment variables:
 
 | Variable | Effect |
 | --- | --- |
 | `DBOS_TEST_USE_COCKROACH_DB` | Run against CockroachDB instead of Postgres. Both are required backends and CI runs both legs |
+| `DBOS_TEST_RUNTIME` | Run `#[dbos_test_support::test]` tests on `tokio` (the default), `smol` or `async-global-executor`. See below |
 | `DBOS_TEST_TIMINGS` | Write per-binary setup costs as JSON lines to the given path |
 | `DBOS_TEST_NO_BASELINE_CACHE` | Skip the cached schema baseline and migrate from scratch. The escape hatch for anything that smells like a schema difference |
 
@@ -89,6 +99,26 @@ The CockroachDB leg is worth knowing about even if you rarely run it locally, si
 already caught integer-width divergences that reading the SQL would not have surfaced. It is also
 the slower leg by a wide margin, because its cost is baseline migration per test binary rather
 than the queries themselves.
+
+### Other runtimes
+
+Most tests use `#[tokio::test]` and run on tokio only. The binaries that exercise spawning and
+timers hardest use `#[dbos_test_support::test]` instead, and CI also runs them, against Postgres
+only, on each non-tokio runtime. The list is in the `test-runtimes` job of `ci.yml`. To run one
+locally, build with that runtime's feature and name it:
+
+```bash
+DBOS_TEST_RUNTIME=smol SMOL_THREADS=4 cargo test -p dbos --features runtime-smol --test shutdown
+```
+
+`SMOL_THREADS` because smol's executor otherwise runs on a single thread, which hides the
+concurrency the other runtimes have.
+
+The feature is what makes `dbos` use smol outside tokio; the variable takes the test outside
+tokio. They must agree, and a test fails at once if they do not. In those binaries, spawn and
+sleep through `dbos::__rt` rather than tokio, which would panic off tokio; each denies clippy's
+`disallowed_methods` and `disallowed_types`, so `cargo clippy` enforces it. `tokio::sync`,
+`select!` and `join!` are fine anywhere.
 
 The harness shares one container by reference count and removes it when the last test drops it.
 CI asserts that nothing is left behind, filtering on the `dev.dbos.test-harness` label the

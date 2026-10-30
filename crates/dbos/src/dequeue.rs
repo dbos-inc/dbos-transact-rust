@@ -174,7 +174,7 @@ pub(crate) fn spawn(executor: Arc<Executor>) {
 async fn supervise(executor: Arc<Executor>) {
     let queues: Queues = Arc::default();
     let running: Arc<Running> = Arc::default();
-    let mut workers: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut workers: HashMap<String, crate::rt::JoinHandle<()>> = HashMap::new();
     // Once, not once a second: the row is a standing misconfiguration, so every sweep would find
     // it again. TypeScript keeps a `conflictWarned` set for its own queue-name collision warning
     // for the same reason.
@@ -1048,18 +1048,18 @@ mod tests {
         let ran = |n: u32| {
             let runs = Arc::clone(&runs);
             async move {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 while runs.load(Ordering::SeqCst) < n {
                     assert!(
-                        tokio::time::Instant::now() < deadline,
+                        std::time::Instant::now() < deadline,
                         "run {n} never started"
                     );
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    crate::rt::sleep(Duration::from_millis(20)).await;
                 }
             }
         };
         ran(1).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        crate::rt::sleep(Duration::from_millis(300)).await;
         let held = row().await;
         assert_eq!(
             held.status,
@@ -1072,13 +1072,13 @@ mod tests {
             .await
             .unwrap();
         ran(2).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while row().await.status != WorkflowStatus::Success {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                std::time::Instant::now() < deadline,
                 "the owner's run never recorded its outcome"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            crate::rt::sleep(Duration::from_millis(20)).await;
         }
         dbos.shutdown().await;
     }

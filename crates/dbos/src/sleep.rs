@@ -91,7 +91,7 @@ where
                     duration_ms = duration.as_millis(),
                     "the sleep is not checkpointed: it is outside a workflow, or inside a step"
                 );
-                tokio::time::sleep(duration).await;
+                crate::rt::sleep(duration).await;
                 return Ok(());
             };
 
@@ -118,7 +118,7 @@ where
                 remaining_ms = remaining.as_millis(),
                 "sleeping until the recorded wake time"
             );
-            tokio::time::sleep(remaining).await;
+            crate::rt::sleep(remaining).await;
             Ok(())
         },
     )

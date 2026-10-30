@@ -510,7 +510,7 @@ where
                     "the step failed and will be retried"
                 );
                 failures.push(error);
-                tokio::time::sleep(backoff).await;
+                crate::rt::sleep(backoff).await;
             }
         }
     };
@@ -694,7 +694,7 @@ where
     // whole `select!` for each combination of watchdogs.
     let deadline = async {
         match options.timeout {
-            Some(timeout) => tokio::time::sleep(timeout).await,
+            Some(timeout) => crate::rt::sleep(timeout).await,
             None => std::future::pending().await,
         }
     };

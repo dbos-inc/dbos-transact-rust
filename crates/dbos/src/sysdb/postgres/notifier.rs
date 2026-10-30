@@ -173,7 +173,7 @@ impl Notifier {
             // a stop can cut it short — with a long window configured, a close would otherwise sit
             // here waiting it out. Nothing else ends it early: `signal` notifies for the payload
             // that *opens* a batch, and this one is already open.
-            let _ = tokio::time::timeout(self.interval, self.woken.notified()).await;
+            let _ = crate::rt::timeout(self.interval, self.woken.notified()).await;
             self.flush().await;
         }
         // Whatever the window was still holding, so a value written just before a shutdown wakes
@@ -318,7 +318,7 @@ mod tests {
 
         assert!(drained(&notifier).is_empty(), "nothing drains this queue");
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), subscription.notified())
+            crate::rt::timeout(Duration::from_secs(5), subscription.notified())
                 .await
                 .is_ok(),
             "the waiter was not woken",

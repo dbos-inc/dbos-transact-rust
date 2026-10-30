@@ -680,10 +680,10 @@ mod tests {
                                 .iter()
                                 .all(|step| step.step_id != 0)
                             {
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                crate::rt::sleep(std::time::Duration::from_millis(10)).await;
                             }
                         };
-                        tokio::time::timeout(std::time::Duration::from_secs(10), recorded)
+                        crate::rt::timeout(std::time::Duration::from_secs(10), recorded)
                             .await
                             .expect("the sleep never recorded its row");
                         Ok::<_, crate::Error>("hello".to_owned())

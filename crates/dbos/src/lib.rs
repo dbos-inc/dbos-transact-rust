@@ -58,13 +58,23 @@
 //! - `macros` *(default)* — [`select_step!`], the durable race, which is a procedural macro and so
 //!   costs `syn` and `quote` at build time. Implies `engine`, because the expansion is engine
 //!   code; nothing it generates reaches the binary.
+//! - `runtime-tokio` *(default)*, `runtime-smol`, `runtime-async-global-executor` — the async
+//!   runtime the crate spawns its background tasks and sets its timers on, which it needs one of.
+//!   Several may be enabled: tokio is used when the caller is in a tokio runtime, and otherwise
+//!   `async-global-executor`, then smol.
 
 #![forbid(unsafe_code)]
+// Spawning and timers go through `rt`, which picks the runtime; `clippy.toml` names what that
+// rules out everywhere else. Denied here rather than left at clippy's default so the rule holds
+// for this crate's own code, and not for the integration tests under `tests/` that run on tokio
+// only; see the `[lints.clippy]` table in `Cargo.toml`.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 // A procedural macro has no `$crate`, so `select_step!`'s expansion names `::dbos` absolutely;
 // this is what lets that path resolve inside this crate's own tests and doctests.
 extern crate self as dbos;
 
+mod rt;
 pub mod sysdb;
 
 #[cfg(feature = "engine")]
@@ -332,6 +342,19 @@ pub use workflow::{
     DuplicationPolicy, Enqueue, PendingRun, PendingStart, PendingWorkflow, RunOptions,
     StartOptions, Timeout,
 };
+
+/// The async runtime seam, for this workspace's tests and **not public API**.
+///
+/// A test binary is another crate, and a test that is to run on more than one runtime has to
+/// spawn and sleep the way the library does rather than through tokio. Not gated on `engine`,
+/// because the test harness uses it and the harness builds without the engine.
+#[doc(hidden)]
+pub mod __rt {
+    pub use crate::rt::{
+        AbortHandle, Elapsed, JoinError, JoinHandle, fallback, sleep, sleep_until, spawn, timeout,
+        timeout_at,
+    };
+}
 
 /// What [`select_step!`](crate::select_step) expands into, and **not public API**.
 ///

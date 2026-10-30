@@ -1,7 +1,7 @@
 //! The instance and the executor: the two halves of the public lifecycle.
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +31,7 @@ pub struct Executor {
     app_version: String,
     app_name: String,
     app_id: String,
-    runtime: tokio::runtime::Handle,
+    runtime: crate::rt::Spawner,
     workflows: Snapshot,
     listen_queues: Option<Vec<String>>,
     /// One set per [`Role`], because shutdown stops them in turn: see [`stop`](Self::stop).
@@ -95,9 +95,9 @@ impl Executor {
             executor_id,
             app_version,
             app_id,
-            // The runtime is the executor's, taken here. `start` is `async`, so a
-            // runtime is necessarily current.
-            runtime: tokio::runtime::Handle::current(),
+            // The runtime is the executor's, taken here. `start` is `async`, so some runtime is
+            // running it; this panics only if it is one this build was not given a feature for.
+            runtime: crate::rt::Spawner::current(),
             workflows,
             app_name,
             listen_queues: config.listen_queues.clone(),
@@ -163,7 +163,7 @@ impl Executor {
         tokio::select! {
             biased;
             () = self.stopping.cancelled() => false,
-            () = tokio::time::sleep(duration) => true,
+            () = crate::rt::sleep(duration) => true,
         }
     }
 
@@ -228,7 +228,7 @@ impl Executor {
     /// come down to ownership. Recovery spawns from a background task rather than from user code,
     /// so "the caller's runtime" is not one answer. And shutdown has to abort exactly the tasks
     /// this executor started, which needs a handle it chose rather than one it inherited.
-    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
+    pub(crate) fn runtime(&self) -> &crate::rt::Spawner {
         &self.runtime
     }
 
@@ -261,7 +261,7 @@ impl Executor {
         self.stopping.cancel();
         let draining = !workflow_completion_timeout.is_zero();
         if draining {
-            let deadline = tokio::time::Instant::now() + workflow_completion_timeout;
+            let deadline = crate::rt::now() + workflow_completion_timeout;
             // Waited on before the drain, not alongside it: a dequeue mid-dispatch is about to add
             // to the set the drain is watching, and a drain that saw it empty first would finish
             // before that workflow started.
@@ -307,9 +307,9 @@ impl Executor {
     ///
     /// Waits only. Nothing is interrupted here, at the deadline or before it: what is left is
     /// cancelled by [`stop`](Self::stop), after this returns.
-    async fn drain(&self, deadline: tokio::time::Instant) {
+    async fn drain(&self, deadline: Instant) {
         loop {
-            let report_at = (tokio::time::Instant::now() + DRAIN_REPORT_INTERVAL).min(deadline);
+            let report_at = (crate::rt::now() + DRAIN_REPORT_INTERVAL).min(deadline);
             if self.workflow_tasks.wait_all_until(report_at).await || report_at >= deadline {
                 return;
             }
@@ -571,7 +571,7 @@ impl DBOS {
     /// ```
     pub async fn shutdown_with(&self, options: ShutdownOptions) {
         let dbos = self.clone();
-        match tokio::spawn(async move { dbos.tear_down(options).await }).await {
+        match crate::rt::spawn(async move { dbos.tear_down(options).await }).await {
             Ok(()) => {}
             Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
             // The runtime itself is shutting down, and the task with it.

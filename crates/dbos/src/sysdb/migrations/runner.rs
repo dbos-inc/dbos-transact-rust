@@ -518,7 +518,7 @@ async fn await_peer(
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        tokio::time::sleep(PEER_POLL).await;
+        crate::rt::sleep(PEER_POLL).await;
     }
 }
 

@@ -1,5 +1,9 @@
 //! Non-blocking starts and the workflow handle, against real databases.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -32,7 +36,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 
 /// The demo's `POST /workflow/:taskid`, posted twice: the id is an idempotency key, so the second
 /// start joins the run already going instead of failing — and both callers get the same answer.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn starting_a_taken_id_joins_the_existing_run() {
     let entered = Arc::new(AtomicU32::new(0));
     let release = Arc::new(tokio::sync::Notify::new());
@@ -69,7 +73,7 @@ async fn starting_a_taken_id_joins_the_existing_run() {
     assert_eq!(second.workflow_id(), "task-42");
 
     release.notify_one();
-    let results = tokio::time::timeout(DEADLINE, async {
+    let results = dbos::__rt::timeout(DEADLINE, async {
         (first.result().await, second.result().await)
     })
     .await
@@ -99,7 +103,7 @@ async fn starting_a_taken_id_joins_the_existing_run() {
 /// A polling handle decodes a recorded failure with the same fidelity the local one does: the
 /// workflow's own error type, fields and all, out of a row this handle never watched being
 /// written.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_polling_handle_returns_the_typed_error_the_run_recorded() {
     #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
     enum CheckoutError {
@@ -157,13 +161,13 @@ async fn a_polling_handle_returns_the_typed_error_the_run_recorded() {
 }
 
 /// Dropping the handle stops the watching, not the workflow.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn dropping_the_handle_does_not_stop_the_workflow() {
     let db = test_database().await;
     let dbos = DBOS::new(config("drop-app", &db));
     let quick = dbos
         .register_workflow("quick", |()| async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
             Ok::<_, dbos::Error>(9u32)
         })
         .unwrap();
@@ -174,7 +178,7 @@ async fn dropping_the_handle_does_not_stop_the_workflow() {
     drop(handle);
 
     let reader = reader(&db).await;
-    tokio::time::timeout(DEADLINE, async {
+    dbos::__rt::timeout(DEADLINE, async {
         loop {
             let row = reader
                 .get_workflow(&workflow_id)
@@ -185,7 +189,7 @@ async fn dropping_the_handle_does_not_stop_the_workflow() {
                 assert_eq!(row.output.as_deref(), Some("9"));
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -200,7 +204,7 @@ async fn dropping_the_handle_does_not_stop_the_workflow() {
 /// `init_workflow` had that row in front of it, so an absence now is a delete and there is nothing
 /// left to wait for — where an id this process has never seen (`Client::retrieve_workflow`) is
 /// waited on instead, because for that one "deleted" and "not yet" are the same observation.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_handle_over_a_row_this_process_read_reports_its_deletion() {
     let release = Arc::new(tokio::sync::Notify::new());
 
@@ -234,7 +238,7 @@ async fn a_handle_over_a_row_this_process_read_reports_its_deletion() {
         .expect("delete failed");
     assert_eq!(deleted, 1, "the row was there to delete");
 
-    let err = tokio::time::timeout(DEADLINE, joined.result())
+    let err = dbos::__rt::timeout(DEADLINE, joined.result())
         .await
         .expect("the handle polled a row that will never reappear")
         .expect_err("the row is gone");
@@ -243,7 +247,7 @@ async fn a_handle_over_a_row_this_process_read_reports_its_deletion() {
     // The run itself has nowhere to record its outcome, which is delete's documented consequence
     // rather than this test's subject.
     release.notify_one();
-    let _ = tokio::time::timeout(DEADLINE, running.result()).await;
+    let _ = dbos::__rt::timeout(DEADLINE, running.result()).await;
 
     dbos.shutdown().await;
 }
