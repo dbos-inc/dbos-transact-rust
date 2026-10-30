@@ -3,6 +3,10 @@
 //! Uses the same container harness as the system database tests: a leased, migrated database per
 //! test, Postgres locally and both backends in CI. Nothing here talks to a developer's own server.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use dbos::sysdb::{SystemDatabase, postgres::PostgresSystemDatabase, postgres::Settings};
 use dbos::{Config, DBOS, Error};
 use std::borrow::Cow;

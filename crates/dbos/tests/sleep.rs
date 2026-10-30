@@ -1,5 +1,9 @@
 //! Durable sleep, against real databases.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::time::Duration;
 
 use dbos::sysdb::SystemDatabase;

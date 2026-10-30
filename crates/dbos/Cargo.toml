@@ -136,9 +136,8 @@ sqlx = { version = "0.9", default-features = false, features = [
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 
 [lints.clippy]
-# Denied for the library in `src/lib.rs` instead, which is the code `clippy.toml`'s list is about.
-# Not denied in the integration tests, so nothing static stops one calling tokio directly. Most
-# run on tokio only and may; the binaries that use `#[dbos_test_support::test]` must not, since
-# they also run off tokio, where such a call panics — CI's `test-runtimes` job is what catches it.
+# Denied instead where it applies: for the library in `src/lib.rs`, and in each integration test
+# binary that uses `#[dbos_test_support::test]`, which also runs off tokio, where a direct tokio
+# call panics. The other test binaries run on tokio only and may call it.
 disallowed_methods = "allow"
 disallowed_types = "allow"

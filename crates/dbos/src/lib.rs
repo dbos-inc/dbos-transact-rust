@@ -66,8 +66,8 @@
 #![forbid(unsafe_code)]
 // Spawning and timers go through `rt`, which picks the runtime; `clippy.toml` names what that
 // rules out everywhere else. Denied here rather than left at clippy's default so the rule holds
-// for this crate's own code alone, not the integration tests under `tests/`; see the
-// `[lints.clippy]` table in `Cargo.toml` for what that leaves unguarded.
+// for this crate's own code, and not for the integration tests under `tests/` that run on tokio
+// only; see the `[lints.clippy]` table in `Cargo.toml`.
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 // A procedural macro has no `$crate`, so `select_step!`'s expansion names `::dbos` absolutely;

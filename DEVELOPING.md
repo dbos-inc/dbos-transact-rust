@@ -116,7 +116,8 @@ concurrency the other runtimes have.
 
 The feature is what makes `dbos` use smol outside tokio; the variable takes the test outside
 tokio. They must agree, and a test fails at once if they do not. In those binaries, spawn and
-sleep through `dbos::__rt` rather than tokio, which would panic off tokio. `tokio::sync`,
+sleep through `dbos::__rt` rather than tokio, which would panic off tokio; each denies clippy's
+`disallowed_methods` and `disallowed_types`, so `cargo clippy` enforces it. `tokio::sync`,
 `select!` and `join!` are fine anywhere.
 
 The harness shares one container by reference count and removes it when the last test drops it.

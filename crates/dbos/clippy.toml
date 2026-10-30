@@ -1,6 +1,7 @@
 # Spawning and timers go through `crate::rt`, which chooses the async runtime; calling tokio for
 # them directly would tie this crate to tokio again, and fail only at run time on another runtime.
-# `rt`'s tokio backend is the one place allowed to.
+# `rt`'s tokio backend is the one place allowed to. The integration tests that run off tokio deny
+# these too, and reach the same functions as `dbos::__rt` rather than `crate::rt`.
 disallowed-methods = [
     { path = "tokio::spawn", replacement = "crate::rt::spawn" },
     { path = "tokio::task::spawn", replacement = "crate::rt::spawn" },

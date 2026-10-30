@@ -121,7 +121,8 @@ jobs:
     #
     # Each of these binaries' tests uses `#[dbos_test_support::test]`, which runs it where
     # `DBOS_TEST_RUNTIME` says and fails if the build would put it anywhere else. Adding a binary
-    # here means moving its tests to that attribute and its spawns and timers to `dbos::__rt`.
+    # here means moving its tests to that attribute, its spawns and timers to `dbos::__rt`, and
+    # adding the `#![deny]` of clippy's disallowed lints the others carry.
     strategy:
       fail-fast: false
       matrix:
