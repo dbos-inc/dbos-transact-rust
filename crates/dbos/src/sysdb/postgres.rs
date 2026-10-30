@@ -6725,9 +6725,10 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .bind(&queue.name)
                 .fetch_one(&mut *tx)
                 .await?;
-                if running > i64::from(concurrency) {
-                    // Reported rather than corrected: the excess is already running, and the
-                    // limit can only govern what has yet to start.
+                // Reported rather than corrected: the excess is already running, and the limit
+                // can only govern what has yet to start. Not for a paused queue, at 0, which is
+                // expected to have work still running.
+                if concurrency > 0 && running > i64::from(concurrency) {
                     tracing::warn!(
                         queue = %queue.name,
                         running,

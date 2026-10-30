@@ -257,11 +257,13 @@ async fn incoherent_limits_are_refused() {
 }
 
 /// **A queue-wide limit of 0 pauses the queue until an update raises it**, for the fleet-wide
-/// limit and the per-process one alike.
+/// limit and the per-process one alike, on an unpartitioned queue and on a partitioned one.
 ///
-/// Registration and update both take 0 and refuse -1. While the limit is 0 the workflows stay
-/// `ENQUEUED` — the internal queue finishing a workflow meanwhile shows the dequeue loop is
-/// running — and once it is raised they run.
+/// Registration takes 0, and an update takes 0 and refuses -1. While the limit is 0 the workflows
+/// stay `ENQUEUED`, and once it is raised they run. A control queue with no limits is registered
+/// beside each paused one and must finish a workflow before the paused one is checked: the sweep
+/// that starts the control queue's worker starts the paused queue's too, so the paused queue has
+/// been polled by then.
 #[tokio::test]
 async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
     let db = test_database().await;
@@ -279,32 +281,72 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
         worker_concurrency: Change::Set(limit),
         ..QueueChange::default()
     };
+    let per_partition = RateLimit {
+        limit: 100,
+        period: Duration::from_secs(60),
+    };
     let cases = [
         (
             "concurrency",
+            "unpartitioned",
             QueueOptions {
                 concurrency: Some(0),
-                polling_interval: Duration::from_millis(100),
                 ..QueueOptions::default()
             },
             set_concurrency as fn(Option<i32>) -> QueueChange,
         ),
         (
             "worker_concurrency",
+            "unpartitioned",
             QueueOptions {
                 worker_concurrency: Some(0),
-                polling_interval: Duration::from_millis(100),
+                ..QueueOptions::default()
+            },
+            set_worker_concurrency as fn(Option<i32>) -> QueueChange,
+        ),
+        (
+            "concurrency",
+            "partitioned",
+            QueueOptions {
+                concurrency: Some(0),
+                partition_rate_limit: Some(per_partition),
+                ..QueueOptions::default()
+            },
+            set_concurrency as fn(Option<i32>) -> QueueChange,
+        ),
+        (
+            "worker_concurrency",
+            "partitioned",
+            QueueOptions {
+                worker_concurrency: Some(0),
+                partition_concurrency: Some(1),
                 ..QueueOptions::default()
             },
             set_worker_concurrency as fn(Option<i32>) -> QueueChange,
         ),
     ];
 
-    for (field, options, change) in cases {
-        let name = format!("paused-by-{field}");
-        dbos.register_queue(&name, options, QueueConflict::AlwaysUpdate)
+    for (field, shape, options, change) in cases {
+        let name = format!("paused-by-{field}-{shape}");
+        let control = format!("{name}-control");
+        let partition_key = (shape == "partitioned").then_some("key");
+        let options = QueueOptions {
+            polling_interval: Duration::from_millis(100),
+            ..options
+        };
+        dbos.register_queue(&name, options.clone(), QueueConflict::AlwaysUpdate)
             .await
-            .unwrap_or_else(|error| panic!("{field}: a limit of 0 was refused: {error:?}"));
+            .unwrap_or_else(|error| panic!("{name}: a limit of 0 was refused: {error:?}"));
+        dbos.register_queue(
+            &control,
+            QueueOptions {
+                polling_interval: Duration::from_millis(100),
+                ..QueueOptions::default()
+            },
+            QueueConflict::AlwaysUpdate,
+        )
+        .await
+        .expect("registration failed");
 
         let error = dbos
             .update_queue(&name, change(Some(-1)))
@@ -313,11 +355,11 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
         assert!(
             matches!(&error, Error::Config(message)
                 if message.contains(&format!("`{field}` must not be negative"))),
-            "{field}: expected a refusal of the negative limit, got {error:?}"
+            "{name}: expected a refusal of the negative limit, got {error:?}"
         );
         dbos.update_queue(&name, change(Some(0)))
             .await
-            .unwrap_or_else(|error| panic!("{field}: an update to 0 was refused: {error:?}"));
+            .unwrap_or_else(|error| panic!("{name}: an update to 0 was refused: {error:?}"));
 
         let mut handles = Vec::new();
         for n in 0..2 {
@@ -327,7 +369,10 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
                         (),
                         StartOptions {
                             workflow_id: Some(&format!("{name}-{n}")),
-                            queue: Some(Enqueue::new(&name)),
+                            queue: Some(Enqueue {
+                                partition_key,
+                                ..Enqueue::new(&name)
+                            }),
                             ..StartOptions::default()
                         },
                     )
@@ -336,18 +381,18 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
             );
         }
 
-        let internal = workflow
+        let controlled = workflow
             .start_with(
                 (),
                 StartOptions {
-                    workflow_id: Some(&format!("{name}-internal")),
-                    queue: Some(Enqueue::new(INTERNAL_QUEUE)),
+                    workflow_id: Some(&format!("{control}-0")),
+                    queue: Some(Enqueue::new(&control)),
                     ..StartOptions::default()
                 },
             )
             .await
             .expect("enqueue failed");
-        assert_eq!(internal.result().await.expect("the workflow failed"), 1);
+        assert_eq!(controlled.result().await.expect("the workflow failed"), 1);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         for n in 0..2 {
@@ -360,20 +405,20 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
                     .expect("the row is missing")
                     .status,
                 WorkflowStatus::Enqueued,
-                "{field}: a queue paused at 0 dequeued a workflow"
+                "{name}: a queue paused at 0 dequeued a workflow"
             );
         }
 
         let raised = dbos
             .update_queue(&name, change(Some(2)))
             .await
-            .unwrap_or_else(|error| panic!("{field}: raising the limit was refused: {error:?}"));
+            .unwrap_or_else(|error| panic!("{name}: raising the limit was refused: {error:?}"));
         let limit = if field == "concurrency" {
             raised.concurrency()
         } else {
             raised.worker_concurrency()
         };
-        assert_eq!(limit, Some(2), "{field}: the raised limit was not stored");
+        assert_eq!(limit, Some(2), "{name}: the raised limit was not stored");
         for handle in handles {
             assert_eq!(handle.result().await.expect("the workflow failed"), 1);
         }
