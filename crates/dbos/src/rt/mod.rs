@@ -187,7 +187,11 @@ impl std::error::Error for Elapsed {}
 ///
 /// Needs no reactor: wake at once and return `Pending` a single time, which puts the task at the
 /// back of the run queue on every executor.
-pub async fn yield_now() {
+///
+/// Only the crate's own tests yield, so only they get it. Library code that needs to can drop the
+/// `cfg`; an integration test would also need it re-exported through `crate::__rt`.
+#[cfg(test)]
+pub(crate) async fn yield_now() {
     let mut yielded = false;
     std::future::poll_fn(|cx| {
         if yielded {

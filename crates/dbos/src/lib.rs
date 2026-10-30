@@ -351,7 +351,7 @@ pub use workflow::{
 pub mod __rt {
     pub use crate::rt::{
         AbortHandle, Elapsed, JoinError, JoinHandle, fallback, sleep, sleep_until, spawn, timeout,
-        timeout_at, yield_now,
+        timeout_at,
     };
 }
 
