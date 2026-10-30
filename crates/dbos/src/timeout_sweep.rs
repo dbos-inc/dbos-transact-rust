@@ -18,7 +18,7 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use crate::instance::Executor;
-use crate::workflow::spawn_tracked;
+use crate::workflow::{Role, spawn_tracked};
 
 /// The most workflows one pass cancels. A full batch means more may be waiting, so the next pass
 /// runs at once rather than after the interval.
@@ -48,15 +48,18 @@ fn interval() -> Duration {
     }
 }
 
-/// Starts the sweep, as a task shutdown aborts with every other one.
+/// Starts the sweep, as a [`Role::Monitor`]: shutdown aborts it once the workflows have drained.
 ///
-/// Its own task rather than a step of the dequeue supervisor's tick: back-to-back full batches
-/// would otherwise hold up queue reconciliation. Shutdown needs nothing more. Aborting the task
+/// After the drain rather than with the producers, because a workflow still running may be waiting
+/// on the sweep to record its timeout. Its own task rather than a step of the dequeue supervisor's
+/// tick: back-to-back full batches would otherwise hold up queue reconciliation. Aborting the task
 /// stops the loop; a statement the server already has may still commit, which cancels only rows
 /// that had expired anyway. The next launch starts a fresh sweep.
 pub(crate) fn spawn(executor: Arc<Executor>) {
     spawn_tracked(
         &executor,
+        Role::Monitor,
+        "workflow timeouts".to_owned(),
         {
             let executor = Arc::clone(&executor);
             sweep(executor, interval())

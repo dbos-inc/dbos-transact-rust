@@ -1,6 +1,9 @@
 //! The instance and the executor: the two halves of the public lifecycle.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::connection::Connection;
@@ -8,7 +11,7 @@ use crate::identity::{Environment, Identity};
 use crate::registry::{Registry, Snapshot};
 use crate::serialization::Serializer;
 use crate::sysdb::SystemDatabase;
-use crate::workflow::Tasks;
+use crate::workflow::{Role, Tasks};
 use crate::{Error, Result};
 
 /// The running half of DBOS, created by [`DBOS::launch`] and dropped by [`DBOS::shutdown`].
@@ -19,7 +22,7 @@ use crate::{Error, Result};
 /// **The connection is held rather than embedded**, which is the split a [`Client`](crate::Client)
 /// rests on. Every other field here exists because this process *runs* workflows: the id, version
 /// and application name a claim stamps, the runtime they are spawned onto, the registry snapshot
-/// they are resolved through, the task set shutdown reaches. A client runs none, so it holds the
+/// they are resolved through, the task sets shutdown reaches. A client runs none, so it holds the
 /// connection alone, and everything both surfaces do is a method on that rather than on this
 /// type.
 pub struct Executor {
@@ -31,7 +34,12 @@ pub struct Executor {
     runtime: tokio::runtime::Handle,
     workflows: Snapshot,
     listen_queues: Option<Vec<String>>,
-    tasks: Tasks,
+    /// One set per [`Role`], because shutdown stops them in turn: see [`stop`](Self::stop).
+    producer_tasks: Tasks,
+    workflow_tasks: Tasks,
+    monitor_tasks: Tasks,
+    /// Cancelled when shutdown begins, which is what the producers' loops watch to stop.
+    stopping: CancellationToken,
 }
 
 impl Executor {
@@ -93,7 +101,10 @@ impl Executor {
             workflows,
             app_name,
             listen_queues: config.listen_queues.clone(),
-            tasks: Tasks::default(),
+            producer_tasks: Tasks::default(),
+            workflow_tasks: Tasks::default(),
+            monitor_tasks: Tasks::default(),
+            stopping: CancellationToken::new(),
         };
         Ok((executor, recovered))
     }
@@ -130,9 +141,35 @@ impl Executor {
         &self.app_name
     }
 
-    /// The workflows this executor started and has not seen finish.
-    pub(crate) fn tasks(&self) -> &Tasks {
-        &self.tasks
+    /// The tasks of one role this executor started and has not seen finish.
+    pub(crate) fn tasks(&self, role: Role) -> &Tasks {
+        match role {
+            Role::Producer => &self.producer_tasks,
+            Role::Workflow => &self.workflow_tasks,
+            Role::Monitor => &self.monitor_tasks,
+        }
+    }
+
+    /// Sleeps for `duration` between a producer loop's passes, unless shutdown begins first.
+    ///
+    /// `true` when it slept the whole duration and the loop should make another pass; `false` once
+    /// shutdown has begun, and at once rather than at the end of the sleep. The
+    /// producers stop here, between passes, rather than wherever an abort would land: a dequeue
+    /// whose claim has committed goes on to start what it claimed, so a graceful shutdown drains
+    /// those workflows instead of leaving them `PENDING` and unstarted.
+    pub(crate) async fn sleep_unless_stopping(&self, duration: Duration) -> bool {
+        // Biased, with the token first: a wait that has already elapsed — a schedule catching up
+        // waits for nothing — would otherwise win half the time and run one more pass.
+        tokio::select! {
+            biased;
+            () = self.stopping.cancelled() => false,
+            () = tokio::time::sleep(duration) => true,
+        }
+    }
+
+    /// Whether shutdown has begun, for a producer about to start a pass.
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stopping.is_cancelled()
     }
 
     /// Which queues this executor dequeues from, or `None` for all of them.
@@ -195,36 +232,114 @@ impl Executor {
         &self.runtime
     }
 
-    /// Stops everything this executor started and closes the system database.
+    /// Stops this executor starting workflows, waits up to `workflow_completion_timeout` for those
+    /// running to finish, and cancels whatever is still running at the deadline.
     ///
-    /// Here rather than in [`DBOS::shutdown`] because this is where the things being stopped live:
-    /// the task set holding running workflows and the dequeue loop, and the connection. Teardown
-    /// that grows a step at a time wants one place to grow, which is also how Java draws it —
-    /// `DBOS.shutdown()` calls `DBOSExecutor.close()` and knows nothing about what that entails.
+    /// The first half of shutdown; [`close`](Self::close) is the second, and the instance stops
+    /// holding the executor between the two. Here rather than in [`DBOS::shutdown_with`] because
+    /// this is where the things being stopped live, and teardown that grows a step at a time
+    /// wants one place to grow.
     ///
-    /// Takes `&self`, not `self`: the instance drops its handle here, but a workflow still running
-    /// may hold another, and shutting down is precisely the moment when that is true.
-    pub(crate) async fn shutdown(&self) {
-        // Cancel, wait, then close — and the wait is what the ordering rests on. `abort` only
-        // schedules cancellation at a task's next yield point, so without waiting this would close
-        // the pool while the bodies it cancelled were still running, and returning would mean
+    /// **The producers stop first**, so the set being drained cannot grow underneath the drain: a
+    /// dequeue that had already claimed work when shutdown began starts it, and that workflow is
+    /// drained with the rest. A workflow started some other way — by the application, or as a
+    /// running workflow's child — is waited for if it starts while the drain is still waiting,
+    /// which is what lets a parent finish. One that starts after the drain has ended is cancelled
+    /// as it arrives and stays `PENDING`. A child a workflow *enqueues* is not dequeued here, so a
+    /// parent waiting on one waits out the timeout.
+    ///
+    /// **A zero timeout waits for nothing**, and is the shutdown this crate always had: the
+    /// producers are stopped, every workflow is cancelled, and the rows stay `PENDING` for
+    /// recovery. A non-zero one cancels the same way at its deadline, so a workflow that overruns
+    /// it is recovered from its last checkpoint rather than marked. What keeps an interrupted
+    /// workflow from being *recorded* as failed is not this ordering but `Error::control`, which
+    /// treats a database failure as a signal rather than an outcome.
+    ///
+    /// Takes `&self`, not `self`: a workflow still running holds another handle, and shutting down
+    /// is precisely the moment when that is true.
+    pub(crate) async fn stop(&self, workflow_completion_timeout: Duration) {
+        self.stopping.cancel();
+        let draining = !workflow_completion_timeout.is_zero();
+        if draining {
+            let deadline = tokio::time::Instant::now() + workflow_completion_timeout;
+            // Waited on before the drain, not alongside it: a dequeue mid-dispatch is about to add
+            // to the set the drain is watching, and a drain that saw it empty first would finish
+            // before that workflow started.
+            if self.producer_tasks.wait_all_until(deadline).await {
+                self.drain(deadline).await;
+            }
+        }
+
+        // Cancel, wait, then report — and the wait is what the ordering rests on. `abort` only
+        // schedules cancellation at a task's next yield point, so without waiting, the system
+        // database could close under bodies that were still running, and returning would mean
         // "told to stop" rather than "stopped". Waiting is also what lets a relaunch in this
         // process start against a genuinely quiet executor.
-        //
-        // What keeps an interrupted workflow from being *recorded* as failed is not this ordering
-        // but `Error::control`, which treats a database failure as a signal rather than an
-        // outcome. Cancelling leaves every row `PENDING`, which is what a later executor
-        // recovers.
-        let cancelled = self.tasks.abort_all().await;
-        if cancelled > 0 {
+        let producers = self.producer_tasks.abort_all().await;
+        let abandoned = self.workflow_tasks.abort_all().await;
+        if draining {
+            if !producers.is_empty() {
+                tracing::warn!(
+                    tasks = ?producers,
+                    "the dequeue loop or the scheduler was still mid-pass at the shutdown \
+                     deadline and was cancelled"
+                );
+            }
+            if !abandoned.is_empty() {
+                tracing::warn!(
+                    workflows = abandoned.len(),
+                    workflow_ids = ?abandoned,
+                    "workflows still running at the shutdown deadline were cancelled; they stay \
+                     PENDING and are recovered from their last checkpoint"
+                );
+            }
+        } else if !abandoned.is_empty() {
             tracing::info!(
-                cancelled,
+                workflows = abandoned.len(),
+                workflow_ids = ?abandoned,
                 "cancelled workflows still running; they stay PENDING"
             );
         }
+    }
+
+    /// Waits for the running workflows to finish on their own, up to `deadline`, saying once a
+    /// second which ones it is still waiting for.
+    ///
+    /// Waits only. Nothing is interrupted here, at the deadline or before it: what is left is
+    /// cancelled by [`stop`](Self::stop), after this returns.
+    async fn drain(&self, deadline: tokio::time::Instant) {
+        loop {
+            let report_at = (tokio::time::Instant::now() + DRAIN_REPORT_INTERVAL).min(deadline);
+            if self.workflow_tasks.wait_all_until(report_at).await || report_at >= deadline {
+                return;
+            }
+            let running = self.workflow_tasks.running();
+            tracing::info!(
+                workflows = running.len(),
+                workflow_ids = ?running,
+                "waiting for workflows to finish before shutting down"
+            );
+        }
+    }
+
+    /// Stops the background monitors and closes the system database. Called after
+    /// [`stop`](Self::stop), once no workflow is running.
+    ///
+    /// **The monitors outlive the drain** because a workflow still running may be waiting on the
+    /// timeout sweep to record that its deadline has passed. **The system database closes last**,
+    /// so everything before it could still checkpoint.
+    ///
+    /// A Conductor connection, once there is one, is closed between the two: after the drain, so
+    /// the executor stays visibly alive to Conductor for as long as it is running workflows, and
+    /// before the pool, which it reads through.
+    pub(crate) async fn close(&self) {
+        self.monitor_tasks.abort_all().await;
         self.conn.close().await;
     }
 }
+
+/// How often a draining shutdown says which workflows it is still waiting for.
+const DRAIN_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 impl std::fmt::Debug for Executor {
     /// Hand-written because a `dyn SystemDatabase` is not `Debug` and should not become so: the
@@ -236,6 +351,21 @@ impl std::fmt::Debug for Executor {
             .field("app_version", &self.app_version)
             .finish_non_exhaustive()
     }
+}
+
+/// What [`DBOS::shutdown_with`] does with the workflows still running.
+///
+/// A struct rather than a bare argument, matching the other `_with` calls of this crate.
+/// Deliberately **not** `#[non_exhaustive]`, which would forbid the `..Default::default()` form.
+#[derive(Debug, Clone, Default)]
+pub struct ShutdownOptions {
+    /// How long to wait for the workflows running in this process to finish before cancelling
+    /// them.
+    ///
+    /// Zero, the default, waits for nothing: every running workflow is cancelled at once. A
+    /// cancelled workflow is not marked; its row stays `PENDING` and it is recovered from its last
+    /// checkpoint, so the timeout trades shutdown time for work redone, never for work lost.
+    pub workflow_completion_timeout: Duration,
 }
 
 /// A DBOS instance: the whole public surface of the library.
@@ -378,16 +508,90 @@ impl DBOS {
         Ok(())
     }
 
-    /// Stops the executor and closes the system database.
+    /// Stops the executor and closes the system database, cancelling any workflow still running.
+    ///
+    /// A workflow started while this runs is cancelled as it arrives, and its caller gets
+    /// [`Error::Interrupted`].
+    ///
+    /// [`shutdown_with`](Self::shutdown_with) with the default options, which wait for nothing: a
+    /// workflow running in this process is cancelled where it stands and stays `PENDING`, for a
+    /// later executor to recover from its last checkpoint. To let running workflows finish first,
+    /// give [`ShutdownOptions::workflow_completion_timeout`].
     ///
     /// **Idempotent**: shutting down an instance that is not launched does nothing, as in Java.
     /// Relaunching afterwards is supported and is what test suites do.
     pub async fn shutdown(&self) {
+        self.shutdown_with(ShutdownOptions::default()).await;
+    }
+
+    /// Stops the executor and closes the system database, first waiting up to
+    /// [`workflow_completion_timeout`](ShutdownOptions::workflow_completion_timeout) for the
+    /// workflows running in this process to finish.
+    ///
+    /// In order:
+    ///
+    /// 1. **The dequeue loop and the scheduler stop**, so no queued workflow starts here from now
+    ///    on. A workflow started any other way — by the application, or as a running workflow's
+    ///    child — still starts while step 2 is waiting, and is waited for with the rest. One
+    ///    started after that is cancelled as it arrives, and its caller gets
+    ///    [`Error::Interrupted`].
+    /// 2. **Running workflows are given until the timeout to finish**, and are not interrupted
+    ///    meanwhile. Which ones are still running is logged once a second.
+    /// 3. **Whatever is still running at the deadline is cancelled**, and logged by id. Its row is
+    ///    left `PENDING`, so it is recovered from its last checkpoint rather than marked failed.
+    /// 4. The workflow-timeout sweep stops, after the wait, since a workflow still running may be
+    ///    waiting on it.
+    /// 5. The system database closes last, so a workflow finishing during the wait can still
+    ///    checkpoint.
+    ///
+    /// The instance stays launched until step 3 is over, so a workflow finishing during the wait
+    /// can still call into it.
+    ///
+    /// A workflow that waits on a child it *enqueued* waits out the timeout: the child is not
+    /// dequeued here once shutdown has begun. So does a workflow that calls this itself, since it
+    /// is one of the workflows being waited for; it is then cancelled and stays `PENDING`.
+    ///
+    /// **Idempotent**: shutting down an instance that is not launched does nothing, and a second
+    /// call made while the first is waiting returns once the first has finished.
+    ///
+    /// **Not cancelled by dropping the future.** The teardown runs as a task of its own, and a
+    /// caller that stops waiting — a `tokio::time::timeout` around this call, or a `select!` —
+    /// leaves it to finish. Cut short, it would leave an instance that reports itself launched
+    /// with its producers stopped and every new workflow cancelled as it arrives.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) {
+    /// use std::time::Duration;
+    ///
+    /// dbos.shutdown_with(dbos::ShutdownOptions {
+    ///     workflow_completion_timeout: Duration::from_secs(30),
+    /// })
+    /// .await;
+    /// # }
+    /// ```
+    pub async fn shutdown_with(&self, options: ShutdownOptions) {
+        let dbos = self.clone();
+        match tokio::spawn(async move { dbos.tear_down(options).await }).await {
+            Ok(()) => {}
+            Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+            // The runtime itself is shutting down, and the task with it.
+            Err(_) => {}
+        }
+    }
+
+    /// The whole of [`shutdown_with`](Self::shutdown_with), run as its own task.
+    async fn tear_down(&self, options: ShutdownOptions) {
         let _lifecycle = self.0.lifecycle.lock().await;
-        let Some(executor) = self.write_executor().take() else {
+        let Some(executor) = self.read_executor() else {
             return;
         };
-        executor.shutdown().await;
+        // Stopped while still installed: a workflow given time to finish may call back into this
+        // instance — to send, to start a child — and an instance that already said it was not
+        // launched would fail it with an error that its body could record as its outcome. Taken
+        // once nothing is running that could make such a call.
+        executor.stop(options.workflow_completion_timeout).await;
+        self.write_executor().take();
+        executor.close().await;
         // The instance outlives the executor, so registration opens again: relaunching takes a
         // fresh snapshot, and what that executor holds is its own.
         self.0.registry.thaw();

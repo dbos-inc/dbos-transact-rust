@@ -16,9 +16,11 @@
 //! names no queue: running it per worker would multiply one identical write by the number of
 //! queues.
 //!
-//! Every task here is registered with the executor's task set, so shutdown reaches queue workers
-//! exactly as it reaches workflows — aborting them without writing anything durable, which leaves
-//! a claimed-but-unstarted workflow `PENDING` for the next executor to recover.
+//! Every task here is a [`Role::Producer`], so shutdown stops it before draining the workflows. A
+//! loop stops between passes, when [`Executor::sleep_unless_stopping`] says shutdown has begun,
+//! so a claim that has committed is dispatched and its workflows are drained with the rest. One
+//! still mid-pass at the shutdown deadline is aborted instead, without writing anything durable,
+//! which leaves a claimed-but-unstarted workflow `PENDING` for the next executor to recover.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,7 +36,7 @@ use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
     AppScope, DatabaseTime, QueueRecord, Timestamp, WorkflowFilter, WorkflowRecord, WorkflowStatus,
 };
-use crate::workflow::{MAX_RECOVERY_ATTEMPTS, spawn_execution, spawn_tracked};
+use crate::workflow::{MAX_RECOVERY_ATTEMPTS, Role, spawn_execution, spawn_tracked};
 
 /// How often the supervisor rebuilds the queue set and transitions delayed workflows.
 ///
@@ -158,6 +160,8 @@ type Queues = Arc<Mutex<HashMap<String, QueueRecord>>>;
 pub(crate) fn spawn(executor: Arc<Executor>) {
     spawn_tracked(
         &executor,
+        Role::Producer,
+        "queues".to_owned(),
         {
             let executor = Arc::clone(&executor);
             supervise(executor)
@@ -166,7 +170,7 @@ pub(crate) fn spawn(executor: Arc<Executor>) {
     );
 }
 
-/// Reconciles the queue set once a second, spawning and respawning workers.
+/// Reconciles the queue set once a second, spawning and respawning workers, until shutdown.
 async fn supervise(executor: Arc<Executor>) {
     let queues: Queues = Arc::default();
     let running: Arc<Running> = Arc::default();
@@ -199,6 +203,8 @@ async fn supervise(executor: Arc<Executor>) {
             tracing::debug!(queue = name, "starting a worker for the queue");
             let handle = spawn_tracked(
                 &executor,
+                Role::Producer,
+                format!("queue {name}"),
                 poll_queue(
                     Arc::clone(&executor),
                     name.clone(),
@@ -210,7 +216,9 @@ async fn supervise(executor: Arc<Executor>) {
             workers.insert(name, handle);
         }
 
-        tokio::time::sleep(SUPERVISOR_INTERVAL).await;
+        if !executor.sleep_unless_stopping(SUPERVISOR_INTERVAL).await {
+            return;
+        }
     }
 }
 
@@ -312,13 +320,18 @@ fn internal_queue() -> QueueRecord {
     }
 }
 
-/// Polls one queue until its row leaves the published set, or shutdown aborts the task.
+/// Polls one queue until its row leaves the published set, or shutdown begins.
 async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, running: Arc<Running>) {
     // Started from the queue's own interval, then adapted. Held across iterations, which is the
     // point: a contended queue stays backed off rather than rediscovering the contention.
     let mut interval = DEFAULT_POLLING_INTERVAL;
 
     loop {
+        // Checked before the first pass too: the supervisor may spawn a worker after shutdown has
+        // begun, and that worker must not claim anything.
+        if executor.is_stopping() {
+            return;
+        }
         // **Re-read every iteration**, which is what makes a limit changed at runtime take effect
         // without a restart. The worker holds a name, not a record, for exactly this reason.
         let Some(queue) = queues
@@ -346,7 +359,9 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
         } else {
             interval.mul_f64(SCALEBACK_FACTOR).max(floor)
         };
-        tokio::time::sleep(jitter(interval)).await;
+        if !executor.sleep_unless_stopping(jitter(interval)).await {
+            return;
+        }
     }
 }
 

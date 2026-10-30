@@ -5,8 +5,8 @@
 //! database plus three things that decide how it is spelled: which serializer encodes the
 //! payloads, which application owns the rows, and how often a wait re-asks. That bundle is this
 //! type. An executor is this **plus** everything execution needs — an executor id and an
-//! application version to stamp claims with, a runtime to spawn onto, a registry snapshot, a task
-//! set to shut down.
+//! application version to stamp claims with, a runtime to spawn onto, a registry snapshot, task
+//! sets to shut down.
 //!
 //! Splitting it this way is what lets a client hold no executor. Java is the model: its
 //! `DBOSClient` holds a `SystemDatabase` and nothing else, its workflow handle is a small class
