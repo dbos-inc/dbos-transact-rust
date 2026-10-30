@@ -17,10 +17,10 @@
 //! queues.
 //!
 //! Every task here is a [`Role::Producer`], so shutdown stops it before draining the workflows. A
-//! loop stops between passes, when [`Executor::wait_for_next_pass`] says shutdown has begun, so a
-//! claim that has committed is dispatched and its workflows are drained with the rest. One still
-//! mid-pass at the shutdown deadline is aborted instead, without writing anything durable, which
-//! leaves a claimed-but-unstarted workflow `PENDING` for the next executor to recover.
+//! loop stops between passes, when [`Executor::sleep_unless_stopping`] says shutdown has begun,
+//! so a claim that has committed is dispatched and its workflows are drained with the rest. One
+//! still mid-pass at the shutdown deadline is aborted instead, without writing anything durable,
+//! which leaves a claimed-but-unstarted workflow `PENDING` for the next executor to recover.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -216,7 +216,7 @@ async fn supervise(executor: Arc<Executor>) {
             workers.insert(name, handle);
         }
 
-        if !executor.wait_for_next_pass(SUPERVISOR_INTERVAL).await {
+        if !executor.sleep_unless_stopping(SUPERVISOR_INTERVAL).await {
             return;
         }
     }
@@ -359,7 +359,7 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
         } else {
             interval.mul_f64(SCALEBACK_FACTOR).max(floor)
         };
-        if !executor.wait_for_next_pass(jitter(interval)).await {
+        if !executor.sleep_unless_stopping(jitter(interval)).await {
             return;
         }
     }
