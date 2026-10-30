@@ -88,8 +88,8 @@ impl Tasks {
     /// Un-counts one whose future has been dropped, waking a shutdown waiting for the last.
     ///
     /// Only the last one wakes anyone: a waiter has nothing to do until the count is zero, and
-    /// [`wait_all`](Self::wait_all) registers before it reads the count, so it cannot miss that
-    /// moment.
+    /// [`wait_all`](Self::wait_all) starts listening before it reads the count, so it cannot miss
+    /// that moment.
     ///
     /// Runs from a `Drop`, including one unwinding out of a panicking workflow, so it takes care
     /// not to panic itself: the count cannot legitimately go below zero — one guard per task,
@@ -159,12 +159,10 @@ impl Tasks {
     /// Waits until no task's future is left alive, counting any that arrive while it waits.
     async fn wait_all(&self) {
         loop {
-            // Registered before the count is read, so the count reaching zero in between is not
-            // missed: `notify_waiters` wakes only those already waiting. Looping covers a task
-            // arriving after the zero, before this waiter ran.
+            // Created before the count is read, so the count reaching zero in between is not
+            // missed: a `Notified` receives `notify_waiters` from the moment it exists, polled or
+            // not. Looping covers a task arriving after the zero, before this waiter ran.
             let emptied = self.emptied.notified();
-            tokio::pin!(emptied);
-            emptied.as_mut().enable();
             // Bound to a `let` so the guard is released before the await, not held across it.
             let live = self.lock().live;
             if live == 0 {
