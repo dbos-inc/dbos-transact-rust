@@ -353,8 +353,9 @@ async fn poll_queue(executor: Arc<Executor>, name: String, queues: Queues, runni
 /// How many more workflows this process may start from a queue, or `None` for unlimited.
 ///
 /// Local by construction: worker concurrency is the limit a process can answer without asking the
-/// database. A per-partition worker limit of zero pauses this worker outright — nothing this crate
-/// registers can hold one, since validation wants at least 1, but a peer's row can.
+/// database. A worker limit of zero pauses this worker outright. A per-partition worker limit of
+/// zero does too — nothing this crate registers can hold one, since validation wants at least 1,
+/// but a peer's row can.
 fn worker_budget(queue: &QueueRecord, running: i64) -> Option<i64> {
     if queue.partition_worker_concurrency.is_some_and(|w| w <= 0) {
         return Some(0);

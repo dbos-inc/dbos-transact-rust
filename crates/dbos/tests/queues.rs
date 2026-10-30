@@ -178,10 +178,6 @@ async fn the_internal_queue_name_is_reserved() {
 }
 
 /// A configuration that cannot mean anything is refused before it reaches the row.
-///
-/// The zeroes matter more than they look: the dequeue clamps its budgets with `.max(0)`, so a
-/// limit of nothing that got stored would read back as a queue that never dequeues, with nothing
-/// anywhere saying why.
 #[tokio::test]
 async fn incoherent_limits_are_refused() {
     let db = test_database().await;
@@ -190,28 +186,29 @@ async fn incoherent_limits_are_refused() {
 
     let cases = [
         (
-            "a fleet-wide limit of nothing",
+            "a negative fleet-wide limit",
             QueueOptions {
-                concurrency: Some(0),
+                concurrency: Some(-1),
                 ..QueueOptions::default()
             },
-            "`concurrency` must be at least 1",
+            "`concurrency` must not be negative",
         ),
         (
-            "a per-process limit of nothing",
-            QueueOptions {
-                worker_concurrency: Some(0),
-                ..QueueOptions::default()
-            },
-            "`worker_concurrency` must be at least 1",
-        ),
-        (
-            "a negative limit",
+            "a negative per-process limit",
             QueueOptions {
                 worker_concurrency: Some(-1),
                 ..QueueOptions::default()
             },
-            "`worker_concurrency` must be at least 1",
+            "`worker_concurrency` must not be negative",
+        ),
+        (
+            "a paused queue with a per-partition limit",
+            QueueOptions {
+                concurrency: Some(0),
+                partition_concurrency: Some(1),
+                ..QueueOptions::default()
+            },
+            "must be greater than or equal to `partition_concurrency`",
         ),
         (
             "one process allowed more than the whole fleet",
@@ -255,6 +252,132 @@ async fn incoherent_limits_are_refused() {
             .is_none(),
         "a refused registration wrote a row anyway"
     );
+
+    dbos.shutdown().await;
+}
+
+/// **A queue-wide limit of 0 pauses the queue until an update raises it**, for the fleet-wide
+/// limit and the per-process one alike.
+///
+/// Registration and update both take 0 and refuse -1. While the limit is 0 the workflows stay
+/// `ENQUEUED` — the internal queue finishing a workflow meanwhile shows the dequeue loop is
+/// running — and once it is raised they run.
+#[tokio::test]
+async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("queue-paused-app", &db));
+    let workflow = dbos
+        .register_workflow("paused", |()| async { Ok::<u32, Error>(1) })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let set_concurrency = |limit: Option<i32>| QueueChange {
+        concurrency: Change::Set(limit),
+        ..QueueChange::default()
+    };
+    let set_worker_concurrency = |limit: Option<i32>| QueueChange {
+        worker_concurrency: Change::Set(limit),
+        ..QueueChange::default()
+    };
+    let cases = [
+        (
+            "concurrency",
+            QueueOptions {
+                concurrency: Some(0),
+                polling_interval: Duration::from_millis(100),
+                ..QueueOptions::default()
+            },
+            set_concurrency as fn(Option<i32>) -> QueueChange,
+        ),
+        (
+            "worker_concurrency",
+            QueueOptions {
+                worker_concurrency: Some(0),
+                polling_interval: Duration::from_millis(100),
+                ..QueueOptions::default()
+            },
+            set_worker_concurrency as fn(Option<i32>) -> QueueChange,
+        ),
+    ];
+
+    for (field, options, change) in cases {
+        let name = format!("paused-by-{field}");
+        dbos.register_queue(&name, options, QueueConflict::AlwaysUpdate)
+            .await
+            .unwrap_or_else(|error| panic!("{field}: a limit of 0 was refused: {error:?}"));
+
+        let error = dbos
+            .update_queue(&name, change(Some(-1)))
+            .await
+            .expect_err("a negative limit was accepted");
+        assert!(
+            matches!(&error, Error::Config(message)
+                if message.contains(&format!("`{field}` must not be negative"))),
+            "{field}: expected a refusal of the negative limit, got {error:?}"
+        );
+        dbos.update_queue(&name, change(Some(0)))
+            .await
+            .unwrap_or_else(|error| panic!("{field}: an update to 0 was refused: {error:?}"));
+
+        let mut handles = Vec::new();
+        for n in 0..2 {
+            handles.push(
+                workflow
+                    .start_with(
+                        (),
+                        StartOptions {
+                            workflow_id: Some(&format!("{name}-{n}")),
+                            queue: Some(Enqueue::new(&name)),
+                            ..StartOptions::default()
+                        },
+                    )
+                    .await
+                    .expect("enqueue failed"),
+            );
+        }
+
+        let internal = workflow
+            .start_with(
+                (),
+                StartOptions {
+                    workflow_id: Some(&format!("{name}-internal")),
+                    queue: Some(Enqueue::new(INTERNAL_QUEUE)),
+                    ..StartOptions::default()
+                },
+            )
+            .await
+            .expect("enqueue failed");
+        assert_eq!(internal.result().await.expect("the workflow failed"), 1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        for n in 0..2 {
+            assert_eq!(
+                reader(&db)
+                    .await
+                    .get_workflow(&format!("{name}-{n}"))
+                    .await
+                    .expect("read failed")
+                    .expect("the row is missing")
+                    .status,
+                WorkflowStatus::Enqueued,
+                "{field}: a queue paused at 0 dequeued a workflow"
+            );
+        }
+
+        let raised = dbos
+            .update_queue(&name, change(Some(2)))
+            .await
+            .unwrap_or_else(|error| panic!("{field}: raising the limit was refused: {error:?}"));
+        let limit = if field == "concurrency" {
+            raised.concurrency()
+        } else {
+            raised.worker_concurrency()
+        };
+        assert_eq!(limit, Some(2), "{field}: the raised limit was not stored");
+        for handle in handles {
+            assert_eq!(handle.result().await.expect("the workflow failed"), 1);
+        }
+    }
 
     dbos.shutdown().await;
 }
