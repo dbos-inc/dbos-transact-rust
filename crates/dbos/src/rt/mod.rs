@@ -431,17 +431,27 @@ mod tests {
             .enable_all()
             .build()
             .expect("a runtime");
-        let (unpolled, polled) = runtime.block_on(async {
-            let unpolled = super::spawn(std::future::pending::<()>());
-            let polled = super::spawn(std::future::pending::<()>());
-            // Let the second one run to its first suspension; the first was spawned too, so
-            // whether it ran is the scheduler's business — the point is that one surely did.
-            super::sleep(std::time::Duration::from_millis(10)).await;
-            (unpolled, polled)
+        let ran = Arc::new(AtomicBool::new(false));
+        let (polled, unpolled) = runtime.block_on(async {
+            let (started, running) = tokio::sync::oneshot::channel();
+            let polled = super::spawn(async move {
+                let _ = started.send(());
+                std::future::pending::<()>().await;
+            });
+            running.await.expect("the first task started");
+            // Spawned last and returned at once, with no await between: on a current-thread
+            // runtime nothing runs it before `block_on` returns, and the runtime is dropped next.
+            let ran = Arc::clone(&ran);
+            let unpolled = super::spawn(async move { ran.store(true, Ordering::SeqCst) });
+            (polled, unpolled)
         });
-        assert!(!unpolled.is_finished() && !polled.is_finished());
+        assert!(!polled.is_finished() && !unpolled.is_finished());
         drop(runtime);
-        for task in [unpolled, polled] {
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the second task was never polled"
+        );
+        for task in [polled, unpolled] {
             assert!(
                 task.is_finished(),
                 "a dropped task is finished, as tokio counts it"
