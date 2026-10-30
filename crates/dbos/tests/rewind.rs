@@ -15,7 +15,7 @@ use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
     Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, Error, RewindOptions, RunOptions,
-    StartOptions,
+    StartOptions, WorkflowIdReusePolicy,
 };
 use sqlx::Row;
 
@@ -754,6 +754,84 @@ async fn a_rewound_parent_adopts_its_child() {
         "the parent ran again"
     );
     assert_eq!(child_runs.load(Ordering::SeqCst), 1, "the child did not");
+
+    dbos.shutdown().await;
+}
+
+/// **A rewound parent adopts its child even when the start refuses a taken id**: the child is the
+/// parent's own, started at a step the rewind erased, so the replay is not a reuse of the id.
+#[tokio::test]
+async fn a_rewound_parent_adopts_a_child_it_started_with_reject() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("rewind-reject-app", &db));
+    let child_runs = counter();
+    let child = dbos
+        .register_workflow("child", {
+            let child_runs = Arc::clone(&child_runs);
+            move |n: u32| {
+                let child_runs = Arc::clone(&child_runs);
+                async move {
+                    child_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok::<u32, Error>(n * 2)
+                }
+            }
+        })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", move |()| {
+            let child = child.clone();
+            async move {
+                child
+                    .run_with(
+                        21,
+                        RunOptions {
+                            workflow_id: Some("the-rejecting-child"),
+                            workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
+                            ..RunOptions::default()
+                        },
+                    )
+                    .await
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "rejecting-parent";
+    parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the first run failed");
+
+    let rerun = dbos
+        .rewind::<u32, EngineOnly>(id)
+        .await
+        .expect("rewind failed");
+    assert_eq!(rerun.result().await.expect("the re-run failed"), 42);
+    assert_eq!(
+        child_runs.load(Ordering::SeqCst),
+        1,
+        "the child did not run again"
+    );
+
+    // A different parent reaching the same id is a reuse, and is refused.
+    let fork = dbos.fork::<u32, Error>(id, 0).await.expect("fork failed");
+    let refused = fork
+        .result()
+        .await
+        .expect_err("the fork reuses the child's id");
+    assert!(
+        matches!(
+            refused,
+            Error::SystemDatabase(dbos::sysdb::Error::WorkflowIdInUse { .. })
+        ),
+        "{refused:?}"
+    );
 
     dbos.shutdown().await;
 }

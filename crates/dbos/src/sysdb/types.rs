@@ -691,6 +691,32 @@ pub struct WorkflowRecord {
     pub attributes: Option<String>,
 }
 
+/// What a start or an enqueue does when its workflow id already names a workflow.
+///
+/// The id is an idempotency key, so the default joins: the caller gets a handle to the workflow
+/// already there, running or finished, and its own input is discarded. [`Reject`](Self::Reject)
+/// is for an id that must be new, such as one derived from a payment that may only be processed
+/// once.
+///
+/// Only another caller's workflow counts. A start that retries after its first attempt's commit
+/// was lost finds its own row, and is neither joined nor refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkflowIdReusePolicy {
+    /// Hand back a handle to the workflow that already has the id.
+    #[default]
+    ReturnExisting,
+    /// Refuse the start with [`Error::WorkflowIdInUse`], whatever the existing workflow's status,
+    /// writing nothing. Only for an id the caller chose: a start or an enqueue that names none is
+    /// refused.
+    ///
+    /// A parent's own child, started at a step a rewind has since erased from the parent's
+    /// record, is not a reuse: the replayed parent adopts it.
+    ///
+    /// **Started from inside a workflow, the refusal is recorded at the parent's step**, so a
+    /// replay of the parent gets the same error and starts nothing.
+    Reject,
+}
+
 /// A workflow being created, as opposed to one being read back.
 ///
 /// This is deliberately *not* [`WorkflowRecord`]. A row has 37 columns; a caller creating a

@@ -39,14 +39,15 @@ use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::instance::Executor;
 use crate::registry::{QualifiedWorkflowName, WorkflowRef};
-use crate::serialization::{PayloadEncoding, encode_input};
+use crate::serialization::{PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::INTERNAL_QUEUE;
 use crate::sysdb::types::{
-    Debounce, DebounceRequest, Timestamp, step_names, validate_positive_duration,
+    Debounce, DebounceRequest, Timestamp, WorkflowIdReusePolicy, step_names,
+    validate_positive_duration,
 };
 use crate::workflow::{
-    Debounced, DuplicationPolicy, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, StartOptions,
-    Timeout, create, encode_attributes, placed_workflow_id, refused_start, validate_start,
+    Debounced, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, Timeout, create, encode_attributes,
+    placed_workflow_id, refused_start, validate_start,
 };
 
 /// What a debounce refuses its arguments as.
@@ -222,62 +223,6 @@ fn refuse_app_name(app_name: Option<&str>) -> Result<()> {
     }
 }
 
-/// Refuses a `workflow_id` on a debouncer's stored options, as [`Error::InvalidArgument`].
-///
-/// A debouncer is reused across keys and across release cycles of one key, so an id stored on it
-/// would name every fresh workflow it ever enqueues. The id names one workflow, and belongs on the
-/// call that enqueues it.
-fn refuse_stored_workflow_id(workflow_id: Option<&str>, method: &str) -> Result<()> {
-    match workflow_id {
-        Some(_) => Err(Error::InvalidArgument {
-            operation: DEBOUNCE_OPERATION.into(),
-            detail: format!(
-                "`options.workflow_id` cannot be set on a debouncer, which enqueues many \
-                 workflows: pass the id for one call in `DebounceOptions::workflow_id`, to \
-                 `{method}`"
-            ),
-        }),
-        None => Ok(()),
-    }
-}
-
-/// Refuses the queue options a debounce owns, as [`Error::InvalidArgument`].
-///
-/// A debounce writes the workflow's deduplication id (the key) and its delay (the period), so a
-/// caller may not set either, nor ask to join a holder of the key the debounce manages. A priority
-/// and a partition key are refused too: debounced workflows do not support them.
-fn refuse_owned_options(queue: &Enqueue<'_>) -> Result<()> {
-    let refuse = |detail: &str| {
-        Err(Error::InvalidArgument {
-            operation: DEBOUNCE_OPERATION.into(),
-            detail: format!("queue `{}`: {detail}", queue.name),
-        })
-    };
-    if queue.deduplication_id.is_some() {
-        return refuse(
-            "a `deduplication_id` cannot be set: the debounce key is the workflow's deduplication id",
-        );
-    }
-    if queue.delay.is_some() {
-        return refuse("a `delay` cannot be set: the debounce period is the workflow's delay");
-    }
-    if queue.duplication_policy == DuplicationPolicy::ReturnExisting {
-        return refuse(
-            "`DuplicationPolicy::ReturnExisting` cannot be set: a debounce owns the workflow's \
-             deduplication",
-        );
-    }
-    if queue.priority.is_some() {
-        return refuse("a `priority` cannot be set: debounced workflows do not support priority");
-    }
-    if queue.partition_key.is_some() {
-        return refuse(
-            "a `partition_key` cannot be set: debounced workflows do not support partition keys",
-        );
-    }
-    Ok(())
-}
-
 /// Refuses a period or a debounce timeout of zero, or one too long to store.
 ///
 /// A zero period would enqueue the workflow ready to run rather than `DELAYED`, where no later
@@ -312,24 +257,14 @@ fn refuse_durations(period: Duration, debounce_timeout: Option<Duration>) -> Res
 /// # Ok(()) }
 /// ```
 ///
-/// # Options
+/// # What a debouncer sets
 ///
-/// [`options`](Self::options) is what a [`start_with`](WorkflowRef::start_with) would be given,
-/// and applies to every workflow a debounce enqueues:
-///
-/// - **[`queue`](StartOptions::queue)** is the queue the debounced workflow waits and runs on, and
-///   the scope of its key: the same key on two queues is two debounces. `None` is the internal
-///   queue every app dequeues. The queue's [`serialization`](Enqueue::serialization) is honoured;
-///   its deduplication id, delay, [`DuplicationPolicy::ReturnExisting`], priority and partition
-///   key are refused as [`Error::InvalidArgument`], because the debounce owns the first three and
-///   debounced workflows support neither of the others.
-/// - **[`workflow_id`](StartOptions::workflow_id)** is refused as [`Error::InvalidArgument`]: an
-///   id names one workflow, and a debouncer enqueues many. Name one call's workflow with
-///   [`debounce_with`](Self::debounce_with) instead.
-/// - **[`timeout`](StartOptions::timeout)** is the workflow's budget once it runs. A debounced
-///   workflow **never inherits** a calling workflow's deadline: a debounce can wait longer than the
-///   caller lives, so [`Timeout::Inherit`] means no budget here, as [`Timeout::None`] does.
-/// - **[`attributes`](StartOptions::attributes)** go on the row of a fresh workflow.
+/// A debouncer's fields apply to every workflow a debounce enqueues. They are the part of a start
+/// a debounce leaves to its caller: the debounce writes the workflow's deduplication id (the key)
+/// and its delay (the period) itself, joins the workflow holding its key rather than refusing or
+/// returning it, and enqueues many workflows, so it takes no workflow id but the one a single call
+/// names with [`debounce_with`](Self::debounce_with). Debounced workflows support neither a
+/// priority nor a partition key.
 ///
 /// # Inside a workflow
 ///
@@ -346,8 +281,19 @@ fn refuse_durations(period: Duration, debounce_timeout: Option<Duration>) -> Res
 pub struct Debouncer<'a, P, R, E = EngineOnly> {
     /// The workflow to debounce.
     pub workflow: WorkflowRef<P, R, E>,
-    /// What to say about every workflow a debounce enqueues — see [Options](Self#options).
-    pub options: StartOptions<'a>,
+    /// The queue the debounced workflow waits and runs on, and the scope of its key: the same key
+    /// on two queues is two debounces. `None` is the internal queue every app dequeues.
+    pub queue: Option<&'a str>,
+    /// How the workflow's input, output and error are encoded: the registration's for
+    /// [`SerializationFormat::Default`], as a start's are.
+    pub serialization: SerializationFormat,
+    /// The workflow's budget once it runs, or `None` for none.
+    ///
+    /// **Never a calling workflow's deadline**: a debounce can hold the workflow back for longer
+    /// than the caller lives.
+    pub timeout: Option<Duration>,
+    /// Attributes for the row of a fresh workflow.
+    pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
     /// The longest a workflow may be held back, counted from the debounce that enqueued it, on the
     /// database clock.
     ///
@@ -367,9 +313,20 @@ impl<'a, P, R, E> Debouncer<'a, P, R, E> {
     pub fn new(workflow: &WorkflowRef<P, R, E>) -> Self {
         Self {
             workflow: workflow.clone(),
-            options: StartOptions::default(),
+            queue: None,
+            serialization: SerializationFormat::Default,
+            timeout: None,
+            attributes: None,
             debounce_timeout: None,
             app_name: None,
+        }
+    }
+
+    /// The queue a debounce enqueues onto, as an enqueue names it.
+    fn enqueue(&self) -> Enqueue<'a> {
+        Enqueue {
+            serialization: self.serialization,
+            ..Enqueue::new(self.queue.unwrap_or(INTERNAL_QUEUE))
         }
     }
 }
@@ -380,7 +337,10 @@ impl<P, R, E> Clone for Debouncer<'_, P, R, E> {
     fn clone(&self) -> Self {
         Self {
             workflow: self.workflow.clone(),
-            options: self.options.clone(),
+            queue: self.queue,
+            serialization: self.serialization,
+            timeout: self.timeout,
+            attributes: self.attributes,
             debounce_timeout: self.debounce_timeout,
             app_name: self.app_name,
         }
@@ -391,7 +351,10 @@ impl<P, R, E> std::fmt::Debug for Debouncer<'_, P, R, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Debouncer")
             .field("workflow", &self.workflow)
-            .field("options", &self.options)
+            .field("queue", &self.queue)
+            .field("serialization", &self.serialization)
+            .field("timeout", &self.timeout)
+            .field("attributes", &self.attributes)
             .field("debounce_timeout", &self.debounce_timeout)
             .field("app_name", &self.app_name)
             .finish()
@@ -414,9 +377,9 @@ where
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidArgument`] for a zero `period` or
-    ///   [`debounce_timeout`](Self::debounce_timeout), an invalid [`app_name`](Self::app_name), or
-    ///   an option the debounce owns — see [Options](Self#options).
+    /// - [`Error::InvalidArgument`] for a zero `period`, [`timeout`](Self::timeout) or
+    ///   [`debounce_timeout`](Self::debounce_timeout), an empty [`queue`](Self::queue), or an
+    ///   invalid [`app_name`](Self::app_name).
     /// - [`Error::SystemDatabase`] with
     ///   [`QueueDeduplicated`](crate::sysdb::Error::QueueDeduplicated) when the key is held by a
     ///   workflow this debounce must not extend — an ordinary deduplicated enqueue, another
@@ -495,11 +458,13 @@ where
     /// The checks come first, so a refused debounce moves no step counter.
     fn place(&self, period: Duration) -> Result<(Arc<Executor>, StepPlacement, StepPlacement)> {
         let executor = self.workflow.dbos().executor(DEBOUNCE_OPERATION)?;
-        refuse_stored_workflow_id(self.options.workflow_id, "Debouncer::debounce_with")?;
-        if let Some(queue) = &self.options.queue {
-            refuse_owned_options(queue)?;
-        }
-        validate_start(self.options.queue.as_ref(), self.options.timeout.budget())?;
+        // A debounce names no workflow id of its own here: one call's is `DebounceOptions`'.
+        validate_start(
+            Some(&self.enqueue()),
+            self.timeout,
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
+        )?;
         refuse_durations(period, self.debounce_timeout)?;
         refuse_app_name(self.app_name)?;
         let bounce = StepPlacement::of(executor.connection(), DEBOUNCE_OPERATION)?;
@@ -526,11 +491,7 @@ where
     ) -> Result<WorkflowHandle<R, E>> {
         let conn = executor.connection();
         let name: &QualifiedWorkflowName = self.workflow.qualified_name();
-        let queue = self
-            .options
-            .queue
-            .clone()
-            .unwrap_or_else(|| Enqueue::new(INTERNAL_QUEUE));
+        let queue = self.enqueue();
         // The registration's encoding unless the queue asks for its own, as a start's is. A bounce
         // writes the input in the same one, so the row's tag always describes its input.
         let encoding = PayloadEncoding::resolve(
@@ -549,13 +510,10 @@ where
             encoding,
             target_app: Some(self.app_name.unwrap_or(executor.app_name())),
         };
-        let attributes = encode_attributes(self.options.attributes)?;
+        let attributes = encode_attributes(self.attributes)?;
         // Never the caller's deadline: the debounce can hold the workflow back for longer than the
         // caller has left.
-        let timeout = match self.options.timeout {
-            Timeout::Inherit => Timeout::None,
-            other => other,
-        };
+        let timeout = self.timeout.map_or(Timeout::None, Timeout::Explicit);
 
         loop {
             let outcome = conn
@@ -586,6 +544,8 @@ where
                     };
                     let request = OwnedStart {
                         workflow_id: placed_workflow_id(call.workflow_id, &start),
+                        // A debounced insert refuses an existing workflow under its id itself.
+                        workflow_id_reuse_policy: WorkflowIdReusePolicy::ReturnExisting,
                         timeout,
                         queue: Some(OwnedEnqueue::from(&fresh)),
                         input: Some(bounce.input.clone()),
@@ -629,7 +589,7 @@ where
 ///
 /// let debouncer = dbos::DebouncerClient {
 ///     debounce_timeout: Some(Duration::from_secs(60)),
-///     ..dbos::DebouncerClient::new(client, "summarise", dbos::EnqueueOptions::new("work"))
+///     ..dbos::DebouncerClient::new(client, "summarise", "work")
 /// };
 /// let handle: dbos::WorkflowHandle<String> = debouncer
 ///     .debounce("user-42", Duration::from_secs(2), "the latest text")
@@ -639,13 +599,9 @@ where
 ///
 /// [`workflow`](Self::workflow) is the workflow's name, as [`Client::enqueue`] takes it: a bare
 /// name for a free function, or a [`QualifiedWorkflowName`] naming its class and configured
-/// instance.
-/// [`options`](Self::options) describes every workflow a debounce enqueues, as it would for
-/// [`Client::enqueue_with`]: its queue (and the key's scope), an app version, a timeout and
-/// attributes. Its [`app_name`](EnqueueOptions::app_name), or else the
-/// client's, is the app the debounce acts for. The queue options a debounce owns are refused as
-/// on [`Debouncer`], and so is a [`workflow_id`](EnqueueOptions::workflow_id): name one call's
-/// workflow with [`debounce_with`](Self::debounce_with).
+/// instance. The other fields apply to every workflow a debounce enqueues, as the same fields of
+/// [`EnqueueOptions`] would to an enqueue, and leave out what a debounce sets itself — see
+/// [`Debouncer`](Debouncer#what-a-debouncer-sets).
 ///
 /// **Not durable from inside a workflow body**, as a client's enqueue is not: a client is a
 /// connection, not an execution, so a replayed body debounces again.
@@ -653,27 +609,61 @@ where
 pub struct DebouncerClient<'a> {
     /// The client to debounce through.
     pub client: Client,
-    /// The workflow, by the key it is registered under.
+    /// The workflow, by the name it is registered under.
     pub workflow: QualifiedWorkflowName,
-    /// What to say about every workflow a debounce enqueues.
-    pub options: EnqueueOptions<'a>,
+    /// The queue the debounced workflow waits and runs on, and the scope of its key — see
+    /// [`Debouncer::queue`].
+    pub queue: &'a str,
+    /// How the workflow's input, output and error are encoded: this client's
+    /// [`serializer`](crate::ClientConfig::serializer) for [`SerializationFormat::Default`], as an
+    /// enqueue's are.
+    pub serialization: SerializationFormat,
+    /// The workflow's budget once it runs, or `None` for none.
+    pub timeout: Option<Duration>,
+    /// Attributes for the row of a fresh workflow.
+    pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    /// The version of the application's code that must run the workflow — see
+    /// [`EnqueueOptions::app_version`].
+    pub app_version: Option<&'a str>,
+    /// The app the debounce acts for, or `None` for this client's — see
+    /// [`Debouncer::app_name`].
+    pub app_name: Option<&'a str>,
     /// The longest a workflow may be held back, counted from the debounce that enqueued it — see
     /// [`Debouncer::debounce_timeout`].
     pub debounce_timeout: Option<Duration>,
 }
 
 impl<'a> DebouncerClient<'a> {
-    /// Debounces `workflow` as `options` would enqueue it, with no timeout.
+    /// Debounces `workflow` on `queue`, with no timeout, for this client's app.
     pub fn new(
         client: &Client,
         workflow: impl Into<QualifiedWorkflowName>,
-        options: EnqueueOptions<'a>,
+        queue: &'a str,
     ) -> Self {
         Self {
             client: client.clone(),
             workflow: workflow.into(),
-            options,
+            queue,
+            serialization: SerializationFormat::Default,
+            timeout: None,
+            attributes: None,
+            app_version: None,
+            app_name: None,
             debounce_timeout: None,
+        }
+    }
+
+    /// What a debounce enqueues with, as an enqueue names it.
+    fn enqueue_options(&self) -> EnqueueOptions<'a> {
+        EnqueueOptions {
+            app_name: self.app_name,
+            app_version: self.app_version,
+            timeout: self.timeout,
+            attributes: self.attributes,
+            ..EnqueueOptions::on(Enqueue {
+                serialization: self.serialization,
+                ..Enqueue::new(self.queue)
+            })
         }
     }
 
@@ -707,25 +697,21 @@ impl<'a> DebouncerClient<'a> {
     where
         P: Serialize,
     {
-        refuse_stored_workflow_id(self.options.workflow_id, "DebouncerClient::debounce_with")?;
-        refuse_owned_options(&self.options.queue)?;
-        self.options.validate(&self.workflow)?;
+        let options = self.enqueue_options();
+        options.validate(&self.workflow)?;
         refuse_durations(period, self.debounce_timeout)?;
-        refuse_app_name(self.options.app_name)?;
+        refuse_app_name(self.app_name)?;
 
         let conn = self.client.connection();
-        let encoding = PayloadEncoding::resolve(
-            self.options.queue.serialization,
-            conn.serializer().encoding(),
-        );
+        let encoding = PayloadEncoding::resolve(self.serialization, conn.serializer().encoding());
         let bounce = Bounce {
             workflow: &self.workflow,
-            queue_name: self.options.queue.name,
+            queue_name: self.queue,
             deduplication_id: deduplication_id(&self.workflow, key),
             period,
             input: encode_input(&input, &encoding)?,
             encoding,
-            target_app: self.options.app_name.or(conn.app_name()),
+            target_app: self.app_name.or(conn.app_name()),
         };
         loop {
             let outcome = conn
@@ -747,11 +733,11 @@ impl<'a> DebouncerClient<'a> {
                         queue: Enqueue {
                             deduplication_id: Some(&bounce.deduplication_id),
                             delay: Some(period),
-                            ..self.options.queue.clone()
+                            ..options.queue.clone()
                         },
                         workflow_id: call.workflow_id,
                         app_name: bounce.target_app,
-                        ..self.options.clone()
+                        ..options.clone()
                     };
                     let created = self
                         .client
@@ -909,59 +895,6 @@ mod tests {
         );
     }
 
-    /// Each option a debounce owns is refused by name; the serialization is not one of them.
-    #[test]
-    fn the_options_a_debounce_owns_are_refused() {
-        let refused = |queue: Enqueue<'_>, field: &str| {
-            let error = refuse_owned_options(&queue).expect_err(field);
-            assert!(
-                matches!(&error, Error::InvalidArgument { operation, detail }
-                    if operation == DEBOUNCE_OPERATION && detail.contains(field)),
-                "{error}"
-            );
-        };
-        refused(
-            Enqueue {
-                deduplication_id: Some("mine"),
-                ..Enqueue::new("q")
-            },
-            "deduplication_id",
-        );
-        refused(
-            Enqueue {
-                delay: Some(Duration::from_secs(1)),
-                ..Enqueue::new("q")
-            },
-            "delay",
-        );
-        refused(
-            Enqueue {
-                duplication_policy: DuplicationPolicy::ReturnExisting,
-                ..Enqueue::new("q")
-            },
-            "ReturnExisting",
-        );
-        refused(
-            Enqueue {
-                priority: Some(1),
-                ..Enqueue::new("q")
-            },
-            "priority",
-        );
-        refused(
-            Enqueue {
-                partition_key: Some("p"),
-                ..Enqueue::new("q")
-            },
-            "partition_key",
-        );
-        refuse_owned_options(&Enqueue {
-            serialization: crate::SerializationFormat::Portable,
-            ..Enqueue::new("q")
-        })
-        .expect("the serialization is the caller's to choose");
-    }
-
     #[test]
     fn a_zero_period_or_timeout_is_refused() {
         assert!(matches!(
@@ -975,19 +908,9 @@ mod tests {
         refuse_durations(Duration::from_secs(1), Some(Duration::from_secs(1))).expect("valid");
     }
 
-    /// A debouncer's stored `workflow_id` is refused by its public name, pointing at the per-call
-    /// form; an empty or malformed `app_name` is refused as `app_name`, not as a column.
+    /// An empty or malformed `app_name` is refused as `app_name`, not as a column.
     #[test]
-    fn a_stored_workflow_id_and_a_bad_app_name_are_refused() {
-        let error = refuse_stored_workflow_id(Some("pinned"), "Debouncer::debounce_with")
-            .expect_err("a stored id is refused");
-        assert!(
-            matches!(&error, Error::InvalidArgument { detail, .. }
-                if detail.contains("options.workflow_id") && detail.contains("debounce_with")),
-            "{error}"
-        );
-        refuse_stored_workflow_id(None, "Debouncer::debounce_with").expect("no id is fine");
-
+    fn a_bad_app_name_is_refused() {
         for bad in ["", "No"] {
             let error = refuse_app_name(Some(bad)).expect_err(bad);
             assert!(

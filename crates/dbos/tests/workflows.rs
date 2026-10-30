@@ -8,8 +8,8 @@ use std::time::Duration;
 use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
-use dbos::sysdb::{BackendError, BackendErrorKind};
-use dbos::{Config, DBOS, Error, RunOptions};
+use dbos::sysdb::{BackendError, BackendErrorKind, Error as SysdbError, INTERNAL_QUEUE};
+use dbos::{Config, DBOS, Enqueue, Error, RunOptions, StartOptions, WorkflowIdReusePolicy};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -36,6 +36,95 @@ async fn double(n: u32) -> dbos::Result<u32> {
 
 async fn greet(_: ()) -> dbos::Result<String> {
     Ok("hello".to_owned())
+}
+
+/// `WorkflowIdReusePolicy::Reject` refuses a start or an enqueue whose id is taken, even by a
+/// finished workflow, and runs nothing; the default joins the workflow that has it.
+#[tokio::test]
+async fn a_rejecting_start_or_enqueue_refuses_a_taken_id() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("reuse-policy-app", &db));
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = {
+        let runs = Arc::clone(&runs);
+        dbos.register_workflow("counted", move |n: u32| {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<u32, Error>(n)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let id = "reuse-policy-id";
+    let rejecting = |queue| StartOptions {
+        workflow_id: Some(id),
+        workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
+        queue,
+        ..StartOptions::default()
+    };
+    let first = counted
+        .start_with(1, rejecting(None))
+        .await
+        .expect("a fresh id is not in use")
+        .result()
+        .await
+        .expect("the workflow failed");
+    assert_eq!(first, 1);
+
+    for queue in [None, Some(Enqueue::new(INTERNAL_QUEUE))] {
+        let refused = counted.start_with(2, rejecting(queue)).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::SystemDatabase(SysdbError::WorkflowIdInUse {
+                    workflow_id,
+                    status: WorkflowStatus::Success,
+                    name: Some(name),
+                })) if workflow_id == id && name == "counted"
+            ),
+            "{:?}",
+            refused.map(|_| ())
+        );
+    }
+
+    // The default joins the finished workflow, and hands back its result.
+    let joined = counted
+        .run_with(
+            3,
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the join failed");
+    assert_eq!(joined, 1, "the result of the workflow that has the id");
+
+    // `Reject` is about an id the caller chose, and is refused without one.
+    for queue in [None, Some(Enqueue::new(INTERNAL_QUEUE))] {
+        let refused = counted
+            .start_with(
+                4,
+                StartOptions {
+                    workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
+                    queue,
+                    ..StartOptions::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument { detail, .. })
+                if detail.contains("`WorkflowIdReusePolicy::Reject` needs a `workflow_id`")),
+            "{:?}",
+            refused.map(|_| ())
+        );
+    }
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "only the first start ran");
+
+    dbos.shutdown().await;
 }
 
 /// The ordinary case: a workflow runs, returns, and its row records what it returned.

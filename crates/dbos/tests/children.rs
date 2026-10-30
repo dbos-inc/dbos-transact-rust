@@ -9,7 +9,7 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
     Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueConflict, QueueOptions, RunOptions,
-    StartOptions, Timeout,
+    StartOptions, Timeout, WorkflowIdReusePolicy,
 };
 
 use dbos_test_support::{Backend, TestDatabase, owner_token, test_database};
@@ -930,6 +930,100 @@ async fn a_child_id_taken_by_another_function_replays_its_error_after_the_row_is
     assert!(
         reader
             .get_workflow("the-taken-child-id")
+            .await
+            .expect("read failed")
+            .is_none(),
+        "the replay started the child"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A child start that refuses a taken id is a recorded error too**, and a replay ends with the same
+/// error after the workflow holding the id is deleted, rather than starting the child.
+#[tokio::test]
+async fn a_rejected_child_start_replays_its_error_after_the_row_is_deleted() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("child-reuse-app", &db));
+    let child = dbos
+        .register_workflow("child", |()| async move { Ok::<u32, Error>(9) })
+        .unwrap();
+    let parent = dbos
+        .register_workflow("parent", {
+            let child = child.clone();
+            move |()| {
+                let child = child.clone();
+                async move {
+                    child
+                        .start_with(
+                            (),
+                            StartOptions {
+                                workflow_id: Some("the-reused-child-id"),
+                                workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
+                                ..StartOptions::default()
+                            },
+                        )
+                        .await?
+                        .result()
+                        .await
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // The same function holds the id: a reuse even so.
+    child
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("the-reused-child-id"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the first child failed");
+
+    let id = "the-rejecting-parent";
+    let first = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start")
+        .result()
+        .await
+        .expect_err("the parent should end with the error");
+    assert!(
+        matches!(
+            first,
+            Error::SystemDatabase(dbos::sysdb::Error::WorkflowIdInUse { .. })
+        ),
+        "{first:?}"
+    );
+
+    // With the first child gone the id is free, so only the record keeps the replay failing.
+    dbos.delete("the-reused-child-id")
+        .await
+        .expect("delete failed");
+    let fork = dbos.fork::<u32, Error>(id, 1).await.expect("fork failed");
+    let replayed = fork
+        .result()
+        .await
+        .expect_err("the replay should end with the error");
+    assert_eq!(
+        replayed.to_string(),
+        first.to_string(),
+        "the replay ended differently from the run it replayed"
+    );
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow("the-reused-child-id")
             .await
             .expect("read failed")
             .is_none(),

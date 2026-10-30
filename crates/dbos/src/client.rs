@@ -69,7 +69,9 @@ use crate::identity::validate_app_name;
 use crate::serialization::Serializer;
 use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode_input};
 use crate::sysdb::DEFAULT_SCHEMA;
-use crate::sysdb::types::{NewWorkflow, Timestamp, VersionInfo, WorkflowStatus};
+use crate::sysdb::types::{
+    NewWorkflow, Timestamp, VersionInfo, WorkflowIdReusePolicy, WorkflowStatus,
+};
 use crate::workflow::{
     Debounced, ENQUEUE_OPERATION, Enqueue, Submitted, encode_attributes, init_or_join, new_row,
     refused_start, validate_start,
@@ -521,9 +523,15 @@ impl Client {
 
         // A client has no step counter of its own, so an enqueue it makes records against no
         // parent — the line drawn for every other call a client makes.
-        match init_or_join(&self.0, &new, options.queue.duplication_policy, None)
-            .await
-            .map_err(|error| refused_start(Some(options.queue.name), error))?
+        match init_or_join(
+            &self.0,
+            &new,
+            options.queue.duplication_policy,
+            options.workflow_id_reuse_policy,
+            None,
+        )
+        .await
+        .map_err(|error| refused_start(Some(options.queue.name), error))?
         {
             Submitted::Created(_) => {
                 tracing::debug!(
@@ -806,9 +814,16 @@ pub struct EnqueueOptions<'a> {
     /// The workflow's id, in place of a generated one.
     ///
     /// An idempotency key, as everywhere else: enqueueing the same id twice records one workflow,
-    /// and the second call hands back a handle to it rather than failing. The natural use from a
-    /// client is a request id, so a retried HTTP request enqueues one workflow.
+    /// and the second call hands back a handle to it rather than failing, unless
+    /// [`workflow_id_reuse_policy`](Self::workflow_id_reuse_policy) says to refuse. The natural use
+    /// from a client is a request id, so a retried HTTP request enqueues one workflow.
     pub workflow_id: Option<&'a str>,
+
+    /// What the enqueue does when the id already names another caller's workflow: join it (the
+    /// default), or refuse with [`WorkflowIdInUse`](crate::sysdb::Error::WorkflowIdInUse).
+    /// [`Reject`](WorkflowIdReusePolicy::Reject) needs a [`workflow_id`](Self::workflow_id), and
+    /// is refused as [`Error::InvalidArgument`] without one.
+    pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
 
     /// The application this workflow belongs to, in place of this client's own.
     ///
@@ -871,7 +886,12 @@ impl<'a> EnqueueOptions<'a> {
                 detail: format!("queue `{}`: `workflow` must not be empty", self.queue.name),
             });
         }
-        validate_start(Some(&self.queue), self.timeout)
+        validate_start(
+            Some(&self.queue),
+            self.timeout,
+            self.workflow_id,
+            self.workflow_id_reuse_policy,
+        )
     }
 
     /// A plain enqueue onto `queue`, asking for nothing else.
@@ -891,6 +911,7 @@ impl<'a> EnqueueOptions<'a> {
         Self {
             queue,
             workflow_id: None,
+            workflow_id_reuse_policy: WorkflowIdReusePolicy::ReturnExisting,
             app_name: None,
             app_version: None,
             timeout: None,

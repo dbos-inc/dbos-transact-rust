@@ -6,6 +6,8 @@
 
 use std::borrow::Cow;
 
+use super::types::WorkflowStatus;
+
 /// What went wrong talking to the system database.
 ///
 /// Deliberately not `sqlx::Error`: that type names a specific driver, and
@@ -44,6 +46,19 @@ pub enum Error {
         workflow_id: String,
         /// Which part disagreed, and how.
         detail: String,
+    },
+    /// A workflow with this id already exists, and the caller asked for a new one with
+    /// [`WorkflowIdReusePolicy::Reject`](super::types::WorkflowIdReusePolicy::Reject).
+    ///
+    /// Raised whatever the existing workflow's status, finished included, and before anything is
+    /// written. An answer rather than a failure, so it is never retried.
+    WorkflowIdInUse {
+        /// The id already in use.
+        workflow_id: String,
+        /// The existing workflow's status.
+        status: WorkflowStatus,
+        /// The existing workflow's name, which may be another function's.
+        name: Option<String>,
     },
     /// A caller supplied a value the layer will not store.
     ///
@@ -212,6 +227,18 @@ impl std::fmt::Display for Error {
                 workflow_id,
                 detail,
             } => write!(f, "workflow {workflow_id} already exists: {detail}"),
+            Error::WorkflowIdInUse {
+                workflow_id,
+                status,
+                name,
+            } => {
+                write!(f, "workflow id {workflow_id} is already in use, by ")?;
+                match name {
+                    Some(name) => write!(f, "workflow {name}")?,
+                    None => f.write_str("a workflow")?,
+                }
+                write!(f, " ({status})")
+            }
             Error::InvalidInput { field, detail } => write!(f, "invalid {field}: {detail}"),
             Error::QueueDeduplicated {
                 workflow_id,
@@ -346,6 +373,7 @@ impl Error {
             | Error::WorkflowConflict { .. }
             | Error::UnexpectedStep { .. } => false,
             Error::ConflictingWorkflow { .. }
+            | Error::WorkflowIdInUse { .. }
             | Error::InvalidInput { .. }
             | Error::QueueDeduplicated { .. }
             | Error::NoForkPoint { .. }

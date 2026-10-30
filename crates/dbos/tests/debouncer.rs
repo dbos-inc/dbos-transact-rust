@@ -14,9 +14,9 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{Error as SysdbError, INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Client, ClientConfig, Config, DBOS, DebounceOptions, Debouncer, DebouncerClient,
-    DuplicationPolicy, Enqueue, EnqueueOptions, Error, QualifiedWorkflowName, QueueConflict,
-    QueueOptions, RunOptions, SerializationFormat, StartOptions, Timeout, WorkflowHandle,
+    Client, ClientConfig, Config, DBOS, DebounceOptions, Debouncer, DebouncerClient, Enqueue,
+    Error, QualifiedWorkflowName, QueueConflict, QueueOptions, RunOptions, SerializationFormat,
+    StartOptions, Timeout, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -691,8 +691,7 @@ async fn concurrent_debounces_of_one_key_coalesce_onto_one_workflow() {
         });
         let client = client.clone();
         tasks.spawn(async move {
-            let debouncer =
-                DebouncerClient::new(&client, "echo", EnqueueOptions::new(INTERNAL_QUEUE));
+            let debouncer = DebouncerClient::new(&client, "echo", INTERNAL_QUEUE);
             let handle: WorkflowHandle<u32> = debouncer
                 .debounce("race", RACE_PERIOD, 100 + n)
                 .await
@@ -721,10 +720,10 @@ async fn concurrent_debounces_of_one_key_coalesce_onto_one_workflow() {
     dbos.shutdown().await;
 }
 
-/// Each option a debounce owns is refused, from an app and from a client, and nothing is written.
-/// So are a zero period, a `workflow_id` stored on the debouncer, and an empty `app_name`.
+/// What a debouncer cannot act on is refused, from an app and from a client, and nothing is
+/// written: a zero period, a zero timeout, an empty queue and an empty `app_name`.
 #[tokio::test]
-async fn each_option_a_debounce_owns_is_refused() {
+async fn what_a_debouncer_cannot_act_on_is_refused() {
     let db = test_database().await;
     let app = "debounce-refuse-app";
     let dbos = DBOS::new(config(app, &db));
@@ -735,69 +734,12 @@ async fn each_option_a_debounce_owns_is_refused() {
     let reader = reader(&db).await;
     let client = client(Some(app), &db).await;
 
-    let owned: [(&str, Enqueue<'static>); 5] = [
-        (
-            "deduplication_id",
-            Enqueue {
-                deduplication_id: Some("mine"),
-                ..Enqueue::new("q")
-            },
-        ),
-        (
-            "delay",
-            Enqueue {
-                delay: Some(Duration::from_secs(100)),
-                ..Enqueue::new("q")
-            },
-        ),
-        (
-            "ReturnExisting",
-            Enqueue {
-                deduplication_id: None,
-                duplication_policy: DuplicationPolicy::ReturnExisting,
-                ..Enqueue::new("q")
-            },
-        ),
-        (
-            "priority",
-            Enqueue {
-                priority: Some(1),
-                ..Enqueue::new("q")
-            },
-        ),
-        (
-            "partition_key",
-            Enqueue {
-                partition_key: Some("p"),
-                ..Enqueue::new("q")
-            },
-        ),
-    ];
     let refused = |error: Error, field: &str| {
         assert!(
             matches!(&error, Error::InvalidArgument { detail, .. } if detail.contains(field)),
             "{field}: {error}"
         );
     };
-    for (field, queue) in owned {
-        let debouncer = Debouncer {
-            options: StartOptions {
-                queue: Some(queue.clone()),
-                ..StartOptions::default()
-            },
-            ..Debouncer::new(&echo)
-        };
-        refused(debouncer.debounce("k", PERIOD, 1).await.unwrap_err(), field);
-        let debouncer = DebouncerClient::new(&client, "echo", EnqueueOptions::on(queue));
-        refused(
-            debouncer
-                .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
-                .await
-                .unwrap_err(),
-            field,
-        );
-    }
-
     refused(
         Debouncer::new(&echo)
             .debounce("k", Duration::ZERO, 1)
@@ -806,39 +748,47 @@ async fn each_option_a_debounce_owns_is_refused() {
         "period",
     );
     refused(
-        DebouncerClient::new(&client, "echo", EnqueueOptions::new(INTERNAL_QUEUE))
+        DebouncerClient::new(&client, "echo", INTERNAL_QUEUE)
             .debounce::<_, u32, dbos::EngineOnly>("k", Duration::ZERO, 1)
             .await
             .unwrap_err(),
         "period",
     );
 
-    // A pinned id stored on a debouncer would name every workflow it enqueues: refused by its
-    // public name, pointing at the per-call form.
-    let stored_id = Debouncer {
-        options: StartOptions {
-            workflow_id: Some("stored"),
-            ..StartOptions::default()
-        },
+    let zero_timeout = Debouncer {
+        timeout: Some(Duration::ZERO),
         ..Debouncer::new(&echo)
     };
     refused(
-        stored_id.debounce("k", PERIOD, 1).await.unwrap_err(),
-        "options.workflow_id",
+        zero_timeout.debounce("k", PERIOD, 1).await.unwrap_err(),
+        "timeout",
     );
-    let stored_id = DebouncerClient::new(
-        &client,
-        "echo",
-        EnqueueOptions {
-            workflow_id: Some("stored"),
-            ..EnqueueOptions::new(INTERNAL_QUEUE)
-        },
+    let zero_timeout = DebouncerClient {
+        timeout: Some(Duration::ZERO),
+        ..DebouncerClient::new(&client, "echo", INTERNAL_QUEUE)
+    };
+    refused(
+        zero_timeout
+            .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
+            .await
+            .unwrap_err(),
+        "timeout",
     );
-    let error = stored_id
-        .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
-        .await
-        .unwrap_err();
-    refused(error, "debounce_with");
+    let empty_queue = Debouncer {
+        queue: Some(""),
+        ..Debouncer::new(&echo)
+    };
+    refused(
+        empty_queue.debounce("k", PERIOD, 1).await.unwrap_err(),
+        "name",
+    );
+    refused(
+        DebouncerClient::new(&client, "echo", "")
+            .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
+            .await
+            .unwrap_err(),
+        "name",
+    );
 
     // An empty app name is refused as the API spells it, not as the column it would fill.
     let error = Debouncer {
@@ -850,14 +800,10 @@ async fn each_option_a_debounce_owns_is_refused() {
     .unwrap_err();
     assert!(!error.to_string().contains("application_name"), "{error}");
     refused(error, "`app_name`");
-    let error = DebouncerClient::new(
-        &client,
-        "echo",
-        EnqueueOptions {
-            app_name: Some(""),
-            ..EnqueueOptions::new(INTERNAL_QUEUE)
-        },
-    )
+    let error = DebouncerClient {
+        app_name: Some(""),
+        ..DebouncerClient::new(&client, "echo", INTERNAL_QUEUE)
+    }
     .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 1)
     .await
     .unwrap_err();
@@ -902,10 +848,7 @@ async fn a_key_held_by_a_workflow_that_is_not_debounced_is_refused() {
         .expect("the holder was not enqueued");
 
     let debouncer = Debouncer {
-        options: StartOptions {
-            queue: Some(Enqueue::new(queue)),
-            ..StartOptions::default()
-        },
+        queue: Some(queue),
         ..Debouncer::new(&echo)
     };
     let error = debouncer.debounce("key", PERIOD, 2).await.unwrap_err();
@@ -928,7 +871,7 @@ async fn a_client_debounce_of_a_nameless_workflow_is_refused() {
     let client = client(None, &db).await;
     let reader = reader(&db).await;
 
-    let debouncer = DebouncerClient::new(&client, "", EnqueueOptions::new("nameless-queue"));
+    let debouncer = DebouncerClient::new(&client, "", "nameless-queue");
     let refused = debouncer.debounce::<_, u32, Error>("key", PERIOD, 1).await;
     assert!(
         matches!(&refused, Err(Error::InvalidArgument { detail, .. })
@@ -949,11 +892,11 @@ async fn a_config_with_no_class_debounces_apart_from_the_free_function() {
     let client = client(None, &db).await;
     let reader = reader(&db).await;
     let queue = "unclassed-queue";
-    let free = DebouncerClient::new(&client, "echo", EnqueueOptions::new(queue));
+    let free = DebouncerClient::new(&client, "echo", queue);
     let unclassed = DebouncerClient::new(
         &client,
         QualifiedWorkflowName::instance("echo", "", "eu"),
-        EnqueueOptions::new(queue),
+        queue,
     );
 
     let a: WorkflowHandle<u32> = free.debounce("key", FOREVER, 1).await.unwrap();
@@ -976,8 +919,8 @@ async fn a_key_collision_between_two_workflows_is_refused() {
     let client = client(None, &db).await;
     let reader = reader(&db).await;
     let queue = "collision-queue";
-    let a = DebouncerClient::new(&client, "colw", EnqueueOptions::new(queue));
-    let b = DebouncerClient::new(&client, "colw-b", EnqueueOptions::new(queue));
+    let a = DebouncerClient::new(&client, "colw", queue);
+    let b = DebouncerClient::new(&client, "colw-b", queue);
 
     let held: WorkflowHandle<u32> = a.debounce("b-k", FOREVER, 1).await.unwrap();
     let error = b
@@ -1026,7 +969,7 @@ async fn the_client_debouncer_coalesces_and_honours_its_options() {
     let reader = reader(&db).await;
     let client = client(Some(app), &db).await;
 
-    let debouncer = DebouncerClient::new(&client, "echo", EnqueueOptions::new("client-queue"));
+    let debouncer = DebouncerClient::new(&client, "echo", "client-queue");
     let first: WorkflowHandle<u32> = debouncer.debounce("key", PERIOD, 0).await.unwrap();
     let second: WorkflowHandle<u32> = debouncer.debounce("key", PERIOD, 1).await.unwrap();
     let first_id = first.workflow_id().to_owned();
@@ -1046,10 +989,7 @@ async fn the_client_debouncer_coalesces_and_honours_its_options() {
     assert_eq!(result(fourth).await, 3);
 
     let timed = DebouncerClient {
-        options: EnqueueOptions {
-            timeout: Some(Duration::from_secs(5)),
-            ..EnqueueOptions::new("client-queue")
-        },
+        timeout: Some(Duration::from_secs(5)),
         ..debouncer.clone()
     };
     let handle: WorkflowHandle<u32> = timed
@@ -1093,7 +1033,7 @@ async fn the_client_debounce_timeout_caps_the_total_delay() {
 
     let capped = DebouncerClient {
         debounce_timeout: Some(Duration::from_secs(2)),
-        ..DebouncerClient::new(&client, "echo", EnqueueOptions::new("client-queue"))
+        ..DebouncerClient::new(&client, "echo", "client-queue")
     };
     let first: WorkflowHandle<u32> = capped.debounce("key", FOREVER, 1).await.unwrap();
     let deadline = row(&reader, first.workflow_id())
@@ -1150,19 +1090,15 @@ async fn a_debounce_can_target_another_application() {
     assert_eq!(again.workflow_id(), first.workflow_id());
 
     // A client acting for itself coalesces once it names the target.
-    let targeted = DebouncerClient::new(
-        &client,
-        "wf",
-        EnqueueOptions {
-            app_name: Some("other-app"),
-            ..EnqueueOptions::new(INTERNAL_QUEUE)
-        },
-    );
+    let targeted = DebouncerClient {
+        app_name: Some("other-app"),
+        ..DebouncerClient::new(&client, "wf", INTERNAL_QUEUE)
+    };
     let coalesced: WorkflowHandle<u32> = targeted.debounce("k", FOREVER, 3).await.unwrap();
     assert_eq!(coalesced.workflow_id(), first.workflow_id());
 
     // Without naming it, the client acts as `app-a` and collides.
-    let error = DebouncerClient::new(&client, "wf", EnqueueOptions::new(INTERNAL_QUEUE))
+    let error = DebouncerClient::new(&client, "wf", INTERNAL_QUEUE)
         .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 4)
         .await
         .unwrap_err();
@@ -1186,34 +1122,34 @@ async fn a_bounce_claims_an_unclaimed_holder_and_another_application_collides() 
     let nameless = client(None, &db).await;
     let app_a = client(Some("app-a"), &db).await;
     let app_b = client(Some("app-b"), &db).await;
-    let options = || EnqueueOptions::new("cross-app-queue");
+    let queue = "cross-app-queue";
     let owner = |record: WorkflowRecord| {
         assert_eq!(record.status, WorkflowStatus::Delayed);
         record.app_name
     };
 
-    let handle: WorkflowHandle<u32> = DebouncerClient::new(&nameless, "shared", options())
+    let handle: WorkflowHandle<u32> = DebouncerClient::new(&nameless, "shared", queue)
         .debounce("k", FOREVER, 1)
         .await
         .unwrap();
     let id = handle.workflow_id().to_owned();
     assert_eq!(owner(row(&reader, &id).await), None);
 
-    let claimed: WorkflowHandle<u32> = DebouncerClient::new(&app_a, "shared", options())
+    let claimed: WorkflowHandle<u32> = DebouncerClient::new(&app_a, "shared", queue)
         .debounce("k", FOREVER, 2)
         .await
         .unwrap();
     assert_eq!(claimed.workflow_id(), id);
     assert_eq!(owner(row(&reader, &id).await).as_deref(), Some("app-a"));
 
-    let error = DebouncerClient::new(&app_b, "shared", options())
+    let error = DebouncerClient::new(&app_b, "shared", queue)
         .debounce::<_, u32, dbos::EngineOnly>("k", PERIOD, 3)
         .await
         .unwrap_err();
     assert!(is_deduplicated(&error), "{error}");
     assert_eq!(owner(row(&reader, &id).await).as_deref(), Some("app-a"));
 
-    let _: WorkflowHandle<u32> = DebouncerClient::new(&nameless, "shared", options())
+    let _: WorkflowHandle<u32> = DebouncerClient::new(&nameless, "shared", queue)
         .debounce("k", FOREVER, 4)
         .await
         .unwrap();
@@ -1276,7 +1212,7 @@ async fn a_pinned_id_reused_after_its_workflow_ran_is_a_conflict_not_a_join() {
     assert_eq!(result(fresh).await, 4);
 
     // The client refuses the same way.
-    let through_client = DebouncerClient::new(&client, "echo", EnqueueOptions::new(INTERNAL_QUEUE));
+    let through_client = DebouncerClient::new(&client, "echo", INTERNAL_QUEUE);
     let error = through_client
         .debounce_with::<_, u32, dbos::EngineOnly>("key", short, 5, pinned("pinned-cycle"))
         .await
@@ -1354,10 +1290,7 @@ async fn a_deduplicated_debounce_inside_a_workflow_replays_its_error() {
         .register_workflow("echo", |x: u32| async move { Ok::<u32, Error>(x) })
         .unwrap();
     let debouncer: Debouncer<'static, u32, u32> = Debouncer {
-        options: StartOptions {
-            queue: Some(Enqueue::new(queue)),
-            ..StartOptions::default()
-        },
+        queue: Some(queue),
         ..Debouncer::new(&echo)
     };
     let parent = dbos
@@ -1458,13 +1391,7 @@ async fn a_portable_bounce_over_a_native_row_replaces_input_and_tag_together() {
 
     let native = Debouncer::new(&echo);
     let portable = Debouncer {
-        options: StartOptions {
-            queue: Some(Enqueue {
-                serialization: SerializationFormat::Portable,
-                ..Enqueue::new(INTERNAL_QUEUE)
-            }),
-            ..StartOptions::default()
-        },
+        serialization: SerializationFormat::Portable,
         ..Debouncer::new(&echo)
     };
 
@@ -1538,7 +1465,7 @@ async fn a_configured_instance_workflow_debounces_under_its_full_identity() {
     // A client naming the eu instance by its key coalesces onto the app's workflow.
     let client = client(Some(app), &db).await;
     let through_client: WorkflowHandle<u32> =
-        DebouncerClient::new(&client, key("eu"), EnqueueOptions::new(INTERNAL_QUEUE))
+        DebouncerClient::new(&client, key("eu"), INTERNAL_QUEUE)
             .debounce("key", FOREVER, 3)
             .await
             .unwrap();
