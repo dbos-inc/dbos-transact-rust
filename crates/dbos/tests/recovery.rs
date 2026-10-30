@@ -193,16 +193,18 @@ async fn an_unregistered_workflow_is_skipped_and_the_rest_recover() {
         .unwrap();
     first.launch().await.expect("launch failed");
 
-    for workflow in [
-        dbos::__rt::spawn(async move { ghost.run(()).await }),
-        dbos::__rt::spawn(async move { keeper.run(()).await }),
-    ] {
-        dbos::__rt::timeout(DEADLINE, entered.notified())
-            .await
-            .expect("a workflow never started");
-        // Not awaited further: both block at the gate until shutdown interrupts them.
-        drop(workflow);
-    }
+    // Started one at a time, each acknowledged before the next. `Notify` keeps one permit, so
+    // two workflows notifying before this waits — which a multi-threaded runtime allows — would
+    // read as one, and the second wait would time out. Not awaited further: both block at the
+    // gate until shutdown interrupts them.
+    drop(dbos::__rt::spawn(async move { ghost.run(()).await }));
+    dbos::__rt::timeout(DEADLINE, entered.notified())
+        .await
+        .expect("ghost never started");
+    drop(dbos::__rt::spawn(async move { keeper.run(()).await }));
+    dbos::__rt::timeout(DEADLINE, entered.notified())
+        .await
+        .expect("keeper never started");
     first.shutdown().await;
 
     // A new instance on the same database, with `ghost`'s code "removed".
