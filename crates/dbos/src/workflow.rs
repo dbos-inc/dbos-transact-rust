@@ -42,9 +42,9 @@ pub(crate) const MAX_RECOVERY_ATTEMPTS: i64 = 100;
 #[derive(Default)]
 pub(crate) struct Tasks {
     state: Mutex<State>,
-    /// Woken as each task's future is dropped, so [`wait`](Tasks::wait) can wait for the last one
-    /// out without polling for it.
-    ended: tokio::sync::Notify,
+    /// Woken when the last live task's future is dropped, so [`wait_all`](Tasks::wait_all) can
+    /// wait for it without polling.
+    emptied: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -87,15 +87,22 @@ impl Tasks {
 
     /// Un-counts one whose future has been dropped, waking a shutdown waiting for the last.
     ///
+    /// Only the last one wakes anyone: a waiter has nothing to do until the count is zero, and
+    /// [`wait_all`](Self::wait_all) registers before it reads the count, so it cannot miss that
+    /// moment.
+    ///
     /// Runs from a `Drop`, including one unwinding out of a panicking workflow, so it takes care
     /// not to panic itself: the count cannot legitimately go below zero — one guard per task,
     /// dropped once — and saturating rather than wrapping keeps a bug here from becoming an abort.
     fn departed(&self) {
-        {
+        let emptied = {
             let mut state = self.lock();
             state.live = state.live.saturating_sub(1);
+            state.live == 0
+        };
+        if emptied {
+            self.emptied.notify_waiters();
         }
-        self.ended.notify_waiters();
     }
 
     /// The labels of the tasks still running, for a shutdown that is waiting on them to say what
@@ -109,12 +116,15 @@ impl Tasks {
             .collect()
     }
 
-    /// [`wait`](Self::wait), bounded by `deadline`: reports whether every task ended before it.
+    /// [`wait_all`](Self::wait_all), bounded by `deadline`: reports whether every task ended
+    /// before it.
     ///
     /// Returns as soon as the last task ends, not at the deadline. Nothing is cancelled, at the
     /// deadline or before it: what is still running is left to [`abort_all`](Self::abort_all).
-    pub(crate) async fn wait_until(&self, deadline: tokio::time::Instant) -> bool {
-        tokio::time::timeout_at(deadline, self.wait()).await.is_ok()
+    pub(crate) async fn wait_all_until(&self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::timeout_at(deadline, self.wait_all())
+            .await
+            .is_ok()
     }
 
     /// Cancels every task still running and waits for them to stop, returning the labels of those
@@ -142,24 +152,25 @@ impl Tasks {
             }
             cancelled
         };
-        self.wait().await;
+        self.wait_all().await;
         cancelled
     }
 
-    /// Waits until no task's future is left alive.
-    async fn wait(&self) {
+    /// Waits until no task's future is left alive, counting any that arrive while it waits.
+    async fn wait_all(&self) {
         loop {
-            // Registered before the count is read, so a task ending in between is not missed:
-            // `notify_waiters` wakes only those already waiting.
-            let ended = self.ended.notified();
-            tokio::pin!(ended);
-            ended.as_mut().enable();
+            // Registered before the count is read, so the count reaching zero in between is not
+            // missed: `notify_waiters` wakes only those already waiting. Looping covers a task
+            // arriving after the zero, before this waiter ran.
+            let emptied = self.emptied.notified();
+            tokio::pin!(emptied);
+            emptied.as_mut().enable();
             // Bound to a `let` so the guard is released before the await, not held across it.
             let live = self.lock().live;
             if live == 0 {
                 return;
             }
-            ended.await;
+            emptied.await;
         }
     }
 
@@ -2775,10 +2786,36 @@ mod tests {
             .expect("the sweep panicked");
     }
 
+    /// Only the last task out ends the wait: one departing while another is still live does not.
+    #[tokio::test]
+    async fn wait_all_waits_for_the_last_task() {
+        let tasks = Arc::new(Tasks::default());
+        tasks.arrived();
+        tasks.arrived();
+
+        let mut waiting = {
+            let tasks = Arc::clone(&tasks);
+            tokio::spawn(async move { tasks.wait_all().await })
+        };
+        tasks.departed();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "the wait ended with a task still live"
+        );
+
+        tasks.departed();
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the wait never noticed the last task leaving")
+            .expect("the wait panicked");
+    }
+
     /// The drain's wait: it gives up at the deadline without cancelling anything, and reports a
     /// set that has emptied as ended.
     #[tokio::test]
-    async fn wait_until_gives_up_at_the_deadline_and_cancels_nothing() {
+    async fn wait_all_until_gives_up_at_the_deadline_and_cancels_nothing() {
         let tasks = Tasks::default();
         tasks.arrived();
         let task = tokio::spawn(std::future::pending::<()>());
@@ -2786,7 +2823,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         assert!(
-            !tasks.wait_until(deadline).await,
+            !tasks.wait_all_until(deadline).await,
             "a live task was reported ended"
         );
         assert!(!task.is_finished(), "the wait cancelled the task");
@@ -2794,7 +2831,7 @@ mod tests {
 
         task.abort();
         tasks.departed();
-        assert!(tasks.wait_until(tokio::time::Instant::now()).await);
+        assert!(tasks.wait_all_until(tokio::time::Instant::now()).await);
     }
 
     /// The race between spawning a workflow and registering it: one that arrives after the sweep
