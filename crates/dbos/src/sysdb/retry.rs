@@ -166,7 +166,7 @@ where
                 "system database operation lost a transaction conflict; replaying"
             );
         }
-        tokio::time::sleep(delay).await;
+        crate::rt::sleep(delay).await;
     }
 }
 

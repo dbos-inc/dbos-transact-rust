@@ -48,18 +48,23 @@ cargo deny check
 
 ## Features
 
-`dbos` has two features, both on by default:
+`dbos` has three features, all on by default:
 
 | Feature | Covers |
 | --- | --- |
 | `engine` | The durable execution engine: lifecycle, registry, contexts, workflows, steps, events, recovery, queues, scheduler, messaging, client |
 | `macros` | Re-exports the attribute macros and `select_step!` from `dbos-macros`. Implies `engine` |
+| `runtime-tokio` | The async runtime the crate spawns tasks and sets timers on. A runtime is required, with or without `engine` |
+
+Spawning and timers go through `crate::rt`, never tokio directly. `crates/dbos/clippy.toml` lists
+what that rules out, and `cargo clippy` enforces it for the library (the integration tests are
+exempt).
 
 With `engine` off, what remains is the system database and Conductor layers, the surface a future
 FFI host would consume. That boundary is a standing CI gate rather than a convention:
 
 ```bash
-cargo check -p dbos --no-default-features
+cargo check -p dbos --no-default-features --features runtime-tokio
 ```
 
 Note the `-p dbos`. Run over the whole workspace, any member asking for `dbos`'s default features

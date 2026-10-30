@@ -90,7 +90,7 @@ async fn sweep(executor: Arc<Executor>, interval: Duration) {
             }
         };
         if !full {
-            tokio::time::sleep(interval).await;
+            crate::rt::sleep(interval).await;
         }
     }
 }

@@ -58,13 +58,20 @@
 //! - `macros` *(default)* — [`select_step!`], the durable race, which is a procedural macro and so
 //!   costs `syn` and `quote` at build time. Implies `engine`, because the expansion is engine
 //!   code; nothing it generates reaches the binary.
+//! - `runtime-tokio` *(default)* — runs on tokio. The crate spawns its background tasks and sets
+//!   its timers on the async runtime this names, and needs one.
 
 #![forbid(unsafe_code)]
+// Spawning and timers go through `rt`, which picks the runtime; `clippy.toml` names what that
+// rules out everywhere else. Denied here rather than left at clippy's default so the rule holds
+// for this crate's own code alone: the integration tests under `tests/` still run on tokio.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 // A procedural macro has no `$crate`, so `select_step!`'s expansion names `::dbos` absolutely;
 // this is what lets that path resolve inside this crate's own tests and doctests.
 extern crate self as dbos;
 
+mod rt;
 pub mod sysdb;
 
 #[cfg(feature = "engine")]

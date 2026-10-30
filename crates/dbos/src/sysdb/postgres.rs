@@ -476,7 +476,7 @@ pub struct PostgresSystemDatabase {
     /// reconnecting against a closed pool for the life of the process, and nothing would say so.
     ///
     /// A `std::sync::Mutex` because it is only ever taken and replaced, never held across an await.
-    listener_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    listener_task: std::sync::Mutex<Option<crate::rt::JoinHandle<()>>>,
     /// The other direction: what this handle writes, told to the processes waiting on it.
     ///
     /// Held whether or not anything is being pushed, because the local wake it does is right on
@@ -486,7 +486,7 @@ pub struct PostgresSystemDatabase {
     /// The notifier's task, kept for the same reason as the listener's — with one difference that
     /// decides the order in [`close`](SystemDatabase::close): its last act is a database write, so
     /// it has to be finished *before* the pool closes rather than by it.
-    notifier_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    notifier_task: std::sync::Mutex<Option<crate::rt::JoinHandle<()>>>,
 }
 
 impl PostgresSystemDatabase {
@@ -620,14 +620,14 @@ impl PostgresSystemDatabase {
         // flush loops drain one queue between them.
         let mut listening = self.listener_task.lock().expect("listener lock");
         if listening.as_ref().is_none_or(|task| task.is_finished()) {
-            *listening = Some(tokio::spawn(Arc::clone(&self.listener).run()));
+            *listening = Some(crate::rt::spawn(Arc::clone(&self.listener).run()));
         }
         let mut notifying = self.notifier_task.lock().expect("notifier lock");
         if notifying.as_ref().is_none_or(|task| task.is_finished()) {
             // Enabled first: `signal` queues nothing until it is, and nothing would drain what it
             // queued before the loop exists.
             self.notifier.enable();
-            *notifying = Some(tokio::spawn(Arc::clone(&self.notifier).run()));
+            *notifying = Some(crate::rt::spawn(Arc::clone(&self.notifier).run()));
         }
         true
     }
@@ -4075,7 +4075,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 None => {}
             }
 
-            tokio::time::sleep(poll_interval).await;
+            crate::rt::sleep(poll_interval).await;
         }
     }
 
@@ -4128,7 +4128,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 return Ok(winner);
             }
 
-            tokio::time::sleep(poll_interval).await;
+            crate::rt::sleep(poll_interval).await;
         }
     }
 
@@ -4191,7 +4191,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 break;
             }
 
-            tokio::time::sleep(poll_interval).await;
+            crate::rt::sleep(poll_interval).await;
         }
         tracing::debug!("every awaited workflow settled");
         Ok(())
@@ -5354,7 +5354,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 continue;
             }
 
-            let _ = tokio::time::timeout(
+            let _ = crate::rt::timeout(
                 remaining.min(self.listener.poll_interval()),
                 subscription.notified(),
             )
@@ -5887,7 +5887,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // the whole timeout; the remaining time caps it so a wait never overruns the deadline.
             // Elapsing is not an error here: both outcomes mean the same thing, which is look
             // again.
-            let _ = tokio::time::timeout(
+            let _ = crate::rt::timeout(
                 remaining.min(self.listener.poll_interval()),
                 subscription.notified(),
             )
@@ -6186,7 +6186,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 wait = wait.min(remaining);
             }
             // Elapsing is not an error: both outcomes mean look again.
-            let _ = tokio::time::timeout(wait, subscription.notified()).await;
+            let _ = crate::rt::timeout(wait, subscription.notified()).await;
         }
     }
 
@@ -9215,10 +9215,10 @@ mod tests {
         .execute(&mut *idle)
         .await
         .unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        crate::rt::sleep(std::time::Duration::from_secs(1)).await;
         // The lock went with the session, so a hand-off goes through at once.
         let other = db.pool().await;
-        tokio::time::timeout(
+        crate::rt::timeout(
             std::time::Duration::from_secs(5),
             sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {table} SET owner_xid = NULL WHERE workflow_uuid = 'wf-idle'"

@@ -82,11 +82,14 @@ jobs:
     # `-p dbos` because the check is about one crate: run over the workspace, any member
     # asking for `dbos`'s defaults would unify `engine` back on and the gate would pass
     # whatever happened. `dbos-test-support` declines them for the same reason.
+    #
+    # A runtime is named because the crate needs one whatever else is off; the runtime is not
+    # part of the engine, so naming it leaves the boundary being checked where it was.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p dbos --no-default-features
+      - run: cargo check -p dbos --no-default-features --features runtime-tokio
 
   test:
     name: Test (${{ matrix.backend }})

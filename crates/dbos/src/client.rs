@@ -1014,26 +1014,25 @@ mod tests {
         })
         .await
         .expect("connect failed");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while !client.connection().sysdb().is_delivering() && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !client.connection().sysdb().is_delivering() && std::time::Instant::now() < deadline {
+            crate::rt::sleep(Duration::from_millis(50)).await;
         }
         let delivering = client.connection().sysdb().is_delivering();
 
         let handle = workflow.start(()).await.expect("start failed");
         let id = handle.workflow_id().to_owned();
-        let waiting = tokio::spawn({
+        let waiting = crate::rt::spawn({
             let client = client.clone();
             async move {
-                let started = tokio::time::Instant::now();
+                let started = std::time::Instant::now();
                 let value = client
                     .get_event::<u32>(&id, "ready", Duration::from_secs(50))
                     .await;
                 (value, started.elapsed())
             }
         });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::rt::sleep(Duration::from_millis(200)).await;
         release.notify_one();
         let (value, elapsed) = waiting.await.expect("the wait panicked");
 
