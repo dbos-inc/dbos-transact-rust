@@ -88,17 +88,17 @@ use std::time::Duration;
 
 use super::types::step_names;
 use super::types::{
-    AppScope, ApplicationRowCounts, AwaitedOutcome, AwaitedStream, Change, DatabaseTime, Debounce,
-    DebounceHolder, DebounceRequest, DequeueStop, Dequeued, EncodedValue, EventRecord, Fork,
-    ForkOptions, ForkPoint, GetEventCaller, IdleTransactionTimeout, InitWorkflowCaller, Message,
-    NewQueue, NewSchedule, NewWorkflow, NotificationRecord, OnExistingQueue, Outcome,
-    PollingConcurrency, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
-    RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus, ScheduleUpdate, StepCaller,
-    StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp, UpdatedQueue,
-    UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy,
-    WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy, decode_step_value, duration_from_ms,
-    duration_from_secs, duration_to_ms, encode_step_value, is_valid_application_name,
-    validate_attributes,
+    AppScope, ApplicationRowCounts, AttributeUpdate, AwaitedOutcome, AwaitedStream, Change,
+    DatabaseTime, Debounce, DebounceHolder, DebounceRequest, DequeueStop, Dequeued, EncodedValue,
+    EventRecord, Fork, ForkOptions, ForkPoint, GetEventCaller, IdleTransactionTimeout,
+    InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow, NotificationRecord,
+    OnExistingQueue, Outcome, PollingConcurrency, QueueRecord, QueueUpdate, RateLimit,
+    RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
+    ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord,
+    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    WorkflowIdReusePolicy, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy,
+    decode_step_value, duration_from_ms, duration_from_secs, duration_to_ms, encode_step_value,
+    is_valid_application_name,
 };
 use super::{
     BackendError, BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, NULL_TOPIC,
@@ -4264,12 +4264,23 @@ impl SystemDatabase for PostgresSystemDatabase {
     async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
-        attributes: Option<&str>,
+        update: AttributeUpdate<'_>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
-        validate_attributes(attributes)?;
+        update.validate()?;
         let workflow_table = self.tables.workflow_status.as_str();
         let started_at = Timestamp::now();
+        let (set, attributes) = match update {
+            AttributeUpdate::Replace(attributes) => ("$2::jsonb", attributes),
+            // Read and written in the one statement, so a concurrent merge either lands first and
+            // is merged into, or waits on the row lock and merges into this one. Anything that is
+            // not an object counts as an empty one, as Python's merge does.
+            AttributeUpdate::Merge(attributes) => (
+                "CASE WHEN jsonb_typeof(attributes) = 'object' \
+                      THEN attributes ELSE '{}'::jsonb END || $2::jsonb",
+                Some(attributes),
+            ),
+        };
 
         with_retry(
             &self.retry,
@@ -4282,7 +4293,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     |mut conn| async move {
                         sqlx::query(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
-                             SET attributes = $2::jsonb, updated_at = {NOW_MS_SQL} \
+                             SET attributes = {set}, updated_at = {NOW_MS_SQL} \
                              WHERE workflow_uuid = $1"
                         )))
                         .bind(workflow_id)

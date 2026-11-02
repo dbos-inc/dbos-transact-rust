@@ -126,8 +126,9 @@ use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
-    Fork as SysFork, ForkOptions as SysForkOptions, RewindOptions as SysRewindOptions, StepRecord,
-    WorkflowDelay, WorkflowFilter, WorkflowRecord, duration_to_ms, step_names,
+    AttributeUpdate, Fork as SysFork, ForkOptions as SysForkOptions,
+    RewindOptions as SysRewindOptions, StepRecord, WorkflowDelay, WorkflowFilter, WorkflowRecord,
+    duration_to_ms, step_names,
 };
 
 /// Whether an operation reaches a workflow's descendants.
@@ -1080,8 +1081,10 @@ impl DBOS {
 
     /// Replaces a workflow's attributes, or clears them with `None`.
     ///
-    /// **A replacement, not a merge**, in every implementation — so a caller adding one key must
-    /// send the others back with it.
+    /// **A replacement, not a merge**, so a caller adding one key must send the others back with
+    /// it, and two callers adding different keys race to drop each other's.
+    /// [`merge_workflow_attributes`](Self::merge_workflow_attributes) adds keys without either
+    /// problem.
     ///
     /// **A map, not encoded JSON.** The other three take one — Python `Dict[str, Any]`, Go
     /// `map[string]any`, Java `Map<String, Object>` — and encode it in their system database layer.
@@ -1129,7 +1132,49 @@ impl DBOS {
                     .connection()
                     .update_workflow_attributes(
                         workflow_id,
-                        encoded.as_deref(),
+                        AttributeUpdate::Replace(encoded.as_deref()),
+                        placement.step_writer(),
+                    )
+                    .await
+            },
+        )
+    }
+
+    /// Merges keys into a workflow's attributes, in one statement.
+    ///
+    /// **A shallow merge of the top-level keys.** A key already there takes the new value, and the
+    /// others stay as they are. A key set to JSON `null` is stored as `null`, not removed. If the
+    /// workflow has no attributes, or has ones that are not an object, the result is just these.
+    ///
+    /// **Atomic**, so two callers merging different keys into the same workflow both land, which a
+    /// read followed by [`update_workflow_attributes`](Self::update_workflow_attributes) cannot
+    /// promise. Python's `update_workflow_attributes(..., merge=True)` is the same operation, and
+    /// records the same step.
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// let more = serde_json::json!({ "reviewed_by": "ops" });
+    /// dbos.merge_workflow_attributes("an-order", more.as_object().unwrap()).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn merge_workflow_attributes<'a>(
+        &self,
+        workflow_id: &'a str,
+        attributes: &serde_json::Map<String, serde_json::Value>,
+    ) -> PendingStep<'a, ()> {
+        // Encoded before the id is taken, as in `update_workflow_attributes`.
+        let built = crate::workflow::encode_attribute_map(attributes)
+            .and_then(|encoded| Ok((encoded, self.placed("merge a workflow's attributes")?)))
+            .map(|(encoded, (executor, placement))| ((executor, encoded), placement));
+        PendingStep::placed(
+            step_names::UPDATE_WORKFLOW_ATTRIBUTES,
+            built,
+            move |(executor, encoded), placement| async move {
+                executor
+                    .connection()
+                    .update_workflow_attributes(
+                        workflow_id,
+                        AttributeUpdate::Merge(&encoded),
                         placement.step_writer(),
                     )
                     .await
@@ -1433,7 +1478,25 @@ impl crate::Client {
     ) -> Result<()> {
         let encoded = crate::workflow::encode_attributes(attributes)?;
         self.connection()
-            .update_workflow_attributes(workflow_id, encoded.as_deref(), None)
+            .update_workflow_attributes(
+                workflow_id,
+                AttributeUpdate::Replace(encoded.as_deref()),
+                None,
+            )
+            .await
+    }
+
+    /// Merges keys into a workflow's attributes, in one statement.
+    ///
+    /// See [`DBOS::merge_workflow_attributes`].
+    pub async fn merge_workflow_attributes(
+        &self,
+        workflow_id: &str,
+        attributes: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        let encoded = crate::workflow::encode_attribute_map(attributes)?;
+        self.connection()
+            .update_workflow_attributes(workflow_id, AttributeUpdate::Merge(&encoded), None)
             .await
     }
 
@@ -1675,25 +1738,33 @@ impl Connection {
         Ok(())
     }
 
-    /// Replaces a workflow's attributes, or clears them.
+    /// Replaces a workflow's attributes, clears them, or merges keys into them.
     ///
-    /// `encoded` is plain JSON, never the configured [`Serializer`](crate::Serializer): the column
-    /// is read by `@>` containment and by every other implementation, so what a workflow chose for
-    /// its own payloads has no say in it. Encoded by the caller rather than here, because
-    /// [`DBOS::update_workflow_attributes`] has to encode before it takes its step id.
+    /// The JSON in `update` is plain JSON, never the configured
+    /// [`Serializer`](crate::Serializer): the column is read by `@>` containment and by every
+    /// other implementation, so what a workflow chose for its own payloads has no say in it.
+    /// Encoded by the caller rather than here, because [`DBOS::update_workflow_attributes`] and
+    /// [`DBOS::merge_workflow_attributes`] have to encode before they take their step ids.
     pub(crate) async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
-        encoded: Option<&str>,
+        update: AttributeUpdate<'_>,
         caller: Option<StepWriter<'_>>,
     ) -> Result<()> {
         self.sysdb()
-            .update_workflow_attributes(workflow_id, encoded, self.step_caller(caller))
+            .update_workflow_attributes(workflow_id, update, self.step_caller(caller))
             .await
             .map_err(Error::from_sysdb)?;
         // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
-        // reaches here indistinguishable from one whose attributes were replaced.
-        tracing::info!(workflow_id, "asked to replace the workflow's attributes");
+        // reaches here indistinguishable from one whose attributes were changed.
+        match update {
+            AttributeUpdate::Replace(_) => {
+                tracing::info!(workflow_id, "asked to replace the workflow's attributes");
+            }
+            AttributeUpdate::Merge(_) => {
+                tracing::info!(workflow_id, "asked to merge into the workflow's attributes");
+            }
+        }
         Ok(())
     }
 

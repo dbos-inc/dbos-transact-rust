@@ -80,8 +80,8 @@ use std::time::Duration;
 
 use types::step_names;
 use types::{
-    AppScope, ApplicationRowCounts, AwaitedOutcome, AwaitedStream, DatabaseTime, Debounce,
-    DebounceRequest, Dequeued, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
+    AppScope, ApplicationRowCounts, AttributeUpdate, AwaitedOutcome, AwaitedStream, DatabaseTime,
+    Debounce, DebounceRequest, Dequeued, EncodedValue, EventRecord, Fork, ForkOptions, ForkPoint,
     GetEventCaller, InitWorkflowCaller, Message, NewQueue, NewSchedule, NewWorkflow,
     NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
@@ -430,9 +430,11 @@ pub trait SystemDatabase: Send + Sync {
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 
-    /// Replaces a workflow's attributes. `None` clears them.
+    /// Replaces a workflow's attributes, clears them, or merges keys into them; see
+    /// [`AttributeUpdate`].
     ///
-    /// A replacement rather than a merge, matching every implementation.
+    /// A merge is one statement, so concurrent merges of different keys never lose each other's,
+    /// as in Python's `update_workflow_attributes(..., merge=True)`.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together** — see
@@ -441,7 +443,7 @@ pub trait SystemDatabase: Send + Sync {
     async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
-        attributes: Option<&str>,
+        update: AttributeUpdate<'_>,
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error>;
 

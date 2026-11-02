@@ -1871,6 +1871,82 @@ async fn attributes_are_replaced_and_can_be_searched() {
     dbos.shutdown().await;
 }
 
+/// **A merge adds keys and keeps the rest**, from outside a workflow and from inside one, where it
+/// is a step recorded under the same name as a replacement.
+#[tokio::test]
+async fn attributes_are_merged_from_outside_and_inside_a_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("merge-attributes-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(0) })
+        .unwrap();
+    let merger = {
+        let instance = dbos.clone();
+        dbos.register_workflow("merger", move |target_id: String| {
+            let instance = instance.clone();
+            async move {
+                let reviewed = serde_json::json!({ "reviewed": true });
+                instance
+                    .merge_workflow_attributes(&target_id, reviewed.as_object().unwrap())
+                    .await?;
+                Ok::<_, Error>(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let id = "merged-into";
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    let attributes = || async {
+        let read = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+        serde_json::from_str::<serde_json::Value>(&read.attributes.unwrap()).unwrap()
+    };
+
+    let tags = serde_json::json!({ "tenant": "acme", "tier": "gold" });
+    dbos.merge_workflow_attributes(id, tags.as_object().unwrap())
+        .await
+        .expect("merge failed");
+    let tier = serde_json::json!({ "tier": "silver" });
+    dbos.merge_workflow_attributes(id, tier.as_object().unwrap())
+        .await
+        .expect("merge failed");
+    assert_eq!(
+        attributes().await,
+        serde_json::json!({ "tenant": "acme", "tier": "silver" })
+    );
+
+    let handle = merger
+        .start(id.to_owned())
+        .await
+        .expect("the merger did not start");
+    let merger_id = handle.workflow_id().to_owned();
+    handle.result().await.expect("the merger failed");
+    assert_eq!(
+        attributes().await,
+        serde_json::json!({ "tenant": "acme", "tier": "silver", "reviewed": true })
+    );
+    let steps: Vec<String> = dbos
+        .list_workflow_steps(&merger_id)
+        .await
+        .expect("step listing failed")
+        .into_iter()
+        .map(|step| step.step_name)
+        .collect();
+    assert_eq!(steps, ["DBOS.update_workflow_attributes"]);
+
+    dbos.shutdown().await;
+}
+
 /// **A management call made from inside a workflow is a step of that workflow.**
 ///
 /// Each call is checkpointed under its `DBOS.*` name, so a replay reads back what the first run
