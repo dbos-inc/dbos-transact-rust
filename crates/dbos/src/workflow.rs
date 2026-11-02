@@ -766,9 +766,26 @@ pub(crate) struct OwnedStart {
     pub(crate) started_at: Timestamp,
     /// Marks the row a debounced one, which only a [`Debouncer`](crate::Debouncer) asks for.
     pub(crate) debounce: Option<Debounced>,
-    /// The application the row is written for, in place of the executor's own. Only a
-    /// [`Debouncer`](crate::Debouncer) targeting another application sets it.
+    /// The application the row is written for, in place of the executor's own. A
+    /// [`Debouncer`](crate::Debouncer) targeting another application sets it, and so may an
+    /// enqueue by name.
     pub(crate) app_name: Option<String>,
+    /// Which application version the row is written with.
+    pub(crate) app_version: RowVersion,
+}
+
+/// Which application version a start writes on its row.
+pub(crate) enum RowVersion {
+    /// This executor's own, or none for a row written for another application, whose executors
+    /// this version means nothing to. What a start of a registered workflow writes: this process
+    /// has the code, so the version that has it is the one to run it.
+    Executor,
+    /// The one the caller named, which pins the row to executors running exactly that code.
+    Named(String),
+    /// None, so the application's latest registered version dequeues it. What an enqueue by name
+    /// writes when it names none: the workflow may be implemented by code this process does not
+    /// have, so this process's version says nothing about who can run it.
+    Latest,
 }
 
 /// What makes a fresh enqueue a debounced one: the row goes in with `is_debounced` set, so the
@@ -1319,6 +1336,7 @@ where
             started_at: Timestamp::now(),
             debounce: None,
             app_name: None,
+            app_version: RowVersion::Executor,
         };
         // The caller's span rather than one of its own: this is the same start, on another
         // thread, and its logs belong where the call was written.
@@ -1429,6 +1447,7 @@ pub(crate) async fn create<R, E>(
         started_at,
         debounce,
         app_name,
+        app_version,
     } = request;
     let owned_queue = queue.as_ref().map(OwnedEnqueue::as_enqueue);
     let enqueue = owned_queue.as_ref();
@@ -1500,7 +1519,11 @@ pub(crate) async fn create<R, E>(
         serialization: Some(encoding.name()),
         executor_id: Some(executor.executor_id()),
         application_name: Some(app_name.as_deref().unwrap_or(executor.app_name())),
-        application_version: (!for_another_app).then(|| executor.app_version()),
+        application_version: match &app_version {
+            RowVersion::Executor => (!for_another_app).then(|| executor.app_version()),
+            RowVersion::Named(version) => Some(version.as_str()),
+            RowVersion::Latest => None,
+        },
         // Only a budget is written: an inherited deadline is an *instant* and has no
         // budget behind it, and `Timeout::None` has neither. The column is what the insert
         // and a dequeue's claim compute a deadline from, so filling it in for either would

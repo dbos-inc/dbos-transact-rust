@@ -61,6 +61,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::config::DATABASE_URL_ENV;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
@@ -73,10 +74,13 @@ use crate::sysdb::types::{
     NewWorkflow, Timestamp, VersionInfo, WorkflowIdReusePolicy, WorkflowStatus,
 };
 use crate::workflow::{
-    Debounced, ENQUEUE_OPERATION, Enqueue, Submitted, encode_attributes, init_or_join, new_row,
-    refused_start, validate_start,
+    Debounced, ENQUEUE_OPERATION, Enqueue, OwnedEnqueue, OwnedStart, RowVersion, Submitted,
+    Timeout, create, encode_attributes, init_or_join, new_row, placed_workflow_id, refused_start,
+    validate_start,
 };
-use crate::{QualifiedWorkflowName, Queue, QueueChange, QueueConflict, QueueOptions};
+use crate::{
+    DBOS, Executor, QualifiedWorkflowName, Queue, QueueChange, QueueConflict, QueueOptions,
+};
 
 /// Everything a [`Client`] needs.
 ///
@@ -380,11 +384,10 @@ impl Client {
     /// the price of naming code this process does not have.
     ///
     /// **Called from inside a workflow body this is not a checkpoint**, unlike
-    /// [`WorkflowRef::start_with`](crate::WorkflowRef::start_with), which records the launch
-    /// against the parent and re-derives the same child on a replay. A client knows nothing of the
-    /// ambient workflow — it is a connection, not an execution — so a replayed body enqueues
-    /// again. Reach for the runtime's own start when the caller is a workflow, and for this when
-    /// it is not.
+    /// [`DBOS::enqueue`], which records the launch against the parent and re-derives the same
+    /// child on a replay. A client knows nothing of the ambient workflow (it is a connection, not
+    /// an execution), so a replayed body enqueues again. Reach for [`DBOS::enqueue`] when the
+    /// caller is a workflow, and for this when it is not.
     pub async fn enqueue<P, R, E>(
         &self,
         workflow: impl Into<QualifiedWorkflowName>,
@@ -769,6 +772,160 @@ impl Client {
     /// The connection this client talks through, for surfaces implemented against one.
     pub(crate) fn connection(&self) -> &Arc<Connection> {
         &self.0
+    }
+}
+
+/// The client's enqueue, from an application: a workflow named rather than registered, recorded as
+/// a child when a workflow does it.
+impl DBOS {
+    /// Enqueues a workflow by name, onto a queue, and hands back a handle to it.
+    ///
+    /// **For a workflow this process need not have**: implemented by another service, or in
+    /// another language, sharing the system database. The name is not looked up in this process's
+    /// registrations, and the row is the one [`Client::enqueue`] writes, so whichever executor has
+    /// the code dequeues it. A workflow this process registered is started through its
+    /// [`WorkflowRef`](crate::WorkflowRef) instead, which can also run it here.
+    ///
+    /// **Called from inside a workflow, the enqueued workflow is its child**, as a
+    /// [`start`](crate::WorkflowRef::start_with) makes one: its id is `{parent_id}-{step_id}`
+    /// unless [`workflow_id`](EnqueueOptions::workflow_id) names one, the launch is recorded at the
+    /// parent's step, and a replay hands back the same handle without enqueueing again. From
+    /// inside a step it is refused, as a start is. Outside a workflow it is [`Client::enqueue`]
+    /// through this application's own connection.
+    ///
+    /// The type parameters are the caller's assertion, as they are for [`Client::enqueue`].
+    ///
+    /// ```no_run
+    /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
+    /// let handle: dbos::WorkflowHandle<String> =
+    ///     dbos.enqueue("send_email", "email-queue", "hello").await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn enqueue<'a, P, R, E>(
+        &self,
+        workflow: impl Into<QualifiedWorkflowName>,
+        queue: &'a str,
+        input: P,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    where
+        P: Serialize,
+        R: 'a,
+        E: 'a,
+    {
+        self.enqueue_with(workflow, input, EnqueueOptions::new(queue))
+    }
+
+    /// [`enqueue`](Self::enqueue), with something to say about how.
+    ///
+    /// The options mean what they mean to [`Client::enqueue_with`], with two differences that come
+    /// of an application making the call:
+    ///
+    /// - **The workflow belongs to this application** unless
+    ///   [`app_name`](EnqueueOptions::app_name) names another.
+    /// - **[`timeout`](EnqueueOptions::timeout) left unset inherits** a parent's deadline when a
+    ///   workflow makes the call, as [`Timeout::Inherit`] does for a child start. Outside a
+    ///   workflow there is none to inherit.
+    ///
+    /// [`app_version`](EnqueueOptions::app_version) left unset writes no version, as a client's
+    /// enqueue does, so the application's latest version dequeues it: this process may not have
+    /// the code at all, so its own version says nothing about who can run it.
+    pub fn enqueue_with<'a, P, R, E>(
+        &self,
+        workflow: impl Into<QualifiedWorkflowName>,
+        input: P,
+        options: EnqueueOptions<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    where
+        P: Serialize,
+        R: 'a,
+        E: 'a,
+    {
+        self.enqueue_encoded(workflow.into(), options, |executor, options| {
+            let encoding = PayloadEncoding::resolve(
+                options.queue.serialization,
+                executor.serializer().encoding(),
+            );
+            Ok((encode_input(&input, &encoding)?, encoding))
+        })
+    }
+
+    /// [`Client::enqueue_portable`] from an application: the portable envelope, as given.
+    ///
+    /// For a workflow in another language that takes arguments by name. Recorded as a child from
+    /// inside a workflow, as [`enqueue`](Self::enqueue) is.
+    pub fn enqueue_portable<'a, R, E>(
+        &self,
+        workflow: impl Into<QualifiedWorkflowName>,
+        args: PortableWorkflowArgs,
+        options: EnqueueOptions<'a>,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    where
+        R: 'a,
+        E: 'a,
+    {
+        self.enqueue_encoded(workflow.into(), options, |_, _| {
+            Ok((
+                encode(&args, &PayloadEncoding::Portable, "argument")?,
+                PayloadEncoding::Portable,
+            ))
+        })
+    }
+
+    /// The enqueue every form shares, given how to encode its input.
+    ///
+    /// **Everything that can be refused is refused before the step id is taken**: an unlaunched
+    /// instance, options no queue could honour, an input or attributes that cannot be encoded, and
+    /// a caller inside a step. A call that never happens must not move the parent's counter.
+    fn enqueue_encoded<'a, R, E, F>(
+        &self,
+        workflow: QualifiedWorkflowName,
+        options: EnqueueOptions<'a>,
+        encode_input: F,
+    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    where
+        R: 'a,
+        E: 'a,
+        F: FnOnce(&Executor, &EnqueueOptions<'a>) -> Result<(String, PayloadEncoding)>,
+    {
+        // Recorded at the parent's step under the workflow's bare name, as a start is.
+        let name: Arc<str> = Arc::from(workflow.name());
+        let built = (|| {
+            let executor = self.executor(ENQUEUE_OPERATION)?;
+            options.validate(&workflow)?;
+            let (input, encoding) = encode_input(&executor, &options)?;
+            let attributes = encode_attributes(options.attributes)?;
+            let placement = StepPlacement::of(executor.connection(), ENQUEUE_OPERATION)?;
+            if matches!(placement, StepPlacement::InsideStep { .. }) {
+                return Err(Error::InsideStep {
+                    operation: ENQUEUE_OPERATION.into(),
+                });
+            }
+            Ok(((executor, input, encoding, attributes), placement))
+        })();
+        PendingStep::placed(
+            name,
+            built,
+            move |(executor, input, encoding, attributes), placement| async move {
+                let request = OwnedStart {
+                    workflow_id: placed_workflow_id(options.workflow_id, &placement),
+                    workflow_id_reuse_policy: options.workflow_id_reuse_policy,
+                    timeout: options.timeout.map_or(Timeout::Inherit, Timeout::Explicit),
+                    queue: Some(OwnedEnqueue::from(&options.queue)),
+                    input: Some(input),
+                    encoding,
+                    attributes,
+                    started_at: Timestamp::now(),
+                    debounce: None,
+                    app_name: options.app_name.map(str::to_owned),
+                    app_version: options.app_version.map_or(RowVersion::Latest, |version| {
+                        RowVersion::Named(version.to_owned())
+                    }),
+                };
+                create::<R, E>(executor, placement, workflow, request)
+                    .await
+                    .map_err(|error| refused_start(Some(options.queue.name), error))
+            },
+        )
     }
 }
 

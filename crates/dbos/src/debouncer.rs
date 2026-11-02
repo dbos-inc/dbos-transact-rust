@@ -46,8 +46,8 @@ use crate::sysdb::types::{
     validate_positive_duration,
 };
 use crate::workflow::{
-    Debounced, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, Timeout, create, encode_attributes,
-    placed_workflow_id, refused_start, validate_start,
+    Debounced, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, RowVersion, Timeout, create,
+    encode_attributes, placed_workflow_id, refused_start, validate_start,
 };
 
 /// What a debounce refuses its arguments as.
@@ -556,6 +556,7 @@ where
                             timeout: self.debounce_timeout,
                         }),
                         app_name: self.app_name.map(str::to_owned),
+                        app_version: RowVersion::Executor,
                     };
                     // Recorded at the start's step as a child start would be — the workflow it
                     // created, or the deduplication error it lost the race with — so a replay
