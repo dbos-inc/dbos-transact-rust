@@ -33,10 +33,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
-use crate::client::{Client, EnqueueOptions};
+use crate::client::Client;
+use crate::enqueue::EnqueueOptions;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::handle::WorkflowHandle;
-use crate::identity::validate_app_name;
+use crate::identity::refuse_app_name;
 use crate::instance::Executor;
 use crate::registry::{QualifiedWorkflowName, WorkflowRef};
 use crate::serialization::{PayloadEncoding, SerializationFormat, encode_input};
@@ -46,8 +47,8 @@ use crate::sysdb::types::{
     validate_positive_duration,
 };
 use crate::workflow::{
-    Debounced, OwnedQueueRequest, OwnedStart, PendingStart, QueueRequest, Timeout, create,
-    encode_attributes, placed_workflow_id, refused_start, validate_start,
+    Debounced, OwnedQueueRequest, OwnedStart, PendingStart, QueueRequest, TargetVersion, Timeout,
+    create, encode_attributes, placed_workflow_id, refused_start, validate_start,
 };
 
 /// What a debounce refuses its arguments as.
@@ -208,19 +209,6 @@ fn lost_the_key(result: &Result<impl Sized>) -> bool {
             crate::sysdb::Error::QueueDeduplicated { .. }
         ))
     )
-}
-
-/// Refuses an [`app_name`](Debouncer::app_name) no app could have, as [`Error::InvalidArgument`]
-/// naming `app_name`, before the name reaches a column.
-fn refuse_app_name(app_name: Option<&str>) -> Result<()> {
-    match app_name.map(validate_app_name) {
-        Some(Err(Error::Config(detail))) => Err(Error::InvalidArgument {
-            operation: DEBOUNCE_OPERATION.into(),
-            detail,
-        }),
-        Some(Err(other)) => Err(other),
-        Some(Ok(())) | None => Ok(()),
-    }
 }
 
 /// Refuses a period or a debounce timeout of zero, or one too long to store.
@@ -466,7 +454,7 @@ where
             WorkflowIdReusePolicy::ReturnExisting,
         )?;
         refuse_durations(period, self.debounce_timeout)?;
-        refuse_app_name(self.app_name)?;
+        refuse_app_name(DEBOUNCE_OPERATION, self.app_name)?;
         let bounce = StepPlacement::of(executor.connection(), DEBOUNCE_OPERATION)?;
         if matches!(bounce, StepPlacement::InsideStep { .. }) {
             return Err(Error::InsideStep {
@@ -556,6 +544,7 @@ where
                             timeout: self.debounce_timeout,
                         }),
                         app_name: self.app_name.map(str::to_owned),
+                        app_version: TargetVersion::Executor,
                     };
                     // Recorded at the start's step as a child start would be — the workflow it
                     // created, or the deduplication error it lost the race with — so a replay
@@ -658,7 +647,7 @@ impl<'a> DebouncerClient<'a> {
         EnqueueOptions {
             app_name: self.app_name,
             app_version: self.app_version,
-            timeout: self.timeout,
+            timeout: self.timeout.map_or(Timeout::None, Timeout::Explicit),
             attributes: self.attributes,
             serialization: self.serialization,
             ..EnqueueOptions::new(self.queue)
@@ -695,10 +684,12 @@ impl<'a> DebouncerClient<'a> {
     where
         P: Serialize,
     {
+        // The app name first: the enqueue's own checks would refuse a bad one too, but as an
+        // enqueue's rather than this debounce's.
+        refuse_app_name(DEBOUNCE_OPERATION, self.app_name)?;
         let options = self.enqueue_options();
         options.validate(&self.workflow)?;
         refuse_durations(period, self.debounce_timeout)?;
-        refuse_app_name(self.app_name)?;
 
         let conn = self.client.connection();
         let encoding = PayloadEncoding::resolve(self.serialization, conn.serializer().encoding());
@@ -907,7 +898,7 @@ mod tests {
     #[test]
     fn a_bad_app_name_is_refused() {
         for bad in ["", "No"] {
-            let error = refuse_app_name(Some(bad)).expect_err(bad);
+            let error = refuse_app_name(DEBOUNCE_OPERATION, Some(bad)).expect_err(bad);
             assert!(
                 matches!(&error, Error::InvalidArgument { operation, detail }
                     if operation == DEBOUNCE_OPERATION
@@ -916,7 +907,7 @@ mod tests {
                 "{error}"
             );
         }
-        refuse_app_name(Some("some-app")).expect("a valid name");
-        refuse_app_name(None).expect("no name");
+        refuse_app_name(DEBOUNCE_OPERATION, Some("some-app")).expect("a valid name");
+        refuse_app_name(DEBOUNCE_OPERATION, None).expect("no name");
     }
 }

@@ -18,7 +18,7 @@ use dbos::{
     Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly,
     EnqueueOptions, Error, Fork, ForkOptions, PortableWorkflowArgs, QualifiedWorkflowName,
     QueueChange, QueueConflict, QueueOptions, QueueRequest, SendMessage, SendOptions,
-    SerializationFormat, StartOptions, WorkflowHandle, WorkflowIdReusePolicy,
+    SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowIdReusePolicy,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -68,7 +68,7 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             "refused-timeout",
             EnqueueOptions {
                 workflow_id: Some("refused-timeout"),
-                timeout: Some(Duration::MAX),
+                timeout: Timeout::Explicit(Duration::MAX),
                 ..EnqueueOptions::new("work")
             },
             "`timeout`",
@@ -86,7 +86,7 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             "zero-timeout",
             EnqueueOptions {
                 workflow_id: Some("zero-timeout"),
-                timeout: Some(Duration::ZERO),
+                timeout: Timeout::Explicit(Duration::ZERO),
                 ..EnqueueOptions::new("work")
             },
             "`timeout` must be a positive, non-zero duration",
@@ -227,7 +227,7 @@ async fn every_option_reaches_the_row() {
                 workflow_id_reuse_policy: WorkflowIdReusePolicy::Reject,
                 app_name: Some("some-other-app"),
                 app_version: Some("v1.2.3"),
-                timeout: Some(Duration::from_secs(90)),
+                timeout: Timeout::Explicit(Duration::from_secs(90)),
                 attributes: Some(&attributes),
                 // Every field named, which is the point of this test -- so there is nothing left
                 // for a functional update to fill in.

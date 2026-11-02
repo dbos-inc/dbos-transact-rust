@@ -94,6 +94,8 @@ mod debouncer;
 #[cfg(feature = "engine")]
 mod dequeue;
 #[cfg(feature = "engine")]
+mod enqueue;
+#[cfg(feature = "engine")]
 mod error;
 #[cfg(feature = "engine")]
 mod event;
@@ -142,13 +144,15 @@ mod workflow;
 #[cfg(feature = "engine")]
 pub use checkpoint::PendingStep;
 #[cfg(feature = "engine")]
-pub use client::{Client, ClientConfig, EnqueueOptions};
+pub use client::{Client, ClientConfig};
 #[cfg(feature = "engine")]
 pub use config::{Config, DATABASE_URL_ENV};
 #[cfg(feature = "engine")]
 pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
 #[cfg(feature = "engine")]
 pub use debouncer::{DebounceOptions, Debouncer, DebouncerClient};
+#[cfg(feature = "engine")]
+pub use enqueue::EnqueueOptions;
 #[cfg(feature = "engine")]
 pub use error::{DurableError, EngineOnly, Error, Result};
 #[cfg(feature = "engine")]

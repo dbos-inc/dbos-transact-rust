@@ -553,6 +553,8 @@ impl<'a> QueueRequest<'a> {
     /// makes "a delay with no queue" and its three siblings unbuildable, so what is left is the
     /// rules that are about the options themselves:
     ///
+    /// - **A deduplication id or a partition key must be absent rather than empty**, as the insert
+    ///   also says, but before a workflow caller's step id is taken.
     /// - **[`DuplicationPolicy::ReturnExisting`] needs a deduplication id**, since with no key
     ///   there is no collision to resolve.
     /// - **A priority must be at least 1.** `0` is the stored sentinel for unprioritised, so
@@ -572,6 +574,16 @@ impl<'a> QueueRequest<'a> {
         let refused = |message: String| start_refusal(Some(self.name), message);
         let refuse = |message: String| Err(refused(message));
 
+        // Refused here as well as by the insert, so an empty key costs a workflow caller no step:
+        // the insert's refusal comes after the parent's step id is taken, and is recorded there.
+        for (field, value) in [
+            ("deduplication_id", self.deduplication_id),
+            ("partition_key", self.partition_key),
+        ] {
+            if value == Some("") {
+                return refuse(format!("`{field}` must be absent rather than empty"));
+            }
+        }
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
             && self.deduplication_id.is_none()
         {
@@ -671,8 +683,8 @@ fn api_field(field: &str) -> &str {
     }
 }
 
-/// Refuses a start's arguments that no row could hold, or that mean nothing together:
-/// [`WorkflowIdReusePolicy::Reject`] without a `workflow_id`, its enqueue's, through
+/// Refuses a start's arguments that no row could hold, or that mean nothing together: an empty
+/// `workflow_id`, [`WorkflowIdReusePolicy::Reject`] without one, its enqueue's, through
 /// [`QueueRequest::validate`], and a timeout of zero or one too long to store as milliseconds. Each
 /// is an [`Error::InvalidArgument`], through [`start_refusal`].
 ///
@@ -681,8 +693,8 @@ fn api_field(field: &str) -> &str {
 /// caller never asked to be new.
 ///
 /// The one check every surface that starts or enqueues a workflow makes before it writes
-/// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
-/// before they encode the input — so a refusal costs no row and no step id. None of it reads a
+/// anything — [`WorkflowRef::start_with`] and [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)
+/// before they take a step id, and the client's enqueues before they encode the input — so a refusal costs no row and no step id. None of it reads a
 /// clock, so a replay decides it as the first run did. The system database refuses the same
 /// values again for its own callers.
 pub(crate) fn validate_start(
@@ -691,6 +703,13 @@ pub(crate) fn validate_start(
     workflow_id: Option<&str>,
     reuse_policy: WorkflowIdReusePolicy,
 ) -> Result<()> {
+    // As the insert refuses it, but before a step id is taken: see `QueueRequest::validate`.
+    if workflow_id == Some("") {
+        return Err(start_refusal(
+            queue.map(|queue| queue.name),
+            "`workflow_id` must not be empty".to_owned(),
+        ));
+    }
     if reuse_policy == WorkflowIdReusePolicy::Reject && workflow_id.is_none() {
         return Err(start_refusal(
             queue.map(|queue| queue.name),
@@ -718,10 +737,11 @@ pub(crate) fn validate_start(
 /// A [`NewWorkflow`] with its queue-shaped half filled in: the five columns a [`QueueRequest`]
 /// decides, and what they are when there is no queue.
 ///
-/// The base both literals that create a workflow build on —
-/// [`WorkflowRef::start_with`](WorkflowRef::start_with), where a queue is one option among
-/// several, and [`Client::enqueue_with`](crate::Client::enqueue_with), where there is always one.
-/// Written once because the two must agree about what a queue owns: which columns it fills, and
+/// The base every literal that creates a workflow builds on — [`create`]'s, behind
+/// [`WorkflowRef::start_with`], [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) and a
+/// [`Debouncer`](crate::Debouncer), where a queue is one option among several, and
+/// [`Client::enqueue_with`](crate::Client::enqueue_with)'s, where there is always one. Written once
+/// because they must agree about what a queue owns: which columns it fills, and
 /// that `priority` is a `NOT NULL` column whose unprioritised value is the sentinel `0` — zero
 /// also being what a workflow that was never enqueued stores, since it has no order to keep.
 ///
@@ -770,9 +790,27 @@ pub(crate) struct OwnedStart {
     pub(crate) started_at: Timestamp,
     /// Marks the row a debounced one, which only a [`Debouncer`](crate::Debouncer) asks for.
     pub(crate) debounce: Option<Debounced>,
-    /// The application the row is written for, in place of the executor's own. Only a
-    /// [`Debouncer`](crate::Debouncer) targeting another application sets it.
+    /// The application the row is written for, in place of the executor's own. A
+    /// [`Debouncer`](crate::Debouncer) targeting another application sets it, and so may an
+    /// enqueue by name.
     pub(crate) app_name: Option<String>,
+    /// Which application version is to run the workflow, which the row records.
+    pub(crate) app_version: TargetVersion,
+}
+
+/// Which application version is to run a started workflow: the version a start writes on its row,
+/// since only an executor running that version dequeues it.
+pub(crate) enum TargetVersion {
+    /// This executor's own, or none for a row written for another application, whose executors
+    /// this version means nothing to. What a start of a registered workflow writes: this process
+    /// has the code, so the version that has it is the one to run it.
+    Executor,
+    /// The one the caller named, which pins the row to executors running exactly that code.
+    Named(String),
+    /// None, so the application's latest registered version dequeues it. What an enqueue by name
+    /// writes when it names none: the workflow may be implemented by code this process does not
+    /// have, so this process's version says nothing about who can run it.
+    Latest,
 }
 
 /// What makes a fresh enqueue a debounced one: the row goes in with `is_debounced` set, so the
@@ -850,10 +888,11 @@ pub(crate) enum Submitted {
 /// decided by the caller before the first attempt, so a retry writes the same row rather than a
 /// differently-derived one.
 ///
-/// Shared by the two callers that create workflows — [`WorkflowRef::start_with`] and
+/// Shared by everything that creates workflows — [`create`], behind [`WorkflowRef::start_with`],
+/// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) and a [`Debouncer`](crate::Debouncer), and
 /// [`Client::enqueue_with`](crate::Client::enqueue_with) — which differ in what they do with the
-/// answer and not in how they get it: a start has a parent's launch to record and a body to spawn,
-/// a client has neither.
+/// answer and not in how they get it: [`create`] has a parent's launch to record and may have a
+/// body to spawn, a client has neither.
 pub(crate) async fn init_or_join(
     conn: &Connection,
     new: &NewWorkflow<'_>,
@@ -1328,6 +1367,7 @@ where
             started_at: Timestamp::now(),
             debounce: None,
             app_name: None,
+            app_version: TargetVersion::Executor,
         };
         // The caller's span rather than one of its own: this is the same start, on another
         // thread, and its logs belong where the call was written.
@@ -1410,6 +1450,8 @@ pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement
 /// The half of [`WorkflowRef::started`](WorkflowRef::started) that touches the database, as a free
 /// function because a task outlives the reference that spawned it: what it needs of the
 /// [`WorkflowRef`] is the key, and that it takes by value.
+/// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) runs it detached the same way, with no
+/// registration behind the key. A [`Debouncer`](crate::Debouncer) awaits it inside its own loop.
 ///
 /// Nothing here is abandoned part-way by a caller losing interest. That is the whole point of it
 /// being here — see [`started`](WorkflowRef::started) — and it is why the order below can be read
@@ -1438,6 +1480,7 @@ pub(crate) async fn create<R, E>(
         started_at,
         debounce,
         app_name,
+        app_version,
     } = request;
     let owned_queue = queue.as_ref().map(OwnedQueueRequest::as_queue_request);
     let enqueue = owned_queue.as_ref();
@@ -1509,7 +1552,11 @@ pub(crate) async fn create<R, E>(
         serialization: Some(encoding.name()),
         executor_id: Some(executor.executor_id()),
         application_name: Some(app_name.as_deref().unwrap_or(executor.app_name())),
-        application_version: (!for_another_app).then(|| executor.app_version()),
+        application_version: match &app_version {
+            TargetVersion::Executor => (!for_another_app).then(|| executor.app_version()),
+            TargetVersion::Named(version) => Some(version.as_str()),
+            TargetVersion::Latest => None,
+        },
         // Only a budget is written: an inherited deadline is an *instant* and has no
         // budget behind it, and `Timeout::None` has neither. The column is what the insert
         // and a dequeue's claim compute a deadline from, so filling it in for either would
@@ -1727,7 +1774,7 @@ pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
 impl<'a, R, E, C> PendingStart<'a, R, E, C> {
     /// A start built from a placed call that answers with a handle, for a durable call other than
     /// [`start_with`](WorkflowRef::start_with) that creates a workflow — a
-    /// [`Debouncer`](crate::Debouncer)'s.
+    /// [`Debouncer`](crate::Debouncer)'s, or [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)'s.
     pub(crate) fn from_step(
         step: PendingStep<'a, WorkflowHandle<R, E>, crate::EngineOnly>,
     ) -> Self {
