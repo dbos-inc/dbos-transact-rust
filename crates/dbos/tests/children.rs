@@ -704,8 +704,8 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
 
 /// **A child start the insert refuses for its arguments is recorded too**, and replays the same.
 ///
-/// An empty deduplication id passes the start's own checks and is refused by the insert, as
-/// `InvalidInput`. The key is shared with the test and made valid before the replay, standing in
+/// An empty queue name passes the start's own checks and is refused by the insert, as
+/// `InvalidInput`. The name is shared with the test and made valid before the replay, standing in
 /// for a refusal the replay would not reach (or a record an earlier version wrote): a fork that
 /// copies the start's checkpoint still takes the refused branch and creates no child, and a fork
 /// that runs the start again, as a control, starts the child.
@@ -731,10 +731,7 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
                         .start_with(
                             (),
                             StartOptions {
-                                queue: Some(QueueRequest {
-                                    deduplication_id: Some(&key),
-                                    ..QueueRequest::new("insert-error-queue")
-                                }),
+                                queue: Some(QueueRequest::new(&key)),
                                 ..StartOptions::default()
                             },
                         )
@@ -762,10 +759,7 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
         .await
         .expect("the parent failed");
     assert!(
-        first.starts_with(
-            "refused: invalid argument to enqueue a workflow: queue `insert-error-queue`: \
-             `deduplication_id`"
-        ),
+        first.starts_with("refused: invalid argument to enqueue a workflow: queue ``: `name`"),
         "{first}"
     );
 
@@ -782,19 +776,24 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
         steps[0]
     );
 
-    *key.lock().unwrap() = "a-valid-key".to_owned();
+    *key.lock().unwrap() = "insert-error-queue".to_owned();
 
     // A fork from step 1 copies the start's checkpoint, so the start replays and must return the
-    // first run's refusal again rather than start the child with a key that is now valid.
+    // first run's refusal again rather than start the child on a queue name that is now valid.
     let replayed = dbos
         .fork::<String, Error>(id, 1)
         .await
         .expect("fork failed");
     let replayed_id = replayed.workflow_id().to_owned();
-    assert_eq!(
-        replayed.result().await.expect("the replay failed"),
-        first,
-        "the replay took a different branch from the run it replayed"
+    // The same refusal, read back from the record. Its message names the queue the caller passes
+    // now, which this test has changed, so only the recorded part is compared.
+    let replayed = replayed.result().await.expect("the replay failed");
+    let refusal = "`name` must be absent rather than empty";
+    assert!(
+        first.ends_with(refusal)
+            && replayed.starts_with("refused: ")
+            && replayed.ends_with(refusal),
+        "the replay took a different branch from the run it replayed: {replayed}"
     );
     assert!(
         reader
@@ -805,7 +804,7 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
         "the replay started the child"
     );
 
-    // A fork from step 0 runs the start again, and with a valid key it goes ahead.
+    // A fork from step 0 runs the start again, and with a valid queue name it goes ahead.
     let rerun = dbos
         .fork::<String, Error>(id, 0)
         .await
@@ -3285,10 +3284,10 @@ async fn an_enqueue_by_name_inherits_its_parents_deadline() {
     dbos.shutdown().await;
 }
 
-/// **An enqueue by name refuses an app name or version no executor could have before it takes a
-/// step id**, so the refusal costs the parent no step and leaves no record.
+/// **An enqueue by name refuses an app name or version no executor could have, and an empty id or
+/// key, before it takes a step id**, so the refusal costs the parent no step and leaves no record.
 #[tokio::test]
-async fn a_bad_app_name_or_version_is_refused_before_the_step_id_is_taken() {
+async fn bad_enqueue_options_are_refused_before_the_step_id_is_taken() {
     let db = test_database().await;
     let dbos = DBOS::new(config("by-name-refused-app", &db));
     let parent = {
@@ -3304,6 +3303,18 @@ async fn a_bad_app_name_or_version_is_refused_before_the_step_id_is_taken() {
                     },
                     dbos::EnqueueOptions {
                         app_version: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        workflow_id: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        deduplication_id: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        partition_key: Some(""),
                         ..dbos::EnqueueOptions::new("idle-queue")
                     },
                 ] {
@@ -3334,6 +3345,9 @@ async fn a_bad_app_name_or_version_is_refused_before_the_step_id_is_taken() {
         .expect("the parent failed");
     assert!(refusals[0].contains("`app_name`"), "{refusals:?}");
     assert!(refusals[1].contains("`app_version`"), "{refusals:?}");
+    assert!(refusals[2].contains("`workflow_id`"), "{refusals:?}");
+    assert!(refusals[3].contains("`deduplication_id`"), "{refusals:?}");
+    assert!(refusals[4].contains("`partition_key`"), "{refusals:?}");
     let steps = reader(&db)
         .await
         .list_workflow_steps("refusing-parent", true, None, None, None)

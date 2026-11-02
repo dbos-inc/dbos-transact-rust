@@ -553,6 +553,8 @@ impl<'a> QueueRequest<'a> {
     /// makes "a delay with no queue" and its three siblings unbuildable, so what is left is the
     /// rules that are about the options themselves:
     ///
+    /// - **A deduplication id or a partition key must be absent rather than empty**, as the insert
+    ///   also says, but before a workflow caller's step id is taken.
     /// - **[`DuplicationPolicy::ReturnExisting`] needs a deduplication id**, since with no key
     ///   there is no collision to resolve.
     /// - **A priority must be at least 1.** `0` is the stored sentinel for unprioritised, so
@@ -572,6 +574,16 @@ impl<'a> QueueRequest<'a> {
         let refused = |message: String| start_refusal(Some(self.name), message);
         let refuse = |message: String| Err(refused(message));
 
+        // Refused here as well as by the insert, so an empty key costs a workflow caller no step:
+        // the insert's refusal comes after the parent's step id is taken, and is recorded there.
+        for (field, value) in [
+            ("deduplication_id", self.deduplication_id),
+            ("partition_key", self.partition_key),
+        ] {
+            if value == Some("") {
+                return refuse(format!("`{field}` must be absent rather than empty"));
+            }
+        }
         if self.duplication_policy == DuplicationPolicy::ReturnExisting
             && self.deduplication_id.is_none()
         {
@@ -671,8 +683,8 @@ fn api_field(field: &str) -> &str {
     }
 }
 
-/// Refuses a start's arguments that no row could hold, or that mean nothing together:
-/// [`WorkflowIdReusePolicy::Reject`] without a `workflow_id`, its enqueue's, through
+/// Refuses a start's arguments that no row could hold, or that mean nothing together: an empty
+/// `workflow_id`, [`WorkflowIdReusePolicy::Reject`] without one, its enqueue's, through
 /// [`QueueRequest::validate`], and a timeout of zero or one too long to store as milliseconds. Each
 /// is an [`Error::InvalidArgument`], through [`start_refusal`].
 ///
@@ -691,6 +703,13 @@ pub(crate) fn validate_start(
     workflow_id: Option<&str>,
     reuse_policy: WorkflowIdReusePolicy,
 ) -> Result<()> {
+    // As the insert refuses it, but before a step id is taken: see `QueueRequest::validate`.
+    if workflow_id == Some("") {
+        return Err(start_refusal(
+            queue.map(|queue| queue.name),
+            "`workflow_id` must not be empty".to_owned(),
+        ));
+    }
     if reuse_policy == WorkflowIdReusePolicy::Reject && workflow_id.is_none() {
         return Err(start_refusal(
             queue.map(|queue| queue.name),
