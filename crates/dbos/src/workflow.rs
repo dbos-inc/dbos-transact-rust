@@ -770,12 +770,13 @@ pub(crate) struct OwnedStart {
     /// [`Debouncer`](crate::Debouncer) targeting another application sets it, and so may an
     /// enqueue by name.
     pub(crate) app_name: Option<String>,
-    /// Which application version the row is written with.
-    pub(crate) app_version: RowVersion,
+    /// Which application version is to run the workflow, which the row records.
+    pub(crate) app_version: TargetVersion,
 }
 
-/// Which application version a start writes on its row.
-pub(crate) enum RowVersion {
+/// Which application version is to run a started workflow: the version a start writes on its row,
+/// since only an executor running that version dequeues it.
+pub(crate) enum TargetVersion {
     /// This executor's own, or none for a row written for another application, whose executors
     /// this version means nothing to. What a start of a registered workflow writes: this process
     /// has the code, so the version that has it is the one to run it.
@@ -1336,7 +1337,7 @@ where
             started_at: Timestamp::now(),
             debounce: None,
             app_name: None,
-            app_version: RowVersion::Executor,
+            app_version: TargetVersion::Executor,
         };
         // The caller's span rather than one of its own: this is the same start, on another
         // thread, and its logs belong where the call was written.
@@ -1520,9 +1521,9 @@ pub(crate) async fn create<R, E>(
         executor_id: Some(executor.executor_id()),
         application_name: Some(app_name.as_deref().unwrap_or(executor.app_name())),
         application_version: match &app_version {
-            RowVersion::Executor => (!for_another_app).then(|| executor.app_version()),
-            RowVersion::Named(version) => Some(version.as_str()),
-            RowVersion::Latest => None,
+            TargetVersion::Executor => (!for_another_app).then(|| executor.app_version()),
+            TargetVersion::Named(version) => Some(version.as_str()),
+            TargetVersion::Latest => None,
         },
         // Only a budget is written: an inherited deadline is an *instant* and has no
         // budget behind it, and `Timeout::None` has neither. The column is what the insert

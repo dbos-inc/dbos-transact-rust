@@ -21,8 +21,8 @@ use crate::handle::WorkflowHandle;
 use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode_input};
 use crate::sysdb::types::{NewWorkflow, Timestamp, WorkflowIdReusePolicy};
 use crate::workflow::{
-    Debounced, ENQUEUE_OPERATION, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, RowVersion,
-    Submitted, Timeout, create, encode_attributes, init_or_join, new_row, placed_workflow_id,
+    Debounced, ENQUEUE_OPERATION, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, Submitted,
+    TargetVersion, Timeout, create, encode_attributes, init_or_join, new_row, placed_workflow_id,
     refused_start, validate_start,
 };
 use crate::{Client, DBOS, Executor, QualifiedWorkflowName};
@@ -542,9 +542,11 @@ impl DBOS {
                     started_at: Timestamp::now(),
                     debounce: None,
                     app_name: options.app_name.map(str::to_owned),
-                    app_version: options.app_version.map_or(RowVersion::Latest, |version| {
-                        RowVersion::Named(version.to_owned())
-                    }),
+                    app_version: options
+                        .app_version
+                        .map_or(TargetVersion::Latest, |version| {
+                            TargetVersion::Named(version.to_owned())
+                        }),
                 };
                 create::<R, E>(executor, placement, workflow, request)
                     .await
