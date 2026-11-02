@@ -5669,7 +5669,7 @@ async fn until_a_take_waits_on_the_owner_lock(pool: &sqlx::PgPool) {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
              WHERE datname = current_database() AND wait_event_type = 'Lock' \
-               AND query LIKE 'SELECT owner_xid %FOR NO KEY UPDATE%'",
+               AND query LIKE 'SELECT owner_xid%FOR NO KEY UPDATE%'",
         )
         .fetch_one(pool)
         .await
@@ -6496,7 +6496,8 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
             std::time::Duration::from_secs(3600),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .at;
     let offset = wake.as_epoch_ms() - before.as_epoch_ms();
     assert!(
         (3_600_000..3_610_000).contains(&offset),
@@ -6510,7 +6511,8 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
             std::time::Duration::from_secs(3600),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .at;
     assert_eq!(replayed, wake, "a replay must not restart the clock");
 
     // Stored as epoch milliseconds in portable JSON, so anything can read it.
@@ -6552,7 +6554,8 @@ async fn a_sleep_records_its_duration_as_the_sleep() {
             std::time::Duration::from_secs(60),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .at;
     let step = sys
         .check_step("wf-waiter", 0, "DBOS.sleep")
         .await
@@ -7625,7 +7628,8 @@ async fn a_recorded_sleep_replays_even_when_recomputing_it_would_overflow() {
             overflowing,
         )
         .await
-        .expect("a recorded sleep should replay rather than be refused");
+        .expect("a recorded sleep should replay rather than be refused")
+        .at;
     assert_eq!(wake_at, Timestamp::from_epoch_ms(recorded));
 
     // The same duration with no record behind it is refused.

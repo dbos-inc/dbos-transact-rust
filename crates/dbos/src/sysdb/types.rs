@@ -1782,6 +1782,38 @@ impl DatabaseTime {
         let ahead = instant.as_epoch_ms().saturating_sub(self.epoch_ms);
         self.read_at + Duration::from_millis(u64::try_from(ahead).unwrap_or(0))
     }
+
+    /// The database's clock now, as this reading carries it forward: the reading plus however long
+    /// this process's monotonic clock has run since. Behind the database's own by the trip back,
+    /// as a wait measured from the reading is.
+    pub fn now(self) -> Timestamp {
+        let elapsed = i64::try_from(self.read_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        Timestamp::from_epoch_ms(self.epoch_ms.saturating_add(elapsed))
+    }
+}
+
+/// A recorded wake time, with the reading of the database's clock taken as it was recorded or
+/// read back.
+///
+/// What [`record_sleep`](crate::sysdb::SystemDatabase::record_sleep) answers with, on a first run
+/// and on a replay alike. The wake time is an instant on the database's clock, which is the one
+/// clock every executor that may replay the step shares; the reading is what lets this process
+/// wait for it on its own monotonic clock, so a host whose wall clock is off the database's wakes
+/// on time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeTime {
+    /// The recorded instant, on the database's clock.
+    pub at: Timestamp,
+    /// The database's clock, read in the transaction that recorded or read back `at`.
+    pub clock: DatabaseTime,
+}
+
+impl WakeTime {
+    /// When, on this process's monotonic clock, the wake time arrives: at once for one already
+    /// past.
+    pub fn arrives(self) -> Instant {
+        self.clock.reaches(self.at)
+    }
 }
 
 /// What the database said about a workflow after initialising it.

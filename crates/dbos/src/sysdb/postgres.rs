@@ -83,7 +83,7 @@ use super::notify::{
     EVENTS_CHANNEL, Registry, STREAMS_CHANNEL, event_key, message_key, stream_key,
 };
 use super::retry::{RetryPolicy, with_retry};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::types::step_names;
@@ -95,7 +95,7 @@ use super::types::{
     OnExistingQueue, Outcome, PollingConcurrency, QueueRecord, QueueUpdate, RateLimit,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepCodec, StepRecord, StepTiming, StreamRead, StreamRecord,
-    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter,
+    Timestamp, UpdatedQueue, UpsertedQueue, VersionInfo, WakeTime, WorkflowDelay, WorkflowFilter,
     WorkflowIdReusePolicy, WorkflowOwner, WorkflowRecord, WorkflowStatus, WrittenBy,
     decode_step_value, duration_from_ms, duration_from_secs, duration_to_ms, encode_step_value,
     is_valid_application_name,
@@ -2482,24 +2482,31 @@ impl PostgresSystemDatabase {
     /// First in its transaction, before the work it guards: a refused check rolls the work back
     /// with it. `FOR NO KEY UPDATE` rather than `FOR UPDATE`, so inserts that reference the row
     /// (its steps, events and streams) don't wait on it; CockroachDB takes it as `FOR UPDATE`.
+    ///
+    /// **Answers with a reading of the database's clock**, taken by the same statement, so a step
+    /// that times something against that clock has a reading without another round trip.
+    /// `clock_timestamp()` rather than `now()`: the row lock can wait, and `now()` is when the
+    /// transaction began.
     async fn check_owner_on(
         &self,
         conn: &mut sqlx::PgConnection,
         owner: WorkflowOwner<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<DatabaseTime, Error> {
         let workflow_table = self.tables.workflow_status.as_str();
-        let current: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT owner_xid FROM {workflow_table} WHERE workflow_uuid = $1 FOR NO KEY UPDATE"
+        let current: Option<(Option<String>, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT owner_xid, (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint \
+             FROM {workflow_table} WHERE workflow_uuid = $1 FOR NO KEY UPDATE"
         )))
         .bind(owner.workflow_id)
         .fetch_optional(&mut *conn)
         .await?;
-        if current.flatten().as_deref() == Some(owner.owner_xid) {
-            Ok(())
-        } else {
-            Err(Error::WorkflowConflict {
+        match current {
+            Some((Some(owner_xid), db_now)) if owner_xid == owner.owner_xid => {
+                Ok(DatabaseTime::read(db_now))
+            }
+            _ => Err(Error::WorkflowConflict {
                 workflow_id: owner.workflow_id.to_owned(),
-            })
+            }),
         }
     }
 
@@ -2789,44 +2796,54 @@ impl PostgresSystemDatabase {
         duration: Duration,
         kind: SleepKind<'_>,
         owner_xid: &str,
-    ) -> Result<Timestamp, Error> {
+    ) -> Result<WakeTime, Error> {
         let pool = &self.pool;
-        // Fixed before the retry: the wake time is what a replay must agree on, and re-reading
-        // the clock per attempt would push it further out each time.
-        let started_at = Timestamp::now();
-        // Computed before the retry, and so before any write.
+        // **Taken on the first attempt and kept for the rest**: the database's clock as the first
+        // owner check read it, and the wake time computed from it. The wake time is what a replay
+        // must agree on, so re-reading the clock per attempt would push it further out each time;
+        // and it is on the database's clock because the executor that replays it after a recovery
+        // may be another host, whose own clock is not this one's.
         //
-        // A sleep whose wake time cannot be stored is refused: the caller asked to be woken at an
-        // instant this layer cannot record, and recording a different one would wake it at the
-        // wrong time on every replay. A deadline is different, because it bounds a wait rather
-        // than being the wait: one too far out to store is one that never elapses, which is what
-        // the caller asked for, so it is held at the largest instant there is — the same answer
-        // `get_event` gives outside a workflow, where no deadline is recorded at all.
+        // The refusal is computed with it, and so before any write. A sleep whose wake time cannot
+        // be stored is refused: the caller asked to be woken at an instant this layer cannot
+        // record, and recording a different one would wake it at the wrong time on every replay. A
+        // deadline is different, because it bounds a wait rather than being the wait: one too far
+        // out to store is one that never elapses, which is what the caller asked for, so it is held
+        // at the largest instant there is — the same answer `get_event` gives outside a workflow,
+        // where no deadline is recorded at all.
         //
         // **The refusal is held until the record has been looked for.** Whether the sum fits
         // depends on the clock, so a replay must not decide it again: a sleep the first run
         // recorded wakes at its recorded instant, or is refused as it was, whatever
         // `now + duration` would be today.
-        let wake_at = match kind {
-            SleepKind::Durable(_) => started_at.try_add("duration", duration),
-            SleepKind::Deadline => Ok(started_at
-                .checked_add(duration)
-                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX))),
-        };
-        let wake_at = &wake_at;
+        let first: OnceLock<(Timestamp, Result<Timestamp, Error>)> = OnceLock::new();
+        let first = &first;
 
         with_retry(&self.retry, "checkpoint_sleep", move || async move {
             // A transaction for the owner check, which locks the workflow's row until the record
             // commits; the record itself is the only write, and the wake time its output.
             let mut conn = pool.begin().await?;
-            self.check_owner_on(
-                &mut conn,
-                WorkflowOwner {
-                    workflow_id,
-                    owner_xid,
-                },
-            )
-            .await?;
+            let clock = self
+                .check_owner_on(
+                    &mut conn,
+                    WorkflowOwner {
+                        workflow_id,
+                        owner_xid,
+                    },
+                )
+                .await?;
+            let (started_at, wake_at) = first.get_or_init(|| {
+                let started_at = clock.now();
+                let wake_at = match kind {
+                    SleepKind::Durable(_) => started_at.try_add("duration", duration),
+                    SleepKind::Deadline => Ok(started_at
+                        .checked_add(duration)
+                        .unwrap_or(Timestamp::from_epoch_ms(i64::MAX))),
+                };
+                (started_at, wake_at)
+            });
+            let started_at = *started_at;
+            let answer = |at: Timestamp| WakeTime { at, clock };
 
             // A replay wakes at the *original* instant. Starting the clock again would make a
             // workflow that crashed fifty minutes into an hour sleep another full hour.
@@ -2835,7 +2852,7 @@ impl PostgresSystemDatabase {
                 .await?
             {
                 tracing::debug!(workflow_id, step_id, "replaying sleep");
-                return replayed_sleep(&step, kind, workflow_id, step_id, owner_xid);
+                return replayed_sleep(&step, kind, workflow_id, step_id, owner_xid).map(answer);
             }
             tracing::debug!(
                 workflow_id,
@@ -2863,7 +2880,7 @@ impl PostgresSystemDatabase {
                     // A sleep is stamped complete at its wake time, which is in the future — so
                     // the step's recorded duration is the sleep. A deadline is stamped now,
                     // because the caller registering it usually returns long before it. Both are
-                    // fixed outside the retry, since `completed_at` is also the token that
+                    // fixed by the first attempt, since `completed_at` is also the token that
                     // recognises this caller's own write after a lost acknowledgement.
                     let completed_at = match kind {
                         SleepKind::Durable(_) => *wake_at,
@@ -2911,7 +2928,7 @@ impl PostgresSystemDatabase {
             {
                 Ok(()) => {
                     conn.commit().await?;
-                    wake_at.clone()
+                    wake_at.clone().map(answer)
                 }
                 // The sleep was recorded between our check and our write. Its answer is the one
                 // every replay must agree on, so adopt it rather than returning ours.
@@ -2924,7 +2941,7 @@ impl PostgresSystemDatabase {
                                 "sleep reported as recorded but cannot be read back".to_owned(),
                             )
                         })?;
-                    replayed_sleep(&step, kind, workflow_id, step_id, owner_xid)
+                    replayed_sleep(&step, kind, workflow_id, step_id, owner_xid).map(answer)
                 }
                 Err(e) => Err(e),
             }
@@ -5099,7 +5116,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         // What `send_messages` stored. The default topic is a sentinel rather than SQL `NULL`,
         // because nothing equals `NULL` and this predicate would never match its own message.
         let stored_topic = topic.unwrap_or(NULL_TOPIC);
-        let started_at = Timestamp::now();
 
         // Two statements, unlike `get_event`'s one, and here the split is forced rather than
         // chosen: a message cannot be read without taking it, and taking it has to be atomic with
@@ -5194,6 +5210,12 @@ impl SystemDatabase for PostgresSystemDatabase {
                 owner_xid,
             )
             .await?;
+        // On the monotonic clock from here on: the deadline is an instant on the database's clock,
+        // and this host's wall clock need not agree with it.
+        let until = deadline.arrives();
+        // When the step began, for the step it records at the end, on the database's clock as the
+        // deadline's reading carries it.
+        let started_at = deadline.clock.now();
 
         /// What one take came back with.
         enum Take {
@@ -5233,13 +5255,11 @@ impl SystemDatabase for PostgresSystemDatabase {
             })
             .await?;
 
-            // Past the deadline and exactly on it are the same answer — no time left — but
-            // `duration_since` reports the first as `None` and the second as zero. Folding them
-            // keeps that one decision in one place; leaving the zero case to the wait below would
-            // spin, since a zero-length timeout returns at once and the next look is another query.
-            let remaining = deadline
-                .duration_since(Timestamp::now())
-                .unwrap_or(Duration::ZERO);
+            // Past the deadline and exactly on it are the same answer — no time left — and
+            // `saturating_duration_since` reports both as zero. Leaving the zero case to the wait
+            // below would spin, since a zero-length timeout returns at once and the next look is
+            // another query.
+            let remaining = until.saturating_duration_since(crate::rt::now());
 
             if has_message || remaining.is_zero() {
                 // Fixed here rather than inside the retry: `completed_at` is also what recognises
@@ -5247,7 +5267,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // between attempts.
                 let timing = StepTiming {
                     started_at,
-                    completed_at: Timestamp::now(),
+                    completed_at: deadline.clock.now(),
                 };
 
                 // **One commit per take, and it has to be.** A message taken but not recorded is
@@ -5272,14 +5292,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                     let mut tx = pool.begin().await?;
                     // First, so a refusal rolls the consume back with it: the message stays for the
                     // workflow's new owner.
-                    self.check_owner_on(
-                        &mut tx,
-                        WorkflowOwner {
-                            workflow_id,
-                            owner_xid,
-                        },
-                    )
-                    .await?;
+                    let clock = self
+                        .check_owner_on(
+                            &mut tx,
+                            WorkflowOwner {
+                                workflow_id,
+                                owner_xid,
+                            },
+                        )
+                        .await?;
 
                     // The check that opened this call cannot stand in for this one: the wait
                     // between them is exactly when another execution of this workflow would have
@@ -5314,13 +5335,11 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                     // Nothing to consume: the message the probe saw went to a take that ran
                     // first. Before the deadline that is no answer, so nothing is recorded and the
-                    // wait goes on. The clock is asked now rather than before the take, since the
-                    // owner check can wait on another take for as long as that one runs, and a take
-                    // that started with time left may get here without any.
+                    // wait goes on. The clock is the owner check's, read after its lock rather than
+                    // before the take, since the lock can wait on another take for as long as that
+                    // one runs, and a take that started with time left may get here without any.
                     if message.is_none() {
-                        let time_left = deadline
-                            .duration_since(Timestamp::now())
-                            .is_some_and(|left| !left.is_zero());
+                        let time_left = deadline.at > clock.now();
                         if time_left {
                             // Explicit, so the owner check's row lock goes now rather than whenever
                             // the connection is next used.
@@ -5696,7 +5715,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         &self,
         caller: StepCaller<'_>,
         duration: Duration,
-    ) -> Result<Timestamp, Error> {
+    ) -> Result<WakeTime, Error> {
         self.checkpoint_sleep(
             caller.workflow_id,
             caller.step_id,
@@ -5815,9 +5834,6 @@ impl SystemDatabase for PostgresSystemDatabase {
             "SELECT value, serialization FROM {events_table} WHERE workflow_uuid = $1 AND key = $2"
         );
         let select = &select;
-        // When the step began, for the step it records at the end — so a workflow's timeline shows
-        // the wait, not the instant the answer was written down.
-        let started_at = Timestamp::now();
 
         // A replay returns what the first run saw and does not wait again. Including the `None` a
         // timeout produced: that is a result, and re-running the wait would let a value that
@@ -5847,23 +5863,31 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Recorded whether or not the value turns out to be there already, so which steps a run
         // writes does not depend on how a race went. A recovery gets the original instant back, so
         // a read that waited fifty of its sixty seconds and crashed has ten left rather than sixty.
-        let deadline = match caller {
+        //
+        // Waited for on the monotonic clock: a recorded deadline is an instant on the database's
+        // clock, and this host's wall clock need not agree with it. The reading that comes with it
+        // also stamps the step this records, so the stamps are on the database's clock too.
+        let (until, clock) = match caller {
             Some(caller) => {
-                self.checkpoint_sleep(
-                    caller.workflow_id,
-                    caller.timeout_step_id,
-                    timeout,
-                    SleepKind::Deadline,
-                    caller.owner_xid,
-                )
-                .await?
+                let deadline = self
+                    .checkpoint_sleep(
+                        caller.workflow_id,
+                        caller.timeout_step_id,
+                        timeout,
+                        SleepKind::Deadline,
+                        caller.owner_xid,
+                    )
+                    .await?;
+                (Some(deadline.arrives()), Some(deadline.clock))
             }
-            // A timeout so large it cannot be represented is one that never elapses, which is what
-            // the caller asked for.
-            None => started_at
-                .checked_add(timeout)
-                .unwrap_or(Timestamp::from_epoch_ms(i64::MAX)),
+            // Outside a workflow nothing is recorded, so the timeout is this process's alone. One
+            // too large to represent is one that never elapses, which is what the caller asked for.
+            None => (crate::rt::now().checked_add(timeout), None),
         };
+        // When the step began, for the step it records at the end — so a workflow's timeline shows
+        // the wait, not the instant the answer was written down. A caller always comes with a
+        // reading; the local clock only stands in where nothing is recorded.
+        let started_at = clock.map_or_else(Timestamp::now, DatabaseTime::now);
 
         // Look, wait a bounded interval, look again. **This loop is what delivers** — a wakeup only
         // ever shortens the interval, so the wait is correct with nothing pushing at all, which is
@@ -5892,13 +5916,13 @@ impl SystemDatabase for PostgresSystemDatabase {
                 });
             }
 
-            // Past the deadline and exactly on it are the same answer — no time left — but
-            // `duration_since` reports the first as `None` and the second as zero. Folding them
-            // keeps that one decision in one place; leaving the zero case to the wait below would
-            // spin, since a zero-length timeout returns at once and the next look is another query.
-            let remaining = deadline
-                .duration_since(Timestamp::now())
-                .unwrap_or(Duration::ZERO);
+            // Past the deadline and exactly on it are the same answer — no time left — and
+            // `saturating_duration_since` reports both as zero. Leaving the zero case to the wait
+            // below would spin, since a zero-length timeout returns at once and the next look is
+            // another query.
+            let remaining = until.map_or(Duration::MAX, |until| {
+                until.saturating_duration_since(crate::rt::now())
+            });
             if remaining.is_zero() {
                 break None;
             }
@@ -5935,7 +5959,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // attempts.
         let timing = StepTiming {
             started_at,
-            completed_at: Timestamp::now(),
+            completed_at: clock.map_or_else(Timestamp::now, DatabaseTime::now),
         };
         let found = found.as_ref();
 

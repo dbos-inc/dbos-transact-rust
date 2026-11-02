@@ -146,7 +146,7 @@ jobs:
           DBOS_TEST_RUNTIME: ${{ matrix.runtime }}
         run: >-
           cargo test -p dbos --features runtime-${{ matrix.runtime }} --no-fail-fast
-          --test events --test handles --test lifecycle --test messages --test queues
+          --test clock --test events --test handles --test lifecycle --test messages --test queues
           --test recovery --test schedules --test shutdown --test sleep --test timeouts
           --test workflows
       - name: No containers left behind
