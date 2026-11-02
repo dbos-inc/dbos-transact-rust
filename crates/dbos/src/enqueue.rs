@@ -14,18 +14,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use tracing::Instrument;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
+use crate::identity::refuse_app_name;
 use crate::serialization::{
     PayloadEncoding, PortableWorkflowArgs, SerializationFormat, encode, encode_input,
 };
 use crate::sysdb::types::{NewWorkflow, Timestamp, WorkflowIdReusePolicy};
 use crate::workflow::{
     Debounced, DuplicationPolicy, ENQUEUE_OPERATION, OwnedQueueRequest, OwnedStart, PendingStart,
-    QueueRequest, Submitted, TargetVersion, Timeout, create, encode_attributes, init_or_join,
-    new_workflow, placed_workflow_id, refused_start, validate_start,
+    QueueRequest, Role, Submitted, TargetVersion, Timeout, create, encode_attributes, init_or_join,
+    new_workflow, placed_workflow_id, refused_start, spawn_tracked, validate_start,
 };
 use crate::{Client, DBOS, Executor, QualifiedWorkflowName};
 
@@ -151,7 +153,11 @@ pub struct EnqueueOptions<'a> {
 
 impl<'a> EnqueueOptions<'a> {
     /// Refuses an enqueue of `workflow` no row could hold: a workflow with no name, which nothing
-    /// could ever dequeue, and what every start checks — see [`validate_start`].
+    /// could ever dequeue, an app name or version no executor could have, and what every start
+    /// checks — see [`validate_start`].
+    ///
+    /// All of it before anything is written, and for [`DBOS::enqueue`] before the parent's step id
+    /// is taken: an option the insert would refuse must not cost a step or leave a recorded error.
     ///
     /// The name is checked here because a client takes it from its caller. A
     /// [`QualifiedWorkflowName`] can hold an empty one, since a row can; an executor's starts take
@@ -169,6 +175,16 @@ impl<'a> EnqueueOptions<'a> {
             return Err(Error::InvalidArgument {
                 operation: ENQUEUE_OPERATION.into(),
                 detail: "`queue_name` must not be empty".to_owned(),
+            });
+        }
+        refuse_app_name(ENQUEUE_OPERATION, self.app_name)?;
+        if self.app_version == Some("") {
+            return Err(Error::InvalidArgument {
+                operation: ENQUEUE_OPERATION.into(),
+                detail: format!(
+                    "queue `{}`: `app_version` must be absent rather than empty",
+                    self.queue_name
+                ),
             });
         }
         validate_start(
@@ -451,8 +467,8 @@ impl DBOS {
     /// [`start`](crate::WorkflowRef::start_with) makes one: its id is `{parent_id}-{step_id}`
     /// unless [`workflow_id`](EnqueueOptions::workflow_id) names one, the launch is recorded at the
     /// parent's step, and a replay hands back the same handle without enqueueing again. From
-    /// inside a step it is refused, as a start is. Outside a workflow it is [`Client::enqueue`]
-    /// through this application's own connection.
+    /// inside a step it is refused, as a start is. Outside a workflow nothing is recorded, as with
+    /// [`Client::enqueue`].
     ///
     /// The type parameters are the caller's assertion, as they are for [`Client::enqueue`].
     ///
@@ -470,8 +486,8 @@ impl DBOS {
     ) -> PendingStart<'a, R, E>
     where
         P: Serialize,
-        R: 'a,
-        E: 'a,
+        R: 'static,
+        E: 'static,
     {
         self.enqueue_with(workflow, input, EnqueueOptions::new(queue))
     }
@@ -498,8 +514,8 @@ impl DBOS {
     ) -> PendingStart<'a, R, E>
     where
         P: Serialize,
-        R: 'a,
-        E: 'a,
+        R: 'static,
+        E: 'static,
     {
         self.enqueue_encoded(workflow.into(), options, |executor, options| {
             let encoding =
@@ -519,8 +535,8 @@ impl DBOS {
         options: EnqueueOptions<'a>,
     ) -> PendingStart<'a, R, E>
     where
-        R: 'a,
-        E: 'a,
+        R: 'static,
+        E: 'static,
     {
         self.enqueue_encoded(workflow.into(), options, |_, _| {
             Ok((
@@ -542,8 +558,8 @@ impl DBOS {
         encode_input: F,
     ) -> PendingStart<'a, R, E>
     where
-        R: 'a,
-        E: 'a,
+        R: 'static,
+        E: 'static,
         F: FnOnce(&Executor, &EnqueueOptions<'a>) -> Result<(String, PayloadEncoding)>,
     {
         // Recorded at the parent's step under the workflow's bare name, as a start is.
@@ -568,8 +584,16 @@ impl DBOS {
             name,
             built,
             move |(executor, input, encoding, attributes), placement| async move {
+                let workflow_id = placed_workflow_id(options.workflow_id, &placement);
+                // Held by the task for as long as it exists, so the parent waits for this enqueue
+                // before recording its outcome, as it does for a start. Taken before the spawn, so
+                // a task aborted before its first poll still gives it back.
+                let tracked = match &placement {
+                    StepPlacement::Recorded { ctx, .. } => Some(ctx.starts().token()),
+                    _ => None,
+                };
                 let request = OwnedStart {
-                    workflow_id: placed_workflow_id(options.workflow_id, &placement),
+                    workflow_id: workflow_id.clone(),
                     workflow_id_reuse_policy: options.workflow_id_reuse_policy,
                     timeout: options.timeout.map_or(Timeout::Inherit, Timeout::Explicit),
                     queue: Some(OwnedQueueRequest::from(&options.queue_request())),
@@ -585,9 +609,26 @@ impl DBOS {
                             TargetVersion::Named(version.to_owned())
                         }),
                 };
-                create::<R, E>(executor, placement, workflow, request)
-                    .await
-                    .map_err(|error| refused_start(Some(options.queue_name), error))
+                // **Detached, as a start's writing half is**, so a caller that stops listening
+                // does not leave it part-way: a join of a deduplicated holder is recorded at the
+                // parent's step after the row is read, and a drop between the two would let a
+                // replay enqueue again. See `WorkflowRef::started`.
+                let creating = create::<R, E>(Arc::clone(&executor), placement, workflow, request)
+                    .instrument(tracing::Span::current());
+                let creating = async move {
+                    let _tracked = tracked;
+                    creating.await
+                };
+                let label = format!("enqueue {workflow_id}");
+                match spawn_tracked(&executor, Role::Workflow, label, creating).await {
+                    Ok(created) => {
+                        created.map_err(|error| refused_start(Some(options.queue_name), error))
+                    }
+                    // Only shutdown aborts it, with the same two outcomes a start's abort has: no
+                    // row, or a row recorded at the parent's step that a replay joins.
+                    Err(join) if join.is_cancelled() => Err(Error::Interrupted { workflow_id }),
+                    Err(join) => std::panic::resume_unwind(join.into_panic()),
+                }
             },
         ))
     }

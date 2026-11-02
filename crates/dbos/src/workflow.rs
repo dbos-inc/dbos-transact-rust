@@ -681,8 +681,8 @@ fn api_field(field: &str) -> &str {
 /// caller never asked to be new.
 ///
 /// The one check every surface that starts or enqueues a workflow makes before it writes
-/// anything — [`WorkflowRef::start_with`] before it takes a step id, and the client's enqueues
-/// before they encode the input — so a refusal costs no row and no step id. None of it reads a
+/// anything — [`WorkflowRef::start_with`] and [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)
+/// before they take a step id, and the client's enqueues before they encode the input — so a refusal costs no row and no step id. None of it reads a
 /// clock, so a replay decides it as the first run did. The system database refuses the same
 /// values again for its own callers.
 pub(crate) fn validate_start(
@@ -718,10 +718,11 @@ pub(crate) fn validate_start(
 /// A [`NewWorkflow`] with its queue-shaped half filled in: the five columns a [`QueueRequest`]
 /// decides, and what they are when there is no queue.
 ///
-/// The base both literals that create a workflow build on —
-/// [`WorkflowRef::start_with`](WorkflowRef::start_with), where a queue is one option among
-/// several, and [`Client::enqueue_with`](crate::Client::enqueue_with), where there is always one.
-/// Written once because the two must agree about what a queue owns: which columns it fills, and
+/// The base every literal that creates a workflow builds on — [`create`]'s, behind
+/// [`WorkflowRef::start_with`], [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) and a
+/// [`Debouncer`](crate::Debouncer), where a queue is one option among several, and
+/// [`Client::enqueue_with`](crate::Client::enqueue_with)'s, where there is always one. Written once
+/// because they must agree about what a queue owns: which columns it fills, and
 /// that `priority` is a `NOT NULL` column whose unprioritised value is the sentinel `0` — zero
 /// also being what a workflow that was never enqueued stores, since it has no order to keep.
 ///
@@ -868,10 +869,11 @@ pub(crate) enum Submitted {
 /// decided by the caller before the first attempt, so a retry writes the same row rather than a
 /// differently-derived one.
 ///
-/// Shared by the two callers that create workflows — [`WorkflowRef::start_with`] and
+/// Shared by everything that creates workflows — [`create`], behind [`WorkflowRef::start_with`],
+/// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) and a [`Debouncer`](crate::Debouncer), and
 /// [`Client::enqueue_with`](crate::Client::enqueue_with) — which differ in what they do with the
-/// answer and not in how they get it: a start has a parent's launch to record and a body to spawn,
-/// a client has neither.
+/// answer and not in how they get it: [`create`] has a parent's launch to record and may have a
+/// body to spawn, a client has neither.
 pub(crate) async fn init_or_join(
     conn: &Connection,
     new: &NewWorkflow<'_>,
@@ -1429,6 +1431,8 @@ pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement
 /// The half of [`WorkflowRef::started`](WorkflowRef::started) that touches the database, as a free
 /// function because a task outlives the reference that spawned it: what it needs of the
 /// [`WorkflowRef`] is the key, and that it takes by value.
+/// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) runs it detached the same way, with no
+/// registration behind the key. A [`Debouncer`](crate::Debouncer) awaits it inside its own loop.
 ///
 /// Nothing here is abandoned part-way by a caller losing interest. That is the whole point of it
 /// being here — see [`started`](WorkflowRef::started) — and it is why the order below can be read
@@ -1751,7 +1755,7 @@ pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
 impl<'a, R, E, C> PendingStart<'a, R, E, C> {
     /// A start built from a placed call that answers with a handle, for a durable call other than
     /// [`start_with`](WorkflowRef::start_with) that creates a workflow — a
-    /// [`Debouncer`](crate::Debouncer)'s.
+    /// [`Debouncer`](crate::Debouncer)'s, or [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)'s.
     pub(crate) fn from_step(
         step: PendingStep<'a, WorkflowHandle<R, E>, crate::EngineOnly>,
     ) -> Self {

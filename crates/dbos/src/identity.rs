@@ -180,6 +180,22 @@ pub(crate) fn validate_app_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a caller's `app_name` no app could have, as [`Error::InvalidArgument`] of `operation`
+/// naming `app_name`, before the name reaches a column.
+///
+/// For a name an enqueue or a debounce writes on a workflow it hands to another application: a
+/// row stamped with a name no executor spells is one nothing dequeues.
+pub(crate) fn refuse_app_name(operation: &'static str, app_name: Option<&str>) -> Result<()> {
+    match app_name.map(validate_app_name) {
+        Some(Err(Error::Config(detail))) => Err(Error::InvalidArgument {
+            operation: operation.into(),
+            detail,
+        }),
+        Some(Err(other)) => Err(other),
+        Some(Ok(())) | None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
