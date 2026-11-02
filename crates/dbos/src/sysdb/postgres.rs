@@ -4291,7 +4291,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     step_names::UPDATE_WORKFLOW_ATTRIBUTES,
                     started_at,
                     |mut conn| async move {
-                        sqlx::query(AssertSqlSafe(format!(
+                        let updated = sqlx::query(AssertSqlSafe(format!(
                             "UPDATE {workflow_table} \
                              SET attributes = {set}, updated_at = {NOW_MS_SQL} \
                              WHERE workflow_uuid = $1"
@@ -4300,6 +4300,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .bind(attributes)
                         .execute(&mut *conn)
                         .await?;
+                        // Counted as matched, not as changed: a workflow whose attributes were
+                        // absent, or already what is written, is one row. None means no workflow
+                        // has the id, which is refused as Go refuses it rather than reported as
+                        // done.
+                        if updated.rows_affected() == 0 {
+                            return Err(Error::NonExistentWorkflow {
+                                workflow_ids: vec![workflow_id.to_owned()],
+                            });
+                        }
                         Ok((conn, ()))
                     },
                 )

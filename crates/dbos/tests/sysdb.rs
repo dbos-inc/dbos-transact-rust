@@ -2308,6 +2308,31 @@ async fn merging_attributes_adds_keys_and_keeps_the_rest() {
     );
 }
 
+/// **An attribute update on an id no workflow has is refused**, replacing or merging, rather than
+/// reported as done with nothing written. A workflow that exists is updated whatever its
+/// attributes were, which the merge test above shows for one that had none.
+#[tokio::test]
+async fn updating_the_attributes_of_a_missing_workflow_is_refused() {
+    let (sys, _db) = sysdb().await;
+    for update in [
+        AttributeUpdate::Replace(Some(r#"{"a": 1}"#)),
+        AttributeUpdate::Replace(None),
+        AttributeUpdate::Merge(r#"{"a": 1}"#),
+    ] {
+        let refused = sys
+            .update_workflow_attributes("wf-nobody-has", update, None)
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::NonExistentWorkflow { workflow_ids })
+                    if workflow_ids == &["wf-nobody-has"]
+            ),
+            "{update:?}: {refused:?}"
+        );
+    }
+}
+
 /// **Merges of different keys into one workflow all land, however they interleave**, which a read
 /// followed by a replacement cannot promise. Run many times, since a lost update is a race.
 #[tokio::test(flavor = "multi_thread")]

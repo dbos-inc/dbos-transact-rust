@@ -1947,6 +1947,96 @@ async fn attributes_are_merged_from_outside_and_inside_a_workflow() {
     dbos.shutdown().await;
 }
 
+/// **An attribute update from inside a workflow on an id no workflow has is refused, and the
+/// refusal is the step's recorded outcome**: a replay refuses again even once a workflow with that
+/// id exists.
+#[tokio::test]
+async fn an_attribute_update_on_a_missing_workflow_is_refused_and_replayed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("missing-attributes-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(0) })
+        .unwrap();
+    let tagger = {
+        let instance = dbos.clone();
+        dbos.register_workflow("tagger", move |target_id: String| {
+            let instance = instance.clone();
+            async move {
+                let tags = serde_json::json!({ "tagged": true });
+                // The refusal is the answer this workflow reports, not a failure of its own.
+                let refused = instance
+                    .merge_workflow_attributes(&target_id, tags.as_object().unwrap())
+                    .await
+                    .is_err_and(|error| {
+                        matches!(
+                            error,
+                            Error::SystemDatabase(dbos::sysdb::Error::NonExistentWorkflow { .. })
+                        )
+                    });
+                Ok::<_, Error>(refused)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let missing = "not-yet-a-workflow";
+    let handle = tagger
+        .start(missing.to_owned())
+        .await
+        .expect("the tagger did not start");
+    let tagger_id = handle.workflow_id().to_owned();
+    assert!(handle.result().await.expect("the tagger failed"));
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(&tagger_id, true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.step_name.as_str(), step.error.is_some()))
+            .collect::<Vec<_>>(),
+        [("DBOS.update_workflow_attributes", true)]
+    );
+
+    // The id exists now, so only the record can answer a replay with the refusal.
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(missing),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the target failed");
+    let replayed = dbos
+        .fork::<bool, EngineOnly>(&tagger_id, 1)
+        .await
+        .expect("fork failed")
+        .result()
+        .await
+        .expect("the replay failed");
+    assert!(
+        replayed,
+        "the replay merged into the workflow that exists now"
+    );
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(missing)
+            .await
+            .unwrap()
+            .unwrap()
+            .attributes
+            .is_none(),
+        "the replay wrote the attributes"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **A management call made from inside a workflow is a step of that workflow.**
 ///
 /// Each call is checkpointed under its `DBOS.*` name, so a replay reads back what the first run

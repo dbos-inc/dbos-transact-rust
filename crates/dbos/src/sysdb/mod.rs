@@ -436,6 +436,10 @@ pub trait SystemDatabase: Send + Sync {
     /// A merge is one statement, so concurrent merges of different keys never lose each other's,
     /// as in Python's `update_workflow_attributes(..., merge=True)`.
     ///
+    /// An id no workflow has is [`Error::NonExistentWorkflow`], for either form, as Go's
+    /// `SetWorkflowAttributes` reports it; a workflow that exists is updated whatever its
+    /// attributes were.
+    ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together** — see
     /// [`fork_workflows`](Self::fork_workflows), which explains what that buys and why this whole

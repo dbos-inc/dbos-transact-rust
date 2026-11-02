@@ -1097,6 +1097,11 @@ impl DBOS {
     /// The object shape is not decoration: [`WorkflowFilter::attributes`] queries the column with
     /// `@>` containment, and containment against a stored array or scalar silently never matches.
     ///
+    /// **An id no workflow has is refused** with
+    /// [`NonExistentWorkflow`](crate::sysdb::Error::NonExistentWorkflow), rather than reported as
+    /// done with nothing written, as Go's `SetWorkflowAttributes` refuses it. Inside a workflow the
+    /// refusal is the step's recorded outcome, so a replay sees it too.
+    ///
     /// `serde_json::Value::as_object` is the usual way in — and note that it answers `None` for a
     /// value that is not an object, which **clears** rather than refusing. Build a
     /// `serde_json::Map` directly when the attributes are assembled at runtime.
@@ -1152,6 +1157,9 @@ impl DBOS {
     /// promise. Python's `update_workflow_attributes(..., merge=True)` is the same operation.
     /// Inside a workflow it is recorded under the same step name as a replacement, as Python
     /// records both under one.
+    ///
+    /// An id no workflow has is refused, as by
+    /// [`update_workflow_attributes`](Self::update_workflow_attributes).
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1757,14 +1765,13 @@ impl Connection {
             .update_workflow_attributes(workflow_id, update, self.step_caller(caller))
             .await
             .map_err(Error::from_sysdb)?;
-        // As on `set_workflow_delay`: no count comes back, so an id with no row behind it
-        // reaches here indistinguishable from one whose attributes were changed.
+        // An id with no row behind it was refused above, so this one was updated.
         match update {
             AttributeUpdate::Replace(_) => {
-                tracing::info!(workflow_id, "asked to replace the workflow's attributes");
+                tracing::info!(workflow_id, "replaced the workflow's attributes");
             }
             AttributeUpdate::Merge(_) => {
-                tracing::info!(workflow_id, "asked to merge into the workflow's attributes");
+                tracing::info!(workflow_id, "merged into the workflow's attributes");
             }
         }
         Ok(())
