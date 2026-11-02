@@ -647,7 +647,7 @@ impl<'a> DebouncerClient<'a> {
         EnqueueOptions {
             app_name: self.app_name,
             app_version: self.app_version,
-            timeout: self.timeout,
+            timeout: self.timeout.map_or(Timeout::None, Timeout::Explicit),
             attributes: self.attributes,
             serialization: self.serialization,
             ..EnqueueOptions::new(self.queue)

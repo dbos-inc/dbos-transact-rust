@@ -3200,7 +3200,7 @@ async fn a_deduplicated_enqueue_by_name_replays_the_way_it_went() {
 }
 
 /// **An enqueue by name from a workflow with a deadline carries that deadline**, as a child start
-/// does, unless it is given a timeout of its own.
+/// does, unless it is given a timeout of its own or told to run unbounded.
 #[tokio::test]
 async fn an_enqueue_by_name_inherits_its_parents_deadline() {
     let db = test_database().await;
@@ -3218,7 +3218,17 @@ async fn an_enqueue_by_name_inherits_its_parents_deadline() {
                         "remote",
                         (),
                         dbos::EnqueueOptions {
-                            timeout: Some(Duration::from_secs(3600)),
+                            timeout: Timeout::Explicit(Duration::from_secs(3600)),
+                            ..dbos::EnqueueOptions::new("idle-deadline-queue")
+                        },
+                    )
+                    .await?;
+                let _: dbos::WorkflowHandle<()> = instance
+                    .enqueue_with(
+                        "remote",
+                        (),
+                        dbos::EnqueueOptions {
+                            timeout: Timeout::None,
                             ..dbos::EnqueueOptions::new("idle-deadline-queue")
                         },
                     )
@@ -3265,6 +3275,12 @@ async fn an_enqueue_by_name_inherits_its_parents_deadline() {
     assert_eq!(inherited.deadline, parent_row.deadline);
     assert_eq!(own.timeout, Some(Duration::from_secs(3600)));
     assert_ne!(own.deadline, parent_row.deadline);
+    let unbounded = reader
+        .get_workflow("deadline-parent-2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((unbounded.timeout, unbounded.deadline), (None, None));
 
     dbos.shutdown().await;
 }

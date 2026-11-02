@@ -132,16 +132,19 @@ pub struct EnqueueOptions<'a> {
     /// a rollback, say — and otherwise let the fleet take it.
     pub app_version: Option<&'a str>,
 
-    /// How long the whole workflow may take, once it starts.
+    /// How long the whole workflow may take, once it starts — the same [`Timeout`] a
+    /// [`StartOptions`](crate::StartOptions) takes.
     ///
-    /// A budget rather than a deadline, and the clock starts on **dequeue**: a workflow given five
-    /// minutes that waits an hour in the queue still gets its five minutes.
+    /// An [`Explicit`](Timeout::Explicit) budget rather than a deadline, and its clock starts on
+    /// **dequeue**: a workflow given five minutes that waits an hour in the queue still gets its
+    /// five minutes.
     ///
-    /// Left unset, a workflow enqueued by [`DBOS::enqueue_with`] from inside another inherits that
-    /// workflow's deadline, as a child start does; outside a workflow, and from a client, there is
-    /// no deadline to inherit, and unset is no timeout. A child that should outlive its parent's
-    /// deadline is given a timeout of its own.
-    pub timeout: Option<Duration>,
+    /// [`Inherit`](Timeout::Inherit), the default, gives a workflow enqueued by
+    /// [`DBOS::enqueue_with`] from inside another that workflow's deadline, as a child start
+    /// does; [`None`](Timeout::None) runs it unbounded even under a parent with a deadline. Outside
+    /// a workflow, and from a [`Client`], there is no deadline to inherit, so the two mean the
+    /// same: no timeout.
+    pub timeout: Timeout,
 
     /// Caller-supplied attributes, stored as JSON on the workflow's row.
     ///
@@ -189,7 +192,7 @@ impl<'a> EnqueueOptions<'a> {
         }
         validate_start(
             Some(&self.queue_request()),
-            self.timeout,
+            self.timeout.budget(),
             self.workflow_id,
             self.workflow_id_reuse_policy,
         )
@@ -218,7 +221,7 @@ impl<'a> EnqueueOptions<'a> {
             workflow_id_reuse_policy: WorkflowIdReusePolicy::ReturnExisting,
             app_name: None,
             app_version: None,
-            timeout: None,
+            timeout: Timeout::Inherit,
             attributes: None,
         }
     }
@@ -399,8 +402,8 @@ impl Client {
             application_version: options.app_version,
             // A budget, never a deadline: a queued workflow's deadline is computed on dequeue, so
             // the wait in the queue is not part of the budget. `start_with` writes the pair the
-            // same way for the same reason.
-            timeout: options.timeout,
+            // same way for the same reason. A client has no parent, so `Inherit` is no timeout.
+            timeout: options.timeout.budget(),
             deadline: None,
             attributes: attributes.as_deref(),
             is_debounced: debounce.is_some(),
@@ -595,7 +598,7 @@ impl DBOS {
                 let request = OwnedStart {
                     workflow_id: workflow_id.clone(),
                     workflow_id_reuse_policy: options.workflow_id_reuse_policy,
-                    timeout: options.timeout.map_or(Timeout::Inherit, Timeout::Explicit),
+                    timeout: options.timeout,
                     queue: Some(OwnedQueueRequest::from(&options.queue_request())),
                     input: Some(input),
                     encoding,
@@ -644,7 +647,7 @@ mod tests {
         assert_eq!(options.queue_request(), QueueRequest::new("work"));
         assert_eq!(options.workflow_id, None);
         assert_eq!(options.app_version, None);
-        assert_eq!(options.timeout, None);
+        assert_eq!(options.timeout, Timeout::Inherit);
         assert_eq!(
             options.duplication_policy,
             DuplicationPolicy::Reject,
