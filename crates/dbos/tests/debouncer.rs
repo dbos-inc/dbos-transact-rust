@@ -14,9 +14,9 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{Error as SysdbError, INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Client, ClientConfig, Config, DBOS, DebounceOptions, Debouncer, DebouncerClient, Enqueue,
-    Error, QualifiedWorkflowName, QueueConflict, QueueOptions, RunOptions, SerializationFormat,
-    StartOptions, Timeout, WorkflowHandle,
+    Client, ClientConfig, Config, DBOS, DebounceOptions, Debouncer, DebouncerClient, Error,
+    QualifiedWorkflowName, QueueConflict, QueueOptions, QueueRequest, RunOptions,
+    SerializationFormat, StartOptions, Timeout, WorkflowHandle,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -837,9 +837,9 @@ async fn a_key_held_by_a_workflow_that_is_not_debounced_is_refused() {
         .start_with(
             1,
             StartOptions {
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     deduplication_id: Some("echo-key"),
-                    ..Enqueue::new(queue)
+                    ..QueueRequest::new(queue)
                 }),
                 ..StartOptions::default()
             },
@@ -1315,9 +1315,9 @@ async fn a_deduplicated_debounce_inside_a_workflow_replays_its_error() {
         .start_with(
             1,
             StartOptions {
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     deduplication_id: Some("echo-key"),
-                    ..Enqueue::new(queue)
+                    ..QueueRequest::new(queue)
                 }),
                 ..StartOptions::default()
             },

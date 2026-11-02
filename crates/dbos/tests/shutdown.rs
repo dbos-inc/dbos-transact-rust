@@ -17,7 +17,7 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
 use dbos::{
-    Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, RunOptions, ShutdownOptions,
+    Config, DBOS, Error, QueueConflict, QueueOptions, QueueRequest, RunOptions, ShutdownOptions,
     StartOptions,
 };
 
@@ -223,7 +223,7 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
         .start_with(
             (),
             StartOptions {
-                queue: Some(Enqueue::new("drain-queue")),
+                queue: Some(QueueRequest::new("drain-queue")),
                 ..StartOptions::default()
             },
         )
@@ -253,7 +253,7 @@ async fn nothing_is_dequeued_once_shutdown_begins() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("drain-queue")),
+                queue: Some(QueueRequest::new("drain-queue")),
                 ..StartOptions::default()
             },
         )

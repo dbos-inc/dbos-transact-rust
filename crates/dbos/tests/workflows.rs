@@ -13,7 +13,7 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{BackendError, BackendErrorKind, Error as SysdbError, INTERNAL_QUEUE};
-use dbos::{Config, DBOS, Enqueue, Error, RunOptions, StartOptions, WorkflowIdReusePolicy};
+use dbos::{Config, DBOS, Error, QueueRequest, RunOptions, StartOptions, WorkflowIdReusePolicy};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -78,7 +78,7 @@ async fn a_rejecting_start_or_enqueue_refuses_a_taken_id() {
         .expect("the workflow failed");
     assert_eq!(first, 1);
 
-    for queue in [None, Some(Enqueue::new(INTERNAL_QUEUE))] {
+    for queue in [None, Some(QueueRequest::new(INTERNAL_QUEUE))] {
         let refused = counted.start_with(2, rejecting(queue)).await;
         assert!(
             matches!(
@@ -108,7 +108,7 @@ async fn a_rejecting_start_or_enqueue_refuses_a_taken_id() {
     assert_eq!(joined, 1, "the result of the workflow that has the id");
 
     // `Reject` is about an id the caller chose, and is refused without one.
-    for queue in [None, Some(Enqueue::new(INTERNAL_QUEUE))] {
+    for queue in [None, Some(QueueRequest::new(INTERNAL_QUEUE))] {
         let refused = counted
             .start_with(
                 4,

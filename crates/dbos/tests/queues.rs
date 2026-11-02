@@ -17,8 +17,8 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewQueue, OnExistingQueue, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Change, Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueChange, QueueConflict,
-    QueueOptions, RateLimit, RunOptions, StartOptions, Timeout,
+    Change, Config, DBOS, DuplicationPolicy, Error, QueueChange, QueueConflict, QueueOptions,
+    QueueRequest, RateLimit, RunOptions, StartOptions, Timeout,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -373,9 +373,9 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
                         (),
                         StartOptions {
                             workflow_id: Some(&format!("{name}-{n}")),
-                            queue: Some(Enqueue {
+                            queue: Some(QueueRequest {
                                 partition_key,
-                                ..Enqueue::new(&name)
+                                ..QueueRequest::new(&name)
                             }),
                             ..StartOptions::default()
                         },
@@ -390,7 +390,7 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
                 (),
                 StartOptions {
                     workflow_id: Some(&format!("{control}-0")),
-                    queue: Some(Enqueue::new(&control)),
+                    queue: Some(QueueRequest::new(&control)),
                     ..StartOptions::default()
                 },
             )
@@ -514,9 +514,9 @@ async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
                     key.to_owned(),
                     StartOptions {
                         workflow_id: Some(&format!("{key}-{n}")),
-                        queue: Some(Enqueue {
+                        queue: Some(QueueRequest {
                             partition_key: Some(key),
-                            ..Enqueue::new("burst-capped")
+                            ..QueueRequest::new("burst-capped")
                         }),
                         ..StartOptions::default()
                     },
@@ -619,7 +619,7 @@ async fn worker_concurrency_bounds_what_one_process_runs_at_once() {
                     (),
                     StartOptions {
                         workflow_id: Some(&format!("fanned-out-{n}")),
-                        queue: Some(Enqueue::new("demo-queue")),
+                        queue: Some(QueueRequest::new("demo-queue")),
                         ..StartOptions::default()
                     },
                 )
@@ -672,7 +672,7 @@ async fn an_enqueued_workflow_is_dispatched_by_the_runner() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("demo-queue")),
+                queue: Some(QueueRequest::new("demo-queue")),
                 ..StartOptions::default()
             },
         )
@@ -726,7 +726,7 @@ async fn a_queue_registered_after_launch_is_dequeued_from() {
             (),
             StartOptions {
                 workflow_id: Some("enqueued-late"),
-                queue: Some(Enqueue::new("late-queue")),
+                queue: Some(QueueRequest::new("late-queue")),
                 ..StartOptions::default()
             },
         )
@@ -760,7 +760,7 @@ async fn a_queued_workflow_with_a_legacy_input_runs_with_it() {
             21,
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("legacy-queue")),
+                queue: Some(QueueRequest::new("legacy-queue")),
                 ..StartOptions::default()
             },
         )
@@ -830,7 +830,7 @@ async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
                     id.to_owned(),
                     StartOptions {
                         workflow_id: Some(id),
-                        queue: Some(Enqueue::new("dead-letter-queue")),
+                        queue: Some(QueueRequest::new("dead-letter-queue")),
                         ..StartOptions::default()
                     },
                 )
@@ -907,7 +907,7 @@ async fn an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("unpolled-queue")),
+                queue: Some(QueueRequest::new("unpolled-queue")),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
                 ..Default::default()
             },
@@ -973,7 +973,7 @@ async fn a_queue_this_process_never_registered_is_dequeued_from() {
             (),
             StartOptions {
                 workflow_id: Some("on-a-queue-nobody-here-registered"),
-                queue: Some(Enqueue::new("written-by-someone-else")),
+                queue: Some(QueueRequest::new("written-by-someone-else")),
                 ..StartOptions::default()
             },
         )
@@ -1015,7 +1015,7 @@ async fn listen_queues_narrows_what_this_process_dequeues() {
             (),
             StartOptions {
                 workflow_id: Some("on-the-listened-queue"),
-                queue: Some(Enqueue::new("fast")),
+                queue: Some(QueueRequest::new("fast")),
                 ..StartOptions::default()
             },
         )
@@ -1026,7 +1026,7 @@ async fn listen_queues_narrows_what_this_process_dequeues() {
             (),
             StartOptions {
                 workflow_id: Some("on-the-other-queue"),
-                queue: Some(Enqueue::new("slow")),
+                queue: Some(QueueRequest::new("slow")),
                 ..StartOptions::default()
             },
         )
@@ -1073,7 +1073,7 @@ async fn listen_queues_never_excludes_the_internal_queue() {
             (),
             StartOptions {
                 workflow_id: Some("internal-under-a-filter"),
-                queue: Some(Enqueue::new(INTERNAL_QUEUE)),
+                queue: Some(QueueRequest::new(INTERNAL_QUEUE)),
                 ..StartOptions::default()
             },
         )
@@ -1113,7 +1113,7 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
             (),
             StartOptions {
                 workflow_id: Some("never-drained"),
-                queue: Some(Enqueue::new("ignored")),
+                queue: Some(QueueRequest::new("ignored")),
                 ..StartOptions::default()
             },
         )
@@ -1127,7 +1127,7 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
             (),
             StartOptions {
                 workflow_id: Some("still-internal"),
-                queue: Some(Enqueue::new(INTERNAL_QUEUE)),
+                queue: Some(QueueRequest::new(INTERNAL_QUEUE)),
                 ..StartOptions::default()
             },
         )
@@ -1197,7 +1197,7 @@ async fn updating_a_queue_changes_what_a_running_worker_honours() {
                     (),
                     StartOptions {
                         workflow_id: Some(&format!("fanned-{n}")),
-                        queue: Some(Enqueue::new("demo-queue")),
+                        queue: Some(QueueRequest::new("demo-queue")),
                         ..StartOptions::default()
                     },
                 )
@@ -1401,7 +1401,7 @@ async fn a_stored_row_cannot_redefine_the_internal_queue() {
             (),
             StartOptions {
                 workflow_id: Some("on-the-internal-queue"),
-                queue: Some(Enqueue::new(INTERNAL_QUEUE)),
+                queue: Some(QueueRequest::new(INTERNAL_QUEUE)),
                 ..StartOptions::default()
             },
         )
@@ -1461,7 +1461,7 @@ async fn another_applications_queue_is_not_dequeued_from() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("belongs-to-a-peer")),
+                queue: Some(QueueRequest::new("belongs-to-a-peer")),
                 ..StartOptions::default()
             },
         )
@@ -1519,7 +1519,7 @@ async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("demo-queue")),
+                queue: Some(QueueRequest::new("demo-queue")),
                 timeout: Timeout::Explicit(Duration::from_secs(300)),
                 ..Default::default()
             },
@@ -1572,7 +1572,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
                     .start_with(
                         (),
                         StartOptions {
-                            queue: Some(Enqueue::new("unpolled-queue")),
+                            queue: Some(QueueRequest::new("unpolled-queue")),
                             ..StartOptions::default()
                         },
                     )
@@ -1627,9 +1627,9 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 /// **The four queue-only options are refused only where nesting could not rule them out.**
 ///
 /// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
-/// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less value
-/// to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`). What is
-/// left is what no shape can express.
+/// error here — it does not compile, because [`QueueRequest`] owns them and there is no queue-less
+/// value to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`).
+/// What is left is what no shape can express.
 #[dbos_test_support::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;
@@ -1649,41 +1649,41 @@ async fn an_incoherent_enqueue_is_refused() {
     let cases = [
         (
             "the unprioritised sentinel spelled as a priority",
-            Enqueue {
+            QueueRequest {
                 priority: Some(0),
-                ..Enqueue::new("demo-queue")
+                ..QueueRequest::new("demo-queue")
             },
             "`priority` must be at least 1",
         ),
         (
             "a priority past what the column holds",
-            Enqueue {
+            QueueRequest {
                 priority: Some(i32::MAX as u32 + 1),
-                ..Enqueue::new("demo-queue")
+                ..QueueRequest::new("demo-queue")
             },
             "`priority` must be at most 2147483647",
         ),
         (
             "a policy for resolving collisions on a key that does not exist",
-            Enqueue {
+            QueueRequest {
                 duplication_policy: DuplicationPolicy::ReturnExisting,
-                ..Enqueue::new("demo-queue")
+                ..QueueRequest::new("demo-queue")
             },
             "`DuplicationPolicy::ReturnExisting` needs a `deduplication_id`",
         ),
         (
             "a delay past what the column holds",
-            Enqueue {
+            QueueRequest {
                 delay: Some(Duration::MAX),
-                ..Enqueue::new("demo-queue")
+                ..QueueRequest::new("demo-queue")
             },
             "`delay` must fit in milliseconds as a 64-bit integer",
         ),
         (
             "a zero delay, which means no delay",
-            Enqueue {
+            QueueRequest {
                 delay: Some(Duration::ZERO),
-                ..Enqueue::new("demo-queue")
+                ..QueueRequest::new("demo-queue")
             },
             "`delay` must be a positive, non-zero duration",
         ),
@@ -1766,9 +1766,9 @@ async fn a_delayed_enqueue_waits_before_it_is_dequeued() {
             (),
             StartOptions {
                 workflow_id: Some("held-back"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     delay: Some(Duration::from_secs(3)),
-                    ..Enqueue::new("demo-queue")
+                    ..QueueRequest::new("demo-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -1821,10 +1821,10 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
     .await
     .expect("registration failed");
 
-    let held = Enqueue {
+    let held = QueueRequest {
         deduplication_id: Some("order-42"),
         delay: Some(Duration::from_secs(3)),
-        ..Enqueue::new("demo-queue")
+        ..QueueRequest::new("demo-queue")
     };
     let first = workflow
         .start_with(
@@ -1868,9 +1868,9 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
             (),
             StartOptions {
                 workflow_id: Some("dedup-third"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     deduplication_id: Some("order-42"),
-                    ..Enqueue::new("demo-queue")
+                    ..QueueRequest::new("demo-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -1896,11 +1896,11 @@ async fn a_deduplication_id_is_held_across_partitions() {
         .unwrap();
     dbos.launch().await.expect("launch failed");
 
-    let on = |partition, policy| Enqueue {
+    let on = |partition, policy| QueueRequest {
         deduplication_id: Some("nightly-report"),
         partition_key: Some(partition),
         duplication_policy: policy,
-        ..Enqueue::new("tenants")
+        ..QueueRequest::new("tenants")
     };
     let start = |id, queue| {
         workflow.start_with(
@@ -1987,11 +1987,11 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
     .expect("registration failed");
 
     // Delayed, so the holder is still waiting when the second caller arrives.
-    let joining = Enqueue {
+    let joining = QueueRequest {
         deduplication_id: Some("order-42"),
         delay: Some(Duration::from_secs(3)),
         duplication_policy: DuplicationPolicy::ReturnExisting,
-        ..Enqueue::new("demo-queue")
+        ..QueueRequest::new("demo-queue")
     };
     let first = workflow
         .start_with(
@@ -2050,10 +2050,10 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
             (),
             StartOptions {
                 workflow_id: Some("join-third"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     deduplication_id: Some("order-42"),
                     duplication_policy: DuplicationPolicy::ReturnExisting,
-                    ..Enqueue::new("demo-queue")
+                    ..QueueRequest::new("demo-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -2113,9 +2113,9 @@ async fn priority_orders_the_backlog_lower_first() {
                     name.to_owned(),
                     StartOptions {
                         workflow_id: Some(name),
-                        queue: Some(Enqueue {
+                        queue: Some(QueueRequest {
                             priority,
-                            ..Enqueue::new("demo-queue")
+                            ..QueueRequest::new("demo-queue")
                         }),
                         ..StartOptions::default()
                     },
@@ -2181,10 +2181,10 @@ async fn a_partition_key_is_recorded_on_the_row() {
             (),
             StartOptions {
                 workflow_id: Some("sharded"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     partition_key: Some("tenant-7"),
                     priority: Some(4),
-                    ..Enqueue::new("demo-queue")
+                    ..QueueRequest::new("demo-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -2228,9 +2228,9 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
             (),
             StartOptions {
                 workflow_id: Some("no-priority"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     delay: Some(Duration::from_secs(30)),
-                    ..Enqueue::new("demo-queue")
+                    ..QueueRequest::new("demo-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -2577,7 +2577,7 @@ async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
         .start_with(
             41,
             StartOptions {
-                queue: Some(Enqueue::new("legacy")),
+                queue: Some(QueueRequest::new("legacy")),
                 ..StartOptions::default()
             },
         )
@@ -2684,9 +2684,9 @@ async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
                         key.to_owned(),
                         StartOptions {
                             workflow_id: Some(&format!("{key}-{n}")),
-                            queue: Some(Enqueue {
+                            queue: Some(QueueRequest {
                                 partition_key: Some(key),
-                                ..Enqueue::new("partitioned-queue")
+                                ..QueueRequest::new("partitioned-queue")
                             }),
                             ..StartOptions::default()
                         },
@@ -2778,9 +2778,9 @@ async fn a_counted_partitioned_queue_runs_its_limit_per_key() {
                         key.to_owned(),
                         StartOptions {
                             workflow_id: Some(&format!("{key}-{n}")),
-                            queue: Some(Enqueue {
+                            queue: Some(QueueRequest {
                                 partition_key: Some(key),
-                                ..Enqueue::new("counted-queue")
+                                ..QueueRequest::new("counted-queue")
                             }),
                             ..StartOptions::default()
                         },
