@@ -1148,8 +1148,9 @@ impl DBOS {
     ///
     /// **Atomic**, so two callers merging different keys into the same workflow both land, which a
     /// read followed by [`update_workflow_attributes`](Self::update_workflow_attributes) cannot
-    /// promise. Python's `update_workflow_attributes(..., merge=True)` is the same operation, and
-    /// records the same step.
+    /// promise. Python's `update_workflow_attributes(..., merge=True)` is the same operation.
+    /// Inside a workflow it is recorded under the same step name as a replacement, as Python
+    /// records both under one.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
