@@ -311,9 +311,9 @@ fn to_sysdb(error: Error) -> crate::sysdb::Error {
 ///
 /// - A start of a workflow takes its registration's choice —
 ///   [`WorkflowOptions::serialization`](crate::WorkflowOptions::serialization) — unless an
-///   [`Enqueue`](crate::Enqueue) makes its own, and a registration that made none takes the
-///   configured [`Serializer`]. A [`Client`](crate::Client), with no registration, takes its own
-///   configured serializer unless its enqueue says otherwise.
+///   [`QueueRequest`](crate::QueueRequest) makes its own, and a registration that made none takes
+///   the configured [`Serializer`]. A [`Client`](crate::Client), with no registration, takes its
+///   own configured serializer unless its enqueue says otherwise.
 /// - A send, event or stream write made inside a workflow takes that workflow's encoding; one made
 ///   outside a workflow takes the configured serializer.
 ///

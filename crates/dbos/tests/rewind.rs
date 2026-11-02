@@ -14,7 +14,7 @@ use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
 use dbos::{
-    Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, Error, RewindOptions, RunOptions,
+    Client, ClientConfig, Config, DBOS, EngineOnly, Error, QueueRequest, RewindOptions, RunOptions,
     StartOptions, WorkflowIdReusePolicy,
 };
 use sqlx::Row;
@@ -965,7 +965,7 @@ async fn a_rewind_is_refused_for_a_workflow_that_has_not_finished() {
             (),
             StartOptions {
                 workflow_id: Some(enqueued),
-                queue: Some(Enqueue::new(PARKING)),
+                queue: Some(QueueRequest::new(PARKING)),
                 ..StartOptions::default()
             },
         )

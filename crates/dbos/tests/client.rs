@@ -15,10 +15,10 @@ use dbos::sysdb::types::WorkflowFilter;
 use dbos::sysdb::types::WorkflowStatus;
 use dbos::sysdb::{Error as SysdbError, SystemDatabase};
 use dbos::{
-    Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly, Enqueue,
+    Change, Children, Client, ClientConfig, Config, DBOS, DuplicationPolicy, EngineOnly,
     EnqueueOptions, Error, Fork, ForkOptions, PortableWorkflowArgs, QualifiedWorkflowName,
-    QueueChange, QueueConflict, QueueOptions, SendMessage, SendOptions, StartOptions,
-    WorkflowHandle, WorkflowIdReusePolicy,
+    QueueChange, QueueConflict, QueueOptions, QueueRequest, SendMessage, SendOptions,
+    SerializationFormat, StartOptions, WorkflowHandle, WorkflowIdReusePolicy,
 };
 use dbos_test_support::{TestDatabase, raw_database, test_database};
 
@@ -77,10 +77,8 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             "refused-delay",
             EnqueueOptions {
                 workflow_id: Some("refused-delay"),
-                ..EnqueueOptions::on(Enqueue {
-                    delay: Some(Duration::MAX),
-                    ..Enqueue::new("work")
-                })
+                delay: Some(Duration::MAX),
+                ..EnqueueOptions::new("work")
             },
             "`delay`",
         ),
@@ -97,10 +95,8 @@ async fn a_client_enqueue_with_an_unstorable_duration_is_refused() {
             "zero-delay",
             EnqueueOptions {
                 workflow_id: Some("zero-delay"),
-                ..EnqueueOptions::on(Enqueue {
-                    delay: Some(Duration::ZERO),
-                    ..Enqueue::new("work")
-                })
+                delay: Some(Duration::ZERO),
+                ..EnqueueOptions::new("work")
             },
             "`delay` must be a positive, non-zero duration",
         ),
@@ -212,8 +208,8 @@ async fn an_enqueue_writes_a_row_nothing_here_could_run() {
 /// Everything an enqueue may say reaches the row it writes.
 ///
 /// One workflow rather than one per option, because what is being checked is the mapping — every
-/// part of the `QualifiedWorkflowName` and every field of `EnqueueOptions` and `Enqueue` landing in
-/// the column it names.
+/// part of the `QualifiedWorkflowName` and every field of `EnqueueOptions` and `QueueRequest`
+/// landing in the column it names.
 #[tokio::test]
 async fn every_option_reaches_the_row() {
     let db = test_database().await;
@@ -235,11 +231,13 @@ async fn every_option_reaches_the_row() {
                 attributes: Some(&attributes),
                 // Every field named, which is the point of this test -- so there is nothing left
                 // for a functional update to fill in.
-                queue: Enqueue {
-                    priority: Some(5),
-                    partition_key: Some("acme"),
-                    ..Enqueue::new("billing")
-                },
+                queue_name: "billing",
+                deduplication_id: None,
+                duplication_policy: DuplicationPolicy::Reject,
+                priority: Some(5),
+                partition_key: Some("acme"),
+                delay: None,
+                serialization: SerializationFormat::Default,
             },
         )
         .await
@@ -321,10 +319,10 @@ async fn a_delayed_enqueue_is_held_back() {
         .enqueue_with(
             "later",
             (),
-            EnqueueOptions::on(Enqueue {
+            EnqueueOptions {
                 delay: Some(Duration::from_secs(3600)),
-                ..Enqueue::new("work")
-            }),
+                ..EnqueueOptions::new("work")
+            },
         )
         .await
         .expect("enqueue failed");
@@ -380,12 +378,10 @@ async fn the_workflow_id_is_an_idempotency_key() {
 async fn a_held_deduplication_key_is_refused_or_joined() {
     let db = test_database().await;
     let client = client("client-dedup", &db).await;
-    let options = |duplication_policy| {
-        EnqueueOptions::on(Enqueue {
-            deduplication_id: Some("order-42"),
-            duplication_policy,
-            ..Enqueue::new("work")
-        })
+    let options = |duplication_policy| EnqueueOptions {
+        deduplication_id: Some("order-42"),
+        duplication_policy,
+        ..EnqueueOptions::new("work")
     };
 
     let first: WorkflowHandle<()> = client
@@ -432,10 +428,10 @@ async fn returning_the_existing_workflow_needs_a_key() {
         .enqueue_with::<_, (), Error>(
             "process_order",
             (),
-            EnqueueOptions::on(Enqueue {
+            EnqueueOptions {
                 duplication_policy: DuplicationPolicy::ReturnExisting,
-                ..Enqueue::new("work")
-            }),
+                ..EnqueueOptions::new("work")
+            },
         )
         .await
         .expect_err("there is no collision to resolve without a deduplication id");
@@ -457,17 +453,17 @@ async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
 
     let cases = [
         (
-            EnqueueOptions::on(Enqueue {
+            EnqueueOptions {
                 deduplication_id: Some(""),
-                ..Enqueue::new("work")
-            }),
+                ..EnqueueOptions::new("work")
+            },
             "queue `work`: `deduplication_id` must be absent rather than empty",
         ),
         (
-            EnqueueOptions::on(Enqueue {
+            EnqueueOptions {
                 partition_key: Some(""),
-                ..Enqueue::new("work")
-            }),
+                ..EnqueueOptions::new("work")
+            },
             "queue `work`: `partition_key` must be absent rather than empty",
         ),
         (
@@ -477,6 +473,7 @@ async fn a_client_enqueue_with_an_empty_value_is_refused_by_its_api_name() {
             },
             "queue `work`: `app_version` must be absent rather than empty",
         ),
+        (EnqueueOptions::new(""), "`queue_name` must not be empty"),
     ];
     for (options, expected) in cases {
         let refused = client
@@ -651,10 +648,8 @@ async fn an_impossible_enqueue_is_refused_before_it_is_written() {
             (),
             EnqueueOptions {
                 workflow_id: Some("never-written"),
-                ..EnqueueOptions::on(Enqueue {
-                    priority: Some(0),
-                    ..Enqueue::new("work")
-                })
+                priority: Some(0),
+                ..EnqueueOptions::new("work")
             },
         )
         .await
@@ -689,12 +684,10 @@ async fn a_clients_deduplication_id_is_held_across_partitions() {
             (),
             EnqueueOptions {
                 workflow_id: Some(id),
-                ..EnqueueOptions::on(Enqueue {
-                    deduplication_id: Some("nightly-report"),
-                    partition_key: Some(partition),
-                    duplication_policy: policy,
-                    ..Enqueue::new("tenants")
-                })
+                deduplication_id: Some("nightly-report"),
+                partition_key: Some(partition),
+                duplication_policy: policy,
+                ..EnqueueOptions::new("tenants")
             },
         )
     };
@@ -1354,7 +1347,7 @@ async fn a_client_cancels_and_resumes_a_workflow_it_did_not_start() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("nothing-polls-this")),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
                 ..StartOptions::default()
             },
         )
@@ -1644,6 +1637,28 @@ async fn a_client_lists_tags_and_delays_workflows() {
         [id],
     );
 
+    // A merge keeps what is there.
+    let tier = serde_json::json!({ "tier": "silver" });
+    client
+        .merge_workflow_attributes(id, tier.as_object().unwrap())
+        .await
+        .expect("merge failed");
+    let merged: serde_json::Value = serde_json::from_str(
+        &reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .attributes
+            .expect("the merge left no attributes"),
+    )
+    .unwrap();
+    assert_eq!(
+        merged,
+        serde_json::json!({ "tenant": "acme", "tier": "silver" })
+    );
+
     // `None` clears, rather than leaving what was there.
     client
         .update_workflow_attributes(id, None)
@@ -1723,7 +1738,7 @@ async fn a_clients_management_call_inside_a_workflow_is_not_a_step() {
             (),
             StartOptions {
                 workflow_id: Some(target_id),
-                queue: Some(Enqueue::new("nothing-polls-this")),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
                 ..StartOptions::default()
             },
         )

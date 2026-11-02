@@ -3,9 +3,9 @@
 //! Debouncing a key starts a workflow that waits `DELAYED` on a queue, holding a deduplication id
 //! derived from the key. Each later debounce of the key pushes that workflow's release out by the
 //! period it names and replaces its input, so it runs **once**, with the **last** input, when the
-//! calls stop — or at the debounce timeout, which caps how far a steady stream of calls can push it.
-//! Once the workflow is released to its queue the key is free again, and the next debounce starts a
-//! fresh workflow.
+//! calls stop — or at the debounce timeout, which caps how far a steady stream of calls can push
+//! it. Once the workflow is released to its queue the key is free again, and the next debounce
+//! starts a fresh workflow.
 //!
 //! [`Debouncer`] debounces a registered workflow from an app; [`DebouncerClient`] does the same
 //! from a [`Client`], naming the workflow as an enqueue does.
@@ -47,8 +47,8 @@ use crate::sysdb::types::{
     validate_positive_duration,
 };
 use crate::workflow::{
-    Debounced, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, TargetVersion, Timeout, create,
-    encode_attributes, placed_workflow_id, refused_start, validate_start,
+    Debounced, OwnedQueueRequest, OwnedStart, PendingStart, QueueRequest, TargetVersion, Timeout,
+    create, encode_attributes, placed_workflow_id, refused_start, validate_start,
 };
 
 /// What a debounce refuses its arguments as.
@@ -324,10 +324,10 @@ impl<'a, P, R, E> Debouncer<'a, P, R, E> {
     }
 
     /// The queue a debounce enqueues onto, as an enqueue names it.
-    fn enqueue(&self) -> Enqueue<'a> {
-        Enqueue {
+    fn queue_request(&self) -> QueueRequest<'a> {
+        QueueRequest {
             serialization: self.serialization,
-            ..Enqueue::new(self.queue.unwrap_or(INTERNAL_QUEUE))
+            ..QueueRequest::new(self.queue.unwrap_or(INTERNAL_QUEUE))
         }
     }
 }
@@ -461,7 +461,7 @@ where
         let executor = self.workflow.dbos().executor(DEBOUNCE_OPERATION)?;
         // A debounce names no workflow id of its own here: one call's is `DebounceOptions`'.
         validate_start(
-            Some(&self.enqueue()),
+            Some(&self.queue_request()),
             self.timeout,
             None,
             WorkflowIdReusePolicy::ReturnExisting,
@@ -492,7 +492,7 @@ where
     ) -> Result<WorkflowHandle<R, E>> {
         let conn = executor.connection();
         let name: &QualifiedWorkflowName = self.workflow.qualified_name();
-        let queue = self.enqueue();
+        let queue = self.queue_request();
         // The registration's encoding unless the queue asks for its own, as a start's is. A bounce
         // writes the input in the same one, so the row's tag always describes its input.
         let encoding = PayloadEncoding::resolve(
@@ -538,7 +538,7 @@ where
                     // insert on one reading of the database clock, which caps the release at the
                     // deadline. A replay that re-runs the start after a crash resolves them again,
                     // from when that insert lands.
-                    let fresh = Enqueue {
+                    let fresh = QueueRequest {
                         deduplication_id: Some(&bounce.deduplication_id),
                         delay: Some(period),
                         ..queue.clone()
@@ -548,7 +548,7 @@ where
                         // A debounced insert refuses an existing workflow under its id itself.
                         workflow_id_reuse_policy: WorkflowIdReusePolicy::ReturnExisting,
                         timeout,
-                        queue: Some(OwnedEnqueue::from(&fresh)),
+                        queue: Some(OwnedQueueRequest::from(&fresh)),
                         input: Some(bounce.input.clone()),
                         encoding: bounce.encoding.clone(),
                         attributes: attributes.clone(),
@@ -662,10 +662,8 @@ impl<'a> DebouncerClient<'a> {
             app_version: self.app_version,
             timeout: self.timeout,
             attributes: self.attributes,
-            ..EnqueueOptions::on(Enqueue {
-                serialization: self.serialization,
-                ..Enqueue::new(self.queue)
-            })
+            serialization: self.serialization,
+            ..EnqueueOptions::new(self.queue)
         }
     }
 
@@ -732,11 +730,8 @@ impl<'a> DebouncerClient<'a> {
                     // The period is the delay and the timeout the deadline, both resolved by the
                     // insert on the database clock, which caps the release at the deadline.
                     let options = EnqueueOptions {
-                        queue: Enqueue {
-                            deduplication_id: Some(&bounce.deduplication_id),
-                            delay: Some(period),
-                            ..options.queue.clone()
-                        },
+                        deduplication_id: Some(&bounce.deduplication_id),
+                        delay: Some(period),
                         workflow_id: call.workflow_id,
                         app_name: bounce.target_app,
                         ..options.clone()

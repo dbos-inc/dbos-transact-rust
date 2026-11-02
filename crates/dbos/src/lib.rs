@@ -343,7 +343,7 @@ pub use wait::{join_workflows, select_workflow};
 pub use dbos_macros::select_step;
 #[cfg(feature = "engine")]
 pub use workflow::{
-    DuplicationPolicy, Enqueue, PendingRun, PendingStart, PendingWorkflow, RunOptions,
+    DuplicationPolicy, PendingRun, PendingStart, PendingWorkflow, QueueRequest, RunOptions,
     StartOptions, Timeout,
 };
 

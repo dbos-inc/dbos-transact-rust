@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use dbos::{
-    Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, EnqueueOptions, Error,
-    PortableWorkflowArgs, QualifiedWorkflowName, QueueConflict, QueueOptions, ScheduleSpec,
-    ScheduledWorkflowInput, SendMessage, SendOptions, SerializationFormat, SetEventOptions,
-    StartOptions, WorkflowOptions, WriteStreamOptions,
+    Client, ClientConfig, Config, DBOS, EngineOnly, EnqueueOptions, Error, PortableWorkflowArgs,
+    QualifiedWorkflowName, QueueConflict, QueueOptions, ScheduleSpec, ScheduledWorkflowInput,
+    SendMessage, SendOptions, SerializationFormat, SetEventOptions, StartOptions, WorkflowOptions,
+    WriteStreamOptions,
 };
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -688,9 +688,10 @@ async fn a_client_enqueues_another_languages_workflow() {
     let db = test_database().await;
     let client = client(&db).await;
     // An application no executor here runs, so the rows stay as the client wrote them.
-    let elsewhere = |queue: Enqueue<'static>| EnqueueOptions {
+    let elsewhere = |serialization| EnqueueOptions {
         app_name: Some("python-app"),
-        ..EnqueueOptions::on(queue)
+        serialization,
+        ..EnqueueOptions::new(QUEUE)
     };
 
     let raw = client
@@ -700,7 +701,7 @@ async fn a_client_enqueues_another_languages_workflow() {
                 positional_args: vec![json!(1), json!("two")],
                 named_args: Map::from_iter([("three".to_owned(), json!(3))]),
             },
-            elsewhere(Enqueue::new(QUEUE)),
+            elsewhere(SerializationFormat::Default),
         )
         .await
         .unwrap();
@@ -711,20 +712,12 @@ async fn a_client_enqueues_another_languages_workflow() {
                 sku: "tea".to_owned(),
                 quantity: 2,
             },
-            elsewhere(Enqueue {
-                serialization: SerializationFormat::Portable,
-                ..Enqueue::new(QUEUE)
-            }),
+            elsewhere(SerializationFormat::Portable),
         )
         .await
         .unwrap();
 
-    let portable = || {
-        elsewhere(Enqueue {
-            serialization: SerializationFormat::Portable,
-            ..Enqueue::new(QUEUE)
-        })
-    };
+    let portable = || elsewhere(SerializationFormat::Portable);
     let two = client
         .enqueue_with::<_, Value, EngineOnly>("pythonWorkflow", ("tea", 2), portable())
         .await

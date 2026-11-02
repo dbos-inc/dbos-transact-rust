@@ -69,7 +69,7 @@ use crate::sysdb::types::{
     Change, NewSchedule, NewWorkflow, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, Timestamp, WorkflowIdReusePolicy, step_names,
 };
-use crate::workflow::{DuplicationPolicy, Enqueue, init_or_join, new_row};
+use crate::workflow::{DuplicationPolicy, QueueRequest, init_or_join, new_workflow};
 
 /// What a scheduled workflow is called with: the tick it is running for, and the schedule's
 /// context.
@@ -1153,7 +1153,7 @@ impl Connection {
             },
             &encoding,
         )?;
-        let queue = Enqueue::new(record.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE));
+        let queue = QueueRequest::new(record.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE));
         let new = NewWorkflow {
             name: Some(firing.workflow.name()),
             class_name: firing.workflow.class_name(),
@@ -1163,7 +1163,7 @@ impl Connection {
             application_name: firing.owner.as_deref(),
             application_version: firing.version.as_deref(),
             schedule_name: Some(&record.schedule_name),
-            ..new_row(workflow_id, Some(&queue))
+            ..new_workflow(workflow_id, Some(&queue))
         };
         // A tick's id is derived from the schedule and the time, so a tick another executor
         // already enqueued is joined rather than refused.

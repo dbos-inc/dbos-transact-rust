@@ -346,9 +346,9 @@ pub struct StartOptions<'a> {
     /// queue claims it and runs it, under whatever limits the queue carries. The handle returned is
     /// a polling one, because the process that asked is usually not the process that runs it.
     ///
-    /// Everything an enqueue can ask for lives in [`Enqueue`] rather than beside this field, which
-    /// is what makes the five queue-only options unstatable without a queue — see that type.
-    pub queue: Option<Enqueue<'a>>,
+    /// Everything an enqueue can ask for lives in [`QueueRequest`] rather than beside this field,
+    /// which is what makes the five queue-only options unstatable without a queue — see that type.
+    pub queue: Option<QueueRequest<'a>>,
 
     /// Caller-supplied attributes, stored as JSON on the workflow's row.
     ///
@@ -392,16 +392,16 @@ pub struct StartOptions<'a> {
 /// ```no_run
 /// # async fn f(workflow: &dbos::WorkflowRef<(), String>) -> dbos::Result<()> {
 /// workflow.start_with((), dbos::StartOptions {
-///     queue: Some(dbos::Enqueue {
+///     queue: Some(dbos::QueueRequest {
 ///         deduplication_id: Some("order-42"),
-///         ..dbos::Enqueue::new("demo-queue")
+///         ..dbos::QueueRequest::new("demo-queue")
 ///     }),
 ///     ..Default::default()
 /// }).await?;
 /// # Ok(()) }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Enqueue<'a> {
+pub struct QueueRequest<'a> {
     /// The queue's name, which is its address.
     pub name: &'a str,
     /// A key no two waiting workflows on this queue may share.
@@ -410,8 +410,8 @@ pub struct Enqueue<'a> {
     /// finishes — so it deduplicates a *backlog*, not a history: enqueueing the same key again
     /// after the first one completed is a new workflow, not a duplicate.
     ///
-    /// A second enqueue under a held key is refused, unless [`duplication_policy`](Self::duplication_policy)
-    /// asks to join the holder instead.
+    /// A second enqueue under a held key is refused, unless
+    /// [`duplication_policy`](Self::duplication_policy) asks to join the holder instead.
     ///
     /// **Held across the whole queue, partitions included.** On a partitioned queue a key held by a
     /// workflow in one partition blocks the same key in every other, and under
@@ -478,7 +478,8 @@ pub struct Enqueue<'a> {
     pub serialization: SerializationFormat,
 }
 
-/// What an enqueue does when its [`deduplication_id`](Enqueue::deduplication_id) is already held.
+/// What an enqueue does when its [`deduplication_id`](QueueRequest::deduplication_id) is already
+/// held.
 ///
 /// Only meaningful with a key: an enqueue with no deduplication id has nothing to collide with,
 /// and asking for [`ReturnExisting`](Self::ReturnExisting) without one is refused rather than
@@ -530,7 +531,7 @@ pub enum DuplicationPolicy {
     ReturnExisting,
 }
 
-impl<'a> Enqueue<'a> {
+impl<'a> QueueRequest<'a> {
     /// A plain enqueue onto `name`, asking for nothing else.
     pub fn new(name: &'a str) -> Self {
         Self {
@@ -657,7 +658,7 @@ pub(crate) fn refused_start(queue: Option<&str>, error: Error) -> Error {
 }
 
 /// The name a start's API gives a column the system database refuses by name: the queue's
-/// [`name`](Enqueue::name) and [`partition_key`](Enqueue::partition_key), and a client's
+/// [`name`](QueueRequest::name) and [`partition_key`](QueueRequest::partition_key), and a client's
 /// `workflow` and [`app_version`](crate::EnqueueOptions::app_version). Every other column is
 /// spelled as the API spells it.
 fn api_field(field: &str) -> &str {
@@ -672,8 +673,8 @@ fn api_field(field: &str) -> &str {
 
 /// Refuses a start's arguments that no row could hold, or that mean nothing together:
 /// [`WorkflowIdReusePolicy::Reject`] without a `workflow_id`, its enqueue's, through
-/// [`Enqueue::validate`], and a timeout of zero or one too long to store as milliseconds. Each is
-/// an [`Error::InvalidArgument`], through [`start_refusal`].
+/// [`QueueRequest::validate`], and a timeout of zero or one too long to store as milliseconds. Each
+/// is an [`Error::InvalidArgument`], through [`start_refusal`].
 ///
 /// A reuse policy is about an id the caller chose, so `Reject` needs one: with none, a root start
 /// has a fresh id nothing can have taken, and a child's is derived from its parent's, an id the
@@ -685,27 +686,27 @@ fn api_field(field: &str) -> &str {
 /// clock, so a replay decides it as the first run did. The system database refuses the same
 /// values again for its own callers.
 pub(crate) fn validate_start(
-    enqueue: Option<&Enqueue<'_>>,
+    queue: Option<&QueueRequest<'_>>,
     timeout: Option<Duration>,
     workflow_id: Option<&str>,
     reuse_policy: WorkflowIdReusePolicy,
 ) -> Result<()> {
     if reuse_policy == WorkflowIdReusePolicy::Reject && workflow_id.is_none() {
         return Err(start_refusal(
-            enqueue.map(|enqueue| enqueue.name),
+            queue.map(|queue| queue.name),
             "`WorkflowIdReusePolicy::Reject` needs a `workflow_id`: the policy is about an id the \
              caller chose"
                 .to_owned(),
         ));
     }
-    if let Some(enqueue) = enqueue {
-        enqueue.validate()?;
+    if let Some(queue) = queue {
+        queue.validate()?;
     }
     if let Some(timeout) = timeout {
         validate_positive_duration("timeout", timeout).map_err(|error| {
             Error::from_refusal(error, |field, detail| {
                 start_refusal(
-                    enqueue.map(|enqueue| enqueue.name),
+                    queue.map(|queue| queue.name),
                     refusal_detail(field, &detail),
                 )
             })
@@ -714,7 +715,7 @@ pub(crate) fn validate_start(
     Ok(())
 }
 
-/// A new workflow row with its queue-shaped half filled in: the five columns an [`Enqueue`]
+/// A [`NewWorkflow`] with its queue-shaped half filled in: the five columns a [`QueueRequest`]
 /// decides, and what they are when there is no queue.
 ///
 /// The base both literals that create a workflow build on —
@@ -725,15 +726,18 @@ pub(crate) fn validate_start(
 /// also being what a workflow that was never enqueued stores, since it has no order to keep.
 ///
 /// The status is not among them. A queued row goes in `ENQUEUED` rather than `PENDING`, and a
-/// [`delay`](Enqueue::delay) makes it `DELAYED`, but `initial_status` derives both from these
+/// [`delay`](QueueRequest::delay) makes it `DELAYED`, but `initial_status` derives both from these
 /// columns rather than a caller stating them.
-pub(crate) fn new_row<'a>(workflow_id: &'a str, enqueue: Option<&Enqueue<'a>>) -> NewWorkflow<'a> {
+pub(crate) fn new_workflow<'a>(
+    workflow_id: &'a str,
+    queue: Option<&QueueRequest<'a>>,
+) -> NewWorkflow<'a> {
     NewWorkflow {
-        queue_name: enqueue.map(|enqueue| enqueue.name),
-        deduplication_id: enqueue.and_then(|enqueue| enqueue.deduplication_id),
-        priority: enqueue.map_or(0, Enqueue::stored_priority),
-        queue_partition_key: enqueue.and_then(|enqueue| enqueue.partition_key),
-        delay: enqueue.and_then(|enqueue| enqueue.delay),
+        queue_name: queue.map(|queue| queue.name),
+        deduplication_id: queue.and_then(|queue| queue.deduplication_id),
+        priority: queue.map_or(0, QueueRequest::stored_priority),
+        queue_partition_key: queue.and_then(|queue| queue.partition_key),
+        delay: queue.and_then(|queue| queue.delay),
         ..NewWorkflow::new(workflow_id)
     }
 }
@@ -756,7 +760,7 @@ pub(crate) struct OwnedStart {
     pub(crate) workflow_id: String,
     pub(crate) workflow_id_reuse_policy: WorkflowIdReusePolicy,
     pub(crate) timeout: Timeout,
-    pub(crate) queue: Option<OwnedEnqueue>,
+    pub(crate) queue: Option<OwnedQueueRequest>,
     pub(crate) input: Option<String>,
     /// How `input` is encoded, and so how the workflow's outcome will be.
     pub(crate) encoding: PayloadEncoding,
@@ -793,8 +797,8 @@ pub(crate) enum TargetVersion {
 /// release from `DELAYED` clears its deduplication id, and with a debounce timeout the insert
 /// resolves into the cap no later bounce may push its release past.
 ///
-/// The row's deduplication id and delay are an ordinary enqueue's, set on its [`Enqueue`]; this
-/// carries only the two columns no public option can write.
+/// The row's deduplication id and delay are an ordinary enqueue's, set on its [`QueueRequest`];
+/// this carries only the two columns no public option can write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Debounced {
     /// How far past the insert a bounce may move the release, or `None` for no cap. A duration,
@@ -802,8 +806,8 @@ pub(crate) struct Debounced {
     pub(crate) timeout: Option<Duration>,
 }
 
-/// An [`Enqueue`] with its strings owned, for the same reason [`OwnedStart`] is: see there.
-pub(crate) struct OwnedEnqueue {
+/// A [`QueueRequest`] with its strings owned, for the same reason [`OwnedStart`] is: see there.
+pub(crate) struct OwnedQueueRequest {
     name: String,
     deduplication_id: Option<String>,
     priority: Option<u32>,
@@ -813,8 +817,8 @@ pub(crate) struct OwnedEnqueue {
     serialization: SerializationFormat,
 }
 
-impl From<&Enqueue<'_>> for OwnedEnqueue {
-    fn from(enqueue: &Enqueue<'_>) -> Self {
+impl From<&QueueRequest<'_>> for OwnedQueueRequest {
+    fn from(enqueue: &QueueRequest<'_>) -> Self {
         Self {
             name: enqueue.name.to_owned(),
             deduplication_id: enqueue.deduplication_id.map(str::to_owned),
@@ -827,15 +831,15 @@ impl From<&Enqueue<'_>> for OwnedEnqueue {
     }
 }
 
-impl OwnedEnqueue {
+impl OwnedQueueRequest {
     /// The borrowed form back, so everything below this point reads one type.
     ///
-    /// An inherent `as_*` rather than [`AsRef`] or [`Borrow`](std::borrow::Borrow), which both
-    /// have to hand back a reference: an [`Enqueue`] is a value *made* of references, so there is
+    /// An inherent `as_*` rather than [`AsRef`] or [`Borrow`](std::borrow::Borrow), which both have
+    /// to hand back a reference: a [`QueueRequest`] is a value *made* of references, so there is
     /// nothing here to lend. `EncodedSendMessage::as_sysdb_message` in `message.rs` is the same
     /// shape for the same reason.
-    fn as_enqueue(&self) -> Enqueue<'_> {
-        Enqueue {
+    fn as_queue_request(&self) -> QueueRequest<'_> {
+        QueueRequest {
             name: &self.name,
             deduplication_id: self.deduplication_id.as_deref(),
             priority: self.priority,
@@ -879,8 +883,9 @@ pub(crate) async fn init_or_join(
         match conn.sysdb().init_workflow(new, caller, reuse_policy).await {
             Ok(initialized) => return Ok(Submitted::Created(initialized)),
             // **A key another workflow holds, and a caller who asked to join it.** The insert lost
-            // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id
-            // is the answer, and a handle to it is what [`DuplicationPolicy::ReturnExisting`] promises.
+            // on the partial unique index over `(queue_name, deduplication_id)`; the holder's id is
+            // the answer, and a handle to it is what [`DuplicationPolicy::ReturnExisting`]
+            // promises.
             Err(crate::sysdb::Error::QueueDeduplicated {
                 queue_name,
                 deduplication_id,
@@ -921,10 +926,14 @@ pub(crate) async fn init_or_join(
 pub(crate) fn encode_attributes(
     attributes: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<String>> {
-    attributes
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|source| Error::encode_failed("attributes", source))
+    attributes.map(encode_attribute_map).transpose()
+}
+
+/// [`encode_attributes`], for attributes that are always there.
+pub(crate) fn encode_attribute_map(
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    serde_json::to_string(attributes).map_err(|source| Error::encode_failed("attributes", source))
 }
 
 impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
@@ -1108,8 +1117,8 @@ where
     /// function, and only the half that writes rows may be deferred into the future.
     ///
     /// **The checks ahead of the placement are ahead of it on purpose**: a start refused for its
-    /// instance, its enqueue or its timeout must move no counter, or the refusal shifts every later step
-    /// of the parent onto the wrong replay slot.
+    /// instance, its enqueue or its timeout must move no counter, or the refusal shifts every later
+    /// step of the parent onto the wrong replay slot.
     ///
     /// The placement itself is [`StepPlacement::of`]'s, shared with every other library step in
     /// the crate — including the await this start's [`run`](Self::run) pairs it with. Two of its
@@ -1330,7 +1339,7 @@ where
             workflow_id: workflow_id.clone(),
             workflow_id_reuse_policy: options.workflow_id_reuse_policy,
             timeout: options.timeout,
-            queue: options.queue.as_ref().map(OwnedEnqueue::from),
+            queue: options.queue.as_ref().map(OwnedQueueRequest::from),
             input: Some(encode_input(&input, &encoding)?),
             encoding,
             attributes: encode_attributes(options.attributes)?,
@@ -1450,7 +1459,7 @@ pub(crate) async fn create<R, E>(
         app_name,
         app_version,
     } = request;
-    let owned_queue = queue.as_ref().map(OwnedEnqueue::as_enqueue);
+    let owned_queue = queue.as_ref().map(OwnedQueueRequest::as_queue_request);
     let enqueue = owned_queue.as_ref();
     // **The ambient context is what makes this a child.** Every reference overloads the same
     // call rather than adding a `start_child`, so factoring a workflow body out into its own
@@ -1536,7 +1545,7 @@ pub(crate) async fn create<R, E>(
         debounce_timeout: debounce.and_then(|debounce| debounce.timeout),
         // The queue's five columns, and nothing below spawns the row they describe: a queue's
         // whole point is that the process which asks is not necessarily the one that runs.
-        ..new_row(&workflow_id, enqueue)
+        ..new_workflow(&workflow_id, enqueue)
     };
 
     let initialized = match init_or_join(
@@ -2563,9 +2572,9 @@ mod tests {
     fn a_start_refuses_a_delay_or_timeout_the_row_cannot_hold() {
         let fits = Duration::from_secs(3600);
         assert!(
-            Enqueue {
+            QueueRequest {
                 delay: Some(fits),
-                ..Enqueue::new("q")
+                ..QueueRequest::new("q")
             }
             .validate()
             .is_ok()
@@ -2581,9 +2590,9 @@ mod tests {
         );
         assert!(validate_start(None, None, None, WorkflowIdReusePolicy::ReturnExisting).is_ok());
 
-        let delay = Enqueue {
+        let delay = QueueRequest {
             delay: Some(Duration::MAX),
-            ..Enqueue::new("q")
+            ..QueueRequest::new("q")
         }
         .validate();
         assert!(
@@ -2595,18 +2604,18 @@ mod tests {
         // Fits in milliseconds, however far past now it lands: the system database resolves it
         // on its own clock and saturates at the largest instant.
         assert!(
-            Enqueue {
+            QueueRequest {
                 delay: Some(Duration::from_millis(i64::MAX as u64)),
-                ..Enqueue::new("q")
+                ..QueueRequest::new("q")
             }
             .validate()
             .is_ok()
         );
         // The enqueue's own checks run through the same function.
         let both = validate_start(
-            Some(&Enqueue {
+            Some(&QueueRequest {
                 delay: Some(Duration::ZERO),
-                ..Enqueue::new("q")
+                ..QueueRequest::new("q")
             }),
             Some(fits),
             None,
@@ -2620,7 +2629,7 @@ mod tests {
 
         // A queued start's timeout is the enqueue's argument, and names its queue.
         let queued = validate_start(
-            Some(&Enqueue::new("q")),
+            Some(&QueueRequest::new("q")),
             Some(Duration::MAX),
             None,
             WorkflowIdReusePolicy::ReturnExisting,
@@ -2647,9 +2656,9 @@ mod tests {
 
         // Zero is refused here too, with the system database's own wording, rather than once the
         // start has taken its step id.
-        let delay = Enqueue {
+        let delay = QueueRequest {
             delay: Some(Duration::ZERO),
-            ..Enqueue::new("q")
+            ..QueueRequest::new("q")
         }
         .validate();
         assert!(

@@ -18,54 +18,74 @@ use serde::Serialize;
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
-use crate::serialization::{PayloadEncoding, PortableWorkflowArgs, encode, encode_input};
+use crate::serialization::{
+    PayloadEncoding, PortableWorkflowArgs, SerializationFormat, encode, encode_input,
+};
 use crate::sysdb::types::{NewWorkflow, Timestamp, WorkflowIdReusePolicy};
 use crate::workflow::{
-    Debounced, ENQUEUE_OPERATION, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, Submitted,
-    TargetVersion, Timeout, create, encode_attributes, init_or_join, new_row, placed_workflow_id,
-    refused_start, validate_start,
+    Debounced, DuplicationPolicy, ENQUEUE_OPERATION, OwnedQueueRequest, OwnedStart, PendingStart,
+    QueueRequest, Submitted, TargetVersion, Timeout, create, encode_attributes, init_or_join,
+    new_workflow, placed_workflow_id, refused_start, validate_start,
 };
 use crate::{Client, DBOS, Executor, QualifiedWorkflowName};
 
 /// What an enqueue by name may say, beyond the input: [`Client::enqueue_with`]'s, and
 /// [`DBOS::enqueue_with`]'s.
 ///
-/// [`queue`](Self::queue) is not optional, which is the difference from
+/// [`queue_name`](Self::queue_name) is not optional, which is the difference from
 /// [`StartOptions`](crate::StartOptions): an enqueue by name runs nothing itself, so every one
 /// names a queue. That is also why there is no [`Default`] — a default would have to invent a queue
 /// name — and why the shape is [`EnqueueOptions::new`] plus functional update:
 ///
 /// ```no_run
-/// # use dbos::{Enqueue, EnqueueOptions};
+/// # use dbos::EnqueueOptions;
 /// let options = EnqueueOptions {
 ///     workflow_id: Some("order-42"),
+///     priority: Some(1),
 ///     ..EnqueueOptions::new("orders")
 /// };
 /// ```
 ///
-/// Asking the queue for something is [`EnqueueOptions::on`], which takes the whole [`Enqueue`]
-/// rather than leaving the `queue` field to be overwritten afterwards — the queue is named once,
-/// where a `..EnqueueOptions::new(..)` base under a `queue:` field would name it twice and honour
-/// only the second:
-///
-/// ```no_run
-/// # use dbos::{Enqueue, EnqueueOptions};
-/// let options = EnqueueOptions {
-///     workflow_id: Some("order-42"),
-///     ..EnqueueOptions::on(Enqueue {
-///         priority: Some(1),
-///         ..Enqueue::new("orders")
-///     })
-/// };
-/// ```
-///
-/// The queue-shaped options — deduplication, priority, partition, delay — live on [`Enqueue`],
-/// where the runtime's enqueue keeps them too, so the two surfaces do not spell the same four
-/// things differently.
+/// **Flat, as Python's and Java's `EnqueueOptions` are.** What to ask of the queue — a
+/// deduplication id, a priority, a partition key, a delay — sits beside everything else, so an
+/// enqueue by name is one type. A [`start`](crate::WorkflowRef::start_with) says the same things
+/// in a [`QueueRequest`], under [`StartOptions::queue`](crate::StartOptions::queue), because there
+/// the queue is optional and those settings exist only with one. Apart from the queue's own name,
+/// the two spell each setting the same way, and are checked by the same rules.
 #[derive(Debug, Clone)]
 pub struct EnqueueOptions<'a> {
-    /// The queue to leave the workflow on, and what to ask of it.
-    pub queue: Enqueue<'a>,
+    /// The queue to leave the workflow on, by name. `queue_name`, as Python's and Java's
+    /// `EnqueueOptions` call it; [`QueueRequest::name`] in a start.
+    pub queue_name: &'a str,
+
+    /// A key no two waiting workflows on this queue may share. See
+    /// [`QueueRequest::deduplication_id`].
+    pub deduplication_id: Option<&'a str>,
+
+    /// What to do when the [`deduplication_id`](Self::deduplication_id) is already held: refuse
+    /// (the default) or join the holder. See [`QueueRequest::duplication_policy`].
+    pub duplication_policy: DuplicationPolicy,
+
+    /// Dequeue order among this queue's waiting workflows, lower first, from 1. See
+    /// [`QueueRequest::priority`].
+    pub priority: Option<u32>,
+
+    /// Which partition of a partitioned queue this workflow belongs to; required on one. See
+    /// [`QueueRequest::partition_key`].
+    pub partition_key: Option<&'a str>,
+
+    /// How long to hold the workflow before it may be dequeued at all. See
+    /// [`QueueRequest::delay`].
+    pub delay: Option<Duration>,
+
+    /// How the enqueued workflow's input, output and error are encoded.
+    ///
+    /// [`SerializationFormat::Portable`] or [`SerializationFormat::Native`] chooses outright.
+    /// [`SerializationFormat::Default`] is the caller's own serializer — a client's
+    /// [`serializer`](crate::ClientConfig::serializer), or an application's — not the workflow's
+    /// registration, which an enqueue by name has none of to defer to. A workflow in another
+    /// language wants `Portable`.
+    pub serialization: SerializationFormat,
 
     /// The workflow's id, in place of a generated one.
     ///
@@ -86,8 +106,8 @@ pub struct EnqueueOptions<'a> {
     /// For a tool that hands work to an application it is not — the name decides which
     /// application's executors may dequeue it. Left unset, [`DBOS::enqueue_with`] writes the
     /// workflow for this application, and [`Client::enqueue_with`] for the client's
-    /// [`ClientConfig::app_name`](crate::ClientConfig::app_name); with both unset, a client writes an unclaimed workflow, which
-    /// any application may run.
+    /// [`ClientConfig::app_name`](crate::ClientConfig::app_name); with both unset, a client writes
+    /// an unclaimed workflow, which any application may run.
     pub app_name: Option<&'a str>,
 
     /// The version of the application's code that must run this workflow.
@@ -124,8 +144,8 @@ pub struct EnqueueOptions<'a> {
     /// Caller-supplied attributes, stored as JSON on the workflow's row.
     ///
     /// Searchable metadata: a tenant, a request id, a trace context. Plain JSON, never the
-    /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by every other
-    /// implementation, so a workflow's own payload encoding has no say in it.
+    /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by
+    /// every other implementation, so a workflow's own payload encoding has no say in it.
     pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -140,33 +160,44 @@ impl<'a> EnqueueOptions<'a> {
         if workflow.name().is_empty() {
             return Err(Error::InvalidArgument {
                 operation: ENQUEUE_OPERATION.into(),
-                detail: format!("queue `{}`: `workflow` must not be empty", self.queue.name),
+                detail: format!("queue `{}`: `workflow` must not be empty", self.queue_name),
+            });
+        }
+        // Here rather than left to the insert, which reports the column under the name a
+        // start's `QueueRequest` gives it.
+        if self.queue_name.is_empty() {
+            return Err(Error::InvalidArgument {
+                operation: ENQUEUE_OPERATION.into(),
+                detail: "`queue_name` must not be empty".to_owned(),
             });
         }
         validate_start(
-            Some(&self.queue),
+            Some(&self.queue_request()),
             self.timeout,
             self.workflow_id,
             self.workflow_id_reuse_policy,
         )
     }
 
-    /// A plain enqueue onto `queue`, asking for nothing else.
-    pub fn new(queue: &'a str) -> Self {
-        Self::on(Enqueue::new(queue))
-    }
-
-    /// The same, for an enqueue that has something to ask of the queue itself — a deduplication
-    /// id, a priority, a partition key, a delay.
-    ///
-    /// **The base to build on whenever [`queue`](Self::queue) is not the default one**, because
-    /// it is the only shape that names the queue once: `EnqueueOptions { queue: .., ..
-    /// EnqueueOptions::new(..) }` names it twice, and the functional update overwrites whatever
-    /// `new` was given, so a rename that misses one of the two silently enqueues onto the stale
-    /// queue.
-    pub fn on(queue: Enqueue<'a>) -> Self {
+    /// A plain enqueue onto `queue_name`, asking for nothing else.
+    pub fn new(queue_name: &'a str) -> Self {
+        let QueueRequest {
+            name,
+            deduplication_id,
+            priority,
+            partition_key,
+            delay,
+            duplication_policy,
+            serialization,
+        } = QueueRequest::new(queue_name);
         Self {
-            queue,
+            queue_name: name,
+            deduplication_id,
+            duplication_policy,
+            priority,
+            partition_key,
+            delay,
+            serialization,
             workflow_id: None,
             workflow_id_reuse_policy: WorkflowIdReusePolicy::ReturnExisting,
             app_name: None,
@@ -175,11 +206,19 @@ impl<'a> EnqueueOptions<'a> {
             attributes: None,
         }
     }
-}
 
-impl<'a> From<Enqueue<'a>> for EnqueueOptions<'a> {
-    fn from(queue: Enqueue<'a>) -> Self {
-        Self::on(queue)
+    /// The queue-shaped half, as a start would say it, which is what the row and the shared
+    /// checks are written against.
+    pub(crate) fn queue_request(&self) -> QueueRequest<'a> {
+        QueueRequest {
+            name: self.queue_name,
+            deduplication_id: self.deduplication_id,
+            priority: self.priority,
+            partition_key: self.partition_key,
+            delay: self.delay,
+            duplication_policy: self.duplication_policy,
+            serialization: self.serialization,
+        }
     }
 }
 
@@ -234,16 +273,16 @@ impl Client {
 
     /// [`enqueue`](Self::enqueue), with something to say about how.
     ///
-    /// See [`EnqueueOptions`] for what may be said, and [`Enqueue`] for the queue-shaped half of
-    /// it — a deduplication id, a priority, a partition key, a delay, and how the input is encoded.
+    /// See [`EnqueueOptions`] for what may be said — among it a deduplication id, a priority, a
+    /// partition key, a delay, and how the input is encoded.
     ///
     /// **For a workflow in another language, enqueue it
     /// [portable](crate::SerializationFormat::Portable)**: the input then goes into the envelope
     /// every SDK reads, a tuple of two or more as that many positional arguments, `()` as none, and
     /// anything else as the one argument. A client has no registration to defer to, so
     /// [`SerializationFormat::Default`](crate::SerializationFormat::Default) is this client's
-    /// [`serializer`](crate::ClientConfig::serializer) here. A callee that takes named arguments needs
-    /// [`enqueue_portable`](Self::enqueue_portable).
+    /// [`serializer`](crate::ClientConfig::serializer) here. A callee that takes named arguments
+    /// needs [`enqueue_portable`](Self::enqueue_portable).
     pub async fn enqueue_with<P, R, E>(
         &self,
         workflow: impl Into<QualifiedWorkflowName>,
@@ -258,7 +297,7 @@ impl Client {
         // could honour should not spend the encoding either.
         options.validate(&workflow)?;
         let encoding = PayloadEncoding::resolve(
-            options.queue.serialization,
+            options.serialization,
             self.connection().serializer().encoding(),
         );
         let input = encode_input(&input, &encoding)?;
@@ -270,7 +309,7 @@ impl Client {
     ///
     /// For a workflow in another language that takes arguments by name, which no Rust value is
     /// written as: [`enqueue_with`](Self::enqueue_with) writes a tuple's elements by position.
-    /// Always portable, whatever [`Enqueue::serialization`] says.
+    /// Always portable, whatever [`EnqueueOptions::serialization`] says.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
@@ -352,7 +391,7 @@ impl Client {
             debounce_timeout: debounce.and_then(|debounce| debounce.timeout),
             // Always `Some`: a client cannot run a workflow, so every enqueue it makes names a
             // queue — which is the difference from `start_with`, where the same base takes `None`.
-            ..new_row(workflow_id, Some(&options.queue))
+            ..new_workflow(workflow_id, Some(&options.queue_request()))
         };
 
         // A client has no step counter of its own, so an enqueue it makes records against no
@@ -360,18 +399,18 @@ impl Client {
         match init_or_join(
             self.connection(),
             &new,
-            options.queue.duplication_policy,
+            options.duplication_policy,
             options.workflow_id_reuse_policy,
             None,
         )
         .await
-        .map_err(|error| refused_start(Some(options.queue.name), error))?
+        .map_err(|error| refused_start(Some(options.queue_name), error))?
         {
             Submitted::Created(_) => {
                 tracing::debug!(
                     workflow_id,
                     %workflow,
-                    queue = options.queue.name,
+                    queue = options.queue_name,
                     "the workflow is enqueued"
                 );
                 // This call wrote the row, so a later absence is a deletion: the handle fails
@@ -463,10 +502,8 @@ impl DBOS {
         E: 'a,
     {
         self.enqueue_encoded(workflow.into(), options, |executor, options| {
-            let encoding = PayloadEncoding::resolve(
-                options.queue.serialization,
-                executor.serializer().encoding(),
-            );
+            let encoding =
+                PayloadEncoding::resolve(options.serialization, executor.serializer().encoding());
             Ok((encode_input(&input, &encoding)?, encoding))
         })
     }
@@ -535,7 +572,7 @@ impl DBOS {
                     workflow_id: placed_workflow_id(options.workflow_id, &placement),
                     workflow_id_reuse_policy: options.workflow_id_reuse_policy,
                     timeout: options.timeout.map_or(Timeout::Inherit, Timeout::Explicit),
-                    queue: Some(OwnedEnqueue::from(&options.queue)),
+                    queue: Some(OwnedQueueRequest::from(&options.queue_request())),
                     input: Some(input),
                     encoding,
                     attributes,
@@ -550,7 +587,7 @@ impl DBOS {
                 };
                 create::<R, E>(executor, placement, workflow, request)
                     .await
-                    .map_err(|error| refused_start(Some(options.queue.name), error))
+                    .map_err(|error| refused_start(Some(options.queue_name), error))
             },
         ))
     }
@@ -559,40 +596,39 @@ impl DBOS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::DuplicationPolicy;
 
     #[test]
     fn an_enqueue_asks_for_a_queue_and_nothing_else() {
         let options = EnqueueOptions::new("work");
-        assert_eq!(options.queue, Enqueue::new("work"));
+        assert_eq!(options.queue_request(), QueueRequest::new("work"));
         assert_eq!(options.workflow_id, None);
         assert_eq!(options.app_version, None);
         assert_eq!(options.timeout, None);
         assert_eq!(
-            options.queue.duplication_policy,
+            options.duplication_policy,
             DuplicationPolicy::Reject,
             "a caller who did not think about deduplication should hear that a key was taken"
         );
     }
 
-    /// The queue is named once, and it is the one that was asked for.
-    ///
-    /// `on` exists so that an enqueue with something to say about the queue does not have to name
-    /// it twice — once in the [`Enqueue`] and once in an `EnqueueOptions::new` base, where only
-    /// the second is honoured.
+    /// The flat fields are the queue request a start would make: the row and the shared checks
+    /// see what the caller wrote.
     #[test]
-    fn options_over_a_queue_keep_the_queue_they_were_given() {
-        let queue = Enqueue {
-            priority: Some(3),
-            ..Enqueue::new("billing")
-        };
+    fn flat_queue_fields_make_the_queue_request() {
         let options = EnqueueOptions {
             workflow_id: Some("order-42"),
-            ..EnqueueOptions::on(queue.clone())
+            priority: Some(3),
+            partition_key: Some("tenant-7"),
+            ..EnqueueOptions::new("billing")
         };
-        assert_eq!(options.queue, queue);
-        assert_eq!(options.queue.name, "billing");
+        assert_eq!(
+            options.queue_request(),
+            QueueRequest {
+                priority: Some(3),
+                partition_key: Some("tenant-7"),
+                ..QueueRequest::new("billing")
+            }
+        );
         assert_eq!(options.workflow_id, Some("order-42"));
-        assert_eq!(EnqueueOptions::from(queue.clone()).queue, queue);
     }
 }

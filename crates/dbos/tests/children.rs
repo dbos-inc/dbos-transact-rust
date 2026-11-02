@@ -8,7 +8,7 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{Outcome, WorkflowStatus};
 use dbos::{
-    Config, DBOS, DuplicationPolicy, Enqueue, Error, QueueConflict, QueueOptions, RunOptions,
+    Config, DBOS, DuplicationPolicy, Error, QueueConflict, QueueOptions, QueueRequest, RunOptions,
     StartOptions, Timeout, WorkflowIdReusePolicy,
 };
 
@@ -445,10 +445,10 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
                         .start_with(
                             (),
                             StartOptions {
-                                queue: Some(Enqueue {
+                                queue: Some(QueueRequest {
                                     deduplication_id: Some("order-42"),
                                     duplication_policy: DuplicationPolicy::ReturnExisting,
-                                    ..Enqueue::new("demo-queue")
+                                    ..QueueRequest::new("demo-queue")
                                 }),
                                 ..StartOptions::default()
                             },
@@ -475,10 +475,10 @@ async fn a_child_joining_a_held_key_is_recorded_as_the_workflow_it_joined() {
             (),
             StartOptions {
                 workflow_id: Some("the-holder"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     deduplication_id: Some("order-42"),
                     delay: Some(Duration::from_secs(3)),
-                    ..Enqueue::new("demo-queue")
+                    ..QueueRequest::new("demo-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -581,9 +581,9 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
                         .start_with(
                             (),
                             StartOptions {
-                                queue: Some(Enqueue {
+                                queue: Some(QueueRequest {
                                     deduplication_id: Some("order-7"),
-                                    ..Enqueue::new("dedup-error-queue")
+                                    ..QueueRequest::new("dedup-error-queue")
                                 }),
                                 ..StartOptions::default()
                             },
@@ -612,9 +612,9 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
             (),
             StartOptions {
                 workflow_id: Some("the-dedup-holder"),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     deduplication_id: Some("order-7"),
-                    ..Enqueue::new("dedup-error-queue")
+                    ..QueueRequest::new("dedup-error-queue")
                 }),
                 ..StartOptions::default()
             },
@@ -731,9 +731,9 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
                         .start_with(
                             (),
                             StartOptions {
-                                queue: Some(Enqueue {
+                                queue: Some(QueueRequest {
                                     deduplication_id: Some(&key),
-                                    ..Enqueue::new("insert-error-queue")
+                                    ..QueueRequest::new("insert-error-queue")
                                 }),
                                 ..StartOptions::default()
                             },
@@ -2331,9 +2331,9 @@ async fn a_child_start_refused_for_an_unstorable_duration_spends_no_step_id() {
                         .start_with(
                             (),
                             StartOptions {
-                                queue: Some(Enqueue {
+                                queue: Some(QueueRequest {
                                     delay: Some(duration),
-                                    ..Enqueue::new("never-reached")
+                                    ..QueueRequest::new("never-reached")
                                 }),
                                 ..StartOptions::default()
                             },
