@@ -704,8 +704,8 @@ async fn a_deduplicated_child_start_replays_its_error_after_the_key_is_freed() {
 
 /// **A child start the insert refuses for its arguments is recorded too**, and replays the same.
 ///
-/// An empty deduplication id passes the start's own checks and is refused by the insert, as
-/// `InvalidInput`. The key is shared with the test and made valid before the replay, standing in
+/// An empty queue name passes the start's own checks and is refused by the insert, as
+/// `InvalidInput`. The name is shared with the test and made valid before the replay, standing in
 /// for a refusal the replay would not reach (or a record an earlier version wrote): a fork that
 /// copies the start's checkpoint still takes the refused branch and creates no child, and a fork
 /// that runs the start again, as a control, starts the child.
@@ -731,10 +731,7 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
                         .start_with(
                             (),
                             StartOptions {
-                                queue: Some(QueueRequest {
-                                    deduplication_id: Some(&key),
-                                    ..QueueRequest::new("insert-error-queue")
-                                }),
+                                queue: Some(QueueRequest::new(&key)),
                                 ..StartOptions::default()
                             },
                         )
@@ -762,10 +759,7 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
         .await
         .expect("the parent failed");
     assert!(
-        first.starts_with(
-            "refused: invalid argument to enqueue a workflow: queue `insert-error-queue`: \
-             `deduplication_id`"
-        ),
+        first.starts_with("refused: invalid argument to enqueue a workflow: queue ``: `name`"),
         "{first}"
     );
 
@@ -782,19 +776,24 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
         steps[0]
     );
 
-    *key.lock().unwrap() = "a-valid-key".to_owned();
+    *key.lock().unwrap() = "insert-error-queue".to_owned();
 
     // A fork from step 1 copies the start's checkpoint, so the start replays and must return the
-    // first run's refusal again rather than start the child with a key that is now valid.
+    // first run's refusal again rather than start the child on a queue name that is now valid.
     let replayed = dbos
         .fork::<String, Error>(id, 1)
         .await
         .expect("fork failed");
     let replayed_id = replayed.workflow_id().to_owned();
-    assert_eq!(
-        replayed.result().await.expect("the replay failed"),
-        first,
-        "the replay took a different branch from the run it replayed"
+    // The same refusal, read back from the record. Its message names the queue the caller passes
+    // now, which this test has changed, so only the recorded part is compared.
+    let replayed = replayed.result().await.expect("the replay failed");
+    let refusal = "`name` must be absent rather than empty";
+    assert!(
+        first.ends_with(refusal)
+            && replayed.starts_with("refused: ")
+            && replayed.ends_with(refusal),
+        "the replay took a different branch from the run it replayed: {replayed}"
     );
     assert!(
         reader
@@ -805,7 +804,7 @@ async fn a_child_start_refused_by_the_insert_replays_its_error_when_the_start_wo
         "the replay started the child"
     );
 
-    // A fork from step 0 runs the start again, and with a valid key it goes ahead.
+    // A fork from step 0 runs the start again, and with a valid queue name it goes ahead.
     let rerun = dbos
         .fork::<String, Error>(id, 0)
         .await
@@ -2931,6 +2930,434 @@ async fn a_losing_step_has_its_cancellation_token_fired() {
     tokio::time::timeout(Duration::from_secs(5), released.notified())
         .await
         .expect("the losing step's token never fired");
+
+    dbos.shutdown().await;
+}
+
+/// **A workflow enqueued by name from inside a workflow is that workflow's child**: named for the
+/// parent and its step, recorded at that step under the workflow's name, and found again by a
+/// replay rather than enqueued a second time.
+#[tokio::test]
+async fn a_workflow_enqueued_by_name_is_a_child_and_a_replay_does_not_enqueue_it_again() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("by-name-app", &db));
+    dbos.register_workflow("worker", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+        .unwrap();
+    let parent = {
+        let instance = dbos.clone();
+        dbos.register_workflow("parent", move |n: u32| {
+            let instance = instance.clone();
+            async move {
+                // By name: the parent holds no reference to the worker's registration.
+                let handle: dbos::WorkflowHandle<u32> =
+                    instance.enqueue("worker", "by-name-queue", n).await?;
+                handle.result().await
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "by-name-queue",
+        QueueOptions::default(),
+        QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    let parent_id = "by-name-parent";
+    let doubled = parent
+        .run_with(
+            21,
+            RunOptions {
+                workflow_id: Some(parent_id),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert_eq!(doubled, 42);
+
+    let reader = reader(&db).await;
+    let child = reader
+        .get_workflow("by-name-parent-0")
+        .await
+        .unwrap()
+        .expect("the child is named for its parent and step");
+    assert_eq!(child.name.as_deref(), Some("worker"));
+    assert_eq!(child.parent_workflow_id.as_deref(), Some(parent_id));
+    assert_eq!(child.queue_name.as_deref(), Some("by-name-queue"));
+    let steps = reader
+        .list_workflow_steps(parent_id, true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps[0].step_name, "worker");
+    assert_eq!(
+        steps[0].child_workflow_id.as_deref(),
+        Some("by-name-parent-0")
+    );
+
+    // Forked past the enqueue, so the replay meets the recorded start and joins its child.
+    let replayed = dbos
+        .fork::<u32, dbos::EngineOnly>(parent_id, 1)
+        .await
+        .expect("fork failed")
+        .result()
+        .await
+        .expect("the replay failed");
+    assert_eq!(replayed, 42);
+    let workers = reader
+        .list_workflows(
+            &dbos::sysdb::types::WorkflowFilter {
+                names: vec!["worker"],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(workers.len(), 1, "the replay enqueued again: {workers:?}");
+
+    dbos.shutdown().await;
+}
+
+/// **Outside a workflow, an enqueue by name writes the row a client's enqueue writes**: this
+/// application's unless another is named, and with no version unless one is named. From inside a
+/// step it is refused, as a start is.
+#[tokio::test]
+async fn an_enqueue_by_name_writes_a_clients_row_and_is_refused_inside_a_step() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("by-name-row-app", &db));
+    let in_step = {
+        let instance = dbos.clone();
+        dbos.register_workflow("in_step", move |()| {
+            let instance = instance.clone();
+            async move {
+                dbos::step("enqueues", || {
+                    let instance = instance.clone();
+                    async move {
+                        let _: dbos::WorkflowHandle<()> =
+                            instance.enqueue("remote", "idle-queue", ()).await?;
+                        Ok::<_, Error>(())
+                    }
+                })
+                .await
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    // A queue nothing polls, so the rows stay as they were written.
+    let _: dbos::WorkflowHandle<u32> = dbos
+        .enqueue_with(
+            "remote",
+            1u32,
+            dbos::EnqueueOptions {
+                workflow_id: Some("own-app"),
+                ..dbos::EnqueueOptions::new("idle-queue")
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    let _: dbos::WorkflowHandle<u32> = dbos
+        .enqueue_with(
+            "remote",
+            2u32,
+            dbos::EnqueueOptions {
+                workflow_id: Some("other-app"),
+                app_name: Some("by-name-other-app"),
+                app_version: Some("v9"),
+                ..dbos::EnqueueOptions::new("idle-queue")
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let reader = reader(&db).await;
+    let own = reader.get_workflow("own-app").await.unwrap().unwrap();
+    assert_eq!(own.status, WorkflowStatus::Enqueued);
+    assert_eq!(own.name.as_deref(), Some("remote"));
+    assert_eq!(own.app_name.as_deref(), Some("by-name-row-app"));
+    assert_eq!(own.app_version, None, "no version unless one is named");
+    assert_eq!(own.parent_workflow_id, None);
+    let other = reader.get_workflow("other-app").await.unwrap().unwrap();
+    assert_eq!(other.app_name.as_deref(), Some("by-name-other-app"));
+    assert_eq!(other.app_version.as_deref(), Some("v9"));
+
+    let refused = in_step.run(()).await.unwrap_err();
+    assert!(matches!(refused, Error::InsideStep { .. }), "{refused:?}");
+    let empty: dbos::Result<dbos::WorkflowHandle<()>> = dbos.enqueue("", "idle-queue", ()).await;
+    assert!(
+        matches!(empty, Err(Error::InvalidArgument { .. })),
+        "{empty:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A deduplicated enqueue by name from a workflow is recorded either way it goes**: a join of the
+/// holder is recorded at the parent's step and replays to the same holder, and a refusal is
+/// recorded as one and replays as one, even once the holder is gone and the key is free.
+#[tokio::test]
+async fn a_deduplicated_enqueue_by_name_replays_the_way_it_went() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("by-name-dedup-app", &db));
+    let parent = {
+        let instance = dbos.clone();
+        dbos.register_workflow("dedup_parent", move |policy: String| {
+            let instance = instance.clone();
+            async move {
+                let duplication_policy = match policy.as_str() {
+                    "join" => DuplicationPolicy::ReturnExisting,
+                    _ => DuplicationPolicy::Reject,
+                };
+                let enqueued: dbos::Result<dbos::WorkflowHandle<()>> = instance
+                    .enqueue_with(
+                        "remote",
+                        (),
+                        dbos::EnqueueOptions {
+                            deduplication_id: Some("held-key"),
+                            duplication_policy,
+                            ..dbos::EnqueueOptions::new("idle-dedup-queue")
+                        },
+                    )
+                    .await;
+                match enqueued {
+                    Ok(handle) => Ok::<_, Error>(format!("joined {}", handle.workflow_id())),
+                    Err(Error::SystemDatabase(dbos::sysdb::Error::QueueDeduplicated {
+                        ..
+                    })) => Ok("deduplicated".to_owned()),
+                    Err(e) => Err(e),
+                }
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    // A queue nothing polls, so the holder keeps the key for as long as the test needs it.
+    let _: dbos::WorkflowHandle<()> = dbos
+        .enqueue_with(
+            "remote",
+            (),
+            dbos::EnqueueOptions {
+                workflow_id: Some("key-holder"),
+                deduplication_id: Some("held-key"),
+                ..dbos::EnqueueOptions::new("idle-dedup-queue")
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let run = |id: &'static str, policy: &str| {
+        parent.run_with(
+            policy.to_owned(),
+            RunOptions {
+                workflow_id: Some(id),
+                ..RunOptions::default()
+            },
+        )
+    };
+    assert_eq!(run("joins", "join").await.unwrap(), "joined key-holder");
+    assert_eq!(run("refused", "reject").await.unwrap(), "deduplicated");
+    let reader = reader(&db).await;
+    let steps = reader
+        .list_workflow_steps("joins", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps[0].child_workflow_id.as_deref(), Some("key-holder"));
+
+    let replay = |id: &'static str| {
+        let dbos = dbos.clone();
+        async move {
+            dbos.fork::<String, Error>(id, 1)
+                .await
+                .expect("fork failed")
+                .result()
+                .await
+                .expect("the replay failed")
+        }
+    };
+    assert_eq!(replay("joins").await, "joined key-holder");
+    // The key is free now, so only the record can say this enqueue was refused.
+    dbos.delete("key-holder").await.expect("delete failed");
+    assert_eq!(replay("refused").await, "deduplicated");
+    let remote = reader
+        .list_workflows(
+            &dbos::sysdb::types::WorkflowFilter {
+                names: vec!["remote"],
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(remote.is_empty(), "a replay enqueued again: {remote:?}");
+
+    dbos.shutdown().await;
+}
+
+/// **An enqueue by name from a workflow with a deadline carries that deadline**, as a child start
+/// does, unless it is given a timeout of its own or told to run unbounded.
+#[tokio::test]
+async fn an_enqueue_by_name_inherits_its_parents_deadline() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("by-name-deadline-app", &db));
+    let parent = {
+        let instance = dbos.clone();
+        dbos.register_workflow("deadline_parent", move |()| {
+            let instance = instance.clone();
+            async move {
+                let _: dbos::WorkflowHandle<()> = instance
+                    .enqueue("remote", "idle-deadline-queue", ())
+                    .await?;
+                let _: dbos::WorkflowHandle<()> = instance
+                    .enqueue_with(
+                        "remote",
+                        (),
+                        dbos::EnqueueOptions {
+                            timeout: Timeout::Explicit(Duration::from_secs(3600)),
+                            ..dbos::EnqueueOptions::new("idle-deadline-queue")
+                        },
+                    )
+                    .await?;
+                let _: dbos::WorkflowHandle<()> = instance
+                    .enqueue_with(
+                        "remote",
+                        (),
+                        dbos::EnqueueOptions {
+                            timeout: Timeout::None,
+                            ..dbos::EnqueueOptions::new("idle-deadline-queue")
+                        },
+                    )
+                    .await?;
+                Ok::<_, Error>(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("deadline-parent"),
+                timeout: Timeout::Explicit(Duration::from_secs(600)),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed")
+        .result()
+        .await
+        .expect("the parent failed");
+
+    let reader = reader(&db).await;
+    let parent_row = reader
+        .get_workflow("deadline-parent")
+        .await
+        .unwrap()
+        .unwrap();
+    let inherited = reader
+        .get_workflow("deadline-parent-0")
+        .await
+        .unwrap()
+        .unwrap();
+    let own = reader
+        .get_workflow("deadline-parent-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(parent_row.deadline.is_some());
+    assert_eq!(inherited.deadline, parent_row.deadline);
+    assert_eq!(own.timeout, Some(Duration::from_secs(3600)));
+    assert_ne!(own.deadline, parent_row.deadline);
+    let unbounded = reader
+        .get_workflow("deadline-parent-2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((unbounded.timeout, unbounded.deadline), (None, None));
+
+    dbos.shutdown().await;
+}
+
+/// **An enqueue by name refuses an app name or version no executor could have, and an empty id or
+/// key, before it takes a step id**, so the refusal costs the parent no step and leaves no record.
+#[tokio::test]
+async fn bad_enqueue_options_are_refused_before_the_step_id_is_taken() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("by-name-refused-app", &db));
+    let parent = {
+        let instance = dbos.clone();
+        dbos.register_workflow("refusing_parent", move |()| {
+            let instance = instance.clone();
+            async move {
+                let mut refusals = Vec::new();
+                for options in [
+                    dbos::EnqueueOptions {
+                        app_name: Some("Not-An-App"),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        app_version: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        workflow_id: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        deduplication_id: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                    dbos::EnqueueOptions {
+                        partition_key: Some(""),
+                        ..dbos::EnqueueOptions::new("idle-queue")
+                    },
+                ] {
+                    let refused: dbos::Result<dbos::WorkflowHandle<()>> =
+                        instance.enqueue_with("remote", (), options).await;
+                    match refused {
+                        Err(Error::InvalidArgument { detail, .. }) => refusals.push(detail),
+                        other => panic!("not refused: {:?}", other.map(|_| ())),
+                    }
+                }
+                dbos::step("after", || async { Ok::<_, Error>(()) }).await?;
+                Ok::<_, Error>(refusals)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let refusals = parent
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some("refusing-parent"),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("the parent failed");
+    assert!(refusals[0].contains("`app_name`"), "{refusals:?}");
+    assert!(refusals[1].contains("`app_version`"), "{refusals:?}");
+    assert!(refusals[2].contains("`workflow_id`"), "{refusals:?}");
+    assert!(refusals[3].contains("`deduplication_id`"), "{refusals:?}");
+    assert!(refusals[4].contains("`partition_key`"), "{refusals:?}");
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps("refusing-parent", true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert_eq!(
+        (steps[0].step_id, steps[0].step_name.as_str()),
+        (0, "after")
+    );
 
     dbos.shutdown().await;
 }
