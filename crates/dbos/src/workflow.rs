@@ -908,10 +908,14 @@ pub(crate) async fn init_or_join(
 pub(crate) fn encode_attributes(
     attributes: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<String>> {
-    attributes
-        .map(serde_json::to_string)
-        .transpose()
-        .map_err(|source| Error::encode_failed("attributes", source))
+    attributes.map(encode_attribute_map).transpose()
+}
+
+/// [`encode_attributes`], for attributes that are always there.
+pub(crate) fn encode_attribute_map(
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    serde_json::to_string(attributes).map_err(|source| Error::encode_failed("attributes", source))
 }
 
 impl<'a> From<RunOptions<'a>> for StartOptions<'a> {

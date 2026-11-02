@@ -3,13 +3,13 @@
 use dbos::sysdb::postgres::{Config, PostgresSystemDatabase, Settings};
 use dbos::sysdb::retry::RetryPolicy;
 use dbos::sysdb::types::{
-    AppScope, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest, DequeueStop,
-    EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller, Message,
-    NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite, PollingConcurrency,
-    QualifiedWorkflowName, QueueRecord, QueueUpdate, RateLimit, RenameBatching, RenameFrom,
-    RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming, Timestamp,
-    WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy, WorkflowRecord, WorkflowStatus,
-    WrittenBy,
+    AppScope, AttributeUpdate, AwaitedOutcome, AwaitedStream, Change, Debounce, DebounceRequest,
+    DequeueStop, EncodedValue, Fork, ForkOptions, ForkPoint, GetEventCaller, InitWorkflowCaller,
+    Message, NewQueue, NewSchedule, NewWorkflow, OnExistingQueue, Outcome, OutcomeWrite,
+    PollingConcurrency, QualifiedWorkflowName, QueueRecord, QueueUpdate, RateLimit, RenameBatching,
+    RenameFrom, RewindOptions, ScheduleFilter, ScheduleStatus, ScheduleUpdate, StepTiming,
+    Timestamp, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy, WorkflowRecord,
+    WorkflowStatus, WrittenBy,
 };
 use dbos::sysdb::{
     BackendErrorKind, DEFAULT_SCHEMA, Error, INTERNAL_QUEUE, PORTABLE_JSON, SystemDatabase,
@@ -2231,9 +2231,13 @@ async fn attributes_are_replaced_not_merged() {
         .await
         .unwrap();
 
-    sys.update_workflow_attributes("wf-attrs", Some(r#"{"tier": "silver"}"#), None)
-        .await
-        .unwrap();
+    sys.update_workflow_attributes(
+        "wf-attrs",
+        AttributeUpdate::Replace(Some(r#"{"tier": "silver"}"#)),
+        None,
+    )
+    .await
+    .unwrap();
     let read = sys.get_workflow("wf-attrs").await.unwrap().unwrap();
     let attributes = read.attributes.unwrap();
     assert!(attributes.contains("silver"));
@@ -2242,11 +2246,144 @@ async fn attributes_are_replaced_not_merged() {
         "a replacement drops keys the new value omits, got {attributes}",
     );
 
-    sys.update_workflow_attributes("wf-attrs", None, None)
+    sys.update_workflow_attributes("wf-attrs", AttributeUpdate::Replace(None), None)
         .await
         .unwrap();
     let read = sys.get_workflow("wf-attrs").await.unwrap().unwrap();
     assert_eq!(read.attributes, None);
+}
+
+/// **A merge adds keys and keeps the rest.** A key it names takes the new value, `null` included,
+/// and attributes that are absent or not an object count as an empty object.
+#[tokio::test]
+async fn merging_attributes_adds_keys_and_keeps_the_rest() {
+    let (sys, db) = sysdb().await;
+    sys.init_workflow(
+        &NewWorkflow::new("wf-merge"),
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    let merge = |json: &'static str| {
+        let sys = &sys;
+        async move {
+            sys.update_workflow_attributes("wf-merge", AttributeUpdate::Merge(json), None)
+                .await
+                .unwrap();
+            let read = sys.get_workflow("wf-merge").await.unwrap().unwrap();
+            serde_json::from_str::<serde_json::Value>(&read.attributes.unwrap()).unwrap()
+        }
+    };
+
+    assert_eq!(
+        merge(r#"{"a": 1}"#).await,
+        serde_json::json!({"a": 1}),
+        "into none"
+    );
+    assert_eq!(
+        merge(r#"{"b": 2}"#).await,
+        serde_json::json!({"a": 1, "b": 2})
+    );
+    assert_eq!(
+        merge(r#"{"a": 3, "c": null}"#).await,
+        serde_json::json!({"a": 3, "b": 2, "c": null}),
+        "a named key is overwritten, and null is stored, not a deletion"
+    );
+
+    // Not an object, as another implementation might have left it.
+    sqlx::query("UPDATE dbos.workflow_status SET attributes = '[1, 2]' WHERE workflow_uuid = $1")
+        .bind("wf-merge")
+        .execute(&db.pool().await)
+        .await
+        .unwrap();
+    assert_eq!(merge(r#"{"d": 4}"#).await, serde_json::json!({"d": 4}));
+
+    // An empty map into none leaves an empty object, not none.
+    sys.init_workflow(
+        &NewWorkflow::new("wf-merge-empty"),
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    sys.update_workflow_attributes("wf-merge-empty", AttributeUpdate::Merge("{}"), None)
+        .await
+        .unwrap();
+    let read = sys.get_workflow("wf-merge-empty").await.unwrap().unwrap();
+    assert_eq!(read.attributes.as_deref(), Some("{}"));
+
+    let refused = sys
+        .update_workflow_attributes("wf-merge", AttributeUpdate::Merge("[1]"), None)
+        .await;
+    assert!(
+        matches!(&refused, Err(Error::InvalidInput { field, .. }) if field == "attributes"),
+        "{refused:?}"
+    );
+}
+
+/// **An attribute update on an id no workflow has is refused**, replacing or merging, rather than
+/// reported as done with nothing written. A workflow that exists is updated whatever its
+/// attributes were, which the merge test above shows for one that had none.
+#[tokio::test]
+async fn updating_the_attributes_of_a_missing_workflow_is_refused() {
+    let (sys, _db) = sysdb().await;
+    for update in [
+        AttributeUpdate::Replace(Some(r#"{"a": 1}"#)),
+        AttributeUpdate::Replace(None),
+        AttributeUpdate::Merge(r#"{"a": 1}"#),
+    ] {
+        let refused = sys
+            .update_workflow_attributes("wf-nobody-has", update, None)
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::NonExistentWorkflow { workflow_ids })
+                    if workflow_ids == &["wf-nobody-has"]
+            ),
+            "{update:?}: {refused:?}"
+        );
+    }
+}
+
+/// **Merges of different keys into one workflow all land, however they interleave**, which a read
+/// followed by a replacement cannot promise. Run many times, since a lost update is a race.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_merges_of_different_keys_all_land() {
+    let (sys, _db) = sysdb().await;
+    let sys = std::sync::Arc::new(sys);
+    const MERGERS: usize = 8;
+    for round in 0..20 {
+        let id = format!("wf-merge-race-{round}");
+        sys.init_workflow(
+            &NewWorkflow::new(&id),
+            None,
+            WorkflowIdReusePolicy::ReturnExisting,
+        )
+        .await
+        .unwrap();
+        let mut merges = tokio::task::JoinSet::new();
+        for i in 0..MERGERS {
+            let (sys, id) = (std::sync::Arc::clone(&sys), id.clone());
+            merges.spawn(async move {
+                let json = format!(r#"{{"k{i}": {i}}}"#);
+                sys.update_workflow_attributes(&id, AttributeUpdate::Merge(&json), None)
+                    .await
+            });
+        }
+        while let Some(merged) = merges.join_next().await {
+            merged.unwrap().unwrap();
+        }
+        let read = sys.get_workflow(&id).await.unwrap().unwrap();
+        let attributes: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&read.attributes.unwrap()).unwrap();
+        assert_eq!(
+            attributes.len(),
+            MERGERS,
+            "round {round} lost a key: {attributes:?}"
+        );
+    }
 }
 
 /// Values the database would accept but no caller meant are rejected before they are written.
@@ -3928,7 +4065,7 @@ async fn attributes_must_be_a_json_object() {
 
         // And on update.
         match sys
-            .update_workflow_attributes("wf-attr-ok", Some(bad), None)
+            .update_workflow_attributes("wf-attr-ok", AttributeUpdate::Replace(Some(bad)), None)
             .await
         {
             Err(Error::InvalidInput { field, .. }) => assert_eq!(field, "attributes"),
@@ -3937,10 +4074,14 @@ async fn attributes_must_be_a_json_object() {
     }
 
     // An object is fine, and so is clearing.
-    sys.update_workflow_attributes("wf-attr-ok", Some(r#"{"tenant":"acme"}"#), None)
-        .await
-        .unwrap();
-    sys.update_workflow_attributes("wf-attr-ok", None, None)
+    sys.update_workflow_attributes(
+        "wf-attr-ok",
+        AttributeUpdate::Replace(Some(r#"{"tenant":"acme"}"#)),
+        None,
+    )
+    .await
+    .unwrap();
+    sys.update_workflow_attributes("wf-attr-ok", AttributeUpdate::Replace(None), None)
         .await
         .unwrap();
 
