@@ -74,9 +74,9 @@ use crate::sysdb::types::{
     NewWorkflow, Timestamp, VersionInfo, WorkflowIdReusePolicy, WorkflowStatus,
 };
 use crate::workflow::{
-    Debounced, ENQUEUE_OPERATION, Enqueue, OwnedEnqueue, OwnedStart, RowVersion, Submitted,
-    Timeout, create, encode_attributes, init_or_join, new_row, placed_workflow_id, refused_start,
-    validate_start,
+    Debounced, ENQUEUE_OPERATION, Enqueue, OwnedEnqueue, OwnedStart, PendingStart, RowVersion,
+    Submitted, Timeout, create, encode_attributes, init_or_join, new_row, placed_workflow_id,
+    refused_start, validate_start,
 };
 use crate::{
     DBOS, Executor, QualifiedWorkflowName, Queue, QueueChange, QueueConflict, QueueOptions,
@@ -782,9 +782,11 @@ impl DBOS {
     ///
     /// **For a workflow this process need not have**: implemented by another service, or in
     /// another language, sharing the system database. The name is not looked up in this process's
-    /// registrations, and the row is the one [`Client::enqueue`] writes, so whichever executor has
-    /// the code dequeues it. A workflow this process registered is started through its
-    /// [`WorkflowRef`](crate::WorkflowRef) instead, which can also run it here.
+    /// registrations, and the row carries what [`Client::enqueue`]'s does, so whichever executor
+    /// has the code dequeues it. It differs in naming this executor as the one that wrote it, and,
+    /// inside a workflow, in recording the parent and carrying its deadline. A workflow this
+    /// process registered is started through its [`WorkflowRef`](crate::WorkflowRef) instead,
+    /// which can also run it here.
     ///
     /// **Called from inside a workflow, the enqueued workflow is its child**, as a
     /// [`start`](crate::WorkflowRef::start_with) makes one: its id is `{parent_id}-{step_id}`
@@ -806,7 +808,7 @@ impl DBOS {
         workflow: impl Into<QualifiedWorkflowName>,
         queue: &'a str,
         input: P,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    ) -> PendingStart<'a, R, E>
     where
         P: Serialize,
         R: 'a,
@@ -834,7 +836,7 @@ impl DBOS {
         workflow: impl Into<QualifiedWorkflowName>,
         input: P,
         options: EnqueueOptions<'a>,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    ) -> PendingStart<'a, R, E>
     where
         P: Serialize,
         R: 'a,
@@ -858,7 +860,7 @@ impl DBOS {
         workflow: impl Into<QualifiedWorkflowName>,
         args: PortableWorkflowArgs,
         options: EnqueueOptions<'a>,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    ) -> PendingStart<'a, R, E>
     where
         R: 'a,
         E: 'a,
@@ -881,7 +883,7 @@ impl DBOS {
         workflow: QualifiedWorkflowName,
         options: EnqueueOptions<'a>,
         encode_input: F,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>>
+    ) -> PendingStart<'a, R, E>
     where
         R: 'a,
         E: 'a,
@@ -902,7 +904,10 @@ impl DBOS {
             }
             Ok(((executor, input, encoding, attributes), placement))
         })();
-        PendingStep::placed(
+        // A start rather than a bare step, so it can't be raced by `select_step!`: a dropped
+        // branch could leave the child created or not depending on where the drop landed, and a
+        // replay would then depend on it too. See `PendingWorkflow`.
+        PendingStart::from_step(PendingStep::placed(
             name,
             built,
             move |(executor, input, encoding, attributes), placement| async move {
@@ -925,14 +930,15 @@ impl DBOS {
                     .await
                     .map_err(|error| refused_start(Some(options.queue.name), error))
             },
-        )
+        ))
     }
 }
 
-/// What a client may say about an enqueue, beyond the input.
+/// What an enqueue by name may say, beyond the input: [`Client::enqueue_with`]'s, and
+/// [`DBOS::enqueue_with`]'s.
 ///
 /// [`queue`](Self::queue) is not optional, which is the difference from
-/// [`StartOptions`](crate::StartOptions): a client cannot run a workflow, so every enqueue it makes
+/// [`StartOptions`](crate::StartOptions): an enqueue by name runs nothing itself, so every one
 /// names a queue. That is also why there is no [`Default`] — a default would have to invent a queue
 /// name — and why the shape is [`EnqueueOptions::new`] plus functional update:
 ///
@@ -982,12 +988,13 @@ pub struct EnqueueOptions<'a> {
     /// is refused as [`Error::InvalidArgument`] without one.
     pub workflow_id_reuse_policy: WorkflowIdReusePolicy,
 
-    /// The application this workflow belongs to, in place of this client's own.
+    /// The application this workflow belongs to, in place of the caller's own.
     ///
     /// For a tool that hands work to an application it is not — the name decides which
-    /// application's executors may dequeue it. Leaving both this and
-    /// [`ClientConfig::app_name`] unset writes an unclaimed workflow, which any application may
-    /// run.
+    /// application's executors may dequeue it. Left unset, [`DBOS::enqueue_with`] writes the
+    /// workflow for this application, and [`Client::enqueue_with`] for the client's
+    /// [`ClientConfig::app_name`]; with both unset, a client writes an unclaimed workflow, which
+    /// any application may run.
     pub app_name: Option<&'a str>,
 
     /// The version of the application's code that must run this workflow.
@@ -1015,10 +1022,10 @@ pub struct EnqueueOptions<'a> {
     /// A budget rather than a deadline, and the clock starts on **dequeue**: a workflow given five
     /// minutes that waits an hour in the queue still gets its five minutes.
     ///
-    /// A plain [`Option`] rather than [`Timeout`](crate::Timeout), whose three states answer a
-    /// question that only exists inside a workflow — whether to inherit a parent's deadline. A
-    /// client has no parent, so `Inherit` and `None` would mean the same thing and the enum would
-    /// spell one state twice.
+    /// Left unset, a workflow enqueued by [`DBOS::enqueue_with`] from inside another inherits that
+    /// workflow's deadline, as a child start does; outside a workflow, and from a client, there is
+    /// no deadline to inherit, and unset is no timeout. A child that should outlive its parent's
+    /// deadline is given a timeout of its own.
     pub timeout: Option<Duration>,
 
     /// Caller-supplied attributes, stored as JSON on the workflow's row.
