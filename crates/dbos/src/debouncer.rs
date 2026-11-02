@@ -33,7 +33,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
-use crate::client::{Client, EnqueueOptions};
+use crate::client::Client;
+use crate::enqueue::EnqueueOptions;
 use crate::error::{DurableError, EngineOnly, Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
