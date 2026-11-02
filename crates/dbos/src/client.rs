@@ -440,11 +440,15 @@ impl Client {
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
-    /// use dbos::{EnqueueOptions, PortableWorkflowArgs}; let args = PortableWorkflowArgs {
-    /// positional_args: vec![serde_json::json!("ada@example.com")], named_args:
-    /// serde_json::Map::from_iter([("urgent".to_owned(), serde_json::json!(true))]), }; let handle:
-    /// dbos::WorkflowHandle<String> = client .enqueue_portable("send_email", args,
-    /// EnqueueOptions::new("email-queue")) .await?; # Ok(()) }
+    /// use dbos::{EnqueueOptions, PortableWorkflowArgs};
+    /// let args = PortableWorkflowArgs {
+    ///     positional_args: vec![serde_json::json!("ada@example.com")],
+    ///     named_args: serde_json::Map::from_iter([("urgent".to_owned(), serde_json::json!(true))]),
+    /// };
+    /// let handle: dbos::WorkflowHandle<String> = client
+    ///     .enqueue_portable("send_email", args, EnqueueOptions::new("email-queue"))
+    ///     .await?;
+    /// # Ok(()) }
     /// ```
     pub async fn enqueue_portable<R, E>(
         &self,
