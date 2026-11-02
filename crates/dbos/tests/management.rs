@@ -1871,6 +1871,172 @@ async fn attributes_are_replaced_and_can_be_searched() {
     dbos.shutdown().await;
 }
 
+/// **A merge adds keys and keeps the rest**, from outside a workflow and from inside one, where it
+/// is a step recorded under the same name as a replacement.
+#[tokio::test]
+async fn attributes_are_merged_from_outside_and_inside_a_workflow() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("merge-attributes-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(0) })
+        .unwrap();
+    let merger = {
+        let instance = dbos.clone();
+        dbos.register_workflow("merger", move |target_id: String| {
+            let instance = instance.clone();
+            async move {
+                let reviewed = serde_json::json!({ "reviewed": true });
+                instance
+                    .merge_workflow_attributes(&target_id, reviewed.as_object().unwrap())
+                    .await?;
+                Ok::<_, Error>(())
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let id = "merged-into";
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(id),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the workflow failed");
+    let attributes = || async {
+        let read = reader(&db).await.get_workflow(id).await.unwrap().unwrap();
+        serde_json::from_str::<serde_json::Value>(&read.attributes.unwrap()).unwrap()
+    };
+
+    let tags = serde_json::json!({ "tenant": "acme", "tier": "gold" });
+    dbos.merge_workflow_attributes(id, tags.as_object().unwrap())
+        .await
+        .expect("merge failed");
+    let tier = serde_json::json!({ "tier": "silver" });
+    dbos.merge_workflow_attributes(id, tier.as_object().unwrap())
+        .await
+        .expect("merge failed");
+    assert_eq!(
+        attributes().await,
+        serde_json::json!({ "tenant": "acme", "tier": "silver" })
+    );
+
+    let handle = merger
+        .start(id.to_owned())
+        .await
+        .expect("the merger did not start");
+    let merger_id = handle.workflow_id().to_owned();
+    handle.result().await.expect("the merger failed");
+    assert_eq!(
+        attributes().await,
+        serde_json::json!({ "tenant": "acme", "tier": "silver", "reviewed": true })
+    );
+    let steps: Vec<String> = dbos
+        .list_workflow_steps(&merger_id)
+        .await
+        .expect("step listing failed")
+        .into_iter()
+        .map(|step| step.step_name)
+        .collect();
+    assert_eq!(steps, ["DBOS.update_workflow_attributes"]);
+
+    dbos.shutdown().await;
+}
+
+/// **An attribute update from inside a workflow on an id no workflow has is refused, and the
+/// refusal is the step's recorded outcome**: a replay refuses again even once a workflow with that
+/// id exists.
+#[tokio::test]
+async fn an_attribute_update_on_a_missing_workflow_is_refused_and_replayed() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("missing-attributes-app", &db));
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(0) })
+        .unwrap();
+    let tagger = {
+        let instance = dbos.clone();
+        dbos.register_workflow("tagger", move |target_id: String| {
+            let instance = instance.clone();
+            async move {
+                let tags = serde_json::json!({ "tagged": true });
+                // The refusal is the answer this workflow reports, not a failure of its own.
+                let refused = instance
+                    .merge_workflow_attributes(&target_id, tags.as_object().unwrap())
+                    .await
+                    .is_err_and(|error| {
+                        matches!(
+                            error,
+                            Error::SystemDatabase(dbos::sysdb::Error::NonExistentWorkflow { .. })
+                        )
+                    });
+                Ok::<_, Error>(refused)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    let missing = "not-yet-a-workflow";
+    let handle = tagger
+        .start(missing.to_owned())
+        .await
+        .expect("the tagger did not start");
+    let tagger_id = handle.workflow_id().to_owned();
+    assert!(handle.result().await.expect("the tagger failed"));
+    let steps = reader(&db)
+        .await
+        .list_workflow_steps(&tagger_id, true, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.step_name.as_str(), step.error.is_some()))
+            .collect::<Vec<_>>(),
+        [("DBOS.update_workflow_attributes", true)]
+    );
+
+    // The id exists now, so only the record can answer a replay with the refusal.
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some(missing),
+                ..dbos::RunOptions::default()
+            },
+        )
+        .await
+        .expect("the target failed");
+    let replayed = dbos
+        .fork::<bool, EngineOnly>(&tagger_id, 1)
+        .await
+        .expect("fork failed")
+        .result()
+        .await
+        .expect("the replay failed");
+    assert!(
+        replayed,
+        "the replay merged into the workflow that exists now"
+    );
+    assert!(
+        reader(&db)
+            .await
+            .get_workflow(missing)
+            .await
+            .unwrap()
+            .unwrap()
+            .attributes
+            .is_none(),
+        "the replay wrote the attributes"
+    );
+
+    dbos.shutdown().await;
+}
+
 /// **A management call made from inside a workflow is a step of that workflow.**
 ///
 /// Each call is checkpointed under its `DBOS.*` name, so a replay reads back what the first run

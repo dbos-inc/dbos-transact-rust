@@ -1644,6 +1644,28 @@ async fn a_client_lists_tags_and_delays_workflows() {
         [id],
     );
 
+    // A merge keeps what is there.
+    let tier = serde_json::json!({ "tier": "silver" });
+    client
+        .merge_workflow_attributes(id, tier.as_object().unwrap())
+        .await
+        .expect("merge failed");
+    let merged: serde_json::Value = serde_json::from_str(
+        &reader(&db)
+            .await
+            .get_workflow(id)
+            .await
+            .expect("read failed")
+            .expect("the row is missing")
+            .attributes
+            .expect("the merge left no attributes"),
+    )
+    .unwrap();
+    assert_eq!(
+        merged,
+        serde_json::json!({ "tenant": "acme", "tier": "silver" })
+    );
+
     // `None` clears, rather than leaving what was there.
     client
         .update_workflow_attributes(id, None)

@@ -1695,6 +1695,31 @@ pub(crate) fn validate_attributes(attributes: Option<&str>) -> Result<(), Error>
     Ok(())
 }
 
+/// What an attribute update does to a workflow's attributes. Each carries an encoded JSON
+/// object, which the system database checks is one before writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttributeUpdate<'a> {
+    /// Replace them with this object, or clear them with `None`.
+    Replace(Option<&'a str>),
+    /// Merge this object's top-level keys into them, in one statement, so two merges of different
+    /// keys never lose each other's.
+    ///
+    /// A key already there takes the new value; a key set to `null` is stored as `null` rather
+    /// than removed. Attributes that are absent, or are not an object, count as an empty one.
+    Merge(&'a str),
+}
+
+impl AttributeUpdate<'_> {
+    /// Rejects an update whose attributes are not a JSON object, as
+    /// [`validate_attributes`] does.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        match *self {
+            AttributeUpdate::Replace(attributes) => validate_attributes(attributes),
+            AttributeUpdate::Merge(attributes) => validate_attributes(Some(attributes)),
+        }
+    }
+}
+
 /// When a delayed workflow should become eligible to run.
 ///
 /// A sum type because the two forms are alternatives, not options: Python takes
