@@ -1150,7 +1150,8 @@ impl DBOS {
     ///
     /// **A shallow merge of the top-level keys.** A key already there takes the new value, and the
     /// others stay as they are. A key set to JSON `null` is stored as `null`, not removed. If the
-    /// workflow has no attributes, or has ones that are not an object, the result is just these.
+    /// workflow has no attributes, or has ones that are not an object, the result is just these,
+    /// so an empty map leaves `{}` where there were none, as it does in Python and Go.
     ///
     /// **Atomic**, so two callers merging different keys into the same workflow both land, which a
     /// read followed by [`update_workflow_attributes`](Self::update_workflow_attributes) cannot
@@ -1765,15 +1766,13 @@ impl Connection {
             .update_workflow_attributes(workflow_id, update, self.step_caller(caller))
             .await
             .map_err(Error::from_sysdb)?;
-        // An id with no row behind it was refused above, so this one was updated.
-        match update {
-            AttributeUpdate::Replace(_) => {
-                tracing::info!(workflow_id, "replaced the workflow's attributes");
-            }
-            AttributeUpdate::Merge(_) => {
-                tracing::info!(workflow_id, "merged into the workflow's attributes");
-            }
-        }
+        // "Asked to", because a replay reads back the recorded outcome and writes nothing. An id
+        // with no row behind it was refused above.
+        let verb = match update {
+            AttributeUpdate::Replace(_) => "replace",
+            AttributeUpdate::Merge(_) => "merge into",
+        };
+        tracing::info!(workflow_id, "asked to {verb} the workflow's attributes");
         Ok(())
     }
 

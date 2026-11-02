@@ -2299,6 +2299,20 @@ async fn merging_attributes_adds_keys_and_keeps_the_rest() {
         .unwrap();
     assert_eq!(merge(r#"{"d": 4}"#).await, serde_json::json!({"d": 4}));
 
+    // An empty map into none leaves an empty object, not none.
+    sys.init_workflow(
+        &NewWorkflow::new("wf-merge-empty"),
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    sys.update_workflow_attributes("wf-merge-empty", AttributeUpdate::Merge("{}"), None)
+        .await
+        .unwrap();
+    let read = sys.get_workflow("wf-merge-empty").await.unwrap().unwrap();
+    assert_eq!(read.attributes.as_deref(), Some("{}"));
+
     let refused = sys
         .update_workflow_attributes("wf-merge", AttributeUpdate::Merge("[1]"), None)
         .await;
