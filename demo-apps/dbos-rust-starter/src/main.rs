@@ -31,7 +31,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dbos::{
-    Change, Config, DBOS, Enqueue, QueueChange, QueueOptions, StartOptions, WorkflowHandle,
+    Change, Config, DBOS, QueueChange, QueueOptions, QueueRequest, StartOptions, WorkflowHandle,
     WorkflowRef,
 };
 use serde::{Deserialize, Serialize};
@@ -382,7 +382,7 @@ async fn queue_enqueue(State(app): State<App>) -> Result<(), AppError> {
             .start_with(
                 (),
                 StartOptions {
-                    queue: Some(Enqueue::new(QUEUE_NAME)),
+                    queue: Some(QueueRequest::new(QUEUE_NAME)),
                     ..Default::default()
                 },
             )

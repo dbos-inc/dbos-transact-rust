@@ -7,7 +7,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{NewWorkflow, Outcome, Timestamp, WorkflowIdReusePolicy, WorkflowStatus};
 use dbos::{
-    Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, RunOptions, StartOptions, Timeout,
+    Config, DBOS, Error, QueueConflict, QueueOptions, QueueRequest, RunOptions, StartOptions,
+    Timeout,
 };
 
 use dbos_test_support::{
@@ -706,7 +707,7 @@ async fn timeouts_hold_with_the_database_clock_off_by(seconds: i64) {
 
     for (label, queue) in [
         ("direct", None),
-        ("queued", Some(Enqueue::new("skew-queue"))),
+        ("queued", Some(QueueRequest::new("skew-queue"))),
     ] {
         let direct = queue.is_none();
         let began = Instant::now();

@@ -224,8 +224,8 @@ pub struct QueueOptions {
     /// **Setting any of the three partition limits is what partitions a queue.** There is no
     /// separate switch: a partition limit is a statement that partitions exist, and the flag the
     /// row carries is derived from it. A workflow names its partition with
-    /// [`Enqueue::partition_key`](crate::Enqueue::partition_key); work sharing a key contends for
-    /// these limits, work under different keys does not.
+    /// [`QueueRequest::partition_key`](crate::QueueRequest::partition_key); work sharing a key
+    /// contends for these limits, work under different keys does not.
     ///
     /// `partition_concurrency: Some(1)` runs one workflow per key at a time. It is also the only
     /// shape the batched sweep can dequeue; see

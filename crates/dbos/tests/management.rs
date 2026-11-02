@@ -13,8 +13,8 @@ use dbos::sysdb::SystemDatabase;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
 use dbos::{
-    Children, Client, ClientConfig, Config, DBOS, EngineOnly, Enqueue, Error, Fork, ForkOptions,
-    ListWorkflowStepsOptions, ResumeOptions, StartOptions,
+    Children, Client, ClientConfig, Config, DBOS, EngineOnly, Error, Fork, ForkOptions,
+    ListWorkflowStepsOptions, QueueRequest, ResumeOptions, StartOptions,
 };
 
 use dbos_test_support::{TestDatabase, test_database};
@@ -72,7 +72,7 @@ async fn resuming_puts_a_workflow_on_a_queue_that_runs_it() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("a-queue-with-no-row")),
+                queue: Some(QueueRequest::new("a-queue-with-no-row")),
                 ..StartOptions::default()
             },
         )
@@ -751,7 +751,7 @@ async fn cancelling_makes_a_workflow_terminal_and_leaves_it_resumable() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("no-runner-here")),
+                queue: Some(QueueRequest::new("no-runner-here")),
                 ..StartOptions::default()
             },
         )
@@ -1263,7 +1263,7 @@ async fn resuming_and_forking_in_bulk_hand_back_a_handle_each() {
                 (),
                 StartOptions {
                     workflow_id: Some(id),
-                    queue: Some(Enqueue::new("still-nothing-polling")),
+                    queue: Some(QueueRequest::new("still-nothing-polling")),
                     ..StartOptions::default()
                 },
             )
@@ -1628,7 +1628,7 @@ async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue::new("a-queue-with-no-runner")),
+                queue: Some(QueueRequest::new("a-queue-with-no-runner")),
                 ..StartOptions::default()
             },
         )
@@ -1759,9 +1759,9 @@ async fn a_delayed_workflow_can_be_released_sooner() {
             (),
             StartOptions {
                 workflow_id: Some(id),
-                queue: Some(Enqueue {
+                queue: Some(QueueRequest {
                     delay: Some(std::time::Duration::from_secs(3600)),
-                    ..Enqueue::new("delayed-work")
+                    ..QueueRequest::new("delayed-work")
                 }),
                 ..StartOptions::default()
             },
@@ -1909,7 +1909,7 @@ async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
             (),
             StartOptions {
                 workflow_id: Some(target_id),
-                queue: Some(Enqueue::new("nothing-polls-this")),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
                 ..StartOptions::default()
             },
         )
@@ -2724,9 +2724,9 @@ async fn self_targeting_is_refused_through_any_ancestor_and_among_other_ids() {
                 (),
                 StartOptions {
                     workflow_id: Some(id),
-                    queue: Some(Enqueue {
+                    queue: Some(QueueRequest {
                         delay: Some(Duration::from_secs(3600)),
-                        ..Enqueue::new("held-bystanders")
+                        ..QueueRequest::new("held-bystanders")
                     }),
                     ..StartOptions::default()
                 },
@@ -2914,7 +2914,7 @@ async fn management_through_another_instance_from_inside_a_workflow_is_refused()
             (),
             StartOptions {
                 workflow_id: Some(target_id),
-                queue: Some(Enqueue::new("nothing-polls-this")),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
                 ..StartOptions::default()
             },
         )
@@ -3137,7 +3137,7 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
             (),
             StartOptions {
                 workflow_id: Some(target_id),
-                queue: Some(Enqueue::new("nothing-polls-this")),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
                 ..StartOptions::default()
             },
         )
@@ -3289,7 +3289,7 @@ async fn a_management_call_refused_by_its_arguments_spends_no_step_id() {
             (),
             StartOptions {
                 workflow_id: Some(target_id),
-                queue: Some(Enqueue::new("nothing-polls-this")),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
                 ..StartOptions::default()
             },
         )
@@ -3393,7 +3393,7 @@ async fn no_workflow_write_reaches_the_legacy_payload_columns() {
             2,
             StartOptions {
                 workflow_id: Some("sweep-queued"),
-                queue: Some(Enqueue::new("sweep-queue")),
+                queue: Some(QueueRequest::new("sweep-queue")),
                 ..StartOptions::default()
             },
         )

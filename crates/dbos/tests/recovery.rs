@@ -15,7 +15,7 @@ use std::time::Duration;
 use dbos::sysdb::postgres::{PostgresSystemDatabase, Settings};
 use dbos::sysdb::types::{WorkflowRecord, WorkflowStatus};
 use dbos::sysdb::{INTERNAL_QUEUE, SystemDatabase};
-use dbos::{Config, DBOS, Enqueue, Error, QueueConflict, QueueOptions, StartOptions};
+use dbos::{Config, DBOS, Error, QueueConflict, QueueOptions, QueueRequest, StartOptions};
 
 use dbos_test_support::{TestDatabase, test_database};
 
@@ -506,7 +506,7 @@ async fn a_superseded_execution_releases_its_queue_slot_while_it_waits() {
     };
     let enqueue = |id| StartOptions {
         workflow_id: Some(id),
-        queue: Some(Enqueue::new(QUEUE)),
+        queue: Some(QueueRequest::new(QUEUE)),
         ..StartOptions::default()
     };
     let reader = reader(&db).await;
