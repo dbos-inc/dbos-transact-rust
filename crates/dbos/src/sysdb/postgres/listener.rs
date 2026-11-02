@@ -122,7 +122,7 @@ impl Listener {
                 Err(e) if is_closed(&e) => break,
                 Err(e) => {
                     tracing::warn!(error = %e, "could not start the notification listener");
-                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    crate::rt::sleep(RECONNECT_DELAY).await;
                     continue;
                 }
             };
@@ -132,7 +132,7 @@ impl Listener {
                 }
                 tracing::warn!(error = %e, "the notification listener failed");
                 self.set_delivering(false);
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                crate::rt::sleep(RECONNECT_DELAY).await;
             }
         }
         self.set_delivering(false);
@@ -195,8 +195,7 @@ impl Listener {
         // Any notification arriving on a subscribed channel proves the subscription delivers,
         // whether it is this test's or real traffic that got here first — so there is nothing to
         // wait past. Traffic that is not the self-test is passed on rather than swallowed.
-        let Ok(received) = tokio::time::timeout(SELF_TEST_TIMEOUT, listener.try_recv()).await
-        else {
+        let Ok(received) = crate::rt::timeout(SELF_TEST_TIMEOUT, listener.try_recv()).await else {
             return Ok(false);
         };
         match received? {

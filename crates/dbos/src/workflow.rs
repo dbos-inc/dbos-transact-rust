@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::task::AbortHandle;
 use tracing::Instrument;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
@@ -19,6 +18,7 @@ use crate::error::{DurableError, EncodedError, Error, Failure, Result, refusal_d
 use crate::handle::{ChildResultPlacement, WorkflowHandle};
 use crate::instance::Executor;
 use crate::registry::{QualifiedWorkflowName, WorkflowRef};
+use crate::rt::AbortHandle;
 use crate::serialization::{EncodedOutput, PayloadEncoding, SerializationFormat, encode_input};
 use crate::sysdb::types::{
     AwaitedOutcome, DatabaseTime, InitWorkflowCaller, NewWorkflow, Outcome, OutcomeWrite,
@@ -121,8 +121,8 @@ impl Tasks {
     ///
     /// Returns as soon as the last task ends, not at the deadline. Nothing is cancelled, at the
     /// deadline or before it: what is still running is left to [`abort_all`](Self::abort_all).
-    pub(crate) async fn wait_all_until(&self, deadline: tokio::time::Instant) -> bool {
-        tokio::time::timeout_at(deadline, self.wait_all())
+    pub(crate) async fn wait_all_until(&self, deadline: Instant) -> bool {
+        crate::rt::timeout_at(deadline, self.wait_all())
             .await
             .is_ok()
     }
@@ -224,7 +224,7 @@ pub(crate) fn spawn_tracked<F>(
     role: Role,
     label: String,
     future: F,
-) -> tokio::task::JoinHandle<F::Output>
+) -> crate::rt::JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -232,7 +232,7 @@ where
     let tasks = executor.tasks(role);
     tasks.arrived();
     let guard = TaskGuard(Arc::clone(executor), role);
-    let task = executor.runtime().clone().spawn(async move {
+    let task = executor.runtime().spawn(async move {
         let _guard = guard;
         future.await
     });
@@ -243,8 +243,8 @@ where
 /// Logs a panic escaping a workflow body, from inside the unwind.
 ///
 /// A panic is deliberately not an outcome — nothing is recorded and the row stays `PENDING`, the
-/// same as a crash — but it must not be *silent*. Tokio parks the panic in the `JoinHandle`, and a
-/// caller that dropped its future never joins it, so without this the only evidence would be the
+/// same as a crash — but it must not be *silent*. The task parks the panic in its
+/// [`JoinHandle`](crate::rt::JoinHandle), and a caller that dropped its future never joins it, so without this the only evidence would be the
 /// panic hook's stderr line: no workflow id, nothing about the durable consequence.
 ///
 /// A drop guard because the unwind is the only place the case can be observed: an async block's
@@ -1265,7 +1265,7 @@ where
     /// so a start driven by anything that abandons a branch, a `select!` or a `timeout`, could be
     /// dropped between creating a child and spawning it and leave a workflow that exists, is
     /// recorded, and that nothing is running until the process next launches. Detached, the drop
-    /// takes the [`JoinHandle`](tokio::task::JoinHandle) and leaves the work: the child is
+    /// takes the [`JoinHandle`](crate::rt::JoinHandle) and leaves the work: the child is
     /// created, its start is recorded, and it runs. What the caller loses by dropping is the
     /// handle, which is [`select_workflow!`](macro@crate::select_workflow)'s existing rule — a
     /// workflow runs whether or not anything is watching it — rather than a new hazard of its own.
@@ -2163,7 +2163,7 @@ pub(crate) fn spawn_execution(
     serialization: Option<String>,
     deadline: Option<Deadline>,
     slot: Option<crate::dequeue::Slot>,
-) -> tokio::task::JoinHandle<std::result::Result<EncodedOutput, Failure>> {
+) -> crate::rt::JoinHandle<std::result::Result<EncodedOutput, Failure>> {
     let span = tracing::info_span!("workflow", workflow_id = %workflow_id, name = %key);
     spawn_tracked(
         executor,
@@ -2259,7 +2259,7 @@ where
     tokio::select! {
         biased;
         outcome = body => Ended::Body(outcome),
-        () = tokio::time::sleep_until(expires.into()) => Ended::DeadlinePassed,
+        () = crate::rt::sleep_until(expires) => Ended::DeadlinePassed,
     }
 }
 
@@ -2739,12 +2739,12 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let _guard = tracing::subscriber::set_default(Capture(Arc::clone(&events)));
 
-        let task = tokio::spawn(async {
+        let task = crate::rt::spawn(async {
             let _log = PanicLog {
                 workflow_id: "wf-boom",
             };
             // Held across an await point, as the real guard is.
-            tokio::task::yield_now().await;
+            crate::rt::yield_now().await;
             panic!("a bug, not an outcome");
         });
         let joined = task.await.expect_err("the task must panic");
@@ -2768,17 +2768,17 @@ mod tests {
 
         let mut sweep = {
             let tasks = Arc::clone(&tasks);
-            tokio::spawn(async move { tasks.abort_all().await })
+            crate::rt::spawn(async move { tasks.abort_all().await })
         };
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut sweep)
+            crate::rt::timeout(Duration::from_millis(100), &mut sweep)
                 .await
                 .is_err(),
             "the sweep returned while a task was still live"
         );
 
         tasks.departed();
-        tokio::time::timeout(Duration::from_secs(10), sweep)
+        crate::rt::timeout(Duration::from_secs(10), sweep)
             .await
             .expect("the sweep never noticed the last task leaving")
             .expect("the sweep panicked");
@@ -2793,18 +2793,18 @@ mod tests {
 
         let mut waiting = {
             let tasks = Arc::clone(&tasks);
-            tokio::spawn(async move { tasks.wait_all().await })
+            crate::rt::spawn(async move { tasks.wait_all().await })
         };
         tasks.departed();
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            crate::rt::timeout(Duration::from_millis(100), &mut waiting)
                 .await
                 .is_err(),
             "the wait ended with a task still live"
         );
 
         tasks.departed();
-        tokio::time::timeout(Duration::from_secs(10), waiting)
+        crate::rt::timeout(Duration::from_secs(10), waiting)
             .await
             .expect("the wait never noticed the last task leaving")
             .expect("the wait panicked");
@@ -2816,10 +2816,10 @@ mod tests {
     async fn wait_all_until_gives_up_at_the_deadline_and_cancels_nothing() {
         let tasks = Tasks::default();
         tasks.arrived();
-        let task = tokio::spawn(std::future::pending::<()>());
+        let task = crate::rt::spawn(std::future::pending::<()>());
         tasks.insert(task.abort_handle(), "wf-slow".to_owned());
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let deadline = Instant::now() + Duration::from_millis(100);
         assert!(
             !tasks.wait_all_until(deadline).await,
             "a live task was reported ended"
@@ -2829,7 +2829,7 @@ mod tests {
 
         task.abort();
         tasks.departed();
-        assert!(tasks.wait_all_until(tokio::time::Instant::now()).await);
+        assert!(tasks.wait_all_until(Instant::now()).await);
     }
 
     /// The race between spawning a workflow and registering it: one that arrives after the sweep
@@ -2839,10 +2839,10 @@ mod tests {
         let tasks = Tasks::default();
         tasks.abort_all().await;
 
-        let task = tokio::spawn(std::future::pending::<()>());
+        let task = crate::rt::spawn(std::future::pending::<()>());
         tasks.insert(task.abort_handle(), "late".to_owned());
 
-        let joined = tokio::time::timeout(Duration::from_secs(10), task)
+        let joined = crate::rt::timeout(Duration::from_secs(10), task)
             .await
             .expect("the late task was never cancelled");
         assert!(joined.expect_err("it must be cancelled").is_cancelled());
@@ -2854,11 +2854,11 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let _guard = tracing::subscriber::set_default(Capture(Arc::clone(&events)));
 
-        tokio::spawn(async {
+        crate::rt::spawn(async {
             let _panic_log = PanicLog {
                 workflow_id: "wf-fine",
             };
-            tokio::task::yield_now().await;
+            crate::rt::yield_now().await;
         })
         .await
         .expect("the task must complete");

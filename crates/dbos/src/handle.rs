@@ -11,12 +11,12 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
-use tokio::task::JoinHandle;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepPosition, StepWriter};
 use crate::connection::Connection;
 use crate::error::EngineOnly;
 use crate::error::{DurableError, EncodedError, Error, Failure, Result};
+use crate::rt::JoinHandle;
 use crate::serialization::{EncodedOutput, PayloadEncoding, Serializer, decode_tagged, encode};
 use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowStatus, step_names};
 

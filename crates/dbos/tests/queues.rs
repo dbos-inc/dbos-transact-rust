@@ -5,6 +5,10 @@
 //! supervisor and its workers for real, so a limit is asserted by what actually runs at once
 //! rather than by what the row says.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,7 +40,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 }
 
 /// A registered queue is a row, and the handle reports what the row holds.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn registering_a_queue_writes_a_row() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-register-app", &db));
@@ -80,7 +84,7 @@ async fn registering_a_queue_writes_a_row() {
 
 /// Registering the same queue again updates it — this process is running the latest version, which
 /// is the default policy's whole question.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn re_registering_updates_the_stored_limits() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-update-app", &db));
@@ -117,7 +121,7 @@ async fn re_registering_updates_the_stored_limits() {
 ///
 /// The read-back is the point: a caller that declined to overwrite still needs to know what its
 /// dequeues will actually honour, which is the row and not the request.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn declining_to_update_reports_what_is_stored() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-leave-app", &db));
@@ -155,7 +159,7 @@ async fn declining_to_update_reports_what_is_stored() {
 }
 
 /// The engine's internal queue is not a queue anybody registers.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn the_internal_queue_name_is_reserved() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-reserved-app", &db));
@@ -178,7 +182,7 @@ async fn the_internal_queue_name_is_reserved() {
 }
 
 /// A configuration that cannot mean anything is refused before it reaches the row.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn incoherent_limits_are_refused() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-invalid-app", &db));
@@ -264,7 +268,7 @@ async fn incoherent_limits_are_refused() {
 /// beside each paused one and must finish a workflow before the paused one is checked: the sweep
 /// that starts the control queue's worker starts the paused queue's too, so the paused queue has
 /// been polled by then.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-paused-app", &db));
@@ -393,7 +397,7 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
             .await
             .expect("enqueue failed");
         assert_eq!(controlled.result().await.expect("the workflow failed"), 1);
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        dbos::__rt::sleep(Duration::from_millis(500)).await;
 
         for n in 0..2 {
             assert_eq!(
@@ -428,7 +432,7 @@ async fn a_limit_of_zero_pauses_a_queue_until_it_is_raised() {
 }
 
 /// Equal limits are coherent: one process may run the whole fleet's allowance.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_per_process_limit_may_equal_the_fleet_limit() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-equal-limits-app", &db));
@@ -459,7 +463,7 @@ async fn a_per_process_limit_may_equal_the_fleet_limit() {
 /// comparison of rates would refuse it. It still caps each key's burst: of four workflows per key,
 /// the queue-wide window would start all eight, and the per-partition one starts two of each. Both
 /// windows outlast the test, so none of them reopens while it runs.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-burst-cap-app", &db));
@@ -526,16 +530,16 @@ async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
         let started = started.lock().unwrap();
         ["tenant-a", "tenant-b"].map(|key| started.get(key).copied().unwrap_or(0))
     };
-    tokio::time::timeout(Duration::from_secs(30), async {
+    dbos::__rt::timeout(Duration::from_secs(30), async {
         while per_key().iter().sum::<usize>() < 4 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            dbos::__rt::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
     .unwrap_or_else(|_| panic!("the queue never started four: {:?}", per_key()));
 
     // Ten more polls: a limit that only slowed the burst would admit more here.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    dbos::__rt::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         per_key(),
         [2, 2],
@@ -546,7 +550,7 @@ async fn a_partition_rate_limit_may_cap_bursts_the_queue_wide_one_allows() {
 }
 
 /// Registering a queue needs a launched instance, because it is a write.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn registering_before_launch_is_refused() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-unlaunched-app", &db));
@@ -570,7 +574,7 @@ async fn registering_before_launch_is_refused() {
 /// Register a queue with `worker_concurrency: 3`, enqueue five workflows that each hold for a
 /// moment, and watch three run while two wait. The Go starter's tab says exactly this, and it is
 /// the scenario the whole runner exists to serve.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn worker_concurrency_bounds_what_one_process_runs_at_once() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-worker-concurrency-app", &db));
@@ -588,7 +592,7 @@ async fn worker_concurrency_bounds_what_one_process_runs_at_once() {
                 async move {
                     let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    dbos::__rt::sleep(Duration::from_millis(400)).await;
                     live.fetch_sub(1, Ordering::SeqCst);
                     Ok::<u32, Error>(1)
                 }
@@ -646,7 +650,7 @@ async fn worker_concurrency_bounds_what_one_process_runs_at_once() {
 ///
 /// The enqueue records `ENQUEUED` and returns a polling handle — the caller may not be the process
 /// that runs it — and the handle resolves once whichever executor dequeued it finishes.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_enqueued_workflow_is_dispatched_by_the_runner() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-dequeue-app", &db));
@@ -698,7 +702,7 @@ async fn an_enqueued_workflow_is_dispatched_by_the_runner() {
 /// The supervisor rebuilds its set from the table on every reconcile, which is the same mechanism
 /// that lets a limit change at runtime. Without it, `register_queue` after launch would write a
 /// row nothing ever polls.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_queue_registered_after_launch_is_dequeued_from() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-late-registration-app", &db));
@@ -708,7 +712,7 @@ async fn a_queue_registered_after_launch_is_dequeued_from() {
     dbos.launch().await.expect("launch failed");
 
     // Long enough that the supervisor has already reconciled without this queue in the set.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    dbos::__rt::sleep(Duration::from_millis(1_500)).await;
     dbos.register_queue(
         "late-queue",
         QueueOptions::default(),
@@ -741,7 +745,7 @@ async fn a_queue_registered_after_launch_is_dequeued_from() {
 ///
 /// The row is made legacy by enqueueing onto a queue nothing polls yet, moving its input into the
 /// legacy column, and only then registering the queue.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_queued_workflow_with_a_legacy_input_runs_with_it() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-legacy-input-app", &db));
@@ -799,7 +803,7 @@ async fn a_queued_workflow_with_a_legacy_input_runs_with_it() {
 ///
 /// The counts are written while the workflows sit on a queue nothing polls yet, then the queue is
 /// registered so the real dequeue takes both.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-dead-letter-app", &db));
@@ -854,19 +858,19 @@ async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
     .await
     .expect("registration failed");
     let mut handles = handles.into_iter();
-    tokio::time::timeout(Duration::from_secs(10), handles.next().unwrap().result())
+    dbos::__rt::timeout(Duration::from_secs(10), handles.next().unwrap().result())
         .await
         .expect("the workflow at the limit never ran")
         .expect("the workflow at the limit failed");
 
     let sys = reader(&db).await;
-    let parked = tokio::time::timeout(Duration::from_secs(10), async {
+    let parked = dbos::__rt::timeout(Duration::from_secs(10), async {
         loop {
             let row = sys.get_workflow("past-the-limit").await.unwrap().unwrap();
             if row.status != WorkflowStatus::Enqueued && row.status != WorkflowStatus::Pending {
                 return row;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -888,7 +892,7 @@ async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
 /// is an address and needs no registration, so a name no runner has in its set leaves the row in
 /// the state the enqueue wrote. The dequeue's half of this rule is
 /// `a_dequeue_stamps_the_deadline_an_enqueue_left_open`.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-timeout-app", &db));
@@ -938,7 +942,7 @@ async fn an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet() {
 ///
 /// That is the point of a fleet sharing a backlog, and it is why `listen_queues` exists as the
 /// way to narrow it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_queue_this_process_never_registered_is_dequeued_from() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-unregistered-app", &db));
@@ -985,7 +989,7 @@ async fn a_queue_this_process_never_registered_is_dequeued_from() {
 /// Both queues have rows and both hold work; only the listened one is drained. The other's
 /// workflow stays `ENQUEUED` for a peer that does listen to it — which is the point, and why this
 /// is a split of one application's fleet rather than a way to disable a queue.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn listen_queues_narrows_what_this_process_dequeues() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
@@ -1052,7 +1056,7 @@ async fn listen_queues_narrows_what_this_process_dequeues() {
 /// `resume`, `fork` and recovery all put work there, so a filter that excluded it would strand
 /// them silently. Here the filter names one unrelated queue, and a workflow enqueued onto the
 /// internal queue still runs.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn listen_queues_never_excludes_the_internal_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
@@ -1085,7 +1089,7 @@ async fn listen_queues_never_excludes_the_internal_queue() {
 /// Distinct from `None`, which is every queue. Go's empty set means "all"; Rust's `Option` carries
 /// that meaning instead, so an empty slice can mean what it says. The internal queue still runs,
 /// as it always does.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(Config {
@@ -1150,7 +1154,7 @@ async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
 ///
 /// The queue starts with `worker_concurrency: 1`, so a fan-out runs one at a time. Raising it to
 /// three mid-flight is picked up by the worker on its next pass, and the rest run three at once.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn updating_a_queue_changes_what_a_running_worker_honours() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-update-limits-app", &db));
@@ -1166,7 +1170,7 @@ async fn updating_a_queue_changes_what_a_running_worker_honours() {
                 async move {
                     let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    dbos::__rt::sleep(Duration::from_millis(600)).await;
                     live.fetch_sub(1, Ordering::SeqCst);
                     Ok::<u32, Error>(1)
                 }
@@ -1203,7 +1207,7 @@ async fn updating_a_queue_changes_what_a_running_worker_honours() {
     }
 
     // One at a time to begin with.
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    dbos::__rt::sleep(Duration::from_millis(1_200)).await;
     assert_eq!(
         peak.load(Ordering::SeqCst),
         1,
@@ -1238,7 +1242,7 @@ async fn updating_a_queue_changes_what_a_running_worker_honours() {
 ///
 /// `worker_concurrency` on its own is always fine; it is only wrong beside the
 /// `concurrency` the row already holds, which is why the merged result is what gets checked.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_update_cannot_leave_a_queue_incoherent() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-update-invalid-app", &db));
@@ -1298,7 +1302,7 @@ async fn an_update_cannot_leave_a_queue_incoherent() {
 }
 
 /// Reading, listing and deleting a queue, and the internal queue's absence from all three.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn the_queue_registry_can_be_read_and_deleted() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-registry-app", &db));
@@ -1368,7 +1372,7 @@ async fn the_queue_registry_can_be_read_and_deleted() {
 ///
 /// The row here asks for a five-minute polling interval. If it were honoured the workflow below
 /// would not run for five minutes; the assertion is that it runs at once.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_stored_row_cannot_redefine_the_internal_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(config("internal-queue-row-app", &db));
@@ -1404,7 +1408,7 @@ async fn a_stored_row_cannot_redefine_the_internal_queue() {
         .await
         .expect("enqueue failed");
 
-    let ran = tokio::time::timeout(Duration::from_secs(20), handle.result())
+    let ran = dbos::__rt::timeout(Duration::from_secs(20), handle.result())
         .await
         .expect("the internal queue took the stored row's polling interval")
         .expect("the workflow failed");
@@ -1419,7 +1423,7 @@ async fn a_stored_row_cannot_redefine_the_internal_queue() {
 /// `list_queues` scopes an unset search to `application_name = <this app> OR application_name IS
 /// NULL`, so a peer application's queue never enters the worker set — taking its work would be
 /// exactly the redirection that makes registering over a peer's queue name an error.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn another_applications_queue_is_not_dequeued_from() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-owner-scope-app", &db));
@@ -1465,7 +1469,7 @@ async fn another_applications_queue_is_not_dequeued_from() {
         .expect("enqueue failed");
 
     // Several reconciles' worth: if this queue were going to enter the set, it would have.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    dbos::__rt::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         ran.load(Ordering::SeqCst),
         0,
@@ -1493,7 +1497,7 @@ async fn another_applications_queue_is_not_dequeued_from() {
 /// workflow_deadline_epoch_ms IS NULL THEN now + workflow_timeout_ms ELSE ... END`, the arm the
 /// queued branch of the deadline rule leaves for it. A budget survives the queue wait intact and
 /// becomes an instant when the workflow is actually picked up.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
     let db = test_database().await;
     let dbos = DBOS::new(config("dequeue-deadline-app", &db));
@@ -1553,7 +1557,7 @@ async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
 /// The child is enqueued onto a queue nothing polls, for the reason
 /// `an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet` gives: the assertion is
 /// about what the enqueue wrote, so the row has to stay as the enqueue left it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_inherited_deadline_reaches_a_queued_child() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-inherit-app", &db));
@@ -1626,7 +1630,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 /// error here — it does not compile, because [`Enqueue`] owns them and there is no queue-less value
 /// to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`). What is
 /// left is what no shape can express.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-validation-app", &db));
@@ -1731,7 +1735,7 @@ async fn an_incoherent_enqueue_is_refused() {
 /// The status is not the caller's to choose — `NewWorkflow::initial_status` derives it from the
 /// queue-and-delay pair — so what is asserted is that the row starts `DELAYED`, that nothing runs
 /// it early, and that it still runs.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_delayed_enqueue_waits_before_it_is_dequeued() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-delay-app", &db));
@@ -1779,14 +1783,14 @@ async fn a_delayed_enqueue_waits_before_it_is_dequeued() {
     );
     // Comfortably inside the delay, and after several supervisor sweeps: the row is not eligible,
     // so no worker may have taken it.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    dbos::__rt::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         ran.load(Ordering::SeqCst),
         0,
         "the workflow ran before its delay expired"
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(20), handle.result())
+    let result = dbos::__rt::timeout(Duration::from_secs(20), handle.result())
         .await
         .expect("the delayed workflow was never released")
         .expect("the workflow failed");
@@ -1799,7 +1803,7 @@ async fn a_delayed_enqueue_waits_before_it_is_dequeued() {
 ///
 /// The key deduplicates a backlog rather than a history, which is the half worth asserting: the
 /// same key enqueued again after the first finished is a new workflow, not a duplicate.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_deduplication_id_admits_one_waiting_workflow() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-dedup-app", &db));
@@ -1851,7 +1855,7 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
     );
 
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(20), first.result())
+        dbos::__rt::timeout(Duration::from_secs(20), first.result())
             .await
             .expect("the first workflow never ran")
             .expect("the workflow failed"),
@@ -1883,7 +1887,7 @@ async fn a_deduplication_id_admits_one_waiting_workflow() {
 /// holder whichever partition it is in. The key is released when the holder finishes, after which
 /// any partition may take it. The queue is registered only after the collisions, so nothing
 /// dequeues the holder until then.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_deduplication_id_is_held_across_partitions() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-dedup-partition-app", &db));
@@ -1944,7 +1948,7 @@ async fn a_deduplication_id_is_held_across_partitions() {
     .await
     .expect("registration failed");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(20), holder.result())
+        dbos::__rt::timeout(Duration::from_secs(20), holder.result())
             .await
             .expect("the holder never ran")
             .expect("the holder failed"),
@@ -1966,7 +1970,7 @@ async fn a_deduplication_id_is_held_across_partitions() {
 /// that holds it, so a retried request waits on the first caller's workflow rather than being told
 /// no. The key is released when the holder finishes, so the same key afterwards is a new workflow
 /// — the same backlog-not-history rule the rejecting default follows.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn return_existing_joins_the_workflow_holding_the_key() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-join-app", &db));
@@ -2030,7 +2034,7 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
 
     for handle in [first, second] {
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(20), handle.result())
+            dbos::__rt::timeout(Duration::from_secs(20), handle.result())
                 .await
                 .expect("the workflow never ran")
                 .expect("the workflow failed"),
@@ -2065,7 +2069,7 @@ async fn return_existing_joins_the_workflow_holding_the_key() {
 ///
 /// One worker at a time, and every workflow enqueued before the runner can drain any of them, so
 /// what is measured is the order the dequeue chose rather than the order they were submitted.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn priority_orders_the_backlog_lower_first() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-priority-app", &db));
@@ -2135,7 +2139,7 @@ async fn priority_orders_the_backlog_lower_first() {
     .expect("registration failed");
 
     for handle in handles {
-        tokio::time::timeout(Duration::from_secs(30), handle.result())
+        dbos::__rt::timeout(Duration::from_secs(30), handle.result())
             .await
             .expect("a prioritised workflow never ran")
             .expect("the workflow failed");
@@ -2156,7 +2160,7 @@ async fn priority_orders_the_backlog_lower_first() {
 /// which matters because partitioning can be turned on later, and because a peer implementation
 /// may own the queue. Nothing dequeues by it here: an unpartitioned queue's dequeue names no
 /// partition, so this asserts the row rather than a run.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_partition_key_is_recorded_on_the_row() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-partition-app", &db));
@@ -2203,7 +2207,7 @@ async fn a_partition_key_is_recorded_on_the_row() {
 
 /// A workflow that names no priority stores the sentinel, which is what makes `None` mean
 /// "unprioritised" rather than "priority zero" — and what an unqueued workflow stores too.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_unprioritised_workflow_stores_the_sentinel() {
     let db = test_database().await;
     let dbos = DBOS::new(config("enqueue-sentinel-app", &db));
@@ -2251,7 +2255,7 @@ async fn an_unprioritised_workflow_stores_the_sentinel() {
 ///
 /// There is no priority switch: the dequeue orders every queue by priority, so the
 /// `priority_enabled` column is always written `TRUE`, for readers that still consult it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_queue_carries_a_rate_limit_and_is_always_a_priority_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-limits-app", &db));
@@ -2320,7 +2324,7 @@ async fn a_queue_carries_a_rate_limit_and_is_always_a_priority_queue() {
 /// The partitioned cases are the ones worth catching here rather than at poll time: the sweep
 /// answers `InvalidInput` for each, and a worker polling once a second would turn that into an
 /// error per tick for as long as the row existed.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn an_unhonourable_queue_configuration_is_refused() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-limit-validation-app", &db));
@@ -2464,7 +2468,7 @@ async fn an_unhonourable_queue_configuration_is_refused() {
 /// There is no `partition_queue` switch on this surface: setting a partition limit is the
 /// statement that partitions exist, and the stored column, written for readers that still consult
 /// it, follows the limits in both directions.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn per_partition_limits_partition_a_queue() {
     let db = test_database().await;
     let dbos = DBOS::new(config("queue-partition-limits-app", &db));
@@ -2528,7 +2532,7 @@ async fn per_partition_limits_partition_a_queue() {
 /// limits, the shape the deprecated flag used to give "these limits apply per partition", is an
 /// unpartitioned queue with queue-wide limits: it reports no partitioning, takes a per-partition
 /// limit like any other queue, and dequeues a workflow that carries no partition key.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
     let db = test_database().await;
     let sys = reader(&db).await;
@@ -2579,7 +2583,7 @@ async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
         )
         .await
         .expect("enqueue failed");
-    let output = tokio::time::timeout(Duration::from_secs(20), handle.result())
+    let output = dbos::__rt::timeout(Duration::from_secs(20), handle.result())
         .await
         .expect("the unkeyed workflow was never dequeued")
         .expect("the workflow failed");
@@ -2612,7 +2616,7 @@ async fn a_flagged_row_without_partition_limits_is_an_unpartitioned_queue() {
 /// Two keys with two workflows each. The assertion is both halves of what partitioning means: no
 /// key ever has two bodies live at once, and the two keys do overlap — otherwise a queue that
 /// simply ran everything serially would pass.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
     let db = test_database().await;
     let dbos = DBOS::new(config("partition-runner-app", &db));
@@ -2638,7 +2642,7 @@ async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
                         per_key_peak.fetch_max(*mine, Ordering::SeqCst);
                         overlap_peak.fetch_max(live.len(), Ordering::SeqCst);
                     }
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    dbos::__rt::sleep(Duration::from_millis(600)).await;
                     let mut live = live.lock().unwrap();
                     if let Some(mine) = live.get_mut(&key) {
                         *mine -= 1;
@@ -2694,7 +2698,7 @@ async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
     }
 
     for handle in handles {
-        tokio::time::timeout(Duration::from_secs(30), handle.result())
+        dbos::__rt::timeout(Duration::from_secs(30), handle.result())
             .await
             .expect("a partitioned workflow never ran")
             .expect("the workflow failed");
@@ -2718,7 +2722,7 @@ async fn a_partitioned_queue_runs_one_workflow_per_key_at_a_time() {
 ///
 /// `partition_concurrency: 2` needs counting, so this takes the other path — and the assertion is
 /// that the limit is real on it: two workflows sharing a key do overlap, three never do.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_counted_partitioned_queue_runs_its_limit_per_key() {
     let db = test_database().await;
     let dbos = DBOS::new(config("partition-counted-app", &db));
@@ -2739,7 +2743,7 @@ async fn a_counted_partitioned_queue_runs_its_limit_per_key() {
                         *mine += 1;
                         per_key_peak.fetch_max(*mine, Ordering::SeqCst);
                     }
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    dbos::__rt::sleep(Duration::from_millis(600)).await;
                     let mut live = live.lock().unwrap();
                     if let Some(mine) = live.get_mut(&key) {
                         *mine -= 1;
@@ -2788,7 +2792,7 @@ async fn a_counted_partitioned_queue_runs_its_limit_per_key() {
     }
 
     for handle in handles {
-        tokio::time::timeout(Duration::from_secs(30), handle.result())
+        dbos::__rt::timeout(Duration::from_secs(30), handle.result())
             .await
             .expect("a partitioned workflow never ran")
             .expect("the workflow failed");

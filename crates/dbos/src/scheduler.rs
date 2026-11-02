@@ -14,13 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp as Instant;
-use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::Executor;
 use crate::cron::{CronSchedule, firing_id};
 use crate::dequeue::random_unit;
 use crate::error::Result;
+use crate::rt::JoinHandle;
 use crate::schedule::Firing;
 use crate::sysdb::types::{ScheduleFilter, ScheduleRecord, ScheduleStatus, Timestamp};
 use crate::workflow::{Role, spawn_tracked};

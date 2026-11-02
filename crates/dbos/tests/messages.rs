@@ -1,5 +1,9 @@
 //! Workflow messages, against real databases.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +48,7 @@ async fn steps(reader: &PostgresSystemDatabase, workflow_id: &str) -> Vec<(i32, 
 
 /// Waits for a workflow's row to reach `SUCCESS`.
 async fn await_success(reader: &PostgresSystemDatabase, workflow_id: &str) {
-    tokio::time::timeout(DEADLINE, async {
+    dbos::__rt::timeout(DEADLINE, async {
         loop {
             let row = reader
                 .get_workflow(workflow_id)
@@ -54,7 +58,7 @@ async fn await_success(reader: &PostgresSystemDatabase, workflow_id: &str) {
             if row.status == WorkflowStatus::Success {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -66,7 +70,7 @@ async fn await_success(reader: &PostgresSystemDatabase, workflow_id: &str) {
 /// Also pins the two checkpoints a receive writes and the order of their ids — the receive first,
 /// its deadline second — which is what a replay looks up and what another SDK replaying this
 /// workflow would expect to find.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_message_from_outside_reaches_a_waiting_workflow() {
     let db = test_database().await;
     let dbos = DBOS::new(config("recv-app", &db));
@@ -87,7 +91,7 @@ async fn a_message_from_outside_reaches_a_waiting_workflow() {
         .await
         .expect("send failed");
 
-    let approval = tokio::time::timeout(DEADLINE, handle.result())
+    let approval = dbos::__rt::timeout(DEADLINE, handle.result())
         .await
         .expect("the workflow never finished")
         .expect("the workflow failed");
@@ -113,7 +117,7 @@ async fn a_message_from_outside_reaches_a_waiting_workflow() {
 /// The receive is what this adds to that test: it is **two** steps, and its deadline's id has to
 /// come from the counter directly behind its own however the two are driven — a pair split by the
 /// poll order would put the sleep somewhere a replay does not expect it.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn messages_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
     let db = test_database().await;
     let dbos = DBOS::new(config("message-join-app", &db));
@@ -178,7 +182,7 @@ async fn messages_driven_out_of_build_order_keep_the_ids_they_were_built_with() 
 }
 
 /// A receive on one topic never takes a message sent on another, and finding nothing is a value.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn topics_do_not_cross_and_absence_is_a_value() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -206,7 +210,7 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
 
     let handle = picky.start(()).await.expect("start failed");
     let workflow_id = handle.workflow_id().to_owned();
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
 
@@ -221,7 +225,7 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
     .expect("send failed");
     release_gate.notify_one();
 
-    let (default, approvals) = tokio::time::timeout(DEADLINE, handle.result())
+    let (default, approvals) = dbos::__rt::timeout(DEADLINE, handle.result())
         .await
         .expect("the workflow never finished")
         .expect("the workflow failed");
@@ -238,7 +242,7 @@ async fn topics_do_not_cross_and_absence_is_a_value() {
 ///
 /// The property the whole checkpoint exists for: a message taken but forgotten would be gone with
 /// nothing recording it, which is the one failure a durable receive may not have.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -270,14 +274,14 @@ async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
         .await
         .expect("send failed");
 
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
 
     // Abandon at the gate and let recovery replay the receive.
     dbos.shutdown().await;
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered workflow never reached its gate again");
     release_gate.notify_one();
@@ -296,7 +300,7 @@ async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
     let recovered = dbos
         .retrieve_workflow::<Option<String>, dbos::Error>(&workflow_id)
         .expect("retrieve failed");
-    let taken = tokio::time::timeout(DEADLINE, recovered.result())
+    let taken = dbos::__rt::timeout(DEADLINE, recovered.result())
         .await
         .expect("the recovered workflow never finished")
         .expect("the workflow failed");
@@ -325,7 +329,7 @@ async fn a_replay_returns_the_message_it_took_rather_than_taking_another() {
 }
 
 /// A workflow's send is a checkpointed step, so a replay delivers once rather than twice.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -363,14 +367,14 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
         .expect("start failed");
     let sender_id = sender.workflow_id().to_owned();
 
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the sender never reached its gate");
 
     // Abandon after the send and let recovery replay it.
     dbos.shutdown().await;
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered sender never reached its gate again");
     release_gate.notify_one();
@@ -401,7 +405,7 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
 /// The asymmetry is the references': a send that runs twice delivers twice, where a receive that
 /// runs twice loses a message. Python, TypeScript and Java send plainly from inside a step and all
 /// four block a receive there.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_step_may_send_but_may_not_receive() {
     let db = test_database().await;
     let dbos = DBOS::new(config("guard-app", &db));
@@ -453,7 +457,7 @@ async fn a_step_may_send_but_may_not_receive() {
         .await
         .expect("start failed");
     let sender_id = handle.workflow_id().to_owned();
-    tokio::time::timeout(DEADLINE, handle.result())
+    dbos::__rt::timeout(DEADLINE, handle.result())
         .await
         .expect("the sender never finished")
         .expect("the send inside a step should have been allowed");
@@ -485,7 +489,7 @@ async fn a_step_may_send_but_may_not_receive() {
 /// does identically for all three single-send surfaces, so exercising it through one covers them
 /// all. `Connection::send_all_encoded` maps it the same way for the batch, which
 /// [`a_workflows_batch_is_one_checkpoint`] reaches.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_send_may_fan_out_to_the_destinations_forks() {
     let db = test_database().await;
     let dbos = DBOS::new(config("forks-app", &db));
@@ -547,7 +551,7 @@ async fn a_send_may_fan_out_to_the_destinations_forks() {
 /// A send borrows nothing from its caller once it is built, so one made from temporaries can be
 /// held past its statement or joined with other calls. This is chiefly a compile-time check: each
 /// call below passes a payload, and a message, that is dropped at the end of its own statement.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_send_built_from_temporaries_outlives_them() {
     let db = test_database().await;
     let dbos = DBOS::new(config("temporaries-app", &db));
@@ -608,7 +612,7 @@ async fn a_send_built_from_temporaries_outlives_them() {
 /// a batch of one included. The name distinguishes the two API surfaces, so reaching for a
 /// different one on a replay is caught as a determinism error — while a batch that merely changed
 /// size is not, being no change of operation.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_workflows_batch_is_one_checkpoint() {
     let reached_gate = Arc::new(tokio::sync::Notify::new());
     let release_gate = Arc::new(tokio::sync::Notify::new());
@@ -654,14 +658,14 @@ async fn a_workflows_batch_is_one_checkpoint() {
         .expect("start failed");
     let sender_id = sender.workflow_id().to_owned();
 
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the sender never reached its gate");
 
     // Abandon after both sends and let recovery replay them.
     dbos.shutdown().await;
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered sender never reached its gate again");
     release_gate.notify_one();

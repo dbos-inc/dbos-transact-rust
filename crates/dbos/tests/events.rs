@@ -1,5 +1,9 @@
 //! Workflow events, against real databases.
 
+// Runs off tokio too, through `#[dbos_test_support::test]`, so spawning and timers go through
+// `dbos::__rt`: a direct tokio call would panic there. `clippy.toml` lists what that rules out.
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -41,7 +45,7 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 
 /// The Workflows tab in miniature: progress published after each step, polled from outside, and
 /// surviving an abandonment without being published twice.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn progress_events_survive_recovery_without_republishing() {
     let one = Arc::new(AtomicU32::new(0));
     let reached_gate = Arc::new(tokio::sync::Notify::new());
@@ -75,8 +79,8 @@ async fn progress_events_survive_recovery_without_republishing() {
     };
     dbos.launch().await.expect("launch failed");
 
-    let running = tokio::spawn(async move { publishes.run(()).await });
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    let running = dbos::__rt::spawn(async move { publishes.run(()).await });
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the workflow never reached its gate");
 
@@ -104,7 +108,7 @@ async fn progress_events_survive_recovery_without_republishing() {
     assert!(matches!(err, Error::Interrupted { .. }), "{err}");
 
     dbos.launch().await.expect("relaunch failed");
-    tokio::time::timeout(DEADLINE, reached_gate.notified())
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
         .await
         .expect("the recovered workflow never reached its gate again");
     let progress: Option<u32> = dbos
@@ -118,7 +122,7 @@ async fn progress_events_survive_recovery_without_republishing() {
     );
     release_gate.notify_one();
 
-    tokio::time::timeout(DEADLINE, async {
+    dbos::__rt::timeout(DEADLINE, async {
         loop {
             let row = reader
                 .get_workflow(&workflow_id)
@@ -128,7 +132,7 @@ async fn progress_events_survive_recovery_without_republishing() {
             if row.status == WorkflowStatus::Success {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            dbos::__rt::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
@@ -160,7 +164,7 @@ async fn progress_events_survive_recovery_without_republishing() {
 
 /// A workflow that reads an event is checkpointed — two steps — and one that reads from inside a
 /// step is not, the step's own checkpoint standing for everything its body did.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
     #[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
     #[error("the reader failed")]
@@ -306,7 +310,7 @@ async fn a_reading_workflow_is_checkpointed_and_a_reading_step_is_not() {
 /// are the same instance; when they are not, the checkpoint would be written through one database
 /// against ids issued by another, so it would land where the workflow that allocated them cannot
 /// see it. Refused rather than silently split.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn reading_through_another_instance_from_inside_a_workflow_is_refused() {
     let db = test_database().await;
     let other = DBOS::new(config("other-app", &db));
@@ -365,7 +369,7 @@ async fn reading_through_another_instance_from_inside_a_workflow_is_refused() {
 
 /// `set_event` needs a workflow around it, and refuses a step — there is no plain version of a
 /// durable write to degrade to.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn set_event_refuses_to_run_outside_a_workflow_or_inside_a_step() {
     let outside: dbos::Result<()> = dbos::set_event("key", &1u32).await;
     assert!(
@@ -411,7 +415,7 @@ async fn set_event_refuses_to_run_outside_a_workflow_or_inside_a_step() {
 /// The rows are only half of it. A branch built last and polled first lands on the same id either
 /// way, so the ids are also read off the values **before** anything is polled — which is the
 /// invariant stated directly, and the only thing that speaks for that last branch.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn library_calls_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
     let db = test_database().await;
     let dbos = DBOS::new(config("join-app", &db));
@@ -484,7 +488,7 @@ async fn library_calls_driven_out_of_build_order_keep_the_ids_they_were_built_wi
 /// argument the call cannot answer, a payload that cannot be encoded, and a wait with nothing to
 /// wait for. What they have in common is that a workflow fixed to stop making them must replay
 /// onto the same slots it recorded — which is only true if they never took one.
-#[tokio::test]
+#[dbos_test_support::test]
 async fn a_refused_call_spends_no_step_id() {
     let db = test_database().await;
     let dbos = DBOS::new(config("refusal-app", &db));

@@ -734,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn no_starts_in_flight_drains_at_once() {
         let starts = Arc::new(Starts::default());
-        tokio::time::timeout(Duration::from_secs(1), starts.drained())
+        crate::rt::timeout(Duration::from_secs(1), starts.drained())
             .await
             .expect("nothing was in flight");
     }
@@ -748,20 +748,20 @@ mod tests {
 
         let mut drained = std::pin::pin!(starts.drained());
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), drained.as_mut())
+            crate::rt::timeout(Duration::from_millis(20), drained.as_mut())
                 .await
                 .is_err(),
             "drained with two starts in flight"
         );
         drop(first);
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), drained.as_mut())
+            crate::rt::timeout(Duration::from_millis(20), drained.as_mut())
                 .await
                 .is_err(),
             "drained with one start still in flight"
         );
         drop(second);
-        tokio::time::timeout(Duration::from_secs(1), drained)
+        crate::rt::timeout(Duration::from_secs(1), drained)
             .await
             .expect("the last start was dropped");
     }
@@ -771,11 +771,11 @@ mod tests {
     async fn a_token_dropped_elsewhere_wakes_the_wait() {
         let starts = Arc::new(Starts::default());
         let token = starts.token();
-        let dropper = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        let dropper = crate::rt::spawn(async move {
+            crate::rt::sleep(Duration::from_millis(20)).await;
             drop(token);
         });
-        tokio::time::timeout(Duration::from_secs(1), starts.drained())
+        crate::rt::timeout(Duration::from_secs(1), starts.drained())
             .await
             .expect("the token was dropped");
         dropper.await.unwrap();
@@ -855,7 +855,7 @@ mod tests {
         assert!(Ctx::current().is_none(), "nothing before");
         Ctx::scope(ctx, async {
             assert_eq!(Ctx::current().expect("inside").workflow_id(), "wf-42");
-            tokio::task::yield_now().await;
+            crate::rt::yield_now().await;
             assert_eq!(
                 Ctx::current().expect("still inside").workflow_id(),
                 "wf-42",
@@ -993,7 +993,7 @@ mod tests {
         let (ctx, dbos, _db) = ctx("wf-42", None).await;
 
         let spawned_saw = Ctx::scope(ctx, async {
-            tokio::spawn(async { Ctx::current().map(|c| c.workflow_id().to_owned()) })
+            crate::rt::spawn(async { Ctx::current().map(|c| c.workflow_id().to_owned()) })
                 .await
                 .expect("the spawned task panicked")
         })

@@ -531,7 +531,7 @@ where
                     return Ok(WorkflowHandle::polling(Arc::clone(conn), workflow_id, true));
                 }
                 BounceAction::Refuse(holder) => return Err(bounce.deduplicated(holder)),
-                BounceAction::Retry => tokio::time::sleep(RETRY_PAUSE).await,
+                BounceAction::Retry => crate::rt::sleep(RETRY_PAUSE).await,
                 BounceAction::Enqueue => {
                     // The period is the delay and the timeout the deadline, both resolved by the
                     // insert on one reading of the database clock, which caps the release at the
@@ -725,7 +725,7 @@ impl<'a> DebouncerClient<'a> {
                     return Ok(WorkflowHandle::polling(Arc::clone(conn), workflow_id, true));
                 }
                 BounceAction::Refuse(holder) => return Err(bounce.deduplicated(holder)),
-                BounceAction::Retry => tokio::time::sleep(RETRY_PAUSE).await,
+                BounceAction::Retry => crate::rt::sleep(RETRY_PAUSE).await,
                 BounceAction::Enqueue => {
                     // The period is the delay and the timeout the deadline, both resolved by the
                     // insert on the database clock, which caps the release at the deadline.

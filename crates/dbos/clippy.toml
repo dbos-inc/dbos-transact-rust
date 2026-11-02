@@ -1,0 +1,25 @@
+# Spawning and timers go through `crate::rt`, which chooses the async runtime; calling tokio for
+# them directly would tie this crate to tokio again, and fail only at run time on another runtime.
+# `rt`'s tokio backend is the one place allowed to. The integration tests that run off tokio deny
+# these too, and reach the same functions as `dbos::__rt` rather than `crate::rt`.
+disallowed-methods = [
+    { path = "tokio::spawn", replacement = "crate::rt::spawn" },
+    { path = "tokio::task::spawn", replacement = "crate::rt::spawn" },
+    { path = "tokio::task::spawn_blocking", reason = "no runtime-neutral equivalent in `crate::rt` yet" },
+    { path = "tokio::task::yield_now", replacement = "crate::rt::yield_now" },
+    { path = "tokio::time::sleep", replacement = "crate::rt::sleep" },
+    { path = "tokio::time::sleep_until", replacement = "crate::rt::sleep_until" },
+    { path = "tokio::time::timeout", replacement = "crate::rt::timeout" },
+    { path = "tokio::time::timeout_at", replacement = "crate::rt::timeout_at" },
+    { path = "tokio::time::interval", reason = "use `crate::rt::sleep` in a loop" },
+    { path = "tokio::runtime::Handle::current", replacement = "crate::rt::Spawner::current" },
+    { path = "tokio::runtime::Handle::try_current", replacement = "crate::rt::Spawner::current" },
+]
+disallowed-types = [
+    { path = "tokio::task::JoinHandle", replacement = "crate::rt::JoinHandle" },
+    { path = "tokio::task::AbortHandle", replacement = "crate::rt::AbortHandle" },
+    { path = "tokio::task::JoinError", replacement = "crate::rt::JoinError" },
+    { path = "tokio::task::JoinSet", reason = "spawn through `crate::rt` instead" },
+    { path = "tokio::runtime::Handle", replacement = "crate::rt::Spawner" },
+    { path = "tokio::time::Instant", replacement = "std::time::Instant" },
+]
