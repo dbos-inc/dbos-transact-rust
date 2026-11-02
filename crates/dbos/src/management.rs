@@ -33,8 +33,9 @@
 //!
 //! Every operation that has one in the references has one here, suffixed `_all`, and the singular
 //! form is a caller with a one-element batch. [`retrieve_workflow`](DBOS::retrieve_workflow),
-//! [`set_workflow_delay`](DBOS::set_workflow_delay) and
-//! [`update_workflow_attributes`](DBOS::update_workflow_attributes) have none, in this crate or in
+//! [`set_workflow_delay`](DBOS::set_workflow_delay),
+//! [`update_workflow_attributes`](DBOS::update_workflow_attributes) and
+//! [`merge_workflow_attributes`](DBOS::merge_workflow_attributes) have none, in this crate or in
 //! any reference: each addresses one row and none of them is worth a round trip to batch.
 //! The bulk form is the primitive: the system database cancels, deletes and forks in batches because a
 //! partially applied batch is worse than a slow one, and the singular methods are wrappers that
