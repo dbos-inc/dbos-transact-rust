@@ -1769,10 +1769,14 @@ pub struct DatabaseTime {
 
 impl DatabaseTime {
     /// A reading of `epoch_ms`, taken now.
+    ///
+    /// Stamped on the clock this crate's timers run on, so the instants [`reaches`](Self::reaches)
+    /// gives are ones a wait through them can be measured against: on tokio, tokio's clock, which
+    /// a test can pause and advance apart from the real one.
     pub fn read(epoch_ms: i64) -> Self {
         Self {
             epoch_ms,
-            read_at: Instant::now(),
+            read_at: crate::rt::now(),
         }
     }
 
@@ -1787,7 +1791,8 @@ impl DatabaseTime {
     /// this process's monotonic clock has run since. Behind the database's own by the trip back,
     /// as a wait measured from the reading is.
     pub fn now(self) -> Timestamp {
-        let elapsed = i64::try_from(self.read_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let elapsed = crate::rt::now().saturating_duration_since(self.read_at);
+        let elapsed = i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX);
         Timestamp::from_epoch_ms(self.epoch_ms.saturating_add(elapsed))
     }
 }

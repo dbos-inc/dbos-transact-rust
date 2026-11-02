@@ -184,6 +184,12 @@ async fn waits_on_the_database_clock<T>(wait: impl Future<Output = T>) -> T {
         waited >= WAIT - Duration::from_millis(500),
         "the wait ended after {waited:?}, before the deadline on the database's clock"
     );
+    // Not an hour, but not seconds late either: a reading that fell behind the database's clock,
+    // say by a wait for a lock, would show here.
+    assert!(
+        waited < WAIT + Duration::from_secs(3),
+        "the wait ended after {waited:?}, well past the deadline on the database's clock"
+    );
     answer
 }
 

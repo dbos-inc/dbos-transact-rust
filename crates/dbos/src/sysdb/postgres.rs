@@ -1892,6 +1892,14 @@ const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 /// compared against is the dequeue's own.
 const NOW_MS_SQL: &str = "(EXTRACT(epoch FROM now()) * 1000)::bigint";
 
+/// The database's clock as the statement evaluates this, in epoch milliseconds: the reading a
+/// [`DatabaseTime`] is made from.
+///
+/// `clock_timestamp()` rather than [`NOW_MS_SQL`]'s `now()`, which is when the transaction began:
+/// a reading is carried forward from the moment its row arrives, so it has to be the database's
+/// clock at about that moment, whatever the transaction waited on before it.
+const CLOCK_MS_SQL: &str = "(EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint";
+
 /// [`NOW_MS_SQL`] plus `operand`, a `bigint` column or parameter of milliseconds, held within
 /// `bigint`'s range where the sum would leave it: the deadline a timeout gives a workflow.
 ///
@@ -2483,19 +2491,24 @@ impl PostgresSystemDatabase {
     /// with it. `FOR NO KEY UPDATE` rather than `FOR UPDATE`, so inserts that reference the row
     /// (its steps, events and streams) don't wait on it; CockroachDB takes it as `FOR UPDATE`.
     ///
-    /// **Answers with a reading of the database's clock**, taken by the same statement, so a step
-    /// that times something against that clock has a reading without another round trip.
-    /// `clock_timestamp()` rather than `now()`: the row lock can wait, and `now()` is when the
-    /// transaction began.
+    /// **Answers with a reading of the database's clock**, taken by the same statement once the
+    /// row is locked, so a step that times something against that clock has a reading without
+    /// another round trip. `clock_timestamp()` rather than `now()`: the row lock can wait, and
+    /// `now()` is when the transaction began.
     async fn check_owner_on(
         &self,
         conn: &mut sqlx::PgConnection,
         owner: WorkflowOwner<'_>,
     ) -> Result<DatabaseTime, Error> {
         let workflow_table = self.tables.workflow_status.as_str();
+        // The clock in the outer select, over the locking one: in a flat `SELECT … FOR NO KEY
+        // UPDATE` PostgreSQL evaluates the select list in the scan, below the lock, so the reading
+        // would predate any wait for the lock and fall behind the database's clock by that wait.
         let current: Option<(Option<String>, i64)> = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT owner_xid, (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint \
-             FROM {workflow_table} WHERE workflow_uuid = $1 FOR NO KEY UPDATE"
+            "SELECT owner_xid, {CLOCK_MS_SQL} FROM ( \
+                 SELECT owner_xid FROM {workflow_table} \
+                 WHERE workflow_uuid = $1 FOR NO KEY UPDATE \
+             ) locked"
         )))
         .bind(owner.workflow_id)
         .fetch_optional(&mut *conn)
@@ -3379,7 +3392,7 @@ impl PostgresSystemDatabase {
                  deduplication_id, workflow_deadline_epoch_ms, creator_xid, serialization, \
                  parent_workflow_id, \
                  created_at = {NOW_MS_SQL} AS inserted, \
-                 (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint AS db_now"
+                 {CLOCK_MS_SQL} AS db_now"
             )))
             .bind(workflow.workflow_id)
             .bind(initial_status.as_str())
@@ -3643,10 +3656,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         let pool = &self.pool;
         with_retry(&self.retry, "database_time", move || async move {
             // The statement's clock, as `init_workflow` returns, read once the claim has committed.
-            let epoch_ms: i64 =
-                sqlx::query_scalar("SELECT (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint")
-                    .fetch_one(pool)
-                    .await?;
+            let epoch_ms: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT {CLOCK_MS_SQL}")))
+                .fetch_one(pool)
+                .await?;
             Ok(DatabaseTime::read(epoch_ms))
         })
         .await
@@ -5292,15 +5304,14 @@ impl SystemDatabase for PostgresSystemDatabase {
                     let mut tx = pool.begin().await?;
                     // First, so a refusal rolls the consume back with it: the message stays for the
                     // workflow's new owner.
-                    let clock = self
-                        .check_owner_on(
-                            &mut tx,
-                            WorkflowOwner {
-                                workflow_id,
-                                owner_xid,
-                            },
-                        )
-                        .await?;
+                    self.check_owner_on(
+                        &mut tx,
+                        WorkflowOwner {
+                            workflow_id,
+                            owner_xid,
+                        },
+                    )
+                    .await?;
 
                     // The check that opened this call cannot stand in for this one: the wait
                     // between them is exactly when another execution of this workflow would have
@@ -5335,11 +5346,12 @@ impl SystemDatabase for PostgresSystemDatabase {
 
                     // Nothing to consume: the message the probe saw went to a take that ran
                     // first. Before the deadline that is no answer, so nothing is recorded and the
-                    // wait goes on. The clock is the owner check's, read after its lock rather than
-                    // before the take, since the lock can wait on another take for as long as that
-                    // one runs, and a take that started with time left may get here without any.
+                    // wait goes on. The clock is asked now rather than before the take, since the
+                    // owner check can wait on another take for as long as that one runs, and a take
+                    // that started with time left may get here without any. Against the loop's own
+                    // `until`, so the two never disagree about whether time is up.
                     if message.is_none() {
-                        let time_left = deadline.at > clock.now();
+                        let time_left = until > crate::rt::now();
                         if time_left {
                             // Explicit, so the owner check's row lock goes now rather than whenever
                             // the connection is next used.
