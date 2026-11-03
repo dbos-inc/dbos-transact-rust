@@ -2963,98 +2963,6 @@ impl PostgresSystemDatabase {
     }
 }
 
-/// What a retiming writes into a version's `version_timestamp`.
-#[derive(Clone, Copy)]
-enum VersionStamp {
-    /// This instant, as given.
-    At(Timestamp),
-    /// The database's clock, or past every version the latest read considers when one is stamped
-    /// ahead of it, so the version retimed is the latest one.
-    AboveTheRest,
-}
-
-impl PostgresSystemDatabase {
-    /// [`update_application_version_timestamp`](SystemDatabase::update_application_version_timestamp)
-    /// and [`promote_application_version`](SystemDatabase::promote_application_version), which
-    /// differ only in the stamp they write.
-    async fn retime_application_version(
-        &self,
-        version_name: &str,
-        application_name: Option<&str>,
-        stamp: VersionStamp,
-    ) -> Result<(), Error> {
-        let versions_table = &self.tables.application_versions;
-        let (versions_table, pool) = (versions_table.as_str(), &self.pool);
-        let application_name = application_name.or(self.application_name.as_deref());
-
-        with_retry(
-            &self.retry,
-            "retime_application_version",
-            move || async move {
-                let mut tx = pool.begin().await?;
-
-                let owner = resolve_owning_application(
-                    &mut tx,
-                    versions_table,
-                    "version_name",
-                    version_name,
-                    application_name,
-                    "Application version",
-                )
-                .await?;
-
-                let stamp_sql = match stamp {
-                    VersionStamp::At(_) => "$3".to_owned(),
-                    // In the statement that writes it, so the stamp is computed against the rows as
-                    // the write sees them. The maximum is over what the latest read for `owner`
-                    // considers, read the way `latest_version_sql` reads it so each probe is one
-                    // index entry: the owner's rows and the unclaimed ones, or every row for a
-                    // nameless owner. Held below `bigint`'s ceiling before the `+ 1`, so a version
-                    // pinned at the largest instant does not make every later promotion overflow.
-                    VersionStamp::AboveTheRest => {
-                        let above = if owner.is_some() {
-                            format!(
-                                "GREATEST( \
-                                   COALESCE((SELECT MAX(version_timestamp) FROM {versions_table} \
-                                             WHERE application_name = $2), 0), \
-                                   COALESCE((SELECT MAX(version_timestamp) FROM {versions_table} \
-                                             WHERE application_name IS NULL), 0))"
-                            )
-                        } else {
-                            format!(
-                                "COALESCE((SELECT MAX(version_timestamp) FROM {versions_table}), 0)"
-                            )
-                        };
-                        format!("GREATEST({CLOCK_MS_SQL}, LEAST({above}, 9223372036854775806) + 1)")
-                    }
-                };
-
-                // Scoped to the resolved row, not to the name alone: once 106 and 107's
-                // per-application keys replace migration 13's, one `version_name` may exist per
-                // application and a bare name match would retime every copy. The `SET` also
-                // claims an unclaimed row, which would otherwise stay every peer's latest.
-                let query = sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {versions_table} SET version_timestamp = {stamp_sql}, \
-                       application_name = $2 \
-                     WHERE version_name = $1 \
-                       AND (application_name IS NULL OR application_name = $2)"
-                )))
-                .bind(version_name)
-                .bind(owner.as_deref());
-                let query = match stamp {
-                    VersionStamp::At(timestamp) => query.bind(timestamp.as_epoch_ms()),
-                    VersionStamp::AboveTheRest => query,
-                };
-                query.execute(&mut *tx).await?;
-
-                tx.commit().await?;
-                Ok(())
-            },
-        )
-        .await
-    }
-}
-
 impl PostgresSystemDatabase {
     /// Works out each workflow's start step from its own recorded history.
     ///
@@ -6500,23 +6408,71 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn update_application_version_timestamp(
-        &self,
-        version_name: &str,
-        timestamp: Timestamp,
-        application_name: Option<&str>,
-    ) -> Result<(), Error> {
-        self.retime_application_version(version_name, application_name, VersionStamp::At(timestamp))
-            .await
-    }
-
     async fn promote_application_version(
         &self,
         version_name: &str,
         application_name: Option<&str>,
     ) -> Result<(), Error> {
-        self.retime_application_version(version_name, application_name, VersionStamp::AboveTheRest)
-            .await
+        let versions_table = &self.tables.application_versions;
+        let (versions_table, pool) = (versions_table.as_str(), &self.pool);
+        let application_name = application_name.or(self.application_name.as_deref());
+
+        with_retry(
+            &self.retry,
+            "promote_application_version",
+            move || async move {
+                let mut tx = pool.begin().await?;
+
+                let owner = resolve_owning_application(
+                    &mut tx,
+                    versions_table,
+                    "version_name",
+                    version_name,
+                    application_name,
+                    "Application version",
+                )
+                .await?;
+
+                // The highest stamp the latest read for `owner` considers, read the way
+                // `latest_version_sql` reads it so each probe is one index entry: the owner's rows
+                // and the unclaimed ones, or every row for a nameless owner. Held below `bigint`'s
+                // ceiling before the `+ 1`, so a version pinned at the largest instant does not
+                // make every later promotion overflow.
+                let highest = if owner.is_some() {
+                    format!(
+                        "GREATEST( \
+                           COALESCE((SELECT MAX(version_timestamp) FROM {versions_table} \
+                                     WHERE application_name = $2), 0), \
+                           COALESCE((SELECT MAX(version_timestamp) FROM {versions_table} \
+                                     WHERE application_name IS NULL), 0))"
+                    )
+                } else {
+                    format!("COALESCE((SELECT MAX(version_timestamp) FROM {versions_table}), 0)")
+                };
+
+                // One statement, so the stamp is computed against the rows as the write sees
+                // them. Scoped to the resolved row, not to the name alone: once 106 and 107's
+                // per-application keys replace migration 13's, one `version_name` may exist per
+                // application and a bare name match would retime every copy. The `SET` also
+                // claims an unclaimed row, which would otherwise stay every peer's latest.
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {versions_table} SET \
+                       version_timestamp = \
+                         GREATEST({CLOCK_MS_SQL}, LEAST({highest}, 9223372036854775806) + 1), \
+                       application_name = $2 \
+                     WHERE version_name = $1 \
+                       AND (application_name IS NULL OR application_name = $2)"
+                )))
+                .bind(version_name)
+                .bind(owner.as_deref())
+                .execute(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn upsert_queue(
@@ -9136,7 +9092,7 @@ mod tests {
         let pool = db.pool().await;
         let sys = versions_handle(&pool, Some("ours"));
         register_versions(&sys, &pool, 10).await;
-        sys.update_application_version_timestamp("version-1", Timestamp::from_epoch_ms(40), None)
+        sys.promote_application_version("version-1", None)
             .await
             .expect("promotion failed");
         let promoted = sys
@@ -9146,7 +9102,6 @@ mod tests {
             .expect("a version is registered");
         assert_eq!(promoted.version_id, "1");
         assert_eq!(promoted.version_name, "version-1");
-        assert_eq!(promoted.version_timestamp, Timestamp::from_epoch_ms(40));
         assert_eq!(promoted.created_at, Timestamp::from_epoch_ms(1));
         assert_eq!(promoted.app_name.as_deref(), Some("ours"));
 
