@@ -168,6 +168,11 @@ pub use instance::{DBOS, Executor, ShutdownOptions};
 #[cfg(feature = "engine")]
 pub use management::{
     Children, Fork, ForkOptions, ListWorkflowStepsOptions, ResumeOptions, RewindOptions,
+    cancel_workflow, cancel_workflows, delete_workflow, delete_workflows, fork_workflow,
+    fork_workflow_with, fork_workflows, list_workflow_steps, list_workflow_steps_with,
+    list_workflows, merge_workflow_attributes, resume_workflow, resume_workflow_with,
+    resume_workflows, retrieve_workflow, rewind_workflow, rewind_workflow_with, set_workflow_delay,
+    update_workflow_attributes,
 };
 #[cfg(feature = "engine")]
 pub use message::{
@@ -256,8 +261,8 @@ pub use wait::{join_workflows, select_workflow};
 /// A branch is any [`PendingStep`]: a [`step`](step()), a handle's
 /// [`result`](WorkflowHandle::result), a wait over workflows
 /// ([`select_workflow`](fn@select_workflow) or [`join_workflows`](fn@join_workflows)), a
-/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a checkpointed management call on
-/// [`DBOS`]. Each checkpoints itself under the id it was built with and replays from its own row
+/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a checkpointed management call — free,
+/// like [`cancel_workflow`] or [`fork_workflow`], or on [`DBOS`]. Each checkpoints itself under the id it was built with and replays from its own row
 /// when it is the recorded winner, so a race between a step and the await of a child is as durable
 /// as one between two steps.
 ///

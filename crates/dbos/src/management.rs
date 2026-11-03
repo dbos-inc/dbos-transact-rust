@@ -17,6 +17,9 @@
 //! the connection beneath both; what differs is the checkpointing described below, and that a
 //! client has no launch to check. Every reference carries this surface on its client too.
 //!
+//! **And every checkpointed operation on [`DBOS`] has a third form, a free function, for a
+//! workflow body** — see [below](#free-forms-for-a-workflow-body).
+//!
 //! # Naming
 //!
 //! A method names its noun exactly when the verb would otherwise be ambiguous in this crate. A
@@ -29,10 +32,24 @@
 //! a bare `DBOS` class rather than a handle you already hold. The concepts are theirs and the
 //! spelling is this crate's.
 //!
+//! **The free forms take the references' spelling, for the references' reason.** A free function
+//! has no receiver either, and `dbos::cancel(id)` at a call site says nothing about what is being
+//! cancelled — `dbos::delete(id)` less still, beside queues and schedules. So they are
+//! [`cancel_workflow`], [`resume_workflow`], [`fork_workflow`], [`rewind_workflow`] and
+//! [`delete_workflow`], with `_with` where the method has one, and the bulk forms are the plurals
+//! [`cancel_workflows`], [`resume_workflows`], [`fork_workflows`] and [`delete_workflows`] where
+//! the method says `_all`. A method whose name already says what it acts on keeps it:
+//! [`set_workflow_delay`](fn@set_workflow_delay),
+//! [`update_workflow_attributes`](fn@update_workflow_attributes),
+//! [`merge_workflow_attributes`](fn@merge_workflow_attributes),
+//! [`list_workflows`](fn@list_workflows), [`list_workflow_steps`](fn@list_workflow_steps) and
+//! [`retrieve_workflow`](fn@retrieve_workflow) are spelled the same both ways.
+//!
 //! # Bulk forms
 //!
-//! Every operation that has one in the references has one here, suffixed `_all`, and the singular
-//! form is a caller with a one-element batch. [`retrieve_workflow`](DBOS::retrieve_workflow),
+//! Every operation that has one in the references has one here, suffixed `_all` on [`DBOS`] and
+//! [`Client`](crate::Client) and pluralised on the free forms, and the singular form is a caller
+//! with a one-element batch. [`retrieve_workflow`](DBOS::retrieve_workflow),
 //! [`set_workflow_delay`](DBOS::set_workflow_delay),
 //! [`update_workflow_attributes`](DBOS::update_workflow_attributes) and
 //! [`merge_workflow_attributes`](DBOS::merge_workflow_attributes) have none, in this crate or in
@@ -47,10 +64,10 @@
 //!
 //! # Called from inside a workflow
 //!
-//! Every operation **on [`DBOS`]** is **checkpointed as a step of the workflow that calls it**, so a
-//! replay reads back what the first execution did instead of doing it again: a fork keeps the id it
-//! generated rather than writing a second one, a cancel or a delete is issued once, and a listing
-//! replays the rows it saw.
+//! Every operation **on [`DBOS`], and its free form,** is **checkpointed as a step of the workflow
+//! that calls it**, so a replay reads back what the first execution did instead of doing it again:
+//! a fork keeps the id it generated rather than writing a second one, a cancel or a delete is
+//! issued once, and a listing replays the rows it saw.
 //!
 //! **Each takes its step id where it is written, not where it is first polled**, which is why every
 //! one of them is a plain `fn` handing back a [`PendingStep`] rather than an `async fn` — see
@@ -70,8 +87,8 @@
 //!
 //! **The checkpoint commits with the operation**, in one transaction, because the step id travels
 //! down into the system database rather than wrapping the call here — see
-//! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows), and
-//! [`DBOS::placed`] for the one line that spends the id. Nothing in this module records a step of
+//! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows), and `place` for the one line
+//! that spends the id. Nothing in this module records a step of
 //! its own, and there is no wrapper left to record one: the atomic version costs the same round
 //! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
 //! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
@@ -89,8 +106,9 @@
 //! each one cost to settle. One call is one step, and the singular forms
 //! delegate to the bulk ones, so `cancel` and `cancel_all` spend the same one step id.
 //!
-//! Three edges. Outside a workflow there is nothing to checkpoint against and the call is a plain
-//! one, which is what an operator's tool does. Inside a *step* it is also plain, by the leaf rule
+//! Three edges. Outside a workflow there is nothing to checkpoint against and the method is a plain
+//! call, which is what an operator's tool does; the free form, with no handle and no context to
+//! take a connection from, is [`Error::NotInWorkflow`] there. Inside a *step* it is also plain, by the leaf rule
 //! every other id-allocating call in this crate follows: the step's own checkpoint stands for
 //! everything its body did. And a **failure is recorded only when the database decided it**:
 //! "already exists" or "no such workflow" is replayed as the same error, so the replay takes the
@@ -100,6 +118,40 @@
 //! [`retrieve_workflow`](DBOS::retrieve_workflow) is the one member of the `DBOS` surface with no
 //! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its equivalent as
 //! `DBOS.getStatus` because Python's reads the row.
+//!
+//! # Free forms, for a workflow body
+//!
+//! **A workflow that manages another workflow should not have to hold a [`DBOS`] to do it.** The
+//! registry lives on the instance, so a registered closure that captures a `DBOS` is stored inside
+//! the very `Arc` it holds a strong reference to: a cycle, which keeps the instance, its executor
+//! and its connection pool alive for the life of the process. A supervisor that cancels a stuck
+//! child or forks a failed one from the step that failed would otherwise have had to capture one —
+//! the cycle [`get_event`](crate::get_event), [`send`](crate::send()) and
+//! [`select_workflow`](fn@crate::select_workflow) already have free forms to avoid, reached by the
+//! one door still open. Java has the same cycle and its collector reclaims it; Python and
+//! TypeScript reach a global instance, and Go passes its client explicitly. Rust has none of those
+//! outs, so this surface has free forms.
+//!
+//! **Each is the method, reached the other way.** A free function takes its connection from the
+//! ambient context, so outside a workflow there is none and the call is [`Error::NotInWorkflow`]
+//! — that is where the methods and the client are. Inside a step it is plain, as the method is,
+//! by the leaf rule. And it answers in the caller's error channel rather than the engine's, so a
+//! workflow with its own error type needs no conversion; one that hands back a
+//! [`WorkflowHandle`] answers in the handle's channel, which is the workflow's own whenever the
+//! two fail the same way.
+//!
+//! **One body behind both surfaces.** Each operation is written once, as a private function that
+//! takes the connection and builds the [`PendingStep`] — the step name, the argument checks that
+//! refuse before an id is spent, the placement, and the run — and the method and the free form
+//! are each a line over it, differing only in which connection they hand it and which refusal
+//! stands in for not having one ([`Error::NotLaunched`] or [`Error::NotInWorkflow`]). So the two
+//! record under the same step names, and a workflow that switches from one to the other between
+//! deployments replays the history it recorded. Only the method can raise
+//! [`Error::WrongInstance`]: the free form takes its connection and its step id from the one
+//! context, so they cannot disagree.
+//!
+//! [`retrieve_workflow`](fn@retrieve_workflow) has a free form too, for the same reason — a
+//! supervisor that has an id and wants to await it needs a handle — and records no step either.
 //!
 //! # One thing this surface deliberately does not do
 //!
@@ -123,7 +175,7 @@ use std::time::Duration;
 
 use crate::checkpoint::{Built, PendingStep, StepPlacement, StepWriter};
 use crate::connection::Connection;
-use crate::error::{Error, Result};
+use crate::error::{DurableError, Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::instance::{DBOS, Executor};
 use crate::sysdb::types::{
@@ -418,6 +470,415 @@ impl Default for ListWorkflowStepsOptions {
     }
 }
 
+/// Marks a workflow cancelled, from inside another workflow, without a handle.
+///
+/// The free form of [`DBOS::cancel`], for a workflow body: a supervisor that stops a stuck child
+/// or a runaway sibling. It takes the executor from the ambient context, so the closure the
+/// supervisor is registered as captures no [`DBOS`] — and a captured `DBOS` is a cycle with the
+/// registry that holds the closure, which keeps the instance, its executor and its connection pool
+/// alive for the life of the process. That is the whole reason this exists beside the method.
+///
+/// Otherwise it is the method exactly: the same body builds both, so the cancel is checkpointed
+/// under the same step name (`DBOS.cancel_workflow`) and a workflow that switches from one to the
+/// other replays the history it recorded. See [`DBOS::cancel`] for what cancelling does — it marks
+/// the row, it does not interrupt — and for why a workflow cannot cancel itself.
+///
+/// The error is the *workflow's* channel, like [`step`](crate::step())'s and
+/// [`send`](crate::send())'s, so `?` needs no conversion. From inside a *step* the cancel is plain,
+/// with no checkpoint of its own, the step's checkpoint standing for everything its body did.
+/// Outside a workflow there is no context to take an executor from, so this is
+/// [`Error::NotInWorkflow`]; there [`DBOS::cancel`] and [`Client::cancel`](crate::Client::cancel)
+/// are the calls.
+///
+/// **Named for what it cancels**, where the method is a bare verb: `dbos.cancel(id)` has a receiver
+/// to say what is being managed, and a free `dbos::cancel(id)` would not.
+///
+/// ```no_run
+/// # async fn supervise(stuck: String) -> dbos::Result<()> {
+/// dbos::cancel_workflow(&stuck).await?;
+/// # Ok(()) }
+/// ```
+pub fn cancel_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> PendingStep<'a, (), E> {
+    pending_cancel(
+        StepPlacement::ambient_connection("cancel_workflow"),
+        workflow_id,
+    )
+}
+
+/// Cancels workflows, and optionally everything descended from them, from inside a workflow.
+///
+/// The free form of [`DBOS::cancel_all`], and the bulk form of [`cancel_workflow`]: it exists for
+/// the reason that one gives, needing no handle and so leaving the workflow's registered closure
+/// with nothing to capture. Recorded as `DBOS.cancel_workflow`, one step for the whole batch, as
+/// the method is. Returns the ids that actually moved — see [`DBOS::cancel_all`] for the cascade.
+///
+/// Named `cancel_workflows` where the method is `cancel_all`: a free function has no receiver to
+/// say what *all* ranges over, so it takes the plural noun the references spell it with.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+///
+/// ```no_run
+/// # async fn supervise(root: String) -> dbos::Result<()> {
+/// // A whole fan-out, root and children.
+/// dbos::cancel_workflows(&[root.as_str()], dbos::Children::Include).await?;
+/// # Ok(()) }
+/// ```
+pub fn cancel_workflows<'a, E: DurableError + 'a>(
+    workflow_ids: &'a [&'a str],
+    children: Children,
+) -> PendingStep<'a, Vec<String>, E> {
+    pending_cancel_all(
+        StepPlacement::ambient_connection("cancel_workflows"),
+        workflow_ids,
+        children,
+    )
+}
+
+/// Puts a workflow back on a queue, from inside another workflow, and hands back a handle to it.
+///
+/// The free form of [`DBOS::resume`], for a workflow body that restarts a cancelled or stalled
+/// workflow without capturing a [`DBOS`] in its registered closure — see [`cancel_workflow`] for
+/// the cycle that capture would make. The same body builds both, so the resume is checkpointed
+/// under the same step name (`DBOS.resume_workflow`) and replays as the method's would. See
+/// [`DBOS::resume`] for what resuming does to a workflow that is still running.
+///
+/// **The call answers in the handle's error channel**, `E`, which is the workflow's own whenever
+/// the two fail the same way — the common case, and the one
+/// [`WorkflowRef::start`](crate::WorkflowRef::start) is written for. Where they differ,
+/// [`map_error`](PendingStep::map_error) or [`lift`](PendingStep::lift) retargets the call before
+/// it is awaited.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step.
+///
+/// ```no_run
+/// # async fn supervise(stalled: String) -> dbos::Result<u32> {
+/// let handle = dbos::resume_workflow::<u32, dbos::EngineOnly>(&stalled).await?;
+/// handle.result().await
+/// # }
+/// ```
+pub fn resume_workflow<'a, R: 'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    resume_workflow_with(workflow_id, ResumeOptions::default())
+}
+
+/// [`resume_workflow`] onto a queue of the caller's choosing.
+///
+/// The free form of [`DBOS::resume_with`]; everything [`resume_workflow`] says holds here.
+pub fn resume_workflow_with<'a, R: 'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    options: ResumeOptions<'a>,
+) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    pending_resume(
+        StepPlacement::ambient_connection("resume_workflow"),
+        workflow_id,
+        options,
+    )
+}
+
+/// Resumes workflows from inside a workflow, handing back one handle per id, in the order given.
+///
+/// The free form of [`DBOS::resume_all`] and the bulk form of [`resume_workflow`], named for the
+/// plural as [`cancel_workflows`] is. One step, `DBOS.resume_workflow`, for the whole batch, and
+/// every id must exist or nothing is enqueued — see [`DBOS::resume_all`].
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
+/// handles' error channel, as [`resume_workflow`] does.
+pub fn resume_workflows<'a, R: 'a, E: DurableError + 'a>(
+    workflow_ids: &'a [&'a str],
+    options: ResumeOptions<'a>,
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, E> {
+    pending_resume_all(
+        StepPlacement::ambient_connection("resume_workflows"),
+        workflow_ids,
+        options,
+    )
+}
+
+/// Forks a workflow from `start_step`, from inside another workflow, and hands back the fork's
+/// handle.
+///
+/// The free form of [`DBOS::fork`], for a workflow body — a supervisor re-running a failed child
+/// from the step that failed — that has no [`DBOS`] to call it on and should not capture one: see
+/// [`cancel_workflow`] for the cycle that capture would make.
+///
+/// **Checkpointed in the transaction that writes the fork**, under `DBOS.fork_workflow`, because
+/// the same body builds this and the method. That is what matters most here: a fork generates a
+/// new id, so a replay without the checkpoint would write a second fork. A replay hands back the
+/// id the first execution recorded.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
+/// handle's error channel, as [`resume_workflow`] does.
+///
+/// ```no_run
+/// # async fn supervise(failed: String) -> dbos::Result<u32> {
+/// let steps = dbos::list_workflow_steps::<dbos::EngineOnly>(&failed).await?;
+/// let at = steps.iter().rev().find(|s| s.error.is_some()).map_or(0, |s| s.step_id);
+/// let fork = dbos::fork_workflow::<u32, dbos::EngineOnly>(&failed, at).await?;
+/// fork.result().await
+/// # }
+/// ```
+pub fn fork_workflow<'a, R: 'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    start_step: i32,
+) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    fork_workflow_with(Fork::new(workflow_id, start_step), ForkOptions::default())
+}
+
+/// [`fork_workflow`], choosing the fork's id, what it inherits and where it runs.
+///
+/// The free form of [`DBOS::fork_with`]; everything [`fork_workflow`] says holds here. An invalid
+/// [`Fork`] or [`ForkOptions`] is refused before the call takes its step id, as the method's is.
+pub fn fork_workflow_with<'a, R: 'a, E: DurableError + 'a>(
+    fork: Fork<'a>,
+    options: ForkOptions<'a>,
+) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    pending_fork(
+        StepPlacement::ambient_connection("fork_workflow"),
+        fork,
+        options,
+    )
+}
+
+/// Forks workflows from inside a workflow, handing back a handle to each fork in the order given.
+///
+/// The free form of [`DBOS::fork_all`] and the bulk form of [`fork_workflow`], named for the plural
+/// as [`cancel_workflows`] is. Every source must exist or no fork is written, and the batch is one
+/// step, `DBOS.fork_workflow` — see [`DBOS::fork_all`].
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
+/// handles' error channel, as [`resume_workflow`] does.
+pub fn fork_workflows<'a, R: 'a, E: DurableError + 'a>(
+    forks: &'a [Fork<'a>],
+    options: ForkOptions<'a>,
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, E> {
+    pending_fork_all(
+        StepPlacement::ambient_connection("fork_workflows"),
+        forks,
+        options,
+    )
+}
+
+/// Re-runs a finished workflow from its first step under the same id, from inside another
+/// workflow.
+///
+/// The free form of [`DBOS::rewind`], for a workflow body with no [`DBOS`] to call it on — see
+/// [`cancel_workflow`] for why it should not capture one. Checkpointed under
+/// `DBOS.rewind_workflow`, as the method is, in the transaction that performs the rewind, so a
+/// recovered caller does not rewind the target again. See [`DBOS::rewind_with`] for what is
+/// discarded, and why a workflow still running cannot be rewound.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
+/// handle's error channel, as [`resume_workflow`] does.
+pub fn rewind_workflow<'a, R: 'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    rewind_workflow_with(workflow_id, RewindOptions::default())
+}
+
+/// [`rewind_workflow`], choosing the step it re-runs from and where it runs.
+///
+/// The free form of [`DBOS::rewind_with`]; everything [`rewind_workflow`] says holds here. Invalid
+/// [`RewindOptions`] are refused before the call takes its step id, as the method's are.
+pub fn rewind_workflow_with<'a, R: 'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    options: RewindOptions<'a>,
+) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
+    pending_rewind(
+        StepPlacement::ambient_connection("rewind_workflow"),
+        workflow_id,
+        options,
+    )
+}
+
+/// Removes a workflow and everything recorded against it, from inside another workflow.
+///
+/// The free form of [`DBOS::delete`], for a workflow body with no [`DBOS`] to call it on — see
+/// [`cancel_workflow`] for why it should not capture one. Checkpointed under
+/// `DBOS.delete_workflow`, as the method is. See [`DBOS::delete`] for what goes with the row, and
+/// [`DBOS::delete_all`] for why a workflow cannot delete itself.
+///
+/// **Named for what it deletes**, where the method is too: a queue and a schedule can be deleted
+/// as well, and a free `dbos::delete(id)` would not say which.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+pub fn delete_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> PendingStep<'a, (), E> {
+    pending_delete(
+        StepPlacement::ambient_connection("delete_workflow"),
+        workflow_id,
+    )
+}
+
+/// Deletes workflows, and optionally everything descended from them, from inside a workflow.
+///
+/// The free form of [`DBOS::delete_all`] and the bulk form of [`delete_workflow`], named for the
+/// plural as [`cancel_workflows`] is. Returns how many rows went, descendants included; one step,
+/// `DBOS.delete_workflow`, for the whole batch.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+pub fn delete_workflows<'a, E: DurableError + 'a>(
+    workflow_ids: &'a [&'a str],
+    children: Children,
+) -> PendingStep<'a, u64, E> {
+    pending_delete_all(
+        StepPlacement::ambient_connection("delete_workflows"),
+        workflow_ids,
+        children,
+    )
+}
+
+/// Holds a queued workflow back, or lets it go sooner, from inside another workflow.
+///
+/// The free form of [`DBOS::set_workflow_delay`], for a workflow body with no [`DBOS`] to call it
+/// on — see [`cancel_workflow`] for why it should not capture one. Checkpointed under
+/// `DBOS.set_workflow_delay`, as the method is, and a delay too long to store is refused before the
+/// call takes its step id. Only a `DELAYED` row moves; see the method for how the delay is timed.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+pub fn set_workflow_delay<'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    delay: WorkflowDelay,
+) -> PendingStep<'a, (), E> {
+    pending_set_workflow_delay(
+        StepPlacement::ambient_connection("set_workflow_delay"),
+        workflow_id,
+        delay,
+    )
+}
+
+/// Replaces a workflow's attributes, or clears them with `None`, from inside another workflow.
+///
+/// The free form of [`DBOS::update_workflow_attributes`], for a workflow body with no [`DBOS`] to
+/// call it on — see [`cancel_workflow`] for why it should not capture one. Checkpointed under
+/// `DBOS.update_workflow_attributes`, as the method is, so a refusal for a missing workflow
+/// replays as the same refusal. A replacement, not a merge:
+/// [`merge_workflow_attributes`](fn@merge_workflow_attributes) adds keys.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+pub fn update_workflow_attributes<'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    attributes: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> PendingStep<'a, (), E> {
+    pending_update_workflow_attributes(
+        StepPlacement::ambient_connection("update_workflow_attributes"),
+        workflow_id,
+        attributes,
+    )
+}
+
+/// Merges keys into a workflow's attributes, in one statement, from inside another workflow.
+///
+/// The free form of [`DBOS::merge_workflow_attributes`], for a workflow body with no [`DBOS`] to
+/// call it on — see [`cancel_workflow`] for why it should not capture one. Recorded under the same
+/// step name as a replacement, `DBOS.update_workflow_attributes`, as the method is.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+pub fn merge_workflow_attributes<'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> PendingStep<'a, (), E> {
+    pending_merge_workflow_attributes(
+        StepPlacement::ambient_connection("merge_workflow_attributes"),
+        workflow_id,
+        attributes,
+    )
+}
+
+/// Reads the workflows matching a filter, from inside a workflow.
+///
+/// The free form of [`DBOS::list_workflows`], for a supervisor that finds what to act on — stuck
+/// workflows, a tenant's backlog — without a [`DBOS`] to call it on; see [`cancel_workflow`] for
+/// why it should not capture one. Checkpointed under `DBOS.list_workflows`, as the method is, so a
+/// replay sees the rows the first execution saw and acts on the same ones, rather than on whatever
+/// matches by then.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+///
+/// ```no_run
+/// # async fn supervise() -> dbos::Result<()> {
+/// use dbos::sysdb::types::{WorkflowFilter, WorkflowStatus};
+///
+/// let filter = WorkflowFilter {
+///     status: vec![WorkflowStatus::Pending],
+///     limit: Some(100),
+///     ..WorkflowFilter::default()
+/// };
+/// for stuck in dbos::list_workflows::<dbos::EngineOnly>(&filter).await? {
+///     dbos::cancel_workflow::<dbos::EngineOnly>(&stuck.workflow_id).await?;
+/// }
+/// # Ok(()) }
+/// ```
+pub fn list_workflows<'a, E: DurableError + 'a>(
+    filter: &'a WorkflowFilter<'a>,
+) -> PendingStep<'a, Vec<WorkflowRecord>, E> {
+    pending_list_workflows(StepPlacement::ambient_connection("list_workflows"), filter)
+}
+
+/// Reads one workflow's steps, in execution order, from inside a workflow.
+///
+/// The free form of [`DBOS::list_workflow_steps`], for a supervisor that finds where another
+/// workflow failed — to fork it from there — without a [`DBOS`] to call it on; see
+/// [`cancel_workflow`] for why it should not capture one. Checkpointed under
+/// `DBOS.list_workflow_steps`, as the method is, so a replay reads the steps the first execution
+/// read.
+///
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
+/// channel.
+pub fn list_workflow_steps<'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+) -> PendingStep<'a, Vec<StepRecord>, E> {
+    list_workflow_steps_with(workflow_id, ListWorkflowStepsOptions::default())
+}
+
+/// [`list_workflow_steps`](fn@list_workflow_steps), choosing what each step carries and which page
+/// to read.
+///
+/// The free form of [`DBOS::list_workflow_steps_with`]; everything
+/// [`list_workflow_steps`](fn@list_workflow_steps) says holds here.
+pub fn list_workflow_steps_with<'a, E: DurableError + 'a>(
+    workflow_id: &'a str,
+    options: ListWorkflowStepsOptions,
+) -> PendingStep<'a, Vec<StepRecord>, E> {
+    pending_list_workflow_steps(
+        StepPlacement::ambient_connection("list_workflow_steps"),
+        workflow_id,
+        options,
+    )
+}
+
+/// A handle to a workflow this workflow did not start, from inside a workflow.
+///
+/// The free form of [`DBOS::retrieve_workflow`]. A supervisor that has an id — from
+/// [`list_workflows`](fn@list_workflows), from an event, from its input — and wants to await or
+/// inspect that workflow needs a handle, and without this the only way to one is a captured
+/// [`DBOS`], the cycle [`cancel_workflow`] describes.
+///
+/// **No step, and not a [`PendingStep`]**, exactly as the method: the call does no I/O, so there
+/// is nothing to replay, and the id is taken on faith. What the handle then does is checkpointed in
+/// the usual way — awaiting its [`result`](WorkflowHandle::result) inside a workflow is a step.
+///
+/// The one refusal is [`Error::NotInWorkflow`], outside a workflow, where
+/// [`DBOS::retrieve_workflow`] is the call. Inside a step it hands back a handle like anywhere
+/// else. It answers in the handle's error channel, as [`resume_workflow`] does.
+///
+/// ```no_run
+/// # async fn supervise(child: String) -> dbos::Result<u32> {
+/// let handle = dbos::retrieve_workflow::<u32, dbos::EngineOnly>(&child)?;
+/// handle.result().await
+/// # }
+/// ```
+pub fn retrieve_workflow<R, E: DurableError>(workflow_id: &str) -> Result<WorkflowHandle<R, E>, E> {
+    let conn = StepPlacement::ambient_connection("retrieve_workflow").map_err(Error::lift)?;
+    Ok(retrieved(conn, workflow_id))
+}
+
 impl DBOS {
     /// This instance, refused if it is not the one running the calling workflow — and where the
     /// call stands in that workflow.
@@ -449,17 +910,34 @@ impl DBOS {
     /// instance should say so whatever else is wrong with the call — and, coming before the
     /// placement, it also means such a call moves no step counter.
     ///
-    /// **The id is spent here, at the call**, which is why every method below is a plain `fn`
-    /// handing back a [`PendingStep`] rather than an `async fn`: a management call built beside a
-    /// step and driven with it takes the same slot on every execution. A method with an argument
-    /// check of its own — [`fork_with`](Self::fork_with)'s and [`fork_all`](Self::fork_all)'s
-    /// refusal of an invalid fork — makes it between the launch check and this, so a refused call
-    /// spends nothing.
+    /// **The id is spent here, at the call**, which is why every method that uses this is a plain
+    /// `fn` handing back a [`PendingStep`] rather than an `async fn`: a call built beside a step
+    /// and driven with it takes the same slot on every execution.
+    ///
+    /// The schedule surface places through this. The management methods below do not: each shares
+    /// its body with a free form that has no `self`, so they hand that body a connection through
+    /// [`served`](Self::served) and the body places for itself, the same way, after the argument
+    /// checks that must refuse before an id is spent.
     pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
     }
 
+    /// This instance's connection, or [`Error::NotLaunched`] naming the operation: what every
+    /// method below hands the body it shares with its free form.
+    ///
+    /// Only the connection, not a placement, because the body places for itself — after the
+    /// argument checks that must refuse before an id is spent. Whether the ambient workflow is
+    /// this instance's is decided there, by [`StepPlacement::of`], which is where
+    /// [`Error::WrongInstance`] comes from.
+    fn served(&self, operation: &'static str) -> Result<Arc<Connection>> {
+        Ok(Arc::clone(self.executor(operation)?.connection()))
+    }
+
     /// A handle to a workflow this process did not start.
+    ///
+    /// **From a workflow body, reach for the free [`retrieve_workflow`](fn@retrieve_workflow)
+    /// instead.** It is this call with no handle to capture; a captured [`DBOS`] is a cycle with
+    /// the registry that holds the workflow's closure.
     ///
     /// The way a listing becomes something to act on: [`list_workflows`](Self::list_workflows)
     /// hands back rows, and this turns one of their ids into a handle that can be awaited. The
@@ -501,17 +979,17 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> Result<WorkflowHandle<R, E>> {
-        let executor = self.executor("retrieve a workflow")?;
-        // Nothing here has seen the row: the id is the caller's, taken on faith, which is the one
-        // handle shape that waits for a row to appear rather than reporting it missing.
-        Ok(WorkflowHandle::polling(
-            Arc::clone(executor.connection()),
-            workflow_id.to_owned(),
-            false,
+        Ok(retrieved(
+            Arc::clone(self.executor("retrieve a workflow")?.connection()),
+            workflow_id,
         ))
     }
 
     /// Marks a workflow cancelled, which is how a running execution is told to stop.
+    ///
+    /// **From a workflow body, reach for the free [`cancel_workflow`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// The row goes to `CANCELLED`, which is terminal: awaiting the workflow raises
     /// [`Error::WorkflowCancelled`] rather than returning a value, and an executor still running it
@@ -542,25 +1020,14 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub fn cancel<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
-        PendingStep::placed(
-            step_names::CANCEL_WORKFLOW,
-            self.placed("cancel a workflow"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .cancel_all(
-                        &[workflow_id],
-                        Children::Skip,
-                        placement.workflow_id(),
-                        placement.step_writer(),
-                    )
-                    .await?;
-                Ok(())
-            },
-        )
+        pending_cancel(self.served("cancel a workflow"), workflow_id)
     }
 
     /// Cancels workflows, and optionally everything descended from them.
+    ///
+    /// **From a workflow body, reach for the free [`cancel_workflows`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// Returns the ids that actually moved, which is a subset: one already finished is left where
     /// it is, and with [`Children::Include`] the list also carries the descendants that were
@@ -589,24 +1056,14 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         children: Children,
     ) -> PendingStep<'a, Vec<String>> {
-        PendingStep::placed(
-            step_names::CANCEL_WORKFLOW,
-            self.placed("cancel a workflow"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .cancel_all(
-                        workflow_ids,
-                        children,
-                        placement.workflow_id(),
-                        placement.step_writer(),
-                    )
-                    .await
-            },
-        )
+        pending_cancel_all(self.served("cancel a workflow"), workflow_ids, children)
     }
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
+    ///
+    /// **From a workflow body, reach for the free [`resume_workflow`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// **Resuming is a fresh start, not a retry.** The recovery-attempt count and the deadline are
     /// both cleared: a workflow parked at the attempt limit would otherwise be parked again on
@@ -659,6 +1116,10 @@ impl DBOS {
 
     /// Resumes a workflow onto a queue of the caller's choosing.
     ///
+    /// **From a workflow body, reach for the free [`resume_workflow_with`] instead.** It is this
+    /// call with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a
+    /// cycle with the registry that holds the workflow's closure.
+    ///
     /// [`resume`](Self::resume) for the common case, which is the engine's internal queue.
     ///
     /// ```no_run
@@ -675,28 +1136,14 @@ impl DBOS {
         workflow_id: &'a str,
         options: ResumeOptions<'a>,
     ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        PendingStep::placed(
-            step_names::RESUME_WORKFLOW,
-            self.placed("resume a workflow"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .resume_all(
-                        &[workflow_id],
-                        options,
-                        placement.workflow_id(),
-                        placement.step_writer(),
-                    )
-                    .await?
-                    .pop()
-                    .ok_or_else(|| {
-                        Error::Config(format!("resuming `{workflow_id}` produced no handle"))
-                    })
-            },
-        )
+        pending_resume(self.served("resume a workflow"), workflow_id, options)
     }
 
     /// Resumes workflows, handing back one handle per id, in the order given.
+    ///
+    /// **From a workflow body, reach for the free [`resume_workflows`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// One handle per id *asked for*, not per row that moved. A workflow that had already finished
     /// is not re-enqueued, and its handle simply reports the outcome it already had — which is what
@@ -715,24 +1162,14 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         options: ResumeOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        PendingStep::placed(
-            step_names::RESUME_WORKFLOW,
-            self.placed("resume a workflow"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .resume_all(
-                        workflow_ids,
-                        options,
-                        placement.workflow_id(),
-                        placement.step_writer(),
-                    )
-                    .await
-            },
-        )
+        pending_resume_all(self.served("resume a workflow"), workflow_ids, options)
     }
 
     /// Forks a workflow from `start_step`, enqueueing the fork and handing back a handle to it.
+    ///
+    /// **From a workflow body, reach for the free [`fork_workflow`] instead.** It is this call with
+    /// no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle with
+    /// the registry that holds the workflow's closure.
     ///
     /// Every step below `start_step` replays from the source's checkpoint, and that step and every
     /// one after it run again. Step ids start at 0, so 0 re-runs the whole workflow. Negative is an
@@ -749,6 +1186,10 @@ impl DBOS {
     }
 
     /// Forks a workflow, choosing the fork's id, what it inherits and where it runs.
+    ///
+    /// **From a workflow body, reach for the free [`fork_workflow_with`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// A fork is a **new workflow** that inherits its source's identity — name, inputs, roles,
     /// attributes — along with the recorded results of every step below
@@ -788,19 +1229,14 @@ impl DBOS {
         fork: Fork<'a>,
         options: ForkOptions<'a>,
     ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        PendingStep::placed(
-            step_names::FORK_WORKFLOW,
-            self.fork_placed(std::slice::from_ref(&fork), &options),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .fork_one(fork.to_sys(), &options.to_sys(), placement.step_writer())
-                    .await
-            },
-        )
+        pending_fork(self.served(FORK_OPERATION), fork, options)
     }
 
     /// Forks workflows, handing back a handle to each fork in the order given.
+    ///
+    /// **From a workflow body, reach for the free [`fork_workflows`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// The batch is the system database's primitive rather than a loop over
     /// [`fork_with`](Self::fork_with), and the difference is visible: every source must exist, or
@@ -834,37 +1270,14 @@ impl DBOS {
         forks: &'a [Fork<'a>],
         options: ForkOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        PendingStep::placed(
-            step_names::FORK_WORKFLOW,
-            self.fork_placed(forks, &options),
-            move |executor, placement| async move {
-                let forks: Vec<SysFork<'_>> = forks.iter().map(|fork| fork.to_sys()).collect();
-                executor
-                    .connection()
-                    .fork_all(&forks, &options.to_sys(), placement.step_writer())
-                    .await
-            },
-        )
-    }
-
-    /// The serving executor and the step id, for [`fork_with`](Self::fork_with) and
-    /// [`fork_all`](Self::fork_all).
-    ///
-    /// Which instance is serving this first, as every other method on this surface does: an
-    /// unlaunched instance should say so whatever else is wrong with the call. Then the argument
-    /// checks, and only then the step id — so a refused fork moves the workflow's counter no more
-    /// than an unlaunched one does.
-    fn fork_placed(&self, forks: &[Fork<'_>], options: &ForkOptions<'_>) -> Built<Arc<Executor>> {
-        self.executor(FORK_OPERATION).and_then(|executor| {
-            refuse_invalid_forks(forks, options)?;
-            // The executor came from this handle rather than from the ambient context, so the two
-            // can disagree — which is the `WrongInstance` [`StepPlacement::of`] exists to raise.
-            let placement = StepPlacement::of(executor.connection(), FORK_OPERATION)?;
-            Ok((executor, placement))
-        })
+        pending_fork_all(self.served(FORK_OPERATION), forks, options)
     }
 
     /// Re-runs a finished workflow from its first step, under the same id.
+    ///
+    /// **From a workflow body, reach for the free [`rewind_workflow`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// [`rewind_with`](Self::rewind_with) for choosing the step and where it runs.
     ///
@@ -883,6 +1296,10 @@ impl DBOS {
 
     /// Discards a finished workflow's history from a step on, and re-enqueues it under the same
     /// id.
+    ///
+    /// **From a workflow body, reach for the free [`rewind_workflow_with`] instead.** It is this
+    /// call with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a
+    /// cycle with the registry that holds the workflow's closure.
     ///
     /// The steps below [`RewindOptions::start_step`] replay from their checkpoints and the rest
     /// run again. **The id is kept, which is the difference from [`fork`](Self::fork)**: a fork is
@@ -940,26 +1357,14 @@ impl DBOS {
         workflow_id: &'a str,
         options: RewindOptions<'a>,
     ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        // The argument check between the launch check and the placement, so a refused option
-        // does not move the workflow's step counter.
-        let built = self.executor("rewind a workflow").and_then(|executor| {
-            refuse_invalid_rewind_options(&options)?;
-            let placement = StepPlacement::of(executor.connection(), "rewind a workflow")?;
-            Ok((executor, placement))
-        });
-        PendingStep::placed(
-            step_names::REWIND_WORKFLOW,
-            built,
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .rewind(workflow_id, options, placement.step_writer())
-                    .await
-            },
-        )
+        pending_rewind(self.served("rewind a workflow"), workflow_id, options)
     }
 
     /// Removes a workflow and everything recorded against it.
+    ///
+    /// **From a workflow body, reach for the free [`delete_workflow`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// Steps, inputs, outcome, events, messages and streams go with the row, so this is not a
     /// status change and there is nothing left to resume. [`cancel`](Self::cancel) is the form
@@ -980,20 +1385,14 @@ impl DBOS {
     /// with [`Error::SystemDatabase`] carrying `InvalidInput` and nothing is deleted; see
     /// [`delete_all`](Self::delete_all) for why.
     pub fn delete<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
-        PendingStep::placed(
-            step_names::DELETE_WORKFLOW,
-            self.placed("delete a workflow"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .delete_all(&[workflow_id], Children::Skip, placement.step_writer())
-                    .await?;
-                Ok(())
-            },
-        )
+        pending_delete(self.served("delete a workflow"), workflow_id)
     }
 
     /// Deletes workflows, and optionally everything descended from them.
+    ///
+    /// **From a workflow body, reach for the free [`delete_workflows`] instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// Returns how many rows went, descendants included.
     ///
@@ -1019,19 +1418,14 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         children: Children,
     ) -> PendingStep<'a, u64> {
-        PendingStep::placed(
-            step_names::DELETE_WORKFLOW,
-            self.placed("delete a workflow"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .delete_all(workflow_ids, children, placement.step_writer())
-                    .await
-            },
-        )
+        pending_delete_all(self.served("delete a workflow"), workflow_ids, children)
     }
 
     /// Holds a queued workflow back, or lets it go sooner.
+    ///
+    /// **From a workflow body, reach for the free [`set_workflow_delay`](fn@set_workflow_delay)
+    /// instead.** It is this call with no handle to capture, recorded under the same step name; a
+    /// captured [`DBOS`] is a cycle with the registry that holds the workflow's closure.
     ///
     /// **Only a `DELAYED` row moves.** A workflow that has already been released is running or
     /// queued, and pushing its delay out would not recall it — so this is a way to reschedule work
@@ -1062,25 +1456,15 @@ impl DBOS {
         workflow_id: &'a str,
         delay: WorkflowDelay,
     ) -> PendingStep<'a, ()> {
-        // The argument check between the launch check and the placement, so a delay too long to
-        // store refuses the call without moving the workflow's step counter.
-        let built = self.executor(DELAY_OPERATION).and_then(|executor| {
-            refuse_unstorable_delay(delay)?;
-            StepPlacement::taken(Ok(executor), DELAY_OPERATION)
-        });
-        PendingStep::placed(
-            step_names::SET_WORKFLOW_DELAY,
-            built,
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .set_workflow_delay(workflow_id, delay, placement.step_writer())
-                    .await
-            },
-        )
+        pending_set_workflow_delay(self.served(DELAY_OPERATION), workflow_id, delay)
     }
 
     /// Replaces a workflow's attributes, or clears them with `None`.
+    ///
+    /// **From a workflow body, reach for the free
+    /// [`update_workflow_attributes`](fn@update_workflow_attributes) instead.** It is this call
+    /// with no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle
+    /// with the registry that holds the workflow's closure.
     ///
     /// **A replacement, not a merge**, so a caller adding one key must send the others back with
     /// it, and two callers adding different keys race to drop each other's.
@@ -1124,29 +1508,19 @@ impl DBOS {
         workflow_id: &'a str,
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> PendingStep<'a, ()> {
-        // Encoded before the id is taken, as every other call in the crate encodes before it
-        // places: attributes that cannot be encoded are a call that never happens, and a call that
-        // never happens must not move the workflow's counter.
-        let built = crate::workflow::encode_attributes(attributes)
-            .and_then(|encoded| Ok((encoded, self.placed("update a workflow's attributes")?)))
-            .map(|(encoded, (executor, placement))| ((executor, encoded), placement));
-        PendingStep::placed(
-            step_names::UPDATE_WORKFLOW_ATTRIBUTES,
-            built,
-            move |(executor, encoded), placement| async move {
-                executor
-                    .connection()
-                    .update_workflow_attributes(
-                        workflow_id,
-                        AttributeUpdate::Replace(encoded.as_deref()),
-                        placement.step_writer(),
-                    )
-                    .await
-            },
+        pending_update_workflow_attributes(
+            self.served("update a workflow's attributes"),
+            workflow_id,
+            attributes,
         )
     }
 
     /// Merges keys into a workflow's attributes, in one statement.
+    ///
+    /// **From a workflow body, reach for the free
+    /// [`merge_workflow_attributes`](fn@merge_workflow_attributes) instead.** It is this call with
+    /// no handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle with
+    /// the registry that holds the workflow's closure.
     ///
     /// **A shallow merge of the top-level keys.** A key already there takes the new value, and the
     /// others stay as they are. A key set to JSON `null` is stored as `null`, not removed. If the
@@ -1173,27 +1547,18 @@ impl DBOS {
         workflow_id: &'a str,
         attributes: &serde_json::Map<String, serde_json::Value>,
     ) -> PendingStep<'a, ()> {
-        // Encoded before the id is taken, as in `update_workflow_attributes`.
-        let built = crate::workflow::encode_attribute_map(attributes)
-            .and_then(|encoded| Ok((encoded, self.placed("merge a workflow's attributes")?)))
-            .map(|(encoded, (executor, placement))| ((executor, encoded), placement));
-        PendingStep::placed(
-            step_names::UPDATE_WORKFLOW_ATTRIBUTES,
-            built,
-            move |(executor, encoded), placement| async move {
-                executor
-                    .connection()
-                    .update_workflow_attributes(
-                        workflow_id,
-                        AttributeUpdate::Merge(&encoded),
-                        placement.step_writer(),
-                    )
-                    .await
-            },
+        pending_merge_workflow_attributes(
+            self.served("merge a workflow's attributes"),
+            workflow_id,
+            attributes,
         )
     }
 
     /// Reads the workflows matching a filter, oldest first unless the filter says otherwise.
+    ///
+    /// **From a workflow body, reach for the free [`list_workflows`](fn@list_workflows) instead.**
+    /// It is this call with no handle to capture, recorded under the same step name; a captured
+    /// [`DBOS`] is a cycle with the registry that holds the workflow's closure.
     ///
     /// **Every filter is one `WHERE` clause**, not a scan the caller narrows afterwards, so
     /// `WorkflowFilter::default()` returns the whole table. A caller that means to page should say
@@ -1227,19 +1592,14 @@ impl DBOS {
         &self,
         filter: &'a WorkflowFilter<'a>,
     ) -> PendingStep<'a, Vec<WorkflowRecord>> {
-        PendingStep::placed(
-            step_names::LIST_WORKFLOWS,
-            self.placed("list workflows"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .list_workflows(filter, placement.step_writer())
-                    .await
-            },
-        )
+        pending_list_workflows(self.served("list workflows"), filter)
     }
 
     /// Reads one workflow's steps, in execution order.
+    ///
+    /// **From a workflow body, reach for the free [`list_workflow_steps`](fn@list_workflow_steps)
+    /// instead.** It is this call with no handle to capture, recorded under the same step name; a
+    /// captured [`DBOS`] is a cycle with the registry that holds the workflow's closure.
     ///
     /// Every step, with its output or error.
     /// [`list_workflow_steps_with`](Self::list_workflow_steps_with) can leave the outputs out, or
@@ -1259,6 +1619,11 @@ impl DBOS {
 
     /// Reads one workflow's steps, choosing what each step carries and which page to read.
     ///
+    /// **From a workflow body, reach for the free
+    /// [`list_workflow_steps_with`](fn@list_workflow_steps_with) instead.** It is this call with no
+    /// handle to capture, recorded under the same step name; a captured [`DBOS`] is a cycle with
+    /// the registry that holds the workflow's closure.
+    ///
     /// See [`list_workflow_steps`](Self::list_workflow_steps).
     /// [`load_output`](ListWorkflowStepsOptions::load_output) off reads only the steps' metadata,
     /// for a listing of a workflow whose step outputs are large;
@@ -1269,16 +1634,7 @@ impl DBOS {
         workflow_id: &'a str,
         options: ListWorkflowStepsOptions,
     ) -> PendingStep<'a, Vec<StepRecord>> {
-        PendingStep::placed(
-            step_names::LIST_WORKFLOW_STEPS,
-            self.placed("list a workflow's steps"),
-            move |executor, placement| async move {
-                executor
-                    .connection()
-                    .list_workflow_steps(workflow_id, options, placement.step_writer())
-                    .await
-            },
-        )
+        pending_list_workflow_steps(self.served("list a workflow's steps"), workflow_id, options)
     }
 }
 
@@ -1806,6 +2162,326 @@ impl Connection {
             .await
             .map_err(Error::from_sysdb)
     }
+}
+
+// The one body each operation has, behind its two surfaces.
+//
+// Each `pending_*` below is the whole of an operation as a step: its recorded name, the argument
+// checks that must refuse before an id is spent, the placement, and the run. The method on `DBOS`
+// and the free function are each one line over it, and differ only in what they hand it as `conn`
+// — the handle's executor's connection, refused as `NotLaunched` before launch, or the ambient
+// workflow's, refused as `NotInWorkflow` outside one — and in the error channel they ask for. That
+// is what makes a workflow that switches from one to the other replay the history it recorded:
+// there is no second copy of the step name or of the order of refusals to drift.
+//
+// The ambient connection is the context's own, so `StepPlacement::of` never sees two instances
+// there and `WrongInstance` is the method's alone; the `operation` passed to it names the call for
+// that error.
+
+/// Where a management call stands: the connection refused first, then the id.
+fn place(conn: Result<Arc<Connection>>, operation: &'static str) -> Built<Arc<Connection>> {
+    conn.and_then(|conn| Connection::placed(&conn, operation))
+}
+
+/// [`place`] with a check between the connection and the id, for the calls with arguments they
+/// can refuse — or a payload they must encode — before a step id is spent. What the check produces
+/// travels beside the connection into the run.
+fn place_after<C>(
+    conn: Result<Arc<Connection>>,
+    operation: &'static str,
+    check: impl FnOnce() -> Result<C>,
+) -> Built<(Arc<Connection>, C)> {
+    let conn = conn?;
+    let checked = check()?;
+    let placement = StepPlacement::of(&conn, operation)?;
+    Ok(((conn, checked), placement))
+}
+
+/// A handle to a workflow by id, taken on faith: the body of both `retrieve_workflow`s.
+fn retrieved<R, E>(conn: Arc<Connection>, workflow_id: &str) -> WorkflowHandle<R, E> {
+    // Nothing here has seen the row: the id is the caller's, taken on faith, which is the one
+    // handle shape that waits for a row to appear rather than reporting it missing.
+    WorkflowHandle::polling(conn, workflow_id.to_owned(), false)
+}
+
+fn pending_cancel<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+) -> PendingStep<'a, (), E> {
+    PendingStep::placed(
+        step_names::CANCEL_WORKFLOW,
+        place(conn, "cancel a workflow"),
+        move |conn, placement| async move {
+            conn.cancel_all(
+                &[workflow_id],
+                Children::Skip,
+                placement.workflow_id(),
+                placement.step_writer(),
+            )
+            .await
+            .map_err(Error::lift)?;
+            Ok(())
+        },
+    )
+}
+
+fn pending_cancel_all<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_ids: &'a [&'a str],
+    children: Children,
+) -> PendingStep<'a, Vec<String>, E> {
+    PendingStep::placed(
+        step_names::CANCEL_WORKFLOW,
+        place(conn, "cancel a workflow"),
+        move |conn, placement| async move {
+            conn.cancel_all(
+                workflow_ids,
+                children,
+                placement.workflow_id(),
+                placement.step_writer(),
+            )
+            .await
+            .map_err(Error::lift)
+        },
+    )
+}
+
+/// `R` and `E` are the handle's; `F` is the channel the call answers in.
+fn pending_resume<'a, R: 'a, E: 'a, F: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+    options: ResumeOptions<'a>,
+) -> PendingStep<'a, WorkflowHandle<R, E>, F> {
+    PendingStep::placed(
+        step_names::RESUME_WORKFLOW,
+        place(conn, "resume a workflow"),
+        move |conn, placement| async move {
+            conn.resume_all(
+                &[workflow_id],
+                options,
+                placement.workflow_id(),
+                placement.step_writer(),
+            )
+            .await
+            .map_err(Error::lift)?
+            .pop()
+            .ok_or_else(|| Error::Config(format!("resuming `{workflow_id}` produced no handle")))
+        },
+    )
+}
+
+fn pending_resume_all<'a, R: 'a, E: 'a, F: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_ids: &'a [&'a str],
+    options: ResumeOptions<'a>,
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, F> {
+    PendingStep::placed(
+        step_names::RESUME_WORKFLOW,
+        place(conn, "resume a workflow"),
+        move |conn, placement| async move {
+            conn.resume_all(
+                workflow_ids,
+                options,
+                placement.workflow_id(),
+                placement.step_writer(),
+            )
+            .await
+            .map_err(Error::lift)
+        },
+    )
+}
+
+/// The fork is checked whole before the id is taken, so a refused fork moves the workflow's
+/// counter no more than an unlaunched instance does.
+fn pending_fork<'a, R: 'a, E: 'a, F: 'a>(
+    conn: Result<Arc<Connection>>,
+    fork: Fork<'a>,
+    options: ForkOptions<'a>,
+) -> PendingStep<'a, WorkflowHandle<R, E>, F> {
+    let built = place_after(conn, FORK_OPERATION, || {
+        refuse_invalid_forks(std::slice::from_ref(&fork), &options)
+    })
+    .map(|((conn, ()), placement)| (conn, placement));
+    PendingStep::placed(
+        step_names::FORK_WORKFLOW,
+        built,
+        move |conn, placement| async move {
+            conn.fork_one(fork.to_sys(), &options.to_sys(), placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+fn pending_fork_all<'a, R: 'a, E: 'a, F: 'a>(
+    conn: Result<Arc<Connection>>,
+    forks: &'a [Fork<'a>],
+    options: ForkOptions<'a>,
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, F> {
+    let built = place_after(conn, FORK_OPERATION, || {
+        refuse_invalid_forks(forks, &options)
+    })
+    .map(|((conn, ()), placement)| (conn, placement));
+    PendingStep::placed(
+        step_names::FORK_WORKFLOW,
+        built,
+        move |conn, placement| async move {
+            let forks: Vec<SysFork<'_>> = forks.iter().map(|fork| fork.to_sys()).collect();
+            conn.fork_all(&forks, &options.to_sys(), placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+fn pending_rewind<'a, R: 'a, E: 'a, F: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+    options: RewindOptions<'a>,
+) -> PendingStep<'a, WorkflowHandle<R, E>, F> {
+    let built = place_after(conn, "rewind a workflow", || {
+        refuse_invalid_rewind_options(&options)
+    })
+    .map(|((conn, ()), placement)| (conn, placement));
+    PendingStep::placed(
+        step_names::REWIND_WORKFLOW,
+        built,
+        move |conn, placement| async move {
+            conn.rewind(workflow_id, options, placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+fn pending_delete<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+) -> PendingStep<'a, (), E> {
+    PendingStep::placed(
+        step_names::DELETE_WORKFLOW,
+        place(conn, "delete a workflow"),
+        move |conn, placement| async move {
+            conn.delete_all(&[workflow_id], Children::Skip, placement.step_writer())
+                .await
+                .map_err(Error::lift)?;
+            Ok(())
+        },
+    )
+}
+
+fn pending_delete_all<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_ids: &'a [&'a str],
+    children: Children,
+) -> PendingStep<'a, u64, E> {
+    PendingStep::placed(
+        step_names::DELETE_WORKFLOW,
+        place(conn, "delete a workflow"),
+        move |conn, placement| async move {
+            conn.delete_all(workflow_ids, children, placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+/// A delay too long to store refuses the call without moving the workflow's step counter.
+fn pending_set_workflow_delay<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+    delay: WorkflowDelay,
+) -> PendingStep<'a, (), E> {
+    let built = place_after(conn, DELAY_OPERATION, || refuse_unstorable_delay(delay))
+        .map(|((conn, ()), placement)| (conn, placement));
+    PendingStep::placed(
+        step_names::SET_WORKFLOW_DELAY,
+        built,
+        move |conn, placement| async move {
+            conn.set_workflow_delay(workflow_id, delay, placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+/// Encoded before the id is taken, as every other call in the crate encodes before it places:
+/// attributes that cannot be encoded are a call that never happens, and a call that never happens
+/// must not move the workflow's counter.
+fn pending_update_workflow_attributes<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+    attributes: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> PendingStep<'a, (), E> {
+    PendingStep::placed(
+        step_names::UPDATE_WORKFLOW_ATTRIBUTES,
+        place_after(conn, "update a workflow's attributes", || {
+            crate::workflow::encode_attributes(attributes)
+        }),
+        move |(conn, encoded), placement| async move {
+            conn.update_workflow_attributes(
+                workflow_id,
+                AttributeUpdate::Replace(encoded.as_deref()),
+                placement.step_writer(),
+            )
+            .await
+            .map_err(Error::lift)
+        },
+    )
+}
+
+/// Encoded before the id is taken, as in [`pending_update_workflow_attributes`].
+fn pending_merge_workflow_attributes<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+    attributes: &serde_json::Map<String, serde_json::Value>,
+) -> PendingStep<'a, (), E> {
+    PendingStep::placed(
+        step_names::UPDATE_WORKFLOW_ATTRIBUTES,
+        place_after(conn, "merge a workflow's attributes", || {
+            crate::workflow::encode_attribute_map(attributes)
+        }),
+        move |(conn, encoded), placement| async move {
+            conn.update_workflow_attributes(
+                workflow_id,
+                AttributeUpdate::Merge(&encoded),
+                placement.step_writer(),
+            )
+            .await
+            .map_err(Error::lift)
+        },
+    )
+}
+
+fn pending_list_workflows<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    filter: &'a WorkflowFilter<'a>,
+) -> PendingStep<'a, Vec<WorkflowRecord>, E> {
+    PendingStep::placed(
+        step_names::LIST_WORKFLOWS,
+        place(conn, "list workflows"),
+        move |conn, placement| async move {
+            conn.list_workflows(filter, placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
+}
+
+fn pending_list_workflow_steps<'a, E: 'a>(
+    conn: Result<Arc<Connection>>,
+    workflow_id: &'a str,
+    options: ListWorkflowStepsOptions,
+) -> PendingStep<'a, Vec<StepRecord>, E> {
+    PendingStep::placed(
+        step_names::LIST_WORKFLOW_STEPS,
+        place(conn, "list a workflow's steps"),
+        move |conn, placement| async move {
+            conn.list_workflow_steps(workflow_id, options, placement.step_writer())
+                .await
+                .map_err(Error::lift)
+        },
+    )
 }
 
 /// Refuses a negative rewind start step. `field` names the step in the message

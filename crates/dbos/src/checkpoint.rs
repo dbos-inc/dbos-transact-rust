@@ -339,8 +339,10 @@ impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
     /// [`select_step!`](crate::select_step) must agree on how they fail before any of them is
     /// awaited, so `map_err(Error::lift)` in an arm is too late: it converts the branch's
     /// *output*, where what has to change is its declared type. This converts the call itself,
-    /// while it is still a value, which is early enough. The management surface is where it comes
-    /// up — those calls answer in the engine's channel and a workflow body rarely does.
+    /// while it is still a value, which is early enough. The management methods on
+    /// [`DBOS`](crate::DBOS) are where it comes up — they answer in the engine's channel and a
+    /// workflow body rarely does — though from a workflow body their free forms, such as
+    /// [`cancel_workflow`](crate::cancel_workflow), answer in the caller's channel and need none.
     ///
     /// Only from the engine's channel, which is not so much a restriction as the whole reason it
     /// is sound: [`EngineOnly`](crate::EngineOnly) is uninhabited, so there is no application
@@ -578,9 +580,10 @@ impl StepPlacement {
     /// wanted it.
     ///
     /// **What the *free* forms of the library calls stand on.** `send`, `send_bulk`,
-    /// `select_workflow` and `join_workflows` have no handle to take an executor from, so being
-    /// inside a workflow is the whole of what makes them callable — which is why each has a
-    /// [`DBOS`](crate::DBOS) form for everyone else, and why
+    /// `select_workflow`, `join_workflows`, the stream reads and the management surface's free
+    /// forms (`cancel_workflow`, `fork_workflow` and the rest) have no handle to take an executor
+    /// from, so being inside a workflow is the whole of what makes them callable — which is why
+    /// each has a [`DBOS`](crate::DBOS) form for everyone else, and why
     /// [`get_event`](crate::get_event)'s free form follows the same rule.
     ///
     /// Here rather than in each of those modules because it is one function: the question of how
