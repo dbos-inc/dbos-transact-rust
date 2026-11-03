@@ -4210,6 +4210,54 @@ async fn a_promotion_stamps_the_database_clock_and_wins_over_a_future_stamp() {
     assert_eq!(stamp("v1").await, i64::MAX);
 }
 
+/// **A nameless promotion wins over every application's versions, as its latest read sees them.**
+///
+/// A nameless handle's latest read spans every application, so promoting a version another
+/// application owns has to beat a peer's stamp too, even one ahead of the database's clock;
+/// otherwise the promotion reports success and the peer's version stays the latest it reads.
+#[tokio::test]
+async fn a_nameless_promotion_wins_over_every_applications_versions() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let nameless = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    alpha
+        .create_application_version("alpha-v1", None)
+        .await
+        .unwrap();
+    beta.create_application_version("beta-v1", None)
+        .await
+        .unwrap();
+    let ahead = nameless.database_time().await.unwrap().now().as_epoch_ms() + 3_600_000;
+    support::set_version_timestamp(&pool, "beta-v1", Timestamp::from_epoch_ms(ahead)).await;
+
+    nameless
+        .promote_application_version("alpha-v1", None)
+        .await
+        .unwrap();
+    let latest = nameless
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version_name, "alpha-v1");
+    assert_eq!(
+        latest.app_name.as_deref(),
+        Some("alpha"),
+        "the owner is kept"
+    );
+}
+
 /// The bulk readers report everything a workflow was sent, published, and streamed.
 ///
 /// Written with raw SQL rather than through the writers, so the read shape is pinned on its own:

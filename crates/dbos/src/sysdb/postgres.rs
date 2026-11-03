@@ -6433,20 +6433,23 @@ impl SystemDatabase for PostgresSystemDatabase {
                 )
                 .await?;
 
-                // The highest stamp the latest read for `owner` considers, read the way
-                // `latest_version_sql` reads it so each probe is one entry of an index: the owner's
-                // rows and the unclaimed ones, or every row for a nameless owner. `ORDER BY ...
-                // LIMIT 1` rather than `MAX`, since an `IS NULL` probe only uses migration 125's
-                // index when it orders by the constant `application_name` too. Held below
-                // `bigint`'s ceiling before the `+ 1`, so a version stamped at the largest value
-                // does not make every later promotion overflow: the promotion then ties it.
+                // The highest stamp the caller's own latest read considers, read the way
+                // `latest_version_sql` reads it so each probe is one entry of an index: the
+                // caller's rows and the unclaimed ones, or every row for a nameless caller. Scoped
+                // by the caller's name rather than by `owner`, which a nameless caller takes from
+                // the row: its latest read spans every application, so scoping to the owner could
+                // report success while a peer's version stayed its latest. `ORDER BY ... LIMIT 1`
+                // rather than `MAX`, since an `IS NULL` probe only uses migration 125's index when
+                // it orders by the constant `application_name` too. Held below `bigint`'s ceiling
+                // before the `+ 1`, so a version stamped at the largest value does not make every
+                // later promotion overflow: the promotion then ties it.
                 let probe = |filter: &str| {
                     format!(
                         "COALESCE((SELECT version_timestamp FROM {versions_table} {filter} \
                                    ORDER BY application_name, version_timestamp DESC LIMIT 1), 0)"
                     )
                 };
-                let highest = if owner.is_some() {
+                let highest = if application_name.is_some() {
                     format!(
                         "GREATEST({}, {})",
                         probe("WHERE application_name = $2"),
