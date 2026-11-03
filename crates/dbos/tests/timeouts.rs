@@ -75,8 +75,8 @@ async fn a_step_that_hangs_is_stopped_at_its_timeout() {
 
 /// The future is dropped, so the body stops rather than running on in the background.
 ///
-/// This is the half TypeScript cannot do: it abandons a timed-out attempt and lets it settle
-/// unobserved. A dropped Rust future stops at its next suspension point.
+/// A timed-out attempt is not abandoned to settle unobserved: a dropped Rust future stops at its
+/// next suspension point.
 #[dbos_test_support::test]
 async fn a_timed_out_body_stops_rather_than_continuing() {
     let db = test_database().await;

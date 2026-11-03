@@ -1,8 +1,8 @@
 //! The system database schema: the migration SQL and the rendering that makes it executable.
 //!
-//! Every DBOS implementation must produce the same schema — a Rust application can share a
-//! system database with one written in Python, TypeScript, Go, or Java — so the statements in
-//! `migrations/` are not free to change. What has to match is the schema the database ends up
+//! Every DBOS SDK must produce the same schema — a Rust application can share a system database
+//! with one written against another DBOS SDK — so the statements in `migrations/` are not free to
+//! change. What has to match is the schema the database ends up
 //! with, including column types; the filenames and comments are this crate's own.
 //!
 //! Porting a migration:
@@ -161,8 +161,7 @@ pub fn render(sql: &str, values: Placeholders<'_>) -> Result<String, RenderError
 
 /// When a migration file applies.
 ///
-/// Declared with the file rather than decided by the assembler. Upstream expresses the same
-/// conditions as `if` statements inside one function per migration; ours are files, so the
+/// Declared with the file rather than decided by the assembler. Migrations here are files, so the
 /// condition has to live somewhere — and next to the file it governs is where it can be read
 /// without cross-referencing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +189,7 @@ impl Applies {
     }
 }
 
-/// A migration file as copied from upstream: its number, its filename, its contents, and when it
-/// applies.
+/// A migration file: its number, its filename, its contents, and when it applies.
 ///
 /// Numbers are not unique across the corpus — several migrations ship variant files for
 /// CockroachDB or for LISTEN/NOTIFY, and those share the number of the migration they vary. A
@@ -315,7 +313,7 @@ sources![
     (45, "45_add_partition_dequeue_index.sql", Applies::Always),
     (46, "46_add_partition_dequeue_index_v2.sql", Applies::Always),
     (47, "47_drop_partition_dequeue_index.sql", Applies::Always),
-    // The shared series. Numbers from 100 up mean the same DDL in every implementation.
+    // The shared series. Numbers from 100 up mean the same DDL in every SDK on the database.
     (
         100,
         "100_workflow_status_application_name.sql",
@@ -457,11 +455,11 @@ pub fn source(name: &str) -> Option<&'static MigrationSource> {
 
 /// The highest migration in this implementation's own history.
 ///
-/// **Below the shared base the numbering still mirrors upstream's, and must.** A version number
-/// under 100 is a claim about schema state, so a database left half-migrated by one
-/// implementation is picked up correctly by another only if their version *n* describes the same
-/// schema. Our 45, 46 and 47 are Python's `fortyfive`, `fortysix` and `fortyseven` down to the
-/// index names. The rule: keep the Go/Python/Java numbering below 100, then jump to 100.
+/// **Below the shared base the numbering is still shared, and must be.** A version number under
+/// 100 is a claim about schema state, so a database left half-migrated by one SDK is picked up
+/// correctly by another only if their version *n* describes the same schema; our 45, 46 and 47
+/// match down to the index names. The rule: below 100, version *n* is the schema every other SDK
+/// on the same database calls *n*; then jump to 100.
 ///
 /// What the shared base changes is only what happens *above* it — see
 /// [`SHARED_MIGRATION_BASE`]. It does not make the numbers below it free.
@@ -470,9 +468,10 @@ pub const LOCAL_MIGRATIONS: u32 = 47;
 /// Where the numbering stops being per-implementation and starts being shared.
 ///
 /// From here up, a version number is a cross-SDK agreement *by construction*: 100 means the same
-/// DDL in Rust, Python and TypeScript because all three define it identically. Below it, the
-/// numbering agrees by porting rather than by agreement — see [`LOCAL_MIGRATIONS`] — which is why
-/// a new shared migration is written once and copied, while an old local one is never renumbered.
+/// DDL in every SDK that carries the shared series, because each defines it identically. Below
+/// it, the numbering agrees by porting rather than by agreement — see [`LOCAL_MIGRATIONS`] — which
+/// is why a new shared migration is written once and copied, while an old local one is never
+/// renumbered.
 ///
 /// Versions between [`LOCAL_MIGRATIONS`] and here are padding — empty migrations that consume a
 /// number and do nothing. They exist so the shared series lands on its agreed numbers whatever
@@ -737,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_matches_upstream_shape() {
+    fn corpus_has_its_history_and_the_shared_series() {
         // 80 files: 79 the runner applies, plus the migration-10 probe, which is bound
         // separately so it cannot be applied by mistake.
         assert_eq!(SOURCES.len(), 79);
@@ -784,11 +783,11 @@ mod tests {
 
     /// Every header names the migration its filename says it is.
     ///
-    /// Upstream's copies do not: fourteen files — the base files of 22 through 35 — name
-    /// themselves exactly four lower, and three of those also cross-reference other
-    /// migrations in the same stale numbering. That is a real defect rather than a
-    /// convention worth preserving, so the copies here are corrected, and this test is what
-    /// keeps them corrected when new files arrive.
+    /// Fourteen files — the base files of 22 through 35 — were first written naming themselves
+    /// exactly four lower, and three of those also cross-referenced other migrations in the
+    /// same stale numbering. That is a real defect rather than a convention worth preserving,
+    /// so the copies here are corrected, and this test is what keeps them corrected when new
+    /// files arrive.
     ///
     /// The correction is confined to comments; the SQL is untouched.
     #[test]
@@ -931,8 +930,7 @@ mod tests {
     /// interpolating it.
     ///
     /// Keeping it out of [`SOURCES`] is what makes applying it by accident impossible —
-    /// stronger than a flag on the item, and it matches how Go binds it. The runner
-    /// special-cases migration 10 with this query, as Python and Java do.
+    /// stronger than a flag on the item. The runner special-cases migration 10 with this query.
     #[test]
     fn the_migration_ten_probe_binds_its_schema() {
         assert_eq!(MIGRATION_10_PK_PROBE.version, 10);

@@ -885,8 +885,7 @@ async fn a_dequeue_parks_a_workflow_past_its_recovery_limit() {
 /// **A queued workflow's budget becomes a deadline on dequeue, not at enqueue.**
 ///
 /// The timeout is recorded and the deadline left null, so a workflow that waits an hour in a queue
-/// still gets the whole budget when it finally runs. Python and TypeScript branch on the queue in
-/// the same place.
+/// still gets the whole budget when it finally runs.
 ///
 /// **Enqueued onto a queue nothing polls**, which is what makes the assertion stable: a queue name
 /// is an address and needs no registration, so a name no runner has in its set leaves the row in
@@ -1086,9 +1085,8 @@ async fn listen_queues_never_excludes_the_internal_queue() {
 
 /// An empty list listens to nothing, which is a setting rather than a mistake.
 ///
-/// Distinct from `None`, which is every queue. Go's empty set means "all"; Rust's `Option` carries
-/// that meaning instead, so an empty slice can mean what it says. The internal queue still runs,
-/// as it always does.
+/// Distinct from `None`, which is every queue: the `Option` carries "all", so an empty slice can
+/// mean what it says. The internal queue still runs, as it always does.
 #[dbos_test_support::test]
 async fn an_empty_listen_set_dequeues_from_no_registered_queue() {
     let db = test_database().await;
@@ -1551,8 +1549,7 @@ async fn a_dequeue_stamps_the_deadline_an_enqueue_left_open() {
 ///
 /// The two differ in what they mean: a budget promises how long the *work* may take, so the queue
 /// wait cannot count against it, while an inherited deadline is an instant the parent is already
-/// bound by — and a child does not escape it by being queued. Python returns the propagated
-/// deadline whether or not there is a queue.
+/// bound by — and a child does not escape it by being queued.
 ///
 /// The child is enqueued onto a queue nothing polls, for the reason
 /// `an_explicit_timeout_on_a_queued_workflow_records_no_deadline_yet` gives: the assertion is
@@ -1628,8 +1625,7 @@ async fn an_inherited_deadline_reaches_a_queued_child() {
 ///
 /// A delay, a priority, a deduplication id or a partition key without a queue is not a runtime
 /// error here — it does not compile, because [`QueueRequest`] owns them and there is no queue-less
-/// value to hang them on. Go returns `InvalidOptionError` for each of those four (`workflow.go`).
-/// What is left is what no shape can express.
+/// value to hang them on. What is left is what no shape can express.
 #[dbos_test_support::test]
 async fn an_incoherent_enqueue_is_refused() {
     let db = test_database().await;

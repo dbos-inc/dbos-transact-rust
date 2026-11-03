@@ -32,9 +32,7 @@
 //!   second application instance's is [`Error::WrongInstance`].
 //!
 //! Those four cases and the argument for each are written once and shared by every caller that
-//! has the same question. The references keep the same logic in one place for the same reason:
-//! Python's `call_function_as_step`, TypeScript's `runInternalStep` and Java's
-//! `runDbosFunctionAsStep` are each one wrapper that every library step goes through.
+//! has the same question, so a library step cannot answer one of them differently from the rest.
 //!
 //! **What is *not* shared is the write**, and deliberately. A child await records the awaited id
 //! alongside the outcome and reads it back through

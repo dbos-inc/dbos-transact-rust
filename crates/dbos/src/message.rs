@@ -15,17 +15,16 @@
 //! receive consumes: the message is marked consumed in the same transaction that records the step
 //! that took it, so exactly one receiver gets it and a replay gets it again rather than taking
 //! another. A caller with no workflow has no step to record against, so it could only consume and
-//! then lose the message if anything went wrong afterwards. All four references reach the same
-//! conclusion, and `sysdb` states it at [`SystemDatabase::recv`](crate::sysdb::SystemDatabase::recv):
-//! its caller is not optional, where [`get_event`](crate::get_event)'s is. Code outside a workflow
+//! then lose the message if anything went wrong afterwards. `sysdb` states this at
+//! [`SystemDatabase::recv`](crate::sysdb::SystemDatabase::recv): its caller is not optional, where
+//! [`get_event`](crate::get_event)'s is. Code outside a workflow
 //! that wants to observe messages without taking them has
 //! [`get_all_notifications`](crate::sysdb::SystemDatabase::get_all_notifications).
 //!
-//! **The two calls differ on standing inside a step, and the references differ with them.** A
-//! [`send`] there is plain and uncheckpointed, as it is in Python, TypeScript and Java; a [`recv`]
-//! there is [`Error::InsideStep`], as it is in all four. The asymmetry is the point: a send that
-//! runs twice delivers twice, while a receive that runs twice *loses* a message, and only the
-//! second is unrecoverable. Go refuses both.
+//! **The two calls differ on standing inside a step.** A [`send`] there is plain and
+//! uncheckpointed; a [`recv`] there is [`Error::InsideStep`]. The asymmetry is the point: a send
+//! that runs twice delivers twice, while a receive that runs twice *loses* a message, and only the
+//! second is unrecoverable.
 //!
 //! **The free [`send`] is not just symmetry with [`set_event`](crate::set_event).** The registry
 //! lives on the instance, so a registered closure that captures a [`DBOS`] is stored inside the
@@ -48,17 +47,16 @@
 //! `send(destination_id, message)` and `send_bulk(messages)`. The `_with` forms take a
 //! [`SendMessage`] (or a slice of them) for everything about the message itself — destination,
 //! payload, topic, idempotency key — and [`SendOptions`] for everything about the call — the fork
-//! fan-out and the encoding. [`send_with`] takes one [`SendMessage`] where [`send_bulk_with`] takes a
-//! slice, and the same [`SendOptions`] serves both. That is the split
+//! fan-out and the encoding. [`send_with`] takes one [`SendMessage`] where [`send_bulk_with`] takes
+//! a slice, and the same [`SendOptions`] serves both. That is the split
 //! [`step`](crate::step())/[`step_with`](crate::step_with) and
 //! `fork`/[`fork_with`](crate::DBOS::fork_with) already make: the plain form for the common case,
 //! the `_with` form for everything else. [`fork_all`](crate::DBOS::fork_all) splits its batch the
 //! same way, with [`Fork`](crate::Fork) beside [`ForkOptions`](crate::ForkOptions).
 //!
-//! **The batch is on all three surfaces, not just the client.** Python and Java are the only
-//! references with a batch send and both expose it on their runtime as well as their client, and
-//! both checkpoint it from inside a workflow — one step for the whole batch. TypeScript and Go have
-//! no batch send to compare.
+//! **The batch is on all three surfaces, not just the client.** Inside a workflow it is
+//! checkpointed as one step for the whole batch, so a workflow fanning messages out gets the same
+//! all-or-none delivery a client does, and a replay sends none of it again.
 //!
 //! All of these are thin. `sysdb` owns the transactional insert, the fork fan-out, the replay
 //! skip, the consuming read, the concurrent-receive guard and the step names
@@ -114,11 +112,10 @@ use crate::sysdb::types::step_names;
 ///
 /// **From inside a step it sends plainly, with no checkpoint** — the leaf rule
 /// [`get_event`](crate::get_event) follows, the enclosing step's own checkpoint standing for
-/// everything its body did. The cost is real and is the references' accepted position rather than
-/// ours: a step that retries sends again, and this form has no idempotency key to stop it. Python,
-/// TypeScript and Java all do exactly this; Go alone refuses the call. A send that must happen once
-/// across retries wants [`send_with`] and a [`SendMessage::idempotency_key`], or wants hoisting out
-/// of the step, where the step id makes it exactly-once.
+/// everything its body did. The cost is real: a step that retries sends again, and this form has no
+/// idempotency key to stop it. A send that must happen once across retries wants [`send_with`] and
+/// a [`SendMessage::idempotency_key`], or wants hoisting out of the step, where the step id makes
+/// it exactly-once.
 ///
 /// Outside a workflow there is no context to take an executor from, so this is
 /// [`Error::NotInWorkflow`]. That is where [`DBOS::send`] is the call.
@@ -192,20 +189,15 @@ where
 /// vary per message, so they travel with the message, while [`SendOptions`] on [`send_bulk_with`]
 /// holds what is uniform across the call.
 ///
-/// Python and Java expose the same as `send_bulk` on their runtime as well as their client;
-/// TypeScript and Go have no batch send at all, and a caller there writes the loop and lives with
-/// the prefix.
-///
 /// # Why `bulk` and not `_all`
 ///
 /// The bulk *management* verbs here are [`cancel_all`](DBOS::cancel_all),
 /// [`resume_all`](DBOS::resume_all), [`fork_all`](DBOS::fork_all) and
 /// [`delete_all`](DBOS::delete_all), so `send_all` would have been the local rhyme. It is not the
-/// name because those four render a *pluralised noun* — Python's `cancel_workflows`, TypeScript's
-/// `cancelWorkflows`, Go's `CancelWorkflows` — into a form that reads on a type where the noun is
-/// implicit. A batch send is not that: Python and Java both chose the distinct word `bulk`, and
-/// `sysdb` already records this call as `DBOS.send_bulk`. A method named for one word that writes
-/// another is a seam for nothing.
+/// name because those four render a *pluralised noun* — the `workflows` the free forms below spell
+/// out — into a form that reads on a type where the noun is implicit. A batch send is not that: it
+/// has no noun to pluralise, and `sysdb` already records this call as `DBOS.send_bulk`. A method
+/// named for one word that writes another is a seam for nothing.
 ///
 /// The management verbs' *free* forms do take the plural noun —
 /// [`cancel_workflows`](crate::cancel_workflows), [`fork_workflows`](crate::fork_workflows) —
@@ -248,9 +240,8 @@ where
 /// `topic` of `None` is the default topic, and a receive on one topic never takes a message sent on
 /// another.
 ///
-/// `Ok(None)` means nothing was waiting when the deadline passed — absence is a value, not an error,
-/// and `Duration::ZERO` makes this a poll: look once, do not wait. Go is the outlier here and raises
-/// a timeout instead; the other three agree with this.
+/// `Ok(None)` means nothing was waiting when the deadline passed — absence is a value, not an
+/// error, and `Duration::ZERO` makes this a poll: look once, do not wait.
 ///
 /// The receive is checkpointed as two steps (the read and its deadline), so a replay returns the
 /// message the first run took, including a timeout's `None`, instead of consuming a second one.
@@ -273,16 +264,9 @@ where
 /// same by construction — its `recv` caller is a required parameter, so there is no uncheckpointed
 /// form of this call to degrade to.
 ///
-/// **[`send`] is the other way, and deliberately.** `sysdb` takes `None` for its caller there, so an
-/// uncheckpointed send is expressible where an uncheckpointed receive is not — and a send that runs
-/// twice delivers twice, where a receive that runs twice *loses* a message. Python, TypeScript and
-/// Java all send plainly from inside a step; only Go refuses, and following Go here would have made
-/// a workflow that ports cleanly between the other three stop working on Rust.
-///
-/// All four references block a receive inside a step, so this refusal is unanimous rather than a
-/// reading: Python raises from `is_workflow()`, TypeScript raises
-/// `DBOSInvalidWorkflowTransitionError` naming `step`, Go raises *"cannot call Recv within a step"*,
-/// and Java raises *"DBOS.recv() must not be called from within a step."*
+/// **[`send`] is the other way, and deliberately.** `sysdb` takes `None` for its caller there, so
+/// an uncheckpointed send is expressible where an uncheckpointed receive is not — and a send that
+/// runs twice delivers twice, where a receive that runs twice *loses* a message.
 pub fn recv<'a, T, E>(topic: Option<&'a str>, timeout: Duration) -> PendingStep<'a, Option<T>, E>
 where
     T: DeserializeOwned + 'a,
@@ -363,10 +347,10 @@ impl DBOS {
     /// Sends a message to a workflow, for it to [`recv`] when it is ready.
     ///
     /// The sender for code outside a workflow that still has an instance — an HTTP handler in the
-    /// application's own process approving an order the workflow is waiting on. **Inside a workflow,
-    /// reach for the free [`send`] instead**: it needs no handle, so the closure a workflow is
-    /// registered as captures nothing, and a captured [`DBOS`] is a cycle with the registry that
-    /// holds the closure.
+    /// application's own process approving an order the workflow is waiting on. **Inside a
+    /// workflow, reach for the free [`send`] instead**: it needs no handle, so the closure a
+    /// workflow is registered as captures nothing, and a captured [`DBOS`] is a cycle with the
+    /// registry that holds the closure.
     ///
     /// Called from outside a workflow there is no step to record, so the send is a plain insert and
     /// the only idempotency available is not sending twice. Called from inside one anyway, it
@@ -374,8 +358,8 @@ impl DBOS {
     /// except that it reports in the engine's own error channel, so a workflow with its own error
     /// type carries the result over with [`Error::lift`].
     ///
-    /// With one exception it cannot share: this takes its executor from `self` and its step ids from
-    /// the ambient context, so a handle to some *other* instance would split the two. That is
+    /// With one exception it cannot share: this takes its executor from `self` and its step ids
+    /// from the ambient context, so a handle to some *other* instance would split the two. That is
     /// [`Error::WrongInstance`] rather than a silent write into the wrong database.
     pub fn send<T: Serialize>(
         &self,
@@ -412,8 +396,8 @@ impl DBOS {
     /// Sends many messages in one transaction, for their destinations to [`recv`] when ready.
     ///
     /// The instance's [`send_bulk`], and it stands to that as [`send`](Self::send) does to the free
-    /// one: the caller for code outside a workflow that still has an instance. See [`send_bulk`] for
-    /// the batch's guarantees and how it is checkpointed.
+    /// one: the caller for code outside a workflow that still has an instance. See [`send_bulk`]
+    /// for the batch's guarantees and how it is checkpointed.
     pub fn send_bulk<T: Serialize>(
         &self,
         messages: &[SendMessage<'_, T>],
@@ -708,8 +692,6 @@ impl crate::Client {
     ///
     /// **All or none**, which is the reason to prefer this over a loop of [`send`](Self::send): the
     /// batch is one insert, so a failure halfway through delivers nothing rather than a prefix.
-    /// Python and Java expose the same as `send_bulk`; TypeScript and Go have no equivalent, and a
-    /// caller there writes the loop and lives with the prefix.
     ///
     /// **A topic and an idempotency key travel on each [`SendMessage`], and only the call's
     /// behaviour is in [`SendOptions`].** The key especially belongs to one message, since it
@@ -824,9 +806,9 @@ impl<'a, T> SendMessage<'a, T> {
 /// is what a call decides once for every message it carries: whether the messages also reach the
 /// destinations' forks, and how they are encoded.
 ///
-/// **A struct so that the next option is not a breaking change.** A send has accumulated options in
-/// every implementation, and each one arriving as another positional parameter would break every
-/// call site. This is where they land instead.
+/// **A struct so that the next option is not a breaking change.** A send's options grow over time,
+/// and each one arriving as another positional parameter would break every call site. This is where
+/// they land instead.
 ///
 /// Built by functional update from [`Default`], as [`Config`](crate::Config) and
 /// [`ForkOptions`](crate::ForkOptions) are:

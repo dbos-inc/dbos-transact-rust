@@ -28,8 +28,9 @@ use crate::sysdb::types::{
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
 ///
-/// The default every implementation shares. It only counts recoveries and dequeues; starting a
-/// workflow fresh never approaches it.
+/// The default other SDKs sharing the database use too, so a workflow is parked after the same
+/// number of attempts whichever executor counts them. It only counts recoveries and dequeues;
+/// starting a workflow fresh never approaches it.
 pub(crate) const MAX_RECOVERY_ATTEMPTS: i64 = 100;
 
 /// The tasks of one [`Role`] this executor started and has not seen finish.
@@ -296,10 +297,10 @@ pub struct RunOptions<'a> {
     /// **Durable, and unlike a step timeout it cancels rather than fails.** The budget becomes a
     /// wall-clock deadline stored on the row, so it survives a crash: a workflow recovered with
     /// two minutes left has two minutes, not the whole budget again. On expiry the row goes
-    /// `CANCELLED` and callers awaiting it get [`Error::WorkflowCancelled`], which is what all four
-    /// references do. Every executor of the application sweeps for expired deadlines, so the row is
-    /// cancelled whether or not anything is running it: a queued workflow nobody has dequeued, or
-    /// one whose executor died, times out too.
+    /// `CANCELLED` and callers awaiting it get [`Error::WorkflowCancelled`]. Every executor of the
+    /// application sweeps for expired deadlines, so the row is cancelled whether or not anything is
+    /// running it: a queued workflow nobody has dequeued, or one whose executor died, times out
+    /// too.
     ///
     /// A step's [`timeout`](crate::StepOptions::timeout) bounds one attempt and is recorded as a
     /// step failure; this bounds everything and is not the workflow's *outcome* at all — a
@@ -310,11 +311,10 @@ pub struct RunOptions<'a> {
     ///
     /// Searchable metadata: a tenant, a request id, a trace context. Plain JSON, never the
     /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by
-    /// every other implementation, so a workflow's own payload encoding has no say in it.
+    /// other SDKs sharing the database, so a workflow's own payload encoding has no say in it.
     ///
-    /// **Not inherited by a child**, which starts with whatever its own call names. TypeScript
-    /// says the same of its `attributes` in as many words; nothing propagates here because a child
-    /// is started through this same type.
+    /// **Not inherited by a child**, which starts with whatever its own call names: nothing
+    /// propagates because a child is started through this same type.
     pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -354,7 +354,7 @@ pub struct StartOptions<'a> {
     ///
     /// Searchable metadata: a tenant, a request id, a trace context. Plain JSON, never the
     /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by
-    /// every other implementation, so a workflow's own payload encoding has no say in it.
+    /// other SDKs sharing the database, so a workflow's own payload encoding has no say in it.
     ///
     /// **Not inherited by a child**, which starts with whatever its own call names — see
     /// [`RunOptions::attributes`].
@@ -366,10 +366,9 @@ pub struct StartOptions<'a> {
 /// **The queue-only options are nested here rather than sitting beside
 /// [`StartOptions::queue`](StartOptions::queue), and that is the whole design.** A deduplication
 /// id, a priority, a partition key, a delay and a [`duplication_policy`](Self::duplication_policy)
-/// each mean nothing without a queue: Go checks all five at start and returns `InvalidOptionError`
-/// for each, including the policy (`workflow.go`), which is five runtime errors describing states
-/// its type system allowed it to build. Owning them from the queue makes the same five
-/// unrepresentable — there is no queue-less value here to hang them on. Two rules survive as
+/// each mean nothing without a queue. Flat beside it, each would need a runtime error at start
+/// describing a state the type allowed a caller to build; owning them from the queue makes all
+/// five unrepresentable — there is no queue-less value here to hang them on. Two rules survive as
 /// refusals at start, because no shape can take them:
 ///
 /// - **A [`priority`](Self::priority) must be between 1 and [`i32::MAX`].** `0` is the stored
@@ -377,12 +376,8 @@ pub struct StartOptions<'a> {
 ///   reads like a real priority.
 /// - **[`DuplicationPolicy::ReturnExisting`] needs a
 ///   [`deduplication_id`](Self::deduplication_id)**, because a policy for resolving a collision is
-///   meaningless where nothing can collide. Python and Go refuse the same pair
-///   (`_enqueue_options.py`, `workflow.go`), and keeping the two apart is what makes the ordinary
+///   meaningless where nothing can collide. Keeping the two apart is what makes the ordinary
 ///   enqueue — a key, no policy — the short one to write.
-///
-/// TypeScript groups the same options into an `EnqueueOptions` bag (`system_database.ts`), which is
-/// the nearest precedent; Go and Python keep them flat on their options struct.
 ///
 /// The name is the address — a [`Queue`](crate::Queue) receipt is not needed to enqueue onto one,
 /// and a queue registered by a peer is as valid a destination as one registered here.
@@ -424,11 +419,10 @@ pub struct QueueRequest<'a> {
     /// Every queue honours it: the dequeue orders a queue's waiting workflows by priority, and
     /// by `created_at` among equal priorities.
     ///
-    /// **`None` is not "priority zero".** The column's `0` is the references' sentinel for
-    /// *unprioritised*, and it sorts ahead of every explicit priority — TypeScript says so in as
-    /// many words (*"starting from 1 ~ 2,147,483,647. Default 0 (highest priority)"*). Letting a
-    /// caller write `Some(0)` would spell one state two ways, so the range starts at 1 and `None`
-    /// is the only way to say "unprioritised".
+    /// **`None` is not "priority zero".** The column's `0` is the sentinel, shared with other SDKs
+    /// on the same database, for *unprioritised*, and it sorts ahead of every explicit priority.
+    /// Letting a caller write `Some(0)` would spell one state two ways, so the range starts at 1
+    /// and `None` is the only way to say "unprioritised".
     pub priority: Option<u32>,
     /// Which partition of a partitioned queue this workflow belongs to.
     ///
@@ -458,16 +452,11 @@ pub struct QueueRequest<'a> {
 
     /// What to do when the [`deduplication_id`](Self::deduplication_id) is already held.
     ///
-    /// Named as Python and TypeScript name it — `duplication_policy` and `duplicationPolicy`,
-    /// beside their `deduplication_id` — rather than shortened; Go says `DeduplicationPolicy`.
-    ///
     /// **Its own field rather than riding inside the key**, though the two are meaningless apart
     /// and keeping them separate costs a rule this type has to refuse at start. Folding them into
     /// one value makes the invalid pair unrepresentable, but only by making the *ordinary* enqueue
-    /// name a policy it does not care about: every implementation defaults to rejecting, and every
-    /// reference's queue tutorial leads with a bare deduplication id, keeping `return-existing`
-    /// for the singleton-workflow section that follows. The common case stays a key and nothing
-    /// else.
+    /// name a policy it does not care about, when the common case is a bare deduplication id that
+    /// rejects a collision. The common case stays a key and nothing else.
     pub duplication_policy: DuplicationPolicy,
     /// How the enqueued workflow's input, output and error are encoded.
     ///
@@ -488,9 +477,8 @@ pub struct QueueRequest<'a> {
 pub enum DuplicationPolicy {
     /// Refuse the enqueue, reporting the collision.
     ///
-    /// The default, and what every implementation defaults to. A caller who did not think about
-    /// collisions should hear that the key was taken, rather than silently joining a workflow
-    /// whose arguments are somebody else's.
+    /// The default. A caller who did not think about collisions should hear that the key was taken,
+    /// rather than silently joining a workflow whose arguments are somebody else's.
     ///
     /// **Started from inside a workflow, the error is recorded at the parent's step**, so a replay
     /// of the parent gets the same error and starts nothing, even once the holder has finished and
@@ -501,20 +489,14 @@ pub enum DuplicationPolicy {
     ///
     /// **Idempotent enqueue**: the first caller's workflow is the one that runs, and every later
     /// caller waits on it instead of being told no — so this caller's arguments are discarded,
-    /// which is the half worth knowing. Three implementations offer the choice — TypeScript's
-    /// `duplicationPolicy` (`dbos.ts`), Python's `duplication_policy` (`_context.py`) and Go's
-    /// `DeduplicationPolicy` (`workflow.go`) — and all three require a key, as this does. Java is
-    /// the one that always rejects, though it has the same lookup underneath: its `DebouncerClient`
-    /// hand-rolls the join with `findDeduplicationHolder`. All three document it as how a
-    /// *singleton workflow* is written.
+    /// which is the half worth knowing. It is how a *singleton workflow* is written.
     ///
     /// The key is held only while the holder is *waiting*, so this joins a backlog, not a history:
     /// once the holder has finished, the same key enqueues a new workflow.
     ///
     /// **Started from inside a workflow, the parent's launch record points at the workflow that was
     /// joined**, not at the id this call derived — so a replay resolves to the same workflow rather
-    /// than trying to start the child again. Go records the same mapping at the same reserved step
-    /// id, for the same stated reason (`workflow.go`).
+    /// than trying to start the child again.
     ///
     /// **A joined workflow is a child by one measure and not by the other, deliberately.** The
     /// relationship is stored twice: `operation_outputs.child_workflow_id` at the parent's step,
@@ -526,8 +508,7 @@ pub enum DuplicationPolicy {
     /// number of callers may join one workflow, and re-parenting it would let *this* parent's
     /// cascade cancel or delete a workflow somebody else created and is waiting on. So a joined
     /// workflow is resolved by the parent's replay and named among its steps, but is not listed
-    /// among its children and does not go down with it. Go's join path records the same one of the
-    /// two.
+    /// among its children and does not go down with it.
     ReturnExisting,
 }
 
@@ -558,9 +539,8 @@ impl<'a> QueueRequest<'a> {
     /// - **[`DuplicationPolicy::ReturnExisting`] needs a deduplication id**, since with no key
     ///   there is no collision to resolve.
     /// - **A priority must be at least 1.** `0` is the stored sentinel for unprioritised, so
-    ///   accepting it would give that state a second spelling that reads like a real priority;
-    ///   the references' documented range starts at 1 for the same reason. The ceiling is
-    ///   [`i32::MAX`] because the column is a signed 32-bit integer.
+    ///   accepting it would give that state a second spelling that reads like a real priority.
+    ///   The ceiling is [`i32::MAX`] because the column is a signed 32-bit integer.
     /// - **A delay must be more than zero, and fit in milliseconds as a 64-bit integer.** A zero
     ///   delay is a caller that meant `None`. Neither rule reads a clock, so a replay decides it as
     ///   the first run did. A delay that fits is never refused for the instant it reaches: the
@@ -928,7 +908,7 @@ pub(crate) async fn init_or_join(
                     }
                     // The holder finished between the conflict and this read, so the key is free
                     // again: retry the insert rather than report a collision with a workflow that
-                    // is over. Python and TypeScript both loop here.
+                    // is over.
                     None => continue,
                 }
             }
@@ -979,27 +959,9 @@ impl<'a> From<RunOptions<'a>> for StartOptions<'a> {
 /// mean both, and inheritance is the more useful default, so an unbounded child would have been
 /// inexpressible.
 ///
-/// **All four references carry these three states**, which is why they are an enum here rather
-/// than a convention:
-///
-/// - **Java** is the same shape under the same first name: a sealed `Timeout` permitting
-///   `Timeout.Inherit`, `Timeout.None` and `Timeout.Explicit` (`workflow/Timeout.java`), resolved
-///   at `DBOSContext.resolveTimeoutAndDeadline` — where the `None` case clears the propagated
-///   deadline *and* the timeout, exactly as [`None`](Self::None) does here. This is the one place
-///   Java **is** the model, variant names included; where it is not is its user-facing
-///   `withDeadline` and the precedence that follows from it, which Rust lacks.
-/// - **TypeScript** spells the three as `number | null | undefined` (`context.ts`) and branches
-///   on the middle one under the comment *"Detach child deadline if a null timeout is configured"*
-///   (`dbos.ts`, and again at `enqueue_workflow.ts`).
-/// - **Python** reaches them through `SetWorkflowTimeout(None)`, whose `__enter__` clears the
-///   propagated deadline as well as the timeout (`_context.py`).
-/// - **Go** gets all three for free, because its deadline rides on a `context` a caller may
-///   decline to pass on.
-///
-/// **The variant names are Java's**, so the two SDKs spell the same three states the same way and
-/// a reader crossing between them has nothing to translate. `Timeout::None` does sit next to the
-/// `Option`s this crate is written in, which is worth a moment's care at a call site and worth
-/// less than the parity.
+/// [`None`](Self::None) clears the propagated deadline *and* the timeout, so a child that says
+/// "no limit" is detached from its parent's budget. `Timeout::None` does sit next to the `Option`s
+/// this crate is written in, which is worth a moment's care at a call site.
 ///
 /// Outside a workflow there is nothing to inherit, so [`Inherit`](Self::Inherit) and
 /// [`None`](Self::None) mean the same thing there: no deadline.
@@ -1015,18 +977,14 @@ pub enum Timeout {
     /// Run for as long as it likes, **even under a parent that has a deadline**.
     ///
     /// The state an `Option<Duration>` cannot express, and the reason this is an enum: `Inherit`
-    /// is a caller who said nothing, and this is a caller who decided. `Timeout.None` in Java,
-    /// a `null` timeout in TypeScript, `SetWorkflowTimeout(None)` in Python.
+    /// is a caller who said nothing, and this is a caller who decided.
     None,
     /// A budget, counted from now.
     ///
     /// **Replaces an inherited deadline rather than being bounded by it**, even when it is the
     /// longer of the two — so a child given more time than its parent has left outlives its
-    /// parent. That is Python's and TypeScript's rule and their shared comment (*"If a timeout is
-    /// explicitly specified, use it over any propagated deadline"*), and it is defensible for the
-    /// reason it reads: an explicit timeout on one specific child is a statement about that child.
-    /// Go takes the earlier of the two instead, but not by design — `context.WithTimeout` composes
-    /// as a minimum and nobody wrote a precedence rule.
+    /// parent. An explicit timeout on one specific child is a statement about that child, so it
+    /// is used over any propagated deadline.
     Explicit(Duration),
 }
 
@@ -1416,13 +1374,12 @@ where
 /// from and what a replay of this position derives again.
 fn child_workflow_id(chosen: Option<&str>, parent: Option<&Parent<'_>>) -> String {
     match (chosen, parent) {
-        // An application-assigned id wins over the derivation, in every reference.
+        // An application-assigned id wins over the derivation.
         (Some(id), _) => id.to_owned(),
         // **`{parent}-{step_id}`, and it must be derived rather than random**: a recovered
         // parent re-derives the same id, so the launch is idempotent even when the crash
-        // landed between creating the child and recording it. Rust's step ids are zero-based
-        // (Go, TypeScript and Java; Python is the one-based outlier — see UPSTREAM item 19),
-        // so a first child is `parent-0` here and in three of the four.
+        // landed between creating the child and recording it. Step ids are zero-based and
+        // public, so a first child is `parent-0`.
         (None, Some(parent)) => format!("{}-{}", parent.workflow_id(), parent.step_id),
         (None, None) => uuid::Uuid::new_v4().to_string(),
     }
@@ -1484,8 +1441,8 @@ pub(crate) async fn create<R, E>(
     } = request;
     let owned_queue = queue.as_ref().map(OwnedQueueRequest::as_queue_request);
     let enqueue = owned_queue.as_ref();
-    // **The ambient context is what makes this a child.** Every reference overloads the same
-    // call rather than adding a `start_child`, so factoring a workflow body out into its own
+    // **The ambient context is what makes this a child.** The same call serves both rather
+    // than a separate `start_child`, so factoring a workflow body out into its own
     // workflow does not change how its call sites are written — and a workflow started from
     // outside one is unaffected by everything below.
     let parent = placed.parent();
@@ -1529,12 +1486,11 @@ pub(crate) async fn create<R, E>(
         // parent and the child genuinely share: both `select!`s fire at the same moment, in
         // different tasks and possibly in different processes, with no signal passing between
         // them. A propagated deadline is the cancellation cascade, and needs no other one.
-        // **Inherited even onto a queue**, and this is not an oversight in Python's code: its
-        // `_get_timeout_deadline` branches on the queue only inside the explicit-timeout arm,
-        // and returns the propagated deadline unconditionally otherwise. The difference is
-        // what the two mean. A budget is a promise about how long the *work* may take, so the
-        // queue wait cannot count against it; an inherited deadline is an instant a parent is
-        // already bound by, and a child does not escape it by being queued.
+        // **Inherited even onto a queue**, though an explicit budget on a queued workflow is
+        // not counted from the enqueue. The difference is what the two mean. A budget is a
+        // promise about how long the *work* may take, so the queue wait cannot count against it;
+        // an inherited deadline is an instant a parent is already bound by, and a child does not
+        // escape it by being queued.
         (Timeout::Inherit, Some(parent)) => parent.deadline(),
         (Timeout::Inherit, None) => None,
     };
@@ -1612,8 +1568,7 @@ pub(crate) async fn create<R, E>(
         Err(error) => return Err(error),
         // **The start records the workflow that was joined**, not the id this call derived,
         // so a replay of this position resolves to the same workflow instead of trying to
-        // start a child that was never created. Go records the same mapping at the same
-        // reserved step id.
+        // start a child that was never created.
         //
         // Only this record, and not the joined workflow's own `parent_workflow_id`: it has an
         // owner already, and a cascade following that column must not reach a workflow this
@@ -1670,9 +1625,7 @@ pub(crate) async fn create<R, E>(
             "another caller created the workflow; the handle joins it"
         );
         // Park-and-adopt, one frame out from the one in `execute`: `init_workflow` just read this
-        // row, and it is the case the references pass their own flag on — Python parks its unowned
-        // dispatch with `fail_if_missing=True` (`_core.py`) and Go its lost start race
-        // (`workflow.go`).
+        // row, so a row that goes missing afterwards was deleted.
         return Ok(WorkflowHandle::polling(
             Arc::clone(executor.connection()),
             workflow_id,
@@ -2167,13 +2120,9 @@ impl Parent<'_> {
     /// [`DuplicationPolicy::ReturnExisting`] describes, held by the shape rather than by care.
     ///
     /// **The step name is the workflow's bare name**, not the `name`/`class_name`/`config_name`
-    /// triple that identifies it — and that is four of four rather than a narrowing, including both
-    /// references that also carry a class and a config. Python records `get_dbos_func_name(func)`
-    /// and hands the other two to `_init_workflow` separately (`_core.py`); Java records
-    /// `workflowName` beside a `className` on the status row (`DBOSExecutor.java`); Go has one name
-    /// to record. The qualification belongs to the child's own row, which the `init_workflow` call
-    /// above fills in — this column is the *parent's* step listing, where the name is what a reader
-    /// is looking for.
+    /// triple that identifies it. The qualification belongs to the child's own row, which the
+    /// `init_workflow` call above fills in — this column is the *parent's* step listing, where the
+    /// name is what a reader is looking for.
     async fn record_child(
         &self,
         executor: &Executor,
@@ -2516,8 +2465,8 @@ async fn adopt_superseded(
     slot: Option<crate::dequeue::Slot>,
 ) -> std::result::Result<EncodedOutput, Failure> {
     drop(slot);
-    // Park-and-adopt, the path every reference passes its own flag on: this execution has read the
-    // row, whether it created it, recovered it or dequeued it, so a missing one has been deleted.
+    // Park-and-adopt: this execution has read the row, whether it created it, recovered it or
+    // dequeued it, so a missing one has been deleted.
     executor.connection().adopt(workflow_id, true).await
 }
 

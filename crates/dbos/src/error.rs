@@ -88,9 +88,8 @@ pub type Result<T, E = EngineOnly> = std::result::Result<T, Error<E>>;
 
 /// Everything a durable function can fail with.
 ///
-/// `#[non_exhaustive]` because more of the error codes the other implementations share arrive
-/// with the phases that raise them; matching callers need a wildcard arm from the start rather
-/// than a breaking change later.
+/// `#[non_exhaustive]` because more variants arrive with the features that raise them; matching
+/// callers need a wildcard arm from the start rather than a breaking change later.
 ///
 /// **Serializable, and that is load-bearing.** A failed workflow or step records the error it
 /// failed with, and a replay has to give back *that error* rather than a description of it — the
@@ -110,8 +109,8 @@ pub enum Error<E = EngineOnly> {
 
     /// An operation needing a running executor was called before [`launch`](crate::DBOS::launch).
     ///
-    /// Names the operation, following Java's `ensureLaunched(caller)`: the useful half of this
-    /// error is which call was too early, and a bare "not launched" makes the developer find it.
+    /// Names the operation: the useful half of this error is which call was too early, and a bare
+    /// "not launched" makes the developer find it.
     #[error("cannot {operation} before DBOS is launched")]
     NotLaunched {
         /// The operation that was called too early.
@@ -362,10 +361,8 @@ pub enum Error<E = EngineOnly> {
     /// Not [`WorkflowCancelled`](Self::WorkflowCancelled), and the distinction is the whole reason
     /// this variant exists: that one means *this* workflow is being cancelled and must stop, while
     /// this one means the workflow it awaited will never produce a result. A parent told the first
-    /// when its child was cancelled would stop itself, which is not what happened and not what any
-    /// implementation does — Python raises `DBOSAwaitedWorkflowCancelledError` "because the
-    /// awaiting workflow is not being cancelled", and Go's `AwaitedWorkflowCancelledError` is the
-    /// same error under the same reasoning.
+    /// when its child was cancelled would stop itself, which is not what happened: the awaiting
+    /// workflow is not being cancelled.
     ///
     /// It is the awaited workflow's *outcome*, so it is recorded like one: a replayed parent is
     /// told the same thing without waiting again.
@@ -477,15 +474,12 @@ pub enum Error<E = EngineOnly> {
     /// A step attempt ran past its timeout and was stopped.
     ///
     /// **Ordinary failure, not a control signal**: it is offered to the retry predicate and
-    /// retried like any other, which is what TypeScript's `StepConfig.timeoutMS` documents. A step
-    /// whose attempts all time out fails with
+    /// retried like any other. A step whose attempts all time out fails with
     /// [`MaxStepRetriesExceeded`](Self::MaxStepRetriesExceeded) holding one of these per attempt.
     ///
     /// The timeout bounds **one attempt**, not the step: three attempts at five seconds may take
     /// fifteen seconds of body time, plus backoff. Nothing here carries a numeric error code,
-    /// because the portable error shape matches on `name` and makes `code` optional — Python codes
-    /// this error 18 and TypeScript codes it 31, and neither is a value a fifth implementation
-    /// should adopt.
+    /// because the portable error shape matches on `name` and makes `code` optional.
     #[error("the step {step} exceeded its {}ms timeout", timeout.as_millis())]
     StepTimeout {
         /// The step's name.
@@ -518,10 +512,9 @@ pub enum Error<E = EngineOnly> {
 
     /// A step was retried to its limit and every attempt failed.
     ///
-    /// Carries **all** of them rather than the last, which is Python's and TypeScript's shape and
-    /// not Java's, which rethrows the final failure untyped. The first failure is usually the
-    /// informative one and the last is usually a timeout, so keeping only one loses the half that
-    /// explains the other.
+    /// Carries **all** of them rather than the last. The first failure is usually the informative
+    /// one and the last is usually a timeout, so keeping only one loses the half that explains the
+    /// other.
     ///
     /// Raised only where retries were actually asked for. A step left at the default
     /// [`StepOptions::max_attempts`](crate::StepOptions::max_attempts) of 1 records whatever its one

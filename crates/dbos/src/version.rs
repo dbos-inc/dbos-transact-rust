@@ -4,7 +4,7 @@
 //! Every executor registers its version at launch, and the **latest** version, the one with the
 //! highest timestamp, is what an enqueue that names no version runs on. Promoting a version moves
 //! its timestamp past every other's, so promoting an older one is a rollback. Both an application
-//! and a [`Client`] can read the registry and promote a version, as in the other implementations.
+//! and a [`Client`] can read the registry and promote a version.
 
 use crate::connection::Connection;
 use crate::error::{Error, Result};
@@ -53,8 +53,7 @@ impl Client {
     /// themselves, and which one a workflow row's `app_version` refers to. A *named*
     /// client answers that question for its own application only — a peer's versions are not in
     /// the listing, and nothing here reads them, which is why a tool that has to see every
-    /// application leaves [`app_name`](crate::ClientConfig::app_name) unset. Python and TypeScript
-    /// scope their listing the same way, and take no target either.
+    /// application leaves [`app_name`](crate::ClientConfig::app_name) unset.
     pub async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
         self.connection().list_app_versions().await
     }
@@ -78,8 +77,8 @@ impl Client {
     /// The version must already exist; this does not register one. Registration is an executor's
     /// business, because a version is a claim about code that is running somewhere. **A name that
     /// matches nothing is not an error**, though: the write moves no row and reports success, so a
-    /// misspelled rollback reads as a rollback. Every implementation discards the row count here;
-    /// UPSTREAM item 2.
+    /// misspelled rollback reads as a rollback: the row count is discarded. Whether it should be
+    /// reported is an open question shared with the other SDKs on the same database.
     ///
     /// Scoped to this client's application, as every write here is. Promoting a version another
     /// application registered fails rather than moving it — a timestamp is what a peer's fleet is
@@ -88,8 +87,8 @@ impl Client {
     ///
     /// **That scoping needs the client to have a name.** A client configured without an
     /// [`app_name`](crate::ClientConfig::app_name) has nothing to be refused under, so it
-    /// promotes whatever version it names, a peer's included — which is either what namelessness
-    /// is for or a shared gap, and UPSTREAM item 26 asks the team which.
+    /// promotes whatever version it names, a peer's included. Whether that is what namelessness is
+    /// for or a gap is an open question shared with the other SDKs on the same database.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {
@@ -110,13 +109,9 @@ impl Client {
     /// a single operator tool roll several applications on a shared system database without
     /// connecting a client per application.
     ///
-    /// **The setter takes a name where the reader does not, and that asymmetry is the references'
-    /// too** — Python's `set_latest_application_version` has an `application_name` keyword and
-    /// TypeScript's an `applicationName` option, while neither `get_latest_application_version`
-    /// takes anything. Promotion is the operation that *claims*: the write also adopts a version
-    /// left unclaimed, which would otherwise read as every peer's latest. Reading claims nothing,
-    /// so it has nothing to say a name about. Go is the one implementation whose client promotes
-    /// without an override at all.
+    /// **The setter takes a name where the reader does not.** Promotion is the operation that
+    /// *claims*: the write also adopts a version left unclaimed, which would otherwise read as
+    /// every peer's latest. Reading claims nothing, so it has nothing to say a name about.
     ///
     /// A version some *third* application registered is still refused — naming an application is
     /// how a caller says which fleet it means, not a way around ownership.

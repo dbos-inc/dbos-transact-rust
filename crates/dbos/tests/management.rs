@@ -1604,8 +1604,7 @@ async fn forking_in_bulk_refuses_invalid_forks_and_writes_nothing() {
 /// **A resume can name the queue it goes back on**, which is how a backlog is resumed without
 /// flooding the fleet — the internal queue takes no limits.
 ///
-/// All four references offer it too. The proof is the row's own `queue_name` after the resume,
-/// not just that the workflow ran.
+/// The proof is the row's own `queue_name` after the resume, not just that the workflow ran.
 #[tokio::test]
 async fn resuming_onto_a_named_queue_puts_the_workflow_there() {
     let db = test_database().await;

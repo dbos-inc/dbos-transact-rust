@@ -201,9 +201,9 @@ async fn a_start_with_an_empty_workflow_id_is_refused_as_an_argument() {
 
 /// Attributes reach the row of a workflow this process runs, not only of one that was enqueued.
 ///
-/// Searchable metadata is a property of the workflow rather than of the queue it waited on, and
-/// TypeScript and Python both attach it on the start path too. The child is here because nothing
-/// propagates: a child carries what its own call names, and this one names nothing.
+/// Searchable metadata is a property of the workflow rather than of the queue it waited on, so the
+/// start path attaches it too. The child is here because nothing propagates: a child carries what
+/// its own call names, and this one names nothing.
 #[dbos_test_support::test]
 async fn a_started_workflow_carries_the_attributes_it_was_given() {
     let db = test_database().await;

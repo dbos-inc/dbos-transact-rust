@@ -19,8 +19,8 @@ use dbos_test_support::{Backend, TestDatabase, owner_token, test_database};
 /// DBOS computes none, so a launch without one fails, and it has to be stable across a relaunch of
 /// the same application or the relaunch would recover nothing. It cannot simply be a shared
 /// constant, though: `application_versions` carries a global `UNIQUE (version_name)`, so two
-/// differently-named applications sharing one database cannot both register `1.0.0` — see the
-/// UPSTREAM notes on `resolve_owning_application`, and
+/// differently-named applications sharing one database cannot both register `1.0.0` — see
+/// `resolve_owning_application` in the system database, and
 /// `lifecycle::a_launch_that_fails_after_connecting_closes_the_database`, which contests a version
 /// on purpose. Keying on the name gives both properties at once.
 fn app_version(app_name: &str) -> String {
@@ -42,12 +42,10 @@ async fn reader(db: &TestDatabase) -> PostgresSystemDatabase {
 /// The child's id is `{parent}-{step_id}`, its row records the parent, and the parent records the
 /// start as a step.
 ///
-/// Zero-based, matching Go, TypeScript and Java: a parent's first child is `parent-0`. Python is
-/// the one-based outlier, which is the step-numbering inconsistency showing up in an id.
+/// Zero-based, like the step ids the name is built from: a parent's first child is `parent-0`.
 ///
 /// **A `run` costs two step ids** — the start and the await — so consecutive children are `-0` and
-/// `-2` rather than `-0` and `-1`. Every reference numbers them the same way, for the same reason:
-/// one counter, and both halves take from it.
+/// `-2` rather than `-0` and `-1`: one counter, and both halves take from it.
 #[tokio::test]
 async fn a_child_is_named_for_its_parent_and_the_step_that_started_it() {
     let db = test_database().await;
@@ -1520,7 +1518,7 @@ async fn a_child_that_is_never_awaited_is_still_recorded() {
     dbos.shutdown().await;
 }
 
-/// A child cannot be started from inside a step, in every implementation.
+/// A child cannot be started from inside a step.
 ///
 /// A step is a leaf, and an id-allocating call inside one shifts every later step onto the wrong
 /// replay slot. There is no plain version of a durable start to degrade to, so this is an error
@@ -1959,9 +1957,9 @@ async fn a_child_inherits_its_parents_deadline() {
 
 /// A child's own timeout replaces the inherited deadline, even when it is the longer of the two.
 ///
-/// Python and TypeScript carry this rule and its comment identically: *"If a timeout is explicitly
-/// specified, use it over any propagated deadline"*. The visible consequence is that such a child
-/// **outlives its parent** — which is the point of asking for a timeout on one specific child.
+/// An explicitly specified timeout is used over any propagated deadline. The visible consequence is
+/// that such a child **outlives its parent** — which is the point of asking for a timeout on one
+/// specific child.
 #[tokio::test]
 async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
     let db = test_database().await;
@@ -2026,10 +2024,8 @@ async fn a_childs_own_timeout_replaces_the_inherited_deadline() {
 /// A child can decline the inherited deadline outright, which no `Option<Duration>` could say.
 ///
 /// [`Timeout::Inherit`] is a caller who said nothing and [`Timeout::None`] is a caller who decided,
-/// and only the second detaches a child from a parent that has a budget. All four references carry
-/// the same three states — Java's `Timeout.None`, a `null` timeout in TypeScript, Python's
-/// `SetWorkflowTimeout(None)` — and each clears the propagated deadline rather than merely leaving
-/// it unset.
+/// and only the second detaches a child from a parent that has a budget: it clears the propagated
+/// deadline rather than merely leaving it unset.
 ///
 /// The row is the assertion: no deadline, and no timeout either. A `workflow_timeout_ms` here
 /// would be a budget nobody asked for, and it is the column a queue recomputes a deadline from.
@@ -2195,10 +2191,9 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
 
 /// A start position that already holds a *plain* step is an error, not a second child.
 ///
-/// **Stricter than every reference, deliberately.** Python falls through and starts a fresh child,
-/// and Go's `CheckChildWorkflow` returns nothing for such a row; both then collide on the write a
-/// moment later, so both end up loud rather than wrong — but only after creating and orphaning a
-/// child workflow. Refusing before anything is created leaves nothing behind to clean up.
+/// **Refused before anything is created, deliberately.** Falling through to a fresh child would
+/// collide on the step write a moment later, so it would end up loud rather than wrong — but only
+/// after creating and orphaning a child workflow. Refusing first leaves nothing behind to clean up.
 ///
 /// The situation is a parent whose code changed under it: `step("child")` at position 0 became
 /// `child.run(())`. Planted directly here rather than staged across two processes, because the

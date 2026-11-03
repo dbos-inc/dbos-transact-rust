@@ -28,33 +28,30 @@
 //!
 //! **Settled, not succeeded.** A workflow counts as finished once its status leaves `PENDING`,
 //! `ENQUEUED` and `DELAYED` — so a cancelled or dead-lettered member ends the wait like any other.
-//! Python and TypeScript exclude exactly those three, and the reason is the same in all three: the
-//! caller asked which race finished first, and a set that has to be re-waited because one member
-//! was cancelled is a wait that can hang on a workflow nobody is running any more.
+//! The caller asked which race finished first, and a set that has to be re-waited because one
+//! member was cancelled is a wait that can hang on a workflow nobody is running any more.
 //!
 //! Neither call returns an outcome, and that is not an omission. What a workflow *returned* comes
 //! back through its own [`WorkflowHandle::result`](crate::WorkflowHandle::result), typed, and a
-//! wait over a set has no one type to give. So these answer *when*, and the handle answers *what*
-//! — which is exactly how Python and TypeScript split it too.
+//! wait over a set has no one type to give. So these answer *when*, and the handle answers *what*.
 //!
-//! # Where this differs from the references
+//! # Ids in, ids out
 //!
-//! **They return handles; these return ids.** `DBOS.waitFirst` hands back the handle that won,
-//! which in a language without ownership costs nothing: the caller still holds the others. Handing
-//! back an owned [`WorkflowHandle`](crate::WorkflowHandle) here would mean taking the whole set by
-//! value and dropping every loser, which is precisely the wrong thing for the loop the call exists
-//! for. So the answer is the winner's **id** — the identity the handle carried anyway, and the same
-//! thing the checkpoint stores, so nothing is projected on the way out and re-derived on replay.
+//! **These return ids, not handles.** Handing back an owned
+//! [`WorkflowHandle`](crate::WorkflowHandle) would mean taking the whole set by value and dropping
+//! every loser, which is precisely the wrong thing for the loop the call exists for. So the answer
+//! is the winner's **id** — the identity the handle carried anyway, and the same thing the
+//! checkpoint stores, so nothing is projected on the way out and re-derived on replay.
 //!
 //! A position in the slice would be the only positional return in this crate (`cancel_all` and
 //! its neighbours take ids and give back ids), is meaningful only against the exact slice it came
 //! from, and would force a set with no repeats — all to skip a
 //! [`position`](std::iter::Iterator::position) lookup in the drain loop above.
 //!
-//! `join_workflows` returns nothing for the same reason its references return their inputs
-//! unchanged: there is nothing to hand back that the caller did not already have.
+//! `join_workflows` returns nothing: there is nothing to hand back that the caller did not already
+//! have.
 //!
-//! **They take handles; these take ids.** Every bulk call here that only names workflows takes
+//! **These take ids, not handles.** Every bulk call here that only names workflows takes
 //! `&[&str]` — [`cancel_all`](crate::DBOS::cancel_all), [`delete_all`](crate::DBOS::delete_all),
 //! [`resume_all`](crate::DBOS::resume_all) — and a wait is not different enough to spell its
 //! argument a second way. It also makes the heterogeneous case expressible: a fan-out whose members
@@ -63,9 +60,8 @@
 //! **Both waits are here.** A fan-out wants both questions — which member finished first, and
 //! when have they all — and having one without the other would leave the natural pair half-built.
 //!
-//! **They are named for the concurrency primitives, not for the references.** Python's `wait_first`
-//! and TypeScript's `waitFirst`/`waitAll` describe the wait; `select_workflow` and `join_workflows`
-//! name the *shape* a Rust caller already knows it by, from `tokio::select!` and `tokio::join!` —
+//! **They are named for the concurrency primitives.** `select_workflow` and `join_workflows` name
+//! the *shape* a Rust caller already knows it by, from `tokio::select!` and `tokio::join!` —
 //! one branch of several wins, or every branch is joined. That is the name the macros over them
 //! take, and a function and its macro that do the same thing under two different names is a seam to
 //! learn for nothing.
@@ -84,9 +80,8 @@
 //!
 //! **`join_workflows` is checkpointed nowhere, on any of its three surfaces.** It decides nothing:
 //! every member has settled by the time it returns, in whatever order, so there is no choice for a
-//! step to pin. TypeScript wraps its `waitAll` in a `runInternalStep` all the same, recording only
-//! that the wait happened, and that row is not worth a step id here — for a reason stronger than
-//! the row being cheap:
+//! step to pin. A step recording only that the wait happened is not worth a step id — for a reason
+//! stronger than the row being cheap:
 //!
 //! - **Whatever it could pin is already pinned harder by what comes after it.** An all-wait is
 //!   written to be followed by [`result`](crate::WorkflowHandle::result) on each handle, and each
@@ -109,15 +104,14 @@
 //!
 //! **A replay of a first-wait checks what its payload lets it check, and no more.** It can ask
 //! whether the recorded winner is still in the set, because the winner is what it recorded anyway.
-//! Step *inputs* are not checkpointed anywhere in DBOS — no implementation's step row has a column
-//! for them — so a replay whose arguments changed reads back the answer to the question it asked
-//! the first time, exactly as a [`sleep`](crate::sleep()) whose duration changed keeps the deadline
-//! it recorded.
+//! Step *inputs* are not checkpointed anywhere — the step row has no column for them — so a replay
+//! whose arguments changed reads back the answer to the question it asked the first time, exactly
+//! as a [`sleep`](crate::sleep()) whose duration changed keeps the deadline it recorded.
 //!
 //! Outside a workflow the first-wait is not checkpointed either, which is the operator's and the
 //! client's case; inside a *step* it is plain too, by the leaf rule every id-allocating call in
 //! this crate follows. [`StepPlacement`] owns those rules and the argument for each. The all-wait
-//! is the same call in all four places.
+//! is the same call in all of these places.
 //!
 //! # Three surfaces, split by where the caller stands
 //!
@@ -165,10 +159,8 @@
 //!
 //! Neither takes a timeout, for the reason
 //! [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) gives at length:
-//! `tokio::time::timeout` around the future, or dropping it, ends the poll. No reference offers one
-//! here either — Python's `wait_first` and TypeScript's `waitFirst`/`waitAll` take a polling
-//! interval and nothing else — but where they would have to grow a parameter to bound the wait,
-//! the language already supplies it.
+//! `tokio::time::timeout` around the future, or dropping it, ends the poll: the language already
+//! supplies the bound, so the call needs no parameter for it.
 
 use std::sync::Arc;
 
@@ -525,12 +517,11 @@ impl DBOS {
     ///
     /// **"Finishes" means settled, not succeeded**: a workflow counts once its status leaves
     /// `PENDING`, `ENQUEUED` and `DELAYED`, so a cancelled or dead-lettered member ends the wait
-    /// like any other. Python and TypeScript exclude exactly those three. What a workflow
-    /// *returned* comes back through its own
+    /// like any other. What a workflow *returned* comes back through its own
     /// [`WorkflowHandle::result`](crate::WorkflowHandle::result), typed — this answers *when*, and
     /// the handle answers *what*.
     ///
-    /// **The winner's id, where the references hand back its handle.** Returning an owned
+    /// **The winner's id, not its handle.** Returning an owned
     /// [`WorkflowHandle`](crate::WorkflowHandle) would mean taking the whole set by value and
     /// dropping every loser, which is the wrong thing for the loop this call exists for. The id is
     /// the identity that handle carried, it is what the checkpoint stores, and it is what every
@@ -543,30 +534,27 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     ///
-    /// **A tie is broken arbitrarily.** Two workflows that settle within the same poll interval
-    /// are not ordered by anything — the interval is the resolution at which this can observe
-    /// finishing, and neither Python nor TypeScript orders its own query either. Inside a workflow
-    /// that costs nothing, because the winner is recorded and a replay reads it back instead of
-    /// racing again; outside one, a second call over the same settled set may answer differently.
+    /// **A tie is broken arbitrarily.** Two workflows that settle within the same poll interval are
+    /// not ordered by anything — the interval is the resolution at which this can observe
+    /// finishing. Inside a workflow that costs nothing, because the winner is recorded and a replay
+    /// reads it back instead of racing again; outside one, a second call over the same settled set
+    /// may answer differently.
     /// [`await_first_workflow_id`](crate::sysdb::SystemDatabase::await_first_workflow_id) sets out
     /// why an `ORDER BY` would make this worse rather than better.
     ///
-    /// **Duplicate ids are accepted**, here and in [`join_workflows`](Self::join_workflows). Python
-    /// and TypeScript both refuse them, for a reason that does not reach a Rust caller: they return
-    /// the winning *handle*, so they key a map by id, and a repeat would put two handles under one
-    /// key. An id has no such collision — a set with `a` twice answers `a`, which names one
-    /// workflow however many entries pointed at it. A caller-supplied id that
+    /// **Duplicate ids are accepted**, here and in [`join_workflows`](Self::join_workflows). An
+    /// answer that is an id has no collision to fear — a set with `a` twice answers `a`, which
+    /// names one workflow however many entries pointed at it. A caller-supplied id that
     /// [`start`](crate::WorkflowRef::start) joined to a run already going produces exactly that
     /// set, legitimately, and there is nothing here for it to break.
     ///
     /// **An empty slice is refused** rather than waited on — the one input either wait rejects.
-    /// Python raises here too; a wait for one of nothing has no answer it could ever give, where a
-    /// wait for *all* of nothing is already satisfied.
+    /// A wait for one of nothing has no answer it could ever give, where a wait for *all* of
+    /// nothing is already satisfied.
     ///
     /// **An id naming no workflow is waited for, not reported**, which is what makes a set of ids
     /// usable before every enqueue has committed — and what makes a mistyped id a wait that never
-    /// ends. That is the trade every reference makes here, and the bound on it is dropping the
-    /// future.
+    /// ends. The bound on that is dropping the future.
     pub fn select_workflow<'a>(&self, workflow_ids: &'a [&'a str]) -> PendingStep<'a, String> {
         let built = self
             .executor("select_workflow")
@@ -582,7 +570,7 @@ impl DBOS {
     /// **"Finishes" means settled, not succeeded** — see
     /// [`select_workflow`](Self::select_workflow), which shares this call's definition of it.
     /// Nothing is returned because there is nothing to hand back that the caller did not already
-    /// have: TypeScript's `waitAll` returns its input unchanged for the same reason.
+    /// have.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS, handles: Vec<dbos::WorkflowHandle<u32>>) -> dbos::Result<()> {
@@ -597,15 +585,14 @@ impl DBOS {
     /// slice returns at once** — nothing to wait for is a satisfied wait, where an empty first-wait
     /// has no answer and is refused.
     ///
-    /// **Nothing is checkpointed**, unlike [`select_workflow`](Self::select_workflow) and unlike
-    /// every reference that has this call — the module doc argues it. Two consequences follow from
-    /// that and are worth stating. A member *resumed* after it settled, a cancelled workflow put
-    /// back on a queue, is waited for again by a replay where a recorded step would have returned
-    /// at once — that is the call answering the question it was asked, which is about the set now.
-    /// And a member *deleted* between one execution and the next never settles, so a replayed join
-    /// waits where awaiting each handle in turn would have read back the outcomes the parent
-    /// already recorded; the free [`join_workflows`](fn@join_workflows) sets out why, and what to
-    /// reach for instead.
+    /// **Nothing is checkpointed**, unlike [`select_workflow`](Self::select_workflow) — the module
+    /// doc argues it. Two consequences follow from that and are worth stating. A member *resumed*
+    /// after it settled, a cancelled workflow put back on a queue, is waited for again by a replay
+    /// where a recorded step would have returned at once — that is the call answering the question
+    /// it was asked, which is about the set now. And a member *deleted* between one execution and
+    /// the next never settles, so a replayed join waits where awaiting each handle in turn would
+    /// have read back the outcomes the parent already recorded; the free
+    /// [`join_workflows`](fn@join_workflows) sets out why, and what to reach for instead.
     ///
     /// Called from inside a workflow it behaves exactly as it does outside one, so an instance
     /// that is not the ambient workflow's is a plain wait here rather than
@@ -626,10 +613,8 @@ impl DBOS {
 /// [`WorkflowHandle::result`](crate::WorkflowHandle::result) already draws for a client's handle
 /// awaited there.
 ///
-/// **This is the union of the reference clients rather than an invention.** Python's client
-/// carries `wait_first` and no `wait_all`; TypeScript's carries both; Go and Java have neither
-/// call anywhere. It is the surface an operator's tool wants most: a client is the caller most
-/// likely to hold a set of ids it did not start.
+/// Both waits are here because this is the surface an operator's tool wants most: a client is the
+/// caller most likely to hold a set of ids it did not start.
 impl crate::Client {
     /// Waits until one of these workflows finishes, and reports which.
     ///
@@ -676,9 +661,7 @@ impl Connection {
     /// computed from state can be empty on one execution and not on the next, and a call that took
     /// an id in one and none in the other shifts every later step of that workflow onto a slot it
     /// did not record. So an empty set is placed like any other and refused by the run, with the
-    /// refusal recorded. TypeScript's `waitAll` returns early on an empty handle list, ahead of
-    /// `runInternalStep`, and carries that hazard; the all-wait here takes no id at all and so has
-    /// no slot to keep stable.
+    /// refusal recorded. The all-wait takes no id at all and so has no slot to keep stable.
     ///
     /// A repeated id is not looked at either: the first-wait answers with the id itself, which
     /// names one workflow however many entries pointed at it.
@@ -756,14 +739,9 @@ impl Connection {
             // have it act on an answer to a question it stopped asking. The same check
             // `ChildResultPlacement::check` makes against a recorded child id, for the same reason.
             //
-            // **Both references make it too, without writing it down**, because returning a
-            // *handle* forces the lookup that catches it: Python's `handle_map[completed_id]` is a
-            // `KeyError` on exactly this (`_dbos.py`), and TypeScript's
-            // `handleMap.get(completedId)!` is an assertion that is false on it, so the caller is
-            // handed `undefined` as a handle and learns about it somewhere else. Answering with the
-            // id means nothing here dereferences it against the set, so the check that comes free
-            // there has to be spelled — which is the whole cost of it. It reads no extra state: the
-            // winner is the payload this call records anyway.
+            // **Spelled out because nothing else would catch it.** Answering with the id means
+            // nothing here dereferences it against the set, as looking up a winning handle would.
+            // It reads no extra state: the winner is the payload this call records anyway.
             if !workflow_ids.contains(&winner.as_str()) {
                 // `expected` is what this run is asking for and `recorded` what the row holds,
                 // which is the order `Error::UnexpectedStep` prints them in and the order

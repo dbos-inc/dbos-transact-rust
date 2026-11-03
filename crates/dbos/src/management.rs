@@ -15,7 +15,7 @@
 //! and on [`Client`](crate::Client) for a process outside it — which, given the paragraph above, is
 //! where an operator usually stands. The operations are the same and share one implementation on
 //! the connection beneath both; what differs is the checkpointing described below, and that a
-//! client has no launch to check. Every reference carries this surface on its client too.
+//! client has no launch to check.
 //!
 //! **And every operation in this module has a third form, a free function, for a workflow
 //! body** — see [below](#free-forms-for-a-workflow-body).
@@ -28,17 +28,13 @@
 //! cancelled, resumed, forked or rewound, so those are bare verbs. Listing always says what it
 //! lists.
 //!
-//! The references spell every one of these `*_workflow`/`*_workflows`, because their entry point is
-//! a bare `DBOS` class rather than a handle you already hold. The concepts are theirs and the
-//! spelling is this crate's.
-//!
-//! **The free forms take the references' spelling, for the references' reason.** A free function
-//! has no receiver either, and `dbos::cancel(id)` at a call site says nothing about what is being
-//! cancelled — `dbos::delete(id)` less still, beside queues and schedules. So they are
-//! [`cancel_workflow`], [`resume_workflow`], [`fork_workflow`], [`rewind_workflow`] and
-//! [`delete_workflow`], with `_with` where the method has one, and the bulk forms are the plurals
-//! [`cancel_workflows`], [`resume_workflows`], [`fork_workflows`] and [`delete_workflows`] where
-//! the method says `_all`. A method whose name already says what it acts on keeps it:
+//! **The free forms spell the noun out.** A free function has no receiver to say what it acts on,
+//! and `dbos::cancel(id)` at a call site says nothing about what is being cancelled —
+//! `dbos::delete(id)` less still, beside queues and schedules. So they are [`cancel_workflow`],
+//! [`resume_workflow`], [`fork_workflow`], [`rewind_workflow`] and [`delete_workflow`], with
+//! `_with` where the method has one, and the bulk forms are the plurals [`cancel_workflows`],
+//! [`resume_workflows`], [`fork_workflows`] and [`delete_workflows`] where the method says `_all`.
+//! A method whose name already says what it acts on keeps it:
 //! [`set_workflow_delay`](fn@set_workflow_delay),
 //! [`update_workflow_attributes`](fn@update_workflow_attributes),
 //! [`merge_workflow_attributes`](fn@merge_workflow_attributes),
@@ -47,16 +43,15 @@
 //!
 //! # Bulk forms
 //!
-//! Every operation that has one in the references has one here, suffixed `_all` on [`DBOS`] and
-//! [`Client`](crate::Client) and pluralised on the free forms, and the singular form is a caller
-//! with a one-element batch. [`retrieve_workflow`](DBOS::retrieve_workflow),
+//! Every operation that addresses a set of workflows has a bulk form, suffixed `_all` on [`DBOS`]
+//! and [`Client`](crate::Client) and pluralised on the free forms, and the singular form is a
+//! caller with a one-element batch. [`retrieve_workflow`](DBOS::retrieve_workflow),
 //! [`set_workflow_delay`](DBOS::set_workflow_delay),
 //! [`update_workflow_attributes`](DBOS::update_workflow_attributes) and
-//! [`merge_workflow_attributes`](DBOS::merge_workflow_attributes) have none, in this crate or in
-//! any reference: each addresses one row and none of them is worth a round trip to batch.
-//! The bulk form is the primitive: the system database cancels, deletes and forks in batches because a
-//! partially applied batch is worse than a slow one, and the singular methods are wrappers that
-//! pass a one-element slice.
+//! [`merge_workflow_attributes`](DBOS::merge_workflow_attributes) have none: each addresses one
+//! row and none of them is worth a round trip to batch. The bulk form is the primitive: the
+//! system database cancels, deletes and forks in batches because a partially applied batch is
+//! worse than a slow one, and the singular methods are wrappers that pass a one-element slice.
 //!
 //! Cascading to descendants lives on the bulk form alone — `cancel_all(&["one"],
 //! Children::Include)` is how one workflow and its tree are cancelled. The singular form is the
@@ -83,24 +78,20 @@
 //! the line already drawn for a client's handle awaited inside a workflow
 //! ([`WorkflowHandle::result`](crate::WorkflowHandle::result)) and for its
 //! [`get_event`](crate::Client::get_event): a client is a guest, and a guest does not write into its
-//! host's step sequence. No reference checkpoints a client's calls either — their wrappers all read
-//! an ambient context a client does not have.
+//! host's step sequence.
 //!
 //! **The checkpoint commits with the operation**, in one transaction, because the step id travels
 //! down into the system database rather than wrapping the call here — see
-//! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows). Nothing in this module
-//! records a step of its own, and there is no wrapper left to record one: the atomic version costs the same round
-//! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
-//! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
-//! a second id; and an execution that has been handed off is refused by the owner check before
-//! the write, in the same transaction, so its work never lands.
+//! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows). Nothing in this module records
+//! a step of its own, and there is no wrapper left to record one: the atomic version costs the same
+//! round trips, and it closes a window the wrapper cannot. A crash between the write and its
+//! checkpoint would otherwise leave the work done and unrecorded, which for a fork is a second
+//! workflow under a second id; and an execution that has been handed off is refused by the owner
+//! check before the write, in the same transaction, so its work never lands.
 //!
-//! **Go draws the same line, from the other side.** Its writes go through `runAsTxn` and its reads
-//! through the plain `RunAsStep`; Python, TypeScript and Java run the whole surface through their
-//! non-transactional wrapper — `call_function_as_step`, `runInternalStep`,
-//! `runDbosFunctionAsStep` — and each keeps a transactional variant for other surfaces. The reads
-//! are transactional here too: a listing that replays the snapshot it recorded is worth the same
-//! one transaction, and it leaves one shape for the whole module rather than two.
+//! **The reads are transactional too**, though they write nothing but their checkpoint: a listing
+//! that replays the snapshot it recorded is worth the same one transaction, and it leaves one shape
+//! for the whole module rather than two.
 //!
 //! The recorded names are in [`step_names`] beside every other name this crate records, with what
 //! each one cost to settle. One call is one step, and the singular forms
@@ -116,8 +107,7 @@
 //! the replay makes the call again.
 //!
 //! [`retrieve_workflow`](DBOS::retrieve_workflow) is the one member of the `DBOS` surface with no
-//! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its equivalent as
-//! `DBOS.getStatus` because Python's reads the row.
+//! step, because it is the one that does no I/O: there is no call to replay.
 //!
 //! # Free forms, for a workflow body
 //!
@@ -128,9 +118,8 @@
 //! child or forks a failed one from the step that failed would otherwise have had to capture one —
 //! the cycle [`get_event`](crate::get_event), [`send`](crate::send()) and
 //! [`select_workflow`](fn@crate::select_workflow) already have free forms to avoid, reached by the
-//! one door still open. Java has the same cycle and its collector reclaims it; Python and
-//! TypeScript reach a global instance, and Go passes its client explicitly. Rust has none of those
-//! outs, so this surface has free forms.
+//! one door still open. Nothing would reclaim the cycle, and there is no global instance to reach
+//! instead, so this surface has free forms.
 //!
 //! **Each is the method, reached the other way.** A free function takes its connection from the
 //! ambient context, so outside a workflow there is none and the call is [`Error::NotInWorkflow`]
@@ -164,12 +153,12 @@
 //! cancelling work at all across a fleet, where the executor running the workflow is usually not the
 //! one being asked to cancel it.
 //!
-//! That also keeps this crate clear of go #426, where shutdown's context cancellation reached the
-//! *durable* cancel path and marked in-flight workflows `CANCELLED` instead of leaving them
-//! `PENDING` for recovery. Rust's shutdown waits for workflows or aborts their tasks, and says so —
-//! see `Tasks::abort_all`, whose rows stay `PENDING` — and durable cancellation is only ever this
-//! module, or a timeout (the timeout sweep, or an execution whose deadline has passed), writing to
-//! the database. Shutdown reaches neither, so there is no shutdown cause to tag.
+//! That also keeps shutdown from marking in-flight workflows `CANCELLED`, which would take them
+//! away from recovery instead of leaving them `PENDING` for it. Shutdown waits for workflows or
+//! aborts their tasks, and says so — see `Tasks::abort_all`, whose rows stay `PENDING` — and
+//! durable cancellation is only ever this module, or a timeout (the timeout sweep, or an execution
+//! whose deadline has passed), writing to the database. Shutdown reaches neither, so there is no
+//! shutdown cause to tag.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -189,14 +178,13 @@ use crate::workflow::PendingStart;
 
 /// Whether an operation reaches a workflow's descendants.
 ///
-/// One type for [`cancel_all`](DBOS::cancel_all) and [`delete_all`](DBOS::delete_all), which the
-/// references keep apart as `cancel_children` and `delete_children` booleans. It is the same
-/// question in both, and a bare `true` at a call site says neither which question it answers nor
-/// which way.
+/// One type for [`cancel_all`](DBOS::cancel_all) and [`delete_all`](DBOS::delete_all), rather than
+/// a boolean on each. It is the same question in both, and a bare `true` at a call site says
+/// neither which question it answers nor which way.
 ///
-/// [`Skip`](Self::Skip) is the default in all four implementations, and the reason is worth
-/// knowing: a workflow's children are workflows in their own right, some of them started by code
-/// that has no idea it was called from another workflow. Reaching them is a decision.
+/// [`Skip`](Self::Skip) is the default, and the reason is worth knowing: a workflow's children are
+/// workflows in their own right, some of them started by code that has no idea it was called from
+/// another workflow. Reaching them is a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Children {
     /// The workflows named, and nothing else.
@@ -512,7 +500,7 @@ pub fn cancel_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> Pendin
 /// the method is. Returns the ids that actually moved — see [`DBOS::cancel_all`] for the cascade.
 ///
 /// Named `cancel_workflows` where the method is `cancel_all`: a free function has no receiver to
-/// say what *all* ranges over, so it takes the plural noun the references spell it with.
+/// say what *all* ranges over, so it takes the plural noun.
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
 /// channel.
@@ -963,33 +951,27 @@ impl DBOS {
     /// handle is a **polling** one — see the module documentation — because the workflow is
     /// running somewhere else, if it is running at all.
     ///
-    /// **The id is not checked, and the call does no I/O.** The references split two-two — Python
-    /// verifies the row and raises `DBOSNonExistentWorkflowError`, Go reads it as part of the call,
-    /// while TypeScript and Java hand back a handle either way, Java's doc saying "the workflow
-    /// exists or not; `getStatus()` can be used to tell the difference".
+    /// **The id is not checked, and the call does no I/O.** A handle is handed back whether or not
+    /// the workflow exists.
     ///
-    /// **The split is downstream of what awaiting a missing row does**, and this crate is on
-    /// TypeScript's and Java's side of it. All five give `await_workflow_result` a
-    /// `fail_if_missing` flag whose default is to wait, so an id nothing has seen — which is
-    /// exactly what this function hands back — polls for the row to appear rather than reporting
-    /// its absence. That is the case the default is for: an id from outside this process, awaited
-    /// before whoever owns it has committed the enqueue. The cost is the references': a *mistyped*
-    /// id awaited through this handle waits instead of failing.
+    /// **That follows from what awaiting a missing row does.** Awaiting an id nothing has seen —
+    /// which is exactly what this function hands back — polls for the row to appear rather than
+    /// reporting its absence. That is the case the wait is for: an id from outside this process,
+    /// awaited before whoever owns it has committed the enqueue. The cost is that a *mistyped* id
+    /// awaited through this handle waits instead of failing.
     ///
     /// So the check would buy something, and what it costs is this call: a verified retrieve is
     /// `async` and fallible on the id as well as the launch, and mapping a listing to handles then
     /// costs a round trip apiece. [`status`](crate::WorkflowHandle::status) is the round trip when
     /// it is wanted — it reports [`Error::WorkflowNotFound`] whatever the handle — and
-    /// `tokio::time::timeout` is the bound when a wait should not be open-ended, which is the
-    /// escape Python and Java cannot offer at all.
+    /// `tokio::time::timeout` is the bound when a wait should not be open-ended.
     ///
     /// It is not the same line [`resume`](Self::resume) draws, and deliberately: a resume is a
     /// write that would otherwise silently do nothing, and its handles name rows the call has just
     /// moved.
     ///
     /// Doing no I/O also makes this the one member of the surface that records **no step** when it
-    /// is called from inside a workflow: there is nothing to replay. Python checkpoints its
-    /// equivalent as `DBOS.getStatus` because Python's reads the row.
+    /// is called from inside a workflow: there is nothing to replay.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1054,10 +1036,9 @@ impl DBOS {
     ///
     /// The cascade is a **level-by-level walk that interleaves with the cancelling**, so a child
     /// spawned while the sweep is running is still caught — the parent is stopped before its
-    /// children are looked up. Python and Java do the same; Go collects the whole subtree first and
-    /// can miss a workflow spawned during the walk. Here the walk is also one transaction, so a
-    /// tree is either wholly cancelled or untouched, and a failure partway leaves nothing to
-    /// finish.
+    /// children are looked up; collecting the whole subtree first could miss a workflow spawned
+    /// during the walk. The walk is also one transaction, so a tree is either wholly cancelled or
+    /// untouched, and a failure partway leaves nothing to finish.
     ///
     /// **A workflow cannot cancel itself here either**, by naming its own id, or with
     /// [`Children::Include`] by naming an ancestor whose tree it is inside. Either refuses the
@@ -1093,8 +1074,7 @@ impl DBOS {
     /// A workflow that has already succeeded or failed is left alone, and the handle simply
     /// reports the outcome it already has. An id with **no row at all** is
     /// [`Error::SystemDatabase`] carrying `NonExistentWorkflow`, because a mistyped id should say
-    /// so rather than silently do nothing — a distinction a zero-row update cannot draw, and one
-    /// Python draws the same way.
+    /// so rather than silently do nothing — a distinction a zero-row update cannot draw.
     ///
     /// # Resuming a workflow that is still running
     ///
@@ -1117,9 +1097,9 @@ impl DBOS {
     ///
     /// The guard is not simply missing here. `PENDING` cannot say whether the executor that owns
     /// it is alive, and a workflow left `PENDING` by a node that died is the case an operator most
-    /// wants to resume by hand — so a predicate that closes the hazard closes that too. All five
-    /// implementations share the two-status deny-list, and UPSTREAM item 27 asks them to settle
-    /// what resume should mean for a live row rather than each tightening it alone.
+    /// wants to resume by hand — so a predicate that closes the hazard closes that too. The
+    /// ownership fence is what keeps a live resume sound instead: the new execution takes the row
+    /// over and the old one's next write is refused, so the two never record side by side.
     ///
     /// **A [`PendingStart`] in the engine's channel**, as a start is: [`lift`](PendingStart::lift)
     /// re-declares the channel for a caller that fails another way, and it is not a
@@ -1178,12 +1158,9 @@ impl DBOS {
     ///
     /// Every id must exist. The whole batch is one statement, so an id with no row behind it fails
     /// the call and nothing is enqueued, rather than resuming the ones that happened to be spelled
-    /// correctly. Python draws the same line on the batch; **Go and Java do not** — Go says so,
-    /// its `ResumeWorkflows` skipping a missing id where its `ResumeWorkflow` refuses one, and
-    /// Java's `resumeWorkflows` being a single `UPDATE ... WHERE workflow_uuid = ANY(?)` that
-    /// never notices one. Following Python here keeps the batch and the single form answering the
-    /// same way. Naming the calling workflow among them fails the call the same way, as
-    /// [`resume`](Self::resume) describes.
+    /// correctly, which keeps the batch and the single form answering the same way. Naming the
+    /// calling workflow among them fails the call the same way, as [`resume`](Self::resume)
+    /// describes.
     pub fn resume_all<'a, R: 'a, E: 'a>(
         &self,
         workflow_ids: &'a [&'a str],
@@ -1411,8 +1388,7 @@ impl DBOS {
     ///
     /// **No status guard, deliberately.** A running workflow is deleted like any other: naming an
     /// id is an operator saying *this one, now*, and refusing would leave no way to clear a
-    /// workflow that is wedged. All four implementations behave the same way — Go's comment on the
-    /// same statement reads "Delete all matching workflows regardless of their state".
+    /// workflow that is wedged.
     ///
     /// The executor running a deleted workflow finds its row gone at the next step boundary and
     /// fails with `NonExistentWorkflow`, rather than stopping cleanly. Cancel first if that matters.
@@ -1510,30 +1486,23 @@ impl DBOS {
     /// [`merge_workflow_attributes`](Self::merge_workflow_attributes) adds keys without either
     /// problem.
     ///
-    /// **A map, not encoded JSON.** The other three take one — Python `Dict[str, Any]`, Go
-    /// `map[string]any`, Java `Map<String, Object>` — and encode it in their system database layer.
-    /// Rust's cannot: it handles every payload as an opaque string so a host across an FFI boundary
-    /// can hand over bytes it already has, which is why `validate_attributes` checks the object
-    /// shape down there *"rather than falling out of the type"*. Here it falls out of the type.
-    /// This is the layer that encodes, and it is the only one that can.
+    /// **A map, not encoded JSON**, encoded here rather than in the system database layer, which
+    /// cannot: it handles every payload as an opaque string so a host across an FFI boundary can
+    /// hand over bytes it already has, which is why `validate_attributes` checks the object shape
+    /// down there *"rather than falling out of the type"*. Here it falls out of the type. This is
+    /// the layer that encodes, and it is the only one that can.
     ///
     /// The object shape is not decoration: [`WorkflowFilter::attributes`] queries the column with
     /// `@>` containment, and containment against a stored array or scalar silently never matches.
     ///
     /// **An id no workflow has is refused** with
     /// [`NonExistentWorkflow`](crate::sysdb::Error::NonExistentWorkflow), rather than reported as
-    /// done with nothing written, as Go's `SetWorkflowAttributes` refuses it. Inside a workflow the
-    /// refusal is the step's recorded outcome, so a replay sees it too.
+    /// done with nothing written. Inside a workflow the refusal is the step's recorded outcome, so
+    /// a replay sees it too.
     ///
     /// `serde_json::Value::as_object` is the usual way in — and note that it answers `None` for a
     /// value that is not an object, which **clears** rather than refusing. Build a
     /// `serde_json::Map` directly when the attributes are assembled at runtime.
-    ///
-    /// **Named for what three of the four call it.** Python's is `update_workflow_attributes` and
-    /// Java's `updateWorkflowAttributes`; TypeScript has no attributes method at all; and Go's
-    /// method is `SetWorkflowAttributes` while the step it records is `DBOS.updateWorkflowAttributes`
-    /// — so Go disagrees with itself, and the stored name is the half that other implementations
-    /// read.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1564,13 +1533,11 @@ impl DBOS {
     /// **A shallow merge of the top-level keys.** A key already there takes the new value, and the
     /// others stay as they are. A key set to JSON `null` is stored as `null`, not removed. If the
     /// workflow has no attributes, or has ones that are not an object, the result is just these,
-    /// so an empty map leaves `{}` where there were none, as it does in Python and Go.
+    /// so an empty map leaves `{}` where there were none.
     ///
     /// **Atomic**, so two callers merging different keys into the same workflow both land, which a
     /// read followed by [`update_workflow_attributes`](Self::update_workflow_attributes) cannot
-    /// promise. Python's `update_workflow_attributes(..., merge=True)` is the same operation.
-    /// Inside a workflow it is recorded under the same step name as a replacement, as Python
-    /// records both under one.
+    /// promise. Inside a workflow it is recorded under the same step name as a replacement.
     ///
     /// An id no workflow has is refused, as by
     /// [`update_workflow_attributes`](Self::update_workflow_attributes).
@@ -1603,17 +1570,16 @@ impl DBOS {
     /// `WorkflowFilter::default()` returns the whole table. A caller that means to page should say
     /// so with [`WorkflowFilter::limit`] — and should know that `created_at` is a millisecond
     /// stamp shared by everything a fan-out creates in the same instant, so a page boundary
-    /// falling inside a tie is not stable. That is `UPSTREAM` item 23, and it is four
-    /// implementations wide.
+    /// falling inside a tie is not stable.
     ///
     /// The filter defaults to **this application's workflows plus unclaimed ones**, not to every
     /// application sharing the database; [`AppScope::Any`](crate::sysdb::types::AppScope)
     /// is the operator's cross-application view. Naming ids explicitly widens it on its own, since
     /// a workflow id is a global address rather than a search.
     ///
-    /// There is no separate `list_queued_workflows` as Python and TypeScript have.
-    /// [`WorkflowFilter::queues_only`] is that method, and it composes with every other filter
-    /// instead of being a second entry point that repeats them.
+    /// There is no separate listing of queued workflows. [`WorkflowFilter::queues_only`] is that
+    /// method, and it composes with every other filter instead of being a second entry point that
+    /// repeats them.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -1696,11 +1662,6 @@ impl DBOS {
 /// application sharing the database, which is what a cross-application operator's tool wants and
 /// what a client acting for one application must not do by accident — see
 /// [`ClientConfig::app_name`](crate::ClientConfig::app_name).
-///
-/// All four references put this surface on their clients. Go goes furthest, taking its `Client`
-/// interface on every management function so a client and a runtime differ in nothing but which
-/// one is passed; Python, TypeScript and Java each carry their own copy on a separate client type,
-/// as this does.
 impl crate::Client {
     /// Stops a workflow, and any executor running it.
     ///
@@ -1879,8 +1840,7 @@ impl crate::Client {
 
     /// Replaces the attributes attached to a workflow, or clears them.
     ///
-    /// See [`DBOS::update_workflow_attributes`]. `None` clears. Present on Python's and Java's
-    /// clients; TypeScript's has no post-hoc update at all.
+    /// See [`DBOS::update_workflow_attributes`]. `None` clears.
     pub async fn update_workflow_attributes(
         &self,
         workflow_id: &str,
@@ -1912,8 +1872,8 @@ impl crate::Client {
 
     /// Reads the workflows matching a filter.
     ///
-    /// See [`DBOS::list_workflows`]. The references' third listing, `list_queued_workflows`, is
-    /// [`WorkflowFilter::queues_only`] here rather than a second method.
+    /// See [`DBOS::list_workflows`]. Queued workflows are listed with
+    /// [`WorkflowFilter::queues_only`] rather than a second method.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {

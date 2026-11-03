@@ -402,9 +402,8 @@ async fn a_workflows_send_is_checkpointed_and_a_replay_does_not_send_twice() {
 
 /// A receive may not stand inside a step; a send may, and is then plain.
 ///
-/// The asymmetry is the references': a send that runs twice delivers twice, where a receive that
-/// runs twice loses a message. Python, TypeScript and Java send plainly from inside a step and all
-/// four block a receive there.
+/// The asymmetry is in the damage: a send that runs twice delivers twice, where a receive that runs
+/// twice loses a message.
 #[dbos_test_support::test]
 async fn a_step_may_send_but_may_not_receive() {
     let db = test_database().await;

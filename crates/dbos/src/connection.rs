@@ -8,10 +8,8 @@
 //! application version to stamp claims with, a runtime to spawn onto, a registry snapshot, task
 //! sets to shut down.
 //!
-//! Splitting it this way is what lets a client hold no executor. Java is the model: its
-//! `DBOSClient` holds a `SystemDatabase` and nothing else, its workflow handle is a small class
-//! over that same database, and the operations both surfaces need take what they use rather than a
-//! whole executor — `DBOSExecutor.enqueueWorkflow(...)` is called by the client with no executor in
+//! Splitting it this way is what lets a client hold no executor: the operations both surfaces need
+//! take what they use rather than a whole executor, so a client calls them with no executor in
 //! sight.
 //!
 //! # `Connection`, not `Database`
@@ -29,9 +27,7 @@
 //! reading an event is in [`event`](crate::event), and awaiting an outcome another execution owns
 //! is in [`workflow`](crate::workflow). That is already how this crate spreads `impl DBOS`, and it
 //! keeps this module to what a connection *is* while each operation stays next to the types it
-//! speaks in. Java's statics are the same idea reached differently: a language that cannot add
-//! methods to a class from another file has to put the shared code somewhere, and it chose the
-//! executor's class.
+//! speaks in.
 //!
 //! It is also what keeps [`WorkflowHandle`](crate::WorkflowHandle) one type. A handle needs the
 //! connection, the serializer and the poll interval, and none of the executing half — so it holds
@@ -127,17 +123,15 @@ impl Connection {
     ///
     /// - **No executor id.** A client claims no workflow, so there is no process for the column to
     ///   name and no statement of its is made on one's behalf.
-    /// - **It does not migrate**, and does not create the database either. A client is a guest —
-    ///   Python says so in as many words (*"Unlike DBOS itself, the client never runs schema
-    ///   migrations: the system database must already have been created by a DBOS application"*),
-    ///   and an operator's tool that can rewrite the schema it is inspecting is a tool that can
+    /// - **It does not migrate**, and does not create the database either. A client is a guest:
+    ///   the system database must already have been created by a DBOS application, and an
+    ///   operator's tool that can rewrite the schema it is inspecting is a tool that can
     ///   break the application it was pointed at. There is no knob:
     ///   [`ClientConfig`] has no `migrate` field to set.
     ///   It does **verify**, because that is what this crate's `migrate: false` means:
     ///   a schema that is missing or behind what this build's queries are written against fails
     ///   here, naming the version it found, instead of surfacing as a confusing SQL error on the
-    ///   first real call. **Go's client does the same** (`SkipMigrations: true`, *"Clients never
-    ///   own the schema"*); Python's, TypeScript's and Java's neither migrate nor check.
+    ///   first real call.
     /// - **The application name may be absent**, which no application's may be. A nameless client
     ///   writes unclaimed rows and reads across every application.
     /// - **Notifications are opt-in.** The listener and notifier start only when

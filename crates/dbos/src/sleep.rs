@@ -33,8 +33,7 @@ use crate::sysdb::types::{StepCaller, duration_to_ms, step_names};
 /// step is a leaf.
 ///
 /// The checkpoint's `completed_at` is stamped at the wake time rather than at the moment the row is
-/// written, so an hour's sleep reads as an hour on a timeline instead of as an instant. All four
-/// references do the same.
+/// written, so an hour's sleep reads as an hour on a timeline instead of as an instant.
 ///
 /// A zero or negative duration is not an error: it records the checkpoint and returns, so a
 /// computed delay that has already elapsed behaves the same on the first run and on a replay.

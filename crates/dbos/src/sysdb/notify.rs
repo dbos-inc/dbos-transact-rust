@@ -2,9 +2,9 @@
 //!
 //! `recv`, `get_event` and `await_stream_values` all wait for a row another process may not have
 //! written yet. Each waits by looping — look at the database, wait a bounded interval, look again —
-//! and **that loop is what delivers.** Every reference works this way: a notification is only ever
-//! a hint to look again, never the value, and nobody acts on its payload. On CockroachDB, which has
-//! no `LISTEN`/`NOTIFY` at all, the loop is the whole mechanism in all four SDKs.
+//! and **that loop is what delivers.** A notification is only ever a hint to look again, never
+//! the value, and nothing acts on its payload. On CockroachDB, which has no `LISTEN`/`NOTIFY` at
+//! all, the loop is the whole mechanism.
 //!
 //! So this registry has exactly one job: let something that already knows a row was written cut a
 //! waiter's interval short. With nothing pushing, it is simply never woken and every waiter runs at
@@ -15,30 +15,25 @@
 //! written in between, which is why [`Registry::subscribe`] is synchronous and infallible: there is
 //! no await between deciding to wait and being able to be woken.
 //!
-//! **Keys are flat and prefixed**, following Java's `SignalKey` — `m::`, `e::`, `s::` over one map.
-//! The prefix is load-bearing rather than decorative: an event and a stream on the same workflow
-//! and key are different things to wait for, and without it a `set_event` would wake a stream
-//! reader.
+//! **Keys are flat and prefixed** — `m::`, `e::`, `s::` over one map. The prefix is load-bearing
+//! rather than decorative: an event and a stream on the same workflow and key are different things
+//! to wait for, and without it a `set_event` would wake a stream reader.
 //!
 //! **Nothing here ever splits a key, and nothing should.** A wire payload is `id::key`, and both
 //! halves are caller-supplied strings that may themselves contain `::` — so splitting is ambiguous
-//! and a parser has to guess. Java takes the same position and is the reference to follow: its
-//! listener does `raiseSignal("m::" + payload)` and its map does an exact-key lookup, so a key
-//! built by a waiter and one built from a notification are string-identical without anyone parsing.
-//! TypeScript and Python do not parse either — Python keeps the `(dest_uuid, topic)` pair beside
-//! the payload precisely so it never has to. Go alone parses, in its polling fallback
-//! (`SplitN(payload, "::", 2)`), which is a thing this crate has no equivalent of: the poller was
-//! the only component that would ever have needed the halves back, and there is no poller.
+//! and a parser has to guess. Nothing needs the halves back, either: a notification only has to
+//! find the waiter holding the same key, and an exact-key lookup does that.
 //!
 //! So the listener builds the key by **concatenating** the prefix onto the payload exactly as it
-//! arrived, and never splits it.
+//! arrived, and never splits it. A key built by a waiter and one built from a notification are
+//! then string-identical without anyone parsing.
 //!
 //! **Prefixing does not make keys injective, and that is fine.** The pairs `("a", "b::c")` and
 //! `("a::b", "c")` both render `m::a::b::c`, so a wake for one wakes the other. A wakeup is only
 //! ever a hint: the woken waiter looks at the database, finds nothing for itself, and waits again
 //! — one wasted query, no wrong answer. Escaping the separator would fix a non-problem and,
-//! worse, would disagree with the `id || '::' || key` that migration 1's trigger and every other
-//! SDK put on the wire.
+//! worse, would disagree with the `id || '::' || key` that migration 1's trigger and the other
+//! SDKs sharing the database put on the wire.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -57,8 +52,7 @@ pub(crate) const STREAMS_CHANNEL: &str = "dbos_streams_channel";
 /// The prefixes, as constants rather than literals in three `format!`s.
 ///
 /// A waiter's key and a notification's key are built by different code and have to come out
-/// string-identical; sharing the prefix is what stops them drifting apart silently. Java's
-/// `SignalKey` centralises the same three.
+/// string-identical; sharing the prefix is what stops them drifting apart silently.
 const MESSAGE_PREFIX: &str = "m";
 const EVENT_PREFIX: &str = "e";
 const STREAM_PREFIX: &str = "s";
@@ -93,8 +87,7 @@ pub(crate) fn stream_key(workflow_id: &str, key: &str) -> String {
 /// **The concatenation the module header is about.** The payload is a wire `id::key` whose halves
 /// may each contain `::`, so it is prepended to whole and never split — which is what makes this
 /// agree with the three functions above for every input, including the ones a parser would get
-/// wrong. Java does exactly this (`SignalKey.signalFor(channel, payload)`); Go is the only
-/// implementation that splits, and only in a polling fallback this crate has no equivalent of.
+/// wrong.
 pub(crate) fn key_for(channel: &str, payload: &str) -> Option<String> {
     let prefix = match channel {
         NOTIFICATIONS_CHANNEL => MESSAGE_PREFIX,
@@ -324,7 +317,8 @@ mod tests {
     /// Two different pairs can render one key, and the registry is allowed to conflate them.
     ///
     /// A wakeup is a hint, so the cost is a wasted look rather than a wrong answer. Escaping the
-    /// separator would fix nothing and would disagree with the wire format every other SDK writes.
+    /// separator would fix nothing and would disagree with the shared wire format other SDKs on
+    /// the same database write.
     #[tokio::test]
     async fn colliding_keys_only_cost_a_spurious_wakeup() {
         let registry = Arc::new(Registry::default());

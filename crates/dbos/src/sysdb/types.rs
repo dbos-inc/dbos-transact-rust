@@ -150,20 +150,18 @@ impl Timestamp {
 
     /// Reads an ISO-8601 instant, or `None` if the text is not one.
     ///
-    /// The inverse of [`to_iso8601`](Self::to_iso8601), and it has to read what the other four
-    /// implementations wrote: Python's `+00:00` offset, TypeScript's `.000Z`, Go's `RFC3339Nano`
-    /// and Java's bare `Z` all parse to the same instant, as does Conductor's explicit numeric
-    /// offset — which it writes rather than `Z` because `datetime.fromisoformat` rejects `Z`
-    /// before Python 3.11.
+    /// The inverse of [`to_iso8601`](Self::to_iso8601), and it has to read whatever the other SDKs
+    /// and Conductor sharing the database wrote: a `+00:00` offset, a `.000Z` fraction, a
+    /// nanosecond fraction, a bare `Z` and an explicit numeric offset all parse to the same
+    /// instant.
     ///
     /// Strict RFC 3339 otherwise: an offset is required and must carry its colon. That is
     /// stricter than a hand-written reader would be tempted to make it, and it turns away nothing
-    /// any writer produces — Conductor's own reader is Go's `time.RFC3339`, which draws the line
-    /// in the same place.
+    /// any writer produces — Conductor's own reader draws the line in the same place.
     ///
-    /// **Sub-millisecond precision is truncated**, since that is all [`Timestamp`] holds. Go
-    /// writes nanoseconds, so a schedule it fired can carry them; cron granularity is seconds, so
-    /// the digits being dropped cannot change a firing decision.
+    /// **Sub-millisecond precision is truncated**, since that is all [`Timestamp`] holds. A
+    /// writer may store nanoseconds; cron granularity is seconds, so the digits being dropped
+    /// cannot change a firing decision.
     pub fn parse_iso8601(text: &str) -> Option<Self> {
         let parsed = OffsetDateTime::parse(text, &Rfc3339).ok()?;
         // Nanoseconds to milliseconds, flooring, so an instant before the epoch truncates towards
@@ -178,7 +176,8 @@ impl Timestamp {
     ///
     /// For [`workflow_schedules.last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at),
     /// the one column in the schema holding a formatted instant rather than epoch milliseconds.
-    /// This is Go's and Java's spelling of the four; every implementation's reader accepts it.
+    /// A bare `Z`, with a fraction only when there is one: a spelling every reader of the column
+    /// accepts.
     ///
     /// Infallible in practice and `String` rather than `Result` because of it: the only way
     /// `time` refuses to format is a year outside its range, which is four orders of magnitude
@@ -258,8 +257,8 @@ pub fn duration_to_ms(field: &'static str, duration: Duration) -> Result<i64, Er
 
 /// Where a workflow is in its lifecycle.
 ///
-/// Stored as text and shared with every other DBOS implementation, so the spellings are a wire
-/// format rather than an internal choice.
+/// Stored as text and shared with the other SDKs on the same database, so the spellings are a
+/// wire format rather than an internal choice.
 ///
 /// The serde representation is those same spellings, which is what the rename on the derive is
 /// for: a status that round-trips through a checkpoint — see [`DBOS::list_workflows`] — must
@@ -302,7 +301,7 @@ impl WorkflowStatus {
     /// Parses a stored value.
     ///
     /// Returns `None` for anything unrecognised rather than guessing. A status written by a
-    /// newer implementation is a real possibility in a shared database, and silently mapping it
+    /// newer SDK is a real possibility in a shared database, and silently mapping it
     /// onto the nearest known value would be worse than reporting that it is unknown.
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
@@ -348,10 +347,8 @@ impl fmt::Display for WorkflowStatus {
 /// What identifies a workflow, as the `workflow_status` row stores it.
 ///
 /// Three columns rather than one name, because that is what Conductor and Console resolve against
-/// and what a configured instance needs. The references model it three different ways — Python
-/// keys on the name alone with instances in a separate map, Go on a derived FQN qualified by the
-/// config name, Java on the whole `{name}/{class}/{instance}` string — but all three *store* these
-/// three columns, so keying on them directly is the shape that reads back from any of them.
+/// and what a configured instance needs. Every SDK sharing the database stores these three
+/// columns, so keying on them directly is the shape that reads back from any row.
 ///
 /// **One spelling of absence.** The columns spell an absent class or config both as `NULL` and as
 /// `''`, so every constructor stores an empty class or config as `None`. Two names for the same
@@ -410,10 +407,8 @@ impl QualifiedWorkflowName {
     /// application in another language can enqueue work for this one, and it writes the status row
     /// in its own spelling before any Rust executor sees it.
     ///
-    /// Both spellings are in the wild, and Java's own code is the evidence rather than an
-    /// assumption of ours — `WorkflowDAO` normalizes `null` and `""` to the same thing when it
-    /// compares an init against an existing row (`WorkflowDAO.java`), which is a defence nobody
-    /// writes against a distinction that cannot occur.
+    /// Both spellings are in the wild: writers on the same database store an absent class or
+    /// config as either, so a reader has to treat them alike.
     pub(crate) fn from_row(
         name: impl Into<String>,
         class_name: Option<&str>,
@@ -529,7 +524,7 @@ impl std::fmt::Display for QualifiedWorkflowName {
 ///
 /// `Serialize`/`Deserialize` because a listing made from inside a workflow is checkpointed and
 /// replays from what it recorded, so the rows have to round-trip. The derives give the record its
-/// JSON shape, and the caller's [`StepCodec`] encodes that. No other implementation reads it — it
+/// JSON shape, and the caller's [`StepCodec`] encodes that. No other SDK reads it — it
 /// is the engine talking to its own replay.
 ///
 /// **It is still a stored format, and the build that reads it is rarely the one that wrote it.**
@@ -635,9 +630,9 @@ pub struct WorkflowRecord {
     pub request: Option<String>,
     /// The application that owns this workflow, or `None` if it is unclaimed.
     ///
-    /// Unclaimed means no application has taken it — a row written before any implementation
-    /// supported ownership, or by a handle with no application of its own. Every application may
-    /// run it, and the first to dequeue it claims it.
+    /// Unclaimed means no application has taken it — a row written before ownership existed, or by
+    /// a handle with no application of its own. Every application may run it, and the first to
+    /// dequeue it claims it.
     #[serde(default, rename = "application_name")]
     pub app_name: Option<String>,
 
@@ -733,10 +728,6 @@ pub enum WorkflowIdReusePolicy {
 ///   recorded against one — the two are one event, and one of them writing without the other is
 ///   the state the pair exists to make unreachable, so there is no caller who can meaningfully
 ///   set the column alone.
-///
-/// Java draws the same line with `WorkflowStatusInternal`. Python and Go pass their full row
-/// type instead, but Go's is a package-internal call taking a transaction, and Python's carries
-/// the same fields it then ignores.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewWorkflow<'a> {
     /// The id, which is what makes a retried submission the same workflow.
@@ -814,8 +805,8 @@ pub struct NewWorkflow<'a> {
     ///
     /// A list rather than an encoded string, unlike `input` and the outcome payloads: those are
     /// opaque to this layer and cross as whatever the caller encoded, but the column is *always*
-    /// a JSON array of strings, so the encoding belongs here. Java calls
-    /// `JsonUtility.toJson(List<String>)` and Python's field comment reads "JSON list of roles".
+    /// a JSON array of strings, a format shared with the other SDKs that read the column, so the
+    /// encoding belongs here.
     ///
     /// Empty is stored as NULL, on the same reasoning as the empty-string normalisation for
     /// `authenticated_user`: "no roles" should have one representation in the column.
@@ -840,17 +831,16 @@ impl<'a> NewWorkflow<'a> {
 
     /// Rejects values the system database will not store.
     ///
-    /// Java validates the same list in `WorkflowStatusInternal`'s constructor, so a bad value
-    /// cannot be built at all. `NewWorkflow` has public fields and so has no construction hook;
-    /// this runs at the point of use instead, which catches the same mistakes one step later.
+    /// `NewWorkflow` has public fields and so has no construction hook to refuse a bad value; this
+    /// runs at the point of use instead.
     ///
     /// **An empty string is not a missing value — `None` is.** A `Some("")` queue name would
     /// enqueue a workflow onto a queue called `""`, and an empty `workflow_id` would create a
     /// row no caller can ever name again. Both are caller bugs worth reporting rather than
     /// storing.
     ///
-    /// The two auth fields are exempt: TypeScript and Go send `""` rather than null when there
-    /// is no auth context, so those are normalised at write time instead of rejected.
+    /// The two auth fields are exempt: `""` is a common way for a caller to say there is no auth
+    /// context, so those are normalised at write time instead of rejected.
     pub fn validate(&self) -> Result<(), Error> {
         for (field, value) in [("workflow_id", Some(self.workflow_id)), ("name", self.name)] {
             if value == Some("") {
@@ -895,8 +885,8 @@ impl<'a> NewWorkflow<'a> {
 
     /// The status this workflow starts in, which follows from the queue and the delay.
     ///
-    /// Not a caller's choice in any implementation: a workflow is `PENDING` when it runs here,
-    /// `ENQUEUED` when it waits on a queue, and `DELAYED` when it waits on a queue and a clock.
+    /// Not a caller's choice: a workflow is `PENDING` when it runs here, `ENQUEUED` when it waits
+    /// on a queue, and `DELAYED` when it waits on a queue and a clock.
     pub fn initial_status(&self) -> WorkflowStatus {
         match (&self.queue_name, &self.delay) {
             (None, _) => WorkflowStatus::Pending,
@@ -976,7 +966,7 @@ mod tests {
 
         assert_eq!(iso(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso(1_786_492_800_000), "2026-08-12T00:00:00Z");
-        // A fraction appears only when there is one, which is Go's and Java's spelling.
+        // A fraction appears only when there is one.
         assert_eq!(iso(1_786_492_800_123), "2026-08-12T00:00:00.123Z");
         // Before the epoch the millisecond floors rather than truncating towards zero, which is
         // the direction `i128::div_euclid` is chosen for.
@@ -984,9 +974,9 @@ mod tests {
         assert_eq!(iso(-86_400_000), "1969-12-31T00:00:00Z");
     }
 
-    /// The four spellings the other implementations write all read back as the same instant.
+    /// The spellings writers on a shared database use all read back as the same instant.
     #[test]
-    fn an_iso8601_instant_parses_from_every_implementations_format() {
+    fn an_iso8601_instant_parses_from_every_writers_format() {
         let parse = Timestamp::parse_iso8601;
         let expected = Some(Timestamp::from_epoch_ms(1_786_492_800_000));
 
@@ -1002,10 +992,8 @@ mod tests {
         assert_eq!(parse("2026-08-12T01:30:00+01:30"), expected);
         assert_eq!(parse("2026-08-11T19:00:00-05:00"), expected);
 
-        // Conductor formats with an explicit numeric offset rather than `Z`, deliberately:
-        // `datetime.fromisoformat` rejects `Z` before Python 3.11 and dbos-transact-py supports
-        // 3.10 (`services/conductor/openmetrics.go`, layout `2006-01-02T15:04:05.999-07:00`).
-        // Its fraction is elided on a whole second, so both of these reach a reader.
+        // Conductor formats with an explicit numeric offset rather than `Z`, and elides the
+        // fraction on a whole second, so both of these reach a reader.
         assert_eq!(parse("2026-08-12T00:00:00+00:00"), expected);
         assert_eq!(
             parse("2026-08-12T00:00:00.123+00:00"),
@@ -1018,9 +1006,8 @@ mod tests {
         assert_eq!(ms(parse("2026-08-12T00:00:00.123999Z")), 123);
 
         // Strict RFC 3339: the offset is required and carries its colon. Neither rejection is
-        // reachable from a writer — Python's `isoformat` always emits the colon, and Conductor's
-        // layout spells the offset `-07:00` — and Conductor's own reader is Go's `time.RFC3339`,
-        // which rejects exactly the same two. Accepting them would be this crate inventing
+        // reachable from a writer, which always emits an offset with its colon, and Conductor's
+        // own reader rejects exactly the same two. Accepting them would be this crate inventing
         // leniency nobody asked for.
         for bad in [
             "",
@@ -1245,7 +1232,7 @@ mod tests {
         assert_eq!(duration_from_secs(-0.0), Some(Duration::ZERO));
     }
 
-    /// The spellings are a wire format shared with the other implementations.
+    /// The spellings are a wire format shared with the other SDKs on the same database.
     #[test]
     fn status_round_trips_through_its_stored_spelling() {
         for status in [
@@ -1261,9 +1248,9 @@ mod tests {
         }
     }
 
-    /// Pinned against the other implementations, which store these exact strings.
+    /// Pinned, because other SDKs sharing the database store and read these exact strings.
     #[test]
-    fn stored_spellings_match_the_other_implementations() {
+    fn stored_spellings_are_the_shared_wire_strings() {
         assert_eq!(WorkflowStatus::Pending.as_str(), "PENDING");
         assert_eq!(WorkflowStatus::Enqueued.as_str(), "ENQUEUED");
         assert_eq!(WorkflowStatus::Delayed.as_str(), "DELAYED");
@@ -1299,11 +1286,9 @@ mod tests {
 /// Which applications' rows a query covers.
 ///
 /// Three cases rather than a list, because "no applications named" is genuinely ambiguous and the
-/// two readings are opposites. Python and TypeScript encode the same three states as
-/// `Optional[List[str]]`, where an *empty* list means every application and an *absent* one means
-/// this handle's own — a distinction they reach through `if not value` and `??` respectively,
-/// state in no comment, and cover with no test. Spelled out here so it cannot be collapsed by a
-/// later tidy-up that sees an empty list and a missing one as the same thing.
+/// two readings are opposites: an *empty* list of applications could mean every application, and an
+/// *absent* one this handle's own. Spelled out here so it cannot be collapsed by a later tidy-up
+/// that sees an empty list and a missing one as the same thing.
 ///
 /// Unclaimed rows are matched in every case: they belong to no application, so they belong to all
 /// of them. See [`AppScope::Named`] for the one exception that is not.
@@ -1336,9 +1321,6 @@ pub enum AppScope<'a> {
 /// [`app_scope`](Self::app_scope) is the exception, and deliberately so: its default scopes
 /// to the caller's own application rather than to everything.
 ///
-/// The set is the union of all four implementations, which do not agree on it: each carries a
-/// couple the others lack. Where they diverge it is noted on the field, so a missing filter
-/// reads as a decision rather than an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowFilter<'a> {
     /// Exact workflow ids.
@@ -1357,9 +1339,9 @@ pub struct WorkflowFilter<'a> {
 
     /// Registered function names.
     pub names: Vec<&'a str>,
-    /// Class names, for class-bound workflows. **Java only.**
+    /// Class names, for class-bound workflows.
     pub class_names: Vec<&'a str>,
-    /// Configured instance names. **Java only**, where it is `instanceName`.
+    /// Configured instance names.
     pub config_names: Vec<&'a str>,
     /// Statuses to include.
     pub status: Vec<WorkflowStatus>,
@@ -1377,9 +1359,9 @@ pub struct WorkflowFilter<'a> {
     pub queues_only: bool,
     /// Schedules that triggered the workflow.
     pub schedule_names: Vec<&'a str>,
-    /// Deduplication keys. **Go only.**
+    /// Deduplication keys.
     pub deduplication_ids: Vec<&'a str>,
-    /// Whether the deduplication key is a debounce key. **Go only.**
+    /// Whether the deduplication key is a debounce key.
     pub is_debounced: Option<bool>,
 
     /// Workflows started by any of these.
@@ -1395,11 +1377,11 @@ pub struct WorkflowFilter<'a> {
 
     /// Created at or after this instant.
     ///
-    /// Go and Python call this `start_time`, which reads as "when the workflow started". It does
-    /// not — it filters `created_at`, and a workflow may be created long before it starts.
+    /// Not `start_time`, which would read as "when the workflow started": it filters
+    /// `created_at`, and a workflow may be created long before it starts.
     /// [`started_after`](Self::started_after) is the one that filters on starting.
     pub created_after: Option<Timestamp>,
-    /// Created at or before this instant. Go and Python call this `end_time`.
+    /// Created at or before this instant.
     pub created_before: Option<Timestamp>,
     /// Finished at or after this instant.
     pub completed_after: Option<Timestamp>,
@@ -1407,12 +1389,12 @@ pub struct WorkflowFilter<'a> {
     pub completed_before: Option<Timestamp>,
     /// Started at or after this instant.
     ///
-    /// Every other implementation calls this `dequeued_after`, because the column is written
-    /// when a queued workflow is dequeued. It is not queue-specific — it is
-    /// [`WorkflowRecord::started_at`], the `started_at_epoch_ms` column — and naming it after
-    /// the queue implies a filter that would exclude workflows that never sat on one.
+    /// Not `dequeued_after`, although the column is written when a queued workflow is dequeued. It
+    /// is not queue-specific — it is [`WorkflowRecord::started_at`], the `started_at_epoch_ms`
+    /// column — and naming it after the queue implies a filter that would exclude workflows that
+    /// never sat on one.
     pub started_after: Option<Timestamp>,
-    /// Started at or before this instant. Elsewhere `dequeued_before`.
+    /// Started at or before this instant. Not `dequeued_before`, for the same reason.
     pub started_before: Option<Timestamp>,
 
     /// Encoded JSON the workflow's attributes must contain.
@@ -1440,9 +1422,9 @@ pub struct WorkflowFilter<'a> {
 impl Default for WorkflowFilter<'_> {
     /// Narrows nothing, and loads everything.
     ///
-    /// `load_input` and `load_output` default *on*, following Python, so a caller that does not
-    /// think about them gets whole records rather than silently empty payloads. That is the one
-    /// place this type cannot be `#[derive(Default)]`.
+    /// `load_input` and `load_output` default *on*, so a caller that does not think about them gets
+    /// whole records rather than silently empty payloads. That is the one place this type cannot be
+    /// `#[derive(Default)]`.
     fn default() -> Self {
         Self {
             workflow_ids: Vec::new(),
@@ -1488,10 +1470,9 @@ impl Default for WorkflowFilter<'_> {
 ///
 /// **The field names do not match the column names.** `step_id` and `step_name` are stored in
 /// `function_id` and `function_name`, which is what the schema has called them since migration 1
-/// and what every implementation's SQL still says. Java's `StepResult` draws the same
-/// distinction, and the reason is that "function" is what these were called before steps had a
-/// name of their own — the columns cannot be renamed without a migration every SDK must agree
-/// on, but the Rust API need not inherit the old word.
+/// and what every SDK sharing the database still reads and writes. "Function" is what these were
+/// called before steps had a name of their own — the columns cannot be renamed without a migration
+/// every SDK must agree on, but the Rust API need not inherit the old word.
 ///
 /// Serde-able for the same reason as [`WorkflowRecord`], and `#[serde(default)]` per field for
 /// the same reason too: a step listing taken from inside a workflow is itself a checkpointed
@@ -1541,14 +1522,12 @@ pub struct StepRecord {
 ///
 /// Those two columns are independently nullable, so a row could carry both — which would make
 /// the work simultaneously successful and failed, and leave a replay believing whichever the
-/// reader happened to check first. Every implementation forbids it; Python asserts
-/// `error is None or output is None`. A sum type means there is nothing to assert.
+/// reader happened to check first. A sum type means there is nothing to assert.
 ///
 /// For a workflow this also settles the status, which is why
 /// [`record_workflow_outcome`](crate::sysdb::SystemDatabase::record_workflow_outcome) does not
-/// take one. No implementation treats it as a free choice: Go computes
-/// `status := Success; if err != nil { status = Error }`, and Java splits the call into
-/// `recordWorkflowOutput` and `recordWorkflowError`.
+/// take one: an output means `SUCCESS` and an error means `ERROR`, with no third choice to get
+/// wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome<'a> {
     /// The work returned.
@@ -1585,10 +1564,9 @@ impl<'a> Outcome<'a> {
 /// workflow rather than by it, so they are states no run ever reports — and it is precisely the
 /// caller waiting on a workflow it is not running that has to be told about them.
 ///
-/// **"Awaited" is the references' own word for that side of the relationship**, and it is load-bearing
-/// rather than decorative: Python raises `DBOSAwaitedWorkflowCancelledError` specifically so a
-/// cancelled *awaited* workflow is not mistaken for the *awaiting* one having been cancelled. The
-/// same distinction is why the variants below are values — see the second bullet.
+/// **"Awaited" is load-bearing rather than decorative:** a cancelled *awaited* workflow must not
+/// be mistaken for the *awaiting* one having been cancelled. The same distinction is why the
+/// variants below are values — see the second bullet.
 ///
 /// Not named for terminality, because one variant is not terminal:
 /// [`WorkflowStatus::is_terminal`] is deliberately false for
@@ -1600,18 +1578,12 @@ impl<'a> Outcome<'a> {
 /// second is the one that would be a bug:
 ///
 /// - A failed workflow's error is encoded in whatever the workflow chose, and this layer does not
-///   deserialize payloads. So a failure is already data here rather than something to raise, and
-///   Go's `AwaitWorkflowResult` returns the same string for the same reason.
+///   deserialize payloads. So a failure is already data here rather than something to raise.
 /// - **A cancelled workflow must not be reported as the caller being cancelled.**
 ///   [`Error::WorkflowCancelled`] means the opposite thing
 ///   — the step-replay check refusing to run *this* workflow's steps — and returning it here would
-///   read as the waiter having been cancelled. Python is explicit about the distinction, raising a
-///   separate `DBOSAwaitedWorkflowCancelledError` "because the awaiting workflow is not being
-///   cancelled". Reporting all four uniformly leaves the user-facing error taxonomy to the engine,
-///   which owns it.
-///
-/// Go returns a result *and* an error together for the same call, which in Rust is only
-/// expressible as a value.
+///   read as the waiter having been cancelled. Reporting all four uniformly leaves the
+///   user-facing error taxonomy to the engine, which owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AwaitedOutcome {
     /// It returned. `None` is a void return, which is a success and not an absent result.
@@ -1633,8 +1605,7 @@ pub enum AwaitedOutcome {
     /// It was recovered too many times and parked, so it has neither.
     ///
     /// The limit it exceeded is not stored — it is the engine's, applied when a dequeue dispatches
-    /// the workflow, rather than a column — so the count is what can be reported. Go reports
-    /// `attempts - 2` as the limit, which is an approximation of the same missing number.
+    /// the workflow, rather than a column — so the count is what can be reported.
     Parked {
         /// Recovery attempts recorded against the workflow.
         recovery_attempts: i64,
@@ -1667,18 +1638,16 @@ pub struct StepTiming {
     /// stamp the clock after their work rather than before it.
     ///
     /// Omitting the timing altogether gives up that detection: with no recorded completion there
-    /// is nothing to compare, so a duplicate write is accepted rather than reported. Java
-    /// behaves the same way, guarding its comparison with `if (endTimeEpochMs != null)`.
+    /// is nothing to compare, so a duplicate write is accepted rather than reported.
     pub completed_at: Timestamp,
 }
 
 /// Rejects attributes that are not a JSON *object*.
 ///
-/// The contract is an object, not arbitrary JSON: every other implementation takes a map — Java
-/// `Map<String, Object>`, Python `Dict[str, Any]`, Go `map[string]any` — and TypeScript rejects
-/// arrays outright with *"must be a key-value object"*. Since this layer takes the encoded form,
-/// so a host across an FFI boundary can hand over bytes it already has, the same check has to
-/// happen here rather than falling out of the type.
+/// The contract is an object, not arbitrary JSON, and it is shared with the other SDKs that read
+/// the column. Since this layer takes the encoded form, so a host across an FFI boundary can hand
+/// over bytes it already has, the same check has to happen here rather than falling out of the
+/// type.
 ///
 /// It matters beyond tidiness: `attributes @> …` in [`WorkflowFilter`] is containment against an
 /// object, so a stored array or scalar would silently never match.
@@ -1722,9 +1691,8 @@ impl AttributeUpdate<'_> {
 
 /// When a delayed workflow should become eligible to run.
 ///
-/// A sum type because the two forms are alternatives, not options: Python takes
-/// `delay_seconds` and `delay_until_epoch_ms` as separate keyword arguments and raises when both
-/// are given, and Java models it as a sealed interface. Both resolve to the same column.
+/// A sum type because the two forms are alternatives, not options: giving both would be a
+/// contradiction to refuse at runtime. Both resolve to the same column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowDelay {
     /// Wait this long from now.
@@ -1856,8 +1824,8 @@ pub struct WorkflowInitResult {
 
 /// Whether a name is usable as an application name.
 ///
-/// Three to 256 characters of lowercase letters, digits, dashes and underscores — the rule
-/// every implementation enforces, so a name registered by one is accepted by the others. The
+/// Three to 256 characters of lowercase letters, digits, dashes and underscores — a rule shared
+/// with the other SDKs on the same database, so a name registered by one is accepted by all. The
 /// length is in bytes, which is the same as characters here because nothing outside ASCII passes.
 pub fn is_valid_application_name(name: &str) -> bool {
     (3..=256).contains(&name.len())
@@ -1870,8 +1838,7 @@ pub fn is_valid_application_name(name: &str) -> bool {
 ///
 /// A sum type rather than a name plus an `adopt_unclaimed` flag. That pair admits four states and
 /// only three are valid requests: naming no application and not adopting unclaimed selects no rows
-/// at all. Python and TypeScript both reject that combination at runtime with
-/// *"Nothing to re-own"*.
+/// at all, a request that could only be refused at runtime.
 ///
 /// **Unclaimed rows are never implied**, unlike everywhere else in this feature, where
 /// `IS NULL` rides along with every ownership predicate. An unclaimed row belongs to every
@@ -1896,7 +1863,7 @@ impl<'a> RenameFrom<'a> {
     }
 }
 
-/// The batch size every implementation defaults to.
+/// The batch size a rename defaults to.
 pub const DEFAULT_RENAME_BATCH_SIZE: u32 = 10_000;
 
 /// How a rename moves the rows that do not have to move atomically.
@@ -1905,9 +1872,8 @@ pub const DEFAULT_RENAME_BATCH_SIZE: u32 = 10_000;
 /// history, and they scope observability and garbage collection alone, so they may lag the rest of
 /// the rename without anything reading a half-renamed state.
 ///
-/// The references say this with a nullable integer, where `None` reads as *unbatched* rather
-/// than as "unset": Python takes its default from the parameter's default value, and TypeScript
-/// separates `null` (unbatched) from `undefined` (absent, so the default).
+/// An enum rather than an `Option<u32>`, where `None` could read as either *unbatched* or
+/// *unset, so the default*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameBatching {
     /// One statement per table, however many rows match. Simplest, and fine for a short history.
@@ -2033,8 +1999,7 @@ impl PollingConcurrency {
 /// How many workflows a queue may start per window.
 ///
 /// One value rather than two `Option`s, because the two columns behind it are only meaningful
-/// together: a limit with no window and a window with no limit are both unenforceable. Java draws
-/// the line in the same place, as `record RateLimit(int limit, Duration period)`.
+/// together: a limit with no window and a window with no limit are both unenforceable.
 ///
 /// The schema stores the pair as two nullable columns and cannot enforce that, so a row with one
 /// set and not the other is [`Error::Malformed`] on read — a state this type says cannot exist.
@@ -2051,20 +2016,13 @@ pub struct RateLimit {
 /// The third state a plain `Option` cannot carry: for a nullable column, "leave it alone" and
 /// "set it to NULL" are different requests, and `Option<T>` has one spelling for both.
 ///
-/// Python and TypeScript pass a dictionary of columns to values, and the three states fall out of
-/// it: a key that is absent leaves the column alone, and a key that is present sets it — including
-/// to null. `Change` is that, typed. [`Change::Leave`] is the absent key, [`Change::Set`] the
-/// present one, and the inner value is what the key held.
-///
-/// Typing it also closes a gap their dictionaries leave open: nothing stops a caller passing a key
-/// whose value is missing rather than null, and the two are indistinguishable by the time the
-/// `SET` clause is built. Here they are separate constructors, so there is no third thing to
-/// write.
+/// [`Change::Leave`] leaves the column out of the `SET` clause, and [`Change::Set`] writes the
+/// inner value — including null. They are separate constructors, so there is no third thing to
+/// write: no way to pass a value that is missing rather than null.
 ///
 /// Clearability lives in the *inner* type rather than in a third variant, so it mirrors the
 /// column: `Change<Option<i32>>` can leave, clear or set, while `Change<bool>` can only leave or
-/// set, because the column behind it is `NOT NULL`. Java splits the same line with two
-/// mechanisms — `Field<Integer>` for nullable columns, `Optional<Boolean>` for the rest.
+/// set, because the column behind it is `NOT NULL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change<T> {
     /// Leave whatever is stored.
@@ -2099,9 +2057,9 @@ impl<T> Change<T> {
 /// The fields of a registered queue that a partial update may change.
 ///
 /// Separate from [`NewQueue`] because they answer different questions: registering describes a
-/// whole queue, updating names only what moves. Java uses one type for both and its documentation
-/// has to say that an absent field means "no limit **on creation** or leave unchanged **on
-/// update**" — the same value meaning two things depending on which call it is passed to.
+/// whole queue, updating names only what moves. One type for both would make an absent field mean
+/// "no limit" on creation and "leave unchanged" on update — the same value meaning two things
+/// depending on which call it is passed to.
 ///
 /// **Ownership is not here.** A queue changes hands only through
 /// [`SystemDatabase::rename_application`](crate::sysdb::SystemDatabase::rename_application);
@@ -2282,19 +2240,17 @@ impl DebounceRequest<'_> {
 /// the first run did rather than bouncing again — see
 /// [`SystemDatabase::debounce_delayed_workflow`](crate::sysdb::SystemDatabase::debounce_delayed_workflow).
 ///
-/// Three outcomes rather than the flat record the references return: their `DebounceResult`
-/// carries `bounced_workflow_id` alongside a run of `holder_*` fields, of which exactly one group
-/// is ever populated. Reading it means checking which — and a stored one means *guessing* which,
-/// since nothing in the shape rules out both groups being set at once. Named states cannot encode
-/// that, so the ambiguity is gone rather than resolved by convention.
+/// Three outcomes rather than a flat record carrying a bounced workflow's id alongside the
+/// holder's fields, of which exactly one group would ever be populated. Reading such a record
+/// means checking which — and a stored one means *guessing* which, since nothing in the shape
+/// rules out both groups being set at once. Named states cannot encode that, so the ambiguity is
+/// gone rather than resolved by convention.
 ///
-/// **The serialized form is this implementation's own, and it is this type's derive.** A step is
-/// only ever replayed by the SDK that wrote it — workflows cross languages by enqueue alone — so
-/// the encoding is recorded in the `serialization` column rather than agreed between
-/// implementations. Python's default is `py_pickle`, base64-encoded pickle, and it is the *user's*
-/// configurable serializer at that: there is no common wire form to conform to. The consequence is
-/// that renaming a variant or field here changes what a replay expects to read, so a rename wants
-/// the same care a schema change does.
+/// **The serialized form is this crate's own, and it is this type's derive.** A step is only ever
+/// replayed by the SDK that wrote it — workflows cross languages by enqueue alone — so the encoding
+/// is recorded in the `serialization` column rather than agreed between SDKs: there is no common
+/// wire form to conform to. The consequence is that renaming a variant or field here changes what a
+/// replay expects to read, so a rename wants the same care a schema change does.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Debounce {
     /// The existing delayed workflow was extended, and its inputs replaced.
@@ -2438,7 +2394,7 @@ impl NewQueue<'_> {
 }
 
 impl<'a> NewQueue<'a> {
-    /// A queue with no limits, polling once a second — the defaults every implementation shares.
+    /// A queue with no limits, polling once a second.
     pub fn new(name: &'a str) -> Self {
         Self {
             name,
@@ -2459,7 +2415,8 @@ impl<'a> NewQueue<'a> {
 /// Never to its owner, which moves only by rename: a name already held by another application is
 /// [`Error::RegisteredByAnother`] in both cases, because the name is the queue's address — as long
 /// as the caller has a name to be refused under. A nameless one is let through and [`Update`]
-/// replaces the peer's limits; UPSTREAM item 26.
+/// replaces the peer's limits: a known limit, and an open question shared with the other SDKs on
+/// the same database.
 ///
 /// [`Update`]: OnExistingQueue::Update
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2713,14 +2670,12 @@ impl<'a> StepCaller<'a> {
 /// carries **two** step ids and they are not interchangeable: one records the read itself, the
 /// other the deadline it waits until. `Some(("wf", 4, 5))` says nothing about which is which, and
 /// transposing them is a mistake nothing catches until a recovery replays the wrong step under the
-/// wrong name. Every reference passes these three together too — Python's
-/// `GetEventWorkflowContext`, TypeScript's `{workflowID, functionID, timeoutFunctionID}`.
+/// wrong name.
 ///
 /// `None` at the call site is a caller outside a workflow: it has no steps to record and nothing
 /// to replay, so it waits on the wall clock and returns whatever it found. That optionality is why
 /// this is a type at all — `recv` blocks and checkpoints the same two steps, but requires its
-/// caller, so it takes them as plain parameters with nothing to wrap. Java draws the line in the
-/// same place, with a `GetEventCaller` record and none for `recv`.
+/// caller, so it takes them as plain parameters with nothing to wrap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GetEventCaller<'a> {
     /// The workflow doing the reading — the caller, never the workflow being read from.
@@ -2929,8 +2884,8 @@ impl<'a> Fork<'a> {
 /// Taken by [`fork_from`](crate::sysdb::SystemDatabase::fork_from), which is kept for a handler of
 /// Conductor's `fork_from_failure` message; the engine's own fork always states its step.
 ///
-/// A sum type because the four are alternatives, not options: Python and TypeScript both take
-/// them as four independent flags and raise unless exactly one is set. The resolved value is a
+/// A sum type because the four are alternatives, not options: as four independent flags, every
+/// combination but exactly one set would have to be refused at runtime. The resolved value is a
 /// [`Fork::start_step`], so the named step *re-runs* and everything below it replays — forking
 /// "from the failure" means running the failed step again, not skipping it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2954,8 +2909,8 @@ pub enum ForkPoint<'a> {
 
 /// How forked workflows are created.
 ///
-/// The defaults are what every implementation does when the caller says nothing: the fork is
-/// enqueued on the internal queue, inherits its source's version, and carries no timeout.
+/// The defaults are what happens when the caller says nothing: the fork is enqueued on the internal
+/// queue, inherits its source's version, and carries no timeout.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ForkOptions<'a> {
     /// The version the fork runs under. `None` inherits the source's.
@@ -2971,15 +2926,12 @@ pub struct ForkOptions<'a> {
     /// The partition of that queue.
     pub queue_partition_key: Option<&'a str>,
     /// How long the fork may run before it is cancelled.
-    ///
-    /// All four references carry this on their fork options.
     pub timeout: Option<Duration>,
     /// Child workflow ids to rewrite as the fork's steps are copied.
     ///
     /// When a tree of workflows is forked together, the parent's recorded children are the
     /// *original* children — replaying them would make the fork adopt the originals rather than
-    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy. Python,
-    /// TypeScript and Go all take this map; Java does not.
+    /// its own. Each `(from, to)` pair rewrites one `child_workflow_id` during the copy.
     pub replacement_children: &'a [(&'a str, &'a str)],
 }
 
@@ -3009,10 +2961,9 @@ impl ForkOptions<'_> {
         }
         // The replacements are applied by joining against them, so one child named twice would
         // match a copied step twice and duplicate it. The primary key would catch that as a
-        // constraint violation, which says nothing about the map that caused it. Python and
-        // TypeScript build a `CASE` instead, which silently takes the first match — but two
-        // replacements for one child is a caller that does not know which it wants, and picking
-        // for them is worse than saying so.
+        // constraint violation, which says nothing about the map that caused it. Nor is taking
+        // the first match an answer: two replacements for one child is a caller that does not
+        // know which it wants, and picking for them is worse than saying so.
         for (index, (original, replacement)) in self.replacement_children.iter().enumerate() {
             if original.is_empty() {
                 return Err(Error::InvalidInput {
@@ -3244,8 +3195,8 @@ pub struct Message<'a> {
     /// The topic it is filed under, or `None` for the untopicked default.
     ///
     /// `None` is stored as a sentinel string rather than `NULL`, because a receiver selects on
-    /// equality and `topic = NULL` matches nothing. Every implementation uses the same sentinel,
-    /// so it is part of the cross-SDK contract rather than an encoding choice.
+    /// equality and `topic = NULL` matches nothing. Other SDKs sharing the database use the same
+    /// sentinel, so it is part of the cross-SDK contract rather than an encoding choice.
     pub topic: Option<&'a str>,
     /// The payload, already encoded by the caller.
     pub message: &'a str,
@@ -3258,11 +3209,10 @@ pub struct Message<'a> {
 
 /// Who wrote to a stream, which decides whether the write is itself a durable step.
 ///
-/// Python, Java and TypeScript encode this in the method name — `write_stream_from_workflow`
-/// versus `write_stream_from_step` — and differ in nothing else. Go takes one method and no
-/// distinction. Naming the difference instead of duplicating the method is the same choice made
-/// for [`send_messages`](crate::sysdb::SystemDatabase::send_messages): the split is in the
-/// behaviour, not the operation.
+/// A workflow's write and a step's write differ in nothing else. Naming the difference instead of
+/// duplicating the method is the same choice made for
+/// [`send_messages`](crate::sysdb::SystemDatabase::send_messages): the split is in the behaviour,
+/// not the operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrittenBy {
     /// The workflow body itself. The write *is* a step: it is recorded, and a replay finds it
@@ -3276,8 +3226,8 @@ pub enum WrittenBy {
 
 /// Whether a schedule fires.
 ///
-/// Two states in every implementation. Pausing does not delete the row or forget
-/// [`ScheduleRecord::last_fired_at`], so resuming picks up where it left off.
+/// Two states. Pausing does not delete the row or forget [`ScheduleRecord::last_fired_at`], so
+/// resuming picks up where it left off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ScheduleStatus {
@@ -3332,7 +3282,7 @@ pub struct ScheduleRecord {
     ///
     /// Stored as ISO-8601 text rather than the epoch milliseconds every other time column holds,
     /// and read back through [`Timestamp::parse_iso8601`] so a caller gets an instant either way.
-    /// The four implementations write four spellings of it — see
+    /// Writers sharing the database spell it differently — see
     /// [`SystemDatabase::update_schedule_last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at).
     pub last_fired_at: Option<Timestamp>,
     /// Whether missed firings are made up when a paused or stopped schedule resumes.
@@ -3353,11 +3303,8 @@ pub struct ScheduleRecord {
 pub struct NewSchedule<'a> {
     /// See [`ScheduleRecord::schedule_id`]. `None` generates one.
     ///
-    /// All four implementations end up with a generated UUID; they differ only in which layer
-    /// generates it. Java's DAO does, as this does. TypeScript and Python generate one layer
-    /// higher, at every call site that registers a schedule, and hand this layer a value it must
-    /// take. That is the same split `application_name` has, and it resolves the same way: the
-    /// fallback lives here so this layer stands on its own, and a registration layer above it
+    /// Either way the schedule ends up with a UUID. The fallback lives here, as it does for
+    /// `application_name`, so this layer stands on its own, and a registration layer above it
     /// that supplies the id makes this a second line of defence rather than the only one.
     pub schedule_id: Option<&'a str>,
     /// See [`ScheduleRecord::schedule_name`].
@@ -3409,8 +3356,7 @@ impl<'a> NewSchedule<'a> {
 ///
 /// **Definition only.** The identity, the status and the last firing are runtime state, moved by
 /// their own methods, so re-applying a definition cannot silently restart a schedule or forget
-/// where it had got to. TypeScript draws the same line and says so in a comment; this makes it
-/// unrepresentable instead.
+/// where it had got to. The type makes that unrepresentable rather than merely documented.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduleUpdate<'a> {
     /// See [`ScheduleRecord::schedule`].

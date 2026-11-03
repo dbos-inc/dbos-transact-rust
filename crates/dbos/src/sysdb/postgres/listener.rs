@@ -27,23 +27,19 @@ use crate::sysdb::notify::{
 /// What every wait uses with no listener delivering, and what a stream read always uses.
 ///
 /// **It is a delivery latency, not a fallback**: with nothing pushing, this is how long a `recv`
-/// takes to see a message another process has already committed. One second is Java's constant, and
-/// Python's whenever no listener is running. TypeScript's 10s is not a counterexample — it is a
-/// fallback beneath a listener that does the delivering, and taking that number without the
-/// listener would be a tenfold regression against every other implementation's no-push behaviour.
+/// takes to see a message another process has already committed, so it has to be short. A longer
+/// value is only safe beneath a listener that does the delivering, which is what
+/// [`LONG_INTERVAL`] is for.
 ///
 /// **A stream read gets this whatever the listener is doing.** A stream reader waits on two things:
-/// a value arriving, which is pushed, and the producer *terminating*, which nothing pushes in any
-/// implementation. A minute's interval there would mean a minute to notice a finished workflow.
-/// Python, Go and Java all draw the line in the same place.
+/// a value arriving, which is pushed, and the producer *terminating*, which nothing pushes. A
+/// minute's interval there would mean a minute to notice a finished workflow.
 const SHORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What `recv` and `get_event` use once a listener is proven to deliver.
 ///
 /// A safety net rather than a delivery path: it catches only what the listener dropped — a
-/// notification lost on the wire, or one sent while this process was reconnecting. Sixty seconds,
-/// matching Python's `_notification_fallback_polling_interval`, Go's
-/// `_NOTIFICATION_FALLBACK_RECHECK_INTERVAL` and Java's `NOTIFICATION_FALLBACK_INTERVAL`.
+/// notification lost on the wire, or one sent while this process was reconnecting. Sixty seconds.
 const LONG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The payload the self-test sends itself.
@@ -58,7 +54,8 @@ const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long to wait before reconnecting after the listener errors.
 ///
-/// A second, which is what Python, TypeScript and Java all sleep between attempts.
+/// A second: short enough that a blip costs little, long enough not to spin against a database
+/// that is down.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// One connection, three channels, feeding one registry.
@@ -109,8 +106,7 @@ impl Listener {
     /// absent listeners, so everything sent while this process had no connection is simply gone.
     /// Waking every waiter after each connect turns that hole into one extra look each — which is
     /// all a wakeup ever was — instead of a stall until each caller's own interval comes round, and
-    /// with the long interval that stall can outlast the caller's timeout entirely. Go and Java
-    /// both do this; Python and TypeScript do not, and rely on the fallback catching it.
+    /// with the long interval that stall can outlast the caller's timeout entirely.
     ///
     /// Waking on the *first* connect too, not only on reconnects: before it there was no listener
     /// either, so the same hole is there.
@@ -146,12 +142,10 @@ impl Listener {
     /// the statement succeeds and the subscription is dropped the moment the backend is handed to
     /// someone else. So this sends itself one notification and waits for it.
     ///
-    /// TypeScript does the same test and only warns, which it can afford because its interval is a
-    /// constant either way. Here the test is what makes the interval switch safe: believing a dead
-    /// subscription would take every `recv` and `get_event` from a second to a minute, silently,
-    /// which is worse than having no listener at all. So a failed self-test leaves the short
-    /// interval in place and the listener running anyway — a notification that does arrive is still
-    /// worth having.
+    /// The test is what makes the interval switch safe: believing a dead subscription would take
+    /// every `recv` and `get_event` from a second to a minute, silently, which is worse than having
+    /// no listener at all. So a failed self-test leaves the short interval in place and the
+    /// listener running anyway — a notification that does arrive is still worth having.
     async fn connect(&self) -> Result<PgListener, sqlx::Error> {
         let mut listener = PgListener::connect_with(&self.pool).await?;
         listener
@@ -274,10 +268,9 @@ mod tests {
         assert_eq!(listener.poll_interval(), SHORT_INTERVAL);
     }
 
-    /// The short interval is the one every reference uses with no push, and the long one is the
-    /// fallback the three that switch agree on.
+    /// A second with nothing pushing, a minute as the safety net beneath a listener.
     #[test]
-    fn the_intervals_are_the_cross_sdk_constants() {
+    fn the_intervals_are_a_second_and_a_minute() {
         assert_eq!(SHORT_INTERVAL, Duration::from_secs(1));
         assert_eq!(LONG_INTERVAL, Duration::from_secs(60));
     }
