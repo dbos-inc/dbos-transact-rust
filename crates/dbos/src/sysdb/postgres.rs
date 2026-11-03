@@ -155,7 +155,8 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
 /// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
-/// | `08P01`, `08007`, `57P04` | protocol violation, commit outcome unknown, database dropped | permanent |
+/// | `08P01`, `08007` | protocol violation, commit outcome unknown | permanent |
+/// | `57014`, `57P04` | statement cancelled, database dropped | permanent |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -170,15 +171,14 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// an ambiguous result, where the transaction may have committed and a replay could apply it
 /// twice. Both are permanent, so they reach the caller.
 ///
-/// **Three codes are carved out of the connection classes**, because asking again cannot help
+/// **Four codes are carved out of the connection classes**, because asking again cannot help
 /// and may hurt. `08P01`, a protocol violation, is the server refusing a malformed request — a
 /// bind that supplies the wrong number of parameters, say — and the same request is malformed on
 /// every attempt. `08007`, transaction resolution unknown, is the `40003` case again: the commit
-/// may have applied. `57P04` names a database that was dropped, which no wait brings back.
-///
-/// `57014`, a cancelled statement, stays in its class and is retried, though a statement cut off
-/// by `statement_timeout` is cut off again on every attempt. Whether to refuse it, and as what
-/// error, is an open question shared with the other SDKs on the same database.
+/// may have applied. `57014` is a statement cancelled while the connection stayed healthy, by
+/// `statement_timeout` or by someone cancelling the backend; a timeout fires again on every
+/// attempt, and a deliberate cancel is meant to stop the work, not delay it. `57P04` names a
+/// database that was dropped, which no wait brings back.
 ///
 /// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
@@ -210,7 +210,7 @@ fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
         return BackendErrorKind::Conflict;
     }
     // Inside the connection classes, but nothing a reconnect cures; see [`classify`].
-    if matches!(code, "08P01" | "08007" | "57P04") {
+    if matches!(code, "08P01" | "08007" | "57014" | "57P04") {
         return BackendErrorKind::Permanent;
     }
     // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
@@ -8447,11 +8447,12 @@ mod tests {
         }
     }
 
-    /// A malformed request, an unknown commit outcome and a dropped database sit in connection
-    /// classes, but asking again cannot help, so they are refused rather than retried.
+    /// A malformed request, an unknown commit outcome, a cancelled statement and a dropped
+    /// database sit in connection classes, but asking again cannot help, so they are refused
+    /// rather than retried.
     #[test]
     fn the_connection_class_exceptions_are_permanent() {
-        for code in ["08P01", "08007", "57P04"] {
+        for code in ["08P01", "08007", "57014", "57P04"] {
             assert_eq!(
                 classify_sqlstate(code, None),
                 BackendErrorKind::Permanent,
@@ -8463,7 +8464,7 @@ mod tests {
     /// The prefix classes are unchanged by the exact-code rules.
     #[test]
     fn connection_classes_match_by_prefix() {
-        for code in ["08000", "08006", "53300", "57014", "57P01", "57P05"] {
+        for code in ["08000", "08006", "53300", "57P01", "57P05"] {
             assert_eq!(
                 classify_sqlstate(code, None),
                 BackendErrorKind::Connection,
@@ -8728,6 +8729,44 @@ mod tests {
                 if db.backend() == dbos_test_support::Backend::Postgres {
                     assert_eq!(backend.sqlstate.as_deref(), Some("08P01"), "{backend:?}");
                 }
+            }
+            other => panic!("expected a backend error, got {other:?}"),
+        }
+    }
+
+    /// A statement cut off by `statement_timeout` fails at once rather than being retried.
+    ///
+    /// The cancellation is `57014`, in the operator-intervention class. Retried, the same timeout
+    /// would cut off the same statement on every attempt and the call would never return; the
+    /// timeout around it is what catches that.
+    #[tokio::test]
+    async fn a_statement_timeout_is_refused_not_retried() {
+        let db = dbos_test_support::test_database().await;
+        let pool = &db.pool().await;
+
+        let outcome = crate::rt::timeout(
+            std::time::Duration::from_secs(10),
+            with_retry(
+                &super::RetryPolicy::default(),
+                "statement_timeout",
+                move || async move {
+                    let mut tx = pool.begin().await?;
+                    sqlx::query("SET LOCAL statement_timeout = '50ms'")
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("SELECT pg_sleep(5)").execute(&mut *tx).await?;
+                    tx.commit().await?;
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("a cancelled statement returns instead of being retried");
+
+        match outcome {
+            Err(Error::Backend(backend)) => {
+                assert_eq!(backend.kind, BackendErrorKind::Permanent, "{backend:?}");
+                assert_eq!(backend.sqlstate.as_deref(), Some("57014"), "{backend:?}");
             }
             other => panic!("expected a backend error, got {other:?}"),
         }
