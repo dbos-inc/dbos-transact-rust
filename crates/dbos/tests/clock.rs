@@ -101,16 +101,21 @@ async fn a_replayed_sleep_ends_on_time_off_by(seconds: i64) {
     dbos.launch().await.expect("launch failed");
 
     let id = "clock-sleeper";
-    workflow
-        .run_with(
+    // Bounded, so a first run that waits by this process's clock fails here rather than sleeping
+    // out the hour.
+    dbos::__rt::timeout(
+        Duration::from_secs(30),
+        workflow.run_with(
             (),
             RunOptions {
                 workflow_id: Some(id),
                 ..RunOptions::default()
             },
-        )
-        .await
-        .expect("the workflow failed");
+        ),
+    )
+    .await
+    .expect("the first run waited on this process's clock, an hour from the database's")
+    .expect("the workflow failed");
     let step = wake_time_step(&db, id).await;
     rerecord_wake_time(&db, id, step).await;
 
@@ -258,4 +263,150 @@ async fn a_replayed_get_event_times_out_on_time_when_the_database_clock_runs_ahe
 #[dbos_test_support::test]
 async fn a_replayed_get_event_times_out_on_time_when_the_database_clock_runs_behind() {
     a_replayed_get_event_times_out_on_time_off_by(-3600).await;
+}
+
+/// The database's clock now, in epoch milliseconds.
+async fn db_now_ms(db: &TestDatabase) -> i64 {
+    sqlx::query_scalar("SELECT (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint")
+        .fetch_one(&db.pool().await)
+        .await
+        .unwrap()
+}
+
+/// The wake time recorded at `step` of `workflow_id`, in epoch milliseconds.
+async fn recorded_wake_time(db: &TestDatabase, workflow_id: &str, step: i32) -> i64 {
+    let step = reader(db)
+        .await
+        .check_step(workflow_id, step, "DBOS.sleep")
+        .await
+        .unwrap()
+        .expect("no wake time was recorded");
+    step.output.unwrap().parse().unwrap()
+}
+
+/// Asserts the wake time recorded at `step` is [`WAIT`] past `before` on the database's clock,
+/// rather than [`WAIT`] past this process's clock, an hour away.
+async fn assert_recorded_on_the_database_clock(
+    db: &TestDatabase,
+    workflow_id: &str,
+    step: i32,
+    before: i64,
+) {
+    let wait = i64::try_from(WAIT.as_millis()).unwrap();
+    let recorded = recorded_wake_time(db, workflow_id, step).await;
+    let after = db_now_ms(db).await;
+    assert!(
+        (before + wait..=after).contains(&recorded),
+        "recorded {recorded}, not {wait}ms past the database's now ({before}..={after})"
+    );
+}
+
+/// **A first run sets its wake time on the database's clock and waits it out.** Nothing is
+/// recorded beforehand, so the sleep computes the wake time itself.
+async fn a_first_sleep_is_timed_on_the_database_clock_off_by(seconds: i64) {
+    let Some(db) = skewed_database(seconds).await else {
+        return;
+    };
+    let dbos = DBOS::new(config("clock-first-sleep-app", &db));
+    let workflow = dbos
+        .register_workflow("naps", |()| async move {
+            dbos::sleep(WAIT).await?;
+            Ok::<u32, Error>(1)
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let id = "clock-first-sleeper";
+    let before = db_now_ms(&db).await;
+    let slept = waits_on_the_database_clock(workflow.run_with(
+        (),
+        RunOptions {
+            workflow_id: Some(id),
+            ..RunOptions::default()
+        },
+    ))
+    .await
+    .expect("the workflow failed");
+    assert_eq!(slept, 1);
+    let step = wake_time_step(&db, id).await;
+    assert_recorded_on_the_database_clock(&db, id, step, before).await;
+
+    dbos.shutdown().await;
+}
+
+#[dbos_test_support::test]
+async fn a_first_sleep_is_timed_on_the_database_clock_when_it_runs_ahead() {
+    a_first_sleep_is_timed_on_the_database_clock_off_by(3600).await;
+}
+
+#[dbos_test_support::test]
+async fn a_first_sleep_is_timed_on_the_database_clock_when_it_runs_behind() {
+    a_first_sleep_is_timed_on_the_database_clock_off_by(-3600).await;
+}
+
+/// **A first receive sets its deadline on the database's clock and times out at it.**
+async fn a_first_recv_is_timed_on_the_database_clock_off_by(seconds: i64) {
+    let id = "clock-first-receiver";
+    let Some((sys, db, owner)) = skewed_sysdb(seconds, id).await else {
+        return;
+    };
+
+    let before = db_now_ms(&db).await;
+    let received = waits_on_the_database_clock(sys.recv(
+        id,
+        0,
+        DEADLINE_STEP,
+        Some("nothing-sent"),
+        WAIT,
+        &owner,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(received, None);
+    assert_recorded_on_the_database_clock(&db, id, DEADLINE_STEP, before).await;
+}
+
+#[dbos_test_support::test]
+async fn a_first_recv_is_timed_on_the_database_clock_when_it_runs_ahead() {
+    a_first_recv_is_timed_on_the_database_clock_off_by(3600).await;
+}
+
+#[dbos_test_support::test]
+async fn a_first_recv_is_timed_on_the_database_clock_when_it_runs_behind() {
+    a_first_recv_is_timed_on_the_database_clock_off_by(-3600).await;
+}
+
+/// **A first read of an event sets its deadline on the database's clock and times out at it.**
+async fn a_first_get_event_is_timed_on_the_database_clock_off_by(seconds: i64) {
+    let id = "clock-first-reader";
+    let Some((sys, db, owner)) = skewed_sysdb(seconds, id).await else {
+        return;
+    };
+
+    let before = db_now_ms(&db).await;
+    let read = waits_on_the_database_clock(sys.get_event(
+        "nobody",
+        "unset",
+        WAIT,
+        Some(GetEventCaller {
+            workflow_id: id,
+            step_id: 0,
+            timeout_step_id: DEADLINE_STEP,
+            owner_xid: &owner,
+        }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(read, None);
+    assert_recorded_on_the_database_clock(&db, id, DEADLINE_STEP, before).await;
+}
+
+#[dbos_test_support::test]
+async fn a_first_get_event_is_timed_on_the_database_clock_when_it_runs_ahead() {
+    a_first_get_event_is_timed_on_the_database_clock_off_by(3600).await;
+}
+
+#[dbos_test_support::test]
+async fn a_first_get_event_is_timed_on_the_database_clock_when_it_runs_behind() {
+    a_first_get_event_is_timed_on_the_database_clock_off_by(-3600).await;
 }
