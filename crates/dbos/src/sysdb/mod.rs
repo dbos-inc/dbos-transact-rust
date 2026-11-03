@@ -1286,7 +1286,7 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Every registered version this handle's application can see, latest first.
     ///
-    /// Takes no target, unlike the three around it: a listing is what *this* application has
+    /// Takes no target, unlike the writes and the latest read around it: a listing is what *this* application has
     /// registered plus the unclaimed, and a caller wanting a peer's asks for the peer's latest.
     /// Python and TypeScript draw the line in the same place.
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error>;
@@ -1295,8 +1295,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **Latest by `version_timestamp`, not by creation.** Moving a version's timestamp is how a
     /// deployment is promoted or rolled back, which is what
-    /// [`update_application_version_timestamp`](Self::update_application_version_timestamp) is
-    /// for — so the newest row is not necessarily the current one.
+    /// [`promote_application_version`](Self::promote_application_version) is for — so the newest
+    /// row is not necessarily the current one.
     ///
     /// `None` rather than an error: an empty registry is what a database looks like before any
     /// application has launched. This layer is alone in that — Python, Go and Java all raise,

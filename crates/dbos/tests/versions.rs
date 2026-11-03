@@ -125,7 +125,15 @@ async fn the_version_calls_are_refused_before_launch() {
         Err(Error::NotLaunched { .. })
     ));
     assert!(matches!(
+        dbos.latest_app_version().await,
+        Err(Error::NotLaunched { .. })
+    ));
+    assert!(matches!(
         dbos.set_latest_app_version("v1").await,
+        Err(Error::NotLaunched { .. })
+    ));
+    assert!(matches!(
+        dbos.set_latest_app_version_for("v1", "versions-peer").await,
         Err(Error::NotLaunched { .. })
     ));
 }

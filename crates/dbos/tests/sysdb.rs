@@ -4205,6 +4205,16 @@ async fn a_promotion_stamps_the_database_clock_and_wins_over_a_future_stamp() {
         latest.version_timestamp.as_epoch_ms(),
         ahead.as_epoch_ms() + 1
     );
+
+    // A version pinned at the largest instant leaves room for one promotion above it, rather than
+    // making every later one overflow.
+    sys.update_application_version_timestamp("v2", Timestamp::from_epoch_ms(i64::MAX), None)
+        .await
+        .unwrap();
+    sys.promote_application_version("v1", None)
+        .await
+        .expect("a pinned version should not make promotion overflow");
+    assert_eq!(stamp("v1").await, i64::MAX);
 }
 
 /// The bulk readers report everything a workflow was sent, published, and streamed.

@@ -6,9 +6,40 @@
 //! its timestamp past every other's, so promoting an older one is a rollback. Both an application
 //! and a [`Client`] can read the registry and promote a version, as in the other implementations.
 
+use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::sysdb::types::VersionInfo;
 use crate::{Client, DBOS};
+
+/// What both surfaces do, against the connection each holds. An application's connection carries
+/// its name, so its reads and promotions are scoped as a client's named for it would be.
+impl Connection {
+    pub(crate) async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
+        self.sysdb()
+            .list_application_versions()
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+
+    pub(crate) async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
+        self.sysdb()
+            .get_latest_application_version(self.app_name())
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+
+    /// Promotes `version_name` for `app_name`, or for this connection's own application.
+    pub(crate) async fn set_latest_app_version(
+        &self,
+        version_name: &str,
+        app_name: Option<&str>,
+    ) -> Result<()> {
+        self.sysdb()
+            .promote_application_version(version_name, app_name.or(self.app_name()))
+            .await
+            .map_err(Error::SystemDatabase)
+    }
+}
 
 impl Client {
     /// Every application version this client can see, newest first: the ones its own application
@@ -19,14 +50,10 @@ impl Client {
     /// themselves, and which one a workflow row's `app_version` refers to. A *named*
     /// client answers that question for its own application only — a peer's versions are not in
     /// the listing, and nothing here reads them, which is why a tool that has to see every
-    /// application leaves [`app_name`](crate::ClientConfig::app_name) unset. Python and TypeScript scope
-    /// their listing the same way, and take no target either.
+    /// application leaves [`app_name`](crate::ClientConfig::app_name) unset. Python and TypeScript
+    /// scope their listing the same way, and take no target either.
     pub async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
-        self.connection()
-            .sysdb()
-            .list_application_versions()
-            .await
-            .map_err(Error::SystemDatabase)
+        self.connection().list_app_versions().await
     }
 
     /// The version a rolling deploy currently prefers, or `None` if none is registered.
@@ -34,11 +61,7 @@ impl Client {
     /// Scoped to this client's application, or across all of them when it is nameless. Latest by
     /// its registered timestamp rather than by creation, which is how a rollback is expressed.
     pub async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
-        self.connection()
-            .sysdb()
-            .get_latest_application_version(self.connection().app_name())
-            .await
-            .map_err(Error::SystemDatabase)
+        self.connection().latest_app_version().await
     }
 
     /// Promotes an already-registered version to be the latest, by moving its timestamp to now on
@@ -73,10 +96,8 @@ impl Client {
     /// ```
     pub async fn set_latest_app_version(&self, version_name: &str) -> Result<()> {
         self.connection()
-            .sysdb()
-            .promote_application_version(version_name, self.connection().app_name())
+            .set_latest_app_version(version_name, None)
             .await
-            .map_err(Error::SystemDatabase)
     }
 
     /// Promotes a version on behalf of the application that registered it.
@@ -109,10 +130,8 @@ impl Client {
         app_name: &str,
     ) -> Result<()> {
         self.connection()
-            .sysdb()
-            .promote_application_version(version_name, Some(app_name))
+            .set_latest_app_version(version_name, Some(app_name))
             .await
-            .map_err(Error::SystemDatabase)
     }
 }
 
@@ -123,23 +142,18 @@ impl DBOS {
     pub async fn list_app_versions(&self) -> Result<Vec<VersionInfo>> {
         self.executor("list application versions")?
             .connection()
-            .sysdb()
-            .list_application_versions()
+            .list_app_versions()
             .await
-            .map_err(Error::SystemDatabase)
     }
 
     /// The version a rolling deploy of this application currently prefers, or `None` if none is
     /// registered: latest by its timestamp rather than by creation, which is how a rollback is
     /// expressed. Not necessarily [`app_version`](Self::app_version), this executor's own.
     pub async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
-        let executor = self.executor("read the latest application version")?;
-        executor
+        self.executor("read the latest application version")?
             .connection()
-            .sysdb()
-            .get_latest_application_version(executor.connection().app_name())
+            .latest_app_version()
             .await
-            .map_err(Error::SystemDatabase)
     }
 
     /// Promotes an already-registered version of this application to be the latest, as
@@ -157,13 +171,10 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub async fn set_latest_app_version(&self, version_name: &str) -> Result<()> {
-        let executor = self.executor("set the latest application version")?;
-        executor
+        self.executor("set the latest application version")?
             .connection()
-            .sysdb()
-            .promote_application_version(version_name, executor.connection().app_name())
+            .set_latest_app_version(version_name, None)
             .await
-            .map_err(Error::SystemDatabase)
     }
 
     /// Promotes a version on behalf of the application that registered it, as
@@ -176,9 +187,7 @@ impl DBOS {
     ) -> Result<()> {
         self.executor("set the latest application version")?
             .connection()
-            .sysdb()
-            .promote_application_version(version_name, Some(app_name))
+            .set_latest_app_version(version_name, Some(app_name))
             .await
-            .map_err(Error::SystemDatabase)
     }
 }
