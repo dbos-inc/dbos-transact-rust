@@ -939,7 +939,7 @@ impl DBOS {
     ///
     /// The schedule surface places through this. The management methods below do not: each shares
     /// its body with a free form that has no `self`, so they hand that body a connection through
-    /// [`served`](Self::served) and the body places for itself, the same way, after the argument
+    /// [`connection`](Self::connection) and the body places for itself, the same way, after the argument
     /// checks that must refuse before an id is spent.
     pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
@@ -952,7 +952,7 @@ impl DBOS {
     /// argument checks that must refuse before an id is spent. Whether the ambient workflow is
     /// this instance's is decided there, by [`StepPlacement::of`], which is where
     /// [`Error::WrongInstance`] comes from.
-    fn served(&self, operation: &'static str) -> Result<Arc<Connection>> {
+    fn connection(&self, operation: &'static str) -> Result<Arc<Connection>> {
         Ok(Arc::clone(self.executor(operation)?.connection()))
     }
 
@@ -1043,7 +1043,7 @@ impl DBOS {
     /// # Ok(()) }
     /// ```
     pub fn cancel<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
-        pending_cancel(self.served("cancel a workflow"), workflow_id)
+        pending_cancel(self.connection("cancel a workflow"), workflow_id)
     }
 
     /// Cancels workflows, and optionally everything descended from them.
@@ -1079,7 +1079,7 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         children: Children,
     ) -> PendingStep<'a, Vec<String>> {
-        pending_cancel_all(self.served("cancel a workflow"), workflow_ids, children)
+        pending_cancel_all(self.connection("cancel a workflow"), workflow_ids, children)
     }
 
     /// Puts a workflow back on a queue, and hands back a handle to watch it.
@@ -1164,7 +1164,7 @@ impl DBOS {
         options: ResumeOptions<'a>,
     ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         PendingStart::from_step(pending_resume(
-            self.served("resume a workflow"),
+            self.connection("resume a workflow"),
             workflow_id,
             options,
         ))
@@ -1193,7 +1193,7 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         options: ResumeOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        pending_resume_all(self.served("resume a workflow"), workflow_ids, options)
+        pending_resume_all(self.connection("resume a workflow"), workflow_ids, options)
     }
 
     /// Forks a workflow from `start_step`, enqueueing the fork and handing back a handle to it.
@@ -1264,7 +1264,7 @@ impl DBOS {
         fork: Fork<'a>,
         options: ForkOptions<'a>,
     ) -> PendingStart<'a, R, E, crate::EngineOnly> {
-        PendingStart::from_step(pending_fork(self.served(FORK_OPERATION), fork, options))
+        PendingStart::from_step(pending_fork(self.connection(FORK_OPERATION), fork, options))
     }
 
     /// Forks workflows, handing back a handle to each fork in the order given.
@@ -1305,7 +1305,7 @@ impl DBOS {
         forks: &'a [Fork<'a>],
         options: ForkOptions<'a>,
     ) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
-        pending_fork_all(self.served(FORK_OPERATION), forks, options)
+        pending_fork_all(self.connection(FORK_OPERATION), forks, options)
     }
 
     /// Re-runs a finished workflow from its first step, under the same id.
@@ -1397,7 +1397,7 @@ impl DBOS {
         options: RewindOptions<'a>,
     ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         PendingStart::from_step(pending_rewind(
-            self.served("rewind a workflow"),
+            self.connection("rewind a workflow"),
             workflow_id,
             options,
         ))
@@ -1428,7 +1428,7 @@ impl DBOS {
     /// with [`Error::SystemDatabase`] carrying `InvalidInput` and nothing is deleted; see
     /// [`delete_all`](Self::delete_all) for why.
     pub fn delete<'a>(&self, workflow_id: &'a str) -> PendingStep<'a, ()> {
-        pending_delete(self.served("delete a workflow"), workflow_id)
+        pending_delete(self.connection("delete a workflow"), workflow_id)
     }
 
     /// Deletes workflows, and optionally everything descended from them.
@@ -1461,7 +1461,7 @@ impl DBOS {
         workflow_ids: &'a [&'a str],
         children: Children,
     ) -> PendingStep<'a, u64> {
-        pending_delete_all(self.served("delete a workflow"), workflow_ids, children)
+        pending_delete_all(self.connection("delete a workflow"), workflow_ids, children)
     }
 
     /// Holds a queued workflow back, or lets it go sooner.
@@ -1499,7 +1499,7 @@ impl DBOS {
         workflow_id: &'a str,
         delay: WorkflowDelay,
     ) -> PendingStep<'a, ()> {
-        pending_set_workflow_delay(self.served(DELAY_OPERATION), workflow_id, delay)
+        pending_set_workflow_delay(self.connection(DELAY_OPERATION), workflow_id, delay)
     }
 
     /// Replaces a workflow's attributes, or clears them with `None`.
@@ -1552,7 +1552,7 @@ impl DBOS {
         attributes: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> PendingStep<'a, ()> {
         pending_update_workflow_attributes(
-            self.served("update a workflow's attributes"),
+            self.connection("update a workflow's attributes"),
             workflow_id,
             attributes,
         )
@@ -1591,7 +1591,7 @@ impl DBOS {
         attributes: &serde_json::Map<String, serde_json::Value>,
     ) -> PendingStep<'a, ()> {
         pending_merge_workflow_attributes(
-            self.served("merge a workflow's attributes"),
+            self.connection("merge a workflow's attributes"),
             workflow_id,
             attributes,
         )
@@ -1635,7 +1635,7 @@ impl DBOS {
         &self,
         filter: &'a WorkflowFilter<'a>,
     ) -> PendingStep<'a, Vec<WorkflowRecord>> {
-        pending_list_workflows(self.served("list workflows"), filter)
+        pending_list_workflows(self.connection("list workflows"), filter)
     }
 
     /// Reads one workflow's steps, in execution order.
@@ -1677,7 +1677,11 @@ impl DBOS {
         workflow_id: &'a str,
         options: ListWorkflowStepsOptions,
     ) -> PendingStep<'a, Vec<StepRecord>> {
-        pending_list_workflow_steps(self.served("list a workflow's steps"), workflow_id, options)
+        pending_list_workflow_steps(
+            self.connection("list a workflow's steps"),
+            workflow_id,
+            options,
+        )
     }
 }
 
