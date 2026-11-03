@@ -11,7 +11,8 @@
 //! [`record_step`](crate::sysdb::SystemDatabase::record_step) under the same ownership check as any
 //! checkpoint, and read back through [`check_step`](crate::sysdb::SystemDatabase::check_step) —
 //! whose refusal of a row recorded under another name is exactly the "old code was here" answer a
-//! patch is asking for.
+//! patch is asking for. An empty position is checked past, too: the old code can leave one behind
+//! a step it recorded first, and only a history that ends there is a first visit.
 //!
 //! # Why the position is peeked, and then claimed
 //!
@@ -68,6 +69,9 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
 /// - **An execution whose history holds some other step at this position** was started by the old
 ///   code and got past this point with it. It gets `false` and takes the old path, which replays
 ///   what it recorded. Nothing is recorded, and the position is left for the old path's step.
+///   So does one whose history holds nothing at this position but a step past it: the old code
+///   got past this point and left a gap, as a `recv` or `get_event` with a timeout does while it
+///   waits, having recorded its timeout at the next position before its own result.
 ///
 /// Patches nest: a later change wraps the patched code in a second patch with a new name, tested
 /// first, so each generation of executions finds its own marker or none.
@@ -230,7 +234,8 @@ enum Found {
     Nothing,
     /// This patch's marker: an execution that took the new path.
     ThisMarker,
-    /// Some other step: an execution of the code from before the patch.
+    /// Some other step, or nothing but a step past it: an execution of the code from before the
+    /// patch.
     OtherStep,
 }
 
@@ -280,6 +285,16 @@ impl PatchPoint {
 
         let found = match sysdb.check_step(workflow_id, step_id, &marker_name).await {
             Ok(Some(_)) => Found::ThisMarker,
+            // An empty position is not yet a history that ends here: a step recorded past it means
+            // the old code got past this point and left a gap, as a `recv` waiting on its timeout
+            // does. Read only by `patch`, since `deprecate_patch` records nothing either way.
+            Ok(None) if marker == Marker::Write => {
+                match sysdb.step_at_or_after(workflow_id, step_id + 1).await {
+                    Ok(Some(_)) => Found::OtherStep,
+                    Ok(None) => Found::Nothing,
+                    Err(error) => return Err(Error::from_sysdb(error)),
+                }
+            }
             Ok(None) => Found::Nothing,
             // The determinism check's refusal is this call's answer: a row recorded under another
             // name is the old code's step.

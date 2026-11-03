@@ -315,6 +315,111 @@ async fn an_execution_recovered_under_patched_code_takes_the_old_path() {
     dbos.shutdown().await;
 }
 
+/// The old code's receive, with a timeout: its own step at 1, its timeout's sleep at 2.
+async fn receives(_: ()) -> dbos::Result<i32> {
+    let a = step_one().await?;
+    let b: Option<i32> = dbos::recv(None, DEADLINE).await?;
+    Ok(a + b.unwrap_or(0))
+}
+
+/// The same, with a patch added before the receive.
+async fn patched_before_receiving(_: ()) -> dbos::Result<i32> {
+    let a = step_one().await?;
+    let patched = dbos::patch("v2").await?;
+    let b: Option<i32> = dbos::recv(None, DEADLINE).await?;
+    Ok(a + b.unwrap_or(0) + if patched { 100 } else { 0 })
+}
+
+/// Waits for `id` to succeed and returns its recorded output.
+async fn finished_output(db: &TestDatabase, id: &str) -> Option<String> {
+    let reader = reader(db).await;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let row = reader
+                .get_workflow(id)
+                .await
+                .expect("read failed")
+                .expect("the row exists");
+            match row.status {
+                WorkflowStatus::Success => return row.output,
+                WorkflowStatus::Error => panic!("{id} failed: {:?}", row.error),
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{id} never finished: an unexpected step leaves an execution pending, not failed")
+    })
+}
+
+/// **A gap the old code left is a point it got past.** A receive with a timeout records its
+/// timeout's sleep, at the position after its own, before it waits, so an execution abandoned while
+/// waiting has nothing at the receive's position and a step past it. A patch added before that
+/// receive must take the old path there rather than record its marker in the gap, which would move
+/// the receive onto its own timeout's position.
+#[tokio::test]
+async fn a_patch_before_a_waiting_receive_takes_the_old_path_on_recovery() {
+    let db = test_database().await;
+    let app = "patch-gap-app";
+    let id = "waiting-run";
+
+    // The old code, abandoned while its receive waits.
+    let (dbos, workflow) = deploy(app, &db, receives).await;
+    let _abandoned = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    tokio::time::timeout(DEADLINE, async {
+        while names(&dbos, id).await != ["step_one", "DBOS.sleep"] {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the receive never recorded its timeout");
+    dbos.shutdown().await;
+
+    // The patched code recovers it on launch, and it takes the old path.
+    let (dbos, workflow) = deploy(app, &db, patched_before_receiving).await;
+    dbos.send(id, &2).await.expect("send failed");
+    assert_eq!(finished_output(&db, id).await.as_deref(), Some("3"));
+    assert_eq!(
+        names(&dbos, id).await,
+        ["step_one", "DBOS.recv", "DBOS.sleep"],
+        "no marker: the old code had got past the patch's position"
+    );
+
+    // A new execution takes the patch, and records its marker before the receive.
+    let new_id = "new-run";
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(new_id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    dbos.send(new_id, &2).await.expect("send failed");
+    let result = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the new execution never finished")
+        .expect("the new execution failed");
+    assert_eq!(result, 103);
+    assert_eq!(
+        names(&dbos, new_id).await,
+        ["step_one", V2, "DBOS.recv", "DBOS.sleep"]
+    );
+    dbos.shutdown().await;
+}
+
 /// Launches `body` under `id`, gated before its first statement, plants `planted` as the step at
 /// position 0, and returns what the workflow then answers.
 ///

@@ -5614,6 +5614,30 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn step_at_or_after(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+    ) -> Result<Option<(i32, String)>, Error> {
+        let steps_table = &self.tables.operation_outputs;
+        let (steps_table, pool) = (steps_table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "step_at_or_after", move || async move {
+            // One entry of the `(workflow_uuid, function_id)` primary key.
+            let step = sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT function_id, function_name FROM {steps_table} \
+                 WHERE workflow_uuid = $1 AND function_id >= $2 \
+                 ORDER BY function_id LIMIT 1"
+            )))
+            .bind(workflow_id)
+            .bind(step_id)
+            .fetch_optional(pool)
+            .await?;
+            Ok(step)
+        })
+        .await
+    }
+
     async fn record_step(
         &self,
         workflow_id: &str,
