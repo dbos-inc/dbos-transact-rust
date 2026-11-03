@@ -486,6 +486,13 @@ async fn a_fresh_debounce_inside_a_workflow_replays_without_enqueueing_again() {
 /// Forced rather than raced: the test holds `workflow_input` locked, which a bounce that finds no
 /// holder never touches and the fresh enqueue's insert waits on. The branch is dropped only once
 /// that insert is seen waiting, so the enqueue has begun, and cannot have finished.
+///
+/// **What this does not isolate is the parent waiting for the enqueue.** The insert waits after the
+/// enqueue has locked the parent's row, so the parent's outcome write would wait on that lock
+/// anyway. The wait itself is the starts token every start holds, which
+/// `children.rs`'s `a_start_dropped_by_a_parent_that_then_finishes_still_starts_the_child`
+/// isolates; here no table stops the enqueue before that lock without stopping the bounce, which
+/// reads and writes the same two tables, first.
 #[tokio::test]
 async fn a_debounce_dropped_while_it_enqueues_still_enqueues_and_records_it() {
     let db = test_database().await;

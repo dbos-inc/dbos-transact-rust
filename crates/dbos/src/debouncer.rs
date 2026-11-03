@@ -571,13 +571,18 @@ where
     /// One attempt's fresh enqueue, run to the end whatever becomes of the debounce awaiting it.
     ///
     /// **Detached, as a start's writing half is** (see `WorkflowRef::started` and
-    /// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)), so a caller that stops listening — a
-    /// `select!` whose other branch won, the parent's cancellation — takes the
+    /// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)), so a body that stops listening — a
+    /// `select!` whose other branch won, a future dropped some other way — takes the
     /// [`JoinHandle`](crate::rt::JoinHandle) and leaves the work. A created workflow commits
     /// together with its record at the start's step; a refused one is two writes, the failed insert
     /// and then the refusal recorded at the step, and detached, the second always follows the first.
     /// The task also holds the parent's starts token for as long as it exists, so the parent waits
     /// for the enqueue before recording its own outcome; see `Ctx::starts`.
+    ///
+    /// **Dropping the debounce is not cancelling its parent.** A parent cancelled, or past its
+    /// deadline, gives up its owner token, and `execute` waits for its starts only within the
+    /// deadline: an enqueue that has not yet checked the parent's ownership is then refused, and no
+    /// workflow is created, as for any start of a parent that no longer runs.
     ///
     /// **Shutdown is not one of the drops it outlives.** The task is a workflow's, so shutdown
     /// aborts it with the parent's, and the debounce reports [`Interrupted`](Error::Interrupted):
