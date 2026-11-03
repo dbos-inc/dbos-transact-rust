@@ -4161,13 +4161,8 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
 /// stamped with plain now would sort below it and change nothing.
 #[tokio::test]
 async fn a_promotion_stamps_the_database_clock_and_wins_over_a_future_stamp() {
-    let (sys, db) = sysdb().await;
-    let db_now = async || -> i64 {
-        sqlx::query_scalar("SELECT (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint")
-            .fetch_one(&db.pool().await)
-            .await
-            .unwrap()
-    };
+    let (sys, _db) = sysdb().await;
+    let db_now = async || sys.database_time().await.unwrap().now().as_epoch_ms();
     sys.create_application_version("v1", None).await.unwrap();
     sys.create_application_version("v2", None).await.unwrap();
     let stamp = |name: &'static str| {
