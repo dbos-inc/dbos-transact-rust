@@ -4116,10 +4116,7 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
 
     // Promoting v1 makes it current even though v2 was created later — which is the whole point
     // of ordering on `version_timestamp` rather than `created_at`.
-    let promoted = Timestamp::from_epoch_ms(latest.version_timestamp.as_epoch_ms() + 60_000);
-    sys.update_application_version_timestamp("v1", promoted, None)
-        .await
-        .unwrap();
+    sys.promote_application_version("v1", None).await.unwrap();
 
     let latest = sys
         .get_latest_application_version(None)
@@ -4127,7 +4124,6 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
         .unwrap()
         .unwrap();
     assert_eq!(latest.version_name, "v1");
-    assert_eq!(latest.version_timestamp, promoted);
 
     let all = sys.list_application_versions().await.unwrap();
     assert_eq!(
@@ -4151,7 +4147,115 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
         again.version_id, v1.version_id,
         "re-registering must not mint a new id or reset the promotion",
     );
-    assert_eq!(again.version_timestamp, promoted);
+    assert_eq!(again.version_timestamp, latest.version_timestamp);
+}
+
+/// **A promotion stamps the database's clock, and wins over a version stamped ahead of it.**
+///
+/// A version stamped in the database's future, by a peer whose clock ran ahead or by an explicit
+/// timestamp, would otherwise stay the latest until the database's clock passed it: a promotion
+/// stamped with plain now would sort below it and change nothing.
+#[tokio::test]
+async fn a_promotion_stamps_the_database_clock_and_wins_over_a_future_stamp() {
+    let (sys, db) = sysdb().await;
+    let pool = db.pool().await;
+    let db_now = async || sys.database_time().await.unwrap().now().as_epoch_ms();
+    sys.create_application_version("v1", None).await.unwrap();
+    sys.create_application_version("v2", None).await.unwrap();
+    let stamp = |name: &'static str| {
+        let sys = &sys;
+        async move {
+            sys.list_application_versions()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|version| version.version_name == name)
+                .unwrap()
+                .version_timestamp
+                .as_epoch_ms()
+        }
+    };
+
+    // With nothing ahead of the clock, the stamp is the database's now.
+    let before = db_now().await;
+    sys.promote_application_version("v1", None).await.unwrap();
+    let after = db_now().await;
+    let promoted = stamp("v1").await;
+    assert!(
+        (before - 5..=after + 5).contains(&promoted),
+        "stamped {promoted}, not the database's now ({before}..={after})"
+    );
+
+    // A version an hour ahead of the database's clock is the latest, and a promotion still wins.
+    let ahead = Timestamp::from_epoch_ms(after + 3_600_000);
+    support::set_version_timestamp(&pool, "v2", ahead).await;
+    sys.promote_application_version("v1", None).await.unwrap();
+    let latest = sys
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version_name, "v1");
+    assert_eq!(
+        latest.version_timestamp.as_epoch_ms(),
+        ahead.as_epoch_ms() + 1
+    );
+
+    // A version stamped at the largest value saturates a promotion, which ties it rather than
+    // failing with an overflow.
+    support::set_version_timestamp(&pool, "v2", Timestamp::from_epoch_ms(i64::MAX)).await;
+    sys.promote_application_version("v1", None)
+        .await
+        .expect("a pinned version should not make promotion overflow");
+    assert_eq!(stamp("v1").await, i64::MAX);
+}
+
+/// **A nameless promotion wins over every application's versions, as its latest read sees them.**
+///
+/// A nameless handle's latest read spans every application, so promoting a version another
+/// application owns has to beat a peer's stamp too, even one ahead of the database's clock;
+/// otherwise the promotion reports success and the peer's version stays the latest it reads.
+#[tokio::test]
+async fn a_nameless_promotion_wins_over_every_applications_versions() {
+    let db = test_database().await;
+    let pool = db.pool().await;
+    let named = |name: &'static str| {
+        PostgresSystemDatabase::from_pool(
+            pool.clone(),
+            &Settings {
+                application_name: Some(name),
+                ..Settings::default()
+            },
+        )
+    };
+    let (alpha, beta) = (named("alpha"), named("beta"));
+    let nameless = PostgresSystemDatabase::from_pool(pool.clone(), &Settings::default());
+
+    alpha
+        .create_application_version("alpha-v1", None)
+        .await
+        .unwrap();
+    beta.create_application_version("beta-v1", None)
+        .await
+        .unwrap();
+    let ahead = nameless.database_time().await.unwrap().now().as_epoch_ms() + 3_600_000;
+    support::set_version_timestamp(&pool, "beta-v1", Timestamp::from_epoch_ms(ahead)).await;
+
+    nameless
+        .promote_application_version("alpha-v1", None)
+        .await
+        .unwrap();
+    let latest = nameless
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version_name, "alpha-v1");
+    assert_eq!(
+        latest.app_name.as_deref(),
+        Some("alpha"),
+        "the owner is kept"
+    );
 }
 
 /// The bulk readers report everything a workflow was sent, published, and streamed.
@@ -10204,9 +10308,7 @@ async fn registering_a_peers_version_name_is_refused() {
         .unwrap()
         .unwrap()
         .version_timestamp;
-    let promote = beta
-        .update_application_version_timestamp("v1.0.0", Timestamp::from_epoch_ms(9_000_000), None)
-        .await;
+    let promote = beta.promote_application_version("v1.0.0", None).await;
     assert!(matches!(promote, Err(Error::RegisteredByAnother { .. })));
     assert_eq!(
         alpha
@@ -10247,10 +10349,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
         .create_application_version("v1", None)
         .await
         .unwrap();
-    anonymous
-        .update_application_version_timestamp("v1", Timestamp::from_epoch_ms(5_000_000), None)
-        .await
-        .unwrap();
+    support::set_version_timestamp(&pool, "v1", Timestamp::from_epoch_ms(5_000_000)).await;
     let unclaimed = anonymous
         .get_latest_application_version(None)
         .await
@@ -10339,14 +10438,9 @@ async fn a_named_target_overrides_the_handles_own_application() {
         .expect("beta has versions");
     assert_eq!(latest.app_name.as_deref(), Some("beta"));
 
-    // Promotion is targeted the same way: pin beta-v1 past beta-v2 from alpha's handle. The
-    // timestamp has to be genuinely later than beta-v2's, which migration 13 defaults to `now()`.
+    // Promotion is targeted the same way: promote beta-v1 past beta-v2 from alpha's handle.
     alpha
-        .update_application_version_timestamp(
-            "beta-v1",
-            Timestamp::from_epoch_ms(99_000_000_000_000),
-            Some("beta"),
-        )
+        .promote_application_version("beta-v1", Some("beta"))
         .await
         .unwrap();
     assert_eq!(

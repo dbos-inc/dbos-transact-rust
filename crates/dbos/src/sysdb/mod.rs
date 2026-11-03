@@ -1286,8 +1286,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Every registered version this handle's application can see, latest first.
     ///
-    /// Takes no target, unlike the three around it: a listing is what *this* application has
-    /// registered plus the unclaimed, and a caller wanting a peer's asks for the peer's latest.
+    /// Takes no target, unlike the writes and the latest read around it: a listing is what *this*
+    /// application has registered plus the unclaimed, and a caller wanting a peer's asks for the
+    /// peer's latest.
     /// Python and TypeScript draw the line in the same place.
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error>;
 
@@ -1295,8 +1296,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **Latest by `version_timestamp`, not by creation.** Moving a version's timestamp is how a
     /// deployment is promoted or rolled back, which is what
-    /// [`update_application_version_timestamp`](Self::update_application_version_timestamp) is
-    /// for — so the newest row is not necessarily the current one.
+    /// [`promote_application_version`](Self::promote_application_version) is for — so the newest
+    /// row is not necessarily the current one.
     ///
     /// `None` rather than an error: an empty registry is what a database looks like before any
     /// application has launched. This layer is alone in that — Python, Go and Java all raise,
@@ -1312,12 +1313,26 @@ pub trait SystemDatabase: Send + Sync {
         application_name: Option<&str>,
     ) -> Result<Option<VersionInfo>, Error>;
 
-    /// Moves a version's timestamp, which is how the latest version is chosen.
+    /// Promotes a version to be the latest, which is how a deployment is rolled forward or back.
+    ///
+    /// The latest version is the one with the highest `version_timestamp`, and this stamps the
+    /// promoted one `GREATEST(the database's now, MAX(version_timestamp) + 1)`: the maximum taken
+    /// over the rows [`get_latest_application_version`](Self::get_latest_application_version)
+    /// reads for the same application, in the one statement that writes it, and held below
+    /// `bigint`'s ceiling before the `+ 1`. The database's clock rather than the caller's, because a
+    /// version is registered stamped by the database's clock, and a promoter whose own clock is
+    /// behind it would stamp a version that still sorts below an older one.
+    ///
+    /// The `+ 1` is what makes a promotion win over a version stamped ahead of the database's
+    /// clock, which an implementation that still stamps the promoter's clock can leave. Winning
+    /// means carrying that stamp forward: the promoted version is then ahead of the clock too, and
+    /// a version registered afterwards sorts below it until the clock passes it. A version stamped
+    /// at `bigint`'s largest value is tied rather than passed.
     ///
     /// `application_name` names whose version to promote; `None` means this handle's own.
     /// Promoting a *different* application's is [`Error::RegisteredByAnother`]: moving a timestamp
     /// is how a deployment is rolled forward or back, so it must not move one a peer is running
-    /// on.
+    /// on. The write also claims an unclaimed row, which would otherwise stay every peer's latest.
     ///
     /// **That guard needs the caller to have a name.** A handle with no application name of its
     /// own resolves to the row's holder and retimes it, a peer's included — the shared behaviour
@@ -1326,10 +1341,13 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **A name that matches nothing is `Ok`, not [`Error::NotRegistered`].** The write moves no
     /// row and says so to nobody, so a misspelled rollback reports success; UPSTREAM item 2.
-    async fn update_application_version_timestamp(
+    ///
+    /// There is no way to set a version's timestamp to an instant of the caller's choosing: no
+    /// caller in any implementation has one to give, and it would be a way to write a stamp ahead
+    /// of the database's clock, which this method can only carry forward, never start.
+    async fn promote_application_version(
         &self,
         version_name: &str,
-        timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error>;
 

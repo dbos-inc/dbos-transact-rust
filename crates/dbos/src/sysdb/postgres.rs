@@ -6408,10 +6408,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
-    async fn update_application_version_timestamp(
+    async fn promote_application_version(
         &self,
         version_name: &str,
-        timestamp: Timestamp,
         application_name: Option<&str>,
     ) -> Result<(), Error> {
         let versions_table = &self.tables.application_versions;
@@ -6420,7 +6419,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         with_retry(
             &self.retry,
-            "update_application_version_timestamp",
+            "promote_application_version",
             move || async move {
                 let mut tx = pool.begin().await?;
 
@@ -6434,17 +6433,49 @@ impl SystemDatabase for PostgresSystemDatabase {
                 )
                 .await?;
 
-                // Scoped to the resolved row, not to the name alone: once 106 and 107's
+                // The highest stamp the caller's own latest read considers, read the way
+                // `latest_version_sql` reads it so each probe is one entry of an index: the
+                // caller's rows and the unclaimed ones, or every row for a nameless caller. Scoped
+                // by the caller's name rather than by `owner`, which a nameless caller takes from
+                // the row: its latest read spans every application, so scoping to the owner could
+                // report success while a peer's version stayed its latest. `ORDER BY ... LIMIT 1`
+                // rather than `MAX`, since an `IS NULL` probe only uses migration 125's index when
+                // it orders by the constant `application_name` too. Held below `bigint`'s ceiling
+                // before the `+ 1`, so a version stamped at the largest value does not make every
+                // later promotion overflow: the promotion then ties it.
+                let probe = |filter: &str| {
+                    format!(
+                        "COALESCE((SELECT version_timestamp FROM {versions_table} {filter} \
+                                   ORDER BY application_name, version_timestamp DESC LIMIT 1), 0)"
+                    )
+                };
+                let highest = if application_name.is_some() {
+                    format!(
+                        "GREATEST({}, {})",
+                        probe("WHERE application_name = $2"),
+                        probe("WHERE application_name IS NULL")
+                    )
+                } else {
+                    format!(
+                        "COALESCE((SELECT version_timestamp FROM {versions_table} \
+                                   ORDER BY version_timestamp DESC LIMIT 1), 0)"
+                    )
+                };
+
+                // One statement, so the stamp is computed against the rows as the write sees
+                // them. Scoped to the resolved row, not to the name alone: once 106 and 107's
                 // per-application keys replace migration 13's, one `version_name` may exist per
                 // application and a bare name match would retime every copy. The `SET` also
                 // claims an unclaimed row, which would otherwise stay every peer's latest.
                 sqlx::query(AssertSqlSafe(format!(
-                    "UPDATE {versions_table} SET version_timestamp = $2, application_name = $3 \
+                    "UPDATE {versions_table} SET \
+                       version_timestamp = \
+                         GREATEST({CLOCK_MS_SQL}, LEAST({highest}, 9223372036854775806) + 1), \
+                       application_name = $2 \
                      WHERE version_name = $1 \
-                       AND (application_name IS NULL OR application_name = $3)"
+                       AND (application_name IS NULL OR application_name = $2)"
                 )))
                 .bind(version_name)
-                .bind(timestamp.as_epoch_ms())
                 .bind(owner.as_deref())
                 .execute(&mut *tx)
                 .await?;
@@ -9073,7 +9104,7 @@ mod tests {
         let pool = db.pool().await;
         let sys = versions_handle(&pool, Some("ours"));
         register_versions(&sys, &pool, 10).await;
-        sys.update_application_version_timestamp("version-1", Timestamp::from_epoch_ms(40), None)
+        sys.promote_application_version("version-1", None)
             .await
             .expect("promotion failed");
         let promoted = sys
@@ -9083,7 +9114,6 @@ mod tests {
             .expect("a version is registered");
         assert_eq!(promoted.version_id, "1");
         assert_eq!(promoted.version_name, "version-1");
-        assert_eq!(promoted.version_timestamp, Timestamp::from_epoch_ms(40));
         assert_eq!(promoted.created_at, Timestamp::from_epoch_ms(1));
         assert_eq!(promoted.app_name.as_deref(), Some("ours"));
 

@@ -1303,6 +1303,27 @@ impl dbos::sysdb::types::StepCodec for TestCodec {
     }
 }
 
+/// Sets application version `version_name`'s timestamp to `timestamp` as given, for a test that
+/// needs one at a particular instant: ahead of the database's clock, say, as another
+/// implementation's promoter can leave it, or ordered against another version. The SDK has no call
+/// that does this, since a promotion stamps the database's clock.
+pub async fn set_version_timestamp(
+    pool: &sqlx::PgPool,
+    version_name: &str,
+    timestamp: dbos::sysdb::types::Timestamp,
+) {
+    let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {}.application_versions SET version_timestamp = $2 WHERE version_name = $1",
+        dbos::sysdb::DEFAULT_SCHEMA
+    )))
+    .bind(version_name)
+    .bind(timestamp.as_epoch_ms())
+    .execute(pool)
+    .await
+    .expect("setting the version's timestamp failed");
+    assert_eq!(updated.rows_affected(), 1, "no version {version_name:?}");
+}
+
 /// The token of the execution that owns `workflow_id` now, which a test writing as that
 /// execution presents. Panics if no execution owns it.
 pub async fn owner_token(sys: &dyn dbos::sysdb::SystemDatabase, workflow_id: &str) -> String {

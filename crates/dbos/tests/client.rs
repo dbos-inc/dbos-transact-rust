@@ -20,7 +20,7 @@ use dbos::{
     QueueChange, QueueConflict, QueueOptions, QueueRequest, SendMessage, SendOptions,
     SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowIdReusePolicy,
 };
-use dbos_test_support::{TestDatabase, raw_database, test_database};
+use dbos_test_support::{TestDatabase, raw_database, skewed_database, test_database};
 
 /// A client for `db`, acting for `app_name`.
 async fn client(app_name: &str, db: &TestDatabase) -> Client {
@@ -1131,6 +1131,53 @@ async fn a_client_reads_application_versions() {
 
     client.close().await;
     dbos.shutdown().await;
+}
+
+/// **A promotion goes by the database's clock, not the promoting process's.** The database's clock
+/// is an hour behind this process. A promotion stamped by this process's clock would land an hour
+/// ahead of the database's, so a version deployed after it would register at the database's now,
+/// sort below the promoted one, and not become the latest for an hour.
+#[tokio::test]
+async fn a_client_promotes_on_the_database_clock() {
+    let Some(db) = skewed_database(-3600).await else {
+        return;
+    };
+    let deploy = async |version: &str| {
+        let dbos = DBOS::new(Config {
+            migrate: true,
+            app_version: Some(version.to_owned()),
+            ..config("client-skew-promote", &db)
+        });
+        dbos.launch().await.expect("launch failed");
+        dbos.shutdown().await;
+    };
+    deploy("v1").await;
+    deploy("v2").await;
+
+    let client = client("client-skew-promote", &db).await;
+    let latest = async || {
+        client
+            .latest_app_version()
+            .await
+            .expect("read failed")
+            .expect("versions were registered at launch")
+            .version_name
+    };
+    client
+        .set_latest_app_version("v1")
+        .await
+        .expect("promote failed");
+    assert_eq!(latest().await, "v1", "promoting rolls the fleet back");
+
+    deploy("v3").await;
+    assert_eq!(
+        latest().await,
+        "v3",
+        "a version deployed after the promotion sorted below it: the promotion was stamped ahead \
+         of the database's clock"
+    );
+
+    client.close().await;
 }
 
 /// Promoting an older version rolls a deploy back.
