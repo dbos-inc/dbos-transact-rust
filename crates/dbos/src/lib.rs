@@ -134,6 +134,8 @@ mod stream;
 #[cfg(feature = "engine")]
 mod timeout_sweep;
 #[cfg(feature = "engine")]
+mod version;
+#[cfg(feature = "engine")]
 mod wait;
 #[cfg(feature = "engine")]
 mod workflow;
