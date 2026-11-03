@@ -4201,8 +4201,8 @@ async fn a_promotion_stamps_the_database_clock_and_wins_over_a_future_stamp() {
         ahead.as_epoch_ms() + 1
     );
 
-    // A version pinned at the largest instant leaves room for one promotion above it, rather than
-    // making every later one overflow.
+    // A version stamped at the largest value saturates a promotion, which ties it rather than
+    // failing with an overflow.
     support::set_version_timestamp(&pool, "v2", Timestamp::from_epoch_ms(i64::MAX)).await;
     sys.promote_application_version("v1", None)
         .await

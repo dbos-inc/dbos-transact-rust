@@ -1286,8 +1286,9 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Every registered version this handle's application can see, latest first.
     ///
-    /// Takes no target, unlike the writes and the latest read around it: a listing is what *this* application has
-    /// registered plus the unclaimed, and a caller wanting a peer's asks for the peer's latest.
+    /// Takes no target, unlike the writes and the latest read around it: a listing is what *this*
+    /// application has registered plus the unclaimed, and a caller wanting a peer's asks for the
+    /// peer's latest.
     /// Python and TypeScript draw the line in the same place.
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error>;
 
@@ -1317,11 +1318,16 @@ pub trait SystemDatabase: Send + Sync {
     /// The latest version is the one with the highest `version_timestamp`, and this stamps the
     /// promoted one `GREATEST(the database's now, MAX(version_timestamp) + 1)`: the maximum taken
     /// over the rows [`get_latest_application_version`](Self::get_latest_application_version)
-    /// reads for the same application, in the one statement that writes it. The database's clock
-    /// rather than the caller's, because a version is registered stamped by the database's clock,
-    /// and a promoter whose own clock is behind it would stamp a version that still sorts below an
-    /// older one. The `+ 1` is what makes a promotion win over a version stamped ahead of the
-    /// database's clock, by an implementation that still stamps the promoter's clock.
+    /// reads for the same application, in the one statement that writes it, and held below
+    /// `bigint`'s ceiling before the `+ 1`. The database's clock rather than the caller's, because a
+    /// version is registered stamped by the database's clock, and a promoter whose own clock is
+    /// behind it would stamp a version that still sorts below an older one.
+    ///
+    /// The `+ 1` is what makes a promotion win over a version stamped ahead of the database's
+    /// clock, which an implementation that still stamps the promoter's clock can leave. Winning
+    /// means carrying that stamp forward: the promoted version is then ahead of the clock too, and
+    /// a version registered afterwards sorts below it until the clock passes it. A version stamped
+    /// at `bigint`'s largest value is tied rather than passed.
     ///
     /// `application_name` names whose version to promote; `None` means this handle's own.
     /// Promoting a *different* application's is [`Error::RegisteredByAnother`]: moving a timestamp
@@ -1337,8 +1343,8 @@ pub trait SystemDatabase: Send + Sync {
     /// row and says so to nobody, so a misspelled rollback reports success; UPSTREAM item 2.
     ///
     /// There is no way to set a version's timestamp to an instant of the caller's choosing: no
-    /// caller in any implementation has one to give, and a stamp ahead of the database's clock is
-    /// what would leave a version registered later sorting below it.
+    /// caller in any implementation has one to give, and it would be a way to write a stamp ahead
+    /// of the database's clock, which this method can only carry forward, never start.
     async fn promote_application_version(
         &self,
         version_name: &str,

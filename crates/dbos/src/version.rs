@@ -21,21 +21,24 @@ impl Connection {
             .map_err(Error::SystemDatabase)
     }
 
+    /// The latest version of this connection's own application. The system-database handle is
+    /// built with the connection's name, so `None` asks for that one.
     pub(crate) async fn latest_app_version(&self) -> Result<Option<VersionInfo>> {
         self.sysdb()
-            .get_latest_application_version(self.app_name())
+            .get_latest_application_version(None)
             .await
             .map_err(Error::SystemDatabase)
     }
 
-    /// Promotes `version_name` for `app_name`, or for this connection's own application.
+    /// Promotes `version_name` for `app_name`, or, with `None`, for this connection's own
+    /// application, as the system-database handle defaults it.
     pub(crate) async fn set_latest_app_version(
         &self,
         version_name: &str,
         app_name: Option<&str>,
     ) -> Result<()> {
         self.sysdb()
-            .promote_application_version(version_name, app_name.or(self.app_name()))
+            .promote_application_version(version_name, app_name)
             .await
             .map_err(Error::SystemDatabase)
     }

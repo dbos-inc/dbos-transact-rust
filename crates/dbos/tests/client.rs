@@ -1134,14 +1134,15 @@ async fn a_client_reads_application_versions() {
 }
 
 /// **A promotion goes by the database's clock, not the promoting process's.** The database's clock
-/// is an hour ahead of this process, and versions are created stamped by it. A promotion stamped
-/// by this process's clock would sort an hour below them and leave the newer version latest.
+/// is an hour behind this process. A promotion stamped by this process's clock would land an hour
+/// ahead of the database's, so a version deployed after it would register at the database's now,
+/// sort below the promoted one, and not become the latest for an hour.
 #[tokio::test]
 async fn a_client_promotes_on_the_database_clock() {
-    let Some(db) = skewed_database(3600).await else {
+    let Some(db) = skewed_database(-3600).await else {
         return;
     };
-    for version in ["v1", "v2"] {
+    let deploy = async |version: &str| {
         let dbos = DBOS::new(Config {
             migrate: true,
             app_version: Some(version.to_owned()),
@@ -1149,22 +1150,31 @@ async fn a_client_promotes_on_the_database_clock() {
         });
         dbos.launch().await.expect("launch failed");
         dbos.shutdown().await;
-    }
+    };
+    deploy("v1").await;
+    deploy("v2").await;
 
     let client = client("client-skew-promote", &db).await;
-    client
-        .set_latest_app_version("v1")
-        .await
-        .expect("promote failed");
-    assert_eq!(
+    let latest = async || {
         client
             .latest_app_version()
             .await
             .expect("read failed")
             .expect("versions were registered at launch")
-            .version_name,
-        "v1",
-        "the promotion sorted below the version it rolls back from"
+            .version_name
+    };
+    client
+        .set_latest_app_version("v1")
+        .await
+        .expect("promote failed");
+    assert_eq!(latest().await, "v1", "promoting rolls the fleet back");
+
+    deploy("v3").await;
+    assert_eq!(
+        latest().await,
+        "v3",
+        "a version deployed after the promotion sorted below it: the promotion was stamped ahead \
+         of the database's clock"
     );
 
     client.close().await;

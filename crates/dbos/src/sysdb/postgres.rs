@@ -6434,20 +6434,29 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
 
                 // The highest stamp the latest read for `owner` considers, read the way
-                // `latest_version_sql` reads it so each probe is one index entry: the owner's rows
-                // and the unclaimed ones, or every row for a nameless owner. Held below `bigint`'s
-                // ceiling before the `+ 1`, so a version pinned at the largest instant does not
-                // make every later promotion overflow.
+                // `latest_version_sql` reads it so each probe is one entry of an index: the owner's
+                // rows and the unclaimed ones, or every row for a nameless owner. `ORDER BY ...
+                // LIMIT 1` rather than `MAX`, since an `IS NULL` probe only uses migration 125's
+                // index when it orders by the constant `application_name` too. Held below
+                // `bigint`'s ceiling before the `+ 1`, so a version stamped at the largest value
+                // does not make every later promotion overflow: the promotion then ties it.
+                let probe = |filter: &str| {
+                    format!(
+                        "COALESCE((SELECT version_timestamp FROM {versions_table} {filter} \
+                                   ORDER BY application_name, version_timestamp DESC LIMIT 1), 0)"
+                    )
+                };
                 let highest = if owner.is_some() {
                     format!(
-                        "GREATEST( \
-                           COALESCE((SELECT MAX(version_timestamp) FROM {versions_table} \
-                                     WHERE application_name = $2), 0), \
-                           COALESCE((SELECT MAX(version_timestamp) FROM {versions_table} \
-                                     WHERE application_name IS NULL), 0))"
+                        "GREATEST({}, {})",
+                        probe("WHERE application_name = $2"),
+                        probe("WHERE application_name IS NULL")
                     )
                 } else {
-                    format!("COALESCE((SELECT MAX(version_timestamp) FROM {versions_table}), 0)")
+                    format!(
+                        "COALESCE((SELECT version_timestamp FROM {versions_table} \
+                                   ORDER BY version_timestamp DESC LIMIT 1), 0)"
+                    )
                 };
 
                 // One statement, so the stamp is computed against the rows as the write sees

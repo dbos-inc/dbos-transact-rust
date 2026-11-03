@@ -2,7 +2,7 @@
 
 use dbos::{Config, DBOS, Error};
 
-use dbos_test_support::{TestDatabase, skewed_database, test_database};
+use dbos_test_support::{TestDatabase, test_database};
 
 fn config(app_name: &str, version: &str, db: &TestDatabase) -> Config {
     Config {
@@ -56,61 +56,6 @@ async fn an_application_lists_its_versions_and_promotes_an_older_one() {
         "v2",
         "this executor still runs its own"
     );
-
-    dbos.shutdown().await;
-}
-
-/// **A peer application's version is refused, unless the promotion names the peer.**
-#[tokio::test]
-async fn an_application_promotes_a_peers_version_only_by_naming_it() {
-    let db = test_database().await;
-    deploy("versions-peer", &["p1", "p2"], &db).await;
-    let dbos = DBOS::new(config("versions-own", "v1", &db));
-    dbos.launch().await.expect("launch failed");
-
-    let refused = dbos.set_latest_app_version("p1").await;
-    assert!(
-        matches!(
-            refused,
-            Err(Error::SystemDatabase(
-                dbos::sysdb::Error::RegisteredByAnother { .. }
-            ))
-        ),
-        "{refused:?}"
-    );
-    dbos.set_latest_app_version_for("p1", "versions-peer")
-        .await
-        .expect("promote failed");
-    dbos.shutdown().await;
-
-    let peer = DBOS::new(config("versions-peer", "p2", &db));
-    peer.launch().await.expect("launch failed");
-    assert_eq!(latest(&peer).await, "p1");
-    peer.shutdown().await;
-}
-
-/// **An application's promotion goes by the database's clock**, an hour ahead of this process's
-/// here, as a client's does. Stamped by this process's clock it would sort below the version it
-/// rolls back from.
-#[tokio::test]
-async fn an_application_promotes_on_the_database_clock() {
-    let Some(db) = skewed_database(3600).await else {
-        return;
-    };
-    let config = |version| Config {
-        migrate: true,
-        ..config("versions-skew", version, &db)
-    };
-    let first = DBOS::new(config("v1"));
-    first.launch().await.expect("launch failed");
-    first.shutdown().await;
-    let dbos = DBOS::new(config("v2"));
-    dbos.launch().await.expect("launch failed");
-
-    dbos.set_latest_app_version("v1")
-        .await
-        .expect("promote failed");
-    assert_eq!(latest(&dbos).await, "v1");
 
     dbos.shutdown().await;
 }

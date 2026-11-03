@@ -697,11 +697,7 @@ impl Connection {
                              for `AlwaysUpdate` or `NeverUpdate`"
                     )));
                 };
-                let latest = self
-                    .sysdb()
-                    .get_latest_application_version(self.app_name())
-                    .await
-                    .map_err(Error::SystemDatabase)?;
+                let latest = self.latest_app_version().await?;
                 match latest {
                     // The first registration of the first version: this process is the latest
                     // because it is the only one.
