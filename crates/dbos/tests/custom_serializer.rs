@@ -444,10 +444,10 @@ async fn rows_outlive_a_change_of_serializer() {
     );
 }
 
-/// A name a reader could not tell from a built-in one, or from no name, is refused before anything
-/// is written.
+/// A name a reader could not tell from a built-in one, or from no name, or one a text column cannot
+/// store, is refused before anything is written.
 #[tokio::test]
-async fn a_built_in_or_empty_name_is_refused() {
+async fn a_built_in_empty_or_unstorable_name_is_refused() {
     #[derive(Debug)]
     struct Named(&'static str);
 
@@ -473,7 +473,7 @@ async fn a_built_in_or_empty_name_is_refused() {
     }
 
     let db = test_database().await;
-    for name in ["rust_serde", "portable_json", ""] {
+    for name in ["rust_serde", "portable_json", "", "with\0nul"] {
         let dbos = DBOS::new(config(
             "custom-refused",
             &db,
@@ -1057,9 +1057,9 @@ async fn a_step_error_the_custom_serializer_refuses_records_a_fixed_marker() {
     dbos.shutdown().await;
 }
 
-const NUL: &str = "nul";
+const WRITTEN_WITH_NUL: &str = "nul";
 
-/// [`Backwards`], except that it writes the string [`NUL`] with a NUL byte in it: text the
+/// [`Backwards`], except that it writes the string [`WRITTEN_WITH_NUL`] with a NUL byte in it: text the
 /// serializer produces without complaint, and that PostgreSQL refuses to store in a text column.
 #[derive(Debug)]
 struct WritesNul;
@@ -1074,7 +1074,7 @@ impl CustomSerializer for WritesNul {
         value: Payload<'_>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let json = serde_json::to_string(&value)?;
-        if json == serde_json::to_string(NUL)? {
+        if json == serde_json::to_string(WRITTEN_WITH_NUL)? {
             return Ok(format!("\0{}", json.chars().rev().collect::<String>()));
         }
         Ok(json.chars().rev().collect())
@@ -1111,7 +1111,7 @@ async fn a_result_encoded_with_a_nul_byte_is_recorded_as_the_workflows_error() {
             let runs = Arc::clone(&runs);
             move |(): ()| {
                 runs.fetch_add(1, Ordering::SeqCst);
-                async { Ok::<_, Error>(NUL.to_owned()) }
+                async { Ok::<_, Error>(WRITTEN_WITH_NUL.to_owned()) }
             }
         })
         .unwrap();
@@ -1173,7 +1173,7 @@ async fn a_step_result_encoded_with_a_nul_byte_is_recorded_as_the_steps_error() 
                         let runs = Arc::clone(&runs);
                         async move {
                             runs.fetch_add(1, Ordering::SeqCst);
-                            Ok::<_, Error>(NUL.to_owned())
+                            Ok::<_, Error>(WRITTEN_WITH_NUL.to_owned())
                         }
                     })
                     .await;
@@ -1209,6 +1209,13 @@ async fn a_step_result_encoded_with_a_nul_byte_is_recorded_as_the_steps_error() 
         "the refusal is recorded as the step's error"
     );
     assert_eq!(tag.as_deref(), Some(NAME));
+
+    let forked = dbos
+        .fork::<String, EngineOnly>(&id, 1)
+        .await
+        .expect("fork failed");
+    let replayed = forked.result().await.expect("the fork failed");
+    assert_eq!(replayed, first, "the replay took a different branch");
     assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
     dbos.shutdown().await;
 }

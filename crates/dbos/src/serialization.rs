@@ -95,9 +95,12 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 /// ```
 ///
 /// **The output is text**, because the columns are. A binary format has to encode its bytes —
-/// base64, say — on the way out and decode them on the way in. Text holding a NUL byte is refused
-/// as though the serializer had refused the value, since PostgreSQL cannot store one in a text
-/// column.
+/// base64, say — on the way out and decode them on the way in. **Text holding a NUL byte is
+/// refused**, as though the serializer had refused the value, on every database: PostgreSQL cannot
+/// store one in a text column, and CockroachDB, which can, refuses it too, so an application
+/// behaves the same on both. A workflow's or a step's result refused this way is recorded as its
+/// error; any other write — an input, an event, a message — returns the refusal to its caller. The
+/// name is held to the same rule, at launch.
 ///
 /// **The format must be self-describing**: able to read a value without knowing its type in
 /// advance, which `serde` calls `deserialize_any`. Some of what the engine writes holds a
@@ -248,7 +251,8 @@ impl Serializer {
         }
     }
 
-    /// Refuses a custom name a reader could not tell from a built-in one, or from no name at all.
+    /// Refuses a custom name a reader could not tell from a built-in one, or from no name at all, or
+    /// one a text column cannot store.
     pub(crate) fn validate(&self) -> crate::Result<()> {
         let Serializer::Custom(custom) = self else {
             return Ok(());
@@ -259,6 +263,10 @@ impl Serializer {
             )),
             name @ (RUST_SERDE | PORTABLE_JSON) => Err(crate::Error::Config(format!(
                 "a custom serializer cannot be named {name}, which is a built-in encoding"
+            ))),
+            // Written as every row's tag, so PostgreSQL would refuse every write; see `refuse_nul`.
+            name if name.contains('\0') => Err(crate::Error::Config(format!(
+                "a custom serializer's name cannot hold a NUL byte: {name:?}"
             ))),
             _ => Ok(()),
         }
@@ -527,8 +535,11 @@ pub(crate) fn encode<T: Serialize, E>(
 /// `character_not_in_repertoire`), while CockroachDB stores it. Rejected at the write, a workflow's
 /// outcome or a step's would surface as a failure of the system database — a control signal, which
 /// leaves the row `PENDING` for recovery to run the body again, side effects and all, only to be
-/// rejected the same way. Refused here, it takes the path every other refusal takes: a result is
-/// recorded as the error it could not be, and an error as its stand-in or the fixed marker. Refused
+/// rejected the same way, until the recovery limit parks it. Refused here, a workflow's or a step's
+/// outcome takes the path every other refusal of one takes: a result is recorded as the error it
+/// could not be, and an error as its stand-in or the fixed marker. A management call's checkpoint,
+/// which encodes through the [`StepCodec`](crate::sysdb::types::StepCodec), is not an outcome: its
+/// refusal stays a control signal, as any refusal of a checkpoint is. Refused
 /// on both databases alike, so an application does not behave differently on the one it moves to,
 /// and so that what decides is the text rather than an error code each database spells its own way.
 ///
