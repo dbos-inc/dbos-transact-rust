@@ -147,7 +147,7 @@ pub use checkpoint::PendingStep;
 #[cfg(feature = "engine")]
 pub use client::{Client, ClientConfig};
 #[cfg(feature = "engine")]
-pub use config::{Config, DATABASE_URL_ENV};
+pub use config::{Config, SYSTEM_DATABASE_URL_ENV};
 #[cfg(feature = "engine")]
 pub use context::{StepStatus, cancellation_token, step_id, step_status, workflow_id};
 #[cfg(feature = "engine")]

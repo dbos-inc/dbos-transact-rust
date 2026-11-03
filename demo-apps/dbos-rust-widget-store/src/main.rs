@@ -30,7 +30,7 @@ use dbos::{Config, DBOS, StartOptions, WorkflowRef};
 use store::{Order, Product, Store, StoreError};
 use workflows::{ORDER_ID, PAYMENT_ID, PAYMENT_STATUS, PAYMENT_TIMEOUT};
 
-/// Used when `DBOS_DATABASE_URL` is not set. The database is created if it does not exist.
+/// Used when `DBOS_SYSTEM_DATABASE_URL` is not set. The database is created if it does not exist.
 ///
 /// Deliberately no username or password: the driver fills in whatever the URL leaves out from the
 /// standard libpq variables, such as PGUSER and PGPASSWORD.
