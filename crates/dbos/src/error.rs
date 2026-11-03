@@ -1139,4 +1139,48 @@ mod tests {
             "{read:?}"
         );
     }
+
+    /// A custom serializer whose text always holds a NUL byte, which a text column cannot store, is
+    /// refused as one that refuses everything: the error and its stand-in alike, so the row records
+    /// the fixed marker instead of failing to write.
+    #[test]
+    fn a_serializer_that_writes_nul_bytes_records_a_fixed_marker() {
+        use crate::serialization::{CustomSerializer, Payload, PayloadSlot, Serializer};
+
+        #[derive(Debug)]
+        struct WritesNul;
+
+        impl CustomSerializer for WritesNul {
+            fn name(&self) -> &str {
+                "writes_nul"
+            }
+
+            fn serialize(
+                &self,
+                value: Payload<'_>,
+            ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(format!("{}\0", serde_json::to_string(&value)?))
+            }
+
+            fn deserialize(
+                &self,
+                _: &str,
+                _: PayloadSlot<'_>,
+            ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err("nothing comes back".into())
+            }
+        }
+
+        let encoding = Serializer::custom(WritesNul).encoding();
+        let error: Error<CardDeclined> = CardDeclined { attempts: 3 }.into();
+        let refused = encode_error::<CardDeclined, EngineOnly>(&error, &encoding)
+            .expect_err("a NUL byte is refused");
+        assert!(
+            matches!(&refused, Error::Serialization { what, message, .. }
+                if what == "error" && message.contains("NUL")),
+            "{refused:?}"
+        );
+        let recorded = EncodedError::of(&error, encoding);
+        assert_eq!(recorded.encoded, UNENCODABLE_ERROR);
+    }
 }
