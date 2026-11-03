@@ -842,9 +842,9 @@ async fn a_batch_of_messages_lands_together() {
 
 /// A client reads the events a running workflow publishes.
 ///
-/// The progress channel every implementation's client has: the application sets a key as it goes,
-/// and whatever is watching from outside reads it. A key that is not there when the deadline passes
-/// is `None` rather than an error, and a zero timeout makes the read a poll.
+/// The progress channel: the application sets a key as it goes, and whatever is watching from
+/// outside reads it. A key that is not there when the deadline passes is `None` rather than an
+/// error, and a zero timeout makes the read a poll.
 #[tokio::test]
 async fn a_client_reads_a_workflow_s_events() {
     let db = test_database().await;
@@ -911,10 +911,9 @@ async fn a_client_reads_workflow_status() {
     assert!(matches!(error, Error::WorkflowNotFound { .. }), "{error}");
 
     // The other half answers differently, and deliberately: a wait treats a missing row as one
-    // that has not been enqueued yet and keeps polling for it, which is what all four references
-    // default to and what a client -- the caller most likely to hold an id before its owner has
-    // committed -- needs. Nothing here ever creates the row, so the wait is still running when the
-    // timeout takes it.
+    // that has not been enqueued yet and keeps polling for it, which is what a client -- the
+    // caller most likely to hold an id before its owner has committed -- needs. Nothing here ever
+    // creates the row, so the wait is still running when the timeout takes it.
     let dangling: WorkflowHandle<()> = client.retrieve_workflow("no-such-workflow");
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(750), dangling.result())
@@ -1040,8 +1039,8 @@ async fn a_dropped_client_releases_its_connections() {
 /// A client is refused the conflict policy that needs an application version.
 ///
 /// It has none — it runs none of the application's code — so "update if I am the latest version"
-/// has no answer. Both surfaces take the same `QueueConflict`, as Python's and TypeScript's do,
-/// and both refuse this combination rather than guessing at an answer.
+/// has no answer. Both surfaces take the same `QueueConflict`, and both refuse this combination
+/// rather than guessing at an answer.
 #[tokio::test]
 async fn a_client_cannot_register_a_queue_by_version() {
     let db = test_database().await;
@@ -1291,10 +1290,8 @@ async fn a_client_promotes_a_version_for_a_named_application() {
 ///
 /// The refusal is the interesting half. Connecting with migrations off *verifies* instead of
 /// skipping, so a schema that is missing or behind what this build's queries are written against
-/// fails at connect, naming the version it found. **Go's client does the same** — `NewClient` sets
-/// `SkipMigrations: true` and fails on an unmigrated database. Python's, TypeScript's and Java's
-/// clients neither migrate nor verify, and report a missing schema as whatever SQL error the first
-/// real call happens to raise.
+/// fails at connect, naming the version it found, rather than surfacing as whatever SQL error the
+/// first real call happens to raise.
 #[tokio::test]
 async fn connecting_to_a_database_no_application_has_created_is_refused() {
     let db = raw_database().await;
@@ -1724,7 +1721,7 @@ async fn a_client_lists_tags_and_delays_workflows() {
     );
 
     // A delay only moves a DELAYED row, and this one is ENQUEUED -- so the call is accepted and
-    // changes nothing, which is the reference behaviour rather than an error.
+    // changes nothing, rather than being an error.
     client
         .set_workflow_delay(id, dbos::WorkflowDelay::For(Duration::ZERO))
         .await

@@ -237,8 +237,8 @@ async fn a_resubmission_counts_no_attempt() {
 
 /// The initial status follows from the queue and the delay, and is not the caller's to choose.
 ///
-/// Java derives it the same way. A caller that could name the status could enqueue a workflow
-/// as `SUCCESS` and have it never run.
+/// A caller that could name the status could enqueue a workflow as `SUCCESS` and have it never
+/// run.
 #[tokio::test]
 async fn the_initial_status_is_derived_from_the_queue_and_delay() {
     let (sys, _db) = sysdb().await;
@@ -350,8 +350,7 @@ async fn dead_lettering_parks_a_pending_workflow_with_enough_attempts() {
 ///
 /// Recovery re-enqueues rather than re-invoking, so this transition is the one every recovered
 /// workflow makes; if the claim did not count, `recovery_attempts` would never move for a queued
-/// workflow at all. Python, TypeScript and Go all count in their claim; Python's says so outright:
-/// *"Count this dispatch against the DLQ limit; no later insert does it."*
+/// workflow at all: no later write counts it.
 #[tokio::test]
 async fn the_dequeue_claim_counts_an_attempt() {
     let (sys, _db) = sysdb().await;
@@ -1101,8 +1100,8 @@ async fn a_wait_on_a_closed_handle_reports_rather_than_hanging() {
 
 /// Cancellation is a terminal state no run reports, and it is a value rather than an error.
 ///
-/// Reporting it as `Error::WorkflowCancelled` would say the *waiter* had been cancelled, which is
-/// the distinction Python keeps by raising a separate error for the awaited workflow.
+/// Reporting it as `Error::WorkflowCancelled` would say the *waiter* had been cancelled, not the
+/// awaited workflow.
 #[tokio::test]
 async fn an_await_reports_a_cancelled_workflow_as_cancelled() {
     let (sys, _db) = sysdb().await;
@@ -1163,8 +1162,8 @@ async fn an_await_reports_a_parked_workflow_rather_than_waiting_for_it() {
 
 /// An absent row is waited through, unless the caller says it has already seen it.
 ///
-/// The default all four references take: a row that is not there is one that has not been inserted
-/// yet, so the wait is for it to appear. `fail_if_missing` is the park-and-adopt caller saying it
+/// By default a row that is not there is one that has not been inserted yet, so the wait is for it
+/// to appear. `fail_if_missing` is the park-and-adopt caller saying it
 /// inserted or read this row itself, which makes an absence a delete and polling on pointless.
 #[tokio::test]
 async fn an_absent_row_is_waited_through_unless_the_caller_says_otherwise() {
@@ -1319,9 +1318,6 @@ async fn an_unreachable_database_is_a_connection_failure() {
 ///
 /// This is the case the whole layer exists for, and the only one that exercises it end to end:
 /// classification, the backoff, and sqlx replacing the dead connection on the second attempt.
-/// Java tests the same thing with `ChaosTest.causeChaos`, which is the same `pg_terminate_backend`
-/// used here.
-///
 /// `test_before_acquire(false)` is what makes it deterministic. sqlx otherwise validates a
 /// pooled connection before handing it out, so a killed one is replaced silently and the retry
 /// never engages — the test would pass while proving nothing.
@@ -1422,8 +1418,7 @@ async fn the_opt_out_surfaces_a_killed_connection() {
 ///
 /// Five workflows chosen so that every filter has both a match and a non-match. Some columns are
 /// then set with raw SQL: `forked_from`, `was_forked_from`, `completed_at`, and
-/// `started_at_epoch_ms` are not settable at creation in any implementation, but the filters on
-/// them are real.
+/// `started_at_epoch_ms` are not settable at creation, but the filters on them are real.
 async fn seeded() -> (PostgresSystemDatabase, support::TestDatabase) {
     let (sys, db) = sysdb().await;
 
@@ -1563,9 +1558,8 @@ fn pending<'a>(executor_id: &'a str, application_version: &'a str) -> WorkflowFi
 
 /// Every filter narrows to what it claims to.
 ///
-/// One test rather than twenty-odd, because the value here is coverage of the *set*: the filters
-/// are a union across four implementations that do not agree on it, and one missing `WHERE`
-/// clause is exactly the kind of thing a per-filter test suite tends not to be written for.
+/// One test rather than twenty-odd, because the value here is coverage of the *set*: one missing
+/// `WHERE` clause is exactly the kind of thing a per-filter test suite tends not to be written for.
 #[tokio::test]
 async fn every_filter_narrows() {
     use dbos::sysdb::types::WorkflowFilter as F;
@@ -1966,10 +1960,9 @@ async fn cancelling_clears_the_queue_and_the_deduplication_key() {
 
 /// Cancelling an already-cancelled workflow changes nothing and reports nothing.
 ///
-/// Go excludes `CANCELLED` from the guard; Java, Python and TypeScript exclude only `SUCCESS`
-/// and `ERROR`, so a second call there rewrites `completed_at` and moves the moment of
-/// cancellation. That matters more here than in any of them: this is the only implementation
-/// whose return value is *the ids that actually moved*, so re-reporting one would be a lie.
+/// The guard excludes `CANCELLED` along with `SUCCESS` and `ERROR`, so a second call does not
+/// rewrite `completed_at` and move the moment of cancellation. The return value is *the ids that
+/// actually moved*, so re-reporting one would be a lie.
 #[tokio::test]
 async fn cancelling_twice_does_not_move_the_cancellation() {
     let (sys, _db) = sysdb().await;
@@ -2049,8 +2042,8 @@ async fn cancelling_a_finished_workflow_does_not_overwrite_it() {
 
 /// The cascade reaches grandchildren, not just direct children.
 ///
-/// A three-generation tree, because a two-generation one passes under any of the three
-/// implementations' strategies and so proves nothing about depth.
+/// A three-generation tree, because a two-generation one passes under a cascade that stops at
+/// direct children, and so proves nothing about depth.
 #[tokio::test]
 async fn cancelling_children_descends_the_whole_tree() {
     let (sys, _db) = sysdb().await;
@@ -2183,7 +2176,7 @@ async fn resuming_clears_the_attempt_count_and_the_deadline() {
 
 /// Resuming an id that does not exist says so; cancelling one does not.
 ///
-/// The asymmetry is deliberate and is Python's. A zero-row update cannot tell "already finished"
+/// The asymmetry is deliberate. A zero-row update cannot tell "already finished"
 /// from "never existed", and only one of the two operations cares about the difference.
 #[tokio::test]
 async fn resuming_a_missing_workflow_is_an_error_but_cancelling_one_is_not() {
@@ -2388,9 +2381,8 @@ async fn concurrent_merges_of_different_keys_all_land() {
 
 /// Values the database would accept but no caller meant are rejected before they are written.
 ///
-/// Java validates the same list in its constructor. The cases here are the ones that would
-/// otherwise create a row nobody can act on: a workflow with no id, a queue named `""`, or a
-/// timeout that expires before the workflow starts.
+/// The cases here are the ones that would otherwise create a row nobody can act on: a workflow
+/// with no id, a queue named `""`, or a timeout that expires before the workflow starts.
 #[tokio::test]
 async fn empty_and_zero_values_are_rejected() {
     let (sys, _db) = sysdb().await;
@@ -2456,9 +2448,9 @@ async fn empty_and_zero_values_are_rejected() {
 
 /// An absent auth context is stored as NULL however the caller spelled it.
 ///
-/// TypeScript and Go send `""` rather than null. Storing both spellings would make an
-/// `authenticated_user` filter miss rows another SDK wrote — so the empty string is normalised
-/// rather than rejected, which is the one place empty is not an error.
+/// Other SDKs on the same database may write `""` rather than null. Storing both spellings would
+/// make an `authenticated_user` filter miss rows another SDK wrote — so the empty string is
+/// normalised rather than rejected, which is the one place empty is not an error.
 #[tokio::test]
 async fn empty_auth_fields_are_normalised_to_null() {
     let (sys, _db) = sysdb().await;
@@ -2528,9 +2520,8 @@ async fn a_step_result_round_trips() {
 
 /// Re-recording with the same completion is this caller's own retry; a different one is a rival.
 ///
-/// This is the reason `completed_at` is a parameter rather than read inside the call. Python
-/// says so at its call site: "Outside the retry: the conflict check compares the stored
-/// completion to ours."
+/// This is the reason `completed_at` is a parameter rather than read inside the call: the conflict
+/// check compares the stored completion to the caller's, so it is fixed once, outside the retry.
 #[tokio::test]
 async fn a_step_recorded_twice_distinguishes_a_retry_from_a_rival() {
     let (sys, _db) = sysdb().await;
@@ -2882,8 +2873,8 @@ async fn a_child_workflow_is_recorded_against_its_step() {
     )
     .await
     .unwrap();
-    // Read back through the ordinary replay check, which is the path Python uses: the child id
-    // is a field of the recorded step, not a separate lookup.
+    // Read back through the ordinary replay check: the child id is a field of the recorded step,
+    // not a separate lookup.
     let step = sys
         .check_step("wf-parent", 0, "run_child")
         .await
@@ -3681,7 +3672,7 @@ async fn a_delay_can_be_moved_only_while_the_workflow_is_delayed() {
 ///
 /// The key is held only while the workflow is DELAYED. Once released the workflow is committed
 /// to running, so a later debounce with the same key must start a fresh workflow rather than
-/// bounce this one. Python does this in the same statement and explains it; Java does not.
+/// bounce this one.
 #[tokio::test]
 async fn releasing_a_delayed_workflow_clears_only_the_debounce_key() {
     let (sys, db) = sysdb().await;
@@ -3923,8 +3914,7 @@ async fn delays_hold_with_the_database_clock_behind() {
 
 /// A second workflow cannot take a deduplication key another already holds on the same queue.
 ///
-/// Java raises `DBOSQueueDuplicatedException` here and Python `DBOSQueueDeduplicatedError`; both
-/// translate SQLSTATE 23505 rather than letting it surface as a generic database failure. The
+/// SQLSTATE 23505 is translated rather than left to surface as a generic database failure. The
 /// only unique index this insert can violate is migration 27's partial one on
 /// `(queue_name, deduplication_id)`, since `ON CONFLICT (workflow_uuid)` absorbs the other.
 #[tokio::test]
@@ -3980,7 +3970,8 @@ async fn a_held_deduplication_key_is_reported_as_such() {
 /// caller's.
 ///
 /// Unlike `input` and the outcome payloads — opaque bytes whose format the caller chooses — the
-/// column is always a JSON array of strings in every implementation, so the sysdb owns it.
+/// column is always a JSON array of strings, for every SDK sharing the database, so the sysdb owns
+/// it.
 #[tokio::test]
 async fn authenticated_roles_are_encoded_by_this_layer() {
     let (sys, db) = sysdb().await;
@@ -4085,10 +4076,9 @@ async fn a_duplicate_submission_does_not_steal_the_executor_stamp() {
 
 /// Attributes must be a JSON object, on both the paths that can set them.
 ///
-/// Every other implementation takes a map, and TypeScript rejects arrays explicitly. Since this
-/// layer takes the encoded form, the check has to be made rather than inherited from a type —
-/// and it is not cosmetic: `attributes @> …` is containment against an object, so a stored array
-/// or scalar would silently never match any filter.
+/// Since this layer takes the encoded form, the check has to be made rather than inherited from a
+/// type — and it is not cosmetic: `attributes @> …` is containment against an object, so a stored
+/// array or scalar would silently never match any filter.
 #[tokio::test]
 async fn attributes_must_be_a_json_object() {
     let (sys, _db) = sysdb().await;
@@ -4680,8 +4670,8 @@ async fn a_value_published_during_the_wait_still_arrives() {
 
 /// Nothing published by the deadline is a value, not an error.
 ///
-/// Python and TypeScript return the same. Go raises a timeout instead, but in its engine — and an
-/// error is the one shape a caller cannot synthesise from the other.
+/// An absence is reported as a value because a caller that wants an error can make one from it, and
+/// cannot go the other way.
 #[tokio::test]
 async fn a_read_that_finds_nothing_reports_absence() {
     let (sys, _db) = sysdb().await;
@@ -4710,7 +4700,7 @@ async fn a_read_that_finds_nothing_reports_absence() {
 /// A read inside a workflow records the publisher's own payload, in the publisher's own format.
 ///
 /// Not a wrapper around the pair: the column holds what was published, so the row stays legible to
-/// an operator and to every other implementation, all four of which record exactly this.
+/// an operator and to every other SDK sharing the database.
 #[tokio::test]
 async fn a_read_records_the_publishers_own_payload() {
     let (sys, _db) = sysdb().await;
@@ -6323,8 +6313,8 @@ async fn a_listener_delivers_a_message_sooner_than_the_interval_allows() {
 ///
 /// **`NOTIFY` is not queued for absent listeners**, so anything written while this process had no
 /// connection is simply gone — and with the interval at a minute, the waiter would sit there long
-/// past its own timeout. Waking every waiter on connect is what covers that. Go and Java both do
-/// it; Python and TypeScript do not, and rely on the fallback catching it.
+/// past its own timeout. Waking every waiter on connect is what covers that, rather than relying
+/// on the fallback poll to catch it.
 ///
 /// **The gap is manufactured rather than raced for.** Killing the listener's connection and then
 /// sending a message would prove nothing: `PgListener` reconnects in milliseconds, so the
@@ -6631,9 +6621,8 @@ async fn a_close_pushes_what_the_window_was_still_holding() {
 /// CockroachDB it is the *only* thing that can shorten a wait, since there is no `LISTEN`/`NOTIFY`
 /// to fall back on; that is why this test does not skip.
 ///
-/// Go signals its local registry the same way. Python and TypeScript do not, and their own
-/// process's waiters hear their writes back off the wire — which on a backend with no wire means
-/// waiting out the interval.
+/// Hearing its own writes back off the wire instead would, on a backend with no wire, mean waiting
+/// out the interval.
 #[tokio::test]
 async fn a_write_wakes_a_waiter_in_its_own_process_with_nothing_pushing() {
     let (sys, _db) = sysdb().await;
@@ -6748,7 +6737,7 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
 /// A sleep's step is stamped complete at the wake time, so its recorded duration is the sleep.
 ///
 /// That timestamp is in the future when the row is written. Deliberate: nothing in execution or
-/// recovery reads it, and a timeline should show an hour's sleep as an hour. Java does the same.
+/// recovery reads it, and a timeline should show an hour's sleep as an hour.
 #[tokio::test]
 async fn a_sleep_records_its_duration_as_the_sleep() {
     let (sys, _db) = sysdb().await;
@@ -7972,9 +7961,8 @@ async fn a_read_deadline_too_far_out_to_store_never_elapses() {
 
 /// Forking a parent rewrites the children it recorded, so it adopts the forked ones.
 ///
-/// Also the guard for the `start_step > 0` boundary: forking from step 1 must carry step 0. It is
-/// where TypeScript and Python disagree — Python's `step > 1` filter drops it — so the assertion
-/// that one step came across is load-bearing.
+/// Also the guard for the `start_step > 0` boundary: forking from step 1 must carry step 0. A
+/// `step > 1` filter would drop it, so the assertion that one step came across is load-bearing.
 #[tokio::test]
 async fn a_fork_can_rewrite_the_children_it_replays() {
     let (sys, _db) = sysdb().await;
@@ -8514,8 +8502,8 @@ async fn a_replayed_send_does_not_send_again() {
         .await
         .unwrap();
     assert_eq!(steps.len(), 1);
-    // The name every implementation records for a single send, so a workflow replayed by another
-    // finds what it expects.
+    // The name every SDK sharing the database records for a single send, so a step listing reads
+    // the same whichever SDK wrote it.
     assert_eq!(steps[0].step_name, "DBOS.send");
 }
 
@@ -10446,7 +10434,7 @@ async fn an_unclaimed_version_is_claimed_where_it_stands() {
 ///
 /// This is the client's case: a tool with no application of its own — or one acting on behalf of
 /// another — names the target per call rather than being configured as it. The handle's name is
-/// only the default, which is what `applicationName ?? this.appName` means in both references.
+/// only the default.
 #[tokio::test]
 async fn a_named_target_overrides_the_handles_own_application() {
     let db = test_database().await;
@@ -11198,12 +11186,11 @@ async fn listing_queues_scopes_but_reading_one_does_not() {
     alpha.delete_queue("alpha-queue").await.unwrap();
 }
 
-/// A queue carrying half a rate limit reads as having none, as TypeScript does.
+/// A queue carrying half a rate limit reads as having none.
 ///
-/// The two columns are only meaningful together and no SDK can write one alone, so reaching this
-/// state takes direct SQL. Matching TypeScript matters more than reporting it: a peer reading the
-/// same row must not see a different queue. The safety cost — an unthrottled queue that says
-/// nothing — is recorded as a `TODO(dbos-team)` on the reader.
+/// The two columns are only meaningful together and no public API writes one alone, so reaching
+/// this state takes direct SQL. It is read as no limit rather than reported; why, and the safety
+/// cost — an unthrottled queue that says nothing — are explained on the reader, `queue_from_row`.
 #[tokio::test]
 async fn half_a_rate_limit_reads_as_none() {
     let (sys, db) = sysdb().await;
@@ -11227,16 +11214,15 @@ async fn half_a_rate_limit_reads_as_none() {
 /// waits for the next poll — 11 of 15 rounds in a stress run. Nothing in the test can prevent it:
 /// a row is readable while still being skippable, so reading it first only narrows the window.
 ///
-/// Skipped rather than loosened, because the assertion is the point: Java's equivalent tests miss
-/// the behaviour precisely because they assert a limit being enforced rather than a count being
-/// complete. Weakening ours the same way would lose the only coverage anyone has.
+/// Skipped rather than loosened, because the assertion is the point: a test that asserts a limit
+/// being enforced rather than a count being complete never sees the behaviour.
 ///
-/// Remove this once the lock mode is settled — see the `TODO(dbos-team)` on
-/// `start_queued_workflows`, UPSTREAM item 7.
+/// Remove this once CockroachDB's lock mode is settled — see the explanation of the lock mode in
+/// `start_queued_workflows`.
 fn skip_dequeue_completeness(db: &support::TestDatabase) -> bool {
     let skipping = matches!(db.backend(), Backend::Cockroach);
     if skipping {
-        eprintln!("skipped on CockroachDB: SKIP LOCKED may under-deliver; see UPSTREAM item 7");
+        eprintln!("skipped on CockroachDB: SKIP LOCKED may under-deliver");
     }
     skipping
 }
@@ -12914,7 +12900,7 @@ async fn creating_a_schedule_twice_is_refused() {
     ));
 
     // The id has its own unique index, and a collision on it is reported as itself rather than
-    // as a name collision — which is what all four references report it as.
+    // as a name collision.
     let taken = sys.get_schedule("nightly", None).await.unwrap().unwrap();
     assert!(matches!(
         sys.create_schedule(
@@ -12991,9 +12977,8 @@ async fn a_creation_losing_to_a_peer_reports_what_it_can_see() {
     //
     // Under PostgreSQL's `READ COMMITTED` the resolve has already taken its snapshot, so the unique
     // index is the first thing to see beta — and an index does not know whose row it protected. So
-    // the error says only that the name is taken, which is what all four references report for any
-    // collision here; naming the holder would mean a second query on a fresh transaction after
-    // every failure, which none of them does.
+    // the error says only that the name is taken; naming the holder would mean a second query on a
+    // fresh transaction after every failure.
     //
     // CockroachDB is `SERIALIZABLE`: the conflict makes the statement retry, the resolve runs again
     // against a snapshot that now includes beta, and it can name the holder. Strictly the better
@@ -13893,7 +13878,7 @@ async fn every_schedule_write_replays_from_its_checkpoint() {
             "DBOS.delete_schedule",
         ]
     );
-    // All four return nothing, so all four record the JSON `null` rather than a NULL column.
+    // All four return nothing, so each records the JSON `null` rather than a NULL column.
     assert!(steps.iter().all(|s| s.output.as_deref() == Some("null")));
 }
 
@@ -14667,7 +14652,7 @@ async fn seed_payload_table_row(pool: &sqlx::PgPool, workflow_id: &str) {
     .unwrap();
 }
 
-/// A row whose payloads live only in the new tables — what Python, TypeScript and Java write —
+/// A row whose payloads live only in the new tables — what the other SDKs now write —
 /// reads back through every reader: the single read, the list, and the result wait.
 #[tokio::test]
 async fn payloads_in_the_payload_tables_are_read() {

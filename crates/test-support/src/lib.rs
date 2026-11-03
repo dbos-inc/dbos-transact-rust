@@ -13,9 +13,9 @@
 //! that a strictly sequential run (`--test-threads=1`) has no overlap and so starts a
 //! container per test — the pathological case, and never worse than not sharing at all.
 //!
-//! **Both v1 backends run the same suite**, switched by `DBOS_TEST_USE_COCKROACH_DB`,
-//! following Java's `PgContainer`. CockroachDB is a v1 backend, not a smoke-tested
-//! afterthought, and the switch is what makes the second CI leg a one-variable change.
+//! **Both v1 backends run the same suite**, switched by `DBOS_TEST_USE_COCKROACH_DB`.
+//! CockroachDB is a v1 backend, not a smoke-tested afterthought, and the switch is what makes
+//! the second CI leg a one-variable change.
 //!
 //! Note that Rust compiles each `tests/*.rs` file into its own binary, and the crate's own
 //! `#[cfg(test)]` code into one more, so "the shared server" is shared within a binary rather
@@ -62,10 +62,9 @@ use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
 use tokio::sync::Mutex;
 
-/// Pinned: what Go and TypeScript run CI against, and the oldest server the migrations
-/// must work on.
+/// Pinned: the oldest server the migrations must work on.
 const POSTGRES_IMAGE: (&str, &str) = ("postgres", "16");
-/// Pinned: Java's choice.
+/// Pinned to one release line.
 const COCKROACH_IMAGE: (&str, &str) = ("cockroachdb/cockroach", "latest-v26.2");
 
 const POSTGRES_PORT: u16 = 5432;
@@ -115,7 +114,7 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// Reads `DBOS_TEST_USE_COCKROACH_DB`, matching Java's `PgContainer` switch.
+    /// Reads `DBOS_TEST_USE_COCKROACH_DB`.
     pub fn from_env() -> Self {
         match std::env::var("DBOS_TEST_USE_COCKROACH_DB") {
             Ok(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes") => {
@@ -1145,11 +1144,11 @@ impl TestDatabase {
 
     /// Terminates the connections tagged with `application_name`, killing them where they sit.
     ///
-    /// Java's `ChaosTest.causeChaos` kills everything on the database. That cannot work here:
-    /// tests run in parallel against a shared server, and CockroachDB's session list is
-    /// **cluster-wide** with no database column — killing by database would take out unrelated
-    /// tests. Tagging the pool under test and killing only that tag is scoped correctly on both
-    /// backends, and the admin connection below is untagged, so it does not kill itself.
+    /// Killing everything on the database cannot work here: tests run in parallel against a shared
+    /// server, and CockroachDB's session list is **cluster-wide** with no database column —
+    /// killing by database would take out unrelated tests. Tagging the pool under test and killing
+    /// only that tag is scoped correctly on both backends, and the admin connection below is
+    /// untagged, so it does not kill itself.
     pub async fn kill_connections(&self, application_name: &str) {
         use sqlx::Executor;
         let mut admin = self.admin_connection().await;
@@ -1304,8 +1303,8 @@ impl dbos::sysdb::types::StepCodec for TestCodec {
 }
 
 /// Sets application version `version_name`'s timestamp to `timestamp` as given, for a test that
-/// needs one at a particular instant: ahead of the database's clock, say, as another
-/// implementation's promoter can leave it, or ordered against another version. The SDK has no call
+/// needs one at a particular instant: ahead of the database's clock, say, as a writer
+/// stamping its own clock can leave it, or ordered against another version. The SDK has no call
 /// that does this, since a promotion stamps the database's clock.
 pub async fn set_version_timestamp(
     pool: &sqlx::PgPool,

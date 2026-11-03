@@ -8,32 +8,32 @@
 
 /// The system schema used when configuration does not name one.
 ///
-/// Every implementation defaults to `dbos`, so a database migrated by one is found by the
-/// others without being told where to look. The name is configurable because some deployments
+/// Every DBOS SDK defaults to `dbos`, so a database migrated by one is found by the others
+/// without being told where to look. The name is configurable because some deployments
 /// keep DBOS's tables somewhere else, but changing it is a deployment-wide decision: every
 /// application sharing the database has to agree.
 pub const DEFAULT_SCHEMA: &str = "dbos";
 
 /// The queue a workflow is resumed onto when the caller names none.
 ///
-/// Every implementation uses this exact string, and a resumed workflow must land on a queue that
-/// another SDK's dequeuer also polls.
+/// A cross-SDK constant: a resumed workflow must land on a queue that another SDK's dequeuer on the
+/// same database also polls.
 pub const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
 
 /// The topic a message with no topic is filed under.
 ///
 /// A sentinel rather than `NULL`, because a receiver selects on `topic = $1` and nothing equals
-/// `NULL`. All four implementations write this exact string, so a message sent by one is found by
-/// another — it is a cross-SDK constant, not an encoding this layer is free to change.
+/// `NULL`. Every SDK on the database writes this exact string, so a message sent by one is found
+/// by another — it is a cross-SDK constant, not an encoding this layer is free to change.
 pub const NULL_TOPIC: &str = "__null__topic__";
 
 /// The serialization tag of portable JSON, the encoding every DBOS SDK reads and writes.
 ///
-/// A cross-SDK constant like [`NULL_TOPIC`]: every implementation writes and recognises this exact
-/// string, so it is defined once, here, for every row tagged with it — the serializer's portable
-/// payloads, a durable sleep's wake time, and the stream-closed marker [`STREAM_CLOSED`]. It lives
-/// in this layer rather than with the serializer because this layer writes it itself, and does not
-/// depend on the serializer.
+/// A cross-SDK constant like [`NULL_TOPIC`]: every SDK on the database writes and recognises this
+/// exact string, so it is defined once, here, for every row tagged with it — the serializer's
+/// portable payloads, a durable sleep's wake time, and the stream-closed marker [`STREAM_CLOSED`].
+/// It lives in this layer rather than with the serializer because this layer writes it itself, and
+/// does not depend on the serializer.
 pub const PORTABLE_JSON: &str = "portable_json";
 
 /// The value written to a stream to mark it closed, as stored: the string
@@ -60,7 +60,7 @@ pub fn is_stream_closed(value: &str, serialization: Option<&str>) -> bool {
 ///
 /// A bound on the work one transaction does, not on what is eventually dequeued: partitions past
 /// the cap are picked up by the next poll, because the `PENDING` gate keeps a partition ineligible
-/// only while its head is running. Every implementation uses this number.
+/// only while its head is running.
 pub const PARTITIONED_DEQUEUE_SWEEP_CAP: u32 = 8192;
 
 pub mod error;
@@ -100,21 +100,20 @@ use types::{
 /// Payloads cross as already-encoded strings; see [`types`].
 ///
 /// The methods that must be atomic with the step recording them take their caller — a workflow id
-/// and step id — and own the transaction internally, rather than taking a caller's connection the
-/// way Python and TypeScript do. **The methods that record a result of their own** — the
-/// management calls: listings, cancels, forks, rewinds, schedule changes, a debounce — take a
-/// [`StepCaller`], whose [`StepCodec`](types::StepCodec) encodes that result, so this layer
-/// chooses no encoding even for its own values; the rest take `caller: Option<(&str, i32)>`.
+/// and step id — and own the transaction internally, rather than taking a caller's connection.
+/// That keeps driver types out of the signatures, makes atomicity the method's job rather than
+/// something each call site must remember, and leaves the trait object backend-neutral: a caller
+/// passes two strings and an integer, never a connection.
+///
+/// **The methods that record a result of their own** — the management calls: listings, cancels,
+/// forks, rewinds, schedule changes, a debounce — take a [`StepCaller`], whose
+/// [`StepCodec`](types::StepCodec) encodes that result, so this layer chooses no encoding even for
+/// its own values; the rest take `caller: Option<(&str, i32)>`.
 /// [`get_event`](SystemDatabase::get_event)
 /// takes a [`GetEventCaller`] instead — the same thing plus the step its deadline is recorded
 /// under — because there the caller is optional and a wrapped `Option` is what reads. It is named
 /// for its one method rather than for blocking in general: `recv` blocks too and takes plain
 /// parameters, because its caller is required and its two step ids are not optional together.
-///
-/// TODO(dbos-team): UPSTREAM item 13, the shape itself. Threading a `PoolClient` or
-/// `sa.Connection` through the system database makes atomicity the call site's job to remember,
-/// and is the part that would not survive a language-neutral core — a host can pass two strings
-/// and an integer, not a connection. Nothing is broken either way; worth the team having seen it.
 #[async_trait]
 pub trait SystemDatabase: Send + Sync {
     /// Records a workflow, or finds the row already under that id.
@@ -191,8 +190,7 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Every workflow descended from this one, at any depth.
     ///
-    /// Excludes the workflow itself. Walks level by level rather than recursing in SQL, which is
-    /// what all four implementations do.
+    /// Excludes the workflow itself. Walks level by level rather than recursing in SQL.
     async fn get_workflow_children(&self, workflow_id: &str) -> Result<Vec<String>, Error>;
 
     /// Records a terminal outcome, but only while the workflow is still running.
@@ -203,8 +201,8 @@ pub trait SystemDatabase: Send + Sync {
     /// outcome instead of reporting its own.
     ///
     /// The terminal status comes from the [`Outcome`] rather than being passed separately, so a
-    /// success carrying an error is unrepresentable. No implementation treats the two as
-    /// independent — see [`Outcome`].
+    /// success carrying an error is unrepresentable. The two are never independent — see
+    /// [`Outcome`].
     ///
     /// **Losing here is a value; losing in [`record_step`](Self::record_step) is an error.** The
     /// two look parallel and deliberately are not. A workflow whose outcome was recorded by someone
@@ -229,70 +227,48 @@ pub trait SystemDatabase: Send + Sync {
     /// and so is the adopt half of park-and-adopt — a run that loses the status-gated outcome write
     /// reads back the outcome that won.
     ///
-    /// **It polls, and every implementation does.** There is no wakeup for workflow completion in
-    /// any of the four: no channel carries it and no trigger publishes it, so the only way to learn
-    /// that a status has changed is to look. `poll_interval` is how often, and the caller supplies
-    /// it because the engine's configuration owns that number.
+    /// **It polls.** There is no wakeup for workflow completion: no channel carries it and no
+    /// trigger publishes it, so the only way to learn that a status has changed is to look.
+    /// `poll_interval` is how often, and the caller supplies it because the engine's configuration
+    /// owns that number.
     ///
-    /// **No timeout**, following Python and Go. A wait ends when the workflow does, and a caller
-    /// that wants to stop sooner drops the future.
+    /// **No timeout.** A wait ends when the workflow does, and a caller that wants to stop sooner
+    /// drops the future.
     ///
     /// **A missing row means "not inserted yet", and `fail_if_missing` is how a caller says
     /// otherwise.** This waits for a workflow to *finish*, and by default a row that is not there
     /// is one that has not appeared yet — a caller holding an id from outside this process, waiting
     /// on whoever owns it to enqueue it, is the case that default serves. A caller that knows the
     /// row must already exist passes `true` and gets [`Error::NonExistentWorkflow`] instead of
-    /// polling for a row that will never reappear.
+    /// polling for a row that will never reappear: the row is known to exist, so a missing row
+    /// means it was deleted.
     ///
-    /// All four references draw the line in the same place, each in its own words — Python's
-    /// `fail_if_missing` (`_sys_db.py`), Go's and Java's required `failIfMissing`, TypeScript's
-    /// optional one — and they all give the same reason for it. Python puts it most plainly
-    /// (`_core.py`): *"The row is known to exist (this dispatch inserted or read it), so a missing
-    /// row means it was deleted: fail fast rather than polling forever."* Python, Go and TypeScript
-    /// pass `true` only where a run parks on its own outcome; **Java also passes it at a handle**,
-    /// on a start that finds the row already `SUCCESS` (`DBOSExecutor.java`), and carries the flag
-    /// on the handle itself — `WorkflowHandleDBPoll`, defaulting to `false`, *"for handles built
-    /// from a `workflow_status` row that was just read"*.
-    ///
-    /// **This engine takes Java's shape and applies the reason wherever it holds**, which is more
-    /// call sites than any reference has. The test is whether the caller has had the row in front
-    /// of it, not which internal route it arrived by. Everyone's park sites are here — the adopt
-    /// path in `workflow.rs`, the deadline cancellation beside it, and the cancellation poller in
-    /// `step.rs` — and so is every handle minted by a call that wrote or read the row: a start, an
-    /// enqueue, a join onto a workflow another execution already owns. Java stops after the
-    /// already-finished start and lets the rest wait; the other three let every handle wait. What
-    /// still waits here is what cannot do better: an id this process has only been handed
+    /// **The engine passes `true` wherever the caller has had the row in front of it**, whatever
+    /// internal route it arrived by. That covers the park sites — the adopt path in `workflow.rs`,
+    /// the deadline cancellation beside it, and the cancellation poller in `step.rs` — and every
+    /// handle minted by a call that wrote or read the row: a start, an enqueue, a join onto a
+    /// workflow another execution already owns. What still waits is what cannot do better: an id
+    /// this process has only been handed
     /// ([`Client::retrieve_workflow`](crate::Client::retrieve_workflow)) or holds only a launch
     /// record for (a parent replaying a child it started), where "deleted" and "not yet" are the
     /// same observation.
     ///
-    /// **The hazard the default carries is real**: a workflow deleted while somebody awaits it
-    /// hangs that waiter, because such a wait cannot tell "not yet" from "never again". Deleting is
-    /// an ordinary operation, reachable from Console and Conductor. Rust waits where the references
-    /// wait, but only on the handles that have never seen the row, where all four wait on every
-    /// handle.
-    ///
-    /// **The fix for what remains is a bound on the wait, and here the caller already has one.**
-    /// Go offers `WithHandleTimeout` and TypeScript a durable `timeoutSeconds`, both of which a
-    /// caller has to know to pass; Python and Java have nothing to pass, and a blocked
-    /// `get_result` stays blocked. A Rust caller wraps the future in `tokio::time::timeout` or
-    /// simply drops it, and the poll stops — the same escape the *no timeout* note above describes,
-    /// applied to the one case that can still wait forever. That is why this method takes no
-    /// timeout of its own: the language supplies the bound the references had to add parameters
-    /// for.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 17.
+    /// **Those remaining waits can hang.** A workflow deleted while one of them awaits it hangs
+    /// that waiter, because the wait cannot tell "not yet" from "never again", and deleting is an
+    /// ordinary operation, reachable from Console and Conductor. The bound is the caller's: wrap
+    /// the future in `tokio::time::timeout` or drop it, and the poll stops — the same escape the
+    /// *no timeout* note above describes. That is why this method takes no timeout of its own.
+    /// Whether such a wait should be bounded by default is an open question shared with the other
+    /// SDKs on the same database.
     ///
     /// Cancellation and dead-lettering are reported as values rather than errors; see
     /// [`AwaitedOutcome`] for why that is not merely convenient.
     ///
     /// **Each poll takes a connection for the length of a query**, so this waits under the polling
     /// concurrency cap — half the pool by default, configured by
-    /// [`Settings::polling_concurrency`](postgres::Settings::polling_concurrency). Python caps the
-    /// same waits together at half its pool with `sys_db_polling_concurrency`, and TypeScript has
-    /// the equivalent. A hundred uncapped waiters are a hundred queries per interval, which empties
-    /// the pool and starves the control plane — leaving those waiters blocked on writes that can no
-    /// longer happen.
+    /// [`Settings::polling_concurrency`](postgres::Settings::polling_concurrency). A hundred
+    /// uncapped waiters are a hundred queries per interval, which empties the pool and starves the
+    /// control plane — leaving those waiters blocked on writes that can no longer happen.
     ///
     /// The permit covers the query and not the wait: it is taken inside the retried region and
     /// released before the interval sleep, so a waiter parked between polls holds nothing. A cap on
@@ -307,38 +283,35 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Waits until one of these workflows has settled, and reports which.
     ///
-    /// "Settled" is the *status* leaving `PENDING`, `ENQUEUED` and `DELAYED` — the same three
-    /// TypeScript's `awaitFirstWorkflowId` and Python's `check_first_workflow_id` exclude. So a
-    /// cancelled or dead-lettered workflow counts as settled and can be the one reported, which is
-    /// deliberate in all three: the caller asked which race finished first, not which succeeded,
-    /// and it has [`await_workflow_result`](Self::await_workflow_result) to ask the second question
-    /// with. Reporting only successes would leave a caller waiting out its whole fan-out because
-    /// one member was cancelled.
+    /// "Settled" is the *status* leaving `PENDING`, `ENQUEUED` and `DELAYED`. So a cancelled or
+    /// dead-lettered workflow counts as settled and can be the one reported, which is deliberate:
+    /// the caller asked which race finished first, not which succeeded, and it has
+    /// [`await_workflow_result`](Self::await_workflow_result) to ask the second question with.
+    /// Reporting only successes would leave a caller waiting out its whole fan-out because one
+    /// member was cancelled.
     ///
-    /// **An id naming no row is waited for, never refused.** There is no `fail_if_missing` here
-    /// and neither reference has one: a set of ids is settled by whichever member appears first,
-    /// and an id whose enqueue has not committed yet is indistinguishable from one that will never
-    /// exist. A caller who needs the stricter reading holds one id and uses
+    /// **An id naming no row is waited for, never refused.** There is no `fail_if_missing` here: a
+    /// set of ids is settled by whichever member appears first, and an id whose enqueue has not
+    /// committed yet is indistinguishable from one that will never exist. A caller who needs the
+    /// stricter reading holds one id and uses
     /// [`await_workflow_result`](Self::await_workflow_result).
     ///
     /// **Duplicate ids are fine, and nothing above requires otherwise either.** `ANY` de-duplicates
     /// on its own and `LIMIT 1` answers with an id, which names one workflow however many entries
     /// pointed at it — so a repeat is invisible here and stays invisible all the way out to
-    /// [`select_workflow`](crate::DBOS::select_workflow), whose answer is that same id. Python and
-    /// TypeScript both reject a repeated id at their own surface, but only because they return a
-    /// *handle* and key a map by id to find it; neither constraint survives the translation.
+    /// [`select_workflow`](crate::DBOS::select_workflow), whose answer is that same id. Rejecting a
+    /// repeat would only be needed by a surface that returned a *handle* and keyed a map by id to
+    /// find it.
     ///
     /// Empty input is [`Error::InvalidInput`], not a wait that never ends — a caller's value the
-    /// layer will not act on, rather than a stored one it could not read. Python raises
-    /// `ValueError` at the same spot; a query over an empty array matches nothing forever, which
-    /// is the worst possible reading of "wait for one of nothing".
+    /// layer will not act on, rather than a stored one it could not read. A query over an empty
+    /// array matches nothing forever, which is the worst possible reading of "wait for one of
+    /// nothing".
     ///
     /// **Two members that settle in the same interval are a tie this cannot break**, and the
     /// winner between them is arbitrary. There is no `ORDER BY`: the poll asks for one settled row
     /// and takes whichever the plan yields first, which can vary with statistics and physical row
-    /// order. TypeScript and Python both do exactly this — neither orders its own `LIMIT 1` — so a
-    /// Rust waiter and a TypeScript one on the same database are arbitrary in the same way rather
-    /// than differently.
+    /// order.
     ///
     /// It is also the honest answer, because **the poll interval is the resolution at which this
     /// call can observe finishing at all**. Two candidate orderings look like improvements and are
@@ -374,11 +347,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// The all-form of [`await_first_workflow_id`](Self::await_first_workflow_id), with the same
     /// definition of settled and the same treatment of an id that names no row — so this waits out
-    /// a mistyped id rather than reporting it, exactly as TypeScript's `awaitWorkflowIds` does.
+    /// a mistyped id rather than reporting it.
     ///
     /// **Each pass asks only about the ids still outstanding**, which is what keeps a long fan-out
-    /// from re-reading the whole set every interval once most of it has finished. TypeScript
-    /// narrows the same way, against a `Set` it deletes from.
+    /// from re-reading the whole set every interval once most of it has finished.
     ///
     /// **Duplicates are harmless**, as they are in the first-form: settling is a property of an id
     /// rather than a choice between ids, so a repeated id is simply satisfied twice. Nothing above
@@ -388,17 +360,16 @@ pub trait SystemDatabase: Send + Sync {
     /// **Nothing above checkpoints this wait**, where
     /// [`await_first_workflow_id`](Self::await_first_workflow_id) is recorded when a workflow makes
     /// it: an all-wait decides nothing, so a replay simply asks again and is answered by a set that
-    /// has already settled. TypeScript records its `waitAll` and this does not — the
-    /// free [`join_workflows`](crate::join_workflows()) sets out why.
+    /// has already settled. The free [`join_workflows`](crate::join_workflows()) sets out why it
+    /// is not recorded.
     ///
     /// Narrowing the array it sends is then an implementation's own business rather than a
-    /// contract: the Postgres one holds its outstanding ids in a `HashSet`, as TypeScript holds
-    /// its own in a `Set`, so a repeat collapses on the way in and each pass removes what it
-    /// watched settle without scanning what it did not.
+    /// contract: the Postgres one holds its outstanding ids in a `HashSet`, so a repeat collapses
+    /// on the way in and each pass removes what it watched settle without scanning what it did
+    /// not.
     ///
-    /// Empty input returns at once. Nothing to wait for is a satisfied wait, and TypeScript
-    /// short-circuits an empty handle list the same way — where an empty *first*-wait has no
-    /// answer to give and is refused.
+    /// Empty input returns at once. Nothing to wait for is a satisfied wait — where an empty
+    /// *first*-wait has no answer to give and is refused.
     async fn await_workflow_ids(
         &self,
         workflow_ids: &[&str],
@@ -433,11 +404,10 @@ pub trait SystemDatabase: Send + Sync {
     /// Replaces a workflow's attributes, clears them, or merges keys into them; see
     /// [`AttributeUpdate`].
     ///
-    /// A merge is one statement, so concurrent merges of different keys never lose each other's,
-    /// as in Python's `update_workflow_attributes(..., merge=True)`.
+    /// A merge is one statement, so concurrent merges of different keys never lose each other's.
     ///
-    /// An id no workflow has is [`Error::NonExistentWorkflow`], for either form, as Go's
-    /// `SetWorkflowAttributes` reports it; a workflow that exists is updated whatever its
+    /// An id no workflow has is [`Error::NonExistentWorkflow`], for either form; a workflow that
+    /// exists is updated whatever its
     /// attributes were.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
@@ -455,9 +425,8 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// **Recovery's whole write.** A `PENDING` row whose executor is gone goes back to `ENQUEUED`
     /// and is dispatched by whichever executor next polls its queue, rather than being executed by
-    /// the process that found it. Python, TypeScript and Go all recover this way; it is what makes
-    /// a recovery sweep idempotent, lets a fleet share one backlog, and turns "how many at once"
-    /// into a question the queue answers.
+    /// the process that found it. That is what makes a recovery sweep idempotent, lets a fleet
+    /// share one backlog, and turns "how many at once" into a question the queue answers.
     ///
     /// A workflow already on a queue goes back to **its own** queue; only one that was never
     /// queued lands on `recovery_queue`, which callers set to [`INTERNAL_QUEUE`].
@@ -467,12 +436,12 @@ pub trait SystemDatabase: Send + Sync {
     /// executor matches nothing rather than tearing a running workflow off its runner.
     ///
     /// **Scoped by application version and by application.** A workflow started under different
-    /// code must not be resumed by an executor running this version, because its recorded steps
-    /// may no longer line up. And `executor_id` defaults to `"local"` — Rust follows Go here — so
-    /// two applications running on one machine present the same executor to this query; unscoped,
-    /// each would re-enqueue the other's workflows and go on to run functions it has never heard
-    /// of. Migration 7's `owner_xid` does not help, because a recovery sweep is looking for
-    /// workflows whose owner is *gone*.
+    /// code must not be resumed by an executor running this version, because its recorded steps may
+    /// no longer line up. And `executor_id` defaults to `"local"`, so two applications running on
+    /// one machine present the same executor to this query; unscoped, each would re-enqueue the
+    /// other's workflows and go on to run functions it has never heard of. Migration 7's
+    /// `owner_xid` does not help, because a recovery sweep is looking for workflows whose owner is
+    /// *gone*.
     ///
     /// Returns the ids that actually moved. An empty `executor_ids` moves nothing.
     async fn reenqueue_for_recovery(
@@ -500,8 +469,7 @@ pub trait SystemDatabase: Send + Sync {
     /// **Clears the deduplication id of debounced workflows in the same statement.** That id is a
     /// debounce key held only while the workflow is `DELAYED`; once released the workflow is
     /// committed to running, and a later debounce with the same key must start a fresh workflow
-    /// rather than bounce this one. Python does this and explains it; **Java does not**, and its
-    /// version predates the column.
+    /// rather than bounce this one.
     async fn transition_delayed_workflows(&self) -> Result<u64, Error>;
 
     /// Cancels up to `limit` unsettled workflows whose deadline has passed, oldest deadline first,
@@ -547,13 +515,11 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// With `cancel_children`, the cascade **cancels each level before discovering the next**,
     /// and repeats until it finds nothing new. Cancelling a parent first is what stops it
-    /// spawning more children behind the walk — Java's comment on the same loop reads "cancel
-    /// level-by-level so newly-spawned children are also caught".
+    /// spawning more children behind the walk, so newly spawned children are also caught.
     ///
-    /// Go instead collects the whole subtree and cancels it in one statement. That is one round
-    /// trip rather than one per level, but it walks the tree while every workflow in it is still
-    /// running, so a child spawned during the walk is missed. Python and Java both interleave,
-    /// and this follows them.
+    /// Collecting the whole subtree and cancelling it in one statement would be one round trip
+    /// rather than one per level, but it would walk the tree while every workflow in it is still
+    /// running, so a child spawned during the walk would be missed.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together** — see
@@ -581,12 +547,12 @@ pub trait SystemDatabase: Send + Sync {
     /// written, so the deeper the tree the later the last read, and a child committed before that
     /// read is caught. Only the commit actually stops a parent, at its next step boundary.
     ///
-    /// **Python and Java get more from the same order than this does**, and the difference is the
-    /// transaction. Python commits each level (`_sys_db.py`, a `with self.engine.begin()` per
-    /// level, its child reads outside any transaction), so a parent reading its own status between
-    /// levels finds `CANCELLED` and stops spawning mid-walk. Wrapping the cascade to commit it with
-    /// the step checkpoint — which is what this whole surface does — trades that visibility for
-    /// atomicity. Worth knowing before treating either half as free.
+    /// **Committing each level separately would get more from the same order**, and the difference
+    /// is the transaction. With a commit per level, and the child reads outside any transaction, a
+    /// parent reading its own status between levels would find `CANCELLED` and stop spawning
+    /// mid-walk. Wrapping the cascade to commit it with the step checkpoint — which is what this
+    /// whole surface does — trades that visibility for atomicity. Worth knowing before treating
+    /// either half as free.
     async fn cancel_workflows(
         &self,
         workflow_ids: &[&str],
@@ -604,8 +570,7 @@ pub trait SystemDatabase: Send + Sync {
     /// Unlike [`cancel_workflows`](Self::cancel_workflows), an id with no row behind it is an
     /// [`Error::NonExistentWorkflow`]. The two differ because a zero-row update cannot tell
     /// "already finished" from "never existed", and here the distinction matters: resuming an id
-    /// that was mistyped should say so rather than silently do nothing. Python draws the same
-    /// line, and for the same reason.
+    /// that was mistyped should say so rather than silently do nothing.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together** — see
@@ -645,17 +610,15 @@ pub trait SystemDatabase: Send + Sync {
     /// nothing here, because what stops a parent spawning is the delete itself, and that is one
     /// transaction whichever order the tree was read in.
     ///
-    /// Python takes no `delete_children` flag and always deletes only what it is given. Java and
-    /// Go have it, and this follows them.
+    /// Without `delete_children`, only what is given is deleted.
     ///
-    /// **No status guard, deliberately.** A running workflow is deleted like any other — Go's
-    /// comment on the same statement reads "Delete all matching workflows regardless of their
-    /// state", and all four behave that way. Naming an id is an operator saying *this one, now*,
-    /// and refusing would leave no way to clear a workflow that is wedged.
+    /// **No status guard, deliberately.** A running workflow is deleted like any other, whatever
+    /// its state. Naming an id is an operator saying *this one, now*, and refusing would leave no
+    /// way to clear a workflow that is wedged.
     ///
-    /// The guard belongs to garbage collection instead, which sweeps by age rather than by id
-    /// and so must never take out live work: all four exclude `PENDING`, `ENQUEUED`, and
-    /// `DELAYED` there. That method is not built yet.
+    /// The guard belongs to garbage collection instead, which sweeps by age rather than by id and
+    /// so must never take out live work: it must exclude `PENDING`, `ENQUEUED`, and `DELAYED`.
+    /// That method is not built yet.
     ///
     /// The consequence for a caller: an executor running a deleted workflow finds its row gone
     /// at the next step boundary and fails with [`Error::NonExistentWorkflow`], rather than
@@ -694,10 +657,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Returns the forked ids in the order given, including any that were generated.
     ///
-    /// **The fork is enqueued, not started.** Its status is `ENQUEUED` on
-    /// [`INTERNAL_QUEUE`] unless [`ForkOptions::queue_name`] says otherwise, so whichever
-    /// executor next polls that queue runs it. All four references do this: the process asking
-    /// for a fork is usually an operator's tool, not a host that can run the workflow.
+    /// **The fork is enqueued, not started.** Its status is `ENQUEUED` on [`INTERNAL_QUEUE`] unless
+    /// [`ForkOptions::queue_name`] says otherwise, so whichever executor next polls that queue runs
+    /// it: the process asking for a fork is usually an operator's tool, not a host that can run the
+    /// workflow.
     ///
     /// **Four tables are copied, not one.** Steps come from `operation_outputs`; a workflow that
     /// published events or wrote streams before its start step must find them again, so
@@ -708,8 +671,7 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Batch because the callers are batch: forking from failure takes a list, and forking a
     /// tree of workflows has to write the whole tree at once for
-    /// [`ForkOptions::replacement_children`] to name ids that exist. Go and Python take the batch
-    /// form directly; Java and TypeScript expose a single-workflow wrapper over one.
+    /// [`ForkOptions::replacement_children`] to name ids that exist.
     ///
     /// Fails with [`Error::NonExistentWorkflow`] if any source is missing, and writes nothing —
     /// a partially applied batch would leave forks whose siblings never existed.
@@ -721,12 +683,6 @@ pub trait SystemDatabase: Send + Sync {
     /// that found no checkpoint would write a *second* fork under a second id and run the work
     /// twice. Cancelling or deleting the same workflow twice reaches the same end state; forking
     /// it twice does not.
-    ///
-    /// **This is ahead of the references.** All four route their management calls through a
-    /// non-transactional step wrapper — Python's `call_function_as_step`, TypeScript's
-    /// `runInternalStep`, Go's `RunAsStep`, Java's `runDbosFunctionAsStep` — which leaves exactly
-    /// that window open. TypeScript has the transactional variant and spends it on schedules;
-    /// this crate has it too, and spends it here as well.
     async fn fork_workflows(
         &self,
         forks: &[Fork<'_>],
@@ -872,17 +828,15 @@ pub trait SystemDatabase: Send + Sync {
     /// workflow was sent stays visible to export and audit.
     ///
     /// **The caller is not optional, unlike [`get_event`](Self::get_event)'s** — which is why the
-    /// three parts are plain parameters here and a [`GetEventCaller`] there. All four
-    /// implementations require a workflow, and the workflow receiving *is* the workflow calling, so
-    /// `workflow_id` is the destination and the step owner at once. A client outside a workflow has
+    /// three parts are plain parameters here and a [`GetEventCaller`] there. A receive requires a
+    /// workflow, and the workflow receiving *is* the workflow calling, so `workflow_id` is the
+    /// destination and the step owner at once. A client outside a workflow has
     /// [`get_all_notifications`](Self::get_all_notifications) to read with and no way to consume,
     /// which is the right shape: consuming without a step to record it against would lose the
     /// message on any retry.
     ///
     /// The struct is what makes `get_event`'s *optional* caller readable; with nothing optional to
-    /// wrap it would buy only naming. Python, TypeScript and Java each carry a caller type for
-    /// `get_event` and pass `recv`'s three flat, which is three implementations reaching the same
-    /// place — Java's is even named `GetEventCaller`.
+    /// wrap it would buy only naming.
     ///
     /// `step_id` records the receive, so a replay returns the message rather than taking another.
     /// `timeout_step_id` records the deadline, so a recovery resumes it rather than restarting the
@@ -899,8 +853,7 @@ pub trait SystemDatabase: Send + Sync {
     /// new execution while the old one still waits, in this process or another, and there
     /// `owner_xid` refuses the old one's consume, so the message is the new owner's.
     ///
-    /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed. Go
-    /// raises a timeout error, in its engine rather than at this layer.
+    /// **Absence is a value.** `Ok(None)` means nothing was waiting when the deadline passed.
     ///
     /// The waiting, the two checkpoints and the polling cap are exactly
     /// [`get_event`](Self::get_event)'s; what differs is that the message is consumed and recorded
@@ -925,15 +878,15 @@ pub trait SystemDatabase: Send + Sync {
     /// **Computing it inside the insert narrows that race but does not close it.** Under `READ
     /// COMMITTED` two concurrent statements can evaluate `MAX(offset)` to the same value and one
     /// still loses the key, so the retry is what makes this correct and the single statement only
-    /// makes it rarer. Python and Go compose it this way; Java and TypeScript read the offset in
-    /// a separate round trip first, holding the window open for longer.
+    /// makes it rarer. Reading the offset in a separate round trip first would hold the window
+    /// open for longer.
     ///
     /// `written_by` decides whether the write is itself a durable step; see [`WrittenBy`].
     ///
-    /// **Writing to a closed stream is allowed here.** Go rejects it, alone among the four, at
-    /// the cost of a query per write. A reader stops at the sentinel, so an entry appended after
-    /// it is invisible rather than corrupting — and a workflow that writes after closing has a
-    /// bug this layer cannot fix by refusing one of the two writes.
+    /// **Writing to a closed stream is allowed here.** Refusing it would cost a query per write. A
+    /// reader stops at the sentinel, so an entry appended after it is invisible rather than
+    /// corrupting — and a workflow that writes after closing has a bug this layer cannot fix by
+    /// refusing one of the two writes.
     #[allow(clippy::too_many_arguments)]
     async fn write_stream(
         &self,
@@ -963,8 +916,7 @@ pub trait SystemDatabase: Send + Sync {
     /// Releases the connections this backend holds.
     ///
     /// Idempotent, and on the trait rather than the concrete type because shutdown reaches the
-    /// system database only through a trait object. Java's `SystemDatabase` and Go's `SysDB`
-    /// both expose the same.
+    /// system database only through a trait object.
     async fn close(&self);
 
     /// Whether this handle started its notification tasks and pushes its own writes. For tests
@@ -983,10 +935,10 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Reads a recorded step, or `None` if it has not run.
     ///
-    /// `check` rather than `get`, following all three references, because this is a replay gate
-    /// and not a lookup: unlike [`get_workflow`](Self::get_workflow), it can reject
-    /// the caller outright. A `get_` that raises [`Error::WorkflowCancelled`] would be a
-    /// surprise in exactly the place a caller can least afford one.
+    /// `check` rather than `get`, because this is a replay gate and not a lookup: unlike
+    /// [`get_workflow`](Self::get_workflow), it can reject the caller outright. A `get_` that
+    /// raises [`Error::WorkflowCancelled`] would be a surprise in exactly the place a caller can
+    /// least afford one.
     ///
     /// This is the whole of durable execution in one call: on replay, a step that returns
     /// `Some` is skipped and its recorded result used instead of running it again.
@@ -1018,8 +970,7 @@ pub trait SystemDatabase: Send + Sync {
     /// records a later step before an earlier one when a `recv` or `get_event` checkpoints its
     /// timeout's sleep, at the step after its own, before it waits, or when concurrent calls of one
     /// workflow finish out of order. So an empty position with a step past it is a point the old
-    /// code got past, and only a history that ends before the position is a first visit. Python's
-    /// `get_checkpoint_at_or_after` and Java's `getCheckpointAtOrAfter` read the same.
+    /// code got past, and only a history that ends before the position is a first visit.
     async fn check_step_at_or_after(
         &self,
         workflow_id: &str,
@@ -1038,13 +989,11 @@ pub trait SystemDatabase: Send + Sync {
     ///   [`Error::StepNondeterminism`]. No other execution can have: the owner check runs first.
     ///
     /// So a caller that retries must pass the same `timing` both times — hold it in a variable
-    /// rather than building it at the call site inside a retry loop. Python spells the rule out
-    /// where it does the same thing: *"Outside the retry: the conflict check compares the stored
-    /// completion to ours."*
+    /// rather than building it at the call site inside a retry loop, since the conflict check
+    /// compares the stored completion with this one.
     ///
     /// A step recorded with no `timing` gets no such detection — there is nothing to compare, so
-    /// a duplicate write is accepted rather than reported. That is the trade for omitting it, and
-    /// it is Java's behaviour whenever its end time is null.
+    /// a duplicate write is accepted rather than reported. That is the trade for omitting it.
     ///
     /// Recording also **re-stamps the workflow's executor id**, because an executor that runs a
     /// step is by definition the one running the workflow.
@@ -1095,24 +1044,21 @@ pub trait SystemDatabase: Send + Sync {
     /// with [`WakeTime::arrives`] on its own monotonic clock and never compares the wake time
     /// against its wall clock.
     ///
-    /// The wake time is the step's recorded output, stored as epoch milliseconds in portable
-    /// JSON. That combination is deliberate and matches neither reference exactly: Java stores
-    /// milliseconds through the *workflow's* serializer, Python stores epoch *seconds* through
-    /// the portable one. Milliseconds because every other instant in this schema is
-    /// milliseconds; portable because the value is a plain number this layer both writes and
-    /// reads, so nothing is served by making it legible only to Rust.
+    /// The wake time is the step's recorded output, stored as epoch milliseconds in portable JSON.
+    /// That combination is deliberate. Milliseconds because every other instant in this schema is
+    /// milliseconds; portable because the value is a plain number this layer both writes and reads,
+    /// so nothing is served by making it legible only to Rust.
     ///
     /// The step's `completed_at` is stamped at the **wake time**, which is in the future when
     /// the row is written — so a timeline shows an hour's sleep as an hour rather than as an
     /// instant. Nothing in execution or recovery reads that column; it is for step aggregates,
-    /// metrics, and Conductor. **All four references do the same**; Go's is `withCompletedAt`
-    /// (#442).
+    /// metrics, and Conductor.
     ///
     /// The deadline [`get_event`](Self::get_event) registers is the same checkpoint with the
     /// opposite stamping, since a read that answers in milliseconds under a minute's timeout has
-    /// not taken a minute. Python and TypeScript expose that as a flag on this method; here it is
-    /// the implementation's business, because no caller of *this* method wants it — a caller
-    /// registering a deadline is calling the blocking read, not recording a sleep by hand.
+    /// not taken a minute. That is the implementation's business rather than a flag on this method,
+    /// because no caller of *this* method wants it — a caller registering a deadline is calling the
+    /// blocking read, not recording a sleep by hand.
     ///
     /// A `duration` whose wake time cannot be stored as epoch milliseconds in an `i64` is
     /// [`Error::InvalidInput`] — but only once the record has been looked for, and the refusal is
@@ -1134,8 +1080,7 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// `step_id` is required rather than optional because `workflow_events_history` keys on it:
     /// `(workflow_uuid, key, function_id)` is its primary key and the column is `NOT NULL`, so
-    /// there is no history row to write without one. TypeScript reaches the same place by
-    /// rejecting `DBOS.setEvent` outside a workflow.
+    /// there is no history row to write without one.
     ///
     /// Setting the same key twice replaces the current value and adds a history row, so the
     /// history is what a fork copies forward and the current value is what a reader sees.
@@ -1156,23 +1101,20 @@ pub trait SystemDatabase: Send + Sync {
     /// read *from*; `caller`, if any, is the workflow doing the reading.
     ///
     /// **Absence is a value, not an error.** `Ok(None)` means the key was not there when the
-    /// deadline passed, which is indistinguishable from the key never being set — the same answer
-    /// Python and TypeScript return. Go raises a timeout error instead, but it does so in its
-    /// engine, above the layer this trait describes, and an error is the one thing a caller cannot
-    /// synthesise if it wanted the other shape.
+    /// deadline passed, which is indistinguishable from the key never being set. A caller that
+    /// wants a timeout error can raise one from `None`.
     ///
     /// **How it waits.** Subscribe, look, wait a bounded interval, look again. The loop is what
     /// delivers: a wakeup only ever says "look again", never what changed, so with no wakeups at
     /// all this still returns as soon as the next interval comes round. That is not a degraded
-    /// mode — CockroachDB has no `LISTEN`/`NOTIFY`, so it is every SDK's Cockroach configuration
-    /// and this crate's CI.
+    /// mode — CockroachDB has no `LISTEN`/`NOTIFY`, so it is the whole mechanism there, including
+    /// in this crate's CI.
     ///
     /// **The caller's cancellation is the caller's business.** A `get_event` in a workflow
-    /// cancelled mid-wait runs to its deadline here; TypeScript re-checks the caller's status every
-    /// interval, which costs a second query per pass to do what dropping the future does for free.
-    /// Python does not check either. Same position as
-    /// [`await_workflow_result`](Self::await_workflow_result): a caller that wants to stop sooner
-    /// drops the future.
+    /// cancelled mid-wait runs to its deadline here; re-checking the caller's status every interval
+    /// would cost a second query per pass to do what dropping the future does for free. Same
+    /// position as [`await_workflow_result`](Self::await_workflow_result): a caller that wants to
+    /// stop sooner drops the future.
     ///
     /// **Inside a workflow it is two checkpoints, not one.** `caller.step_id` records the read, so
     /// a replay returns the value the first run saw rather than waiting again — including the
@@ -1290,14 +1232,13 @@ pub trait SystemDatabase: Send + Sync {
     /// `version_id` is not the identity callers use — `version_name` is, and it is what workflow
     /// rows store.
     ///
-    /// `application_name` names the application the version belongs to; `None` means this
-    /// handle's own. A version already held by a *different* application is
-    /// [`Error::RegisteredByAnother`] rather than a silent takeover — for a caller that has a name
-    /// to be refused under. A handle with no application name of its own is let through instead,
-    /// and registers nothing: the claim is guarded on the row being unowned and the insert
-    /// declines on conflict, so the peer's row stands as it was. That branch is a shared one; see
-    /// UPSTREAM item 26 on `resolve_owning_application` for the writes where it is *not*
-    /// harmless.
+    /// `application_name` names the application the version belongs to; `None` means this handle's
+    /// own. A version already held by a *different* application is [`Error::RegisteredByAnother`]
+    /// rather than a silent takeover — for a caller that has a name to be refused under. A handle
+    /// with no application name of its own is let through instead, and registers nothing: the claim
+    /// is guarded on the row being unowned and the insert declines on conflict, so the peer's row
+    /// stands as it was. That branch is harmless here; on the writes that update an existing row it
+    /// is not — see [`upsert_queue`](Self::upsert_queue).
     async fn create_application_version(
         &self,
         version_name: &str,
@@ -1309,7 +1250,6 @@ pub trait SystemDatabase: Send + Sync {
     /// Takes no target, unlike the writes and the latest read around it: a listing is what *this*
     /// application has registered plus the unclaimed, and a caller wanting a peer's asks for the
     /// peer's latest.
-    /// Python and TypeScript draw the line in the same place.
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>, Error>;
 
     /// The version with the highest timestamp, or `None` if none are registered.
@@ -1320,10 +1260,9 @@ pub trait SystemDatabase: Send + Sync {
     /// row is not necessarily the current one.
     ///
     /// `None` rather than an error: an empty registry is what a database looks like before any
-    /// application has launched. This layer is alone in that — Python, Go and Java all raise,
-    /// because their callers ask only where a version must already exist. That is a caller's
-    /// invariant, not this layer's, and it matches [`get_workflow`](Self::get_workflow) returning
-    /// `None`.
+    /// application has launched. A caller that asks only where a version must already exist can
+    /// raise its own error; that is a caller's invariant, not this layer's, and it matches
+    /// [`get_workflow`](Self::get_workflow) returning `None`.
     ///
     /// `application_name` names whose latest to read; `None` means this handle's own. Naming a
     /// peer is what a schedule fire needs: a schedule carries its owner, and its runs are enqueued
@@ -1344,7 +1283,7 @@ pub trait SystemDatabase: Send + Sync {
     /// behind it would stamp a version that still sorts below an older one.
     ///
     /// The `+ 1` is what makes a promotion win over a version stamped ahead of the database's
-    /// clock, which an implementation that still stamps the promoter's clock can leave. Winning
+    /// clock, which a writer stamping its own clock rather than the database's can leave. Winning
     /// means carrying that stamp forward: the promoted version is then ahead of the clock too, and
     /// a version registered afterwards sorts below it until the clock passes it. A version stamped
     /// at `bigint`'s largest value is tied rather than passed.
@@ -1355,16 +1294,17 @@ pub trait SystemDatabase: Send + Sync {
     /// on. The write also claims an unclaimed row, which would otherwise stay every peer's latest.
     ///
     /// **That guard needs the caller to have a name.** A handle with no application name of its
-    /// own resolves to the row's holder and retimes it, a peer's included — the shared behaviour
-    /// UPSTREAM item 26 asks all five implementations to settle, and what a default-configured
-    /// client does today.
+    /// own resolves to the row's holder and retimes it, a peer's included, which is what a
+    /// default-configured client does today. Whether a nameless writer should be refused is an
+    /// open question shared with the other SDKs on the same database.
     ///
     /// **A name that matches nothing is `Ok`, not [`Error::NotRegistered`].** The write moves no
-    /// row and says so to nobody, so a misspelled rollback reports success; UPSTREAM item 2.
+    /// row and says so to nobody, so a misspelled rollback reports success. Whether it should be an
+    /// error is an open question shared with the other SDKs on the same database.
     ///
     /// There is no way to set a version's timestamp to an instant of the caller's choosing: no
-    /// caller in any implementation has one to give, and it would be a way to write a stamp ahead
-    /// of the database's clock, which this method can only carry forward, never start.
+    /// caller has one to give, and it would be a way to write a stamp ahead of the database's
+    /// clock, which this method can only carry forward, never start.
     async fn promote_application_version(
         &self,
         version_name: &str,
@@ -1386,8 +1326,8 @@ pub trait SystemDatabase: Send + Sync {
     /// ownership moves only by [`rename_application`](Self::rename_application).
     ///
     /// **A nameless caller is not refused, and [`OnExistingQueue::Update`] then replaces a peer's
-    /// stored limits** while leaving the owner column alone. Shared with every implementation, and
-    /// unresolved: UPSTREAM item 26 on `resolve_owning_application`.
+    /// stored limits** while leaving the owner column alone. Whether a nameless writer should be
+    /// refused is an open question shared with the other SDKs on the same database.
     async fn upsert_queue(
         &self,
         queue: &NewQueue<'_>,
@@ -1493,8 +1433,7 @@ pub trait SystemDatabase: Send + Sync {
     /// partition's head identically, and the `PENDING` gate admits at most one row per partition,
     /// so the limit is enforced by the data rather than by a count. Anything else a queue can
     /// carry has to be counted within each key, which is what walking the partitions one at a time
-    /// through [`start_queued_workflows`](Self::start_queued_workflows) is for. TypeScript splits
-    /// the same two ways, on the same four conditions.
+    /// through [`start_queued_workflows`](Self::start_queued_workflows) is for.
     ///
     /// `partition_worker_concurrency` is deliberately not among them: it is at least 1, and a
     /// partition already capped at one workflow across the whole fleet cannot exceed one in any
@@ -1533,9 +1472,8 @@ pub trait SystemDatabase: Send + Sync {
     /// **Read, check and write in one transaction**, which is what `validate` is for. The row is
     /// read under `FOR UPDATE`, the update is applied to it, the result is handed to `validate`,
     /// and the write lands before the lock is released — so a limit judged against a row that has
-    /// since moved cannot be stored. Go manages the same thing with the `mutate` callback its
-    /// `UpdateQueueConfig` takes; Python and TypeScript read and write separately, and two
-    /// operators changing different limits at once can leave a pair neither asked for.
+    /// since moved cannot be stored. Reading and writing separately would let two operators
+    /// changing different limits at once leave a pair neither asked for.
     ///
     /// **The transaction does not leave this layer.** `validate` is handed the row as stored and
     /// the row as the update would leave it, and says yes or no; it does no I/O of its own and
@@ -1550,9 +1488,8 @@ pub trait SystemDatabase: Send + Sync {
     /// caller is expected to recognise its own refusal coming back.
     ///
     /// An update naming nothing writes nothing, `updated_at` included, and is not validated: the
-    /// stored row stands unexamined, which is what both references do rather than treating an
-    /// empty update as an error. A caller assembling one from optional inputs should not have to
-    /// check whether any survived.
+    /// stored row stands unexamined, rather than an empty update being treated as an error. A
+    /// caller assembling one from optional inputs should not have to check whether any survived.
     ///
     /// [`Error::NotRegistered`] if the name matches nothing, like
     /// [`update_schedule`](Self::update_schedule) — the row has to be read to check against it, so
@@ -1587,10 +1524,9 @@ pub trait SystemDatabase: Send + Sync {
     /// through to [`Debounce::Held`] instead, which describes the holder well enough for a caller
     /// to tell a collision from a coincidence.
     ///
-    /// TODO(dbos-team): UPSTREAM item 11. No reference keys a debounce on all three parts of a
-    /// workflow's identity — TypeScript matches name and class, Python the name alone — so there a
-    /// bounce for one configured instance can extend another's workflow and replace its inputs.
-    /// This implementation matches all three.
+    /// Which parts of a workflow's identity a debounce key is scoped to is an open question shared
+    /// with the other SDKs on the same database. A writer that matches on fewer of them can extend
+    /// a workflow this one would treat as another's, and replace its inputs.
     ///
     /// [`DebounceRequest::application_name`] is the application the bounce acts *for*; `None` means
     /// this handle's own. Only that application's holders and unclaimed ones are extended, and an
@@ -1599,11 +1535,9 @@ pub trait SystemDatabase: Send + Sync {
     /// runs as, when a workflow is doing the bouncing. Given one, the bounce and its step
     /// checkpoint **commit together**: a crash can never leave one without the other, which on
     /// recovery would bounce work that had already been bounced. A replay returns what the first
-    /// run decided rather than bouncing again.
-    ///
-    /// Python and TypeScript get that atomicity by passing a database connection down from
-    /// `call_txn_as_step`. This layer names no driver type, so it takes the step instead and owns
-    /// the transaction — the same shape as [`send_messages`](Self::send_messages).
+    /// run decided rather than bouncing again. This layer names no driver type, so it takes the
+    /// step rather than a connection and owns the transaction — the same shape as
+    /// [`send_messages`](Self::send_messages).
     async fn debounce_delayed_workflow(
         &self,
         request: &DebounceRequest<'_>,
@@ -1614,10 +1548,9 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// The caller for this is an enqueue that **lost a race and wants to adopt the winner**:
     /// submitting under a key another workflow holds fails on the unique index, and a
-    /// return-the-existing-one policy then asks who won and reports that id instead of erroring
-    /// (`client.ts`, `Debouncer.java`). `None` means the holder finished between the conflict and
-    /// this read — the key is free again and the caller should retry the insert rather than treat
-    /// it as an error.
+    /// return-the-existing-one policy then asks who won and reports that id instead of erroring.
+    /// `None` means the holder finished between the conflict and this read — the key is free again
+    /// and the caller should retry the insert rather than treat it as an error.
     ///
     /// Narrow on purpose: the id alone. A bounce needs to know far more about the holder, but it
     /// reads that for itself — see [`types::Debounce::Held`].
@@ -1636,10 +1569,10 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// Only the registration. Workflows already enqueued keep their `queue_name`.
     ///
-    /// Whether anything still dequeues them depends on the layer above: an implementation that
-    /// also keeps queues declared in code carries on polling one it declared, while this crate's
-    /// engine builds its worker set from these rows alone, so deleting the row strands the backlog
-    /// until the queue is registered again.
+    /// Whether anything still dequeues them depends on the layer above: one that also kept queues
+    /// declared in code would carry on polling one it declared, but this crate's engine builds its
+    /// worker set from these rows alone, so deleting the row strands the backlog until the queue is
+    /// registered again.
     async fn delete_queue(&self, name: &str) -> Result<(), Error>;
 
     /// Registers a schedule, failing if the name is taken.
@@ -1649,18 +1582,16 @@ pub trait SystemDatabase: Send + Sync {
     /// `schedule_name` is unique across every application sharing the database. A caller with no
     /// application name of its own gets the first of those for a peer's row rather than the
     /// second, because nothing refuses it and the unique index is what stops the insert; nothing
-    /// is overwritten either way. UPSTREAM item 26.
+    /// is overwritten either way.
     ///
-    /// The cron expression is stored, not parsed. Java validates it here and the other three do
-    /// not; validating belongs with the scheduler that has to interpret it, not with the layer
-    /// that only persists it.
+    /// The cron expression is stored, not parsed: validating belongs with the scheduler that has to
+    /// interpret it, not with the layer that only persists it.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
-    /// decided rather than doing it again. TypeScript and Python get that atomicity by passing a
-    /// database connection down from their step wrapper (`runTransactionalInternalStep`,
-    /// `dbos.ts`); this layer names no driver type, so it takes the step instead and owns the
-    /// transaction — the same shape as [`send_messages`](Self::send_messages) and
+    /// decided rather than doing it again. This layer names no driver type, so it takes the step
+    /// rather than a connection and owns the transaction — the same shape as
+    /// [`send_messages`](Self::send_messages) and
     /// [`debounce_delayed_workflow`](Self::debounce_delayed_workflow).
     async fn create_schedule(
         &self,
@@ -1677,16 +1608,12 @@ pub trait SystemDatabase: Send + Sync {
     ///
     /// An unclaimed row is claimed in the same statement, and a peer's is
     /// [`Error::RegisteredByAnother`] — again only for a caller that has a name. A nameless one
-    /// replaces the peer's definition instead, which is UPSTREAM item 26.
+    /// replaces the peer's definition instead; whether it should be refused is an open question
+    /// shared with the other SDKs on the same database.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it, with the same
-    /// meaning it has on [`create_schedule`](Self::create_schedule) — but on weaker precedent. **No
-    /// reference runs this as a step.** TypeScript has no counterpart at all: its upsert is inlined
-    /// in `applySchedules`, which takes no connection. Python's `upsert_schedule` (`_sys_db.py`)
-    /// does take one, but only ever from `apply_schedules`, which is a plain transaction rather
-    /// than a step. The parameter is here because the signature is Python's and a schedule
-    /// registered from inside a workflow wants the same atomicity its siblings get, not because a
-    /// reference does it.
+    /// meaning it has on [`create_schedule`](Self::create_schedule): a schedule registered from
+    /// inside a workflow wants the same atomicity its siblings get.
     async fn upsert_schedule(
         &self,
         schedule: &NewSchedule<'_>,
@@ -1702,15 +1629,10 @@ pub trait SystemDatabase: Send + Sync {
     /// **Runtime state is taken at face value**, not refused and not normalised: a `status` or
     /// `last_fired_at` seeds a fresh row and is dropped by the conflict clause on an existing one,
     /// so re-applying cannot resume a schedule an operator paused. Whether a *declaration* should
-    /// carry either is a question for whoever builds one — the references never ask it here,
-    /// because their public `applySchedules` takes a type with no such fields and the layer above
-    /// hardcodes both. Java normalises at this layer instead, forcing `ACTIVE` and a null
-    /// `lastFiredAt` onto every entry.
+    /// carry either is a question for whoever builds one, not for the layer that stores it.
     ///
     /// **No step, unlike its siblings.** This is a startup call, made before the process runs any
-    /// workflow, and TypeScript's takes no connection and is not step-wrapped either. Python has no
-    /// method here at all — its `apply_schedules` is a loop over
-    /// [`upsert_schedule`](Self::upsert_schedule) one layer up (`_dbos.py`).
+    /// workflow.
     async fn apply_schedules(&self, schedules: &[NewSchedule<'_>]) -> Result<(), Error>;
 
     /// Reads one schedule, or `None` if there is no such name.
@@ -1749,8 +1671,7 @@ pub trait SystemDatabase: Send + Sync {
     /// Changes a registered schedule's definition.
     ///
     /// [`Error::NotRegistered`] if the name matches nothing, including when the update itself is
-    /// empty — a typo should not read as success. TypeScript is explicit about both; the other
-    /// three have no such method.
+    /// empty — a typo should not read as success.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
@@ -1765,25 +1686,21 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Pauses or resumes a schedule.
     ///
-    /// One method rather than the pair Python and Java expose, which are their two calls to
-    /// exactly this — TypeScript already collapses it the same way.
+    /// One method for both directions: pausing and resuming are the same write with a different
+    /// status.
     ///
-    /// [`Error::NotRegistered`] if the name matches nothing. **All four implementations are
-    /// silent here**, so pausing a schedule that does not exist reads as success in every one of
-    /// them. Raising is the recoverable direction: a layer above can swallow an error it does not
-    /// want, and no layer above can manufacture one this layer never raised.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 12. Nothing but TypeScript's `updateSchedule` checks the
-    /// row count, so a misspelled schedule name reports success, which an operator cannot tell
-    /// from a schedule that is now paused.
+    /// [`Error::NotRegistered`] if the name matches nothing, so a misspelled name does not report
+    /// a success an operator cannot tell from a schedule that is now paused. Raising is the
+    /// recoverable direction: a layer above can swallow an error it does not want, and no layer
+    /// above can manufacture one this layer never raised.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
     /// decided rather than doing it again — see [`create_schedule`](Self::create_schedule) for
     /// the shape.
     ///
-    /// Pausing and resuming record **different step names**, as they are different calls in the
-    /// references, so a replay of one is never mistaken for the other.
+    /// Pausing and resuming record **different step names**, so a replay of one is never mistaken
+    /// for the other.
     async fn set_schedule_status(
         &self,
         name: &str,
@@ -1798,23 +1715,20 @@ pub trait SystemDatabase: Send + Sync {
     /// races an operator's delete, and a schedule removed between firing and this write is a
     /// benign outcome rather than an error the loop has to absorb.
     ///
-    /// The column is **text, not epoch milliseconds** — the one time column in the schema that
-    /// is — so this takes an instant and formats it, rather than taking a string and trusting the
-    /// caller to have picked a spelling the others read. Each implementation picked a different
-    /// one: Python `datetime.isoformat()`, TypeScript `Date.toISOString()`, Go `RFC3339Nano`,
-    /// Java `Instant.toString()`. [`Timestamp::to_iso8601`](types::Timestamp::to_iso8601) writes
-    /// TypeScript's, the only fixed-width one of the four.
+    /// The column is **text, not epoch milliseconds** — the one time column in the schema that is —
+    /// so this takes an instant and formats it, rather than taking a string and trusting the caller
+    /// to have picked a spelling the others read. The SDKs sharing the database each write their
+    /// own ISO 8601 spelling; [`Timestamp::to_iso8601`](types::Timestamp::to_iso8601) writes UTC
+    /// as RFC 3339, with a bare `Z` and a fraction only when there is one, trailing zeros trimmed.
     ///
     /// [`ScheduleRecord::last_fired_at`](types::ScheduleRecord::last_fired_at) is an instant too,
     /// read through [`Timestamp::parse_iso8601`](types::Timestamp::parse_iso8601), which accepts
-    /// all four spellings. A stored value that is not an instant at all is
+    /// every one of those spellings. A stored value that is not an instant at all is
     /// [`Error::Malformed`] rather than silently a schedule that never fired — the same treatment
-    /// an unrecognised status gets, since both mean the row holds something this build cannot
-    /// read.
+    /// an unrecognised status gets, since both mean the row holds something this build cannot read.
     ///
     /// **No step, unlike its siblings**, and for the same reason it is silent about a missing row:
     /// the scheduler loop writes this after every firing, and a loop is not a workflow step.
-    /// Neither TypeScript nor Python takes a connection here.
     ///
     /// **An unconditional write by name**, which leaves two races open. A loop still running for a
     /// schedule that was deleted and created again under the same name writes the new schedule's
@@ -1833,8 +1747,8 @@ pub trait SystemDatabase: Send + Sync {
 
     /// Removes a schedule from the registry.
     ///
-    /// Silent if the name matches nothing, as all four implementations are. Workflows the
-    /// schedule already fired are ordinary workflows and are untouched.
+    /// Silent if the name matches nothing. Workflows the schedule already fired are ordinary
+    /// workflows and are untouched.
     ///
     /// `caller` names the workflow step this runs as, when a workflow is doing it. Given one, the
     /// write and its step checkpoint **commit together**, and a replay returns what the first run
@@ -1880,8 +1794,7 @@ pub trait SystemDatabase: Send + Sync {
     /// compares the **child id**, since the timestamp here spans only the launch and a retry
     /// would stamp a new one — while the child id it is recording is necessarily the same. A
     /// *different* child at the same position is nondeterminism in the parent, and is reported
-    /// as [`Error::StepNondeterminism`]. Python splits the two for exactly this reason; Java
-    /// reaches it by passing null timestamps and skipping the comparison.
+    /// as [`Error::StepNondeterminism`].
     async fn record_child_workflow(
         &self,
         parent_workflow_id: &str,

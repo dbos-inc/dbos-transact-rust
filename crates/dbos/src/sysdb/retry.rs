@@ -1,10 +1,7 @@
 //! Retrying system database operations that failed for reasons that may pass.
 //!
-//! Every implementation wraps its sysdb calls in this: Python a `@db_retry` decorator on each
-//! sysdb method, Java a `dbRetry(...)` call on each, Go a `Retry` helper on every statement. The
-//! bargain is stated most plainly in Python's docstring — if DBOS loses its database connection,
-//! *everything pauses until the connection is recovered, trading off availability for
-//! correctness*.
+//! Every sysdb call is wrapped in this. The bargain: if DBOS loses its database connection,
+//! everything pauses until the connection is recovered, trading availability for correctness.
 //!
 //! That trade is the point. A workflow engine whose durable state is briefly unreachable has
 //! two choices: block, or report a failure that the caller will treat as a real outcome and act
@@ -29,8 +26,8 @@
 //!
 //! Anything that identifies *this* attempt. The retried region runs more than once, so a value
 //! generated inside it differs between runs — and if a commit acknowledgement was lost, the
-//! second run will not recognise the first run's write. Java's comment on the owner identity is
-//! exactly this: "generated outside of the DB retry loop, in case commit acks get lost".
+//! second run will not recognise the first run's write. An owner identity, for instance, is
+//! generated outside the retry loop, in case the commit acknowledgement gets lost.
 
 use std::future::Future;
 use std::time::Duration;
@@ -51,10 +48,9 @@ pub struct RetryPolicy {
     pub max_backoff: Duration,
     /// Whether to block on connection failures rather than reporting them.
     ///
-    /// `true` is the trade described above. Setting it `false` opts out — Python exposes the
-    /// same switch as `retry_connection_errors=False` — and suits a caller that would rather
-    /// handle the failure itself than wait. It does not affect conflicts, which have a switch of
-    /// their own.
+    /// `true` is the trade described above. Setting it `false` opts out, and suits a caller that
+    /// would rather handle the failure itself than wait. It does not affect conflicts, which have a
+    /// switch of their own.
     pub retry_connection_errors: bool,
     /// Whether to replay transaction conflicts rather than reporting them.
     ///
@@ -173,7 +169,7 @@ where
 /// Spreads the backoff over `[0.5, 1.5)` of its nominal value.
 ///
 /// Without this, every process that lost the same database comes back at the same instant and
-/// knocks it over again. Python and Java use this exact range; Go uses a much tighter one.
+/// knocks it over again.
 ///
 /// The randomness comes from a v4 UUID rather than a random-number generator, because `uuid` is
 /// already a dependency and drawing one number per retry does not justify another. Both reach

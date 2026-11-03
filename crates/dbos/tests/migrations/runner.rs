@@ -145,8 +145,9 @@ async fn tolerates_a_database_ahead_of_this_build() {
 ///
 /// The bar is the whole corpus, because everything in it is something some statement names. A
 /// peer that migrated to the version before this build's ceiling and stopped — which is what an
-/// implementation that has not ported the newest shared migration leaves behind — must be
-/// reported here, not discovered later as a missing column on whichever query touches it first.
+/// SDK on the same database that does not yet ship the newest shared migration leaves behind —
+/// must be reported here, not discovered later as a missing column on whichever query touches it
+/// first.
 #[tokio::test]
 async fn verify_refuses_a_database_short_of_the_ceiling() {
     let db = raw_database().await;
@@ -318,8 +319,8 @@ async fn sweeps_invalid_indexes_left_by_an_interrupted_build() {
 /// migration 10 actually exists for completely uncovered — the case of a database created by a
 /// version old enough to have missed it.
 ///
-/// Simulated the way Java's suite does: apply a migration 1 with the primary key stripped out,
-/// record version 1, then run everything and check the key arrives.
+/// Simulated by applying a migration 1 with the primary key stripped out, recording version 1, then
+/// running everything and checking the key arrives.
 #[tokio::test]
 async fn migration_ten_backfills_a_missing_primary_key() {
     let db = raw_database().await;
@@ -407,7 +408,7 @@ async fn migration_ten_backfills_a_missing_primary_key() {
 
 /// A failing migration leaves the recorded version where it was.
 ///
-/// The version is what every implementation reads to decide what is left to do, so advancing
+/// The version is what every SDK on the database reads to decide what is left to do, so advancing
 /// it past work that did not happen would strand the database: the failed migration would
 /// never be retried, by this process or any other.
 #[tokio::test]

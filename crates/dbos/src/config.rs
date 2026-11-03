@@ -47,22 +47,21 @@ pub struct Config {
     ///
     /// Resolved like [`app_version`](Self::app_version) and with the same precedence: this wins
     /// over [`EXECUTOR_ID_ENV`](crate::EXECUTOR_ID_ENV) off DBOS Cloud and loses to it on, and
-    /// when neither says anything the executor is `"local"` — the default every implementation
-    /// shares.
+    /// when neither says anything the executor is `"local"`, the id other SDKs sharing the
+    /// database also default to.
     pub executor_id: Option<String>,
 
     /// The version of the application's code.
     ///
-    /// **Nothing computes one.** The other implementations fall back to a hash of the
-    /// application's code, and that is the mistake this does not repeat: in Rust the only thing to
-    /// hash is the executable, and a Rust build is not reproducible, so the version would move
-    /// under a rebuild that changed nothing — stranding the previous run's `PENDING` rows with an
-    /// executor that no longer exists, after hashing tens of megabytes at every launch to get
-    /// there. A version has to come from somewhere, so [`launch`](crate::DBOS::launch) fails when
-    /// neither this nor `DBOS__APPVERSION` gives it one.
+    /// **Nothing computes one.** Falling back to a hash of the application's code does not work
+    /// here: in Rust the only thing to hash is the executable, and a Rust build is not
+    /// reproducible, so the version would move under a rebuild that changed nothing — stranding the
+    /// previous run's `PENDING` rows with an executor that no longer exists, after hashing tens of
+    /// megabytes at every launch to get there. A version has to come from somewhere, so
+    /// [`launch`](crate::DBOS::launch) fails when neither this nor `DBOS__APPVERSION` gives it one.
     ///
     /// `None` here therefore means "whatever the environment says", not "work it out". The
-    /// precedence is Java's, resolved at launch: this wins over
+    /// precedence is resolved at launch: this wins over
     /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV), except on DBOS Cloud
     /// ([`CLOUD_ENV`](crate::CLOUD_ENV)), where the deployment's variable wins over whatever the
     /// application was built believing.
@@ -96,9 +95,8 @@ pub struct Config {
 
     /// How often a caller waiting on a workflow it does not own asks whether it has finished.
     ///
-    /// `None` is one second, the interval every implementation polls at. Workflow completion has
-    /// no wakeup anywhere — no channel carries it and no trigger publishes it — so looking is the
-    /// only way to learn a status changed.
+    /// `None` is one second. Workflow completion has no wakeup anywhere — no channel carries it
+    /// and no trigger publishes it — so looking is the only way to learn a status changed.
     ///
     /// Zero is rejected rather than treated as "as fast as possible": it is a busy loop against
     /// the database, never something a caller means.
@@ -106,20 +104,17 @@ pub struct Config {
 
     /// Which queues this process dequeues from. `None` is all of them.
     ///
-    /// **Configuration rather than a runtime call.** Go takes a replace-the-set API, Python a
-    /// pre-launch call, TypeScript and Java configuration, and Rust follows the latter pair. The
-    /// supervisor intersects this with what it reads from the `queues` table on every sweep, so
-    /// the dynamic half — a queue registered later, or deleted — comes for free without a second
-    /// way to change the set.
+    /// **Configuration rather than a runtime call.** The supervisor intersects this with what it
+    /// reads from the `queues` table on every sweep, so the dynamic half — a queue registered
+    /// later, or deleted — comes for free without a second way to change the set.
     ///
     /// What it is for: splitting one application's queues across differently-shaped processes.
     /// A worker fleet sized for slow media jobs and one sized for fast API calls share a database
     /// and a code base, and neither should drain the other's backlog.
     ///
     /// `Some(vec![])` listens to **nothing**, and is not the same as `None`. It is a real setting
-    /// — a process that enqueues and never runs anything — and is the one place this differs from
-    /// Go, whose empty set means "all". An empty *slice* is unambiguous in Rust where a nil-versus-
-    /// empty distinction in Go is a trap, so the option carries the meaning instead.
+    /// — a process that enqueues and never runs anything. An empty list never means "all": the
+    /// option carries that meaning, so the two cannot be confused.
     ///
     /// [`INTERNAL_QUEUE`](crate::sysdb::INTERNAL_QUEUE) is always dequeued from, whatever this
     /// says. It is where `resume`, `fork` and recovery put work, so filtering it out would strand
@@ -128,9 +123,9 @@ pub struct Config {
 
     /// How long a written key waits for company before a wakeup is pushed for it.
     ///
-    /// `None` is ten milliseconds, as in Python, TypeScript and Go. `Some(Duration::ZERO)` is
-    /// meaningful and *not* rejected — it turns coalescing off, which is a push per write. That is
-    /// the one duration here where zero is a setting rather than a mistake.
+    /// `None` is ten milliseconds. `Some(Duration::ZERO)` is meaningful and *not* rejected — it
+    /// turns coalescing off, which is a push per write. That is the one duration here where zero
+    /// is a setting rather than a mistake.
     pub notification_coalesce: Option<Duration>,
 
     /// How long a system-database connection may sit idle inside an open transaction before the
@@ -149,8 +144,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// A configuration with the defaults every implementation shares, for an application named
-    /// `app_name`, reaching the database at `database_url`.
+    /// A configuration with the defaults, for an application named `app_name`, reaching the
+    /// database at `database_url`.
     ///
     /// Leaves [`app_version`](Self::app_version) unset, which means launch takes it from
     /// `DBOS__APPVERSION` and fails if that is unset too.
@@ -179,8 +174,8 @@ impl Config {
     /// That variable and no other. The identity variables — `DBOS__APPVERSION`, `DBOS__VMID`,
     /// `DBOS__CLOUD` and `DBOS__APPID` — carry two underscores because they are DBOS Cloud's to
     /// set, and `DBOS_APP_NAME` is a deployment's too; an end user *may* set them, but a
-    /// configuration is not the layer that reads them. Launch is, as in Java, so that a `Config`
-    /// written by hand and one from here resolve to the same identity.
+    /// configuration is not the layer that reads them. Launch is, so that a `Config` written by
+    /// hand and one from here resolve to the same identity.
     ///
     /// A missing or empty `DBOS_SYSTEM_DATABASE_URL` leaves [`database_url`](Self::database_url)
     /// empty rather than failing here, so that a caller who sets it afterwards is not forced
@@ -247,7 +242,7 @@ impl Config {
 /// How often the scheduler re-reads the schedules table when nothing else is configured.
 pub(crate) const DEFAULT_SCHEDULER_POLLING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The interval every implementation polls a workflow's outcome at.
+/// How often a workflow's outcome is polled when nothing else is configured.
 pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
@@ -276,7 +271,7 @@ mod tests {
         assert_eq!(
             config(None).outcome_poll_interval(),
             Duration::from_secs(1),
-            "the interval every implementation polls at"
+            "the default polling interval"
         );
         assert_eq!(
             config(Some(Duration::from_millis(250))).outcome_poll_interval(),

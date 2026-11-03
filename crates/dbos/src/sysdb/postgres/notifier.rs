@@ -13,9 +13,8 @@
 //! rather than waiting out an interval — and a reader in *this* process hears with no round trip at
 //! all, since [`signal`](Notifier::signal) wakes the local registry directly.
 //!
-//! All four references do this, and agree on the shape: a per-channel set of payloads, a loop that
-//! flushes it on a ~10ms cadence, one `pg_notify` statement per channel per flush, and a failed
-//! batch dropped rather than retried.
+//! The shape: a per-channel set of payloads, a loop that flushes it on a ~10ms cadence, one
+//! `pg_notify` statement per channel per flush, and a failed batch dropped rather than retried.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -31,27 +30,23 @@ use crate::sysdb::notify::{Registry, key_for};
 /// **The whole point is that it is not zero.** A push per write would be one notifying transaction
 /// per write, which is exactly the cost a database trigger has; ten milliseconds
 /// of latency turns a burst of writes into one statement, and bounds the rate of notifying commits
-/// however fast the application writes. Ten is Go's `DefaultNotificationCoalesceInterval`,
-/// Python's `notification_coalesce_sec`, TypeScript's `DEFAULT_NOTIFICATION_COALESCE_MS` and
-/// Java's flush period.
+/// however fast the application writes.
 ///
 /// The default rather than the value:
-/// [`Settings::notification_coalesce`](super::Settings::notification_coalesce) overrides it, as the
-/// same setting does in all four.
+/// [`Settings::notification_coalesce`](super::Settings::notification_coalesce) overrides it.
 pub(crate) const COALESCE_INTERVAL: Duration = Duration::from_millis(10);
 
 /// One statement per channel per flush, however many payloads the batch holds.
 ///
 /// `unnest` is what makes that possible: the SQL text is the same for one payload and a thousand,
 /// so the server can reuse the plan, and one round trip takes the async-notify queue lock once.
-/// This is the one statement all four references share character for character.
 const PUSH_BATCH: &str = "SELECT pg_notify($1, p) FROM unnest($2::text[]) AS p";
 
 /// What this process has written and not yet told anyone else about.
 ///
 /// One set per channel, so a batch that cannot be sent takes only its own channel down with it —
 /// and a set rather than a list, because repeated writes to one key between flushes are one thing
-/// to look at, not one each. Python, TypeScript, Go and Java all collapse duplicates the same way.
+/// to look at, not one each.
 type Pending = HashMap<&'static str, HashSet<String>>;
 
 /// The outbound half of the wakeup path.
@@ -114,17 +109,16 @@ impl Notifier {
     ///
     /// **Call it after the transaction commits**, never before: a waiter woken by this looks at the
     /// database, and one that looks before the row is visible finds nothing and goes back to sleep
-    /// until its own interval comes round — which is the stall the wakeup existed to prevent. Go
-    /// and Java both say the same thing on their equivalents.
+    /// until its own interval comes round — which is the stall the wakeup existed to prevent.
     ///
     /// Waiters here are woken immediately and with no round trip, whether or not anything is being
-    /// pushed. That is Go's behaviour and not Python's or TypeScript's, whose local waiters hear
-    /// their own process's writes back off the wire; it costs nothing, and it is what makes a
-    /// same-process write visible promptly on CockroachDB, where there is no wire.
+    /// pushed, rather than hearing their own process's writes back off the wire. It costs
+    /// nothing, and it is what makes a same-process write visible promptly on CockroachDB, where
+    /// there is no wire.
     pub(crate) fn signal(&self, channel: &'static str, workflow_id: &str, key: &str) {
-        // The wire form, exactly as migration 1's trigger builds it and as every other SDK sends
-        // it: `id::key`, with neither half escaped. See [`crate::sysdb::notify`] on why nothing
-        // splits it.
+        // The wire form, exactly as migration 1's trigger builds it and as the other SDKs sharing
+        // the database send it: `id::key`, with neither half escaped. See [`crate::sysdb::notify`]
+        // on why nothing splits it.
         let payload = format!("{workflow_id}::{key}");
         let Some(registry_key) = key_for(channel, &payload) else {
             // Unreachable: the callers pass channel constants. A channel nobody listens on has no
@@ -153,11 +147,10 @@ impl Notifier {
 
     /// Flushes what has been signalled, until [`stop`](Self::stop), then once more.
     ///
-    /// **Idle costs nothing.** The references all tick — Go a 10ms `Ticker`, Python a `sleep` loop,
-    /// Java a fixed-delay schedule — which wakes a hundred times a second in a process that may
-    /// never write an event at all. Waiting for the first payload and *then* opening the window
-    /// coalesces exactly the same writes, since the window is measured from the first signal
-    /// either way.
+    /// **Idle costs nothing.** A loop that ticks every 10ms wakes a hundred times a second in a
+    /// process that may never write an event at all. Waiting for the first payload and *then*
+    /// opening the window coalesces exactly the same writes, since the window is measured from
+    /// the first signal either way.
     pub(crate) async fn run(self: std::sync::Arc<Self>) {
         while !self.stopping.load(Ordering::Relaxed) {
             // Idle until a payload opens a batch, or the handle closes. One `Notify` carries both
@@ -177,8 +170,7 @@ impl Notifier {
             self.flush().await;
         }
         // Whatever the window was still holding, so a value written just before a shutdown wakes
-        // readers elsewhere rather than leaving them to their interval. Every reference makes the
-        // same last flush.
+        // readers elsewhere rather than leaving them to their interval.
         self.flush().await;
         tracing::debug!("the notifier stopped");
     }
@@ -211,15 +203,14 @@ impl Notifier {
                 .execute(&self.pool)
                 .await;
             if let Err(e) = sent {
-                // **Dropped, never requeued**, which all four references are explicit about: a
-                // payload the database will not take — one over `pg_notify`'s 8000-byte limit, say
-                // — would otherwise be retried forever and stall every later batch behind it. What
-                // is lost is an interval of latency for whoever was waiting, not the value.
+                // **Dropped, never requeued**: a payload the database will not take — one over
+                // `pg_notify`'s 8000-byte limit, say — would otherwise be retried forever and stall
+                // every later batch behind it. What is lost is an interval of latency for whoever
+                // was waiting, not the value.
                 //
                 // Not retried through [`with_retry`](crate::sysdb::retry::with_retry) either, for
                 // the same reason: it has no attempt limit, so a channel that cannot be pushed
-                // would hold the loop rather than the queue. Python, TypeScript and Java do not
-                // retry; Go does, for errors its dialect calls transient, with no attempt limit.
+                // would hold the loop rather than the queue.
                 tracing::warn!(
                     channel,
                     count = payloads.len(),

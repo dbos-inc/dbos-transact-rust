@@ -175,10 +175,10 @@ async fn late_migrations_take_effect() {
 
 /// The shared series lands on every table it names.
 ///
-/// Separate from the check above because these migrations are not this implementation's own:
-/// versions from 100 up mean the same DDL in Python and TypeScript, and the whole point of the
-/// padding is that they arrive at those numbers. A database migrated by Rust and then opened by
-/// another implementation must find the columns already there rather than try to add them again.
+/// Separate from the check above because these migrations are not this SDK's own: versions from
+/// 100 up mean the same DDL in every SDK sharing the database, and the whole point of the padding
+/// is that they arrive at those numbers. A database migrated by Rust and then opened by another SDK
+/// must find the columns already there rather than try to add them again.
 #[tokio::test]
 async fn the_shared_series_adds_application_name_everywhere() {
     let db = raw_database().await;

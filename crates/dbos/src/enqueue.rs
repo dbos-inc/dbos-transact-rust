@@ -48,7 +48,7 @@ use crate::{Client, DBOS, Executor, QualifiedWorkflowName};
 /// };
 /// ```
 ///
-/// **Flat, as Python's and Java's `EnqueueOptions` are.** What to ask of the queue — a
+/// **Flat.** What to ask of the queue — a
 /// deduplication id, a priority, a partition key, a delay — sits beside everything else, so an
 /// enqueue by name is one type. A [`start`](crate::WorkflowRef::start_with) says the same things
 /// in a [`QueueRequest`], under [`StartOptions::queue`](crate::StartOptions::queue), because there
@@ -56,8 +56,7 @@ use crate::{Client, DBOS, Executor, QualifiedWorkflowName};
 /// the two spell each setting the same way, and are checked by the same rules.
 #[derive(Debug, Clone)]
 pub struct EnqueueOptions<'a> {
-    /// The queue to leave the workflow on, by name. `queue_name`, as Python's and Java's
-    /// `EnqueueOptions` call it; [`QueueRequest::name`] in a start.
+    /// The queue to leave the workflow on, by name; [`QueueRequest::name`] in a start.
     pub queue_name: &'a str,
 
     /// A key no two waiting workflows on this queue may share. See
@@ -150,7 +149,7 @@ pub struct EnqueueOptions<'a> {
     ///
     /// Searchable metadata: a tenant, a request id, a trace context. Plain JSON, never the
     /// configured [`Serializer`](crate::Serializer) — the column is read by containment and by
-    /// every other implementation, so a workflow's own payload encoding has no say in it.
+    /// the other SDKs sharing the database, so a workflow's own payload encoding has no say in it.
     pub attributes: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -268,9 +267,8 @@ impl Client {
     ///
     /// The type parameters are the caller's assertion, not a checked fact: there is no registry
     /// here to look the name up in, so `R` is what the caller knows the workflow returns and a
-    /// mismatch surfaces when the result is decoded. That is the trade every implementation's
-    /// client makes — Java calls its return `WorkflowHandle<T, E>` on the same terms — and it is
-    /// the price of naming code this process does not have.
+    /// mismatch surfaces when the result is decoded. That is the price of naming code this process
+    /// does not have.
     ///
     /// **Called from inside a workflow body this is not a checkpoint**, unlike
     /// [`DBOS::enqueue`], which records the launch against the parent and re-derives the same

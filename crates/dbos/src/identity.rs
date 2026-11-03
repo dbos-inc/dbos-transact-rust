@@ -1,10 +1,10 @@
 //! Who this executor is: what the configuration says, and what the deployment says.
 //!
 //! One place resolves the application name, the application version and the executor id, because
-//! the three answer to the same rule and the rule is not obvious. It is Java's
-//! `DBOSExecutor` constructor, ported: the environment is read first, the configuration overrides
-//! it, and on DBOS Cloud the override does not happen — the deployment outranks the build there,
-//! since the application was built without knowing which deployment would run it.
+//! the three answer to the same rule and the rule is not obvious: the environment is read first,
+//! the configuration overrides it, and on DBOS Cloud the override does not happen — the deployment
+//! outranks the build there, since the application was built without knowing which deployment would
+//! run it.
 //!
 //! Resolution happens at launch rather than while a [`Config`] is being built, so that a
 //! configuration written by hand and one from [`Config::from_env`] arrive at the same identity.
@@ -15,8 +15,7 @@
 //! only `DBOS_SYSTEM_DATABASE_URL`. The `DBOS__` spelling marks them as DBOS Cloud's to set — an
 //! end user may, but the layer that reads them is this one.
 //!
-//! The one departure from Java is the version. Java hashes the application's code when nothing
-//! supplies one; nothing here does, and a missing version is an error — see
+//! Nothing computes a version when none is supplied; a missing version is an error — see
 //! [`Config::app_version`].
 
 use crate::config::Config;
@@ -24,13 +23,12 @@ use crate::{Error, Result};
 
 /// Environment variable carrying the application version.
 ///
-/// Two underscores, matching Python, TypeScript, Go and Java — the odd spelling is a cross-SDK
-/// constant, not a typo to tidy.
+/// Two underscores — the odd spelling is a constant shared by every DBOS SDK, not a typo to tidy.
 pub const APP_VERSION_ENV: &str = "DBOS__APPVERSION";
 
 /// Environment variable saying this process is running on DBOS Cloud.
 ///
-/// Read as Java reads it — `Boolean.parseBoolean`, so a case-insensitive `true` and nothing else.
+/// A case-insensitive `true`, and nothing else.
 /// It decides which side of every identity question wins: on DBOS Cloud the deployment is the
 /// authority, and off it the application is.
 pub const CLOUD_ENV: &str = "DBOS__CLOUD";
@@ -52,7 +50,7 @@ pub const CLOUD_APP_NAME_ENV: &str = "DBOS_APP_NAME";
 /// A deployment's way of naming an executor, and what [`Config::executor_id`] falls back to.
 pub const EXECUTOR_ID_ENV: &str = "DBOS__VMID";
 
-/// The default every implementation shares for a process nothing named.
+/// The executor id for a process nothing named, shared with the other SDKs.
 const DEFAULT_EXECUTOR_ID: &str = "local";
 
 /// What the environment says about this process.
@@ -79,13 +77,10 @@ impl Environment {
     /// Reads the environment this process was started with.
     pub(crate) fn read() -> Self {
         // An empty variable is an unset one throughout: a deployment that exports a name it has
-        // not filled in yet means "nothing". Java reaches the same conclusion for the app name by
-        // a longer route, rejecting an empty one after the fact, but keeps an empty `DBOS__VMID`
-        // as `""` rather than falling back the way this does.
+        // not filled in yet means "nothing", so an empty `DBOS__VMID` falls back to the default.
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         Self {
-            // `Boolean.parseBoolean` in Java: a case-insensitive `true`, and anything else —
-            // `1`, `yes`, a typo — is false.
+            // A case-insensitive `true`, and anything else — `1`, `yes`, a typo — is false.
             cloud: std::env::var(CLOUD_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("true")),
             app_id: var(APP_ID_ENV).unwrap_or_default(),
             app_name: var(CLOUD_APP_NAME_ENV),
@@ -138,7 +133,6 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
     }
     validate_app_name(&app_name)?;
 
-    // Where Java would hash the application's code.
     let Some(app_version) = app_version else {
         return Err(Error::Config(format!(
             "no application version: set `app_version`, or the {APP_VERSION_ENV} environment \
@@ -156,8 +150,8 @@ pub(crate) fn resolve(config: &Config, env: &Environment) -> Result<Identity> {
     })
 }
 
-/// The rule the other implementations share: 3–256 characters of lowercase letters, digits, dashes
-/// and underscores.
+/// The rule shared with the other SDKs: 3–256 characters of lowercase letters, digits, dashes and
+/// underscores.
 ///
 /// Checked rather than trusted because the name is an ownership key: a row stamped with a name no
 /// other executor spells the same way is a row nothing claims.
@@ -284,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn an_app_name_is_held_to_the_rule_every_implementation_shares() {
+    fn an_app_name_is_held_to_the_shared_rule() {
         for ok in ["abc", "my-app", "my_app_2", &"a".repeat(256)] {
             assert!(validate_app_name(ok).is_ok(), "{ok:?} should be accepted");
         }

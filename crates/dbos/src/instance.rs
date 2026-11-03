@@ -189,8 +189,8 @@ impl Executor {
     ///
     /// **`app_` here, `application_` in the rows `sysdb` writes**, and the two meet at exactly
     /// this call: the API names the pair [`app_name`](Self::app_name) and `app_version`, matching
-    /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV) and the `DBOS__APPVERSION` every
-    /// implementation reads — and so do the `sysdb` types the API hands back, such as
+    /// [`APP_VERSION_ENV`](crate::APP_VERSION_ENV) and the `DBOS__APPVERSION` every DBOS SDK
+    /// reads — and so do the `sysdb` types the API hands back, such as
     /// [`WorkflowRecord`](crate::sysdb::types::WorkflowRecord) — while the `sysdb` types only the
     /// engine writes spell them `application_name` and `application_version` because those are
     /// the columns' own names. The conversion happens where a value crosses into such a type —
@@ -450,8 +450,7 @@ impl DBOS {
     /// Connects to the system database, migrates it, registers this application version, and starts
     /// the executor.
     ///
-    /// **Idempotent**: launching an already-launched instance warns and returns, which is what
-    /// Python does (`_launch`) and what Java's compare-and-set amounts to. It is not an error
+    /// **Idempotent**: launching an already-launched instance warns and returns. It is not an error
     /// because the common cause is two entry points both being defensive, and failing there would
     /// punish the caller who did nothing wrong.
     pub async fn launch(&self) -> Result<()> {
@@ -518,7 +517,7 @@ impl DBOS {
     /// later executor to recover from its last checkpoint. To let running workflows finish first,
     /// give [`ShutdownOptions::workflow_completion_timeout`].
     ///
-    /// **Idempotent**: shutting down an instance that is not launched does nothing, as in Java.
+    /// **Idempotent**: shutting down an instance that is not launched does nothing.
     /// Relaunching afterwards is supported and is what test suites do.
     pub async fn shutdown(&self) {
         self.shutdown_with(ShutdownOptions::default()).await;
@@ -615,8 +614,7 @@ impl DBOS {
 
     /// The running executor, or [`Error::NotLaunched`] naming the operation that wanted it.
     ///
-    /// Java's `ensureLaunched(caller)`, and for its reason: the useful half of the error is which
-    /// call was too early.
+    /// The operation is named because the useful half of the error is which call was too early.
     pub(crate) fn executor(&self, operation: &'static str) -> Result<Arc<Executor>> {
         self.read_executor().ok_or(Error::NotLaunched {
             operation: operation.into(),

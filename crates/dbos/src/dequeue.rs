@@ -5,8 +5,8 @@
 //! here is the loop that asks, the cadence it asks at, and the count it has to keep to ask
 //! correctly.
 //!
-//! **A supervisor, and a worker per queue**, which is Go's arrangement and holds harder in Rust
-//! where a task is cheaper than a goroutine. The supervisor sweeps once a second: transition
+//! **A supervisor, and a worker per queue**, since a task is cheap enough to give each queue its
+//! own cadence and backoff. The supervisor sweeps once a second: transition
 //! `DELAYED` rows, rebuild the queue set, spawn a worker for anything missing one. A worker reads
 //! its queue's configuration from the published set on every pass, which is what lets a limit
 //! change at runtime — the whole point of the starter app's Queues tab — and stops itself when its
@@ -176,8 +176,7 @@ async fn supervise(executor: Arc<Executor>) {
     let running: Arc<Running> = Arc::default();
     let mut workers: HashMap<String, crate::rt::JoinHandle<()>> = HashMap::new();
     // Once, not once a second: the row is a standing misconfiguration, so every sweep would find
-    // it again. TypeScript keeps a `conflictWarned` set for its own queue-name collision warning
-    // for the same reason.
+    // it again.
     let mut warned_internal = false;
 
     loop {
@@ -232,8 +231,8 @@ async fn supervise(executor: Arc<Executor>) {
 /// fleet share one backlog. The scope is this application's rows plus the unclaimed ones — a peer
 /// application's queue is not this one's to poll.
 ///
-/// **A transient read failure keeps the previous set rather than emptying it**, which is Go's
-/// behaviour and the only safe one: publishing an empty set would stop every worker, and the next
+/// **A transient read failure keeps the previous set rather than emptying it**, the only safe
+/// choice: publishing an empty set would stop every worker, and the next
 /// tick would start them all again.
 ///
 /// **[`Config::listen_queues`](crate::Config::listen_queues) narrows it here, after the read.**
@@ -270,10 +269,10 @@ async fn refresh_queue_set(
     for queue in listed {
         if queue.name == INTERNAL_QUEUE {
             // **Skipped, and said out loud once.** Rust's `register_queue` refuses this name, but
-            // nothing else does: every peer implementation's client accepts it, and this crate's
+            // nothing stops another SDK's client on the same database writing it, and this crate's
             // own `sysdb::upsert_queue` is public and unguarded. Honouring the row would put a
-            // concurrency limit or a polling interval on the queue `resume` and `fork` land on —
-            // a knob whose only meaning is to throttle recovery from outside the application.
+            // concurrency limit or a polling interval on the queue `resume` and `fork` land on — a
+            // knob whose only meaning is to throttle recovery from outside the application.
             if !*warned_internal {
                 *warned_internal = true;
                 tracing::warn!(
@@ -303,9 +302,9 @@ async fn refresh_queue_set(
 /// application in the fleet race to create the same one, and would hand an operator a knob whose
 /// only meaning is "break resume".
 ///
-/// It carries no concurrency default, which is a choice rather than an oversight: none of the four
-/// references gives it one either, so an executor that re-enqueues a large backlog dequeues all of
-/// it.
+/// It carries no concurrency default, which is a choice rather than an oversight, and one the
+/// other SDKs sharing the database make for this queue too: an executor that re-enqueues a large
+/// backlog dequeues all of it.
 fn internal_queue() -> QueueRecord {
     QueueRecord {
         name: INTERNAL_QUEUE.to_owned(),
@@ -398,21 +397,21 @@ impl Polled {
 /// One dequeue and the dispatch of whatever it claimed. Reports the contention it met, if any, and
 /// how many claims it took to get there.
 ///
-/// **Three shapes, which is the split TypeScript makes.** An unpartitioned queue is one claim. A
+/// **Three shapes.** An unpartitioned queue is one claim. A
 /// partitioned queue whose only limit is one-at-a-time-per-key is a single batched sweep, which is
 /// what keeps a thousand partitions costing one round trip rather than a thousand. Any other
 /// partitioned queue walks its partitions one at a time, because the limits it carries have to be
 /// counted within each key — and in a shuffled order, so a queue with more partitions than budget
 /// does not starve the ones sorting last.
 ///
-/// **The walk is bounded by the queue-wide limits as well as by the worker's own.** Each visit is
-/// a claim transaction, at a stricter isolation whenever the queue carries a shared limit, and with
-/// a queue-wide limit spent every one of them claims nothing, so a queue with tens of thousands of waiting partitions would otherwise pay
-/// that many transactions a poll to learn one fact. The queue's room under its global concurrency
-/// is read once up front: none means no partition is visited at all, and the walk ends as soon as
-/// this poll has claimed it. A claim that reports a queue-wide limit closed — a peer filled it
-/// since, or the rate limit's window is full — ends the walk too, since every other key would
-/// report the same.
+/// **The walk is bounded by the queue-wide limits as well as by the worker's own.** Each visit is a
+/// claim transaction, at a stricter isolation whenever the queue carries a shared limit, and with a
+/// queue-wide limit spent every one of them claims nothing, so a queue with tens of thousands of
+/// waiting partitions would otherwise pay that many transactions a poll to learn one fact. The
+/// queue's room under its global concurrency is read once up front: none means no partition is
+/// visited at all, and the walk ends as soon as this poll has claimed it. A claim that reports a
+/// queue-wide limit closed — a peer filled it since, or the rate limit's window is full — ends the
+/// walk too, since every other key would report the same.
 async fn poll_once(
     executor: &Arc<Executor>,
     queue: &QueueRecord,
@@ -597,7 +596,7 @@ fn report_dequeue_error(error: &sysdb::Error) -> Option<Contention> {
 ///
 /// Starvation is the reason rather than fairness in the abstract: a worker whose budget runs out
 /// part way through would otherwise always spend it on whichever keys sort first, and the tail of
-/// a large partition set would never be reached. TypeScript shuffles here for the same reason.
+/// a large partition set would never be reached.
 ///
 /// Seeded from a v4 UUID for the reason [`jitter`] draws one: the randomness comes from a
 /// dependency this crate already has rather than one added for two uses. Seeded once per walk and
@@ -627,8 +626,8 @@ async fn dispatch_claimed(
     }
 
     // **One round trip for the whole batch**, which is why the claim returns ids rather than
-    // rows: Python's `start_dequeued_workflows` reads every claimed status at once and then
-    // dispatches each, and the system database was built for that shape.
+    // rows: every claimed status is read at once and then each is dispatched, and the system
+    // database was built for that shape.
     let ids: Vec<&str> = claimed.iter().map(String::as_str).collect();
     let rows = match executor
         .sysdb()
@@ -682,7 +681,7 @@ async fn dispatch_claimed(
     // read that follows is a `list_workflows`, which sorts by `created_at`. Walking the rows as
     // they arrive would therefore undo the sort — and `dispatch` awaits a round trip apiece, so
     // on a prioritised queue the workflow that ranked first would start last, one round trip per
-    // row late. Indexing the rows and walking the claimed ids is how Python keeps the order too.
+    // row late. Indexing the rows and walking the claimed ids keeps the claim's order.
     let mut by_id: HashMap<String, _> = rows
         .into_iter()
         .map(|row| (row.workflow_id.clone(), row))
@@ -728,7 +727,7 @@ async fn dispatch_claimed(
 /// load-bearing.** The claim has already flipped the row to `PENDING`, counted the attempt, and
 /// stamped `executor_id` before this is reached, so there is nothing for the order to save. What
 /// it does mean is that a row this process cannot run is never parked, however many attempts it
-/// accrues — the subject of the upstream note below.
+/// accrues — the subject of the note on the skip below.
 ///
 /// `slot` is this workflow's place in its queue's local running tally. It travels into the spawned
 /// execution so the tally is released when the workflow's task ends — and is dropped here,
@@ -757,15 +756,13 @@ async fn dispatch(
         // Logged and skipped, never fatal: the code that knew this workflow was removed or
         // renamed, and the row waits for a launch that recognises it.
         //
-        // TODO(dbos-team): UPSTREAM item 24, the cap this skip never reaches. The claim already
-        // counted this dispatch — `start_queued_workflows` does `recovery_attempts + 1` — and
-        // the cap below is the only place that reads that count and parks the row, so returning
-        // here skips it: the row is claimed, counted, skipped, re-enqueued by
-        // recovery, and claimed again, with nothing ever parking it. All four implementations
-        // have the same hole, and for them the order is forced because the budget is read off the
-        // registration whose absence is the problem. Here it is `MAX_RECOVERY_ATTEMPTS`, a
-        // constant, so this could check the cap first; it does not, because a lone port that
-        // parks rows its peers leave alone is the worse divergence.
+        // The skip also bypasses the recovery cap. The claim already counted this dispatch —
+        // `start_queued_workflows` does `recovery_attempts + 1` — and the cap below is the only
+        // place that reads that count and parks the row, so a row no launch recognises cycles:
+        // claimed, counted, skipped, re-enqueued by recovery, and claimed again, never parked.
+        // The cap is `MAX_RECOVERY_ATTEMPTS`, a constant, so it could be checked first; it is
+        // not, because whether such a row should be parked is an open question shared with the
+        // other SDKs on the same database, and parking it here alone would decide it for them.
         tracing::warn!(
             workflow_id,
             workflow = %key,
@@ -1235,7 +1232,7 @@ mod tests {
         // come back short of a row enqueued moments ago, leaving one of the open partitions'
         // rows waiting through no fault of the walk.
         if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
-            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            eprintln!("skipped on CockroachDB: a claim may under-deliver");
             dbos.shutdown().await;
             return;
         }
@@ -1277,7 +1274,7 @@ mod tests {
         // come back short of a row enqueued moments ago, and each short claim costs the walk one
         // more visit; the walk is still bounded there, just not to this count.
         if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
-            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            eprintln!("skipped on CockroachDB: a claim may under-deliver");
             dbos.shutdown().await;
             return;
         }

@@ -6,13 +6,11 @@
 //! carries. That is what makes a fan-out bounded, a backlog shared across a fleet, and a workflow
 //! runnable by a process other than the one that asked for it.
 //!
-//! **Every queue here is database-backed, and that is a deliberate narrowing.** The other
-//! implementations carry two kinds — an in-process registry of queues declared in code, and rows in
-//! the `queues` table — and are moving users onto the second so the first can be deprecated. Rust
-//! starts where they are going: a queue is a row, always, so there is one place a limit lives, one
-//! answer to what a queue's concurrency currently is, and no question about which kind a name
-//! refers to. It also removes the branch every reference runner carries, where a queue's
-//! configuration is re-read per iteration only if it came from the database.
+//! **Every queue here is database-backed, and that is a deliberate narrowing.** There is no
+//! in-process registry of queues declared in code: a queue is a row in the `queues` table, always,
+//! so there is one place a limit lives, one answer to what a queue's concurrency currently is, and
+//! no question about which kind a name refers to. The runner re-reads every queue's configuration
+//! per iteration, with no branch on where it came from.
 //!
 //! The one queue with no row is [`INTERNAL_QUEUE`], which is the engine's own: `resume` and `fork`
 //! put work there, and it is not a queue anybody registers.
@@ -32,15 +30,14 @@ use crate::sysdb::{Error as SysdbError, INTERNAL_QUEUE};
 
 /// How often a queue is polled when nothing says otherwise.
 ///
-/// One second in every implementation, and the floor a contended worker backs off from.
+/// One second, and the floor a contended worker backs off from.
 pub(crate) const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A registered queue, as the database holds it.
 ///
 /// Returned by [`DBOS::register_queue`], and **read back from the row rather than echoed from the
 /// request**: a registration that declined to overwrite an existing row returns what is actually
-/// stored, which is what this executor's dequeues will honour. Go reads the row back for the same
-/// reason.
+/// stored, which is what this executor's dequeues will honour.
 ///
 /// Holding one is not what makes a queue work — the name is the address, and
 /// [`StartOptions::queue`](crate::StartOptions::queue) takes a name. This is a receipt.
@@ -127,9 +124,9 @@ impl Queue {
 
 /// What a queue allows, and how often it is polled.
 ///
-/// Every field defaults to "no limit", which is what every implementation's bare registration
-/// means. A queue with no limits still does something worth having: it is a place work can be left
-/// for a fleet to pick up, rather than run by whoever asked.
+/// Every field defaults to "no limit", which is what a bare registration means. A queue with no
+/// limits still does something worth having: it is a place work can be left for a fleet to pick up,
+/// rather than run by whoever asked.
 ///
 /// # The four concurrency limits
 ///
@@ -206,7 +203,7 @@ pub struct QueueOptions {
     ///
     /// The floor rather than the cadence: a worker that meets contention backs off from here and
     /// scales back towards it, and jitters every wait so a fleet that started together does not
-    /// poll in lockstep. One second in every implementation.
+    /// poll in lockstep. One second by default.
     pub polling_interval: Duration,
     /// How fast this queue's workflows may start, or `None` for unthrottled.
     ///
@@ -317,19 +314,19 @@ pub struct QueueChange {
 ///
 /// **That holds for a caller with an application name of its own.** A nameless one — which is what
 /// a [`Client`](crate::Client) is unless it was configured otherwise — is let through by the
-/// ownership check every implementation shares, and then rewrites the stored limits of whatever
-/// queue it names, a peer's included; only the owner column is left alone. UPSTREAM item 26 on
-/// `resolve_owning_application` asks the team to settle whether that is the contract or the gap.
+/// ownership check, and then rewrites the stored limits of whatever queue it names, a peer's
+/// included; only the owner column is left alone. Whether that is the contract or a gap is an open
+/// question shared with the other SDKs on the same database.
 ///
-/// **The same type on both surfaces**, as in Python and TypeScript. A
+/// **The same type on both surfaces.** A
 /// [`Client`](crate::Client) can therefore name
 /// [`UpdateIfLatestVersion`](Self::UpdateIfLatestVersion), which it has no version to answer, and
 /// is refused when it does.
 ///
-/// **Named at the call, never defaulted.** Python and TypeScript default it per surface — to
-/// `update_if_latest_version` for an application (`_dbos.py`, `dbos.ts`) and to `always_update` for
-/// a client (`_client.py`, `client.ts`) — which one Rust type cannot express, a default being a
-/// property of the type rather than of the caller. So a registration says which it means.
+/// **Named at the call, never defaulted.** The natural default differs per surface —
+/// [`UpdateIfLatestVersion`](Self::UpdateIfLatestVersion) for an application,
+/// [`AlwaysUpdate`](Self::AlwaysUpdate) for a client — which one type cannot express, a default
+/// being a property of the type rather than of the caller. So a registration says which it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueConflict {
     /// Overwrite only if this process is running the **latest registered application version**.
@@ -341,8 +338,7 @@ pub enum QueueConflict {
     /// default, since it is the first.
     ///
     /// **A [`Client`](crate::Client) is refused this**, having no version to be the latest of:
-    /// [`Client::register_queue`](crate::Client::register_queue) returns [`Error::Config`], which
-    /// is where Python and TypeScript raise on the same combination (`_client.py`, `client.ts`).
+    /// [`Client::register_queue`](crate::Client::register_queue) returns [`Error::Config`].
     UpdateIfLatestVersion,
     /// Always overwrite the stored limits.
     ///
@@ -602,9 +598,7 @@ impl DBOS {
     /// is read under a row lock, the change is merged onto it, the result is validated, and the
     /// write lands before the lock is released — so two operators changing different limits at the
     /// same instant cannot store a pair neither asked for. The second waits for the first and
-    /// validates against what it actually wrote. Go manages the same thing through
-    /// `UpdateQueueConfig`; Python and TypeScript read and write separately and can store an
-    /// incoherent pair.
+    /// validates against what it actually wrote.
     pub async fn update_queue(&self, name: &str, change: QueueChange) -> Result<Queue> {
         self.executor("update a queue")?
             .connection()
@@ -619,8 +613,7 @@ impl DBOS {
     /// **Workflows already enqueued on it are not touched.** They keep the queue name they were
     /// given and stop being dequeued, because a worker only exists for a queue that has a row —
     /// so deleting a queue with a backlog strands that backlog until the queue is registered
-    /// again. That is the same behaviour in every implementation, and it is why deleting is not
-    /// how you pause a queue.
+    /// again. That is why deleting is not how you pause a queue.
     pub async fn delete_queue(&self, name: &str) -> Result<()> {
         self.executor("delete a queue")?
             .connection()
@@ -661,7 +654,7 @@ impl Connection {
     ///
     /// **The refusal lives here**, for both surfaces, because the condition it tests — a caller
     /// with no version — is exactly what this parameter carries. Both surfaces take the same
-    /// [`QueueConflict`], as Python's and TypeScript's do.
+    /// [`QueueConflict`].
     pub(crate) async fn register_queue(
         &self,
         name: &str,
@@ -686,9 +679,8 @@ impl Connection {
             QueueConflict::UpdateIfLatestVersion => {
                 // **A handle with no application version cannot answer this question**, which is
                 // the case a [`Client`](crate::Client) is: it runs none of the application's code,
-                // so there is no version of it to weigh against the registered ones. Python and
-                // TypeScript refuse the same combination on the same grounds (`_client.py`,
-                // `client.ts`). Only a client reaches it: `DBOS::register_queue` passes the
+                // so there is no version of it to weigh against the registered ones. Only a client
+                // reaches it: `DBOS::register_queue` passes the
                 // executor's version, which a launched instance always has.
                 let Some(version) = app_version else {
                     return Err(Error::Config(format!(

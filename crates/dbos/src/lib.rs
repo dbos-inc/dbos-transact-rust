@@ -1,9 +1,8 @@
 //! DBOS Transact for Rust — lightweight durable workflows on Postgres.
 //!
-//! This crate is the Rust port of [DBOS Transact](https://docs.dbos.dev/), joining the
-//! Python, TypeScript, Go, and Java implementations. All five share one Postgres system
-//! database schema, so a Rust application can run alongside applications written in any
-//! of the others.
+//! This crate is [DBOS Transact](https://docs.dbos.dev/) for Rust. It shares one Postgres system
+//! database schema with the other DBOS Transact SDKs, so a Rust application can run alongside
+//! applications written in any of their languages.
 //!
 //! # Status
 //!

@@ -88,9 +88,8 @@ async fn there_is_no_workflow_id_outside_a_workflow() {
 /// A step sees its own id; the workflow body between steps sees none.
 ///
 /// **The gap is the assertion worth making.** A step id belongs to a step, so a workflow that has
-/// finished one and not started the next is inside neither — which is where Python answers `None`
-/// and TypeScript `undefined`, and where a naive implementation that stored the last id handed out
-/// would answer with a stale one.
+/// finished one and not started the next is inside neither, and the answer is `None` — where a
+/// naive implementation that stored the last id handed out would answer with a stale one.
 #[tokio::test]
 async fn step_ids_are_visible_inside_steps_and_nowhere_else() {
     let db = test_database().await;
@@ -187,11 +186,11 @@ async fn every_attempt_of_a_step_sees_the_same_id() {
     );
 }
 
-/// A plain step reports attempt 1 of 1, where Python and TypeScript both report nothing.
+/// A plain step reports attempt 1 of 1 rather than nothing.
 ///
-/// The divergence is deliberate: every step here runs the same retry loop with `max_attempts`
-/// defaulting to 1, so there is an honest answer to give, and "does this retry?" is
-/// `max_attempts > 1` rather than an `Option` to unwrap inside an `Option`.
+/// Every step runs the same retry loop with `max_attempts` defaulting to 1, so there is an honest
+/// answer to give, and "does this retry?" is `max_attempts > 1` rather than an `Option` to unwrap
+/// inside an `Option`.
 #[tokio::test]
 async fn a_plain_step_reports_one_attempt_of_one() {
     let db = test_database().await;
@@ -317,10 +316,9 @@ type NestedTrace = (Option<StepStatus>, Option<StepStatus>, Option<i32>);
 ///
 /// **A nested call is not a step**: it takes no id, writes no checkpoint, and is replayed as part
 /// of the body that called it, so the only id with a row behind it is the outer one — and the
-/// attempt being counted is the outer step's too. Python, TypeScript, Go and Java each run a
-/// nested step as a plain call in the caller's context and answer the same way; this pins the
-/// agreement, because the answer comes from the plain path *not* opening a scope of its own, which
-/// is exactly the kind of thing a later refactor flips without noticing.
+/// attempt being counted is the outer step's too. This pins the answer, because it comes from the
+/// plain path *not* opening a scope of its own, which is exactly the kind of thing a later refactor
+/// flips without noticing.
 #[tokio::test]
 async fn a_nested_step_reports_the_step_that_encloses_it() {
     let db = test_database().await;

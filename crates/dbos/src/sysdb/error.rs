@@ -40,7 +40,7 @@ pub enum Error {
     /// A workflow with this id already exists, running a different function.
     ///
     /// Reusing an id for different work is a programming error, not a race: the id is how
-    /// every implementation decides two attempts are the same workflow.
+    /// two attempts are recognised as the same workflow.
     ConflictingWorkflow {
         /// The id submitted twice.
         workflow_id: String,
@@ -410,7 +410,7 @@ impl std::fmt::Display for BackendError {
 /// Whether a backend failure is worth asking again about.
 ///
 /// Classification is the backend's job, not the retry loop's: SQLSTATEs are Postgres's, and a
-/// SQLite backend would decide on message text instead. Python and Go both split it this way.
+/// SQLite backend would decide on message text instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BackendErrorKind {
     /// The connection failed, or the server cannot serve requests right now.

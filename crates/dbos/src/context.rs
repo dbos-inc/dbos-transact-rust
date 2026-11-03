@@ -2,10 +2,9 @@
 //!
 //! A workflow function is an ordinary `async fn` taking its own arguments and nothing else. What
 //! makes it durable — which workflow it is, and which step comes next — travels in a
-//! [`tokio::task_local!`], set for the duration of the body and unset outside it. Python's
-//! `ContextVar`, TypeScript's `AsyncLocalStorage` and Java's thread-locals are the same mechanism;
-//! Go is the outlier that threads a parameter, and its own starter application is the argument
-//! against copying it.
+//! [`tokio::task_local!`], set for the duration of the body and unset outside it. Threading a
+//! context parameter instead would put it in every workflow and step signature, and through every
+//! helper between them.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -42,7 +41,7 @@ pub(crate) struct Ctx {
     /// A step is a leaf: the checkpoint it writes stands for everything the body did, so a step
     /// inside a step is a plain call. Without this the inner call would allocate a step id of its
     /// own and every step after it would replay against the wrong slot — a correctness trap rather
-    /// than a policy question, and Go #420 draws the same line.
+    /// than a policy question.
     ///
     /// **Here rather than on [`WorkflowState`], because the question is about one call stack and
     /// not about the workflow.** [`in_step_scope`](Self::in_step_scope) binds it on the context it
@@ -92,12 +91,11 @@ pub(crate) struct StepScope {
 
 /// What a step body can learn about the attempt it is running as.
 ///
-/// Read with [`step_status`]. The equivalent is `DBOS.step_status` in Python
-/// and `DBOS.stepStatus` in TypeScript; Go and Java expose nothing like it.
+/// Read with [`step_status`].
 ///
-/// TypeScript's carries a fourth field, `timeoutSignal`, which here is
-/// [`cancellation_token`] — a free function rather than a field, because
-/// it is useful to a body that has no interest in which attempt it is.
+/// The token a body watches for an abandoned attempt is not a field here but
+/// [`cancellation_token`] — a free function, because it is useful to a body that has no interest
+/// in which attempt it is.
 ///
 /// **A read-only snapshot, and read-only by construction.** The fields are behind accessors rather
 /// than public, so there is no way to write one. That is not a guard against a body changing its
@@ -112,16 +110,14 @@ pub struct StepStatus {
     pub(crate) step_id: i32,
     /// Which attempt is running, counting from **one**.
     ///
-    /// **One-based, matching TypeScript, whose `attemptNum` reaches the body as 1 on the first
-    /// try.** Python is the outlier and documents its own as zero-indexed, which makes a plain step
-    /// "attempt 0 of 1"; this crate already spells the same number one-based in a step's tracing
-    /// span, and a body that logs "attempt 2 of 3" should not have to add one to say so.
+    /// **One-based**, so a plain step is "attempt 1 of 1" rather than "attempt 0 of 1". A step's
+    /// tracing span spells the same number one-based, and a body that logs "attempt 2 of 3"
+    /// should not have to add one to say so.
     pub(crate) current_attempt: u32,
     /// How many attempts the policy allows in total, so a body can tell it is on its last.
     ///
-    /// **Always a number, where Python and TypeScript both report nothing for a step that does not
-    /// retry.** They have to: their step config leaves the count unset. Here every step runs the
-    /// same loop with `max_attempts` defaulting to 1, so a plain step is honestly attempt 1 of 1 —
+    /// **Always a number, even for a step that does not retry.** Every step runs the same loop
+    /// with `max_attempts` defaulting to 1, so a plain step is honestly attempt 1 of 1 —
     /// and "does this step retry?" is `max_attempts() > 1` rather than a second `Option` to unwrap
     /// inside one.
     ///
@@ -216,14 +212,9 @@ struct WorkflowState {
     encoding: PayloadEncoding,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
-    /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
-    /// pre-increments (`stepID: -1, // Steps are 0-indexed`), while TypeScript and Java start at 0
-    /// and post-increment. Python is the outlier at one-based, and that is an upstream
-    /// inconsistency rather than a choice open to this port: the step id addresses a fork point
-    /// and labels a row in a step listing, so it is a number Conductor renders and a user passes
-    /// to `fork`. Three of four is what a fourth implementation has to match.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 19.
+    /// **Zero-based, and the base is part of the contract.** The id is public: it is stored in
+    /// `operation_outputs.function_id`, shown in step listings, and passed to `fork` as the step
+    /// to resume at, so other SDKs sharing the database rely on the same base.
     next_step_id: AtomicI32,
     /// The child starts this workflow has in flight, which it waits for before recording its
     /// outcome.
@@ -328,7 +319,7 @@ impl Ctx {
     /// that wrap this, which is what keeps the context itself off the public surface.
     ///
     /// `None` is not an error. A step called outside a workflow runs plainly and undurably, which
-    /// is Python's behaviour and is what makes a function built from steps ordinarily testable.
+    /// is what makes a function built from steps ordinarily testable.
     pub(crate) fn current() -> Option<Ctx> {
         CURRENT.try_with(Ctx::clone).ok()
     }
@@ -540,9 +531,6 @@ impl Ctx {
 /// # Ok(())
 /// # }
 /// ```
-///
-/// The equivalent is `DBOS.workflow_id` in Python, `DBOS.workflowID` in TypeScript,
-/// `dbos.GetWorkflowID(ctx)` in Go and `DBOS.workflowId()` in Java.
 pub fn workflow_id() -> Option<String> {
     Ctx::with_current(|ctx| ctx.map(|ctx| ctx.workflow_id().to_owned()))
 }
@@ -555,16 +543,14 @@ pub fn workflow_id() -> Option<String> {
 /// same step in the same workflow has the same id on every execution.
 ///
 /// **`None` in the workflow body itself**, not just outside a workflow. A step id belongs to a
-/// step, and between two steps a workflow is inside neither; Python and TypeScript answer `None`
-/// and `undefined` in exactly the same place. So this is `Some` only while a step body is
-/// executing, which includes the retries of a step — every attempt of one step reports that
-/// step's id.
+/// step, and between two steps a workflow is inside neither. So this is `Some` only while a step
+/// body is executing, which includes the retries of a step — every attempt of one step reports
+/// that step's id.
 ///
 /// **A step called from inside another step reports the enclosing step's id**, because a nested
 /// call is not a step of its own: it takes no id, writes no checkpoint, and is replayed as part of
 /// the body that called it. Reporting the durable step the work belongs to is the only answer with
-/// a checkpoint row behind it. Python, TypeScript, Go and Java all run a nested step as a plain
-/// call in the caller's context, and so answer the same way.
+/// a checkpoint row behind it.
 ///
 /// ```no_run
 /// async fn charge() -> dbos::Result<()> {
@@ -573,9 +559,6 @@ pub fn workflow_id() -> Option<String> {
 ///     Ok(())
 /// }
 /// ```
-///
-/// The equivalent is `DBOS.step_id` in Python, `DBOS.stepID` in TypeScript,
-/// `dbos.GetStepID(ctx)` in Go and `DBOS.stepId()` in Java.
 pub fn step_id() -> Option<i32> {
     Ctx::with_current(|ctx| ctx.and_then(Ctx::step_id))
 }
@@ -612,9 +595,6 @@ pub fn step_id() -> Option<i32> {
 ///     Err(Upstream)?
 /// }
 /// ```
-///
-/// The equivalent is `DBOS.step_status` in Python and `DBOS.stepStatus` in TypeScript. See
-/// [`StepStatus`] for where the three fields differ from theirs.
 pub fn step_status() -> Option<StepStatus> {
     Ctx::with_current(|ctx| ctx.and_then(Ctx::step_status))
 }
@@ -641,10 +621,8 @@ pub fn step_status() -> Option<StepStatus> {
 /// [`spawn_blocking`](tokio::task::spawn_blocking) thread, or a client holding its own cancel
 /// handle. **Ordinary `async` code needs nothing:** a step that times out has its future dropped,
 /// which stops it at its next suspension point and runs its destructors on the way out, so a
-/// connection is returned and a guard released without the body containing a line about it. That
-/// is the half TypeScript cannot do — it abandons a timed-out attempt and discards whatever the
-/// abandoned promise eventually settles to — and this covers the remainder Rust cannot reach by
-/// dropping.
+/// connection is returned and a guard released without the body containing a line about it. This
+/// token covers the remainder that dropping cannot reach.
 ///
 /// It fires whenever the engine **abandons** an attempt. An attempt that reaches an outcome does
 /// *not* fire it: the body has had its chance to clean up, and work it deliberately left running is
@@ -674,9 +652,6 @@ pub fn step_status() -> Option<StepStatus> {
 ///     Ok(hashed.await.expect("the hashing thread panicked"))
 /// }
 /// ```
-///
-/// TypeScript's `stepStatus.timeoutSignal` is the equivalent, and the only one: Python, Go and
-/// Java expose nothing a step body can watch.
 pub fn cancellation_token() -> CancellationToken {
     Ctx::with_current(|ctx| ctx.map(Ctx::cancellation).unwrap_or_default())
 }
@@ -784,11 +759,7 @@ mod tests {
     #[test]
     fn step_ids_are_zero_based() {
         let state = state();
-        assert_eq!(
-            state.next_step_id(),
-            0,
-            "Go, TypeScript and Java all number the first step 0"
-        );
+        assert_eq!(state.next_step_id(), 0, "step ids are zero-based");
         assert_eq!(state.next_step_id(), 1);
         assert_eq!(state.next_step_id(), 2);
     }

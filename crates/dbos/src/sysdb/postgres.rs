@@ -8,26 +8,22 @@
 //! Events go through `tracing` with structured fields rather than interpolated messages, and the
 //! crate installs no subscriber — a host chooses what to do with them.
 //!
-//! What gets logged is taken from the four references, which agree on the shape:
+//! What gets logged:
 //!
-//! - **`debug!` on a replay-or-run decision**, for any operation gated by a recorded step. Java
-//!   logs `"Replaying setEvent, workflow: {}, step: {}, key: {}"` against `"Running setEvent…"`,
-//!   Python the same pair, on `set_event`, `get_event`, `recv`, `sleep`, `send_bulk`, and
-//!   `write_stream`. It is the single most useful line when a workflow behaves oddly on recovery,
-//!   because it says which side of the replay the caller is on.
-//! - **`debug!` with a count** on anything that sweeps or acts in bulk — Go, Python and
-//!   TypeScript all log dequeue counts this way. A caller that asked for five and moved three
-//!   wants to know without a second query.
+//! - **`debug!` on a replay-or-run decision**, for any operation gated by a recorded step —
+//!   `set_event`, `get_event`, `recv`, `sleep`, `send_bulk`, and `write_stream` among them. It is
+//!   the single most useful line when a workflow behaves oddly on recovery, because it says which
+//!   side of the replay the caller is on.
+//! - **`debug!` with a count** on anything that sweeps or acts in bulk, dequeue included. A caller
+//!   that asked for five and moved three wants to know without a second query.
 //! - **`debug!` on a non-error outcome that changes what the caller should do**: a workflow
 //!   recorded but not claimed, an outcome another run already wrote.
-//! - **`warn!` before returning a conflict.** Java and TypeScript both warn that a step "was
-//!   already recorded" before throwing, because the error alone does not say which execution
-//!   lost.
+//! - **`warn!` before returning a conflict** — a step that was already recorded, say — because
+//!   the error alone does not say which execution lost.
 //!
-//! Two things deliberately absent. **No `error!`** — errors are returned, and Go and TypeScript
-//! logging them before returning double-reports every failure the caller then handles. And **no
-//! per-method entry logging**, which Java has (`debug("initWorkflowStatus workflowId {}")`) and
-//! nothing else does; a span belongs to the caller, not to every statement.
+//! Two things deliberately absent. **No `error!`** — errors are returned, and logging them before
+//! returning double-reports every failure the caller then handles. And **no per-method entry
+//! logging**; a span belongs to the caller, not to every statement.
 //!
 //! # Application scoping
 //!
@@ -177,16 +173,16 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
 /// call a transport failure permanent. See [`is_transport_failure`].
 ///
-/// TODO(dbos-team): UPSTREAM item 8. Classifying by class prefix means a *protocol* violation
-/// lands in whichever class it happens to carry rather than being called permanent, so some are
-/// retried. Worth checking whether the other implementations' classifiers have the same property —
-/// they classify by code lists, which have the opposite failure mode.
+/// TODO: classifying by class prefix puts a *protocol* violation in whichever class its code
+/// carries rather than calling it permanent, so some are retried instead of failing fast — a
+/// parameter-count mismatch, say. CockroachDB can also report its own i/o timeout as `XXUUU`,
+/// which lands in the internal-error class.
 fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     if let Some(code) = sqlstate {
         return classify_sqlstate(code, error.as_database_error().map(|e| e.message()));
     }
-    // No SQLSTATE means the database never answered, so the request never reached it. Java
-    // matches driver message text for this case; sqlx gives the variants directly.
+    // No SQLSTATE means the database never answered, so the request never reached it. sqlx
+    // names the transport failure as a variant, so no message text needs reading.
     match error {
         sqlx::Error::Io(_)
         | sqlx::Error::Tls(_)
@@ -218,10 +214,8 @@ fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
         // code it attaches to a failure it has no better code for. That includes losing the
         // connection to a client mid-read, which it reports as an internal error whose
         // message is the transport failure verbatim. Reading the message is the only way to
-        // tell those apart, and getting it wrong in this direction is what the reference
-        // implementations already accept: Python and TypeScript both match driver message
-        // text alongside the code, rather than letting a code that is not in the connection
-        // set end the decision.
+        // tell those apart, so the message is read alongside the code rather than letting a
+        // code outside the connection set end the decision.
         "XX" => match message {
             Some(message) if is_transport_failure(message) => BackendErrorKind::Connection,
             _ => BackendErrorKind::Permanent,
@@ -264,8 +258,7 @@ pub struct Settings<'a> {
     pub retry: RetryPolicy,
     /// Identifies this process among the executors sharing the database.
     ///
-    /// `None` leaves the executor column alone entirely, which is Python's behaviour when it has
-    /// no id to stamp.
+    /// `None` leaves the executor column alone entirely rather than stamping a placeholder id.
     pub executor_id: Option<&'a str>,
     /// Names the application this handle acts for, among the applications sharing the database.
     ///
@@ -288,8 +281,7 @@ pub struct Settings<'a> {
     pub polling_concurrency: PollingConcurrency,
     /// How long a written key waits for company before this handle pushes a wakeup for it.
     ///
-    /// `None` is ten milliseconds, which is what Python, TypeScript and Go all default the same
-    /// setting to. Longer trades wakeup latency for fewer notifying transactions;
+    /// `None` is ten milliseconds. Longer trades wakeup latency for fewer notifying transactions;
     /// `Some(Duration::ZERO)` turns coalescing off, which is a push per write — what a database
     /// trigger costs, and why migrations 43 and 44 remove the events and streams triggers.
     ///
@@ -299,7 +291,7 @@ pub struct Settings<'a> {
 }
 
 impl Default for Settings<'_> {
-    /// The defaults every implementation shares.
+    /// The defaults.
     ///
     /// Hand-written rather than derived because `<&str as Default>` is the empty string, and a
     /// handle addressing schema `""` would fail on its first query rather than at construction.
@@ -328,8 +320,8 @@ pub struct Config<'a> {
     /// one: it decides which variant of the schema is applied, and `from_pool` never migrates.
     /// CockroachDB has no LISTEN/NOTIFY, so the dialect forces polling there whatever this says.
     ///
-    /// TODO(dbos-team): UPSTREAM item 15. Deciding the schema from a per-process setting is
-    /// permanent and affects every application sharing the database — see the note on
+    /// The schema it picks is permanent and shared by every application on the database, yet the
+    /// first process to migrate decides it from its own setting — see the note on
     /// [`build_migrations`](crate::sysdb::migrations::build_migrations).
     pub use_listen_notify: bool,
     /// How long a connection may sit idle inside an open transaction before the server ends its
@@ -343,14 +335,14 @@ pub struct Config<'a> {
     ///
     /// On by default. Turning it off suits an application whose database is migrated by something
     /// else — a deployment step, or another executor that got there first — and it then connects
-    /// to whatever is already there. Java gates the same step on `DBOSConfig.migrate`.
+    /// to whatever is already there.
     pub migrate: bool,
     /// How the resulting handle behaves.
     pub settings: Settings<'a>,
 }
 
 impl<'a> Config<'a> {
-    /// A configuration with the defaults every implementation shares.
+    /// A configuration for `url`, with every other field at its default.
     pub fn new(url: &'a str) -> Self {
         Self {
             url,
@@ -439,8 +431,7 @@ pub struct PostgresSystemDatabase {
     /// Every wait here is a loop that re-queries the database, and each pass takes a connection.
     /// Uncapped, enough waiters empty the pool and starve the control plane — enqueue, dequeue,
     /// status writes, recovery, cancellation — leaving the waiters blocked on writes that can no
-    /// longer happen. Python and TypeScript cap the same thing the same way; see
-    /// [`Settings::polling_concurrency`] for the size.
+    /// longer happen. See [`Settings::polling_concurrency`] for the size.
     ///
     /// **A permit covers one query, never a wait.** A call site acquires, queries, and lets the
     /// permit drop before waiting. Held across the wait it would cap concurrent *waiters* rather
@@ -449,8 +440,6 @@ pub struct PostgresSystemDatabase {
     ///
     /// **It goes inside the retry loop, not around it.** A poll that failed and is backing off is
     /// asleep, not querying, so a permit held through the backoff is held for up to a minute.
-    /// Python says the same at each of its call sites: "under the limiter, inside `db_retry` so the
-    /// permit frees across backoff."
     ///
     /// Never closed, which is what makes `acquire` infallible at the call sites. Closing the handle
     /// closes the pool, so every in-flight poll fails permanently and releases its permit, and a
@@ -570,9 +559,9 @@ impl PostgresSystemDatabase {
         };
 
         // The same flag that decided whether the database got its NOTIFY triggers decides whether
-        // this process listens for them, which is UPSTREAM item 15's complaint — but with the
-        // triggers absent there would be nothing to hear, so following it here is right whatever
-        // the flag's shape should be.
+        // this process listens for them. A per-process flag deciding a shared schema is a problem
+        // of its own (see `Config::use_listen_notify`), but with the triggers absent there would be
+        // nothing to hear, so following it here is right whatever the flag's shape should be.
         if config.use_listen_notify {
             handle.start_notifications().await;
         }
@@ -649,8 +638,6 @@ impl PostgresSystemDatabase {
     /// configuration, not a fault: it means waits re-query every second instead of every minute,
     /// which is what CockroachDB does always and what any deployment does when its subscription
     /// cannot be relied on.
-    ///
-    /// Java exposes the same as `notificationSource.isRunning()`.
     pub fn is_delivering(&self) -> bool {
         self.listener.is_delivering()
     }
@@ -883,9 +870,8 @@ impl PostgresSystemDatabase {
     /// Runs `work` as a durable step, on a transaction the step's checkpoint shares.
     ///
     /// The shape every system-database call needs when it must be atomic with the step recording
-    /// it: **check, run, record**. Python's `call_txn_as_step` (`_sys_db.py`) and TypeScript's
-    /// `runTransactionalStep` (`system_database.ts`) are the same three steps around a caller's
-    /// connection; this one owns the transaction instead.
+    /// it: **check, run, record**. It owns the transaction rather than borrowing a caller's
+    /// connection.
     ///
     /// - **Already recorded** — the stored output is decoded and returned, or the stored error
     ///   raised again.
@@ -978,8 +964,8 @@ impl PostgresSystemDatabase {
         step_name: &str,
         started_at: Option<Timestamp>,
     ) -> Result<(), Error> {
-        // Python fails loudly here rather than "silently wedging the parent on recovery": a
-        // parent that replays and finds an empty child id has no workflow to attach to.
+        // Refused loudly rather than silently wedging the parent on recovery: a parent that
+        // replays and finds an empty child id has no workflow to attach to.
         if child_workflow_id.is_empty() {
             return Err(Error::InvalidInput {
                 field: "child_workflow_id".into(),
@@ -989,15 +975,15 @@ impl PostgresSystemDatabase {
         let steps_table = self.tables.operation_outputs.as_str();
         // Spans the launch only — the parent does not wait for the child here, so the step is
         // complete as soon as the child exists. Stamped only when the caller offered a start,
-        // since half a pair measures nothing. Java passes both null here.
+        // since half a pair measures nothing.
         let completed_at = started_at.map(|_| Timestamp::now());
         let application_name = self.application_name.as_deref();
 
         // Same `DO UPDATE`-to-itself trick as `record_step`, but the returned value
         // compared is the **child id**, not the completion time. A retry stamps a new clock
         // reading and would fail a timestamp comparison, while the child id it is trying to
-        // record is by definition the same one. Python states the rule exactly: "Same child
-        // means an idempotent db_retry; a different child means nondeterminism."
+        // record is by definition the same one. The same child means a retry of this write; a
+        // different child means the parent is not deterministic.
         let stored: Option<Option<String>> = sqlx::query_scalar(AssertSqlSafe(format!(
             "INSERT INTO {steps_table} (workflow_uuid, function_id, function_name, \
              child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, \
@@ -1260,10 +1246,9 @@ impl PostgresSystemDatabase {
             }
         };
 
-        // Nothing precedes step 0, so a fork from there has nothing to carry. **TypeScript's guard,
-        // not Python's**: TypeScript skips `startStep > 0` and Python skips `step > 1`, and with
-        // steps numbered from zero the latter drops step 0 from every fork that resumes at
-        // step 1 — the fork then re-runs a step it was given the result of.
+        // Nothing precedes step 0, so a fork from there has nothing to carry. **The guard is
+        // `> 0`, not `> 1`**: steps are numbered from zero, so a fork that resumes at step 1 has
+        // step 0 to copy, and skipping it would re-run a step the fork was given the result of.
         let copies_anything = start_steps.iter().any(|&step| step > 0);
 
         let queue_name = options.queue_name.unwrap_or(INTERNAL_QUEUE);
@@ -1304,8 +1289,8 @@ impl PostgresSystemDatabase {
         }
 
         // The fork inherits its source's identity and starts enqueued. `application_version`
-        // falls back to the source's, matching Go and TypeScript: a fork stamped with no
-        // version would be invisible to the recovery that scopes by it.
+        // falls back to the source's: a fork stamped with no version would be invisible to the
+        // recovery that scopes by it.
         //
         // `application_name` falls back the other way — the source's owner wins, and this
         // application's name is used only to claim a source nobody owns, which is what a
@@ -1751,7 +1736,7 @@ const WORKFLOW_COLUMNS: &str = "workflow_uuid, status, name, class_name, config_
 /// **The payloads live in `workflow_input` and `workflow_output`** (migration 109), and every
 /// SDK now writes them there and nowhere else. A row written before that move has them in the
 /// legacy `workflow_status` columns instead, so each is read as the new table's value falling
-/// back to the old column, as Python, TypeScript and Java do.
+/// back to the old column.
 ///
 /// Correlated subqueries on the two tables' primary key rather than a join: a join would put a
 /// second `workflow_uuid`, `output` and `error` in scope, and every unqualified column in
@@ -1831,14 +1816,12 @@ fn decode_roles(stored: Option<String>) -> Result<Vec<String>, Error> {
 /// the `completed_at` the step is stamped with, and so the duration every timeline and step
 /// aggregate reports for it.
 ///
-/// **A 2–2 split across the references, but not a coin toss** — it splits by *caller*, and the two
-/// implementations that distinguish the callers do so explicitly. Python and TypeScript each carry
-/// a flag for exactly this (`project_completion_time`, `recordCompletionAtDeadline`), set for real
-/// sleeps and clear for the deadline `recv` and `get_event` register. Java projects both only
-/// because `recv` and `getEvent` call the very same `durableSleepEndTime` and it has no flag to do
-/// otherwise; Go never projects at all, so its sleeps look instantaneous.
+/// **It splits by *caller*.** A real sleep is waited out, so its duration is the sleep; the
+/// deadline `recv` and `get_event` register is usually abandoned early, so projecting it would
+/// overstate every such call. Stamping every sleep at the moment it was written would make the
+/// real ones look instantaneous instead.
 ///
-/// Private, and the flag those two references expose is not on
+/// Private, and not a flag on
 /// [`record_sleep`](SystemDatabase::record_sleep): a caller registering a deadline reaches for the
 /// blocking read, not for this. Nothing outside this module has both a reason to record a sleep and
 /// a reason to choose.
@@ -1861,8 +1844,8 @@ enum SleepKind<'a> {
 ///
 /// A collision means another writer took the offset this one computed, and the retry recomputes
 /// it — so each attempt is lost to a *different* rival, and the loop converges as long as writers
-/// are finite. Python loops forever with a 100ms sleep; a bound turns a pathological case into an
-/// error a caller can see rather than a call that never returns.
+/// are finite. A bound turns a pathological case into an error a caller can see rather than a call
+/// that never returns.
 const STREAM_OFFSET_ATTEMPTS: u32 = 16;
 
 /// The database's clock, in epoch milliseconds, as a SQL expression.
@@ -1982,9 +1965,8 @@ fn timed_out_sweep_sql(workflow_table: &str) -> String {
 /// that runs once per poll interval for the length of every wait.
 ///
 /// **The complement is the definition of "settled", and it is deliberately wide**: `SUCCESS`,
-/// `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` all end a wait. Python and TypeScript
-/// exclude exactly these three and no others, so a Rust waiter and a TypeScript one watching the
-/// same fan-out agree on who finished first.
+/// `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` all end a wait, and only the three
+/// statuses here keep one open.
 const UNSETTLED: &str = "'PENDING', 'ENQUEUED', 'DELAYED'";
 
 /// Every column of `queues` [`queue_from_row`] reads.
@@ -2096,18 +2078,17 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
             .map(Some)
             .ok_or_else(|| Error::Malformed(format!("{column} is not a duration: {secs}"))),
     };
-    // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and no
-    // SDK can write it — all four reject an unpaired limit at their public surface. Read as *no
-    // limit* rather than reported, matching TypeScript (`wfqueue.ts`), so a hand-edited row does
-    // not make a peer and this implementation disagree about what the same queue is.
+    // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and the
+    // public API cannot write it. Read as *no limit* rather than reported. Other SDKs sharing the
+    // database do not all read such a row the same way, so a hand-edited one can still make peers
+    // disagree about what the same queue is.
     //
     // One reader for both pairs, so the queue-wide limit and the per-partition one cannot come to
     // disagree about what half a limit means.
     //
-    // TODO(dbos-team): UPSTREAM item 4. Reading it away means a queue whose limit was half
-    // written runs unthrottled and says nothing, which is a silent safety failure rather
-    // than a cosmetic one; a `CHECK ((rate_limit_max IS NULL) = (rate_limit_period_sec IS
-    // NULL))` in a future shared migration would make the question moot for everyone.
+    // The cost: a queue whose limit was half written runs unthrottled and says nothing. The schema
+    // has no constraint pairing the columns; a `CHECK ((rate_limit_max IS NULL) =
+    // (rate_limit_period_sec IS NULL))` in a shared migration would rule the row out.
     let rate_limit = |max_column: &str, period_column: &str| -> Result<Option<RateLimit>, Error> {
         Ok(
             match (
@@ -2198,41 +2179,27 @@ fn latest_version_sql(versions_table: &str, named: bool) -> String {
 ///
 /// **A nameless writer is not thereby stopped from writing.** Leaving the owner intact means the
 /// *column*: the holder comes back, the write that follows is scoped to it, and so a handle with
-/// no application name of its own goes on to rewrite a row a named application holds. Item 26
-/// below.
+/// no application name of its own goes on to rewrite a row a named application holds. Whether a
+/// nameless writer should be allowed that is an open question shared with other SDKs on the same
+/// database; the alternative is to let it claim an unclaimed row but refuse an owned one, with
+/// [`Error::RegisteredByAnother`] and no `claimant`, which the variant already models.
 ///
 /// **Diagnostic, not a guard.** The writes it precedes match only a row that is unclaimed or
-/// already this application's, and that is what keeps a *named* peer's row safe. Item 2 below.
+/// already this application's, and that is what keeps a *named* peer's row safe. Callers resolve
+/// here and then write, and at READ COMMITTED — where every statement takes a fresh snapshot,
+/// transaction or not — a registrar can claim the row in between. The write then matches zero
+/// rows rather than landing on the wrong one, but the caller is told `Ok`, as it is for a version
+/// name that matches nothing at all. This read takes no `FOR UPDATE` lock that would close the gap.
 ///
-/// TODO(dbos-team): UPSTREAM item 9, per-application queue and schedule names. Their global
-/// uniqueness means two applications sharing a system database cannot both register `orders`, so
-/// anyone sharing one needs an application prefix by convention. A `(application_name, name)` key
-/// mirroring 106 and 107 would settle it, but it is a larger change than the version one, because
-/// `workflow_status.queue_name` stores a bare string that would then no longer identify a queue on
-/// its own.
-///
-/// TODO(dbos-team): UPSTREAM item 1. This read is exact only while the name is globally unique.
-/// Migrations 106 and 107 exist to replace `application_versions`' `UNIQUE (version_name)` with
-/// per-application keys, and when the old constraint is finally dropped a name may exist once per
-/// application — so this returns an arbitrary matching row and a claimant is non-deterministically
-/// refused or allowed. Python's `_resolve_row_owner` and TypeScript's `#resolveRowOwner` read by
-/// name alone too, so the drop migration wants an `application_name IS NOT DISTINCT FROM` scope on
-/// this read in all three, agreed before anyone writes the drop.
-///
-/// TODO(dbos-team): UPSTREAM item 2. Callers resolve here and then write, and at READ COMMITTED —
-/// where every statement takes a fresh snapshot, transaction or not — a registrar can claim the
-/// row in between. The write is self-guarding, so it matches zero rows rather than landing on the
-/// wrong one — but the caller is told `Ok`, as it is for a version name that matches nothing at
-/// all. `SELECT … FOR UPDATE` would close that, and neither reference does it — both lock rows
-/// only on the dequeue path — so it is a change to raise with them rather than make alone.
-///
-/// TODO(dbos-team): UPSTREAM item 26. The nameless branch above is a shared gap rather than this
-/// port's choice — all five resolvers return the holder to a claimant that has no name, and their
-/// callers then write scoped to it, so a nameless writer rewrites a peer's registration. Either
-/// that is what a nameless writer is for, in which case all five need to say so, or it may claim
-/// an unclaimed row but not overwrite an owned one, in which case this returns
-/// [`Error::RegisteredByAnother`] with no `claimant`, which the variant already models. Not a
-/// change to make in one implementation.
+/// **Exact only while the name is globally unique.** Queue and schedule names are unique across
+/// the whole database, so two applications sharing it cannot both register `orders` and need an
+/// application prefix by convention; keying them by `(application_name, name)` would also mean
+/// `workflow_status.queue_name`, a bare string, no longer identifies a queue on its own. Version
+/// names are moving the other way: migrations 106 and 107 add per-application keys to replace
+/// `application_versions`' `UNIQUE (version_name)`. Once that constraint is dropped a name may
+/// exist once per application, this read returns an arbitrary matching row, and a claimant is
+/// refused or allowed at random — so the drop needs an `application_name IS NOT DISTINCT FROM`
+/// scope on this read first.
 async fn resolve_owning_application(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
@@ -2434,8 +2401,8 @@ impl PostgresSystemDatabase {
         {
             // One statement, so the status and the step come from a single snapshot. Two queries
             // could straddle a cancellation — read PENDING, get cancelled, then replay a step of
-            // a cancelled workflow. Python avoids that by wrapping both in a transaction; the
-            // join gets the same consistency, and one round trip instead of two.
+            // a cancelled workflow. The join is as consistent as a transaction around both, in
+            // one round trip instead of two.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "SELECT s.status, {step_columns} \
                  FROM {workflow_table} s \
@@ -2578,8 +2545,7 @@ impl PostgresSystemDatabase {
             // `DO UPDATE` setting a column to itself rather than `DO NOTHING`: the point is to
             // make `RETURNING` fire on conflict, so the stored completion comes back and can be
             // compared. `DO NOTHING` returns no row, which cannot tell a step recorded already
-            // from this caller's own retry. Python and TypeScript use the same trick; Java uses
-            // `DO NOTHING` and so silently accepts a duplicate.
+            // from this caller's own retry, and so would silently accept a duplicate.
             //
             // `Option<Option<i64>>`: the outer is "was there a row", the inner is the column,
             // which is nullable because a caller may record a step without timings.
@@ -2627,12 +2593,10 @@ impl PostgresSystemDatabase {
 
             // Winning the checkpoint is what proves this executor is advancing the workflow, so
             // the claim is conditional on it — an executor that recovered a workflow from a dead
-            // peer takes ownership here, and one that lost the race does not. Java guards the
-            // same write with `if (won)`; TypeScript's comment reads "Winning the checkpoint
-            // proves this executor is advancing the workflow". Python re-stamps unconditionally
-            // and beforehand, which claims workflows it has just lost.
+            // peer takes ownership here, and one that lost the race does not. Claiming
+            // unconditionally, or before the insert, would claim workflows just lost.
             //
-            // Skipped when this process has no id, as Python does.
+            // Skipped when this process has no id, which leaves the column as it was.
             if let Some(executor_id) = executor_id {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {workflow_table} SET executor_id = $2 \
@@ -2653,9 +2617,9 @@ impl PostgresSystemDatabase {
     /// a retry restarting only this statement would leave the cascade around it half-walked.
     ///
     /// The clock is the transaction's. `now()` is `transaction_timestamp()` in Postgres, so every
-    /// level of one cascade stamps the same instant — where the references, whose levels each
-    /// commit on their own, write times that span the walk. Nothing reads the column to decide
-    /// anything, and one cancellation happening at one instant is the more honest of the two.
+    /// level of one cascade stamps the same instant, rather than times that span the walk. Nothing
+    /// reads the column to decide anything, and one cancellation happening at one instant is the
+    /// more honest record.
     ///
     /// The terminal-status guard is what makes cancellation safe to repeat: a workflow that has
     /// already succeeded keeps its result rather than being overwritten with `CANCELLED`.
@@ -2669,13 +2633,11 @@ impl PostgresSystemDatabase {
     {
         let workflow_table = &self.tables.workflow_status;
         let ids: Vec<&str> = workflow_ids.iter().map(AsRef::as_ref).collect();
-        // TODO(dbos-team): UPSTREAM item 6, clearing `started_at_epoch_ms` here. The rate limiter
-        // is the usual justification and does not apply: this statement sets `queue_name = NULL` on
-        // the same line, and the count is scoped by `queue_name`, so the row leaves the limiter
-        // through the name rather than through the start time. A workflow that was running when it
-        // was cancelled *did* start, so clearing the column discards true information and hides the
-        // row from `started_after`/`started_before`. Kept anyway — diverging from four
-        // implementations on a durable column is the worse trade.
+        // `started_at_epoch_ms` is cleared because that is the cancelled row other SDKs on the same
+        // database write; nothing here needs it. The rate limiter would not: the count is scoped by
+        // `queue_name`, which this statement also clears, so the row leaves the limiter through the
+        // name. A workflow that was running when it was cancelled *did* start, so clearing the
+        // column discards true information and hides the row from `started_after`/`started_before`.
         // `owner_xid` is cleared so the execution running a cancelled workflow, should it still
         // be writing, is refused at its next write.
         let cancelled: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
@@ -3150,11 +3112,9 @@ impl PostgresSystemDatabase {
             .await;
         };
 
-        // Python and TypeScript omit each bound until it has a value, so their select comes in two
-        // shapes and their update in three, with parameters pushed alongside whichever clauses were
-        // appended. `COALESCE($n, '')` collapses the missing-lower-bound case, leaving one select
-        // shape and two update shapes here — each with a fixed parameter count, so the bind list
-        // cannot drift out of step with the SQL.
+        // `COALESCE($n, '')` collapses the missing-lower-bound case rather than omitting the
+        // clause, leaving one select shape and two update shapes — each with a fixed parameter
+        // count, so the bind list cannot drift out of step with the SQL.
         //
         // The `batch_size`-th distinct key bounds each range, inclusively. The offset is one less
         // because `OFFSET` counts from zero, and `DISTINCT` is what keeps one workflow's steps
@@ -3340,10 +3300,10 @@ impl PostgresSystemDatabase {
                 .await?;
             }
 
-            // The column list is Java's INSERT, in its order, plus Python's two debounce
-            // columns. Columns absent from it are absent deliberately: `started_at`,
-            // `completed_at`, `forked_from`, `was_forked_from`, and `rate_limited` are written by
-            // execution, forking, and the rate limiter — never at creation. The legacy payload
+            // Every column a creation sets, the two debounce columns included. Columns absent
+            // from it are absent deliberately: `started_at`, `completed_at`, `forked_from`,
+            // `was_forked_from`, and `rate_limited` are written by execution, forking, and the
+            // rate limiter — never at creation. The legacy payload
             // columns, `inputs`, `output` and `error`, are never written at all: the input goes to
             // `workflow_input` below, and the outcome to `workflow_output`.
             //
@@ -3404,9 +3364,9 @@ impl PostgresSystemDatabase {
             .bind(workflow.priority)
             .bind(workflow.queue_partition_key)
             .bind(delay_ms)
-            // TypeScript and Go send `""` rather than null when there is no auth context, and
-            // Java normalises it on the way in for that reason. Storing both spellings would
-            // make an `authenticated_user IS NULL` filter miss rows another SDK wrote.
+            // An empty string means no auth context and is stored as null, so there is one
+            // spelling: storing both would make an `authenticated_user IS NULL` filter miss rows
+            // written with the other.
             .bind(empty_to_none(workflow.authenticated_user))
             .bind(empty_to_none(workflow.assumed_role))
             .bind(encode_roles(&workflow.authenticated_roles))
@@ -3425,14 +3385,10 @@ impl PostgresSystemDatabase {
             .bind(workflow.schedule_name)
             .bind(debounce_timeout_ms)
             .bind(workflow.is_debounced)
-            // Both Python and TypeScript apply the application name fallback a layer up, in the
-            // executor and the client. It is here so that this layer can stand alone.
-            //
-            // TODO(dbos-team): UPSTREAM item 3, which asks for nothing beyond awareness. Rows come
-            // out identical either way, since no upstream path arrives unfilled — but a reviewer
-            // comparing implementations should not read the extra fallback as a behavioural
-            // difference. The executor resolves the name above this layer, which makes this a
-            // redundant second line of defence — a reason to keep it rather than remove it.
+            // Falls back to the handle's application name at this layer, because steps stamp
+            // theirs from the handle too (and a fork claims an unowned source with it): a workflow
+            // that did not would be owned differently from its own steps. Callers above usually
+            // resolve the name already, so for them this is a second line of defence.
             .bind(
                 workflow
                     .application_name
@@ -3443,8 +3399,8 @@ impl PostgresSystemDatabase {
             // A unique violation here can only be the partial index on
             // `(queue_name, deduplication_id)`: the primary-key conflict is absorbed by
             // `ON CONFLICT (workflow_uuid)` above. Guarded on the caller having supplied a key
-            // rather than asserting it, as Python does, so an unexpected violation stays a
-            // backend error instead of being mislabelled.
+            // rather than assumed, so an unexpected violation stays a backend error instead of
+            // being mislabelled.
             .map_err(|e| match Error::from(e) {
                 Error::Backend(b)
                     if b.sqlstate.as_deref() == Some("23505")
@@ -3497,7 +3453,7 @@ impl PostgresSystemDatabase {
             }
 
             // Same id, different function: a programming error rather than a race, because the id
-            // is how every implementation decides two attempts are the same workflow.
+            // is what decides two attempts are the same workflow.
             //
             // A stored `''` is absent, as `NULL` is: other SDKs write either for a free function
             // or an unconfigured one, and this layer never stores `''` itself.
@@ -3854,23 +3810,18 @@ impl SystemDatabase for PostgresSystemDatabase {
                         );
                     }
                     if let Some(attributes) = &filter.attributes {
-                        // Containment, served by the GIN index. SQLite cannot reproduce `@>` and Go
-                        // rejects the filter there; both Postgres and CockroachDB support it.
+                        // Containment, served by the GIN index; both Postgres and CockroachDB
+                        // support it.
                         clause(&mut q, "attributes @> ");
                         q.push_bind(attributes).push("::jsonb");
                     }
 
-                    // `created_at` alone, which is what Python, TypeScript and Go all order by. It
-                    // is a millisecond stamp, so rows created inside one millisecond are returned
-                    // in an order this query does not fix — and `limit`/`offset` page through that
-                    // order. Adding `workflow_uuid` as a tiebreaker would settle it, and is
-                    // deliberately not done here: a listing that pages differently from every other
-                    // implementation is a worse problem than one that pages ambiguously in the same
-                    // way they do.
-                    //
-                    // TODO(dbos-team): UPSTREAM item 23. `limit`/`offset` page through this
-                    // order, so a boundary inside a tie hands one workflow to two pages and skips
-                    // another. Worth fixing in all four, and only there.
+                    // `created_at` alone. It is a millisecond stamp, so rows created inside one
+                    // millisecond come back in an order this query does not fix, and
+                    // `limit`/`offset` page through that order: a page boundary inside a tie can
+                    // hand one workflow to two pages and skip another. A `workflow_uuid`
+                    // tiebreaker would settle it; the order is left as it is because listings
+                    // from other SDKs on the same database page by `created_at` alone too.
                     q.push(if filter.sort_desc {
                         " ORDER BY created_at DESC"
                     } else {
@@ -3924,7 +3875,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 self.direct_children(&mut conn, &[workflow_id]).await?,
             );
 
-            // Level by level, as all four do. Terminates because `seen` only grows, so a cycle —
+            // Level by level. Terminates because `seen` only grows, so a cycle —
             // which the data should not contain — stops rather than looping.
             let mut start = 0;
             while start < descendants.len() {
@@ -3963,7 +3914,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             // finished workflow. It also makes this retry-safe — a
             // retry after a lost acknowledgement finds its own write and reports
             // `AlreadyFinished`, which is wrong only in that it is the caller's own outcome.
-            // Finishing releases the deduplication key, as it does in all four implementations.
+            // Finishing releases the deduplication key.
             // The unique index spans every status, so a key left on a finished row would be
             // held forever and nothing could ever be submitted under it again.
             //
@@ -4024,8 +3975,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         let (workflow_table, pool) = (workflow_table.as_str(), &self.pool);
         // Four columns and the attempt count, not the whole row: this runs once per interval for
         // as long as the caller waits, where `get_workflow` reads thirty-odd columns to answer a
-        // question about one. Python reads the same narrow set for the same reason. The outcome
-        // is read the way `get_workflow` reads it — see `workflow_payloads`.
+        // question about one. The outcome is read the way `get_workflow` reads it — see
+        // `workflow_payloads`.
         let select = format!(
             "SELECT status, {}, {}, serialization, recovery_attempts \
              FROM {workflow_table} WHERE workflow_uuid = $1",
@@ -4114,7 +4065,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         poll_interval: Duration,
     ) -> Result<String, Error> {
         // Refused rather than parked forever: `= ANY('{}')` matches nothing, so an empty wait would
-        // be a wait with no possible end. Python raises at the same point.
+        // be a wait with no possible end.
         if workflow_ids.is_empty() {
             return Err(Error::InvalidInput {
                 field: "workflow_ids".into(),
@@ -4187,15 +4138,13 @@ impl SystemDatabase for PostgresSystemDatabase {
         //
         // **It is also what keeps the narrowing linear.** A pass removes every id it watched
         // settle, and over a `Vec` each removal is a scan of the whole outstanding list — a fan-out
-        // of a few thousand pays that once per settled member per pass. TypeScript's
-        // `awaitWorkflowIds` carries its outstanding ids in a `Set` and deletes from it for the
-        // same reason; this is that, spelled in the type.
+        // of a few thousand pays that once per settled member per pass. A set deletes in
+        // constant time.
         let mut outstanding: HashSet<String> =
             workflow_ids.iter().map(|id| (*id).to_owned()).collect();
 
         while !outstanding.is_empty() {
-            // The bind wants a slice, so each pass materialises the ids it is about to ask about.
-            // TypeScript spreads its set into an array in the same spot, for the same reason —
+            // The bind wants a slice, so each pass materialises the ids it is about to ask about —
             // borrowed rather than cloned, because the set outlives the pass and a long fan-out
             // would otherwise copy every outstanding id once per interval.
             let ids: Vec<&str> = outstanding.iter().map(String::as_str).collect();
@@ -4303,7 +4252,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             AttributeUpdate::Replace(attributes) => ("$2::jsonb", attributes),
             // Read and written in the one statement, so a concurrent merge either lands first and
             // is merged into, or waits on the row lock and merges into this one. Anything that is
-            // not an object counts as an empty one, as Python's merge does.
+            // not an object counts as an empty one, so a merge always yields an object.
             AttributeUpdate::Merge(attributes) => (
                 "CASE WHEN jsonb_typeof(attributes) = 'object' \
                       THEN attributes ELSE '{}'::jsonb END || $2::jsonb",
@@ -4331,8 +4280,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                         .await?;
                         // Counted as matched, not as changed: a workflow whose attributes were
                         // absent, or already what is written, is one row. None means no workflow
-                        // has the id, which is refused as Go refuses it rather than reported as
-                        // done.
+                        // has the id, which is refused rather than reported as done.
                         if updated.rows_affected() == 0 {
                             return Err(Error::NonExistentWorkflow {
                                 workflow_ids: vec![workflow_id.to_owned()],
@@ -4366,8 +4314,8 @@ impl SystemDatabase for PostgresSystemDatabase {
             // cleared because the dead run no longer owns it: should it still be writing, its next
             // write is refused, and the claim that dequeues the row writes its own token.
             //
-            // `NULLIF` is Go's, and it is for rows this implementation did not write: older
-            // versions stored "not queued" as the empty string rather than NULL, and without it
+            // `NULLIF` is for rows this crate did not write: older SDK versions stored "not
+            // queued" as the empty string rather than NULL, and without it
             // such a row would keep `''` as its queue name and never be polled by anything.
             let ids: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "UPDATE {workflow_table} \
@@ -4552,7 +4500,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                     // are invisible to the workflows being cancelled until it commits, so a parent
                     // still running can commit a child after `direct_children` has passed its
                     // level. Each level's read simply takes a later snapshot than the last. See
-                    // the trait method, which sets this against Python's per-level commit.
+                    // the trait method.
                     let mut cancelled = self.cancel_batch(&mut tx, workflow_ids).await?;
                     if !cancel_children {
                         return Ok((tx, cancelled));
@@ -4730,13 +4678,6 @@ impl SystemDatabase for PostgresSystemDatabase {
         // Only the caller's own id is checked, not its ancestry: an ancestor is a target only when
         // it was named with `delete_children`, and then the walk above has already put the caller
         // in `targets`. A parent deleted on its own leaves this workflow's row alone.
-        //
-        // TODO(dbos-team): UPSTREAM item 25. The other three implementations write the same
-        // checkpoint and none of them refuses the call. Against the foreign key a self-delete
-        // failed there too — Python and TypeScript with the delete already committed and the
-        // checkpoint failing behind it — and without it, it succeeds and leaves the orphan.
-        // Whether a workflow may delete itself at all is the cross-implementation question; this
-        // refusal is the conservative reading, and is Rust alone until the four agree.
         if let Some(StepCaller {
             workflow_id: caller_id,
             ..
@@ -5134,15 +5075,10 @@ impl SystemDatabase for PostgresSystemDatabase {
         // recording the step. So the poll asks only whether something is waiting, and the taking
         // follows a yes, below. `LIMIT 1` because this asks a yes/no question: without it the
         // statement returns a row per unconsumed message, once per interval, for as long as the
-        // receiver waits — and a producer outrunning its consumer is exactly when that grows. Go
-        // asks the same question the same way, as `SELECT EXISTS (SELECT 1 …)`; Python, TypeScript
-        // and Java all project `topic` with no bound, and so all three pay for rows they discard.
-        // Bounding beats `EXISTS` here only in that nothing has to be decoded — a bare `1` types as
-        // `INT4` on PostgreSQL and `INT8` on CockroachDB, and a column never read cannot be read
-        // wrongly.
-        //
-        // TODO(dbos-team): UPSTREAM item 18. The three unbounded ones ship rows they discard, on
-        // the statement every waiting `recv` runs once per interval. One word fixes each.
+        // receiver waits — and a producer outrunning its consumer is exactly when that grows.
+        // `LIMIT 1` rather than `SELECT EXISTS (…)` only because nothing has to be decoded — a bare
+        // `1` types as `INT4` on PostgreSQL and `INT8` on CockroachDB, and a column never read
+        // cannot be read wrongly.
         let probe = format!(
             "SELECT 1 FROM {notifications_table} \
              WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE LIMIT 1"
@@ -5162,15 +5098,9 @@ impl SystemDatabase for PostgresSystemDatabase {
         // a no-op instead of a redundant write, and it means correctness does not rest on the step
         // insert being the thing that fails.
         //
-        // The destination and topic are *not* restated out here, though Python, TypeScript and Java
-        // all restate them: `message_uuid` is the primary key, so the row the subquery names
-        // already carries both and repeating them cannot exclude anything.
-        //
-        // TODO(dbos-team): UPSTREAM item 16. Go omits this predicate — the only one of the five
-        // to do so — and gets away with it: `runAsTxn` puts `ConsumeMessage` and
-        // `RecordOperationResult` in one transaction under `defer tx.Rollback`, so the second
-        // execution's record conflicts on `(workflow_uuid, function_id)` and its consumption is
-        // discarded with it. The divergence stands and the one-line fix is still worth making.
+        // The destination and topic are *not* restated out here: `message_uuid` is the primary key,
+        // so the row the subquery names already carries both and repeating them cannot exclude
+        // anything.
         //
         // `consumed_by_function_id` is this recv's own step, not its timeout's: it is what a
         // rewind compares against its cut, and the cut is a step a replay re-runs from.
@@ -5627,11 +5557,11 @@ impl SystemDatabase for PostgresSystemDatabase {
         with_retry(&self.retry, "check_step_at_or_after", move || async move {
             // One statement, so the status and the step come from one snapshot, as in
             // `check_step_on`. The step is one entry of the `(workflow_uuid, function_id)` primary
-            // key, read by the query Python and Java run. **Its subquery names `$1` rather than
-            // correlating on `s.workflow_uuid`**: CockroachDB decorrelates a `LATERAL` into a join
-            // and applies the `LIMIT` after it, decoding every step from the position to the end
-            // of the history, which on a replayed patch is the rest of the workflow. Uncorrelated,
-            // the limit stays in the scan on both databases.
+            // key. **Its subquery names `$1` rather than correlating on `s.workflow_uuid`**:
+            // CockroachDB decorrelates a `LATERAL` into a join and applies the `LIMIT` after it,
+            // decoding every step from the position to the end of the history, which on a replayed
+            // patch is the rest of the workflow. Uncorrelated, the limit stays in the scan on both
+            // databases.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "SELECT s.status, o.function_id, o.function_name \
                  FROM {workflow_table} s \
@@ -6008,7 +5938,7 @@ impl SystemDatabase for PostgresSystemDatabase {
 
         // **Outside a workflow this is the whole call.** There is no step to record, so there is
         // nothing for a transaction to be atomic with — and the last look the loop took is the
-        // answer. TypeScript returns its polled row the same way.
+        // answer.
         let Some(caller) = caller else {
             tracing::debug!(
                 workflow_id,
@@ -6065,8 +5995,9 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // The event's own encoded value under the event's own format, not a wrapper around the
             // pair — so the column holds what the publisher wrote and stays legible to whoever
-            // reads the row, this crate included. All four references record exactly this. A
-            // timeout records a NULL output, which is how they spell "there was nothing" too.
+            // reads the row, this crate included; other SDKs on the same database record the
+            // step in this shape too. A timeout records a NULL output, the shared spelling of
+            // "there was nothing".
             self.record_step_on(
                 &mut tx,
                 caller.workflow_id,
@@ -6671,16 +6602,12 @@ impl SystemDatabase for PostgresSystemDatabase {
         local_running_count: i64,
         partition_local_running_count: i64,
     ) -> Result<Dequeued, Error> {
-        // Refused rather than matched, because no row can hold it: `NewWorkflow` and
-        // `ForkOptions` both reject an empty partition key on the way in. Accepting it here would
-        // select nothing and report an empty partition, which reads as "no work" rather than as
-        // the mistake it is.
-        //
-        // TODO(dbos-team): UPSTREAM item 5 — an empty partition key means four different things
-        // across the four implementations. Rust refuses it, which is the only answer consistent
-        // with `NewWorkflow::validate` rejecting the same value on the way in; whether the others
-        // should reject it too, or Rust should normalise as Go and Java do, is a cross-SDK
-        // decision rather than one to take here.
+        // Refused rather than matched, because no row written through this crate can hold it:
+        // `NewWorkflow` and `ForkOptions` both reject an empty partition key on the way in.
+        // Accepting it here would select nothing and report an empty partition, which reads as
+        // "no work" rather than as the mistake it is. Other SDKs on the same database do not all
+        // treat an empty key this way — some normalise it to no key — so whether it should be
+        // refused or normalised is an open question.
         if partition_key == Some("") {
             return Err(Error::InvalidInput {
                 field: "partition_key".into(),
@@ -6916,14 +6843,15 @@ impl SystemDatabase for PostgresSystemDatabase {
                 .await?;
             let version_predicate = version_predicate(is_latest, 3);
 
-            // TODO(dbos-team): UPSTREAM item 7. CockroachDB resolves write intents
+            // **`SKIP LOCKED` under-delivers on CockroachDB.** It resolves write intents
             // asynchronously after a commit, and `SKIP LOCKED` skips a row whose intent is still
             // unresolved rather than waiting, so a workflow enqueued moments ago is passed over
-            // and the dequeue comes back short. A plain `FOR UPDATE` on CockroachDB measures
-            // clean and is what the item recommends, here and in the partitioned sweep's lock
-            // step; it is not applied yet, because the cost is that concurrent dequeues on one
-            // queue serialise there, and no implementation varies its SQL for it. No barrier
-            // outside this statement helps — a row is readable while still being skippable. The
+            // and the dequeue comes back short. A plain `FOR UPDATE` there measures clean, here
+            // and in the partitioned sweep's lock step; it is not applied, because concurrent
+            // dequeues on one queue would then serialise, and the lock mode is the same on both
+            // backends. No barrier outside this statement helps — a row is readable while still
+            // being skippable. Whether CockroachDB should take `FOR UPDATE` instead is an open
+            // question shared with the other SDKs on the same database; until it is settled, the
             // integration tests that assert a complete dequeue are skipped on CockroachDB.
             //
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
@@ -7126,8 +7054,7 @@ impl SystemDatabase for PostgresSystemDatabase {
         // reaches every partition, so ordering by key is free and makes the claim deterministic.
         // A sweep the caller's budget cuts short does not reach every partition, and taking the
         // lowest keys every time would leave the tail of a large partition set permanently unserved
-        // under sustained load. TypeScript switches on the same condition; the walk in `dequeue`
-        // shuffles for the same reason.
+        // under sustained load. The walk in `dequeue` shuffles for the same reason.
         let sweep_order = if sweep_limit < cap {
             "random()"
         } else {
@@ -7177,12 +7104,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // It is bounded and it heals — `sweep_order` is `random()` in exactly the case
                 // the budget binds, so no partition is masked twice running, and a short sweep
                 // reports no contention, so the poller scales *back* towards the queue's interval
-                // rather than backing off.
-                //
-                // TODO(dbos-team): UPSTREAM item 21. Python and TypeScript place the `LIMIT` and
-                // the version predicate here too, and the fix worth having —
-                // `application_version` in `idx_workflow_status_partition_dequeue_v3` — is a
-                // shared migration in any case.
+                // rather than backing off. Adding `application_version` to
+                // `idx_workflow_status_partition_dequeue_v3` would let `chosen` filter by version
+                // cheaply; that index is shared schema, so it needs a shared migration.
                 //
                 // `LATERAL` rather than a correlated scalar subquery: it plans as a tight nested
                 // loop instead of a slower per-row subplan. `workflow_uuid` totalizes the head
@@ -7192,7 +7116,7 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // row the probe is not a top-1 at all: `application_version` is not in the index,
                 // so it walks that partition's entries and heap-checks each to return nothing.
                 // That cost is paid whatever the `LIMIT` bounds, and it is why the index, rather
-                // than the `LIMIT`, is what item 21 proposes moving. The `NOT EXISTS` on
+                // than the `LIMIT`, is the thing to change. The `NOT EXISTS` on
                 // `PENDING` is unscoped by design — a mutual-exclusion probe must block on any
                 // owner's row.
                 //
@@ -7251,10 +7175,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                             OR application_name IS NULL)"
                 );
 
-                // TODO(dbos-team): UPSTREAM item 7. This `SKIP LOCKED` under-delivers on
-                // CockroachDB for the reason given on `start_queued_workflows` — a head enqueued
-                // moments ago is skipped and its partition idles until the next sweep. The item's
-                // recommended plain `FOR UPDATE` applies here as well as there.
+                // This `SKIP LOCKED` under-delivers on CockroachDB for the reason given in
+                // `start_queued_workflows`: a head enqueued moments ago is skipped and its
+                // partition idles until the next sweep.
                 //
                 // Locks the fixed candidate set rather than re-selecting with a `LIMIT`, whose
                 // `SKIP LOCKED` could slide past a locked head and admit a partition's second
@@ -7284,9 +7207,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                 // `RETURNING` reports exactly the rows this statement flipped, which is what
                 // makes the guard the admission control rather than a check before one.
                 //
-                // Counts `recovery_attempts` for the reason the unpartitioned sweep gives, and
-                // both count because both are claims: TypeScript increments in each of its two
-                // as well.
+                // Counts `recovery_attempts` for the reason the unpartitioned sweep gives: both
+                // are claims.
                 //
                 // The deadline saturates, as in the unpartitioned claim; see `now_ms_plus_sql`.
                 let deadline_from_timeout = now_ms_plus_sql("workflow_timeout_ms");
@@ -7348,8 +7270,7 @@ impl SystemDatabase for PostgresSystemDatabase {
             "get_deduplication_key_holder",
             move || async move {
                 // No status filter, and none is needed: every terminal transition clears the key,
-                // so a row still carrying one is by definition an active holder. The references
-                // filter on nothing either.
+                // so a row still carrying one is by definition an active holder.
                 let holder: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                     "SELECT workflow_uuid FROM {workflow_table} \
                      WHERE queue_name = $1 AND deduplication_id = $2"
@@ -7434,8 +7355,8 @@ impl SystemDatabase for PostgresSystemDatabase {
 
             // `FOR UPDATE` rather than a stricter isolation level: the row is held for the rest of
             // the transaction, so a peer planning against the same queue waits here instead of
-            // racing to the `UPDATE` and having its whole attempt thrown away. Go takes the other
-            // route — repeatable read, and a retry on the serialization failure that follows.
+            // racing to the `UPDATE` and having its whole attempt thrown away, as it would under
+            // repeatable read and a retry on the serialization failure that follows.
             let row = sqlx::query(AssertSqlSafe(format!(
                 "SELECT {QUEUE_COLUMNS} FROM {queues_table} WHERE name = $1 FOR UPDATE"
             )))
@@ -7569,8 +7490,8 @@ impl SystemDatabase for PostgresSystemDatabase {
                     |mut tx| async move {
                         // The cap is what stops a steady stream of requests postponing the workflow
                         // forever: past the deadline, the delay stops moving. `CASE` rather than
-                        // the `LEAST` this backend has, so the statement stays diffable against the
-                        // four references, which all spell the cap out this way.
+                        // `LEAST`, so what a NULL deadline means — no cap — is spelled out rather
+                        // than left to how `LEAST` treats a NULL argument.
                         //
                         // `is_debounced` and the workflow's identity are both in the guard. Without
                         // the identity, two unrelated workflows whose keys happen to concatenate
@@ -7752,10 +7673,9 @@ impl SystemDatabase for PostgresSystemDatabase {
                     )
                     .await?;
 
-                    // A plain insert, as all four references issue: the unique index refuses a name
-                    // already taken, and there is nothing to do afterwards but say which index it
-                    // was. Python and TypeScript catch the violation and report the name; the
-                    // constraint tells us whether the id collided instead, which they cannot.
+                    // A plain insert: the unique index refuses a name already taken, and there is
+                    // nothing to do afterwards but say which index it was. The violated constraint
+                    // also tells a colliding id apart from a colliding name.
                     let inserted = sqlx::query(AssertSqlSafe(format!(
                         "INSERT INTO {schedules_table} \
                          (schedule_id, schedule_name, workflow_name, workflow_class_name, \
@@ -8046,8 +7966,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        // Pause and resume are two API calls in the references and two step names with them, so a
-        // replay of one is not mistaken for the other.
+        // Pause and resume are two step names, so a replay of one is not mistaken for the other.
+        // Both are shared with other SDKs on the same database.
         let step_name = match status {
             ScheduleStatus::Active => step_names::RESUME_SCHEDULE,
             ScheduleStatus::Paused => step_names::PAUSE_SCHEDULE,
@@ -8296,10 +8216,8 @@ impl PostgresSystemDatabase {
         // re-run the send, and a message list that came out empty once and non-empty the next
         // time would be delivered for real. Recording it makes the replay a replay.
         //
-        // **The two batch implementations disagree.** Python guards only its insert with
-        // `if rows` and records the step regardless; Java returns early on an empty list and
-        // records nothing. Python's is the safer half of that split, for the reason above, and
-        // an empty send is cheap to record.
+        // So only the insert is skipped for an empty list, never the step: returning early would
+        // leave that hole, and an empty send is cheap to record.
         //
         // With nothing to send *and* no step to record, there is genuinely nothing to do.
         if messages.is_empty() && caller.is_none() {
@@ -8307,15 +8225,13 @@ impl PostgresSystemDatabase {
         }
         // Two messages under one key would give two rows the same primary key, so the second
         // would be silently discarded as a duplicate of the first. A caller who did that does not
-        // know they have sent one message, and the database cannot tell them. Both
-        // implementations with a batch API reject this — Python raises, Java throws — and
-        // neither of the two without one can.
+        // know they have sent one message, and the database cannot tell them. So a batch that
+        // repeats a key is refused before anything is written.
         //
-        // The *empty* key is ours to decide, because they disagree: Python treats `""` as falsy
-        // and so as absent, giving the message a generated id; Java treats it as a real key, so
-        // one message keys on `"::destination"` and two collide. Refusing it picks neither
-        // reading of an input that means nothing, and matches how this layer treats every other
-        // empty string.
+        // The *empty* key is refused too. Read as absent, it would quietly give the message a
+        // generated id; read as a real key, one message would key on `"::destination"` and two
+        // would collide. Refusing it picks neither reading of an input that means nothing, and
+        // matches how this layer treats every other empty string.
         let mut keys = HashSet::with_capacity(messages.len());
         for message in messages {
             if let Some(key) = message.idempotency_key {

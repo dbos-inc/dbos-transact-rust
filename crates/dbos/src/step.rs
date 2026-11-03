@@ -30,26 +30,20 @@ pub type ShouldRetry<E> = Arc<dyn Fn(&Error<E>) -> bool + Send + Sync>;
 /// form. Deliberately **not** `#[non_exhaustive]`, so `..Default::default()` keeps working as
 /// fields are added.
 ///
-/// **The defaults are the three-way majority, not Go's.** Python, TypeScript and Java all use a
-/// one-second base with a 2.0 rate; Go uses 100ms with a five-second cap, which is a different
-/// feature — that one is for a flaky network call, this one is for an upstream that is down.
+/// **The defaults are sized for a dependency that is down, not a flaky call**: a one-second base
+/// that doubles after each failure, up to an hour.
 ///
-/// **The predicate is synchronous**, unlike Python's and TypeScript's, which also accept an
-/// `async` one. Go's `WithStepRetryPredicate` and Java's `StepShouldRetry` are both synchronous, so
-/// this is 2-of-4 rather than a deviation from consensus — and in Rust the two are not equally
-/// priced. An async predicate cannot be stored in a struct field without boxing its future, so
-/// every caller would write `Arc::new(|e| Box::pin(async move { .. }))` to express what is almost
-/// always a pure match on an error. A check that genuinely has to await belongs in the body, which
-/// can return an error the predicate then declines.
+/// **The predicate is synchronous.** An async predicate cannot be stored in a struct field
+/// without boxing its future, so every caller would write
+/// `Arc::new(|e| Box::pin(async move { .. }))` to express what is almost always a pure match on
+/// an error. A check that genuinely has to await belongs in the body, which can return an error
+/// the predicate then declines.
 pub struct StepOptions<E = EngineOnly> {
     /// How many times the body may run before the step is failed. Defaults to **1**: no retrying.
     ///
-    /// All four references agree that a plain step does not retry, and spell it three different
-    /// ways — Python and TypeScript with a `retries_allowed` boolean beside a count, Go with
-    /// `maxRetries == 0`, Java by flooring `maxAttempts` at 1. The count alone is taken here
-    /// because a boolean beside it can express `retries_allowed: false, max_attempts: 5`, which
-    /// means nothing, and an option that cannot state a contradiction is worth more than one that
-    /// matches a reference's field list.
+    /// The count alone says whether a step retries. A `retries_allowed` boolean beside it could
+    /// express `retries_allowed: false, max_attempts: 5`, which means nothing, and an option that
+    /// cannot state a contradiction is worth more than one that can.
     ///
     /// Zero is treated as one: a step whose body never runs is not a step.
     pub max_attempts: u32,
@@ -65,11 +59,11 @@ pub struct StepOptions<E = EngineOnly> {
     /// the next suspension point while running destructors on the way out — and the step fails
     /// with [`Error::StepTimeout`]. That is an ordinary retryable failure: it is offered to
     /// [`should_retry`](Self::should_retry) and counts against
-    /// [`max_attempts`](Self::max_attempts), as TypeScript's `timeoutMS` also specifies.
+    /// [`max_attempts`](Self::max_attempts).
     ///
     /// **Each attempt gets its own timeout, and backoff is not charged against it.** Three
-    /// attempts at five seconds may spend fifteen seconds in the body. Python states the same
-    /// layering where it puts the supervisor inside the retry loop.
+    /// attempts at five seconds may spend fifteen seconds in the body: the supervisor runs inside
+    /// the retry loop, once per attempt.
     ///
     /// Before the future is dropped, the attempt's cancellation token fires, which
     /// [`cancellation_token`](crate::cancellation_token) hands to the body — the way to stop work
@@ -77,9 +71,9 @@ pub struct StepOptions<E = EngineOnly> {
     /// need none of it: they stop at their next suspension point and run their destructors,
     /// returning connections and releasing guards without the body saying so.
     ///
-    /// **Unlike Python, this is not restricted to some kinds of step.** py #826 rejects a timeout
-    /// on a sync step because *"Python has no preemption mechanism for sync steps"*; every step
-    /// here is a future, so there is no second case to exclude and no error to raise.
+    /// **Any step may take one.** Every step is a future, so any step can be dropped at a
+    /// suspension point and there is no error to raise for asking. Work dropping cannot reach,
+    /// such as a blocking thread, is what the cancellation token is for.
     pub timeout: Option<Duration>,
     /// Whether to stop this step as soon as the workflow is seen to be `CANCELLED` elsewhere.
     ///
@@ -91,8 +85,7 @@ pub struct StepOptions<E = EngineOnly> {
     ///
     /// The cost is a periodic status read per running step, at
     /// [`Config::outcome_poll_interval`](field@crate::Config::outcome_poll_interval), under the same
-    /// polling-concurrency cap as every other database-backed wait. Python's `preemptible` does
-    /// the same and hardcodes its interval.
+    /// polling-concurrency cap as every other database-backed wait.
     ///
     /// **A preempted step records nothing** and runs again on resume, because a cancellation is a
     /// control signal rather than the step's result — the step did not fail, it was interrupted.
@@ -100,13 +93,10 @@ pub struct StepOptions<E = EngineOnly> {
     /// Decides whether a failure is worth retrying. `None` retries every failure.
     ///
     /// Returning `false` ends the step immediately with that error, even with attempts left — so a
-    /// 4xx from an API is not hammered three times while a 5xx is. Named for the majority: Python's
-    /// `should_retry`, TypeScript's `shouldRetry` and Java's `StepShouldRetry` agree, and only Go
-    /// spells it `WithStepRetryPredicate`.
+    /// 4xx from an API is not hammered three times while a 5xx is.
     ///
-    /// **It is evaluated before the backoff sleep**, so declining an error costs no wait. That is
-    /// Go's documented behaviour and the only sensible order: waiting to find out whether to wait
-    /// helps nobody.
+    /// **It is evaluated before the backoff sleep**, so declining an error costs no wait: waiting
+    /// to find out whether to wait helps nobody.
     ///
     /// **A control signal never reaches it.** Cancellation, shutdown and system-database failures
     /// other than a typed refusal end the step before the policy is consulted, so a predicate
@@ -228,8 +218,8 @@ impl<E> StepOptions<E> {
 /// `.map_err(MyError::from)?`.
 ///
 /// Outside a workflow the body simply runs, undurably. That makes a function built from steps
-/// ordinarily callable and ordinarily testable, and it is what Python does. Inside another step the
-/// same applies: a step is a leaf, so a nested one is a plain call rather than a second checkpoint.
+/// ordinarily callable and ordinarily testable. Inside another step the same applies: a step is a
+/// leaf, so a nested one is a plain call rather than a second checkpoint.
 ///
 /// **Steps may run concurrently, and the id is what makes that sound.** This call takes the id
 /// from the workflow's counter *here*, in the caller's own sequential order, and hands back a
@@ -319,7 +309,7 @@ where
 /// **Every attempt shares one checkpoint.** The recorded result is looked for once, before the
 /// first attempt, and written once, after the last; a replay of a step that took three attempts
 /// sees one outcome, and the intermediate failures live only in logs and spans. That is why
-/// `operation_outputs` has no attempt column in any of the five implementations.
+/// `operation_outputs` has no attempt column.
 ///
 /// **A control signal is never retried.** Cancellation, shutdown, and any system-database failure
 /// other than a typed refusal end the step immediately with nothing recorded, so the workflow
@@ -328,8 +318,7 @@ where
 /// attempt.
 ///
 /// The recorded `started_at` covers the **whole sequence**, from before the recorded-result check
-/// to after the final attempt, rather than the last attempt alone. Python takes its
-/// `step_start_time` in the same place, and so does Go (#442).
+/// to after the final attempt, rather than the last attempt alone.
 pub fn step_with<'a, T, E, F, Fut>(
     name: &str,
     options: StepOptions<E>,
@@ -395,8 +384,7 @@ where
     let workflow_id = ctx.workflow_id();
 
     // Before the check, not after it: the recorded duration covers the whole step, including the
-    // round trip that asks whether it has already run. Python takes `step_start_time` here, and
-    // so does Go (#442).
+    // round trip that asks whether it has already run.
     let started_at = Timestamp::now();
 
     let recorded = executor
@@ -473,8 +461,7 @@ where
                 });
             }
             // Declined by the policy: this failure is the step's outcome, whatever attempts
-            // remain. Checked before the backoff so refusing to retry costs no wait, which is Go's
-            // documented order for the same hook.
+            // remain. Checked before the backoff so refusing to retry costs no wait.
             Err(error)
                 if options
                     .should_retry
@@ -623,19 +610,17 @@ fn encode_step_error<T, E: DurableError>(
 
 /// Runs one attempt under the watchdogs its options ask for.
 ///
-/// One place decides whether the attempt completed or blew its deadline, which is the shape of
-/// Python's `_supervise_step` (py #826), where the preemption poller and the step timeout share
-/// one loop. Preemption joins here rather than beside it.
+/// One place decides whether the attempt completed, blew its deadline or was preempted: the
+/// preemption poller and the step timeout share one `select!` rather than racing beside it.
 ///
 /// **Without a timeout this is the body and nothing else** — no timer, no token, no `select!` —
 /// so a step that does not ask for one pays nothing for the option existing.
 ///
 /// With one, the attempt races a timer. On expiry the token fires *first* and the body's future is
 /// then dropped, and the order matters: dropping stops the future at its next suspension point, so
-/// anything that would only learn from the token has to be told before it goes. Dropping is also
-/// the half TypeScript cannot do — it abandons a timed-out attempt and discards whatever the
-/// abandoned promise eventually settles to, while a dropped Rust future stops *and* runs its
-/// destructors, returning connections and releasing guards without the body saying so.
+/// anything that would only learn from the token has to be told before it goes. A dropped future
+/// stops *and* runs its destructors, returning connections and releasing guards without the body
+/// saying so.
 async fn supervise<T, E, Fut>(
     ctx: &Ctx,
     name: &str,
@@ -714,7 +699,7 @@ where
     // not checkpointing a cancelled workflow's step is the safer error — a timeout is recorded and
     // replays as a failure, while a cancellation records nothing and runs again on resume. Getting
     // the tie wrong this way costs one re-execution; getting it wrong the other way durably fails a
-    // workflow that was never given a chance. Python states the same rule for the same reason.
+    // workflow that was never given a chance.
     tokio::select! {
         biased;
         outcome = attempt => outcome,
@@ -748,8 +733,7 @@ where
 /// what preemption needs from the database. That method already polls the status row, already
 /// reports a cancellation as a *value* rather than an error, already releases its connection
 /// between polls, and already runs under the polling-concurrency cap that stops a fan-out of
-/// waiters from starving the control plane. Python's poller is the same loop over
-/// `get_workflow_status`, with an interval it hardcodes and this one takes from config.
+/// waiters from starving the control plane. Its interval comes from config.
 ///
 /// A terminal outcome that is *not* a cancellation means another executor wrote this workflow's
 /// result while this process was still running it. There is nothing to preempt for — the step's
@@ -843,9 +827,9 @@ mod tests {
         assert_eq!(overflows.backoff(2), cap);
     }
 
-    /// The default is the three-way majority, and it does not retry.
+    /// The default backoff is a one-second base doubling to an hour, and it does not retry.
     #[test]
-    fn the_defaults_match_python_typescript_and_java() {
+    fn the_defaults_are_a_one_second_doubling_backoff_without_retries() {
         let options = StepOptions::<EngineOnly>::default();
         assert_eq!(options.max_attempts, 1, "a plain step does not retry");
         assert_eq!(options.interval, Duration::from_secs(1));
@@ -1158,8 +1142,8 @@ mod tests {
 
         Ctx::scope(ctx(&dbos, "wf-nested"), async {
             step("outer", || async {
-                // A step is a leaf (Go draws the same line in #420). Were this to allocate an id,
-                // every step after it would replay against the wrong slot.
+                // A step is a leaf. Were this to allocate an id, every step after it would replay
+                // against the wrong slot.
                 let inner = step("inner", || async { Ok::<_, crate::Error>(1u32) })
                     .await
                     .unwrap();

@@ -748,8 +748,8 @@ struct RawEnvelope<'a> {
 ///
 /// All four fields are always written, `null` where there is nothing to say. On the way in,
 /// `name` is required — every SDK writes it, and it is what makes an object an envelope rather
-/// than some other JSON — while a missing or `null` `message` reads as empty, since a Java
-/// exception may have none.
+/// than some other JSON — while a missing or `null` `message` reads as empty, since an error
+/// raised with no message is written that way.
 #[derive(Debug, Serialize, Deserialize)]
 struct PortableError {
     name: String,

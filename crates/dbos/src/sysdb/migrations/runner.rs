@@ -117,13 +117,12 @@ pub enum MigrateError {
     },
     /// The schema is older than this build needs, and migrating was not asked for.
     ///
-    /// **The message names DBOS Rust rather than "DBOS"**, because five implementations share one
-    /// schema and the reader's next question is whose requirement is unmet: a database migrated by
-    /// a peer that stops short of what this build reads is exactly the case
-    /// [`verify`] exists to catch. It also names no flag, because the two
-    /// callers do not have the same one — an instance can be launched with
-    /// [`Config::migrate`](crate::Config::migrate), and a [`Client`](crate::Client) has no such
-    /// field at all — so the advice is the remedy rather than the knob.
+    /// **The message names DBOS Rust rather than "DBOS"**, because every DBOS SDK shares one schema
+    /// and the reader's next question is whose requirement is unmet: a database migrated by a peer
+    /// that stops short of what this build reads is exactly the case [`verify`] exists to catch. It
+    /// also names no flag, because the two callers do not have the same one — an instance can be
+    /// launched with [`Config::migrate`](crate::Config::migrate), and a [`Client`](crate::Client)
+    /// has no such field at all — so the advice is the remedy rather than the knob.
     Outdated {
         /// The version the database records. `0` means nothing has ever migrated it.
         recorded: i64,
@@ -259,8 +258,7 @@ async fn record_version(
 /// not recover. CockroachDB has no such state.
 async fn drop_invalid_indexes(pool: &PgPool, schema: &str) -> Result<(), sqlx::Error> {
     // Joined through the *table's* namespace rather than the index's. The two are always the
-    // same in PostgreSQL, but this is the form the other implementations use, so a future
-    // comparison against them is a plain diff.
+    // same in PostgreSQL.
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT i.relname FROM pg_index ix \
          JOIN pg_class i ON i.oid = ix.indexrelid \
@@ -307,9 +305,9 @@ async fn drop_invalid_indexes(pool: &PgPool, schema: &str) -> Result<(), sqlx::E
 ///   `$$`-quoted function bodies.
 /// - **A migration and its version write commit together** wherever a transaction is possible,
 ///   which is everything except the online ones. That is required rather than tidy for
-///   migrations in the shared series: every implementation runs those against databases they
-///   share, and migration 105 drops and recreates `enqueue_workflow`, so a peer must never
-///   find the function missing in between.
+///   migrations in the shared series: every SDK on the database runs those against it, and
+///   migration 105 drops and recreates `enqueue_workflow`, so a peer must never find the
+///   function missing in between.
 pub async fn run(
     pool: &PgPool,
     schema: &str,
@@ -341,9 +339,9 @@ pub async fn run(
 /// from migration 101 and the per-partition limits from 108, and every payload read and write
 /// goes through migration 109's tables — so a database that stopped short of the ceiling is one
 /// this build cannot be sure of reading, whatever it can parse. The distinction matters because
-/// the SDKs reach the series at different paces: a database another implementation's older
-/// release migrated (Java 1.1 stops at 112, Go 1.4 at 113) is turned away here rather than read
-/// on the assumption that the missing migrations do not matter.
+/// the SDKs reach the series at different paces: a database an older release of another SDK
+/// migrated, stopping short of the ceiling, is turned away here rather than read on the
+/// assumption that the missing migrations do not matter.
 pub async fn verify(pool: &PgPool, schema: &str) -> Result<(), MigrateError> {
     let required = i64::from(SHARED_MIGRATIONS);
     let recorded = match recorded_version(pool, schema).await {

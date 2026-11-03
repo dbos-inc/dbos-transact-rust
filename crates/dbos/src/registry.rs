@@ -125,8 +125,8 @@ pub(crate) type Snapshot = Arc<HashMap<QualifiedWorkflowName, RegisteredWorkflow
 impl Registry {
     /// Registers `workflow` under `name`, refusing a second registration of the same identity.
     ///
-    /// Uniqueness is on the whole triple, which is Java's model and the strictest of the three:
-    /// a name that resolves to two functions is a workflow that recovers as the wrong one.
+    /// Uniqueness is on the whole triple: a name that resolves to two functions is a workflow that
+    /// recovers as the wrong one.
     ///
     /// Refuses outright once frozen. The operation is named here rather than passed in because
     /// registration is the only thing that inserts.
@@ -571,8 +571,8 @@ mod tests {
 
     #[test]
     fn a_row_written_with_empty_strings_resolves_to_the_same_key_as_one_written_with_nulls() {
-        // Some SDKs spell absence `""` where Python writes NULL, and both must find this
-        // registration.
+        // SDKs sharing the database spell absence either as `""` or as NULL, and both must find
+        // this registration.
         let free = QualifiedWorkflowName::new("checkout");
         assert_eq!(
             QualifiedWorkflowName::from_row("checkout", None, None),
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn a_key_displays_as_the_triple_the_references_spell() {
+    fn a_key_displays_as_its_slash_separated_triple() {
         assert_eq!(
             QualifiedWorkflowName::new("checkout").to_string(),
             "checkout"

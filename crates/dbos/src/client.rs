@@ -7,16 +7,11 @@
 //! an HTTP front end that hands work to a worker fleet, a cron host, an operator's tool, a test
 //! that drives an application it did not start.
 //!
-//! Every implementation ships one — `DBOSClient` in Python, TypeScript and Java, `dbos.Client` in
-//! Go — and they agree on what it is for and disagree on what it *is*. Go makes a client a
-//! `Context` with a flag on it, so every runtime method is on the client and every client method is
-//! on the runtime. The other three make it a separate class over the system database alone. Rust
-//! follows the three, and follows **Java** in particular for the internals: a [`Client`] holds a
-//! connection — the system-database handle, the serializer, the application name, the poll
+//! A [`Client`] is a separate type over the system database alone, not a mode of the runtime. It
+//! holds a connection — the system-database handle, the serializer, the application name, the poll
 //! interval — and no [`Executor`](crate::Executor), because an executor is the machinery for
 //! running workflows and a client runs none. What both surfaces need is a method on that
-//! connection, which is what Java's `static DBOSExecutor.enqueueWorkflow(...)` is for: its client
-//! calls it with no executor in sight.
+//! connection, so a client calls it with no executor in sight.
 //!
 //! The type system then makes the boundary concrete twice over. Nothing on this type can fail with
 //! [`Error::NotLaunched`], because **a client is always connected** — [`connect`](Client::connect)
@@ -35,17 +30,6 @@
 //! migrations off verifies the schema rather than ignoring it, so a missing or outdated one is
 //! reported at [`connect`](Client::connect) naming the version it found, rather than as whatever
 //! SQL error the first real call happens to raise.
-//!
-//! **None of the four implementations migrates from a client**, and only Go checks. Go's
-//! `NewClient` sets `SkipMigrations: true` — *"Clients never own the schema"* — which routes it
-//! through the same `VerifyMigrations` this does, and fails construction on a database behind the
-//! build. Python's client says it does not migrate (*"We only create database connections but do
-//! not run migrations"*) and does not verify either: its `verify_migrations` exists but is reached
-//! only from `DBOS.launch`. TypeScript's is the same shape — `SystemDatabase.init`, which picks
-//! between migrating and verifying, is called by the executor and never by `DBOSClient`. Java's
-//! client constructs a `SystemDatabase` directly and `MigrationManager` is reached only from
-//! `DBOS.launch`, so its `getCurrentSysDbVersion` is never consulted from a client at all. In
-//! those three a mismatched schema surfaces as whatever SQL error the first real call raises.
 //!
 //! **It has no application version of its own**, so it stamps none unless an enqueue names one.
 //! A client's binary is not the application's.
@@ -88,8 +72,7 @@ use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 /// executor id (it claims nothing), no application version (it runs nothing), no listen set (it
 /// dequeues nothing) and no `migrate` (it is a guest in the database). Four fields that must not be
 /// set is four fields that should not exist, and an application name that may be absent is a fifth
-/// difference in the opposite direction. Go, whose client is its runtime, carries a `ClientConfig`
-/// separate from its `Config` for the same reason.
+/// difference in the opposite direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     /// The application this client acts for, or `None` to act for every application.
@@ -97,16 +80,14 @@ pub struct ClientConfig {
     /// **The one field that may be absent, and the choice it makes is real.** Named, this client
     /// is that application: rows it writes are stamped with the name and belong to it, and a search
     /// it makes is scoped to it. Nameless, it writes *unclaimed* rows — which every application
-    /// matches, and any may run — and reads across all of them. Go's client says the same in its
-    /// own words: *"Leave empty to list all workflows, but beware that writing will serve all
-    /// applications."*
+    /// matches, and any may run — and reads across all of them.
     ///
     /// **Serving all applications includes editing their rows.** A registration a named
     /// application already owns keeps its owner, but a nameless client still writes through it: it
     /// replaces a queue's limits, a schedule's definition, or the timestamp deciding which version
-    /// is latest, where a client naming a *different* application would be refused. Every
-    /// implementation behaves this way and UPSTREAM item 26 asks whether it should, so name this
-    /// client if it is meant to touch only its own.
+    /// is latest, where a client naming a *different* application would be refused. Whether a
+    /// nameless writer should get through is an open question shared with the other SDKs on the
+    /// same database; until it is settled, name this client if it is meant to touch only its own.
     ///
     /// Set it whenever several applications share a system database. Leave it unset for a tool
     /// whose job is to look at all of them.
@@ -120,9 +101,8 @@ pub struct ClientConfig {
 
     /// Maximum pooled connections.
     ///
-    /// Smaller than an application's default, as in Python (`DEFAULT_CLIENT_POOL_SIZE`): a client
-    /// runs no workflows, so its pool serves the calls its caller makes rather than a fleet of
-    /// executing bodies.
+    /// Smaller than an application's default: a client runs no workflows, so its pool serves the
+    /// calls its caller makes rather than a fleet of executing bodies.
     pub max_connections: u32,
 
     /// Schema holding the DBOS tables.
@@ -223,13 +203,6 @@ impl ClientConfig {
     /// it can see. Picking a name up from an ambient variable would silently narrow an operator's
     /// tool to whichever application happened to be deployed around it.
     ///
-    /// The other implementations draw the line in the same place. Python's `DBOSClient` takes
-    /// `application_name` as a constructor argument and reads no environment variable anywhere in
-    /// its client module; Go's `ClientConfig.AppName` is likewise configuration only — the
-    /// `DBOS__APPVERSION`, `DBOS__VMID`, `DBOS__APPID` and `DBOS__CLOUD` reads all sit on its
-    /// executor's path — and its doc says what a nameless one costs: *"Leave empty to list all
-    /// workflows, but beware that writing will serve all applications."*
-    ///
     /// So a client deployed alongside an application must be told its name, here or on the field:
     ///
     /// ```no_run
@@ -284,8 +257,7 @@ impl ClientConfig {
 /// **It holds a connection and nothing else.** Not an executor: an executor is the machinery for
 /// *running* workflows — an id, a version and an application name to stamp claims with, a runtime
 /// to spawn onto, a registry to resolve names through, task sets to shut down — and a client does
-/// none of that. Java draws the same line, its `DBOSClient` holding a `SystemDatabase` and a
-/// serializer; the operations both surfaces share are methods on the connection, so calling one
+/// none of that. The operations both surfaces share are methods on the connection, so calling one
 /// here costs no executor and implies none.
 ///
 /// Cheap to clone — it is an `Arc` internally — so a clone is another handle to the same
@@ -295,18 +267,17 @@ impl ClientConfig {
 /// teardown, which closes the connections but says nothing about when. That is a safety net —
 /// without it the listener would hold a `LISTEN` connection for the life of the process — and not a
 /// shutdown: nothing waits for either task, and whatever the notifier had inside its coalescing
-/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client is
-/// put away deliberately, and is what a process that connects repeatedly wants.
+/// window may go out after the drop returns or not at all. [`close`](Self::close) is how a client
+/// is put away deliberately, and is what a process that connects repeatedly wants.
 #[derive(Clone, Debug)]
 pub struct Client(Arc<Connection>);
 
 impl Client {
     /// Connects to the system database.
     ///
-    /// Eager, like Go's, TypeScript's and Java's: an unreachable database is reported here rather
-    /// than on the first call that needed it, because a client is usually built at start-up where
-    /// a failure is cheap and diagnosable. Python's `lazy=True` defers it; nothing here does, and
-    /// the price of that choice is one round trip at construction.
+    /// Eager: an unreachable database is reported here rather than on the first call that needed
+    /// it, because a client is usually built at start-up where a failure is cheap and diagnosable.
+    /// The price is one round trip at construction.
     ///
     /// **Migrates nothing, and creates nothing.** It verifies instead: a schema that is missing or
     /// behind what this build's queries are written against fails here, naming the version it
@@ -351,13 +322,10 @@ impl Client {
     /// hold an id before whoever owns it has committed the enqueue, and this is the one handle in
     /// the crate that waits for a row to appear rather than reporting its absence.
     ///
-    /// **Java's client is the other unchecked one**, and its javadoc sends users to that same pair:
-    /// *"This call does not ensure that the workflow exists; use the returned handle's
-    /// `getStatus()`"* (`DBOSClient.java`). Python's and Go's spend a round trip instead and refuse
-    /// an id that names nothing (`_client.py`, `workflow.go`) — which is what a caller who wants it
-    /// writes here as [`workflow_status`](Self::workflow_status) before taking the handle — or
-    /// bounds the wait instead, since dropping the future ends it and `tokio::time::timeout` is the
-    /// whole of what Go's `WithHandleTimeout` exists to provide.
+    /// A caller who wants an id that names nothing refused calls
+    /// [`workflow_status`](Self::workflow_status) before taking the handle, at the cost of a round
+    /// trip — or bounds the wait instead, since dropping the future ends it and
+    /// `tokio::time::timeout` is all a bounded wait needs.
     pub fn retrieve_workflow<R, E>(&self, workflow_id: &str) -> WorkflowHandle<R, E> {
         WorkflowHandle::polling(Arc::clone(&self.0), workflow_id.to_owned(), false)
     }
@@ -388,15 +356,14 @@ impl Client {
     /// states — but [`UpdateIfLatestVersion`](crate::QueueConflict::UpdateIfLatestVersion) is
     /// [`Error::Config`] here rather than a registration: a client runs none of the application's
     /// code, so there is no version of it to be the latest of. Ask for
-    /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate), which is what Python's and
-    /// TypeScript's clients default to, or [`NeverUpdate`](crate::QueueConflict::NeverUpdate). They
-    /// refuse the same combination (`_client.py`, `client.ts`).
+    /// [`AlwaysUpdate`](crate::QueueConflict::AlwaysUpdate) or
+    /// [`NeverUpdate`](crate::QueueConflict::NeverUpdate).
     ///
     /// **A client with no application name of its own registers over a peer's queue rather than
-    /// being refused**, replacing its stored limits — the ownership check every implementation
-    /// shares lets a nameless writer through. Give the client an
-    /// [`app_name`](ClientConfig::app_name) to get the refusal
-    /// [`QueueConflict`] describes. UPSTREAM item 26.
+    /// being refused**, replacing its stored limits: the ownership check lets a nameless writer
+    /// through. Whether it should is an open question shared with the other SDKs on the same
+    /// database. Give the client an [`app_name`](ClientConfig::app_name) to get the refusal
+    /// [`QueueConflict`] describes.
     ///
     /// ```no_run
     /// # async fn f(client: &dbos::Client) -> dbos::Result<()> {

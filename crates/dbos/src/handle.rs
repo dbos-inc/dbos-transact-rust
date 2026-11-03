@@ -1,11 +1,11 @@
 //! The workflow handle: three methods over a workflow id, in two flavours.
 //!
-//! Every reference agrees on the surface — the id, the result, the status — and every reference
-//! splits the implementation the same way. A handle to a workflow running in *this*
-//! process awaits the running task directly; a handle to one running elsewhere, or to one that
-//! finished before this process started, has nothing local to await and polls the database. The
-//! two are one public type, because a caller has no reason to care which it holds — and with a
-//! caller-supplied id, which one it gets is decided by a race it cannot see.
+//! The surface is the id, the result and the status, and the implementation splits two ways. A
+//! handle to a workflow running in *this* process awaits the running task directly; a handle to one
+//! running elsewhere, or to one that finished before this process started, has nothing local to
+//! await and polls the database. The two are one public type, because a caller has no reason to
+//! care which it holds — and with a caller-supplied id, which one it gets is decided by a race it
+//! cannot see.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::sysdb::types::{Outcome, StepRecord, StepTiming, Timestamp, WorkflowSt
 ///
 /// Returned by [`start`](crate::WorkflowRef::start), and consumed by
 /// [`result`](Self::result): a result can be taken once, which the signature says rather than a
-/// runtime error (Go returns *"workflow result channel is already closed"* at the same point).
+/// runtime error.
 /// Dropping a handle does not stop the workflow — it only stops watching.
 pub struct WorkflowHandle<R, E = crate::EngineOnly> {
     conn: Arc<Connection>,
@@ -46,9 +46,9 @@ enum Provenance {
         /// `true` where this process inserted or read it, so a later absence is a deletion and
         /// waiting for the row is waiting for something that will never come back; `false` for an
         /// id taken on faith, which may name a workflow whose enqueue has not committed yet. It is
-        /// the references' `fail_if_missing`, and it reaches
-        /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) as
-        /// exactly that.
+        /// passed to
+        /// [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result) as its
+        /// `fail_if_missing`.
         fail_if_missing: bool,
     },
 }
@@ -72,8 +72,7 @@ impl<R, E> WorkflowHandle<R, E> {
     ///
     /// **Takes a connection rather than an executor**, which is what lets a
     /// [`Client`](crate::Client) hand one back: watching a workflow is reading its row, and reading
-    /// a row needs no process that could run it. Java's client builds the same thing — a small
-    /// handle class over the system database alone.
+    /// a row needs no process that could run it.
     ///
     /// `fail_if_missing` says whether this call saw the row: `true` when it inserted or read it,
     /// `false` for an id it was merely given. [`result`](Self::result) spells out what the two do
@@ -158,23 +157,20 @@ where
     /// [`status`](Self::status) is the other half, and answers an unknown id the same way whatever
     /// the handle: it reports the absence, because a single read has nothing to wait for.
     ///
-    /// That split is the references' `fail_if_missing` drawn one line further out. Java draws it
-    /// at a handle too — `WorkflowHandleDBPoll` carries the flag, set for a handle built from a row
-    /// it just read — and stops after the already-finished start; the other three pass it only
-    /// where a run parks on its own row and let every handle wait. What is left waiting here is the
-    /// case none of them can avoid: an id whose row this process has never seen, where "deleted"
-    /// and "not yet" are the same observation.
+    /// That split is `fail_if_missing`, carried on the handle. What is left waiting is the case
+    /// nothing can avoid: an id whose row this process has never seen, where "deleted" and "not
+    /// yet" are the same observation.
     ///
     /// **A wait that could go on forever is bounded by dropping it, outside a workflow.**
     /// `tokio::time::timeout` around this future, or dropping the future outright, ends the poll —
     /// so the hazard [`await_workflow_result`](crate::sysdb::SystemDatabase::await_workflow_result)
-    /// describes costs a caller here what Go and TypeScript charge an argument for and Python and
-    /// Java cannot offer at all. **Inside the workflow that started the child it is neither**, for
-    /// the reason [`PendingStep`] gives every durable call: a `timeout` is a race nothing records,
-    /// so a replay is free to decide it the other way and continue from a wait this execution
-    /// abandoned. What is wrong there is the *unrecorded* decision and not the racing — bound the
-    /// child where its bound belongs, with [`StartOptions::timeout`](crate::StartOptions::timeout)
-    /// or the deadline it inherits, and race this wait with the macro built for the shape:
+    /// describes needs no timeout argument here. **Inside the workflow that started the child it is
+    /// neither**, for the reason [`PendingStep`] gives every durable call: a `timeout` is a race
+    /// nothing records, so a replay is free to decide it the other way and continue from a wait
+    /// this execution abandoned. What is wrong there is the *unrecorded* decision and not the
+    /// racing — bound the child where its bound belongs, with
+    /// [`StartOptions::timeout`](crate::StartOptions::timeout) or the deadline it inherits, and
+    /// race this wait with the macro built for the shape:
     /// [`select_workflow!`](macro@crate::select_workflow) against other waits, which checkpoints
     /// the winner and then awaits that handle alone on the run and on the replay both, or
     /// [`select_step!`](crate::select_step) against a call of another kind — a step, a sleep, an
@@ -209,10 +205,10 @@ where
     /// The await itself, once something polls it.
     ///
     /// Takes the [`ChildResultPlacement`] rather than building one, because the id it holds was
-    /// claimed where the call was written. That is also what lets [`run_with`](crate::WorkflowRef::run_with)
-    /// claim the await's id immediately behind the start's and hand it here once the child
-    /// exists: where an await stands is decided by the ambient context and the connection, and
-    /// the handle has no say in either.
+    /// claimed where the call was written. That is also what lets
+    /// [`run_with`](crate::WorkflowRef::run_with) claim the await's id immediately behind the
+    /// start's and hand it here once the child exists: where an await stands is decided by the
+    /// ambient context and the connection, and the handle has no say in either.
     pub(crate) async fn settle(self, awaiting: ChildResultPlacement) -> Result<R, E> {
         if let Some(recorded) = awaiting
             .check(&self.conn, &self.workflow_id)
@@ -260,10 +256,10 @@ where
             // the same error.
             Err(Failure::Recorded(recorded)) => Err(recorded.decode(&self.workflow_id)),
             // **A cancelled child is not a cancelled parent.** `WorkflowCancelled` means the
-            // workflow *asking* is being cancelled — the step-replay check refusing to run it —
-            // so reporting it here would read as the wrong workflow having been stopped. Every
-            // reference raises a separate awaited-cancelled error for exactly this, and it is
-            // recorded like any other outcome: the child is over, and the parent has learned so.
+            // workflow *asking* is being cancelled — the step-replay check refusing to run it — so
+            // reporting it here would read as the wrong workflow having been stopped. It gets an
+            // error of its own instead, and is recorded like any other outcome: the child is over,
+            // and the parent has learned so.
             Err(Failure::Control(Error::WorkflowCancelled { workflow_id }))
                 // Only where there is a caller for the two to be confused with each other.
                 if awaiting.placement().inside_a_workflow() =>
@@ -312,9 +308,9 @@ where
 ///
 /// A workflow awaiting some other workflow it did not itself start is treated exactly as a parent
 /// awaiting its child, deliberately: it is learning an outcome it should not have to learn twice
-/// either, and Python and Go checkpoint that case too. The name follows the layer below rather
-/// than that distinction — every implementation stores the awaited id in `child_workflow_id`,
-/// whoever started it.
+/// either. The name follows the layer below rather than that distinction — the awaited id is
+/// stored in `child_workflow_id` whoever started it, which is the column's meaning for every SDK
+/// sharing the database.
 pub(crate) struct ChildResultPlacement(StepPlacement);
 
 impl ChildResultPlacement {
@@ -357,9 +353,8 @@ impl ChildResultPlacement {
         // this is. For a child it cannot differ — the handle's id was read out of the launch row
         // moments earlier — but a workflow may also await a handle it did not start, and there the
         // recorded row is the only thing that knows which workflow answered. Adopting some other
-        // workflow's outcome as this one's is what this refuses, and every implementation writes
-        // the id needed to refuse it (Python's `record_get_result` stores the awaited id as
-        // `child_workflow_id` too, `_sys_db.py`).
+        // workflow's outcome as this one's is what this refuses, using the awaited id the
+        // recorded row holds in `child_workflow_id`.
         if recorded.child_workflow_id.as_deref() != Some(awaited_workflow_id) {
             return Err(Error::SystemDatabase(crate::sysdb::Error::UnexpectedStep {
                 workflow_id: workflow_id.to_owned(),
@@ -381,38 +376,25 @@ impl ChildResultPlacement {
     /// unrecorded is whatever a replay must not be pinned to:
     ///
     /// - **the parent being interrupted** — shutdown aborted the task, nothing is decided, and a
-    ///   recovered parent must await again (Go says the same in its own words: *"nothing is
-    ///   checkpointed, so a resume re-executes the await"*);
+    ///   recovered parent must await again, since nothing was checkpointed;
     /// - **a system-database failure**, which is a statement about the substrate rather than about
     ///   the child;
     /// - **the child being parked** at `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, which is the one that
     ///   needs an argument, below.
     ///
-    /// **A parked child still fails its parent** — all four implementations let that error out of
-    /// the await, and none treats it as something a parent can wait out. What is withheld is only
-    /// the *checkpoint*: parking is the one non-terminal verdict a workflow can carry, so freezing
-    /// it into the parent's replay would outlive its own truth. A parent resumed after its child
-    /// was resumed re-asks the child's row and sees what the child actually did; a parent holding
-    /// a recorded "parked" would replay that answer forever. It is the same argument as the
-    /// interrupted-await bullet above, one step further out.
+    /// **A parked child still fails its parent** — the error leaves the await, and a parent does
+    /// not wait it out. What is withheld is only the *checkpoint*: parking is the one non-terminal
+    /// verdict a workflow can carry, so freezing it into the parent's replay would outlive its own
+    /// truth. A parent resumed after its child was resumed re-asks the child's row and sees what
+    /// the child actually did; a parent holding a recorded "parked" would replay that answer
+    /// forever. It is the same argument as the interrupted-await bullet above, one step further
+    /// out.
     ///
-    /// **Rust follows Go here, against the other three.** Go filters this case out of its await
-    /// checkpoint deliberately and says so — *"either the workflow result proper (no dlq, no raw
-    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go`). Python, TypeScript
-    /// and Java all record it, because in all three the await runs inside the generic step wrapper
-    /// and that wrapper checkpoints whatever exception it caught.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 20. Two implementations pin a parked child's verdict into
-    /// the parent's replay and two do not, and none of the four argues for its side — the split
-    /// falls exactly along "Go's await path filters on purpose" versus "a step wrapper records by
-    /// default", which is not a decision anyone made twice. It is worth settling before v1,
-    /// because it changes what a resumed parent sees. The same item covers a second half: Python
-    /// and TypeScript raise a distinct *awaited* error here
-    /// (`DBOSAwaitedWorkflowMaxRecoveryAttemptsExceeded`,
-    /// `DBOSAwaitedWorkflowExceededMaxRecoveryAttempts`) while Go and Java reuse the error a
-    /// workflow gets for its own parking — a two-two split the *cancellation* case does not have,
-    /// where all four separate the two meanings and Rust followed them into
-    /// [`Error::AwaitedWorkflowCancelled`].
+    /// Whether a parked child's verdict belongs in the parent's replay is an open question shared
+    /// with the other SDKs on the same database, and the answer changes what a resumed parent
+    /// sees. So is the error itself: a parked child surfaces as
+    /// [`Error::MaxRecoveryAttemptsExceeded`], the same error a workflow gets for its own parking,
+    /// whereas a cancelled child has an error of its own, [`Error::AwaitedWorkflowCancelled`].
     async fn record(
         &self,
         conn: &Connection,

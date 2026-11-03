@@ -151,9 +151,9 @@ async fn select_workflow_reports_the_first_to_settle() {
 
 /// A cancelled workflow ends the wait, exactly as a successful one does.
 ///
-/// The definition of "settled" is the status leaving `PENDING`/`ENQUEUED`/`DELAYED`, which Python
-/// and TypeScript share — so this is a cross-SDK contract rather than a local choice. Reporting
-/// only successes would leave a fan-out waiting out a member nobody is running any more.
+/// "Settled" means the status has left `PENDING`/`ENQUEUED`/`DELAYED`, a definition shared with the
+/// other SDKs on the same database rather than a local choice. Reporting only successes would
+/// leave a fan-out waiting out a member nobody is running any more.
 #[tokio::test]
 async fn a_cancelled_workflow_counts_as_settled() {
     let db = test_database().await;
@@ -293,8 +293,7 @@ async fn join_workflows_returns_when_the_last_one_settles() {
 /// The two empty cases differ, and the difference is not an accident.
 ///
 /// An all-wait over nothing is satisfied — there is nothing outstanding. A first-wait over nothing
-/// has no answer it could ever give, so it is refused rather than parked forever. Python raises at
-/// the same point.
+/// has no answer it could ever give, so it is refused rather than parked forever.
 #[tokio::test]
 async fn an_empty_wait_is_satisfied_for_all_and_refused_for_first() {
     let db = test_database().await;
@@ -492,11 +491,11 @@ async fn an_empty_first_wait_records_its_refusal() {
 
 /// A repeated id is accepted by both waits, and answers with the id it names.
 ///
-/// Python and TypeScript refuse it in `waitFirst`, but only because they return the winning
-/// *handle* and key a map by id to find it. An id has no such collision: a set holding `a` twice
-/// answers `a`, which names one workflow however many entries pointed at it. The set arises
-/// legitimately — a caller-supplied id that `start` joined to a run already going hands back a
-/// second handle on one workflow.
+/// Refusing it would only make sense for a wait that returned the winning *handle* and keyed a map
+/// by id to find it. An id has no such collision: a set holding `a` twice answers `a`, which names
+/// one workflow however many entries pointed at it. The set arises legitimately — a
+/// caller-supplied id that `start` joined to a run already going hands back a second handle on one
+/// workflow.
 #[tokio::test]
 async fn a_repeated_id_is_accepted_by_both_waits() {
     let db = test_database().await;
