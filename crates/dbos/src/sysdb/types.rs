@@ -176,8 +176,8 @@ impl Timestamp {
     ///
     /// For [`workflow_schedules.last_fired_at`](crate::sysdb::SystemDatabase::update_schedule_last_fired_at),
     /// the one column in the schema holding a formatted instant rather than epoch milliseconds.
-    /// A bare `Z`, with a fraction only when there is one: a spelling every reader of the column
-    /// accepts.
+    /// RFC 3339: a bare `Z`, with a fraction only when there is one and its trailing zeros
+    /// trimmed, so 120 ms is `.12Z`.
     ///
     /// Infallible in practice and `String` rather than `Result` because of it: the only way
     /// `time` refuses to format is a year outside its range, which is four orders of magnitude

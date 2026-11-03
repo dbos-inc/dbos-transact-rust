@@ -8502,8 +8502,8 @@ async fn a_replayed_send_does_not_send_again() {
         .await
         .unwrap();
     assert_eq!(steps.len(), 1);
-    // The name every SDK sharing the database records for a single send, so a workflow replayed
-    // by another finds what it expects.
+    // The name every SDK sharing the database records for a single send, so a step listing reads
+    // the same whichever SDK wrote it.
     assert_eq!(steps[0].step_name, "DBOS.send");
 }
 

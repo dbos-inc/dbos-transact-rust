@@ -1965,9 +1965,8 @@ fn timed_out_sweep_sql(workflow_table: &str) -> String {
 /// that runs once per poll interval for the length of every wait.
 ///
 /// **The complement is the definition of "settled", and it is deliberately wide**: `SUCCESS`,
-/// `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` all end a wait. Other SDKs on the
-/// same database count the same three statuses as unsettled, so waiters in different languages
-/// watching one fan-out agree on who finished first.
+/// `ERROR`, `CANCELLED` and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` all end a wait, and only the three
+/// statuses here keep one open.
 const UNSETTLED: &str = "'PENDING', 'ENQUEUED', 'DELAYED'";
 
 /// Every column of `queues` [`queue_from_row`] reads.
@@ -2080,9 +2079,9 @@ fn queue_from_row(row: &sqlx::postgres::PgRow) -> Result<QueueRecord, Error> {
             .ok_or_else(|| Error::Malformed(format!("{column} is not a duration: {secs}"))),
     };
     // Both columns or neither: a row carrying one is a state `RateLimit` says cannot exist, and the
-    // public API cannot write it. Read as *no limit* rather than reported, which is how other SDKs
-    // sharing the database read it too, so a hand-edited row does not make peers disagree about
-    // what the same queue is.
+    // public API cannot write it. Read as *no limit* rather than reported. Other SDKs sharing the
+    // database do not all read such a row the same way, so a hand-edited one can still make peers
+    // disagree about what the same queue is.
     //
     // One reader for both pairs, so the queue-wide limit and the per-partition one cannot come to
     // disagree about what half a limit means.
@@ -3386,10 +3385,10 @@ impl PostgresSystemDatabase {
             .bind(workflow.schedule_name)
             .bind(debounce_timeout_ms)
             .bind(workflow.is_debounced)
-            // Falls back to the handle's application name at this layer, because steps and forks
-            // stamp theirs from the handle too: a workflow that did not would be owned differently
-            // from its own steps. Callers above usually resolve the name already, so for them this
-            // is a second line of defence.
+            // Falls back to the handle's application name at this layer, because steps stamp
+            // theirs from the handle too (and a fork claims an unowned source with it): a workflow
+            // that did not would be owned differently from its own steps. Callers above usually
+            // resolve the name already, so for them this is a second line of defence.
             .bind(
                 workflow
                     .application_name
@@ -7966,8 +7965,8 @@ impl SystemDatabase for PostgresSystemDatabase {
         caller: Option<StepCaller<'_>>,
     ) -> Result<(), Error> {
         let schedules_table = self.tables.workflow_schedules.as_str();
-        // Pause and resume are two step names, shared with other SDKs on the same database, so a
-        // replay of one is not mistaken for the other.
+        // Pause and resume are two step names, so a replay of one is not mistaken for the other.
+        // Both are shared with other SDKs on the same database.
         let step_name = match status {
             ScheduleStatus::Active => step_names::RESUME_SCHEDULE,
             ScheduleStatus::Paused => step_names::PAUSE_SCHEDULE,

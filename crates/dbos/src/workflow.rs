@@ -28,9 +28,9 @@ use crate::sysdb::types::{
 
 /// Attempts before a workflow is parked as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
 ///
-/// The default other SDKs sharing the database use too, so a workflow is parked after the same
-/// number of attempts whichever executor counts them. It only counts recoveries and dequeues;
-/// starting a workflow fresh never approaches it.
+/// The default other SDKs sharing the database use too, so a workflow left at the default is
+/// parked after the same number of attempts whichever executor counts them. It only counts
+/// recoveries and dequeues; starting a workflow fresh never approaches it.
 pub(crate) const MAX_RECOVERY_ATTEMPTS: i64 = 100;
 
 /// The tasks of one [`Role`] this executor started and has not seen finish.

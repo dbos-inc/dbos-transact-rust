@@ -1719,7 +1719,9 @@ pub trait SystemDatabase: Send + Sync {
     /// so this takes an instant and formats it, rather than taking a string and trusting the caller
     /// to have picked a spelling the others read. The SDKs sharing the database each write their
     /// own ISO 8601 spelling; [`Timestamp::to_iso8601`](types::Timestamp::to_iso8601) writes UTC
-    /// with a bare `Z` and a fraction only when there is one, which every reader accepts.
+    /// as RFC 3339, with a bare `Z` and a fraction only when there is one, trailing zeros trimmed.
+    /// A reader that accepts only some ISO 8601 forms (no `Z`, or only 3- or 6-digit fractions)
+    /// may refuse it.
     ///
     /// [`ScheduleRecord::last_fired_at`](types::ScheduleRecord::last_fired_at) is an instant too,
     /// read through [`Timestamp::parse_iso8601`](types::Timestamp::parse_iso8601), which accepts

@@ -458,8 +458,8 @@ pub fn source(name: &str) -> Option<&'static MigrationSource> {
 /// **Below the shared base the numbering is still shared, and must be.** A version number under
 /// 100 is a claim about schema state, so a database left half-migrated by one SDK is picked up
 /// correctly by another only if their version *n* describes the same schema; our 45, 46 and 47
-/// match down to the index names. The rule: below 100, version *n* is the schema every other SDK
-/// on the same database calls *n*; then jump to 100.
+/// match down to the index names. The rule: below 100, version *n* is the schema every other
+/// numbered migration series on the same database calls *n*; then jump to 100.
 ///
 /// What the shared base changes is only what happens *above* it — see
 /// [`SHARED_MIGRATION_BASE`]. It does not make the numbers below it free.
