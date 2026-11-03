@@ -1007,16 +1007,20 @@ pub trait SystemDatabase: Send + Sync {
     ) -> Result<Option<StepRecord>, Error>;
 
     /// The earliest step recorded at or past `step_id`, as its id and name, or `None` when the
-    /// history ends before it.
+    /// history ends before it: what a [`patch`](crate::patch) reads at its position.
     ///
-    /// A history can have a gap: an execution records a later step before an earlier one when a
-    /// `recv` or `get_event` checkpoints its timeout's sleep, at the step after its own, before it
-    /// waits, or when concurrent calls of one workflow finish out of order. A
-    /// [`patch`](crate::patch) whose own step is empty reads this to tell an execution that has
-    /// not got this far, which may take the new path, from one that got past it on the code from
-    /// before the patch, which may not. Python's `get_checkpoint_at_or_after` and Java's
-    /// `getCheckpointAtOrAfter` read the same.
-    async fn step_at_or_after(
+    /// A gate like [`check_step`](Self::check_step), with its first check: a cancelled workflow
+    /// raises [`Error::WorkflowCancelled`], and one that does not exist
+    /// [`Error::NonExistentWorkflow`]. It does not compare names, because a patch asks *which*
+    /// step is there rather than claiming one.
+    ///
+    /// **Past the position, not only at it**, because a history can have a gap. An execution
+    /// records a later step before an earlier one when a `recv` or `get_event` checkpoints its
+    /// timeout's sleep, at the step after its own, before it waits, or when concurrent calls of one
+    /// workflow finish out of order. So an empty position with a step past it is a point the old
+    /// code got past, and only a history that ends before the position is a first visit. Python's
+    /// `get_checkpoint_at_or_after` and Java's `getCheckpointAtOrAfter` read the same.
+    async fn check_step_at_or_after(
         &self,
         workflow_id: &str,
         step_id: i32,

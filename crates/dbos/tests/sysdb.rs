@@ -2664,6 +2664,57 @@ async fn a_cancelled_workflow_refuses_to_replay_steps() {
     }
 }
 
+/// The patch read answers with the first step at or past a position, so a gap below a recorded
+/// step reads as that step, and only a history that ends before the position reads as nothing.
+/// It is a gate like `check_step`: a cancelled or missing workflow is refused, not read.
+#[tokio::test]
+async fn the_patch_read_finds_the_first_step_at_or_past_a_position() {
+    let (sys, _db) = sysdb().await;
+    sys.init_workflow(
+        &workflow("wf-gap"),
+        None,
+        WorkflowIdReusePolicy::ReturnExisting,
+    )
+    .await
+    .unwrap();
+    let owner = owner_token(&sys, "wf-gap").await;
+    // Positions 0 and 2, as a receive waiting on its timeout leaves them.
+    for (step_id, name) in [(0, "charge"), (2, "DBOS.sleep")] {
+        sys.record_step(
+            "wf-gap",
+            step_id,
+            name,
+            Outcome::Output(None),
+            None,
+            None,
+            &owner,
+        )
+        .await
+        .unwrap();
+    }
+
+    let at = async |step_id| sys.check_step_at_or_after("wf-gap", step_id).await.unwrap();
+    assert_eq!(at(0).await, Some((0, "charge".to_owned())));
+    assert_eq!(
+        at(1).await,
+        Some((2, "DBOS.sleep".to_owned())),
+        "the gap reads past"
+    );
+    assert_eq!(at(3).await, None, "the history ends before 3");
+
+    sys.cancel_workflows(&["wf-gap"], false, None, None)
+        .await
+        .unwrap();
+    match sys.check_step_at_or_after("wf-gap", 1).await {
+        Err(Error::WorkflowCancelled { workflow_id }) => assert_eq!(workflow_id, "wf-gap"),
+        other => panic!("expected a cancellation error, got {other:?}"),
+    }
+    match sys.check_step_at_or_after("wf-ghost", 0).await {
+        Err(Error::NonExistentWorkflow { workflow_ids }) => assert_eq!(workflow_ids, ["wf-ghost"]),
+        other => panic!("expected a non-existent-workflow error, got {other:?}"),
+    }
+}
+
 /// Steps come back in execution order, and payloads can be declined.
 #[tokio::test]
 async fn steps_are_listed_in_execution_order() {

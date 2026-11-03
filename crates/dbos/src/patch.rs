@@ -9,10 +9,11 @@
 //!
 //! The marker is an ordinary step row, written through
 //! [`record_step`](crate::sysdb::SystemDatabase::record_step) under the same ownership check as any
-//! checkpoint, and read back through [`check_step`](crate::sysdb::SystemDatabase::check_step) —
-//! whose refusal of a row recorded under another name is exactly the "old code was here" answer a
-//! patch is asking for. An empty position is checked past, too: the old code can leave one behind
-//! a step it recorded first, and only a history that ends there is a first visit.
+//! checkpoint. It is read back through
+//! [`check_step_at_or_after`](crate::sysdb::SystemDatabase::check_step_at_or_after), which answers
+//! with the first step at or past the position rather than the one at it: the old code can leave
+//! the position empty behind a step it recorded first, so only a history that ends before the
+//! position is a first visit.
 //!
 //! # Why the position is peeked, and then claimed
 //!
@@ -20,8 +21,8 @@
 //! order calls are written in is the order their positions follow. A patch does too: building one
 //! looks at the next id without taking it ([`Ctx::peek_step_id`]). It cannot take it there,
 //! because whether it occupies the position depends on what the history holds at it, and reading
-//! that is a database round trip. So awaiting it reads the history at the peeked position, and
-//! then takes the id only if it is still the next one ([`Ctx::claim_step_id`], one
+//! that is a database round trip. So awaiting it reads the history from the peeked position on,
+//! and then takes the id only if it is still the next one ([`Ctx::claim_step_id`], one
 //! compare-and-swap).
 //!
 //! The swap is what keeps the marker at the position the code says. If any other call of this
@@ -122,9 +123,11 @@ use crate::sysdb::types::{Outcome, StepTiming, Timestamp, step_names};
 ///
 /// The position is the one reached when the call is built, as for every durable call. Dropping
 /// the future after it has claimed the position but before its marker is written — inside a
-/// `tokio::select!` or a `timeout`, say — leaves the position used with nothing recorded there, and
-/// a replay records the marker at it: a patch, like any step, is not something to race or time
-/// out.
+/// `tokio::select!` or a `timeout`, say — leaves the position used with nothing recorded there.
+/// A replay then records the marker at it only if the execution recorded nothing after it; once
+/// a later step is recorded, the empty position reads as the old code's and the replay takes the
+/// old path, which the rest of its history was not recorded by. A patch, like any step, is not
+/// something to race or time out.
 pub fn patch<E: DurableError>(
     name: &str,
 ) -> impl Future<Output = crate::Result<bool, E>> + Send + use<E> {
@@ -234,9 +237,11 @@ enum Found {
     Nothing,
     /// This patch's marker: an execution that took the new path.
     ThisMarker,
-    /// Some other step, or nothing but a step past it: an execution of the code from before the
-    /// patch.
+    /// Some other step: an execution of the code from before the patch.
     OtherStep,
+    /// Nothing, but a step past it: an execution of the code from before the patch that left a
+    /// gap here, as a `recv` waiting on its timeout does.
+    Gap,
 }
 
 /// A patch point as built: the execution it is in, and the position it peeked.
@@ -283,23 +288,15 @@ impl PatchPoint {
         let workflow_id = ctx.workflow_id();
         let sysdb = ctx.executor().sysdb();
 
-        let found = match sysdb.check_step(workflow_id, step_id, &marker_name).await {
-            Ok(Some(_)) => Found::ThisMarker,
-            // An empty position is not yet a history that ends here: a step recorded past it means
-            // the old code got past this point and left a gap, as a `recv` waiting on its timeout
-            // does. Read only by `patch`, since `deprecate_patch` records nothing either way.
-            Ok(None) if marker == Marker::Write => {
-                match sysdb.step_at_or_after(workflow_id, step_id + 1).await {
-                    Ok(Some(_)) => Found::OtherStep,
-                    Ok(None) => Found::Nothing,
-                    Err(error) => return Err(Error::from_sysdb(error)),
-                }
-            }
-            Ok(None) => Found::Nothing,
-            // The determinism check's refusal is this call's answer: a row recorded under another
-            // name is the old code's step.
-            Err(crate::sysdb::Error::UnexpectedStep { .. }) => Found::OtherStep,
-            Err(error) => return Err(Error::from_sysdb(error)),
+        let found = match sysdb
+            .check_step_at_or_after(workflow_id, step_id)
+            .await
+            .map_err(Error::from_sysdb)?
+        {
+            None => Found::Nothing,
+            Some((at, recorded)) if at == step_id && recorded == marker_name => Found::ThisMarker,
+            Some((at, _)) if at == step_id => Found::OtherStep,
+            Some(_) => Found::Gap,
         };
 
         // From here on, the read means something only if nothing took the position while it was out.
@@ -310,7 +307,7 @@ impl PatchPoint {
         };
         let occupy = match (&found, marker) {
             (Found::ThisMarker, _) | (Found::Nothing, Marker::Write) => true,
-            (Found::OtherStep, _) | (Found::Nothing, Marker::Honour) => false,
+            (Found::OtherStep | Found::Gap, _) | (Found::Nothing, Marker::Honour) => false,
         };
         if occupy {
             if !ctx.claim_step_id(step_id) {
@@ -366,7 +363,17 @@ impl PatchPoint {
                 );
                 Ok(false)
             }
-            (Found::OtherStep | Found::Nothing, Marker::Honour) => Ok(true),
+            (Found::Gap, Marker::Write) => {
+                tracing::debug!(
+                    workflow_id,
+                    step_id,
+                    patch = name,
+                    "an execution from before the patch, with a step recorded past this one: \
+                     taking the old path"
+                );
+                Ok(false)
+            }
+            (Found::OtherStep | Found::Gap | Found::Nothing, Marker::Honour) => Ok(true),
         }
     }
 }
