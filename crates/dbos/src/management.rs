@@ -939,8 +939,8 @@ impl DBOS {
     ///
     /// The schedule surface places through this. The management methods below do not: each shares
     /// its body with a free form that has no `self`, so they hand that body a connection through
-    /// [`connection`](Self::connection) and the body places for itself, the same way, after the argument
-    /// checks that must refuse before an id is spent.
+    /// [`connection`](Self::connection) and the body places for itself, the same way, after the
+    /// argument checks that must refuse before an id is spent.
     pub(crate) fn placed(&self, operation: &'static str) -> Result<(Arc<Executor>, StepPlacement)> {
         StepPlacement::taken(self.executor(operation), operation)
     }
