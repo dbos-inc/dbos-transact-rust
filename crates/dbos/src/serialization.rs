@@ -95,7 +95,9 @@ const ENVELOPE: &str = "dbos::PortableWorkflowArgs";
 /// ```
 ///
 /// **The output is text**, because the columns are. A binary format has to encode its bytes —
-/// base64, say — on the way out and decode them on the way in.
+/// base64, say — on the way out and decode them on the way in. Text holding a NUL byte is refused
+/// as though the serializer had refused the value, since PostgreSQL cannot store one in a text
+/// column.
 ///
 /// **The format must be self-describing**: able to read a value without knowing its type in
 /// advance, which `serde` calls `deserialize_any`. Some of what the engine writes holds a
@@ -497,13 +499,14 @@ pub(crate) fn encode<T: Serialize, E>(
 ) -> Result<String, E> {
     match encoding {
         PayloadEncoding::Custom(custom) => {
-            custom
+            let text = custom
                 .serialize(Payload(value))
                 .map_err(|error| Error::Serialization {
                     what: what.into(),
                     message: error.to_string(),
                     source: None,
-                })
+                })?;
+            refuse_nul(text, what)
         }
         PayloadEncoding::Native | PayloadEncoding::Portable => {
             let mode = if matches!(encoding, PayloadEncoding::Native) {
@@ -515,6 +518,30 @@ pub(crate) fn encode<T: Serialize, E>(
                 .map_err(|source| Error::encode_failed(what, source))
         }
     }
+}
+
+/// What a custom serializer wrote for `what`, unless it holds a NUL byte, which is refused as the
+/// serializer refusing the value.
+///
+/// **A text column cannot store a NUL**: PostgreSQL rejects the write (`22021`,
+/// `character_not_in_repertoire`), while CockroachDB stores it. Rejected at the write, a workflow's
+/// outcome or a step's would surface as a failure of the system database — a control signal, which
+/// leaves the row `PENDING` for recovery to run the body again, side effects and all, only to be
+/// rejected the same way. Refused here, it takes the path every other refusal takes: a result is
+/// recorded as the error it could not be, and an error as its stand-in or the fixed marker. Refused
+/// on both databases alike, so an application does not behave differently on the one it moves to,
+/// and so that what decides is the text rather than an error code each database spells its own way.
+///
+/// Only a custom serializer's text needs this: JSON writes a NUL as `\u0000`.
+fn refuse_nul<E>(text: String, what: &'static str) -> Result<String, E> {
+    if !text.contains('\0') {
+        return Ok(text);
+    }
+    Err(Error::Serialization {
+        what: what.into(),
+        message: "the serializer wrote a NUL byte, which a text column cannot store".to_owned(),
+        source: None,
+    })
 }
 
 /// A portable workflow input, as the envelope every DBOS SDK writes it in.

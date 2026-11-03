@@ -1056,3 +1056,159 @@ async fn a_step_error_the_custom_serializer_refuses_records_a_fixed_marker() {
     assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
     dbos.shutdown().await;
 }
+
+const NUL: &str = "nul";
+
+/// [`Backwards`], except that it writes the string [`NUL`] with a NUL byte in it: text the
+/// serializer produces without complaint, and that PostgreSQL refuses to store in a text column.
+#[derive(Debug)]
+struct WritesNul;
+
+impl CustomSerializer for WritesNul {
+    fn name(&self) -> &str {
+        NAME
+    }
+
+    fn serialize(
+        &self,
+        value: Payload<'_>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let json = serde_json::to_string(&value)?;
+        if json == serde_json::to_string(NUL)? {
+            return Ok(format!("\0{}", json.chars().rev().collect::<String>()));
+        }
+        Ok(json.chars().rev().collect())
+    }
+
+    fn deserialize(
+        &self,
+        text: &str,
+        into: PayloadSlot<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Backwards.deserialize(text, into)
+    }
+}
+
+/// Whether `error` is the refusal of a NUL byte in what the serializer wrote for `what`.
+fn refused_for_nul(error: &Error, expected: &str) -> bool {
+    matches!(
+        error,
+        Error::Serialization { what, message, .. }
+            if what == expected && message.contains("NUL")
+    )
+}
+
+/// **A result whose encoding holds a NUL byte is the workflow's error**, as a result the serializer
+/// refuses is: the database cannot store it, so the row ends ERROR with the refusal rather than
+/// staying PENDING for recovery to run the body again, and a replay reads the refusal back.
+#[tokio::test]
+async fn a_result_encoded_with_a_nul_byte_is_recorded_as_the_workflows_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("custom-nul", &db, Serializer::custom(WritesNul)));
+    let runs = Arc::new(AtomicU32::new(0));
+    let nul = dbos
+        .register_workflow("nul", {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, Error>(NUL.to_owned()) }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = nul.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let error = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .unwrap_err();
+    assert!(refused_for_nul(&error, "result"), "{error:?}");
+
+    let (status, tag) = row(
+        &db,
+        r#"SELECT status, serialization FROM "dbos"."workflow_status" WHERE workflow_uuid = $1"#,
+        &id,
+    )
+    .await;
+    assert_eq!(status.as_deref(), Some("ERROR"));
+    assert_eq!(tag.as_deref(), Some(NAME));
+
+    let replayed = nul
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(&id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the replay's start failed")
+        .result()
+        .await
+        .unwrap_err();
+    assert!(refused_for_nul(&replayed, "result"), "{replayed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    dbos.shutdown().await;
+}
+
+/// **A step result whose encoding holds a NUL byte is the step's error**, recorded under the step's
+/// id, rather than a failed write that leaves the workflow for recovery to run again.
+#[tokio::test]
+async fn a_step_result_encoded_with_a_nul_byte_is_recorded_as_the_steps_error() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config(
+        "custom-nul-step",
+        &db,
+        Serializer::custom(WritesNul),
+    ));
+    let runs = Arc::new(AtomicU32::new(0));
+    let workflow = dbos
+        .register_workflow("handles_it", {
+            let runs = Arc::clone(&runs);
+            move |(): ()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    let refused = dbos::step("nul", || {
+                        let runs = Arc::clone(&runs);
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Error>(NUL.to_owned())
+                        }
+                    })
+                    .await;
+                    match refused {
+                        Err(error) if refused_for_nul(&error, "step result") => {
+                            Ok::<_, Error>("refused".to_owned())
+                        }
+                        other => Err(Error::Config(format!("not refused: {other:?}"))),
+                    }
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    let handle = workflow.start(()).await.unwrap();
+    let id = handle.workflow_id().to_owned();
+    let first = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the workflow finishes")
+        .expect("the workflow failed");
+    assert_eq!(first, "refused");
+
+    let (error, tag) = row(
+        &db,
+        r#"SELECT error, serialization FROM "dbos"."operation_outputs"
+           WHERE workflow_uuid = $1 AND function_id = 0"#,
+        &id,
+    )
+    .await;
+    assert!(
+        error.is_some(),
+        "the refusal is recorded as the step's error"
+    );
+    assert_eq!(tag.as_deref(), Some(NAME));
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the step ran again");
+    dbos.shutdown().await;
+}
