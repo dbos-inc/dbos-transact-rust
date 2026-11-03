@@ -18,7 +18,8 @@ use dbos::{
     QualifiedWorkflowName, QueueConflict, QueueOptions, QueueRequest, RunOptions,
     SerializationFormat, StartOptions, Timeout, WorkflowHandle,
 };
-use dbos_test_support::{TestDatabase, test_database};
+use dbos_test_support::{Backend, TestDatabase, test_database};
+use tokio::sync::Notify;
 
 /// How long a test waits for a workflow it expects to run.
 const WAIT: Duration = Duration::from_secs(60);
@@ -470,6 +471,135 @@ async fn a_fresh_debounce_inside_a_workflow_replays_without_enqueueing_again() {
         rows_named(&reader, "child").await.len(),
         1,
         "no second child"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// A debounce dropped while its fresh enqueue is writing still enqueues, and records it.
+///
+/// **The enqueue runs in a task of its own**, as a start's writing half does, so a caller that
+/// stops listening — a `select!` whose other branch won, the parent's cancellation — takes the
+/// handle and leaves the work. Inline, the drop would abandon the write part-way, and of a join or
+/// a recorded deduplication error that can mean an outcome read but never recorded, which a replay
+/// then debounces again.
+///
+/// Forced rather than raced: the test holds `workflow_input` locked, which a bounce that finds no
+/// holder never touches and the fresh enqueue's insert waits on. The branch is dropped only once
+/// that insert is seen waiting, so the enqueue has begun, and cannot have finished.
+#[tokio::test]
+async fn a_debounce_dropped_while_it_enqueues_still_enqueues_and_records_it() {
+    let db = test_database().await;
+    if db.backend() == Backend::Cockroach {
+        // The lock that stalls the enqueue is Postgres's `LOCK TABLE`, and what this checks — the
+        // enqueue running detached — is the same on both backends.
+        return;
+    }
+    let dbos = DBOS::new(config("debounce-dropped-app", &db));
+    let child = dbos
+        .register_workflow("child", |x: u32| async move { Ok::<u32, Error>(x) })
+        .unwrap();
+    let debouncer: Debouncer<'static, u32, u32> = Debouncer::new(&child);
+    let locked = Arc::new(Notify::new());
+    let waiting = Arc::new(Notify::new());
+    let parent = dbos
+        .register_workflow("parent", {
+            let (locked, waiting) = (Arc::clone(&locked), Arc::clone(&waiting));
+            move |()| {
+                let debouncer = debouncer.clone();
+                let (locked, waiting) = (Arc::clone(&locked), Arc::clone(&waiting));
+                async move {
+                    // The parent's own input is written to the table about to be locked, so the
+                    // lock is taken only once the parent has started.
+                    locked.notified().await;
+                    tokio::select! {
+                        debounced = debouncer.debounce("key", FOREVER, 7) => {
+                            panic!("the debounce finished under the lock: {debounced:?}")
+                        }
+                        () = waiting.notified() => {}
+                    }
+                    Ok::<_, Error>(())
+                }
+            }
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    let reader = reader(&db).await;
+
+    let parent_id = "the-dropping-debouncer";
+    let handle = parent
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(parent_id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("the parent did not start");
+    let pool = db.pool().await;
+    let mut lock = pool.begin().await.expect("begin failed");
+    sqlx::query("LOCK TABLE dbos.workflow_input IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("lock failed");
+    locked.notify_one();
+
+    // The fresh enqueue's insert, waiting on the lock: the debounce is past its bounce and inside
+    // the write.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let stalled: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock' \
+               AND query ILIKE '%INSERT INTO%workflow_input%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read failed");
+        if stalled > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the enqueue never reached its insert"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    waiting.notify_one();
+    lock.rollback().await.expect("unlock failed");
+
+    tokio::time::timeout(WAIT, handle.result())
+        .await
+        .expect("the parent never finished")
+        .expect("the parent failed");
+
+    // Enqueued, and recorded at the start's step, so a replay joins it rather than debouncing again.
+    let child_id = format!("{parent_id}-1");
+    let held = row(&reader, &child_id).await;
+    assert_eq!(held.status, WorkflowStatus::Delayed);
+    assert_eq!(held.parent_workflow_id.as_deref(), Some(parent_id));
+    let steps = reader
+        .list_workflow_steps(parent_id, true, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<_> = steps
+        .iter()
+        .map(|s| {
+            (
+                s.step_id,
+                s.step_name.as_str(),
+                s.child_workflow_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (0, "DBOS.debounce_delayed_workflow", None),
+            (1, "child", Some(child_id.as_str())),
+        ],
+        "the dropped debounce recorded its bounce and its start"
     );
 
     dbos.shutdown().await;

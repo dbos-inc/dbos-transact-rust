@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tracing::Instrument;
 
 use crate::checkpoint::{PendingStep, StepPlacement};
 use crate::client::Client;
@@ -47,8 +48,9 @@ use crate::sysdb::types::{
     validate_positive_duration,
 };
 use crate::workflow::{
-    Debounced, OwnedQueueRequest, OwnedStart, PendingStart, QueueRequest, TargetVersion, Timeout,
-    create, encode_attributes, placed_workflow_id, refused_start, validate_start,
+    Debounced, OwnedQueueRequest, OwnedStart, PendingStart, QueueRequest, Role, TargetVersion,
+    Timeout, create, encode_attributes, placed_workflow_id, refused_start, spawn_tracked,
+    validate_start,
 };
 
 /// What a debounce refuses its arguments as.
@@ -550,10 +552,10 @@ where
                     // created, or the deduplication error it lost the race with — so a replay
                     // takes the same branch. The replayed form of that error is the same variant,
                     // read back from the start's record.
-                    let created =
-                        create::<R, E>(Arc::clone(&executor), start, name.clone(), request)
-                            .await
-                            .map_err(|error| refused_start(Some(queue.name), error));
+                    let created = self
+                        .created(&executor, start, request)
+                        .await
+                        .map_err(|error| refused_start(Some(queue.name), error));
                     if !lost_the_key(&created) {
                         return created;
                     }
@@ -563,6 +565,54 @@ where
             // A further attempt, which takes ids of its own where it runs.
             bounce_at = StepPlacement::of(conn, DEBOUNCE_OPERATION)?;
             start = StepPlacement::of(conn, DEBOUNCE_OPERATION)?;
+        }
+    }
+
+    /// One attempt's fresh enqueue, run to the end whatever becomes of the debounce awaiting it.
+    ///
+    /// **Detached, as a start's writing half is**, so a caller that stops listening does not leave
+    /// it part-way. A created workflow commits together with its record at the start's step, but
+    /// two outcomes are two writes rather than one: the deduplication error the loop reads as a
+    /// lost key is recorded at the step after the insert fails, and a join of a deduplicated
+    /// holder after the holder is read. A drop between the two — the parent's own cancellation, or
+    /// shutdown aborting the parent's task — would leave the step unrecorded, and a replay would
+    /// debounce again, enqueueing a second workflow if the key had been freed meanwhile. Detached,
+    /// the drop takes the [`JoinHandle`](crate::rt::JoinHandle) and leaves the work. See
+    /// `WorkflowRef::started`.
+    ///
+    /// Holds the parent's starts token for as long as the task exists, so the parent waits for the
+    /// enqueue before recording its outcome; see `Ctx::starts`. Answers in the engine's channel,
+    /// as `create` does, and reports [`Interrupted`](Error::Interrupted) if shutdown aborts it,
+    /// which leaves either no row or a row recorded at the start's step that a replay joins.
+    async fn created(
+        &self,
+        executor: &Arc<Executor>,
+        start: StepPlacement,
+        request: OwnedStart,
+    ) -> Result<WorkflowHandle<R, E>> {
+        let workflow_id = request.workflow_id.clone();
+        // Taken before the spawn and moved into the task, so one aborted before its first poll
+        // still gives it back.
+        let tracked = match &start {
+            StepPlacement::Recorded { ctx, .. } => Some(ctx.starts().token()),
+            _ => None,
+        };
+        let creating = create::<R, E>(
+            Arc::clone(executor),
+            start,
+            self.workflow.qualified_name().clone(),
+            request,
+        )
+        .instrument(tracing::Span::current());
+        let creating = async move {
+            let _tracked = tracked;
+            creating.await
+        };
+        let label = format!("debounce {workflow_id}");
+        match spawn_tracked(executor, Role::Workflow, label, creating).await {
+            Ok(created) => created,
+            Err(join) if join.is_cancelled() => Err(Error::Interrupted { workflow_id }),
+            Err(join) => std::panic::resume_unwind(join.into_panic()),
         }
     }
 }
