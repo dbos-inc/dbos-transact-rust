@@ -1742,24 +1742,27 @@ pub(crate) async fn create<R, E>(
               the step ids it claimed; await it"]
 pub struct PendingWorkflow<'a, T, E = crate::EngineOnly>(PendingStep<'a, T, E>);
 
-/// A [`start`](WorkflowRef::start) that has claimed its step id and has started nothing.
+/// A call that sets a workflow running, has claimed its step id, and has done nothing yet: a
+/// [`start`](WorkflowRef::start), or a fork, resume or rewind such as
+/// [`fork_workflow`](crate::fork_workflow).
 ///
 /// One id, and it answers with a handle: the workflow's outcome is the handle's to give, through
 /// [`result`](crate::WorkflowHandle::result), which claims an id of its own where it is written.
 ///
-/// **Two error types, because a start deals in two.** `E` is the *child's* — it is what the handle
-/// will report when the child finishes, and none of it is in play yet. `C` is the channel this
-/// call itself answers in, and a start can only fail in the engine's terms: the child's body has
-/// not run, so there is no application error for it to have. One parameter for both would force a
-/// parent to fail the way its child does — and a parent whose error type differs from its child's
-/// would then have no way to report a start failure at all, since `?` cannot convert between two
-/// application channels and [`Error::lift`] starts from [`EngineOnly`](crate::EngineOnly).
+/// **Two error types, because the call deals in two.** `E` is the *target's* — the child a start
+/// creates, or the workflow a fork, resume or rewind sets running — and is what the handle will
+/// report when it finishes; none of it is in play yet. `C` is the channel this call itself answers
+/// in, and the call can only fail in the engine's terms: this call runs none of the target's body,
+/// so there is no application error for it to have. One parameter for both would force a caller to
+/// fail the way its target does — and a caller whose error type differs would then have no way to
+/// report the call failing at all, since `?` cannot convert between two application channels and
+/// [`Error::lift`] starts from [`EngineOnly`](crate::EngineOnly).
 ///
 /// `C` **defaults to `E`**, which is the common case written without saying anything: a workflow
 /// starting a child that fails the way it does writes `child.start(x).await?` and nothing else.
 /// Where the two differ, [`lift`](Self::lift) re-declares the channel before the await.
-#[must_use = "a start that is not awaited never starts the workflow, and has still spent the step \
-              id it claimed; await it"]
+#[must_use = "a call that is not awaited never sets the workflow running, and has still spent the \
+              step id it claimed; await it"]
 pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
     /// The start itself, in the engine's channel — see [`PendingWorkflow`] for why a start is a
     /// newtype and not a [`PendingStep`].
@@ -1773,8 +1776,9 @@ pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
 
 impl<'a, R, E, C> PendingStart<'a, R, E, C> {
     /// A start built from a placed call that answers with a handle, for a durable call other than
-    /// [`start_with`](WorkflowRef::start_with) that creates a workflow — a
-    /// [`Debouncer`](crate::Debouncer)'s, or [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)'s.
+    /// [`start_with`](WorkflowRef::start_with) that sets a workflow running — a
+    /// [`Debouncer`](crate::Debouncer)'s, [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)'s, or a
+    /// fork, resume or rewind ([`fork_workflow`](crate::fork_workflow) and the rest).
     pub(crate) fn from_step(
         step: PendingStep<'a, WorkflowHandle<R, E>, crate::EngineOnly>,
     ) -> Self {

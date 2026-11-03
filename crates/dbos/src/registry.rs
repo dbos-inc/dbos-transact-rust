@@ -256,8 +256,10 @@ impl DBOS {
     /// **Do not capture the [`DBOS`] instance in `workflow`.** The registry lives on the instance,
     /// so the closure is stored inside the very `Arc` a captured handle points at — a cycle, and
     /// the instance, its executor and its connection pool are then never freed. Nothing a workflow
-    /// body needs requires one: [`step`](crate::step()), [`set_event`](crate::set_event) and
-    /// [`get_event`](crate::get_event) all read the ambient context.
+    /// body needs requires one: [`step`](crate::step()), [`set_event`](crate::set_event),
+    /// [`get_event`](crate::get_event), [`send`](crate::send()) and managing another workflow —
+    /// [`cancel_workflow`](crate::cancel_workflow), [`fork_workflow`](crate::fork_workflow) and the
+    /// rest of the management surface's free forms — all read the ambient context.
     ///
     /// A [`WorkflowRef`] holds an instance too, so capturing one — to start a child workflow —
     /// has the same effect. That is a known gap rather than a rule anyone can follow around:

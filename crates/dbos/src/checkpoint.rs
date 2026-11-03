@@ -54,11 +54,11 @@
 //! are not, because a race *decides* something and nothing records what it decided. [`PendingStep`]
 //! sets out the rule and what to reach for instead.
 //!
-//! Two calls are kept out of a durable race by their own types:
-//! [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a workflow,
-//! and a race polls in source order and stops at the first branch that is ready — so whether the
-//! child exists at all would follow the timing of some other branch. Start outside the race; race
-//! what observes the result.
+//! Two kinds of call are kept out of a durable race by their own types:
+//! [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *set a workflow
+//! running* — a start, and a fork, resume or rewind — and a race polls in source order and stops
+//! at the first branch that is ready, so whether that workflow runs at all would follow the timing
+//! of some other branch. Set it running outside the race; race what observes the result.
 //! [`select_step!`](crate::select_step) pushes each branch onto a set that takes a [`PendingStep`],
 //! so a start handed to one is a type error rather than a paragraph ignored. What no type stops is
 //! `tokio::select!`, which takes any future — there the prose is what stands between a body and
@@ -339,8 +339,12 @@ impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
     /// [`select_step!`](crate::select_step) must agree on how they fail before any of them is
     /// awaited, so `map_err(Error::lift)` in an arm is too late: it converts the branch's
     /// *output*, where what has to change is its declared type. This converts the call itself,
-    /// while it is still a value, which is early enough. The management surface is where it comes
-    /// up — those calls answer in the engine's channel and a workflow body rarely does.
+    /// while it is still a value, which is early enough. The management methods on
+    /// [`DBOS`](crate::DBOS) are where it comes up — they answer in the engine's channel and a
+    /// workflow body rarely does — though from a workflow body most of their free forms, such as
+    /// [`cancel_workflow`](crate::cancel_workflow), answer in the caller's channel and need none.
+    /// The bulk resume and fork, [`resume_workflows`](crate::resume_workflows) and
+    /// [`fork_workflows`](crate::fork_workflows), answer in the engine's and do.
     ///
     /// Only from the engine's channel, which is not so much a restriction as the whole reason it
     /// is sound: [`EngineOnly`](crate::EngineOnly) is uninhabited, so there is no application
@@ -578,9 +582,10 @@ impl StepPlacement {
     /// wanted it.
     ///
     /// **What the *free* forms of the library calls stand on.** `send`, `send_bulk`,
-    /// `select_workflow` and `join_workflows` have no handle to take an executor from, so being
-    /// inside a workflow is the whole of what makes them callable — which is why each has a
-    /// [`DBOS`](crate::DBOS) form for everyone else, and why
+    /// `select_workflow`, `join_workflows`, the stream reads and the management surface's free
+    /// forms (`cancel_workflow`, `fork_workflow` and the rest) have no handle to take an executor
+    /// from, so being inside a workflow is the whole of what makes them callable — which is why
+    /// each has a [`DBOS`](crate::DBOS) form for everyone else, and why
     /// [`get_event`](crate::get_event)'s free form follows the same rule.
     ///
     /// Here rather than in each of those modules because it is one function: the question of how

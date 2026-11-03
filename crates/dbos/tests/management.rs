@@ -5,7 +5,7 @@
 //! the two listings are reads and writes against the row itself, and are checked against the
 //! system database directly.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -3624,6 +3624,676 @@ async fn no_workflow_write_reaches_the_legacy_payload_columns() {
         finished_without_output.is_empty(),
         "finished workflows with no workflow_output row: {finished_without_output:?}"
     );
+
+    dbos.shutdown().await;
+}
+
+/// What a supervisor fails with, so the free forms are exercised in a channel that is not the
+/// engine's: each answers in the caller's channel, and `?` needs no conversion.
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("the supervisor halted")]
+struct Halted;
+
+/// What another target fails with, which is not the supervisor's: a call that hands back its
+/// handle re-declares its channel with `lift` and is otherwise written the same.
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("the other target stalled")]
+struct Stalled;
+
+/// The workflows a supervisor manages, by id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Supervisees {
+    /// Waiting on a queue nothing polls, to be cancelled and resumed alone.
+    one: String,
+    /// Two more, to be cancelled and resumed as a batch.
+    pair: [String; 2],
+    /// A finished workflow, to be forked, rewound, tagged and listed.
+    done: String,
+    /// Held back an hour on a polled queue, to be brought forward.
+    delayed: String,
+    /// A finished workflow that fails as [`Stalled`], to be forked.
+    other: String,
+}
+
+/// What a supervisor saw, which a replay must see again.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Supervised {
+    cancelled: Vec<String>,
+    resumed: Vec<u32>,
+    forked_ids: Vec<String>,
+    rewound: Vec<u32>,
+    deleted: u64,
+    delayed: u32,
+    attributes: Option<String>,
+    listed_steps: (usize, usize),
+    other_forked: String,
+}
+
+/// The supervisor's body, capturing nothing: every call reaches the executor through the ambient
+/// context. Every free management function is called here.
+async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
+    use dbos::{Fork, ForkOptions, ResumeOptions, RewindOptions, WorkflowDelay};
+
+    dbos::cancel_workflow(&t.one).await?;
+    let resumed_one = dbos::resume_workflow::<u32, Halted>(&t.one).await?;
+    let mut resumed = vec![resumed_one.result().await?];
+
+    let pair = [t.pair[0].as_str(), t.pair[1].as_str()];
+    let mut cancelled = dbos::cancel_workflows(&pair, Children::Skip).await?;
+    cancelled.sort();
+    for handle in dbos::resume_workflows::<u32, Halted>(&pair, ResumeOptions::default())
+        .lift()
+        .await?
+    {
+        resumed.push(handle.result().await?);
+    }
+    // Already finished, so nothing moves; the handle reports the outcome it had.
+    drop(dbos::resume_workflow_with::<u32, Halted>(&t.one, ResumeOptions::default()).await?);
+
+    let first = dbos::fork_workflow::<u32, Halted>(&t.done, 0).await?;
+    let chosen = dbos::fork_workflow_with::<u32, Halted>(
+        Fork {
+            forked_id: Some("supervised-fork"),
+            ..Fork::new(&t.done, 0)
+        },
+        ForkOptions::default(),
+    )
+    .await?;
+    let batch = [Fork::new(&t.done, 0)];
+    let mut batched = dbos::fork_workflows::<u32, Halted>(&batch, ForkOptions::default())
+        .lift()
+        .await?;
+    let third = batched.pop().expect("one fork in, one handle out");
+    let forked_ids: Vec<String> = [&first, &chosen, &third]
+        .iter()
+        .map(|handle| handle.workflow_id().to_owned())
+        .collect();
+    for handle in [first, chosen, third] {
+        assert_eq!(handle.result().await?, 1);
+    }
+
+    let mut rewound = vec![
+        dbos::rewind_workflow::<u32, Halted>(&t.done)
+            .await?
+            .result()
+            .await?,
+    ];
+    rewound.push(
+        dbos::rewind_workflow_with::<u32, Halted>(&t.done, RewindOptions::default())
+            .await?
+            .result()
+            .await?,
+    );
+
+    dbos::delete_workflow(&forked_ids[0]).await?;
+    let rest = [forked_ids[1].as_str(), forked_ids[2].as_str()];
+    let deleted = dbos::delete_workflows(&rest, Children::Skip).await?;
+
+    dbos::set_workflow_delay(&t.delayed, WorkflowDelay::For(Duration::ZERO)).await?;
+    let delayed = dbos::retrieve_workflow::<u32, Halted>(&t.delayed)?
+        .result()
+        .await?;
+
+    let tags = serde_json::json!({ "tenant": "acme" });
+    dbos::update_workflow_attributes(&t.done, tags.as_object()).await?;
+    let more = serde_json::json!({ "supervised": true });
+    dbos::merge_workflow_attributes(&t.done, more.as_object().unwrap()).await?;
+    let filter = WorkflowFilter {
+        workflow_ids: vec![&t.done],
+        ..WorkflowFilter::default()
+    };
+    let attributes = dbos::list_workflows(&filter)
+        .await?
+        .pop()
+        .and_then(|row| row.attributes);
+    let listed_steps = (
+        dbos::list_workflow_steps(&t.done).await?.len(),
+        dbos::list_workflow_steps_with(
+            &t.done,
+            ListWorkflowStepsOptions {
+                load_output: false,
+                ..Default::default()
+            },
+        )
+        .await?
+        .len(),
+    );
+
+    // A target that fails another way: the fork re-declares its channel with `lift`, which is all
+    // forking it takes. Awaiting its result would map that error separately; it is not awaited.
+    let other = dbos::fork_workflow::<u32, Stalled>(&t.other, 0)
+        .lift()
+        .await?;
+    let other_forked = other.workflow_id().to_owned();
+
+    Ok(Supervised {
+        cancelled,
+        resumed,
+        forked_ids,
+        rewound,
+        deleted,
+        delayed,
+        attributes,
+        listed_steps,
+        other_forked,
+    })
+}
+
+/// **A workflow that holds no `DBOS` can manage other workflows, and its management replays.**
+///
+/// The supervisor's registered closure captures nothing, so it reaches every management call
+/// through the free forms — and each is recorded under the name the `DBOS` method records, in the
+/// order it was made. Forking the supervisor past its last step replays every one of those steps
+/// from its checkpoint: the fork hands back exactly what the first run saw, fork ids included, no
+/// target forks again, the rewound target's row is untouched, so it was not rewound a second
+/// time, and no target's body runs again. Cancel, delay, the attribute writes and delete are idempotent, so for those the replay's
+/// answer is the evidence, not the database.
+#[tokio::test]
+async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("free-management-app", &db));
+    // Every run of a target's body, so a replay that re-runs one — a rewind, say — is seen.
+    let runs = Arc::new(AtomicUsize::new(0));
+    let target = dbos
+        .register_workflow("supervisee", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    dbos::step("work", || async { Ok::<u32, Error<Halted>>(1) }).await
+                }
+            }
+        })
+        .unwrap();
+    let other = dbos
+        .register_workflow(
+            "other-target",
+            |()| async move { Ok::<u32, Error<Stalled>>(2) },
+        )
+        .unwrap();
+    let supervisor = dbos.register_workflow("supervisor", supervise).unwrap();
+    dbos.launch().await.expect("launch failed");
+    dbos.register_queue(
+        "delayed-work",
+        dbos::QueueOptions::default(),
+        dbos::QueueConflict::UpdateIfLatestVersion,
+    )
+    .await
+    .expect("registration failed");
+
+    let parked = |id: &'static str| {
+        let target = target.clone();
+        async move {
+            target
+                .start_with(
+                    (),
+                    StartOptions {
+                        workflow_id: Some(id),
+                        queue: Some(QueueRequest::new("nothing-polls-this")),
+                        ..StartOptions::default()
+                    },
+                )
+                .await
+                .expect("enqueue failed");
+        }
+    };
+    parked("parked-one").await;
+    parked("parked-a").await;
+    parked("parked-b").await;
+    target
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("finished-one"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the finished target failed");
+    other
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("finished-other"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the other target failed");
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("held-back"),
+                queue: Some(QueueRequest {
+                    delay: Some(Duration::from_secs(3600)),
+                    ..QueueRequest::new("delayed-work")
+                }),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let supervisees = Supervisees {
+        one: "parked-one".to_owned(),
+        pair: ["parked-a".to_owned(), "parked-b".to_owned()],
+        done: "finished-one".to_owned(),
+        delayed: "held-back".to_owned(),
+        other: "finished-other".to_owned(),
+    };
+    let supervisor_id = "the-supervisor";
+    let seen = tokio::time::timeout(
+        Duration::from_secs(60),
+        supervisor.run_with(
+            supervisees,
+            dbos::RunOptions {
+                workflow_id: Some(supervisor_id),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("the supervisor never finished")
+    .expect("the supervisor failed");
+
+    assert_eq!(seen.cancelled, ["parked-a", "parked-b"]);
+    assert_eq!(seen.resumed, [1, 1, 1]);
+    assert_eq!(seen.forked_ids.len(), 3);
+    assert_eq!(seen.forked_ids[1], "supervised-fork");
+    assert_eq!(seen.rewound, [1, 1]);
+    assert_eq!(seen.deleted, 2);
+    assert_eq!(seen.delayed, 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(seen.attributes.as_deref().unwrap()).unwrap(),
+        serde_json::json!({ "tenant": "acme", "supervised": true }),
+    );
+    assert_eq!(seen.listed_steps, (1, 1));
+
+    let reader = reader(&db).await;
+    for id in &seen.forked_ids {
+        assert!(
+            reader.get_workflow(id).await.unwrap().is_none(),
+            "fork {id} was not deleted"
+        );
+    }
+
+    let steps = reader
+        .list_workflow_steps(supervisor_id, false, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<&str> = steps.iter().map(|s| s.step_name.as_str()).collect();
+    assert_eq!(
+        recorded,
+        [
+            "DBOS.cancel_workflow",
+            "DBOS.resume_workflow",
+            "DBOS.get_result",
+            "DBOS.cancel_workflow",
+            "DBOS.resume_workflow",
+            "DBOS.get_result",
+            "DBOS.get_result",
+            "DBOS.resume_workflow",
+            "DBOS.fork_workflow",
+            "DBOS.fork_workflow",
+            "DBOS.fork_workflow",
+            "DBOS.get_result",
+            "DBOS.get_result",
+            "DBOS.get_result",
+            "DBOS.rewind_workflow",
+            "DBOS.get_result",
+            "DBOS.rewind_workflow",
+            "DBOS.get_result",
+            "DBOS.delete_workflow",
+            "DBOS.delete_workflow",
+            "DBOS.set_workflow_delay",
+            // `retrieve_workflow` records nothing; awaiting its handle does.
+            "DBOS.get_result",
+            "DBOS.update_workflow_attributes",
+            "DBOS.update_workflow_attributes",
+            "DBOS.list_workflows",
+            "DBOS.list_workflow_steps",
+            "DBOS.list_workflow_steps",
+            "DBOS.fork_workflow",
+        ],
+        "the free forms did not record under the methods' step names",
+    );
+    let ids: Vec<i32> = steps.iter().map(|s| s.step_id).collect();
+    assert_eq!(ids, (0..steps.len() as i32).collect::<Vec<_>>());
+
+    // Past the last step, so every call replays from its checkpoint. A rewind run again would
+    // write the target's row at once — back to enqueued — where the run it enqueues comes later,
+    // so the row is what shows it; the run count catches a body run again in the replay itself.
+    let rewound_row = reader
+        .get_workflow("finished-one")
+        .await
+        .expect("read failed")
+        .expect("the rewound target exists");
+    let before = runs.load(Ordering::SeqCst);
+    let replay = dbos
+        .fork::<Supervised, Halted>(supervisor_id, steps.len() as i32)
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(Duration::from_secs(60), replay.result())
+        .await
+        .expect("the replay never finished")
+        .expect("the replay failed");
+    assert_eq!(
+        replayed, seen,
+        "the replay did not hand back what the first run saw"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        before,
+        "the replay ran a target's body again"
+    );
+    let row = reader
+        .get_workflow("finished-one")
+        .await
+        .expect("read failed")
+        .expect("the rewound target exists");
+    assert_eq!(
+        (row.status, row.updated_at),
+        (rewound_row.status, rewound_row.updated_at),
+        "the replay rewound the finished workflow again"
+    );
+    let forks_of_done: Vec<String> = reader
+        .list_workflows(&WorkflowFilter::default(), None)
+        .await
+        .expect("read failed")
+        .into_iter()
+        .filter(|row| row.forked_from.as_deref() == Some("finished-one"))
+        .map(|row| row.workflow_id)
+        .collect();
+    assert!(
+        forks_of_done.is_empty(),
+        "the replay forked the finished workflow again: {forks_of_done:?}"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **A workflow recorded with the `DBOS` methods replays with the free forms**, which is what
+/// sharing one body buys: a deployment that drops its captured handle for the free functions
+/// recovers the executions the old code started.
+///
+/// The first instance records the workflow through the methods. A second, on the same database,
+/// registers the same name with the free forms and forks the first run past its last step, so its
+/// body replays the methods' history — under a different step name that would be
+/// `UnexpectedStep`, and a re-run would fork a second time under a new id.
+#[tokio::test]
+async fn a_workflow_recorded_through_the_methods_replays_through_the_free_forms() {
+    let db = test_database().await;
+    let operator_id = "switching-operator";
+
+    let recorded = {
+        let dbos = DBOS::new(config("switch-forms-app", &db));
+        let target = dbos
+            .register_workflow("switch-target", |()| async move { Ok::<u32, Error>(5) })
+            .unwrap();
+        let operator = dbos
+            .register_workflow("switching", {
+                let dbos = dbos.clone();
+                move |source: String| {
+                    let dbos = dbos.clone();
+                    async move {
+                        dbos.cancel(&source).await?;
+                        let fork = dbos.fork::<u32, EngineOnly>(&source, 0).await?;
+                        let rows = dbos
+                            .list_workflows(&WorkflowFilter {
+                                workflow_ids: vec![&source],
+                                ..WorkflowFilter::default()
+                            })
+                            .await?;
+                        let steps = dbos.list_workflow_steps(&source).await?;
+                        Ok::<_, Error>((fork.workflow_id().to_owned(), rows.len(), steps.len()))
+                    }
+                }
+            })
+            .unwrap();
+        dbos.launch().await.expect("launch failed");
+        target
+            .run_with(
+                (),
+                dbos::RunOptions {
+                    workflow_id: Some("switch-source"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the source failed");
+        let recorded = operator
+            .run_with(
+                "switch-source".to_owned(),
+                dbos::RunOptions {
+                    workflow_id: Some(operator_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the method-form operator failed");
+        dbos.shutdown().await;
+        recorded
+    };
+
+    let dbos = DBOS::new(config("switch-forms-app", &db));
+    let _target = dbos
+        .register_workflow("switch-target", |()| async move { Ok::<u32, Error>(5) })
+        .unwrap();
+    dbos.register_workflow("switching", |source: String| async move {
+        dbos::cancel_workflow(&source).await?;
+        let fork = dbos::fork_workflow::<u32, EngineOnly>(&source, 0).await?;
+        let filter = WorkflowFilter {
+            workflow_ids: vec![&source],
+            ..WorkflowFilter::default()
+        };
+        let rows = dbos::list_workflows(&filter).await?;
+        let steps = dbos::list_workflow_steps(&source).await?;
+        Ok::<_, Error>((fork.workflow_id().to_owned(), rows.len(), steps.len()))
+    })
+    .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    // Past the last step the methods recorded, so the whole body replays.
+    let past_last = reader(&db)
+        .await
+        .list_workflow_steps(operator_id, false, None, None, None)
+        .await
+        .expect("read failed")
+        .iter()
+        .map(|step| step.step_id + 1)
+        .max()
+        .expect("the methods recorded steps");
+    let replay = dbos
+        .fork::<(String, usize, usize), EngineOnly>(operator_id, past_last)
+        .await
+        .expect("fork failed");
+    let replayed = tokio::time::timeout(Duration::from_secs(60), replay.result())
+        .await
+        .expect("the replay never finished")
+        .expect("the free-form replay of the methods' history failed");
+    assert_eq!(replayed, recorded);
+
+    let forks: Vec<String> = reader(&db)
+        .await
+        .list_workflows(&WorkflowFilter::default(), None)
+        .await
+        .expect("read failed")
+        .into_iter()
+        .filter(|row| row.forked_from.as_deref() == Some("switch-source"))
+        .map(|row| row.workflow_id)
+        .collect();
+    assert_eq!(
+        forks,
+        std::slice::from_ref(&recorded.0),
+        "the replay forked the source again"
+    );
+
+    dbos.shutdown().await;
+}
+
+/// **Outside a workflow every free form is `NotInWorkflow`**, naming itself — there is no context
+/// to take a connection from, and that is where the methods and the client are. No instance or
+/// database is needed to find that out.
+#[tokio::test]
+async fn the_free_management_calls_need_a_workflow() {
+    use dbos::{Fork, ForkOptions, ResumeOptions, RewindOptions, WorkflowDelay};
+
+    fn refused<T: std::fmt::Debug>(result: dbos::Result<T>, operation: &str) {
+        match result {
+            Err(Error::NotInWorkflow { operation: named }) => assert_eq!(named, operation),
+            other => panic!("{operation}: expected NotInWorkflow, got {other:?}"),
+        }
+    }
+
+    let ids = ["a"];
+    let forks = [Fork::new("a", 0)];
+    let filter = WorkflowFilter::default();
+    let map = serde_json::Map::new();
+    refused(dbos::cancel_workflow("a").await, "cancel_workflow");
+    refused(
+        dbos::cancel_workflows(&ids, Children::Skip).await,
+        "cancel_workflows",
+    );
+    refused(
+        dbos::resume_workflow::<u32, EngineOnly>("a").await,
+        "resume_workflow",
+    );
+    refused(
+        dbos::resume_workflow_with::<u32, EngineOnly>("a", ResumeOptions::default()).await,
+        "resume_workflow_with",
+    );
+    refused(
+        dbos::resume_workflows::<u32, EngineOnly>(&ids, ResumeOptions::default()).await,
+        "resume_workflows",
+    );
+    refused(
+        dbos::fork_workflow::<u32, EngineOnly>("a", 0).await,
+        "fork_workflow",
+    );
+    refused(
+        dbos::fork_workflow_with::<u32, EngineOnly>(Fork::new("a", 0), ForkOptions::default())
+            .await,
+        "fork_workflow_with",
+    );
+    refused(
+        dbos::fork_workflows::<u32, EngineOnly>(&forks, ForkOptions::default()).await,
+        "fork_workflows",
+    );
+    refused(
+        dbos::rewind_workflow::<u32, EngineOnly>("a").await,
+        "rewind_workflow",
+    );
+    refused(
+        dbos::rewind_workflow_with::<u32, EngineOnly>("a", RewindOptions::default()).await,
+        "rewind_workflow_with",
+    );
+    refused(dbos::delete_workflow("a").await, "delete_workflow");
+    refused(
+        dbos::delete_workflows(&ids, Children::Skip).await,
+        "delete_workflows",
+    );
+    refused(
+        dbos::set_workflow_delay("a", WorkflowDelay::For(Duration::ZERO)).await,
+        "set_workflow_delay",
+    );
+    refused(
+        dbos::update_workflow_attributes("a", None).await,
+        "update_workflow_attributes",
+    );
+    refused(
+        dbos::merge_workflow_attributes("a", &map).await,
+        "merge_workflow_attributes",
+    );
+    refused(dbos::list_workflows(&filter).await, "list_workflows");
+    refused(dbos::list_workflow_steps("a").await, "list_workflow_steps");
+    refused(
+        dbos::list_workflow_steps_with("a", ListWorkflowStepsOptions::default()).await,
+        "list_workflow_steps_with",
+    );
+    refused(
+        dbos::retrieve_workflow::<u32, EngineOnly>("a"),
+        "retrieve_workflow",
+    );
+}
+
+/// **Inside a step the free forms are plain**, as the methods are: the step's own checkpoint
+/// stands for everything its body did, so they take no ids of their own. And in the workflow body,
+/// a call refused by its arguments spends no id either.
+#[tokio::test]
+async fn the_free_management_calls_inside_a_step_record_nothing_of_their_own() {
+    let db = test_database().await;
+    let dbos = DBOS::new(config("free-management-step-app", &db));
+    let target = dbos
+        .register_workflow("step-target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let operator = dbos
+        .register_workflow("step-operator", |target_id: String| async move {
+            let refused = dbos::fork_workflow::<u32, EngineOnly>(&target_id, -1).await;
+            assert!(
+                matches!(refused, Err(Error::InvalidArgument { .. })),
+                "{refused:?}"
+            );
+            dbos::step("manage", || {
+                let target_id = target_id.clone();
+                async move {
+                    dbos::cancel_workflow(&target_id).await?;
+                    let filter = WorkflowFilter {
+                        workflow_ids: vec![&target_id],
+                        ..WorkflowFilter::default()
+                    };
+                    Ok::<_, Error>(dbos::list_workflows(&filter).await?.len())
+                }
+            })
+            .await
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some("cancelled-from-a-step"),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+    let operator_id = "free-step-operator";
+    let listed = operator
+        .run_with(
+            "cancelled-from-a-step".to_owned(),
+            dbos::RunOptions {
+                workflow_id: Some(operator_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the operator failed");
+    assert_eq!(listed, 1);
+
+    let reader = reader(&db).await;
+    assert_eq!(
+        reader
+            .get_workflow("cancelled-from-a-step")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Cancelled,
+    );
+    let steps = reader
+        .list_workflow_steps(operator_id, false, None, None, None)
+        .await
+        .expect("read failed");
+    let recorded: Vec<(i32, &str)> = steps
+        .iter()
+        .map(|s| (s.step_id, s.step_name.as_str()))
+        .collect();
+    assert_eq!(recorded, [(0, "manage")]);
 
     dbos.shutdown().await;
 }
