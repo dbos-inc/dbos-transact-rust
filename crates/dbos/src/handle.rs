@@ -381,38 +381,25 @@ impl ChildResultPlacement {
     /// unrecorded is whatever a replay must not be pinned to:
     ///
     /// - **the parent being interrupted** — shutdown aborted the task, nothing is decided, and a
-    ///   recovered parent must await again (Go says the same in its own words: *"nothing is
-    ///   checkpointed, so a resume re-executes the await"*);
+    ///   recovered parent must await again, since nothing was checkpointed;
     /// - **a system-database failure**, which is a statement about the substrate rather than about
     ///   the child;
     /// - **the child being parked** at `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, which is the one that
     ///   needs an argument, below.
     ///
-    /// **A parked child still fails its parent** — all four implementations let that error out of
-    /// the await, and none treats it as something a parent can wait out. What is withheld is only
-    /// the *checkpoint*: parking is the one non-terminal verdict a workflow can carry, so freezing
-    /// it into the parent's replay would outlive its own truth. A parent resumed after its child
-    /// was resumed re-asks the child's row and sees what the child actually did; a parent holding
-    /// a recorded "parked" would replay that answer forever. It is the same argument as the
-    /// interrupted-await bullet above, one step further out.
+    /// **A parked child still fails its parent** — the error leaves the await, and a parent does
+    /// not wait it out. What is withheld is only the *checkpoint*: parking is the one non-terminal
+    /// verdict a workflow can carry, so freezing it into the parent's replay would outlive its own
+    /// truth. A parent resumed after its child was resumed re-asks the child's row and sees what
+    /// the child actually did; a parent holding a recorded "parked" would replay that answer
+    /// forever. It is the same argument as the interrupted-await bullet above, one step further
+    /// out.
     ///
-    /// **Rust follows Go here, against the other three.** Go filters this case out of its await
-    /// checkpoint deliberately and says so — *"either the workflow result proper (no dlq, no raw
-    /// awaitWorkflowResult error) or the child's cancellation"* (`workflow.go`). Python, TypeScript
-    /// and Java all record it, because in all three the await runs inside the generic step wrapper
-    /// and that wrapper checkpoints whatever exception it caught.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 20. Two implementations pin a parked child's verdict into
-    /// the parent's replay and two do not, and none of the four argues for its side — the split
-    /// falls exactly along "Go's await path filters on purpose" versus "a step wrapper records by
-    /// default", which is not a decision anyone made twice. It is worth settling before v1,
-    /// because it changes what a resumed parent sees. The same item covers a second half: Python
-    /// and TypeScript raise a distinct *awaited* error here
-    /// (`DBOSAwaitedWorkflowMaxRecoveryAttemptsExceeded`,
-    /// `DBOSAwaitedWorkflowExceededMaxRecoveryAttempts`) while Go and Java reuse the error a
-    /// workflow gets for its own parking — a two-two split the *cancellation* case does not have,
-    /// where all four separate the two meanings and Rust followed them into
-    /// [`Error::AwaitedWorkflowCancelled`].
+    /// Whether a parked child's verdict belongs in the parent's replay is an open question shared
+    /// with the other SDKs on the same database, and the answer changes what a resumed parent
+    /// sees. So is the error itself: a parked child surfaces as
+    /// [`Error::MaxRecoveryAttemptsExceeded`], the same error a workflow gets for its own parking,
+    /// whereas a cancelled child has an error of its own, [`Error::AwaitedWorkflowCancelled`].
     async fn record(
         &self,
         conn: &Connection,

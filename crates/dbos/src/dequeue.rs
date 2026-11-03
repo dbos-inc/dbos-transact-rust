@@ -757,15 +757,13 @@ async fn dispatch(
         // Logged and skipped, never fatal: the code that knew this workflow was removed or
         // renamed, and the row waits for a launch that recognises it.
         //
-        // TODO(dbos-team): UPSTREAM item 24, the cap this skip never reaches. The claim already
-        // counted this dispatch — `start_queued_workflows` does `recovery_attempts + 1` — and
-        // the cap below is the only place that reads that count and parks the row, so returning
-        // here skips it: the row is claimed, counted, skipped, re-enqueued by
-        // recovery, and claimed again, with nothing ever parking it. All four implementations
-        // have the same hole, and for them the order is forced because the budget is read off the
-        // registration whose absence is the problem. Here it is `MAX_RECOVERY_ATTEMPTS`, a
-        // constant, so this could check the cap first; it does not, because a lone port that
-        // parks rows its peers leave alone is the worse divergence.
+        // The skip also bypasses the recovery cap. The claim already counted this dispatch —
+        // `start_queued_workflows` does `recovery_attempts + 1` — and the cap below is the only
+        // place that reads that count and parks the row, so a row no launch recognises cycles:
+        // claimed, counted, skipped, re-enqueued by recovery, and claimed again, never parked.
+        // The cap is `MAX_RECOVERY_ATTEMPTS`, a constant, so it could be checked first; it is
+        // not, because whether such a row should be parked is an open question shared with the
+        // other SDKs on the same database, and parking it here alone would decide it for them.
         tracing::warn!(
             workflow_id,
             workflow = %key,
@@ -1235,7 +1233,7 @@ mod tests {
         // come back short of a row enqueued moments ago, leaving one of the open partitions'
         // rows waiting through no fault of the walk.
         if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
-            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            eprintln!("skipped on CockroachDB: a claim may under-deliver; see the dequeue");
             dbos.shutdown().await;
             return;
         }
@@ -1277,7 +1275,7 @@ mod tests {
         // come back short of a row enqueued moments ago, and each short claim costs the walk one
         // more visit; the walk is still bounded there, just not to this count.
         if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
-            eprintln!("skipped on CockroachDB: a claim may under-deliver; see UPSTREAM item 7");
+            eprintln!("skipped on CockroachDB: a claim may under-deliver; see the dequeue");
             dbos.shutdown().await;
             return;
         }

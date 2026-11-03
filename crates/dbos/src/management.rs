@@ -214,18 +214,14 @@ pub enum Children {
 
 /// Where a resumed workflow goes.
 ///
-/// A struct for one field, because it is the field every reference has and none of them stopped
-/// there — and because `resume_all(&ids, None)` says nothing at a call site about what was
-/// declined.
+/// A struct for one field, so that options can be added without changing every call site — and
+/// because `resume_all(&ids, None)` says nothing at a call site about what was declined.
 ///
-/// TODO(dbos-team): UPSTREAM item 28. One field is also all any reference has. Resume takes a
-/// queue name and no partition key in all five, and the `UPDATE` behind it moves `queue_name`
-/// while leaving `queue_partition_key` untouched — so resuming onto a partitioned queue either
-/// carries over a key belonging to whatever queue the workflow was on before, or, for a workflow
-/// that never had one, writes the unkeyed row that
-/// [`ForkOptions::queue_partition_key`] exists to prevent. Deliberately not closed here alone:
-/// the gap is the contract's, and a field no reference has would put this crate's `resume` ahead
-/// of it.
+/// **Resume takes a queue name and no partition key.** The `UPDATE` behind it moves `queue_name`
+/// and leaves `queue_partition_key` untouched, so resuming onto a partitioned queue either carries
+/// over a key belonging to whatever queue the workflow was on before or, for a workflow that never
+/// had one, writes the unkeyed row that [`ForkOptions::queue_partition_key`] exists to prevent.
+/// A known open gap, shared with the other SDKs on the same database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeOptions<'a> {
     /// The queue the workflow is re-enqueued on. `None` is the engine's internal queue.

@@ -564,11 +564,12 @@ pub struct Migration {
 /// A migration that does not apply renders empty rather than being dropped: versions are
 /// positional, so removing one would renumber everything after it.
 ///
-/// TODO(dbos-team): UPSTREAM item 15. `use_listen_notify` decides both how *this process* waits and
-/// whether the *database* gets its NOTIFY triggers — and the second is permanent and shared. A
-/// database migrated with it off has no triggers, so a Go peer, which has no such config and always
-/// LISTENs on Postgres (`dialect.go`), waits out every `recv` timeout in silence. 1, 20 and 39 are
-/// still gated; whether any migration should be is the question.
+/// **`use_listen_notify` decides two things, and only one of them is this process's.** It sets how
+/// this process waits, and also whether the *database* gets its NOTIFY triggers — which is
+/// permanent and shared. A database migrated with it off has no triggers, so any peer on the same
+/// database that LISTENs on Postgres waits out every `recv` timeout in silence. 1, 20 and 39 are
+/// still gated on it; whether a per-process setting should shape a shared schema at all is an open
+/// question shared with the other SDKs on the same database.
 pub fn build_migrations(schema: &str, dialect: Dialect, use_listen_notify: bool) -> Vec<Migration> {
     let quoted = quote_identifier(schema);
     // CockroachDB has no LISTEN/NOTIFY, so asking for it there is asking for nothing.

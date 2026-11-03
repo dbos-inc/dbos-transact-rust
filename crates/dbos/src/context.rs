@@ -216,14 +216,9 @@ struct WorkflowState {
     encoding: PayloadEncoding,
     /// The next step id to hand out, so the first step in a workflow is step 0.
     ///
-    /// **Zero-based, matching Go, TypeScript and Java** — Go initializes to `-1` and
-    /// pre-increments (`stepID: -1, // Steps are 0-indexed`), while TypeScript and Java start at 0
-    /// and post-increment. Python is the outlier at one-based, and that is an upstream
-    /// inconsistency rather than a choice open to this port: the step id addresses a fork point
-    /// and labels a row in a step listing, so it is a number Conductor renders and a user passes
-    /// to `fork`. Three of four is what a fourth implementation has to match.
-    ///
-    /// TODO(dbos-team): UPSTREAM item 19.
+    /// **Zero-based, and the base is part of the contract.** The id is public: it is stored in
+    /// `operation_outputs.function_id`, shown in step listings, and passed to `fork` as the step
+    /// to resume at, so other SDKs sharing the database rely on the same base.
     next_step_id: AtomicI32,
     /// The child starts this workflow has in flight, which it waits for before recording its
     /// outcome.

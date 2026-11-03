@@ -11198,12 +11198,12 @@ async fn listing_queues_scopes_but_reading_one_does_not() {
     alpha.delete_queue("alpha-queue").await.unwrap();
 }
 
-/// A queue carrying half a rate limit reads as having none, as TypeScript does.
+/// A queue carrying half a rate limit reads as having none.
 ///
 /// The two columns are only meaningful together and no SDK can write one alone, so reaching this
-/// state takes direct SQL. Matching TypeScript matters more than reporting it: a peer reading the
-/// same row must not see a different queue. The safety cost — an unthrottled queue that says
-/// nothing — is recorded as a `TODO(dbos-team)` on the reader.
+/// state takes direct SQL. Every SDK reading the same row must see the same queue, so this reads
+/// it the way they do rather than reporting it. The safety cost — an unthrottled queue that says
+/// nothing — is explained on the reader, `queue_from_row`.
 #[tokio::test]
 async fn half_a_rate_limit_reads_as_none() {
     let (sys, db) = sysdb().await;
@@ -11227,16 +11227,15 @@ async fn half_a_rate_limit_reads_as_none() {
 /// waits for the next poll — 11 of 15 rounds in a stress run. Nothing in the test can prevent it:
 /// a row is readable while still being skippable, so reading it first only narrows the window.
 ///
-/// Skipped rather than loosened, because the assertion is the point: Java's equivalent tests miss
-/// the behaviour precisely because they assert a limit being enforced rather than a count being
-/// complete. Weakening ours the same way would lose the only coverage anyone has.
+/// Skipped rather than loosened, because the assertion is the point: a test that asserts a limit
+/// being enforced rather than a count being complete never sees the behaviour.
 ///
-/// Remove this once the lock mode is settled — see the `TODO(dbos-team)` on
-/// `start_queued_workflows`, UPSTREAM item 7.
+/// Remove this once the lock mode is settled — see the explanation of the lock mode in
+/// `start_queued_workflows`.
 fn skip_dequeue_completeness(db: &support::TestDatabase) -> bool {
     let skipping = matches!(db.backend(), Backend::Cockroach);
     if skipping {
-        eprintln!("skipped on CockroachDB: SKIP LOCKED may under-deliver; see UPSTREAM item 7");
+        eprintln!("skipped on CockroachDB: SKIP LOCKED may under-deliver");
     }
     skipping
 }
