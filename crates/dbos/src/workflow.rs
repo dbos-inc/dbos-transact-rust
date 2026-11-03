@@ -1451,7 +1451,7 @@ pub(crate) fn placed_workflow_id(chosen: Option<&str>, placement: &StepPlacement
 /// function because a task outlives the reference that spawned it: what it needs of the
 /// [`WorkflowRef`] is the key, and that it takes by value.
 /// [`DBOS::enqueue_with`](crate::DBOS::enqueue_with) runs it detached the same way, with no
-/// registration behind the key. A [`Debouncer`](crate::Debouncer) awaits it inside its own loop.
+/// registration behind the key, and a [`Debouncer`](crate::Debouncer) once per attempt of its loop.
 ///
 /// Nothing here is abandoned part-way by a caller losing interest. That is the whole point of it
 /// being here — see [`started`](WorkflowRef::started) — and it is why the order below can be read

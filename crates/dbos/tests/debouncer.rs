@@ -480,9 +480,8 @@ async fn a_fresh_debounce_inside_a_workflow_replays_without_enqueueing_again() {
 ///
 /// **The enqueue runs in a task of its own**, as a start's writing half does, so a caller that
 /// stops listening — a `select!` whose other branch won, the parent's cancellation — takes the
-/// handle and leaves the work. Inline, the drop would abandon the write part-way, and of a join or
-/// a recorded deduplication error that can mean an outcome read but never recorded, which a replay
-/// then debounces again.
+/// handle and leaves the work. Inline, the drop rolled the enqueue back, and the parent finished
+/// without the workflow its debounce had begun to create.
 ///
 /// Forced rather than raced: the test holds `workflow_input` locked, which a bounce that finds no
 /// holder never touches and the fresh enqueue's insert waits on. The branch is dropped only once
@@ -512,11 +511,14 @@ async fn a_debounce_dropped_while_it_enqueues_still_enqueues_and_records_it() {
                     // The parent's own input is written to the table about to be locked, so the
                     // lock is taken only once the parent has started.
                     locked.notified().await;
+                    // Biased, so a runner slow to poll the parent until the lock is gone still
+                    // takes the branch the test fired rather than whichever is ready.
                     tokio::select! {
+                        biased;
+                        () = waiting.notified() => {}
                         debounced = debouncer.debounce("key", FOREVER, 7) => {
                             panic!("the debounce finished under the lock: {debounced:?}")
                         }
-                        () = waiting.notified() => {}
                     }
                     Ok::<_, Error>(())
                 }
@@ -551,7 +553,8 @@ async fn a_debounce_dropped_while_it_enqueues_still_enqueues_and_records_it() {
     loop {
         let stalled: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
-             WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock' \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+               AND wait_event_type = 'Lock' \
                AND query ILIKE '%INSERT INTO%workflow_input%'",
         )
         .fetch_one(&pool)
