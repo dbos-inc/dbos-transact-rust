@@ -60,7 +60,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::DATABASE_URL_ENV;
+use crate::config::SYSTEM_DATABASE_URL_ENV;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
@@ -209,7 +209,7 @@ impl ClientConfig {
         }
     }
 
-    /// [`ClientConfig::new`], taking the database URL from `DBOS_DATABASE_URL`.
+    /// [`ClientConfig::new`], taking the database URL from `DBOS_SYSTEM_DATABASE_URL`.
     ///
     /// A missing or empty variable leaves [`database_url`](Self::database_url) empty rather than
     /// failing here, so a caller who sets it afterwards is not forced through an error path;
@@ -240,14 +240,14 @@ impl ClientConfig {
     /// };
     /// ```
     pub fn from_env() -> Self {
-        Self::new(std::env::var(DATABASE_URL_ENV).unwrap_or_default())
+        Self::new(std::env::var(SYSTEM_DATABASE_URL_ENV).unwrap_or_default())
     }
 
     /// Checks what can be checked before anything is connected.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.database_url.is_empty() {
             return Err(Error::Config(format!(
-                "no database URL: set `database_url`, or the {DATABASE_URL_ENV} environment \
+                "no database URL: set `database_url`, or the {SYSTEM_DATABASE_URL_ENV} environment \
                  variable if the configuration came from `ClientConfig::from_env`"
             )));
         }
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
         let err = ClientConfig::new("").validate().unwrap_err();
-        assert!(err.to_string().contains(DATABASE_URL_ENV), "{err}");
+        assert!(err.to_string().contains(SYSTEM_DATABASE_URL_ENV), "{err}");
     }
 
     /// A client is meant to be cloned into whatever holds application state, and used from

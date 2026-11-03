@@ -37,8 +37,8 @@ cargo run -p dbos-rust-starter
 
 Then open <http://localhost:8080>. The app creates its `dbos_rust_starter` database if it does not
 exist, and the standard libpq variables (`PGUSER`, `PGPASSWORD`) apply; point it at another server
-with `DBOS_DATABASE_URL`. See the [starter's README](./demo-apps/dbos-rust-starter/README.md) for
-details.
+with `DBOS_SYSTEM_DATABASE_URL`. See the
+[starter's README](./demo-apps/dbos-rust-starter/README.md) for details.
 
 ## Try the widget store
 
@@ -61,7 +61,7 @@ cargo run -p dbos-rust-widget-store
 
 Then open <http://localhost:8080>. The app creates its `dbos_rust_widget_store` database and its
 own `products` and `orders` tables on first run, so there is nothing to migrate by hand; point it
-at another server with `DBOS_DATABASE_URL`. The workflow worth reading is the checkout, which
+at another server with `DBOS_SYSTEM_DATABASE_URL`. The workflow worth reading is the checkout, which
 reserves a widget and then *stops* until a payment webhook tells it whether the card was charged —
 a wait that outlives the process. See the [widget store's
 README](./demo-apps/dbos-rust-widget-store/README.md) for what to try.

@@ -99,7 +99,7 @@ const DEFAULT_WORKER_CONCURRENCY: i32 = 3;
 /// How many the Enqueue button puts on the queue at once.
 const ENQUEUE_BATCH: usize = 5;
 
-/// Used when `DBOS_DATABASE_URL` is not set. The database is created if it does not exist.
+/// Used when `DBOS_SYSTEM_DATABASE_URL` is not set. The database is created if it does not exist.
 ///
 /// Deliberately no username or password: the driver fills in whatever the URL leaves out
 /// from the standard libpq variables, such as PGUSER and PGPASSWORD.
