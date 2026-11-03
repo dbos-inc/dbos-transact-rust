@@ -261,9 +261,8 @@ pub use wait::{join_workflows, select_workflow};
 /// A branch is any [`PendingStep`]: a [`step`](step()), a handle's
 /// [`result`](WorkflowHandle::result), a wait over workflows
 /// ([`select_workflow`](fn@select_workflow) or [`join_workflows`](fn@join_workflows)), a
-/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a management call that observes or
-/// marks rather than sets a workflow running — free, like [`cancel_workflow`] or
-/// [`list_workflows`], or on [`DBOS`]. Each checkpoints itself under the id it was built with and
+/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a management call that hands back no
+/// handle — free, like [`cancel_workflow`] or [`list_workflows`], or on [`DBOS`]. Each checkpoints itself under the id it was built with and
 /// replays from its own row when it is the recorded winner, so a race between a step and the await
 /// of a child is as durable as one between two steps.
 ///
@@ -281,8 +280,10 @@ pub use wait::{join_workflows, select_workflow};
 /// another branch, and a run additionally holds two ids and would leave a started, recorded child
 /// whose outcome the parent never learns. Start outside the race, and race the handle's
 /// [`result`](WorkflowHandle::result) — which observes rather than creates, and is the branch that
-/// was meant. A fork, a resume and a rewind hand back a [`PendingStart`] too, for the same reason;
-/// their bulk forms are steps and the type does not stop them, but they are no better a branch.
+/// was meant. A fork, a resume and a rewind hand back a [`PendingStart`] too: each sets a workflow
+/// running, so whether it runs would follow the race. The type stops only those. A losing branch
+/// that committed has still done its work, so a cancel, a delete, a delay brought forward, or a
+/// bulk fork or resume (which stay steps) are no better branches, though the type allows them.
 ///
 /// **What losing means.** A losing step is dropped mid-body and records nothing, so a replay never
 /// runs it; its [`cancellation_token`] fires on the way out, as it does for a timeout, so work it

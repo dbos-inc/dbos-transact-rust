@@ -793,7 +793,8 @@ impl Error<EngineOnly> {
     /// needing a panic or a fallback for a case that cannot occur.
     ///
     /// Public because a workflow with its own error type sometimes holds an engine-channel
-    /// result — the management methods on [`DBOS`](crate::DBOS) are, and
+    /// result — the management methods on [`DBOS`](crate::DBOS) are, as are the bulk free
+    /// [`resume_workflows`](crate::resume_workflows) and [`fork_workflows`](crate::fork_workflows), and
     /// [`DBOS::get_event`](crate::DBOS::get_event) called from inside a workflow is another — and
     /// `?` cannot lift `Error<EngineOnly>` into `Error<E>` on its own: the blanket conversion
     /// would wrap the whole error as the application's. This is the conversion written out:

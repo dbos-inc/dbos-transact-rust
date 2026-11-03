@@ -73,16 +73,24 @@
 //!
 //! A [`PendingStep`] — a [`step`](crate::step()), a
 //! [`handle.result()`](crate::WorkflowHandle::result), a [`sleep`](crate::sleep()), an event, a
-//! wait, a management call. Every one of them **observes**: it claims one id, records one row, and
-//! a replay of it reads that row back rather than doing the thing again.
+//! wait, and the management calls that hand back no handle. Each claims one id, records one row,
+//! and a replay of it reads that row back rather than doing the thing again.
 //!
-//! A child's [`start`](crate::WorkflowRef::start) or [`run`](crate::WorkflowRef::run) — a
-//! [`PendingStart`](crate::PendingStart) and a [`PendingWorkflow`](crate::PendingWorkflow) — is
-//! **not** a `PendingStep`, so [`Branches::push`] cannot be handed one and a race cannot be built
-//! over one.
-//! That is the type doing what the prose alone could not: a start *creates* a workflow, only the
-//! winner is polled on a replay, and so whether a child exists at all would follow the timing of
-//! some other branch. Start outside the race and race what observes the result.
+//! A child's [`start`](crate::WorkflowRef::start) or [`run`](crate::WorkflowRef::run), and a
+//! [`fork_workflow`](crate::fork_workflow), [`resume_workflow`](crate::resume_workflow) or
+//! [`rewind_workflow`](crate::rewind_workflow) — a [`PendingStart`](crate::PendingStart) or a
+//! [`PendingWorkflow`](crate::PendingWorkflow) — is **not** a `PendingStep`, so
+//! [`Branches::push`] cannot be handed one and a race cannot be built over one. That is the type
+//! doing what the prose alone could not: each sets a workflow running, only the winner is polled
+//! on a replay, and so whether that workflow runs at all would follow the timing of some other
+//! branch. Set it running outside the race and race what observes the result.
+//!
+//! **The type draws the line at a handed-back handle, not at every effect.** A losing branch that
+//! committed has still done its work — a cancel, a delete, a delay brought forward, which
+//! [`set_workflow_delay`](crate::set_workflow_delay) can use to set a workflow running sooner —
+//! and so has a losing bulk [`fork_workflows`](crate::fork_workflows) or
+//! [`resume_workflows`](crate::resume_workflows), which stay `PendingStep`s. Racing a call that
+//! changes another workflow is rarely what is meant.
 
 use std::marker::PhantomData;
 

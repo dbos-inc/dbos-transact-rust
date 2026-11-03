@@ -70,8 +70,9 @@
 //! issued once, and a listing replays the rows it saw.
 //!
 //! **Each takes its step id where it is written, not where it is first polled**, which is why every
-//! one of them is a plain `fn` handing back a [`PendingStep`] rather than an `async fn` — see
-//! [`PendingStep`] for what that buys. A management call built beside a step and driven with it by
+//! one of them is a plain `fn` handing back a [`PendingStep`] — or, for a fork, a resume or a
+//! rewind, a [`PendingStart`] wrapping one — rather than an `async fn`; see [`PendingStep`] for
+//! what that buys. A management call built beside a step and driven with it by
 //! `tokio::join!` therefore takes the same slot on every execution, and one that is refused before
 //! it reaches the counter — an unlaunched instance, another instance's handle, an argument the call
 //! cannot answer — moves no slot at all.
@@ -134,10 +135,12 @@
 //! **Each is the method, reached the other way.** A free function takes its connection from the
 //! ambient context, so outside a workflow there is none and the call is [`Error::NotInWorkflow`]
 //! — that is where the methods and the client are. Inside a step it is plain, as the method is,
-//! by the leaf rule. And it answers in the caller's error channel rather than the engine's, so a
-//! workflow with its own error type needs no conversion; one that hands back a
-//! [`WorkflowHandle`] answers in the handle's channel, which is the workflow's own whenever the
-//! two fail the same way.
+//! by the leaf rule. A call with no handle to hand back answers in the caller's error channel, so
+//! a workflow with its own error type needs no conversion. A fork, a resume or a rewind hands back
+//! a [`PendingStart`], which answers in the handle's channel unless
+//! [`lift`](PendingStart::lift) re-declares it — the caller's own whenever the two fail the same
+//! way. Their bulk forms answer in the engine's channel, as the methods do, and
+//! [`lift`](PendingStep::lift) puts them in the caller's.
 //!
 //! **One body behind both surfaces.** Each operation is written once, as a private function that
 //! takes the connection and builds the [`PendingStep`] — the step name, the argument checks that
@@ -559,9 +562,7 @@ pub fn cancel_workflows<'a, E: DurableError + 'a>(
 /// handle.result().await
 /// # }
 /// ```
-pub fn resume_workflow<'a, R: 'a, E: DurableError + 'a>(
-    workflow_id: &'a str,
-) -> PendingStart<'a, R, E> {
+pub fn resume_workflow<'a, R: 'a, E: 'a>(workflow_id: &'a str) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_resume(
         StepPlacement::ambient_connection("resume_workflow"),
         workflow_id,
@@ -572,7 +573,7 @@ pub fn resume_workflow<'a, R: 'a, E: DurableError + 'a>(
 /// [`resume_workflow`] onto a queue of the caller's choosing.
 ///
 /// The free form of [`DBOS::resume_with`]; everything [`resume_workflow`] says holds here.
-pub fn resume_workflow_with<'a, R: 'a, E: DurableError + 'a>(
+pub fn resume_workflow_with<'a, R: 'a, E: 'a>(
     workflow_id: &'a str,
     options: ResumeOptions<'a>,
 ) -> PendingStart<'a, R, E> {
@@ -627,7 +628,7 @@ pub fn resume_workflows<'a, R: 'a, E: 'a>(
 /// fork.result().await
 /// # }
 /// ```
-pub fn fork_workflow<'a, R: 'a, E: DurableError + 'a>(
+pub fn fork_workflow<'a, R: 'a, E: 'a>(
     workflow_id: &'a str,
     start_step: i32,
 ) -> PendingStart<'a, R, E> {
@@ -642,7 +643,7 @@ pub fn fork_workflow<'a, R: 'a, E: DurableError + 'a>(
 ///
 /// The free form of [`DBOS::fork_with`]; everything [`fork_workflow`] says holds here. An invalid
 /// [`Fork`] or [`ForkOptions`] is refused before the call takes its step id, as the method's is.
-pub fn fork_workflow_with<'a, R: 'a, E: DurableError + 'a>(
+pub fn fork_workflow_with<'a, R: 'a, E: 'a>(
     fork: Fork<'a>,
     options: ForkOptions<'a>,
 ) -> PendingStart<'a, R, E> {
@@ -685,9 +686,7 @@ pub fn fork_workflows<'a, R: 'a, E: 'a>(
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. A [`PendingStart`], as
 /// [`resume_workflow`] is.
-pub fn rewind_workflow<'a, R: 'a, E: DurableError + 'a>(
-    workflow_id: &'a str,
-) -> PendingStart<'a, R, E> {
+pub fn rewind_workflow<'a, R: 'a, E: 'a>(workflow_id: &'a str) -> PendingStart<'a, R, E> {
     PendingStart::from_step(pending_rewind(
         StepPlacement::ambient_connection("rewind_workflow"),
         workflow_id,
@@ -699,7 +698,7 @@ pub fn rewind_workflow<'a, R: 'a, E: DurableError + 'a>(
 ///
 /// The free form of [`DBOS::rewind_with`]; everything [`rewind_workflow`] says holds here. Invalid
 /// [`RewindOptions`] are refused before the call takes its step id, as the method's are.
-pub fn rewind_workflow_with<'a, R: 'a, E: DurableError + 'a>(
+pub fn rewind_workflow_with<'a, R: 'a, E: 'a>(
     workflow_id: &'a str,
     options: RewindOptions<'a>,
 ) -> PendingStart<'a, R, E> {
@@ -1126,6 +1125,10 @@ impl DBOS {
     /// implementations share the two-status deny-list, and UPSTREAM item 27 asks them to settle
     /// what resume should mean for a live row rather than each tightening it alone.
     ///
+    /// **A [`PendingStart`] in the engine's channel**, as a start is: [`lift`](PendingStart::lift)
+    /// re-declares the channel for a caller that fails another way, and it is not a
+    /// [`select_step!`](crate::select_step) branch, since it sets a workflow running.
+    ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
     /// let handle = dbos.resume::<u32, dbos::EngineOnly>("stalled-workflow").await?;
@@ -1205,6 +1208,10 @@ impl DBOS {
     /// [`list_workflow_steps`](Self::list_workflow_steps).
     ///
     /// [`fork_with`](Self::fork_with) for a chosen id and the options; this is the common case.
+    ///
+    /// **A [`PendingStart`] in the engine's channel**, as a start is: [`lift`](PendingStart::lift)
+    /// re-declares the channel for a caller that fails another way, and it is not a
+    /// [`select_step!`](crate::select_step) branch, since it sets a workflow running.
     pub fn fork<'a, R: 'a, E: 'a>(
         &self,
         workflow_id: &'a str,
@@ -1308,6 +1315,10 @@ impl DBOS {
     /// with the registry that holds the workflow's closure.
     ///
     /// [`rewind_with`](Self::rewind_with) for choosing the step and where it runs.
+    ///
+    /// **A [`PendingStart`] in the engine's channel**, as a start is: [`lift`](PendingStart::lift)
+    /// re-declares the channel for a caller that fails another way, and it is not a
+    /// [`select_step!`](crate::select_step) branch, since it sets a workflow running.
     ///
     /// ```no_run
     /// # async fn f(dbos: &dbos::DBOS) -> dbos::Result<()> {
@@ -2278,12 +2289,13 @@ fn pending_cancel_all<'a, E: 'a>(
     )
 }
 
-/// `R` and `E` are the handle's; `F` is the channel the call answers in.
-fn pending_resume<'a, R: 'a, E: 'a, F: 'a>(
+/// `R` and `E` are the handle's; the call answers in the engine's channel, which the surfaces
+/// re-declare.
+fn pending_resume<'a, R: 'a, E: 'a>(
     conn: Result<Arc<Connection>>,
     workflow_id: &'a str,
     options: ResumeOptions<'a>,
-) -> PendingStep<'a, WorkflowHandle<R, E>, F> {
+) -> PendingStep<'a, WorkflowHandle<R, E>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
         place(conn, "resume a workflow"),
@@ -2302,11 +2314,11 @@ fn pending_resume<'a, R: 'a, E: 'a, F: 'a>(
     )
 }
 
-fn pending_resume_all<'a, R: 'a, E: 'a, F: 'a>(
+fn pending_resume_all<'a, R: 'a, E: 'a>(
     conn: Result<Arc<Connection>>,
     workflow_ids: &'a [&'a str],
     options: ResumeOptions<'a>,
-) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, F> {
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     PendingStep::placed(
         step_names::RESUME_WORKFLOW,
         place(conn, "resume a workflow"),
@@ -2325,11 +2337,11 @@ fn pending_resume_all<'a, R: 'a, E: 'a, F: 'a>(
 
 /// The fork is checked whole before the id is taken, so a refused fork moves the workflow's
 /// counter no more than an unlaunched instance does.
-fn pending_fork<'a, R: 'a, E: 'a, F: 'a>(
+fn pending_fork<'a, R: 'a, E: 'a>(
     conn: Result<Arc<Connection>>,
     fork: Fork<'a>,
     options: ForkOptions<'a>,
-) -> PendingStep<'a, WorkflowHandle<R, E>, F> {
+) -> PendingStep<'a, WorkflowHandle<R, E>> {
     let built = place_after(conn, FORK_OPERATION, || {
         refuse_invalid_forks(std::slice::from_ref(&fork), &options)
     })
@@ -2345,11 +2357,11 @@ fn pending_fork<'a, R: 'a, E: 'a, F: 'a>(
     )
 }
 
-fn pending_fork_all<'a, R: 'a, E: 'a, F: 'a>(
+fn pending_fork_all<'a, R: 'a, E: 'a>(
     conn: Result<Arc<Connection>>,
     forks: &'a [Fork<'a>],
     options: ForkOptions<'a>,
-) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, F> {
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     let built = place_after(conn, FORK_OPERATION, || {
         refuse_invalid_forks(forks, &options)
     })
@@ -2366,11 +2378,11 @@ fn pending_fork_all<'a, R: 'a, E: 'a, F: 'a>(
     )
 }
 
-fn pending_rewind<'a, R: 'a, E: 'a, F: 'a>(
+fn pending_rewind<'a, R: 'a, E: 'a>(
     conn: Result<Arc<Connection>>,
     workflow_id: &'a str,
     options: RewindOptions<'a>,
-) -> PendingStep<'a, WorkflowHandle<R, E>, F> {
+) -> PendingStep<'a, WorkflowHandle<R, E>> {
     let built = place_after(conn, "rewind a workflow", || {
         refuse_invalid_rewind_options(&options)
     })

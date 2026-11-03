@@ -3759,7 +3759,8 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
         .len(),
     );
 
-    // A target that fails another way: the fork re-declares its channel, and nothing else changes.
+    // A target that fails another way: the fork re-declares its channel with `lift`, which is all
+    // forking it takes. Awaiting its result would map that error separately; it is not awaited.
     let other = dbos::fork_workflow::<u32, Stalled>(&t.other, 0)
         .lift()
         .await?;
@@ -3784,8 +3785,8 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
 /// through the free forms — and each is recorded under the name the `DBOS` method records, in the
 /// order it was made. Forking the supervisor past its last step replays every one of those steps
 /// from its checkpoint: the fork hands back exactly what the first run saw, fork ids included, no
-/// target forks again, and no target's body runs again, so nothing was rewound a second time
-/// either. Cancel, delay, the attribute writes and delete are idempotent, so for those the replay's
+/// target forks again, the rewound target's row is untouched, so it was not rewound a second
+/// time, and no target's body runs again. Cancel, delay, the attribute writes and delete are idempotent, so for those the replay's
 /// answer is the evidence, not the database.
 #[tokio::test]
 async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
@@ -3961,7 +3962,14 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
     let ids: Vec<i32> = steps.iter().map(|s| s.step_id).collect();
     assert_eq!(ids, (0..steps.len() as i32).collect::<Vec<_>>());
 
-    // Past the last step, so every call replays from its checkpoint.
+    // Past the last step, so every call replays from its checkpoint. A rewind run again would
+    // write the target's row at once — back to enqueued — where the run it enqueues comes later,
+    // so the row is what shows it; the run count catches a body run again in the replay itself.
+    let rewound_row = reader
+        .get_workflow("finished-one")
+        .await
+        .expect("read failed")
+        .expect("the rewound target exists");
     let before = runs.load(Ordering::SeqCst);
     let replay = dbos
         .fork::<Supervised, Halted>(supervisor_id, steps.len() as i32)
@@ -3979,6 +3987,16 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
         runs.load(Ordering::SeqCst),
         before,
         "the replay ran a target's body again"
+    );
+    let row = reader
+        .get_workflow("finished-one")
+        .await
+        .expect("read failed")
+        .expect("the rewound target exists");
+    assert_eq!(
+        (row.status, row.updated_at),
+        (rewound_row.status, rewound_row.updated_at),
+        "the replay rewound the finished workflow again"
     );
     let forks_of_done: Vec<String> = reader
         .list_workflows(&WorkflowFilter::default(), None)
@@ -4078,14 +4096,17 @@ async fn a_workflow_recorded_through_the_methods_replays_through_the_free_forms(
     dbos.launch().await.expect("launch failed");
 
     // Past the last step the methods recorded, so the whole body replays.
-    let last = reader(&db)
+    let past_last = reader(&db)
         .await
         .list_workflow_steps(operator_id, false, None, None, None)
         .await
         .expect("read failed")
-        .len();
+        .iter()
+        .map(|step| step.step_id + 1)
+        .max()
+        .expect("the methods recorded steps");
     let replay = dbos
-        .fork::<(String, usize, usize), EngineOnly>(operator_id, last as i32)
+        .fork::<(String, usize, usize), EngineOnly>(operator_id, past_last)
         .await
         .expect("fork failed");
     let replayed = tokio::time::timeout(Duration::from_secs(60), replay.result())

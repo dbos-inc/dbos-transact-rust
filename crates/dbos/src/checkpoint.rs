@@ -54,11 +54,11 @@
 //! are not, because a race *decides* something and nothing records what it decided. [`PendingStep`]
 //! sets out the rule and what to reach for instead.
 //!
-//! Two calls are kept out of a durable race by their own types:
-//! [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *create* a workflow,
-//! and a race polls in source order and stops at the first branch that is ready — so whether the
-//! child exists at all would follow the timing of some other branch. Start outside the race; race
-//! what observes the result.
+//! Two kinds of call are kept out of a durable race by their own types:
+//! [`PendingStart`](crate::PendingStart) and [`PendingRun`](crate::PendingRun) *set a workflow
+//! running* — a start, and a fork, resume or rewind — and a race polls in source order and stops
+//! at the first branch that is ready, so whether that workflow runs at all would follow the timing
+//! of some other branch. Set it running outside the race; race what observes the result.
 //! [`select_step!`](crate::select_step) pushes each branch onto a set that takes a [`PendingStep`],
 //! so a start handed to one is a type error rather than a paragraph ignored. What no type stops is
 //! `tokio::select!`, which takes any future — there the prose is what stands between a body and
@@ -341,8 +341,10 @@ impl<'a, T> PendingStep<'a, T, crate::EngineOnly> {
     /// *output*, where what has to change is its declared type. This converts the call itself,
     /// while it is still a value, which is early enough. The management methods on
     /// [`DBOS`](crate::DBOS) are where it comes up — they answer in the engine's channel and a
-    /// workflow body rarely does — though from a workflow body their free forms, such as
+    /// workflow body rarely does — though from a workflow body most of their free forms, such as
     /// [`cancel_workflow`](crate::cancel_workflow), answer in the caller's channel and need none.
+    /// The bulk resume and fork, [`resume_workflows`](crate::resume_workflows) and
+    /// [`fork_workflows`](crate::fork_workflows), answer in the engine's and do.
     ///
     /// Only from the engine's channel, which is not so much a restriction as the whole reason it
     /// is sound: [`EngineOnly`](crate::EngineOnly) is uninhabited, so there is no application
