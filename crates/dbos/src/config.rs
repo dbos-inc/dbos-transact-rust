@@ -5,10 +5,9 @@ use std::time::Duration;
 use crate::serialization::Serializer;
 use crate::sysdb::DEFAULT_SCHEMA;
 
-/// Environment variable naming the system database.
-///
-/// The same name every implementation reads.
-pub const DATABASE_URL_ENV: &str = "DBOS_DATABASE_URL";
+/// Environment variable naming the system database, which [`Config::from_env`] and
+/// [`ClientConfig::from_env`](crate::ClientConfig::from_env) read.
+pub const SYSTEM_DATABASE_URL_ENV: &str = "DBOS_SYSTEM_DATABASE_URL";
 
 /// Everything a [`DBOS`](crate::DBOS) instance needs.
 ///
@@ -175,7 +174,7 @@ impl Config {
         }
     }
 
-    /// [`Config::new`], taking the database URL from [`DATABASE_URL_ENV`].
+    /// [`Config::new`], taking the database URL from [`SYSTEM_DATABASE_URL_ENV`].
     ///
     /// That variable and no other. The identity variables — `DBOS__APPVERSION`, `DBOS__VMID`,
     /// `DBOS__CLOUD` and `DBOS__APPID` — carry two underscores because they are DBOS Cloud's to
@@ -183,14 +182,14 @@ impl Config {
     /// configuration is not the layer that reads them. Launch is, as in Java, so that a `Config`
     /// written by hand and one from here resolve to the same identity.
     ///
-    /// A missing or empty `DBOS_DATABASE_URL` leaves [`database_url`](Self::database_url) empty
-    /// rather than failing here, so that a caller who sets it afterwards is not forced through an
-    /// error path. [`launch`](crate::DBOS::launch) is where an empty URL is reported, which is also
-    /// where it would have failed anyway.
+    /// A missing or empty `DBOS_SYSTEM_DATABASE_URL` leaves [`database_url`](Self::database_url)
+    /// empty rather than failing here, so that a caller who sets it afterwards is not forced
+    /// through an error path. [`launch`](crate::DBOS::launch) is where an empty URL is reported,
+    /// which is also where it would have failed anyway.
     pub fn from_env(app_name: impl Into<String>) -> Self {
         Self::new(
             app_name,
-            std::env::var(DATABASE_URL_ENV).unwrap_or_default(),
+            std::env::var(SYSTEM_DATABASE_URL_ENV).unwrap_or_default(),
         )
     }
 
@@ -202,7 +201,7 @@ impl Config {
     pub(crate) fn validate(&self) -> crate::Result<()> {
         if self.database_url.is_empty() {
             return Err(crate::Error::Config(format!(
-                "no database URL: set `database_url`, or the {DATABASE_URL_ENV} environment \
+                "no database URL: set `database_url`, or the {SYSTEM_DATABASE_URL_ENV} environment \
                  variable if the configuration came from `Config::from_env`"
             )));
         }
@@ -255,10 +254,17 @@ pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1
 mod tests {
     use super::*;
 
+    /// The name is public contract, read by both `from_env` constructors, so it is pinned as a
+    /// literal rather than compared with itself.
+    #[test]
+    fn the_system_database_url_is_read_from_dbos_system_database_url() {
+        assert_eq!(SYSTEM_DATABASE_URL_ENV, "DBOS_SYSTEM_DATABASE_URL");
+    }
+
     #[test]
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
         let err = Config::new("app", "").validate().unwrap_err();
-        assert!(err.to_string().contains(DATABASE_URL_ENV), "{err}");
+        assert!(err.to_string().contains(SYSTEM_DATABASE_URL_ENV), "{err}");
     }
 
     #[test]

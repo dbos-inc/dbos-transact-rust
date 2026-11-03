@@ -17,7 +17,7 @@ You need a PostgreSQL server. With Docker:
 
 ```bash
 docker run -d --name widget-store-pg -e POSTGRES_PASSWORD=dbos -p 5432:5432 postgres:17
-export DBOS_DATABASE_URL="postgres://postgres:dbos@localhost:5432/dbos_rust_widget_store"
+export DBOS_SYSTEM_DATABASE_URL="postgres://postgres:dbos@localhost:5432/dbos_rust_widget_store"
 ```
 
 Then:
@@ -29,8 +29,9 @@ cargo run -p dbos-rust-widget-store
 The app serves at http://localhost:8080. It creates the database, the DBOS system tables, and its
 own `products` and `orders` tables on first run — there is nothing to migrate by hand.
 
-Without `DBOS_DATABASE_URL` it falls back to `postgres://localhost:5432/dbos_rust_widget_store`,
-letting the standard libpq variables (`PGUSER`, `PGPASSWORD`) fill in the rest.
+Without `DBOS_SYSTEM_DATABASE_URL` it falls back to
+`postgres://localhost:5432/dbos_rust_widget_store`, letting the standard libpq variables (`PGUSER`,
+`PGPASSWORD`) fill in the rest.
 
 ## What to try
 

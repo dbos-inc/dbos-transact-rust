@@ -12,8 +12,8 @@
 //! connected yet.
 //!
 //! The variables themselves are named here rather than in [`config`](crate::config), which reads
-//! only `DBOS_DATABASE_URL`. The `DBOS__` spelling marks them as DBOS Cloud's to set — an end user
-//! may, but the layer that reads them is this one.
+//! only `DBOS_SYSTEM_DATABASE_URL`. The `DBOS__` spelling marks them as DBOS Cloud's to set — an
+//! end user may, but the layer that reads them is this one.
 //!
 //! The one departure from Java is the version. Java hashes the application's code when nothing
 //! supplies one; nothing here does, and a missing version is an error — see

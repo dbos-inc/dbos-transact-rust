@@ -29,7 +29,7 @@ URL carries no username or password, so the standard libpq variables apply — s
 `PGPASSWORD` if your server wants them. Point it elsewhere entirely with:
 
 ```bash
-export DBOS_DATABASE_URL=postgres://user:password@host:5432/dbname
+export DBOS_SYSTEM_DATABASE_URL=postgres://user:password@host:5432/dbname
 ```
 
 Open <http://localhost:8080>, launch a workflow, and crash the app mid-run. Restart it with
