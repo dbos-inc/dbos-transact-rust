@@ -5614,6 +5614,59 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn check_step_at_or_after(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+    ) -> Result<Option<(i32, String)>, Error> {
+        let workflow_table = &self.tables.workflow_status;
+        let steps_table = &self.tables.operation_outputs;
+        let (workflow_table, steps_table, pool) =
+            (workflow_table.as_str(), steps_table.as_str(), &self.pool);
+
+        with_retry(&self.retry, "check_step_at_or_after", move || async move {
+            // One statement, so the status and the step come from one snapshot, as in
+            // `check_step_on`. The step is one entry of the `(workflow_uuid, function_id)` primary
+            // key, read by the query Python and Java run. **Its subquery names `$1` rather than
+            // correlating on `s.workflow_uuid`**: CockroachDB decorrelates a `LATERAL` into a join
+            // and applies the `LIMIT` after it, decoding every step from the position to the end
+            // of the history, which on a replayed patch is the rest of the workflow. Uncorrelated,
+            // the limit stays in the scan on both databases.
+            let row = sqlx::query(AssertSqlSafe(format!(
+                "SELECT s.status, o.function_id, o.function_name \
+                 FROM {workflow_table} s \
+                 LEFT JOIN ( \
+                   SELECT function_id, function_name FROM {steps_table} \
+                   WHERE workflow_uuid = $1 AND function_id >= $2 \
+                   ORDER BY function_id LIMIT 1 \
+                 ) o ON TRUE \
+                 WHERE s.workflow_uuid = $1"
+            )))
+            .bind(workflow_id)
+            .bind(step_id)
+            .fetch_optional(pool)
+            .await?;
+
+            let Some(row) = row else {
+                return Err(Error::NonExistentWorkflow {
+                    workflow_ids: vec![workflow_id.to_owned()],
+                });
+            };
+            let status: String = row.try_get("status")?;
+            if status == WorkflowStatus::Cancelled.as_str() {
+                return Err(Error::WorkflowCancelled {
+                    workflow_id: workflow_id.to_owned(),
+                });
+            }
+            // `function_id` is `NOT NULL` in the table, so a NULL is the join finding nothing.
+            let Some(found) = row.try_get::<Option<i32>, _>("function_id")? else {
+                return Ok(None);
+            };
+            Ok(Some((found, row.try_get("function_name")?)))
+        })
+        .await
+    }
+
     async fn record_step(
         &self,
         workflow_id: &str,

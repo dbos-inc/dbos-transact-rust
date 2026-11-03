@@ -315,8 +315,215 @@ async fn an_execution_recovered_under_patched_code_takes_the_old_path() {
     dbos.shutdown().await;
 }
 
+/// The old code's receive, with a timeout: its own step at 1, its timeout's sleep at 2.
+async fn receives(_: ()) -> dbos::Result<i32> {
+    let a = step_one().await?;
+    let b: Option<i32> = dbos::recv(None, DEADLINE).await?;
+    Ok(a + b.unwrap_or(0))
+}
+
+/// The same, with a patch added before the receive.
+async fn patched_before_receiving(_: ()) -> dbos::Result<i32> {
+    let a = step_one().await?;
+    let patched = dbos::patch("v2").await?;
+    let b: Option<i32> = dbos::recv(None, DEADLINE).await?;
+    Ok(a + b.unwrap_or(0) + if patched { 100 } else { 0 })
+}
+
+/// Waits for `id` to succeed and returns its recorded output.
+async fn finished_output(db: &TestDatabase, id: &str) -> Option<String> {
+    let reader = reader(db).await;
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let row = reader
+                .get_workflow(id)
+                .await
+                .expect("read failed")
+                .expect("the row exists");
+            match row.status {
+                WorkflowStatus::Success => return row.output,
+                WorkflowStatus::Error => panic!("{id} failed: {:?}", row.error),
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{id} never finished: an unexpected step leaves an execution pending, not failed")
+    })
+}
+
+/// **A gap the old code left is a point it got past.** A receive with a timeout records its
+/// timeout's sleep, at the position after its own, before it waits, so an execution abandoned while
+/// waiting has nothing at the receive's position and a step past it. A patch added before that
+/// receive must take the old path there rather than record its marker in the gap, which would move
+/// the receive onto its own timeout's position.
+#[tokio::test]
+async fn a_patch_before_a_waiting_receive_takes_the_old_path_on_recovery() {
+    let db = test_database().await;
+    let app = "patch-gap-app";
+    let id = "waiting-run";
+
+    // The old code, abandoned while its receive waits.
+    let (dbos, workflow) = deploy(app, &db, receives).await;
+    let _abandoned = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    tokio::time::timeout(DEADLINE, async {
+        while names(&dbos, id).await != ["step_one", "DBOS.sleep"] {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the receive never recorded its timeout");
+    dbos.shutdown().await;
+
+    // The patched code recovers it on launch, and it takes the old path.
+    let (dbos, workflow) = deploy(app, &db, patched_before_receiving).await;
+    dbos.send(id, &2).await.expect("send failed");
+    assert_eq!(finished_output(&db, id).await.as_deref(), Some("3"));
+    assert_eq!(
+        names(&dbos, id).await,
+        ["step_one", "DBOS.recv", "DBOS.sleep"],
+        "no marker: the old code had got past the patch's position"
+    );
+
+    // A new execution takes the patch, and records its marker before the receive.
+    let new_id = "new-run";
+    let handle = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(new_id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    dbos.send(new_id, &2).await.expect("send failed");
+    let result = tokio::time::timeout(DEADLINE, handle.result())
+        .await
+        .expect("the new execution never finished")
+        .expect("the new execution failed");
+    assert_eq!(result, 103);
+    assert_eq!(
+        names(&dbos, new_id).await,
+        ["step_one", V2, "DBOS.recv", "DBOS.sleep"]
+    );
+    dbos.shutdown().await;
+}
+
+/// The workflow the `get_event` deployments read from.
+const PUBLISHER: &str = "publisher";
+
+/// The old code's `get_event`, with a timeout: its own step at 1, its timeout's sleep at 2.
+async fn reads_an_event(_: ()) -> dbos::Result<i32> {
+    let a = step_one().await?;
+    let b: Option<i32> = dbos::get_event(PUBLISHER, "b", DEADLINE).await?;
+    Ok(a + b.unwrap_or(0))
+}
+
+/// The same, with a patch added before the read.
+async fn patched_before_reading(_: ()) -> dbos::Result<i32> {
+    let a = step_one().await?;
+    let patched = dbos::patch("v2").await?;
+    let b: Option<i32> = dbos::get_event(PUBLISHER, "b", DEADLINE).await?;
+    Ok(a + b.unwrap_or(0) + if patched { 100 } else { 0 })
+}
+
+/// Launches a deployment whose `workflow` is `body`, beside a workflow that publishes the event
+/// `body` reads.
+async fn deploy_with_publisher<F, Fut>(
+    app_name: &str,
+    db: &TestDatabase,
+    body: F,
+) -> (
+    DBOS,
+    WorkflowRef<(), i32, EngineOnly>,
+    WorkflowRef<(), (), EngineOnly>,
+)
+where
+    F: Fn(()) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = dbos::Result<i32>> + Send + 'static,
+{
+    let dbos = DBOS::new(config(app_name, db));
+    let workflow = dbos.register_workflow("workflow", body).unwrap();
+    let publisher = dbos
+        .register_workflow("publish", |()| async {
+            dbos::set_event("b", &2).await?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    dbos.launch().await.expect("launch failed");
+    (dbos, workflow, publisher)
+}
+
+/// **The same gap, left by a `get_event`**, which records its timeout's sleep before it waits just
+/// as a receive does.
+#[tokio::test]
+async fn a_patch_before_a_waiting_get_event_takes_the_old_path_on_recovery() {
+    let db = test_database().await;
+    let app = "patch-event-gap-app";
+    let id = "reading-run";
+
+    // The old code, abandoned while its read waits.
+    let (dbos, workflow, _) = deploy_with_publisher(app, &db, reads_an_event).await;
+    let _abandoned = workflow
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(id),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("start failed");
+    tokio::time::timeout(DEADLINE, async {
+        while names(&dbos, id).await != ["step_one", "DBOS.sleep"] {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the read never recorded its timeout");
+    dbos.shutdown().await;
+
+    // The patched code recovers it on launch, and it takes the old path once the event is set.
+    let (dbos, workflow, publisher) = deploy_with_publisher(app, &db, patched_before_reading).await;
+    publisher
+        .run_with(
+            (),
+            RunOptions {
+                workflow_id: Some(PUBLISHER),
+                ..RunOptions::default()
+            },
+        )
+        .await
+        .expect("publishing failed");
+    assert_eq!(finished_output(&db, id).await.as_deref(), Some("3"));
+    assert_eq!(
+        names(&dbos, id).await,
+        ["step_one", "DBOS.get_event", "DBOS.sleep"],
+        "no marker: the old code had got past the patch's position"
+    );
+
+    // A new execution takes the patch, and records its marker before the read.
+    assert_eq!(run(&workflow, "new-reading-run").await, 103);
+    assert_eq!(
+        names(&dbos, "new-reading-run").await,
+        ["step_one", V2, "DBOS.get_event", "DBOS.sleep"]
+    );
+    dbos.shutdown().await;
+}
+
 /// Launches `body` under `id`, gated before its first statement, plants `planted` as the step at
-/// position 0, and returns what the workflow then answers.
+/// position `at`, and returns what the workflow then answers.
 ///
 /// How an execution whose history the code no longer knows is reached in-process: a fork of one
 /// would fail by a control signal, which records no outcome and leaves the fork `PENDING` with no
@@ -324,6 +531,7 @@ async fn an_execution_recovered_under_patched_code_takes_the_old_path() {
 async fn with_planted_history<F, Fut>(
     app_name: &str,
     id: &str,
+    at: i32,
     planted: &str,
     body: F,
 ) -> dbos::Result<i32>
@@ -363,7 +571,7 @@ where
     reader
         .record_step(
             id,
-            0,
+            at,
             planted,
             Outcome::Output(None),
             None,
@@ -381,12 +589,31 @@ where
     result
 }
 
+/// **A gap below a recorded step is the old code's, however it was left**: concurrent calls of one
+/// execution can finish out of order, so position 1 can be recorded while 0 is not. A patch at 0
+/// takes the old path there, and records nothing in the gap.
+#[tokio::test]
+async fn a_patch_in_a_gap_below_a_recorded_step_takes_the_old_path() {
+    async fn patched_first(_: ()) -> dbos::Result<i32> {
+        Ok(if dbos::patch("v2").await? { 1 } else { 0 })
+    }
+    let result = with_planted_history(
+        "patch-planted-gap-app",
+        "gap-at-0",
+        1,
+        "step_two",
+        patched_first,
+    )
+    .await;
+    assert_eq!(result.unwrap(), 0, "the old path, with no marker at 0");
+}
+
 /// **Code that no longer knows a marker meets it as any changed code meets an old history**: as an
 /// unexpected step, with nothing recorded over it.
 #[tokio::test]
 async fn code_that_no_longer_knows_a_marker_finds_an_unexpected_step() {
     // The v3 patch deprecated, meeting an execution that took the v2 patch.
-    let result = with_planted_history("patch-deprecated-app", "holds-v2", V2, v4).await;
+    let result = with_planted_history("patch-deprecated-app", "holds-v2", 0, V2, v4).await;
     match result {
         Err(Error::SystemDatabase(SysdbError::UnexpectedStep {
             step_id,
@@ -402,7 +629,7 @@ async fn code_that_no_longer_knows_a_marker_finds_an_unexpected_step() {
     }
 
     // The deprecated patch removed, meeting an execution that took it.
-    let result = with_planted_history("patch-removed-app", "holds-v3", V3, v5).await;
+    let result = with_planted_history("patch-removed-app", "holds-v3", 0, V3, v5).await;
     match result {
         Err(Error::SystemDatabase(SysdbError::UnexpectedStep {
             step_id, recorded, ..
@@ -608,7 +835,7 @@ async fn a_deprecated_patch_meeting_the_old_code_finds_an_unexpected_step() {
     }
 
     let result =
-        with_planted_history("deprecate-old-app", "holds-v1", "step_one", deprecated).await;
+        with_planted_history("deprecate-old-app", "holds-v1", 0, "step_one", deprecated).await;
     match result {
         Err(Error::SystemDatabase(SysdbError::UnexpectedStep {
             step_id,
