@@ -3313,9 +3313,9 @@ pub struct NewSchedule<'a> {
     /// See [`ScheduleRecord::schedule_id`]. `None` generates a UUID; a supplied id is stored as
     /// given, so it need not be one.
     ///
-    /// The fallback lives here, as it does for
-    /// `application_name`, so this layer stands on its own, and a registration layer above it
-    /// that supplies the id makes this a second line of defence rather than the only one.
+    /// The fallback lives here, as it does for `application_name`, so this layer stands on its
+    /// own, and a registration layer above it that supplies the id makes this a second line of
+    /// defence rather than the only one.
     pub schedule_id: Option<&'a str>,
     /// See [`ScheduleRecord::schedule_name`].
     pub schedule_name: &'a str,
