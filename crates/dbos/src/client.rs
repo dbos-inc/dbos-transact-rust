@@ -209,7 +209,7 @@ impl ClientConfig {
         }
     }
 
-    /// [`ClientConfig::new`], taking the database URL from `DBOS_SYSTEM_DATABASE_URL`.
+    /// [`ClientConfig::new`], taking the database URL from [`SYSTEM_DATABASE_URL_ENV`].
     ///
     /// A missing or empty variable leaves [`database_url`](Self::database_url) empty rather than
     /// failing here, so a caller who sets it afterwards is not forced through an error path;
