@@ -783,11 +783,11 @@ mod tests {
 
     /// Every header names the migration its filename says it is.
     ///
-    /// Fourteen files — the base files of 22 through 35 — were first written naming themselves
-    /// exactly four lower, and three of those also cross-referenced other migrations in the
-    /// same stale numbering. That is a real defect rather than a convention worth preserving,
+    /// In the shared migration sources, fourteen files — the base files of 22 through 35 — name
+    /// themselves exactly four lower, and three of those also cross-reference other migrations in
+    /// the same stale numbering. That is a real defect rather than a convention worth preserving,
     /// so the copies here are corrected, and this test is what keeps them corrected when new
-    /// files arrive.
+    /// files are ported.
     ///
     /// The correction is confined to comments; the SQL is untouched.
     #[test]

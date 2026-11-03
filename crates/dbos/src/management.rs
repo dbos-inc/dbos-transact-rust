@@ -1098,8 +1098,10 @@ impl DBOS {
     /// The guard is not simply missing here. `PENDING` cannot say whether the executor that owns
     /// it is alive, and a workflow left `PENDING` by a node that died is the case an operator most
     /// wants to resume by hand — so a predicate that closes the hazard closes that too. The
-    /// ownership fence is what keeps a live resume sound instead: the new execution takes the row
-    /// over and the old one's next write is refused, so the two never record side by side.
+    /// ownership fence is what bounds it: the new execution takes the row over and the old one's
+    /// next write is refused, so only one records, though a step in flight at the hand-off runs
+    /// in both. Whether resume should refuse a live workflow is an open question shared with the
+    /// other SDKs on the same database.
     ///
     /// **A [`PendingStart`] in the engine's channel**, as a start is: [`lift`](PendingStart::lift)
     /// re-declares the channel for a caller that fails another way, and it is not a
@@ -2111,8 +2113,8 @@ impl Connection {
     /// Replaces a workflow's attributes, clears them, or merges keys into them.
     ///
     /// The JSON in `update` is plain JSON, never the configured
-    /// [`Serializer`](crate::Serializer): the column is read by `@>` containment and by every
-    /// other implementation, so what a workflow chose for its own payloads has no say in it.
+    /// [`Serializer`](crate::Serializer): the column is read by `@>` containment and by other
+    /// SDKs on the same database, so what a workflow chose for its own payloads has no say in it.
     /// Encoded by the caller rather than here, because [`DBOS::update_workflow_attributes`] and
     /// [`DBOS::merge_workflow_attributes`] have to encode before they take their step ids.
     pub(crate) async fn update_workflow_attributes(

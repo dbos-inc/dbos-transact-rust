@@ -1232,7 +1232,7 @@ mod tests {
         // come back short of a row enqueued moments ago, leaving one of the open partitions'
         // rows waiting through no fault of the walk.
         if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
-            eprintln!("skipped on CockroachDB: a claim may under-deliver; see the dequeue");
+            eprintln!("skipped on CockroachDB: a claim may under-deliver");
             dbos.shutdown().await;
             return;
         }
@@ -1274,7 +1274,7 @@ mod tests {
         // come back short of a row enqueued moments ago, and each short claim costs the walk one
         // more visit; the walk is still bounded there, just not to this count.
         if matches!(db.backend(), dbos_test_support::Backend::Cockroach) {
-            eprintln!("skipped on CockroachDB: a claim may under-deliver; see the dequeue");
+            eprintln!("skipped on CockroachDB: a claim may under-deliver");
             dbos.shutdown().await;
             return;
         }

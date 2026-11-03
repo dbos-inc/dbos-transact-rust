@@ -2173,8 +2173,7 @@ async fn a_parent_and_its_child_hit_an_inherited_deadline_independently() {
 
     // And the parent, cancelled *while awaiting*, checkpointed nothing for that await. The wait
     // was interrupted rather than answered, so a resumed parent asks the child's then-settled row
-    // again instead of replaying a verdict it never actually received. Go states the same rule in
-    // its own words at the same point.
+    // again instead of replaying a verdict it never actually received.
     let steps = reader
         .list_workflow_steps(id, false, None, None, None)
         .await

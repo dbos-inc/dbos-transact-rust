@@ -1364,9 +1364,10 @@ async fn the_queue_registry_can_be_read_and_deleted() {
 
 /// **A stored row for the internal queue is ignored, not honoured.**
 ///
-/// `register_queue` refuses the name, but nothing else does — every peer implementation's client
-/// accepts it, and this crate's own `sysdb::upsert_queue` is public and unguarded. Honouring such
-/// a row would let anything sharing the database throttle the queue `resume` and `fork` land on.
+/// `register_queue` refuses the name, but nothing else does — nothing stops another SDK's client
+/// on the same database writing it, and this crate's own `sysdb::upsert_queue` is public and
+/// unguarded. Honouring such a row would let anything sharing the database throttle the queue
+/// `resume` and `fork` land on.
 ///
 /// The row here asks for a five-minute polling interval. If it were honoured the workflow below
 /// would not run for five minutes; the assertion is that it runs at once.

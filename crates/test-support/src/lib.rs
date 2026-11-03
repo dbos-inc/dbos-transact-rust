@@ -1303,8 +1303,8 @@ impl dbos::sysdb::types::StepCodec for TestCodec {
 }
 
 /// Sets application version `version_name`'s timestamp to `timestamp` as given, for a test that
-/// needs one at a particular instant: ahead of the database's clock, say, as another
-/// implementation's promoter can leave it, or ordered against another version. The SDK has no call
+/// needs one at a particular instant: ahead of the database's clock, say, as a writer
+/// stamping its own clock can leave it, or ordered against another version. The SDK has no call
 /// that does this, since a promotion stamps the database's clock.
 pub async fn set_version_timestamp(
     pool: &sqlx::PgPool,

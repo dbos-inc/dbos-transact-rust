@@ -920,7 +920,7 @@ pub(crate) async fn init_or_join(
 /// Caller-supplied attributes as the row stores them: JSON text, or nothing.
 ///
 /// Plain `serde_json`, never the configured serializer — the column is read by containment and by
-/// every other implementation, so a workflow's payload encoding has no say in it. A
+/// other SDKs on the same database, so a workflow's payload encoding has no say in it. A
 /// [`serde_json::Map`] is an object by construction, which is the shape `validate_attributes`
 /// insists on downstream; the error arm is here because `to_string` is fallible in principle, not
 /// because a map can trip it.

@@ -11188,10 +11188,9 @@ async fn listing_queues_scopes_but_reading_one_does_not() {
 
 /// A queue carrying half a rate limit reads as having none.
 ///
-/// The two columns are only meaningful together and no SDK can write one alone, so reaching this
-/// state takes direct SQL. Every SDK reading the same row must see the same queue, so this reads
-/// it the way they do rather than reporting it. The safety cost — an unthrottled queue that says
-/// nothing — is explained on the reader, `queue_from_row`.
+/// The two columns are only meaningful together and no public API writes one alone, so reaching
+/// this state takes direct SQL. It is read as no limit rather than reported; why, and the safety
+/// cost — an unthrottled queue that says nothing — are explained on the reader, `queue_from_row`.
 #[tokio::test]
 async fn half_a_rate_limit_reads_as_none() {
     let (sys, db) = sysdb().await;
@@ -11218,7 +11217,7 @@ async fn half_a_rate_limit_reads_as_none() {
 /// Skipped rather than loosened, because the assertion is the point: a test that asserts a limit
 /// being enforced rather than a count being complete never sees the behaviour.
 ///
-/// Remove this once the lock mode is settled — see the explanation of the lock mode in
+/// Remove this once CockroachDB's lock mode is settled — see the explanation of the lock mode in
 /// `start_queued_workflows`.
 fn skip_dequeue_completeness(db: &support::TestDatabase) -> bool {
     let skipping = matches!(db.backend(), Backend::Cockroach);

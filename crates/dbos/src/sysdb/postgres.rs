@@ -6850,8 +6850,9 @@ impl SystemDatabase for PostgresSystemDatabase {
             // and in the partitioned sweep's lock step; it is not applied, because concurrent
             // dequeues on one queue would then serialise, and the lock mode is the same on both
             // backends. No barrier outside this statement helps — a row is readable while still
-            // being skippable. The integration tests that assert a complete dequeue are skipped
-            // on CockroachDB.
+            // being skippable. Whether CockroachDB should take `FOR UPDATE` instead is an open
+            // question shared with the other SDKs on the same database; until it is settled, the
+            // integration tests that assert a complete dequeue are skipped on CockroachDB.
             //
             // `SKIP LOCKED` steps over rows a peer is already claiming, which is what makes an
             // unlimited queue scale across executors. `NOWAIT` instead whenever a shared budget

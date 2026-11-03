@@ -71,8 +71,9 @@ pub struct StepOptions<E = EngineOnly> {
     /// need none of it: they stop at their next suspension point and run their destructors,
     /// returning connections and releasing guards without the body saying so.
     ///
-    /// **Any step may take one.** Every step is a future, so there is no kind of step that cannot
-    /// be stopped and no error to raise for asking.
+    /// **Any step may take one.** Every step is a future, so any step can be dropped at a
+    /// suspension point and there is no error to raise for asking. Work dropping cannot reach,
+    /// such as a blocking thread, is what the cancellation token is for.
     pub timeout: Option<Duration>,
     /// Whether to stop this step as soon as the workflow is seen to be `CANCELLED` elsewhere.
     ///

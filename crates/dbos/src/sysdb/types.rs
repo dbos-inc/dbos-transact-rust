@@ -980,9 +980,17 @@ mod tests {
         let parse = Timestamp::parse_iso8601;
         let expected = Some(Timestamp::from_epoch_ms(1_786_492_800_000));
 
-        assert_eq!(parse("2026-08-12T00:00:00.000Z"), expected, "TypeScript");
-        assert_eq!(parse("2026-08-12T00:00:00Z"), expected, "Go and Java");
-        assert_eq!(parse("2026-08-12T00:00:00+00:00"), expected, "Python");
+        assert_eq!(
+            parse("2026-08-12T00:00:00.000Z"),
+            expected,
+            "milliseconds, Z"
+        );
+        assert_eq!(parse("2026-08-12T00:00:00Z"), expected, "bare Z");
+        assert_eq!(
+            parse("2026-08-12T00:00:00+00:00"),
+            expected,
+            "+00:00 offset"
+        );
         assert_eq!(
             parse("2026-08-12T00:00:00.000000000Z"),
             expected,
@@ -2002,7 +2010,8 @@ impl PollingConcurrency {
 /// together: a limit with no window and a window with no limit are both unenforceable.
 ///
 /// The schema stores the pair as two nullable columns and cannot enforce that, so a row with one
-/// set and not the other is [`Error::Malformed`] on read — a state this type says cannot exist.
+/// set and not the other — a state this type says cannot exist — is read as no limit. See
+/// `queue_from_row`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateLimit {
     /// Workflows that may start in each window.
