@@ -6420,6 +6420,57 @@ impl SystemDatabase for PostgresSystemDatabase {
         .await
     }
 
+    async fn promote_application_version(
+        &self,
+        version_name: &str,
+        application_name: Option<&str>,
+    ) -> Result<(), Error> {
+        let versions_table = &self.tables.application_versions;
+        let (versions_table, pool) = (versions_table.as_str(), &self.pool);
+        let application_name = application_name.or(self.application_name.as_deref());
+
+        with_retry(
+            &self.retry,
+            "promote_application_version",
+            move || async move {
+                let mut tx = pool.begin().await?;
+
+                let owner = resolve_owning_application(
+                    &mut tx,
+                    versions_table,
+                    "version_name",
+                    version_name,
+                    application_name,
+                    "Application version",
+                )
+                .await?;
+
+                // One statement, so the stamp is computed against the rows as the write sees
+                // them. The maximum is over what the latest read for `owner` considers: its own
+                // rows and the unclaimed ones, or every row for a nameless owner. The database's
+                // clock rather than the caller's, and above that maximum even when it is ahead of
+                // the clock, so the promoted version is the latest one.
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {versions_table} SET \
+                       version_timestamp = GREATEST({NOW_MS_SQL}, ( \
+                         SELECT COALESCE(MAX(version_timestamp), 0) + 1 FROM {versions_table} \
+                         WHERE $2::text IS NULL OR application_name = $2 \
+                           OR application_name IS NULL)), \
+                       application_name = $2 \
+                     WHERE version_name = $1 \
+                       AND (application_name IS NULL OR application_name = $2)"
+                )))
+                .bind(version_name)
+                .bind(owner.as_deref())
+                .execute(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok(())
+            },
+        )
+        .await
+    }
     async fn upsert_queue(
         &self,
         queue: &NewQueue<'_>,

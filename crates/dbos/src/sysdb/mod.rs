@@ -1305,7 +1305,12 @@ pub trait SystemDatabase: Send + Sync {
         application_name: Option<&str>,
     ) -> Result<Option<VersionInfo>, Error>;
 
-    /// Moves a version's timestamp, which is how the latest version is chosen.
+    /// Moves a version's timestamp to `timestamp` as given, which is how the latest version is
+    /// chosen.
+    ///
+    /// For a caller that means a particular instant. Promoting a version to be the latest now is
+    /// [`promote_application_version`](Self::promote_application_version), which stamps it on the
+    /// database's clock and above every other version.
     ///
     /// `application_name` names whose version to promote; `None` means this handle's own.
     /// Promoting a *different* application's is [`Error::RegisteredByAnother`]: moving a timestamp
@@ -1323,6 +1328,30 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         version_name: &str,
         timestamp: Timestamp,
+        application_name: Option<&str>,
+    ) -> Result<(), Error>;
+
+    /// Promotes a version to be the latest, stamping it later than every version the latest read
+    /// considers.
+    ///
+    /// The stamp is `GREATEST(the database's now, MAX(version_timestamp) + 1)`, the maximum taken
+    /// over the rows [`get_latest_application_version`](Self::get_latest_application_version)
+    /// reads for the same application, in the one statement that writes it. The database's clock
+    /// rather than the caller's, because a version is created stamped by the database's clock, and
+    /// a promoter whose own clock is behind it would stamp a version that still sorts below an
+    /// older one. The `+ 1` is what makes a promotion win over a version stamped ahead of the
+    /// database's clock, by a peer whose clock ran ahead or by an explicit
+    /// [`update_application_version_timestamp`](Self::update_application_version_timestamp).
+    ///
+    /// Scoped and guarded as [`update_application_version_timestamp`] is: `application_name` names
+    /// whose version to promote, `None` meaning this handle's own; a version a different
+    /// application registered is [`Error::RegisteredByAnother`]; the write claims an unclaimed
+    /// row; and a name that matches nothing is `Ok`.
+    ///
+    /// [`update_application_version_timestamp`]: Self::update_application_version_timestamp
+    async fn promote_application_version(
+        &self,
+        version_name: &str,
         application_name: Option<&str>,
     ) -> Result<(), Error>;
 

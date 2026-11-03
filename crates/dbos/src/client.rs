@@ -66,7 +66,7 @@ use crate::handle::WorkflowHandle;
 use crate::identity::validate_app_name;
 use crate::serialization::Serializer;
 use crate::sysdb::DEFAULT_SCHEMA;
-use crate::sysdb::types::{Timestamp, VersionInfo, WorkflowStatus};
+use crate::sysdb::types::{VersionInfo, WorkflowStatus};
 use crate::{Queue, QueueChange, QueueConflict, QueueOptions};
 
 /// Everything a [`Client`] needs.
@@ -475,7 +475,8 @@ impl Client {
             .map_err(Error::SystemDatabase)
     }
 
-    /// Promotes an already-registered version to be the latest, by moving its timestamp to now.
+    /// Promotes an already-registered version to be the latest, by moving its timestamp to now on
+    /// the database's clock, and past every other version's.
     ///
     /// The write half of [`latest_app_version`](Self::latest_app_version), and how
     /// a rolling deploy is steered from outside the fleet: the latest version is chosen by
@@ -507,7 +508,7 @@ impl Client {
     pub async fn set_latest_app_version(&self, version_name: &str) -> Result<()> {
         self.0
             .sysdb()
-            .update_application_version_timestamp(version_name, Timestamp::now(), self.0.app_name())
+            .promote_application_version(version_name, self.0.app_name())
             .await
             .map_err(Error::SystemDatabase)
     }
@@ -543,7 +544,7 @@ impl Client {
     ) -> Result<()> {
         self.0
             .sysdb()
-            .update_application_version_timestamp(version_name, Timestamp::now(), Some(app_name))
+            .promote_application_version(version_name, Some(app_name))
             .await
             .map_err(Error::SystemDatabase)
     }

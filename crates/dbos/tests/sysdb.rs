@@ -4154,6 +4154,64 @@ async fn application_versions_are_registered_once_and_ordered_by_timestamp() {
     assert_eq!(again.version_timestamp, promoted);
 }
 
+/// **A promotion stamps the database's clock, and wins over a version stamped ahead of it.**
+///
+/// A version stamped in the database's future, by a peer whose clock ran ahead or by an explicit
+/// timestamp, would otherwise stay the latest until the database's clock passed it: a promotion
+/// stamped with plain now would sort below it and change nothing.
+#[tokio::test]
+async fn a_promotion_stamps_the_database_clock_and_wins_over_a_future_stamp() {
+    let (sys, db) = sysdb().await;
+    let db_now = async || -> i64 {
+        sqlx::query_scalar("SELECT (EXTRACT(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&db.pool().await)
+            .await
+            .unwrap()
+    };
+    sys.create_application_version("v1", None).await.unwrap();
+    sys.create_application_version("v2", None).await.unwrap();
+    let stamp = |name: &'static str| {
+        let sys = &sys;
+        async move {
+            sys.list_application_versions()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|version| version.version_name == name)
+                .unwrap()
+                .version_timestamp
+                .as_epoch_ms()
+        }
+    };
+
+    // With nothing ahead of the clock, the stamp is the database's now.
+    let before = db_now().await;
+    sys.promote_application_version("v1", None).await.unwrap();
+    let after = db_now().await;
+    let promoted = stamp("v1").await;
+    assert!(
+        (before - 5..=after + 5).contains(&promoted),
+        "stamped {promoted}, not the database's now ({before}..={after})"
+    );
+
+    // A version an hour ahead of the database's clock is the latest, and a promotion still wins.
+    let ahead = Timestamp::from_epoch_ms(after + 3_600_000);
+    sys.update_application_version_timestamp("v2", ahead, None)
+        .await
+        .unwrap();
+    sys.promote_application_version("v1", None).await.unwrap();
+    let latest = sys
+        .get_latest_application_version(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version_name, "v1");
+    assert_eq!(
+        latest.version_timestamp.as_epoch_ms(),
+        ahead.as_epoch_ms() + 1
+    );
+}
+
 /// The bulk readers report everything a workflow was sent, published, and streamed.
 ///
 /// Written with raw SQL rather than through the writers, so the read shape is pinned on its own:

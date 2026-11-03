@@ -20,7 +20,7 @@ use dbos::{
     QueueChange, QueueConflict, QueueOptions, QueueRequest, SendMessage, SendOptions,
     SerializationFormat, StartOptions, Timeout, WorkflowHandle, WorkflowIdReusePolicy,
 };
-use dbos_test_support::{TestDatabase, raw_database, test_database};
+use dbos_test_support::{TestDatabase, raw_database, skewed_database, test_database};
 
 /// A client for `db`, acting for `app_name`.
 async fn client(app_name: &str, db: &TestDatabase) -> Client {
@@ -1131,6 +1131,43 @@ async fn a_client_reads_application_versions() {
 
     client.close().await;
     dbos.shutdown().await;
+}
+
+/// **A promotion goes by the database's clock, not the promoting process's.** The database's clock
+/// is an hour ahead of this process, and versions are created stamped by it. A promotion stamped
+/// by this process's clock would sort an hour below them and leave the newer version latest.
+#[tokio::test]
+async fn a_client_promotes_on_the_database_clock() {
+    let Some(db) = skewed_database(3600).await else {
+        return;
+    };
+    for version in ["v1", "v2"] {
+        let dbos = DBOS::new(Config {
+            migrate: true,
+            app_version: Some(version.to_owned()),
+            ..config("client-skew-promote", &db)
+        });
+        dbos.launch().await.expect("launch failed");
+        dbos.shutdown().await;
+    }
+
+    let client = client("client-skew-promote", &db).await;
+    client
+        .set_latest_app_version("v1")
+        .await
+        .expect("promote failed");
+    assert_eq!(
+        client
+            .latest_app_version()
+            .await
+            .expect("read failed")
+            .expect("versions were registered at launch")
+            .version_name,
+        "v1",
+        "the promotion sorted below the version it rolls back from"
+    );
+
+    client.close().await;
 }
 
 /// Promoting an older version rolls a deploy back.
