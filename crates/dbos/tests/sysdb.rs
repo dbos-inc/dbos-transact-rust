@@ -5669,7 +5669,7 @@ async fn until_a_take_waits_on_the_owner_lock(pool: &sqlx::PgPool) {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
              WHERE datname = current_database() AND wait_event_type = 'Lock' \
-               AND query LIKE 'SELECT owner_xid %FOR NO KEY UPDATE%'",
+               AND query LIKE 'SELECT owner_xid%FOR NO KEY UPDATE%'",
         )
         .fetch_one(pool)
         .await
@@ -5680,6 +5680,63 @@ async fn until_a_take_waits_on_the_owner_lock(pool: &sqlx::PgPool) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("the receive's take never waited on the rival's owner lock");
+}
+
+/// **A sleep whose owner check waits on the workflow's row lock wakes at the time it recorded.**
+///
+/// The wake time is the database's clock once the lock is held plus the duration, and the wait is
+/// measured from that same reading. A reading taken before the lock wait would be behind the
+/// database's clock by the wait, and the sleep would then wake that much after its recorded time.
+#[tokio::test]
+async fn a_sleep_that_waits_on_the_row_lock_wakes_at_its_recorded_time() {
+    let db = test_database().await;
+    if skip_without_lock_waits(&db) {
+        return;
+    }
+    let pool = db.pool().await;
+    let sys = std::sync::Arc::new(PostgresSystemDatabase::from_pool(
+        pool.clone(),
+        &Settings::default(),
+    ));
+    let id = "wf-locked-sleeper";
+    sys.init_workflow(&workflow(id), None, WorkflowIdReusePolicy::ReturnExisting)
+        .await
+        .unwrap();
+    let owner = owner_token(&*sys, id).await;
+
+    let mut rival = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT owner_xid FROM dbos.workflow_status WHERE workflow_uuid = 'wf-locked-sleeper' \
+         FOR NO KEY UPDATE",
+    )
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    let sleeping = tokio::spawn({
+        let sys = std::sync::Arc::clone(&sys);
+        async move {
+            let wake = sys
+                .record_sleep(
+                    support::step_caller(id, 0, &owner),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep_until(wake.arrives().into()).await;
+            wake.at
+        }
+    });
+    until_a_take_waits_on_the_owner_lock(&pool).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    rival.commit().await.unwrap();
+
+    let wake_at = sleeping.await.unwrap();
+    let woke = sys.database_time().await.unwrap().now();
+    let late = woke.as_epoch_ms() - wake_at.as_epoch_ms();
+    assert!(
+        (-100..500).contains(&late),
+        "woke {late}ms after the recorded wake time, on the database's clock"
+    );
 }
 
 /// **A receive whose message another receive took keeps waiting**, and the next message sent
@@ -6489,14 +6546,16 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
     .await
     .unwrap();
 
-    let before = Timestamp::now();
+    // The database's clock, which the wake time is set on, not this host's.
+    let before = sys.database_time().await.unwrap().now();
     let wake = sys
         .record_sleep(
             support::step_caller("wf-sleeper", 0, &owner_token(&sys, "wf-sleeper").await),
             std::time::Duration::from_secs(3600),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .at;
     let offset = wake.as_epoch_ms() - before.as_epoch_ms();
     assert!(
         (3_600_000..3_610_000).contains(&offset),
@@ -6510,7 +6569,8 @@ async fn a_replayed_sleep_keeps_its_original_wake_time() {
             std::time::Duration::from_secs(3600),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .at;
     assert_eq!(replayed, wake, "a replay must not restart the clock");
 
     // Stored as epoch milliseconds in portable JSON, so anything can read it.
@@ -6545,14 +6605,16 @@ async fn a_sleep_records_its_duration_as_the_sleep() {
     .await
     .unwrap();
 
-    let before = Timestamp::now();
+    // The database's clock, which the wake time is set on, not this host's.
+    let before = sys.database_time().await.unwrap().now();
     let wake = sys
         .record_sleep(
             support::step_caller("wf-waiter", 0, &owner_token(&sys, "wf-waiter").await),
             std::time::Duration::from_secs(60),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .at;
     let step = sys
         .check_step("wf-waiter", 0, "DBOS.sleep")
         .await
@@ -7625,7 +7687,8 @@ async fn a_recorded_sleep_replays_even_when_recomputing_it_would_overflow() {
             overflowing,
         )
         .await
-        .expect("a recorded sleep should replay rather than be refused");
+        .expect("a recorded sleep should replay rather than be refused")
+        .at;
     assert_eq!(wake_at, Timestamp::from_epoch_ms(recorded));
 
     // The same duration with no record behind it is refused.

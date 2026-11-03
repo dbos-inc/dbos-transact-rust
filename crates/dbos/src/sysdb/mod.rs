@@ -86,8 +86,8 @@ use types::{
     NotificationRecord, OnExistingQueue, Outcome, OutcomeWrite, QueueRecord, QueueUpdate,
     RenameBatching, RenameFrom, RewindOptions, ScheduleFilter, ScheduleRecord, ScheduleStatus,
     ScheduleUpdate, StepCaller, StepRecord, StepTiming, StreamRead, StreamRecord, Timestamp,
-    UpdatedQueue, UpsertedQueue, VersionInfo, WorkflowDelay, WorkflowFilter, WorkflowIdReusePolicy,
-    WorkflowInitResult, WorkflowOwner, WorkflowRecord, WrittenBy,
+    UpdatedQueue, UpsertedQueue, VersionInfo, WakeTime, WorkflowDelay, WorkflowFilter,
+    WorkflowIdReusePolicy, WorkflowInitResult, WorkflowOwner, WorkflowRecord, WrittenBy,
 };
 
 /// Everything the engine needs from the system database.
@@ -1068,6 +1068,13 @@ pub trait SystemDatabase: Send + Sync {
     /// clock again — which is the whole point. A workflow that slept an hour and crashed after
     /// fifty minutes has ten left, not sixty.
     ///
+    /// **The wake time is on the database's clock**, `clock_timestamp()` plus `duration`, read in
+    /// the transaction that records it and fixed across retries. A recovery can replay the step on
+    /// another executor, and the database's clock is the one both share. The answer carries a
+    /// reading of that clock, taken in the same transaction on a replay too, so the caller waits
+    /// with [`WakeTime::arrives`] on its own monotonic clock and never compares the wake time
+    /// against its wall clock.
+    ///
     /// The wake time is the step's recorded output, stored as epoch milliseconds in portable
     /// JSON. That combination is deliberate and matches neither reference exactly: Java stores
     /// milliseconds through the *workflow's* serializer, Python stores epoch *seconds* through
@@ -1096,7 +1103,7 @@ pub trait SystemDatabase: Send + Sync {
         &self,
         caller: StepCaller<'_>,
         duration: Duration,
-    ) -> Result<Timestamp, Error>;
+    ) -> Result<WakeTime, Error>;
 
     /// Publishes a key/value on a workflow, for another workflow to read.
     ///
