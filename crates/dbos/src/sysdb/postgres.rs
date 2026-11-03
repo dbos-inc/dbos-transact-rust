@@ -155,6 +155,7 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
 /// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
+/// | `08P01`, `08007`, `57P04` | protocol violation, commit outcome unknown, database dropped | permanent |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -169,14 +170,20 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// an ambiguous result, where the transaction may have committed and a replay could apply it
 /// twice. Both are permanent, so they reach the caller.
 ///
+/// **Three codes are carved out of the connection classes**, because asking again cannot help
+/// and may hurt. `08P01`, a protocol violation, is the server refusing a malformed request — a
+/// bind that supplies the wrong number of parameters, say — and the same request is malformed on
+/// every attempt. `08007`, transaction resolution unknown, is the `40003` case again: the commit
+/// may have applied. `57P04` names a database that was dropped, which no wait brings back.
+///
+/// `57014`, a cancelled statement, stays in its class and is retried, though a statement cut off
+/// by `statement_timeout` is cut off again on every attempt. Whether to refuse it, and as what
+/// error, is an open question shared with the other SDKs on the same database.
+///
 /// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
 /// call a transport failure permanent. See [`is_transport_failure`].
 ///
-/// TODO: classifying by class prefix puts a *protocol* violation in whichever class its code
-/// carries rather than calling it permanent, so some are retried instead of failing fast — a
-/// parameter-count mismatch, say. CockroachDB can also report its own i/o timeout as `XXUUU`,
-/// which lands in the internal-error class.
 fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     if let Some(code) = sqlstate {
         return classify_sqlstate(code, error.as_database_error().map(|e| e.message()));
@@ -201,6 +208,10 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
 fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
     if matches!(code, "40001" | "40P01") {
         return BackendErrorKind::Conflict;
+    }
+    // Inside the connection classes, but nothing a reconnect cures; see [`classify`].
+    if matches!(code, "08P01" | "08007" | "57P04") {
+        return BackendErrorKind::Permanent;
     }
     // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
     // transaction. The transaction rolled back with it, so asking again on a new connection is
@@ -8436,10 +8447,23 @@ mod tests {
         }
     }
 
-    /// The prefix classes are unchanged by the exact-code rule for class 40.
+    /// A malformed request, an unknown commit outcome and a dropped database sit in connection
+    /// classes, but asking again cannot help, so they are refused rather than retried.
+    #[test]
+    fn the_connection_class_exceptions_are_permanent() {
+        for code in ["08P01", "08007", "57P04"] {
+            assert_eq!(
+                classify_sqlstate(code, None),
+                BackendErrorKind::Permanent,
+                "{code}"
+            );
+        }
+    }
+
+    /// The prefix classes are unchanged by the exact-code rules.
     #[test]
     fn connection_classes_match_by_prefix() {
-        for code in ["08006", "53300", "57P01"] {
+        for code in ["08000", "08006", "53300", "57014", "57P01", "57P05"] {
             assert_eq!(
                 classify_sqlstate(code, None),
                 BackendErrorKind::Connection,
@@ -8669,6 +8693,44 @@ mod tests {
             .unwrap()
             .expect("wf-caller exists")
             .name
+    }
+
+    /// A statement the server rejects as malformed fails at once rather than being retried.
+    ///
+    /// Binding one parameter to a statement that takes two is a protocol violation the server
+    /// reports as `08P01`, a code in the connection class. Classified as a connection error,
+    /// [`with_retry`] would ask again forever; the timeout is what catches that.
+    #[tokio::test]
+    async fn a_malformed_statement_is_refused_not_retried() {
+        let db = dbos_test_support::test_database().await;
+        let pool = &db.pool().await;
+
+        let outcome = crate::rt::timeout(
+            std::time::Duration::from_secs(10),
+            with_retry(
+                &super::RetryPolicy::default(),
+                "malformed",
+                move || async move {
+                    let sum: i32 = sqlx::query_scalar("SELECT $1::INT4 + $2::INT4")
+                        .bind(1_i32)
+                        .fetch_one(pool)
+                        .await?;
+                    Ok(sum)
+                },
+            ),
+        )
+        .await
+        .expect("a malformed statement returns instead of being retried");
+
+        match outcome {
+            Err(Error::Backend(backend)) => {
+                assert_eq!(backend.kind, BackendErrorKind::Permanent, "{backend:?}");
+                if db.backend() == dbos_test_support::Backend::Postgres {
+                    assert_eq!(backend.sqlstate.as_deref(), Some("08P01"), "{backend:?}");
+                }
+            }
+            other => panic!("expected a backend error, got {other:?}"),
+        }
     }
 
     /// A backend failure inside the work leaves neither the work's writes nor a recorded error.
