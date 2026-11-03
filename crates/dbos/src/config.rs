@@ -254,6 +254,13 @@ pub(crate) const DEFAULT_OUTCOME_POLL_INTERVAL: Duration = Duration::from_secs(1
 mod tests {
     use super::*;
 
+    /// The name is public contract, read by both `from_env` constructors, so it is pinned as a
+    /// literal rather than compared with itself.
+    #[test]
+    fn the_system_database_url_is_read_from_dbos_system_database_url() {
+        assert_eq!(SYSTEM_DATABASE_URL_ENV, "DBOS_SYSTEM_DATABASE_URL");
+    }
+
     #[test]
     fn validation_reports_a_missing_url_by_the_name_of_the_variable_that_sets_it() {
         let err = Config::new("app", "").validate().unwrap_err();
