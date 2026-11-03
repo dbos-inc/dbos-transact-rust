@@ -1773,8 +1773,9 @@ pub struct PendingStart<'a, R, E = crate::EngineOnly, C = E> {
 
 impl<'a, R, E, C> PendingStart<'a, R, E, C> {
     /// A start built from a placed call that answers with a handle, for a durable call other than
-    /// [`start_with`](WorkflowRef::start_with) that creates a workflow — a
-    /// [`Debouncer`](crate::Debouncer)'s, or [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)'s.
+    /// [`start_with`](WorkflowRef::start_with) that sets a workflow running — a
+    /// [`Debouncer`](crate::Debouncer)'s, [`DBOS::enqueue_with`](crate::DBOS::enqueue_with)'s, or a
+    /// fork, resume or rewind ([`fork_workflow`](crate::fork_workflow) and the rest).
     pub(crate) fn from_step(
         step: PendingStep<'a, WorkflowHandle<R, E>, crate::EngineOnly>,
     ) -> Self {

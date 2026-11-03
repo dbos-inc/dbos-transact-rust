@@ -17,8 +17,8 @@
 //! the connection beneath both; what differs is the checkpointing described below, and that a
 //! client has no launch to check. Every reference carries this surface on its client too.
 //!
-//! **And every checkpointed operation on [`DBOS`] has a third form, a free function, for a
-//! workflow body** — see [below](#free-forms-for-a-workflow-body).
+//! **And every operation in this module has a third form, a free function, for a workflow
+//! body** — see [below](#free-forms-for-a-workflow-body).
 //!
 //! # Naming
 //!
@@ -87,9 +87,8 @@
 //!
 //! **The checkpoint commits with the operation**, in one transaction, because the step id travels
 //! down into the system database rather than wrapping the call here — see
-//! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows), and `place` for the one line
-//! that spends the id. Nothing in this module records a step of
-//! its own, and there is no wrapper left to record one: the atomic version costs the same round
+//! [`fork_workflows`](crate::sysdb::SystemDatabase::fork_workflows). Nothing in this module
+//! records a step of its own, and there is no wrapper left to record one: the atomic version costs the same round
 //! trips, and it closes a window the wrapper cannot. A crash between the write and its checkpoint
 //! would otherwise leave the work done and unrecorded, which for a fork is a second workflow under
 //! a second id; and an execution that has been handed off is refused by the owner check before
@@ -108,12 +107,12 @@
 //!
 //! Three edges. Outside a workflow there is nothing to checkpoint against and the method is a plain
 //! call, which is what an operator's tool does; the free form, with no handle and no context to
-//! take a connection from, is [`Error::NotInWorkflow`] there. Inside a *step* it is also plain, by the leaf rule
-//! every other id-allocating call in this crate follows: the step's own checkpoint stands for
-//! everything its body did. And a **failure is recorded only when the database decided it**:
-//! "already exists" or "no such workflow" is replayed as the same error, so the replay takes the
-//! branch the original run took, while a database that was unreachable records nothing and the
-//! replay makes the call again.
+//! take a connection from, is [`Error::NotInWorkflow`] there. Inside a *step* it is also plain, by
+//! the leaf rule every other id-allocating call in this crate follows: the step's own checkpoint
+//! stands for everything its body did. And a **failure is recorded only when the database decided
+//! it**: "already exists" or "no such workflow" is replayed as the same error, so the replay takes
+//! the branch the original run took, while a database that was unreachable records nothing and
+//! the replay makes the call again.
 //!
 //! [`retrieve_workflow`](DBOS::retrieve_workflow) is the one member of the `DBOS` surface with no
 //! step, because it is the one that does no I/O: there is no call to replay. Python checkpoints its equivalent as
@@ -183,6 +182,7 @@ use crate::sysdb::types::{
     RewindOptions as SysRewindOptions, StepRecord, WorkflowDelay, WorkflowFilter, WorkflowRecord,
     duration_to_ms, step_names,
 };
+use crate::workflow::PendingStart;
 
 /// Whether an operation reaches a workflow's descendants.
 ///
@@ -543,11 +543,13 @@ pub fn cancel_workflows<'a, E: DurableError + 'a>(
 /// under the same step name (`DBOS.resume_workflow`) and replays as the method's would. See
 /// [`DBOS::resume`] for what resuming does to a workflow that is still running.
 ///
-/// **The call answers in the handle's error channel**, `E`, which is the workflow's own whenever
-/// the two fail the same way — the common case, and the one
-/// [`WorkflowRef::start`](crate::WorkflowRef::start) is written for. Where they differ,
-/// [`map_error`](PendingStep::map_error) or [`lift`](PendingStep::lift) retargets the call before
-/// it is awaited.
+/// **A [`PendingStart`], as [`WorkflowRef::start`](crate::WorkflowRef::start) hands back**: it
+/// hands back a workflow to wait on, and answers in the handle's error channel, `E`, by default —
+/// the caller's own whenever the two fail the same way, so `?` needs nothing. Where they differ,
+/// [`lift`](PendingStart::lift) re-declares the channel before the await; nothing is lost, since
+/// the call itself can only fail in the engine's terms. And like a start it is not a
+/// [`select_step!`](crate::select_step) branch: it changes what runs, and only the winner of a
+/// race is polled on replay.
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step.
 ///
@@ -559,8 +561,12 @@ pub fn cancel_workflows<'a, E: DurableError + 'a>(
 /// ```
 pub fn resume_workflow<'a, R: 'a, E: DurableError + 'a>(
     workflow_id: &'a str,
-) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
-    resume_workflow_with(workflow_id, ResumeOptions::default())
+) -> PendingStart<'a, R, E> {
+    PendingStart::from_step(pending_resume(
+        StepPlacement::ambient_connection("resume_workflow"),
+        workflow_id,
+        ResumeOptions::default(),
+    ))
 }
 
 /// [`resume_workflow`] onto a queue of the caller's choosing.
@@ -569,12 +575,12 @@ pub fn resume_workflow<'a, R: 'a, E: DurableError + 'a>(
 pub fn resume_workflow_with<'a, R: 'a, E: DurableError + 'a>(
     workflow_id: &'a str,
     options: ResumeOptions<'a>,
-) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
-    pending_resume(
-        StepPlacement::ambient_connection("resume_workflow"),
+) -> PendingStart<'a, R, E> {
+    PendingStart::from_step(pending_resume(
+        StepPlacement::ambient_connection("resume_workflow_with"),
         workflow_id,
         options,
-    )
+    ))
 }
 
 /// Resumes workflows from inside a workflow, handing back one handle per id, in the order given.
@@ -583,12 +589,14 @@ pub fn resume_workflow_with<'a, R: 'a, E: DurableError + 'a>(
 /// plural as [`cancel_workflows`] is. One step, `DBOS.resume_workflow`, for the whole batch, and
 /// every id must exist or nothing is enqueued — see [`DBOS::resume_all`].
 ///
-/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
-/// handles' error channel, as [`resume_workflow`] does.
-pub fn resume_workflows<'a, R: 'a, E: DurableError + 'a>(
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. **The call answers in the
+/// engine's channel**, as the method does, so [`lift`](PendingStep::lift) puts it in the caller's
+/// before the await: `.lift().await?`. A batch is not a [`select_step!`](crate::select_step)
+/// branch either, though its type does not stop one; see [`resume_workflow`].
+pub fn resume_workflows<'a, R: 'a, E: 'a>(
     workflow_ids: &'a [&'a str],
     options: ResumeOptions<'a>,
-) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, E> {
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     pending_resume_all(
         StepPlacement::ambient_connection("resume_workflows"),
         workflow_ids,
@@ -608,8 +616,8 @@ pub fn resume_workflows<'a, R: 'a, E: DurableError + 'a>(
 /// new id, so a replay without the checkpoint would write a second fork. A replay hands back the
 /// id the first execution recorded.
 ///
-/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
-/// handle's error channel, as [`resume_workflow`] does.
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. A [`PendingStart`], as
+/// [`resume_workflow`] is.
 ///
 /// ```no_run
 /// # async fn supervise(failed: String) -> dbos::Result<u32> {
@@ -622,8 +630,12 @@ pub fn resume_workflows<'a, R: 'a, E: DurableError + 'a>(
 pub fn fork_workflow<'a, R: 'a, E: DurableError + 'a>(
     workflow_id: &'a str,
     start_step: i32,
-) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
-    fork_workflow_with(Fork::new(workflow_id, start_step), ForkOptions::default())
+) -> PendingStart<'a, R, E> {
+    PendingStart::from_step(pending_fork(
+        StepPlacement::ambient_connection("fork_workflow"),
+        Fork::new(workflow_id, start_step),
+        ForkOptions::default(),
+    ))
 }
 
 /// [`fork_workflow`], choosing the fork's id, what it inherits and where it runs.
@@ -633,12 +645,12 @@ pub fn fork_workflow<'a, R: 'a, E: DurableError + 'a>(
 pub fn fork_workflow_with<'a, R: 'a, E: DurableError + 'a>(
     fork: Fork<'a>,
     options: ForkOptions<'a>,
-) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
-    pending_fork(
-        StepPlacement::ambient_connection("fork_workflow"),
+) -> PendingStart<'a, R, E> {
+    PendingStart::from_step(pending_fork(
+        StepPlacement::ambient_connection("fork_workflow_with"),
         fork,
         options,
-    )
+    ))
 }
 
 /// Forks workflows from inside a workflow, handing back a handle to each fork in the order given.
@@ -647,12 +659,14 @@ pub fn fork_workflow_with<'a, R: 'a, E: DurableError + 'a>(
 /// as [`cancel_workflows`] is. Every source must exist or no fork is written, and the batch is one
 /// step, `DBOS.fork_workflow` — see [`DBOS::fork_all`].
 ///
-/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
-/// handles' error channel, as [`resume_workflow`] does.
-pub fn fork_workflows<'a, R: 'a, E: DurableError + 'a>(
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. **The call answers in the
+/// engine's channel**, as the method does, so [`lift`](PendingStep::lift) puts it in the caller's
+/// before the await: `.lift().await?`. A batch is not a [`select_step!`](crate::select_step)
+/// branch either, though its type does not stop one; see [`resume_workflow`].
+pub fn fork_workflows<'a, R: 'a, E: 'a>(
     forks: &'a [Fork<'a>],
     options: ForkOptions<'a>,
-) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>, E> {
+) -> PendingStep<'a, Vec<WorkflowHandle<R, E>>> {
     pending_fork_all(
         StepPlacement::ambient_connection("fork_workflows"),
         forks,
@@ -669,12 +683,16 @@ pub fn fork_workflows<'a, R: 'a, E: DurableError + 'a>(
 /// recovered caller does not rewind the target again. See [`DBOS::rewind_with`] for what is
 /// discarded, and why a workflow still running cannot be rewound.
 ///
-/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The call answers in the
-/// handle's error channel, as [`resume_workflow`] does.
+/// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. A [`PendingStart`], as
+/// [`resume_workflow`] is.
 pub fn rewind_workflow<'a, R: 'a, E: DurableError + 'a>(
     workflow_id: &'a str,
-) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
-    rewind_workflow_with(workflow_id, RewindOptions::default())
+) -> PendingStart<'a, R, E> {
+    PendingStart::from_step(pending_rewind(
+        StepPlacement::ambient_connection("rewind_workflow"),
+        workflow_id,
+        RewindOptions::default(),
+    ))
 }
 
 /// [`rewind_workflow`], choosing the step it re-runs from and where it runs.
@@ -684,12 +702,12 @@ pub fn rewind_workflow<'a, R: 'a, E: DurableError + 'a>(
 pub fn rewind_workflow_with<'a, R: 'a, E: DurableError + 'a>(
     workflow_id: &'a str,
     options: RewindOptions<'a>,
-) -> PendingStep<'a, WorkflowHandle<R, E>, E> {
-    pending_rewind(
-        StepPlacement::ambient_connection("rewind_workflow"),
+) -> PendingStart<'a, R, E> {
+    PendingStart::from_step(pending_rewind(
+        StepPlacement::ambient_connection("rewind_workflow_with"),
         workflow_id,
         options,
-    )
+    ))
 }
 
 /// Removes a workflow and everything recorded against it, from inside another workflow.
@@ -834,7 +852,11 @@ pub fn list_workflows<'a, E: DurableError + 'a>(
 pub fn list_workflow_steps<'a, E: DurableError + 'a>(
     workflow_id: &'a str,
 ) -> PendingStep<'a, Vec<StepRecord>, E> {
-    list_workflow_steps_with(workflow_id, ListWorkflowStepsOptions::default())
+    pending_list_workflow_steps(
+        StepPlacement::ambient_connection("list_workflow_steps"),
+        workflow_id,
+        ListWorkflowStepsOptions::default(),
+    )
 }
 
 /// [`list_workflow_steps`](fn@list_workflow_steps), choosing what each step carries and which page
@@ -847,7 +869,7 @@ pub fn list_workflow_steps_with<'a, E: DurableError + 'a>(
     options: ListWorkflowStepsOptions,
 ) -> PendingStep<'a, Vec<StepRecord>, E> {
     pending_list_workflow_steps(
-        StepPlacement::ambient_connection("list_workflow_steps"),
+        StepPlacement::ambient_connection("list_workflow_steps_with"),
         workflow_id,
         options,
     )
@@ -866,7 +888,9 @@ pub fn list_workflow_steps_with<'a, E: DurableError + 'a>(
 ///
 /// The one refusal is [`Error::NotInWorkflow`], outside a workflow, where
 /// [`DBOS::retrieve_workflow`] is the call. Inside a step it hands back a handle like anywhere
-/// else. It answers in the handle's error channel, as [`resume_workflow`] does.
+/// else. It answers in the handle's error channel, as [`resume_workflow`] does by default; unlike
+/// it, a plain `Result` has nowhere to re-declare that, so a caller that fails another way maps
+/// the refusal itself.
 ///
 /// ```no_run
 /// # async fn supervise(child: String) -> dbos::Result<u32> {
@@ -1110,7 +1134,7 @@ impl DBOS {
     pub fn resume<'a, R: 'a, E: 'a>(
         &self,
         workflow_id: &'a str,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+    ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         self.resume_with(workflow_id, ResumeOptions::default())
     }
 
@@ -1135,8 +1159,12 @@ impl DBOS {
         &self,
         workflow_id: &'a str,
         options: ResumeOptions<'a>,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        pending_resume(self.served("resume a workflow"), workflow_id, options)
+    ) -> PendingStart<'a, R, E, crate::EngineOnly> {
+        PendingStart::from_step(pending_resume(
+            self.served("resume a workflow"),
+            workflow_id,
+            options,
+        ))
     }
 
     /// Resumes workflows, handing back one handle per id, in the order given.
@@ -1181,7 +1209,7 @@ impl DBOS {
         &self,
         workflow_id: &'a str,
         start_step: i32,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+    ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         self.fork_with(Fork::new(workflow_id, start_step), ForkOptions::default())
     }
 
@@ -1228,8 +1256,8 @@ impl DBOS {
         &self,
         fork: Fork<'a>,
         options: ForkOptions<'a>,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        pending_fork(self.served(FORK_OPERATION), fork, options)
+    ) -> PendingStart<'a, R, E, crate::EngineOnly> {
+        PendingStart::from_step(pending_fork(self.served(FORK_OPERATION), fork, options))
     }
 
     /// Forks workflows, handing back a handle to each fork in the order given.
@@ -1290,7 +1318,7 @@ impl DBOS {
     pub fn rewind<'a, R: 'a, E: 'a>(
         &self,
         workflow_id: &'a str,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
+    ) -> PendingStart<'a, R, E, crate::EngineOnly> {
         self.rewind_with(workflow_id, RewindOptions::default())
     }
 
@@ -1356,8 +1384,12 @@ impl DBOS {
         &self,
         workflow_id: &'a str,
         options: RewindOptions<'a>,
-    ) -> PendingStep<'a, WorkflowHandle<R, E>> {
-        pending_rewind(self.served("rewind a workflow"), workflow_id, options)
+    ) -> PendingStart<'a, R, E, crate::EngineOnly> {
+        PendingStart::from_step(pending_rewind(
+            self.served("rewind a workflow"),
+            workflow_id,
+            options,
+        ))
     }
 
     /// Removes a workflow and everything recorded against it.

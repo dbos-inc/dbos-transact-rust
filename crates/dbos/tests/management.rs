@@ -5,7 +5,7 @@
 //! the two listings are reads and writes against the row itself, and are checked against the
 //! system database directly.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -3634,6 +3634,12 @@ async fn no_workflow_write_reaches_the_legacy_payload_columns() {
 #[error("the supervisor halted")]
 struct Halted;
 
+/// What another target fails with, which is not the supervisor's: a call that hands back its
+/// handle re-declares its channel with `lift` and is otherwise written the same.
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[error("the other target stalled")]
+struct Stalled;
+
 /// The workflows a supervisor manages, by id.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Supervisees {
@@ -3645,6 +3651,8 @@ struct Supervisees {
     done: String,
     /// Held back an hour on a polled queue, to be brought forward.
     delayed: String,
+    /// A finished workflow that fails as [`Stalled`], to be forked.
+    other: String,
 }
 
 /// What a supervisor saw, which a replay must see again.
@@ -3658,6 +3666,7 @@ struct Supervised {
     delayed: u32,
     attributes: Option<String>,
     listed_steps: (usize, usize),
+    other_forked: String,
 }
 
 /// The supervisor's body, capturing nothing: every call reaches the executor through the ambient
@@ -3672,7 +3681,10 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
     let pair = [t.pair[0].as_str(), t.pair[1].as_str()];
     let mut cancelled = dbos::cancel_workflows(&pair, Children::Skip).await?;
     cancelled.sort();
-    for handle in dbos::resume_workflows::<u32, Halted>(&pair, ResumeOptions::default()).await? {
+    for handle in dbos::resume_workflows::<u32, Halted>(&pair, ResumeOptions::default())
+        .lift()
+        .await?
+    {
         resumed.push(handle.result().await?);
     }
     // Already finished, so nothing moves; the handle reports the outcome it had.
@@ -3688,7 +3700,9 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
     )
     .await?;
     let batch = [Fork::new(&t.done, 0)];
-    let mut batched = dbos::fork_workflows::<u32, Halted>(&batch, ForkOptions::default()).await?;
+    let mut batched = dbos::fork_workflows::<u32, Halted>(&batch, ForkOptions::default())
+        .lift()
+        .await?;
     let third = batched.pop().expect("one fork in, one handle out");
     let forked_ids: Vec<String> = [&first, &chosen, &third]
         .iter()
@@ -3745,6 +3759,12 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
         .len(),
     );
 
+    // A target that fails another way: the fork re-declares its channel, and nothing else changes.
+    let other = dbos::fork_workflow::<u32, Stalled>(&t.other, 0)
+        .lift()
+        .await?;
+    let other_forked = other.workflow_id().to_owned();
+
     Ok(Supervised {
         cancelled,
         resumed,
@@ -3754,6 +3774,7 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
         delayed,
         attributes,
         listed_steps,
+        other_forked,
     })
 }
 
@@ -3762,16 +3783,32 @@ async fn supervise(t: Supervisees) -> Result<Supervised, Error<Halted>> {
 /// The supervisor's registered closure captures nothing, so it reaches every management call
 /// through the free forms — and each is recorded under the name the `DBOS` method records, in the
 /// order it was made. Forking the supervisor past its last step replays every one of those steps
-/// from its checkpoint: the fork hands back exactly what the first run saw, fork ids included, so
-/// nothing was forked, rewound or deleted a second time.
+/// from its checkpoint: the fork hands back exactly what the first run saw, fork ids included, no
+/// target forks again, and no target's body runs again, so nothing was rewound a second time
+/// either. Cancel, delay, the attribute writes and delete are idempotent, so for those the replay's
+/// answer is the evidence, not the database.
 #[tokio::test]
 async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
     let db = test_database().await;
     let dbos = DBOS::new(config("free-management-app", &db));
+    // Every run of a target's body, so a replay that re-runs one — a rewind, say — is seen.
+    let runs = Arc::new(AtomicUsize::new(0));
     let target = dbos
+        .register_workflow("supervisee", {
+            let runs = Arc::clone(&runs);
+            move |()| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    dbos::step("work", || async { Ok::<u32, Error<Halted>>(1) }).await
+                }
+            }
+        })
+        .unwrap();
+    let other = dbos
         .register_workflow(
-            "supervisee",
-            |()| async move { Ok::<u32, Error<Halted>>(1) },
+            "other-target",
+            |()| async move { Ok::<u32, Error<Stalled>>(2) },
         )
         .unwrap();
     let supervisor = dbos.register_workflow("supervisor", supervise).unwrap();
@@ -3813,6 +3850,16 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
         )
         .await
         .expect("the finished target failed");
+    other
+        .run_with(
+            (),
+            dbos::RunOptions {
+                workflow_id: Some("finished-other"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the other target failed");
     target
         .start_with(
             (),
@@ -3833,6 +3880,7 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
         pair: ["parked-a".to_owned(), "parked-b".to_owned()],
         done: "finished-one".to_owned(),
         delayed: "held-back".to_owned(),
+        other: "finished-other".to_owned(),
     };
     let supervisor_id = "the-supervisor";
     let seen = tokio::time::timeout(
@@ -3860,7 +3908,7 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
         serde_json::from_str::<serde_json::Value>(seen.attributes.as_deref().unwrap()).unwrap(),
         serde_json::json!({ "tenant": "acme", "supervised": true }),
     );
-    assert_eq!(seen.listed_steps, (0, 0));
+    assert_eq!(seen.listed_steps, (1, 1));
 
     let reader = reader(&db).await;
     for id in &seen.forked_ids {
@@ -3906,6 +3954,7 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
             "DBOS.list_workflows",
             "DBOS.list_workflow_steps",
             "DBOS.list_workflow_steps",
+            "DBOS.fork_workflow",
         ],
         "the free forms did not record under the methods' step names",
     );
@@ -3913,6 +3962,7 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
     assert_eq!(ids, (0..steps.len() as i32).collect::<Vec<_>>());
 
     // Past the last step, so every call replays from its checkpoint.
+    let before = runs.load(Ordering::SeqCst);
     let replay = dbos
         .fork::<Supervised, Halted>(supervisor_id, steps.len() as i32)
         .await
@@ -3924,6 +3974,11 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
     assert_eq!(
         replayed, seen,
         "the replay did not hand back what the first run saw"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        before,
+        "the replay ran a target's body again"
     );
     let forks_of_done: Vec<String> = reader
         .list_workflows(&WorkflowFilter::default(), None)
@@ -4022,8 +4077,15 @@ async fn a_workflow_recorded_through_the_methods_replays_through_the_free_forms(
     .unwrap();
     dbos.launch().await.expect("launch failed");
 
+    // Past the last step the methods recorded, so the whole body replays.
+    let last = reader(&db)
+        .await
+        .list_workflow_steps(operator_id, false, None, None, None)
+        .await
+        .expect("read failed")
+        .len();
     let replay = dbos
-        .fork::<(String, usize, usize), EngineOnly>(operator_id, 4)
+        .fork::<(String, usize, usize), EngineOnly>(operator_id, last as i32)
         .await
         .expect("fork failed");
     let replayed = tokio::time::timeout(Duration::from_secs(60), replay.result())
@@ -4079,7 +4141,7 @@ async fn the_free_management_calls_need_a_workflow() {
     );
     refused(
         dbos::resume_workflow_with::<u32, EngineOnly>("a", ResumeOptions::default()).await,
-        "resume_workflow",
+        "resume_workflow_with",
     );
     refused(
         dbos::resume_workflows::<u32, EngineOnly>(&ids, ResumeOptions::default()).await,
@@ -4092,7 +4154,7 @@ async fn the_free_management_calls_need_a_workflow() {
     refused(
         dbos::fork_workflow_with::<u32, EngineOnly>(Fork::new("a", 0), ForkOptions::default())
             .await,
-        "fork_workflow",
+        "fork_workflow_with",
     );
     refused(
         dbos::fork_workflows::<u32, EngineOnly>(&forks, ForkOptions::default()).await,
@@ -4104,7 +4166,7 @@ async fn the_free_management_calls_need_a_workflow() {
     );
     refused(
         dbos::rewind_workflow_with::<u32, EngineOnly>("a", RewindOptions::default()).await,
-        "rewind_workflow",
+        "rewind_workflow_with",
     );
     refused(dbos::delete_workflow("a").await, "delete_workflow");
     refused(
@@ -4127,7 +4189,7 @@ async fn the_free_management_calls_need_a_workflow() {
     refused(dbos::list_workflow_steps("a").await, "list_workflow_steps");
     refused(
         dbos::list_workflow_steps_with("a", ListWorkflowStepsOptions::default()).await,
-        "list_workflow_steps",
+        "list_workflow_steps_with",
     );
     refused(
         dbos::retrieve_workflow::<u32, EngineOnly>("a"),

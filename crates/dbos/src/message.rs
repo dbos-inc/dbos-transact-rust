@@ -208,10 +208,10 @@ where
 /// another is a seam for nothing.
 ///
 /// The management verbs' *free* forms do take the plural noun —
-/// [`cancel_workflows`](crate::cancel_workflows), [`fork_workflows`](crate::fork_workflows) — because
-/// a free function has no type to leave the noun implicit on. That is the same rule from the other
-/// side, and it still gives a batch send no noun to pluralise: a free `send_bulk` sits beside a free
-/// `send`, as it does on [`DBOS`].
+/// [`cancel_workflows`](crate::cancel_workflows), [`fork_workflows`](crate::fork_workflows) —
+/// because a free function has no type to leave the noun implicit on. That is the same rule from
+/// the other side, and it still gives a batch send no noun to pluralise: a free `send_bulk` sits
+/// beside a free `send`, as it does on [`DBOS`].
 pub fn send_bulk<T, E>(messages: &[SendMessage<'_, T>]) -> PendingStep<'static, (), E>
 where
     T: Serialize,

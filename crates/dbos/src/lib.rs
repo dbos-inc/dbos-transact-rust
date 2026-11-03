@@ -261,10 +261,11 @@ pub use wait::{join_workflows, select_workflow};
 /// A branch is any [`PendingStep`]: a [`step`](step()), a handle's
 /// [`result`](WorkflowHandle::result), a wait over workflows
 /// ([`select_workflow`](fn@select_workflow) or [`join_workflows`](fn@join_workflows)), a
-/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a checkpointed management call — free,
-/// like [`cancel_workflow`] or [`fork_workflow`], or on [`DBOS`]. Each checkpoints itself under the id it was built with and replays from its own row
-/// when it is the recorded winner, so a race between a step and the await of a child is as durable
-/// as one between two steps.
+/// [`get_event`], a [`set_event`], a [`sleep`](sleep()), or a management call that observes or
+/// marks rather than sets a workflow running — free, like [`cancel_workflow`] or
+/// [`list_workflows`], or on [`DBOS`]. Each checkpoints itself under the id it was built with and
+/// replays from its own row when it is the recorded winner, so a race between a step and the await
+/// of a child is as durable as one between two steps.
 ///
 /// **Where *every* branch is a workflow's outcome, reach for
 /// [`select_workflow!`](macro@crate::select_workflow) instead.** Both are durable; the difference
@@ -280,7 +281,8 @@ pub use wait::{join_workflows, select_workflow};
 /// another branch, and a run additionally holds two ids and would leave a started, recorded child
 /// whose outcome the parent never learns. Start outside the race, and race the handle's
 /// [`result`](WorkflowHandle::result) — which observes rather than creates, and is the branch that
-/// was meant.
+/// was meant. A fork, a resume and a rewind hand back a [`PendingStart`] too, for the same reason;
+/// their bulk forms are steps and the type does not stop them, but they are no better a branch.
 ///
 /// **What losing means.** A losing step is dropped mid-body and records nothing, so a replay never
 /// runs it; its [`cancellation_token`] fires on the way out, as it does for a timeout, so work it
