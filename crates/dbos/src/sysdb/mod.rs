@@ -1006,6 +1006,26 @@ pub trait SystemDatabase: Send + Sync {
         step_name: &str,
     ) -> Result<Option<StepRecord>, Error>;
 
+    /// The earliest step recorded at or past `step_id`, as its id and name, or `None` when the
+    /// history ends before it: what a [`patch`](crate::patch) reads at its position.
+    ///
+    /// A gate like [`check_step`](Self::check_step), with its first check: a cancelled workflow
+    /// raises [`Error::WorkflowCancelled`], and one that does not exist
+    /// [`Error::NonExistentWorkflow`]. It does not compare names, because a patch asks *which*
+    /// step is there rather than claiming one.
+    ///
+    /// **Past the position, not only at it**, because a history can have a gap. An execution
+    /// records a later step before an earlier one when a `recv` or `get_event` checkpoints its
+    /// timeout's sleep, at the step after its own, before it waits, or when concurrent calls of one
+    /// workflow finish out of order. So an empty position with a step past it is a point the old
+    /// code got past, and only a history that ends before the position is a first visit. Python's
+    /// `get_checkpoint_at_or_after` and Java's `getCheckpointAtOrAfter` read the same.
+    async fn check_step_at_or_after(
+        &self,
+        workflow_id: &str,
+        step_id: i32,
+    ) -> Result<Option<(i32, String)>, Error>;
+
     /// Records a step's result, which no later execution may overwrite.
     ///
     /// [`StepTiming::completed_at`] is the concurrency control, not merely a timestamp. The
