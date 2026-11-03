@@ -3310,9 +3310,10 @@ pub struct ScheduleRecord {
 /// [`QueueRecord`]: registering does not require an owner, and the record always reports one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSchedule<'a> {
-    /// See [`ScheduleRecord::schedule_id`]. `None` generates one.
+    /// See [`ScheduleRecord::schedule_id`]. `None` generates a UUID; a supplied id is stored as
+    /// given, so it need not be one.
     ///
-    /// Either way the schedule ends up with a UUID. The fallback lives here, as it does for
+    /// The fallback lives here, as it does for
     /// `application_name`, so this layer stands on its own, and a registration layer above it
     /// that supplies the id makes this a second line of defence rather than the only one.
     pub schedule_id: Option<&'a str>,
