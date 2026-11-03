@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::checkpoint::{PendingStep, StepPlacement, StepWriter};
 use crate::error::{DurableError, Error};
-use crate::sysdb::types::{StepCaller, Timestamp, duration_to_ms, step_names};
+use crate::sysdb::types::{StepCaller, duration_to_ms, step_names};
 
 /// Waits for `duration`, resuming at the **original** wake time after a crash.
 ///
@@ -95,7 +95,7 @@ where
                 return Ok(());
             };
 
-            let wake_at = executor
+            let wake = executor
                 .sysdb()
                 .record_sleep(
                     StepCaller {
@@ -111,14 +111,18 @@ where
 
             // From the recorded wake time, not from now: on a replay `record_sleep` gives back the
             // instant the first run chose, and the remaining wait is whatever is left of it. A
-            // replay that woke long ago waits not at all.
-            let remaining = wake_at.duration_since(Timestamp::now()).unwrap_or_default();
+            // replay that woke long ago waits not at all. Measured on the monotonic clock from
+            // the database's reading, never against this host's wall clock, which need not agree
+            // with the clock the wake time was set on.
+            let until = wake.arrives();
             tracing::debug!(
                 step_id,
-                remaining_ms = remaining.as_millis(),
+                remaining_ms = until
+                    .saturating_duration_since(crate::rt::now())
+                    .as_millis(),
                 "sleeping until the recorded wake time"
             );
-            crate::rt::sleep(remaining).await;
+            crate::rt::sleep_until(until).await;
             Ok(())
         },
     )
