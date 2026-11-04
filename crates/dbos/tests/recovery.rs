@@ -161,6 +161,130 @@ async fn a_relaunch_resumes_at_the_step_after_the_last_one_recorded() {
     dbos.shutdown().await;
 }
 
+/// A workflow whose history holds the library's own steps, under the names Rust 0.5 recorded,
+/// replays under this release.
+///
+/// The body sets an event, starts and awaits a child, and cancels another workflow, then blocks;
+/// `shutdown` abandons it there. The history must hold exactly 0.5's names for those steps —
+/// `DBOS.setEvent`, `DBOS.getResult`, `DBOS.cancelWorkflow` — and the relaunch must replay every
+/// one of them from its checkpoint, without starting the child again, and finish.
+#[dbos_test_support::test]
+async fn a_history_under_the_0_5_step_names_replays() {
+    let child_runs = Arc::new(AtomicU32::new(0));
+    let reached_gate = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let db = test_database().await;
+    let dbos = DBOS::new(config("step-names-app", &db));
+    let child = {
+        let runs = Arc::clone(&child_runs);
+        dbos.register_workflow("child", move |n: u32| {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<u32, Error>(n * 2)
+            }
+        })
+        .unwrap()
+    };
+    let target = dbos
+        .register_workflow("target", |()| async move { Ok::<u32, Error>(1) })
+        .unwrap();
+    let parent = {
+        let (reached, release) = (Arc::clone(&reached_gate), Arc::clone(&release_gate));
+        dbos.register_workflow("parent", move |target_id: String| {
+            let child = child.clone();
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            async move {
+                dbos::set_event::<_, dbos::EngineOnly>("progress", &1_u32).await?;
+                let doubled = child.start(21).await?.result().await?;
+                dbos::cancel_workflow::<dbos::EngineOnly>(&target_id).await?;
+                reached.notify_one();
+                release.notified().await;
+                Ok::<u32, Error>(doubled)
+            }
+        })
+        .unwrap()
+    };
+    dbos.launch().await.expect("launch failed");
+
+    // The target sits on a queue nothing polls, so it is there to be cancelled.
+    let target_id = "step-names-target";
+    target
+        .start_with(
+            (),
+            StartOptions {
+                workflow_id: Some(target_id),
+                queue: Some(QueueRequest::new("nothing-polls-this")),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .expect("enqueue failed");
+
+    let parent_id = "step-names-parent";
+    let running = {
+        let parent = parent.clone();
+        dbos::__rt::spawn(async move {
+            parent
+                .run_with(
+                    target_id.to_owned(),
+                    dbos::RunOptions {
+                        workflow_id: Some(parent_id),
+                        ..Default::default()
+                    },
+                )
+                .await
+        })
+    };
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the workflow never reached its gate");
+    dbos.shutdown().await;
+    let err = running.await.expect("the task panicked").unwrap_err();
+    assert!(matches!(err, Error::Interrupted { .. }), "{err}");
+
+    let reader = reader(&db).await;
+    let recorded = |steps: Vec<dbos::sysdb::types::StepRecord>| {
+        steps
+            .into_iter()
+            .map(|s| (s.step_id, s.step_name))
+            .collect::<Vec<_>>()
+    };
+    let history = recorded(
+        reader
+            .list_workflow_steps(parent_id, false, None, None, None)
+            .await
+            .expect("read failed"),
+    );
+    let expected = [
+        (0, "DBOS.setEvent".to_owned()),
+        (1, "child".to_owned()),
+        (2, "DBOS.getResult".to_owned()),
+        (3, "DBOS.cancelWorkflow".to_owned()),
+    ];
+    assert_eq!(history, expected, "the history holds 0.5's names");
+
+    dbos.launch().await.expect("relaunch failed");
+    dbos::__rt::timeout(DEADLINE, reached_gate.notified())
+        .await
+        .expect("the recovered workflow never reached its gate again");
+    release_gate.notify_one();
+
+    let row = await_status(&reader, parent_id, WorkflowStatus::Success).await;
+    assert_eq!(row.output.as_deref(), Some("42"));
+    assert_eq!(child_runs.load(Ordering::SeqCst), 1, "the child ran once");
+    let replayed = recorded(
+        reader
+            .list_workflow_steps(parent_id, false, None, None, None)
+            .await
+            .expect("read failed"),
+    );
+    assert_eq!(replayed, expected, "the replay recorded nothing new");
+
+    dbos.shutdown().await;
+}
+
 /// A row whose registration is gone is skipped, and does not strand the workflows behind it.
 ///
 /// The first instance registers two workflows and abandons both. The second registers only one —

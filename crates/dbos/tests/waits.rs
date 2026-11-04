@@ -384,7 +384,7 @@ async fn waits_driven_out_of_build_order_keep_the_ids_they_were_built_with() {
         .collect();
     assert_eq!(
         recorded,
-        [(0, "DBOS.select_workflow"), (1, "after")],
+        [(0, "DBOS.selectWorkflow"), (1, "after")],
         "the ids follow the order the calls were built in, not the order they were polled in",
     );
 
@@ -477,7 +477,7 @@ async fn an_empty_first_wait_records_its_refusal() {
         .collect();
     assert_eq!(
         seen,
-        [(0, "DBOS.select_workflow"), (1, "after")],
+        [(0, "DBOS.selectWorkflow"), (1, "after")],
         "the refusal occupies its own slot, leaving `after` where it would have been anyway"
     );
     let refusal = &steps[0];
@@ -581,7 +581,7 @@ async fn a_first_wait_inside_a_workflow_is_a_checkpointed_step_and_an_all_wait_i
         .collect();
     assert_eq!(
         seen,
-        [(0, "quick"), (1, "quick"), (2, "DBOS.select_workflow")],
+        [(0, "quick"), (1, "quick"), (2, "DBOS.selectWorkflow")],
         "the two launches and the one wait that records, in order"
     );
 

@@ -8263,7 +8263,7 @@ impl PostgresSystemDatabase {
     /// Everything about a send but its recorded name is the same for one message and for many —
     /// the transaction, the fork fan-out, the replay skip, the duplicate-key check, the foreign
     /// key — so the two trait methods are a name apiece over this. Splitting them up there rather
-    /// than inferring the name down here is what makes a one-message batch record `DBOS.send_bulk`.
+    /// than inferring the name down here is what makes a one-message batch record `DBOS.sendBulk`.
     async fn deliver(
         &self,
         messages: &[Message<'_>],

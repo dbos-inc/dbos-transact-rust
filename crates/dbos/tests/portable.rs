@@ -519,7 +519,7 @@ async fn a_parent_records_a_portable_childs_error_as_the_child_wrote_it() {
 
     let (awaited_at, serialization, error): (i32, String, String) = sqlx::query_as(
         r#"SELECT function_id, serialization, error FROM "dbos"."operation_outputs"
-           WHERE workflow_uuid = $1 AND function_name = 'DBOS.get_result'"#,
+           WHERE workflow_uuid = $1 AND function_name = 'DBOS.getResult'"#,
     )
     .bind(&id)
     .fetch_one(&db.pool().await)

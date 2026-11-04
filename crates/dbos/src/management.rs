@@ -466,7 +466,7 @@ impl Default for ListWorkflowStepsOptions {
 /// alive for the life of the process. That is the whole reason this exists beside the method.
 ///
 /// Otherwise it is the method exactly: the same body builds both, so the cancel is checkpointed
-/// under the same step name (`DBOS.cancel_workflow`) and a workflow that switches from one to the
+/// under the same step name (`DBOS.cancelWorkflow`) and a workflow that switches from one to the
 /// other replays the history it recorded. See [`DBOS::cancel`] for what cancelling does — it marks
 /// the row, it does not interrupt — and for why a workflow cannot cancel itself.
 ///
@@ -496,7 +496,7 @@ pub fn cancel_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> Pendin
 ///
 /// The free form of [`DBOS::cancel_all`], and the bulk form of [`cancel_workflow`]: it exists for
 /// the reason that one gives, needing no handle and so leaving the workflow's registered closure
-/// with nothing to capture. Recorded as `DBOS.cancel_workflow`, one step for the whole batch, as
+/// with nothing to capture. Recorded as `DBOS.cancelWorkflow`, one step for the whole batch, as
 /// the method is. Returns the ids that actually moved — see [`DBOS::cancel_all`] for the cascade.
 ///
 /// Named `cancel_workflows` where the method is `cancel_all`: a free function has no receiver to
@@ -527,7 +527,7 @@ pub fn cancel_workflows<'a, E: DurableError + 'a>(
 /// The free form of [`DBOS::resume`], for a workflow body that restarts a cancelled or stalled
 /// workflow without capturing a [`DBOS`] in its registered closure — see [`cancel_workflow`] for
 /// the cycle that capture would make. The same body builds both, so the resume is checkpointed
-/// under the same step name (`DBOS.resume_workflow`) and replays as the method's would. See
+/// under the same step name (`DBOS.resumeWorkflow`) and replays as the method's would. See
 /// [`DBOS::resume`] for what resuming does to a workflow that is still running.
 ///
 /// **A [`PendingStart`], as [`WorkflowRef::start`](crate::WorkflowRef::start) hands back**: it
@@ -571,7 +571,7 @@ pub fn resume_workflow_with<'a, R: 'a, E: 'a>(
 /// Resumes workflows from inside a workflow, handing back one handle per id, in the order given.
 ///
 /// The free form of [`DBOS::resume_all`] and the bulk form of [`resume_workflow`], named for the
-/// plural as [`cancel_workflows`] is. One step, `DBOS.resume_workflow`, for the whole batch, and
+/// plural as [`cancel_workflows`] is. One step, `DBOS.resumeWorkflow`, for the whole batch, and
 /// every id must exist or nothing is enqueued — see [`DBOS::resume_all`].
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. **The call answers in the
@@ -596,7 +596,7 @@ pub fn resume_workflows<'a, R: 'a, E: 'a>(
 /// from the step that failed — that has no [`DBOS`] to call it on and should not capture one: see
 /// [`cancel_workflow`] for the cycle that capture would make.
 ///
-/// **Checkpointed in the transaction that writes the fork**, under `DBOS.fork_workflow`, because
+/// **Checkpointed in the transaction that writes the fork**, under `DBOS.forkWorkflow`, because
 /// the same body builds this and the method. That is what matters most here: a fork generates a
 /// new id, so a replay without the checkpoint would write a second fork. A replay hands back the
 /// id the first execution recorded.
@@ -642,7 +642,7 @@ pub fn fork_workflow_with<'a, R: 'a, E: 'a>(
 ///
 /// The free form of [`DBOS::fork_all`] and the bulk form of [`fork_workflow`], named for the plural
 /// as [`cancel_workflows`] is. Every source must exist or no fork is written, and the batch is one
-/// step, `DBOS.fork_workflow` — see [`DBOS::fork_all`].
+/// step, `DBOS.forkWorkflow` — see [`DBOS::fork_all`].
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. **The call answers in the
 /// engine's channel**, as the method does, so [`lift`](PendingStep::lift) puts it in the caller's
@@ -664,7 +664,7 @@ pub fn fork_workflows<'a, R: 'a, E: 'a>(
 ///
 /// The free form of [`DBOS::rewind`], for a workflow body with no [`DBOS`] to call it on — see
 /// [`cancel_workflow`] for why it should not capture one. Checkpointed under
-/// `DBOS.rewind_workflow`, as the method is, in the transaction that performs the rewind, so a
+/// `DBOS.rewindWorkflow`, as the method is, in the transaction that performs the rewind, so a
 /// recovered caller does not rewind the target again. See [`DBOS::rewind_with`] for what is
 /// discarded, and why a workflow still running cannot be rewound.
 ///
@@ -697,7 +697,7 @@ pub fn rewind_workflow_with<'a, R: 'a, E: 'a>(
 ///
 /// The free form of [`DBOS::delete`], for a workflow body with no [`DBOS`] to call it on — see
 /// [`cancel_workflow`] for why it should not capture one. Checkpointed under
-/// `DBOS.delete_workflow`, as the method is. See [`DBOS::delete`] for what goes with the row, and
+/// `DBOS.deleteWorkflow`, as the method is. See [`DBOS::delete`] for what goes with the row, and
 /// [`DBOS::delete_all`] for why a workflow cannot delete itself.
 ///
 /// **Named for what it deletes**, where the method is too: a queue and a schedule can be deleted
@@ -716,7 +716,7 @@ pub fn delete_workflow<'a, E: DurableError + 'a>(workflow_id: &'a str) -> Pendin
 ///
 /// The free form of [`DBOS::delete_all`] and the bulk form of [`delete_workflow`], named for the
 /// plural as [`cancel_workflows`] is. Returns how many rows went, descendants included; one step,
-/// `DBOS.delete_workflow`, for the whole batch.
+/// `DBOS.deleteWorkflow`, for the whole batch.
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
 /// channel.
@@ -735,7 +735,7 @@ pub fn delete_workflows<'a, E: DurableError + 'a>(
 ///
 /// The free form of [`DBOS::set_workflow_delay`], for a workflow body with no [`DBOS`] to call it
 /// on — see [`cancel_workflow`] for why it should not capture one. Checkpointed under
-/// `DBOS.set_workflow_delay`, as the method is, and a delay too long to store is refused before the
+/// `DBOS.setWorkflowDelay`, as the method is, and a delay too long to store is refused before the
 /// call takes its step id. Only a `DELAYED` row moves; see the method for how the delay is timed.
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
@@ -755,7 +755,7 @@ pub fn set_workflow_delay<'a, E: DurableError + 'a>(
 ///
 /// The free form of [`DBOS::update_workflow_attributes`], for a workflow body with no [`DBOS`] to
 /// call it on — see [`cancel_workflow`] for why it should not capture one. Checkpointed under
-/// `DBOS.update_workflow_attributes`, as the method is, so a refusal for a missing workflow
+/// `DBOS.updateWorkflowAttributes`, as the method is, so a refusal for a missing workflow
 /// replays as the same refusal. A replacement, not a merge:
 /// [`merge_workflow_attributes`](fn@merge_workflow_attributes) adds keys.
 ///
@@ -776,7 +776,7 @@ pub fn update_workflow_attributes<'a, E: DurableError + 'a>(
 ///
 /// The free form of [`DBOS::merge_workflow_attributes`], for a workflow body with no [`DBOS`] to
 /// call it on — see [`cancel_workflow`] for why it should not capture one. Recorded under the same
-/// step name as a replacement, `DBOS.update_workflow_attributes`, as the method is.
+/// step name as a replacement, `DBOS.updateWorkflowAttributes`, as the method is.
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's
 /// channel.
@@ -795,7 +795,7 @@ pub fn merge_workflow_attributes<'a, E: DurableError + 'a>(
 ///
 /// The free form of [`DBOS::list_workflows`], for a supervisor that finds what to act on — stuck
 /// workflows, a tenant's backlog — without a [`DBOS`] to call it on; see [`cancel_workflow`] for
-/// why it should not capture one. Checkpointed under `DBOS.list_workflows`, as the method is, so a
+/// why it should not capture one. Checkpointed under `DBOS.listWorkflows`, as the method is, so a
 /// replay sees the rows the first execution saw and acts on the same ones, rather than on whatever
 /// matches by then.
 ///
@@ -827,7 +827,7 @@ pub fn list_workflows<'a, E: DurableError + 'a>(
 /// The free form of [`DBOS::list_workflow_steps`], for a supervisor that finds where another
 /// workflow failed — to fork it from there — without a [`DBOS`] to call it on; see
 /// [`cancel_workflow`] for why it should not capture one. Checkpointed under
-/// `DBOS.list_workflow_steps`, as the method is, so a replay reads the steps the first execution
+/// `DBOS.listWorkflowSteps`, as the method is, so a replay reads the steps the first execution
 /// read.
 ///
 /// [`Error::NotInWorkflow`] outside a workflow; plain inside a step. The error is the workflow's

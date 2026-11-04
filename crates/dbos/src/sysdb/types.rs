@@ -900,6 +900,51 @@ impl<'a> NewWorkflow<'a> {
 mod tests {
     use super::*;
 
+    /// Every recorded step name, spelled out. A replay compares these exactly, so renaming one
+    /// strands every workflow recorded under the old name; this test is where such a rename has to
+    /// be made on purpose. The names Rust 0.5 recorded are among them, unchanged.
+    #[test]
+    fn the_step_names_are_pinned() {
+        use step_names::*;
+        let pinned = [
+            (SLEEP, "DBOS.sleep"),
+            (PATCH_PREFIX, "DBOS.patch-"),
+            (SEND, "DBOS.send"),
+            (SEND_BULK, "DBOS.sendBulk"),
+            (WRITE_STREAM, "DBOS.writeStream"),
+            (CLOSE_STREAM, "DBOS.closeStream"),
+            (READ_STREAM, "DBOS.readStream"),
+            (READ_STREAM_VALUE, "DBOS.readStreamValue"),
+            (SET_EVENT, "DBOS.setEvent"),
+            (GET_EVENT, "DBOS.getEvent"),
+            (GET_RESULT, "DBOS.getResult"),
+            (SELECT_WORKFLOW, "DBOS.selectWorkflow"),
+            (SELECT_STEP, "DBOS.selectStep"),
+            (RECV, "DBOS.recv"),
+            (DEBOUNCE, "DBOS.debounceDelayedWorkflow"),
+            (CANCEL_WORKFLOW, "DBOS.cancelWorkflow"),
+            (RESUME_WORKFLOW, "DBOS.resumeWorkflow"),
+            (DELETE_WORKFLOW, "DBOS.deleteWorkflow"),
+            (FORK_WORKFLOW, "DBOS.forkWorkflow"),
+            (REWIND_WORKFLOW, "DBOS.rewindWorkflow"),
+            (SET_WORKFLOW_DELAY, "DBOS.setWorkflowDelay"),
+            (UPDATE_WORKFLOW_ATTRIBUTES, "DBOS.updateWorkflowAttributes"),
+            (LIST_WORKFLOWS, "DBOS.listWorkflows"),
+            (LIST_WORKFLOW_STEPS, "DBOS.listWorkflowSteps"),
+            (CREATE_SCHEDULE, "DBOS.createSchedule"),
+            (UPSERT_SCHEDULE, "DBOS.upsertSchedule"),
+            (GET_SCHEDULE, "DBOS.getSchedule"),
+            (LIST_SCHEDULES, "DBOS.listSchedules"),
+            (UPDATE_SCHEDULE, "DBOS.updateSchedule"),
+            (PAUSE_SCHEDULE, "DBOS.pauseSchedule"),
+            (RESUME_SCHEDULE, "DBOS.resumeSchedule"),
+            (DELETE_SCHEDULE, "DBOS.deleteSchedule"),
+        ];
+        for (constant, literal) in pinned {
+            assert_eq!(constant, literal);
+        }
+    }
+
     /// Every way of building a name stores an empty class or config as absent, so names for the
     /// same workflow are equal however they were built.
     #[test]
@@ -3057,11 +3102,17 @@ impl RewindOptions<'_> {
 /// write them. A second backend that redeclared them could drift from this one silently, and
 /// nothing would notice until a workflow recorded by one was replayed by the other.
 ///
-/// **`DBOS.`, then snake_case.** The prefix marks a step as the library's own rather than the
+/// **`DBOS.`, then camelCase.** The prefix marks a step as the library's own rather than the
 /// application's, and the DBOS console relies on it: a step whose name starts with `DBOS.` is shown
 /// as a framework action, not as user code. After the prefix, each name is the operation's words
-/// in snake_case, as Rust spells them — `send_bulk` records `DBOS.send_bulk`, and
-/// [`DBOS::cancel`](crate::DBOS::cancel) records `DBOS.cancel_workflow`.
+/// in camelCase — `send_bulk` records `DBOS.sendBulk`, and [`DBOS::cancel`](crate::DBOS::cancel)
+/// records `DBOS.cancelWorkflow` — the spelling the other SDKs sharing the database use for their
+/// own steps, and the names Rust 0.5 recorded. The console reads some of them by exact name: it
+/// tells a parent's await of a child from the child's start by `DBOS.getResult`.
+///
+/// **Renaming one breaks replay.** A replay compares each recorded name exactly, so a workflow
+/// recorded under the old name fails under the new one with [`Error::UnexpectedStep`] and is
+/// eventually parked. A workflow started by an older release must still finish under this one.
 ///
 /// **Public because a caller may legitimately need to name one** — filtering a step listing to the
 /// engine's own operations, or grouping by them — and retyping a string the engine already owns is
@@ -3091,14 +3142,14 @@ pub mod step_names {
     /// it. Inferring it from the batch size would record a one-message bulk send as `DBOS.send`,
     /// which is not the call the caller made.
     pub const SEND: &str = "DBOS.send";
-    pub const SEND_BULK: &str = "DBOS.send_bulk";
+    pub const SEND_BULK: &str = "DBOS.sendBulk";
 
     /// The step names a stream write records, chosen by whether the value is the closing sentinel.
     ///
     /// Deriving rather than passing means a close is always recorded as a close, whichever entry
     /// point reached it.
-    pub const WRITE_STREAM: &str = "DBOS.write_stream";
-    pub const CLOSE_STREAM: &str = "DBOS.close_stream";
+    pub const WRITE_STREAM: &str = "DBOS.writeStream";
+    pub const CLOSE_STREAM: &str = "DBOS.closeStream";
 
     /// The step names a workflow's stream read records, one step per value it delivers: the
     /// reader's [`READ_STREAM`], and [`READ_STREAM_VALUE`] for the read of a single value.
@@ -3106,14 +3157,14 @@ pub mod step_names {
     /// The two reads record the same rows under different names so that a workflow changed from
     /// one to the other is caught on replay as `UnexpectedStep` rather than handed a value the
     /// other read recorded.
-    pub const READ_STREAM: &str = "DBOS.read_stream";
-    pub const READ_STREAM_VALUE: &str = "DBOS.read_stream_value";
+    pub const READ_STREAM: &str = "DBOS.readStream";
+    pub const READ_STREAM_VALUE: &str = "DBOS.readStreamValue";
 
     /// The step name `set_event` records, which a replay compares against.
-    pub const SET_EVENT: &str = "DBOS.set_event";
+    pub const SET_EVENT: &str = "DBOS.setEvent";
 
     /// The step name `get_event` records.
-    pub const GET_EVENT: &str = "DBOS.get_event";
+    pub const GET_EVENT: &str = "DBOS.getEvent";
 
     /// The step name a parent writes when it awaits a child.
     ///
@@ -3121,7 +3172,7 @@ pub mod step_names {
     /// [`record_child_result`](crate::sysdb::SystemDatabase::record_child_result) and read back by
     /// [`check_child_result`](crate::sysdb::SystemDatabase::check_child_result), which is the only
     /// reason both of those exist rather than the caller passing a name.
-    pub const GET_RESULT: &str = "DBOS.get_result";
+    pub const GET_RESULT: &str = "DBOS.getResult";
 
     /// The step name a wait for the *first* of several workflows records, named for the call that
     /// writes it, [`select_workflow`](crate::select_workflow()).
@@ -3131,7 +3182,7 @@ pub mod step_names {
     /// choice a replay could make differently, and the [`GET_RESULT`] steps it is written to
     /// precede already record the outcomes a replay reads. The free
     /// [`join_workflows`](crate::join_workflows()) sets out the argument.
-    pub const SELECT_WORKFLOW: &str = "DBOS.select_workflow";
+    pub const SELECT_WORKFLOW: &str = "DBOS.selectWorkflow";
 
     /// The step name a durable race over steps records, named for the call that writes it,
     /// [`select_step!`](crate::select_step).
@@ -3139,13 +3190,13 @@ pub mod step_names {
     /// **What it records is a position, not an outcome**: the index of the branch that won, among
     /// the branches that race at this point in the code. The winner's own result is under the
     /// winning step's own id, so recording it here too would keep one outcome in two places.
-    pub const SELECT_STEP: &str = "DBOS.select_step";
+    pub const SELECT_STEP: &str = "DBOS.selectStep";
 
     /// The step name `recv` records.
     pub const RECV: &str = "DBOS.recv";
 
     /// The step a debounce records when a workflow does the bouncing.
-    pub const DEBOUNCE: &str = "DBOS.debounce_delayed_workflow";
+    pub const DEBOUNCE: &str = "DBOS.debounceDelayedWorkflow";
 
     /// The step names the management surface records, which a replay compares against.
     ///
@@ -3172,28 +3223,28 @@ pub mod step_names {
     /// **[`FORK_WORKFLOW`] covers every fork point**, because
     /// [`fork_from`](crate::sysdb::SystemDatabase::fork_from) resolves all four
     /// [`ForkPoint`](super::ForkPoint)s through one method.
-    pub const CANCEL_WORKFLOW: &str = "DBOS.cancel_workflow";
-    pub const RESUME_WORKFLOW: &str = "DBOS.resume_workflow";
-    pub const DELETE_WORKFLOW: &str = "DBOS.delete_workflow";
-    pub const FORK_WORKFLOW: &str = "DBOS.fork_workflow";
-    pub const REWIND_WORKFLOW: &str = "DBOS.rewind_workflow";
-    pub const SET_WORKFLOW_DELAY: &str = "DBOS.set_workflow_delay";
-    pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.update_workflow_attributes";
-    pub const LIST_WORKFLOWS: &str = "DBOS.list_workflows";
-    pub const LIST_WORKFLOW_STEPS: &str = "DBOS.list_workflow_steps";
+    pub const CANCEL_WORKFLOW: &str = "DBOS.cancelWorkflow";
+    pub const RESUME_WORKFLOW: &str = "DBOS.resumeWorkflow";
+    pub const DELETE_WORKFLOW: &str = "DBOS.deleteWorkflow";
+    pub const FORK_WORKFLOW: &str = "DBOS.forkWorkflow";
+    pub const REWIND_WORKFLOW: &str = "DBOS.rewindWorkflow";
+    pub const SET_WORKFLOW_DELAY: &str = "DBOS.setWorkflowDelay";
+    pub const UPDATE_WORKFLOW_ATTRIBUTES: &str = "DBOS.updateWorkflowAttributes";
+    pub const LIST_WORKFLOWS: &str = "DBOS.listWorkflows";
+    pub const LIST_WORKFLOW_STEPS: &str = "DBOS.listWorkflowSteps";
 
     /// The step names the schedule methods record, which a replay compares against.
     ///
     /// Pausing and resuming reach one method but record two names: the name follows the status
     /// being set rather than the method being called.
-    pub const CREATE_SCHEDULE: &str = "DBOS.create_schedule";
-    pub const UPSERT_SCHEDULE: &str = "DBOS.upsert_schedule";
-    pub const GET_SCHEDULE: &str = "DBOS.get_schedule";
-    pub const LIST_SCHEDULES: &str = "DBOS.list_schedules";
-    pub const UPDATE_SCHEDULE: &str = "DBOS.update_schedule";
-    pub const PAUSE_SCHEDULE: &str = "DBOS.pause_schedule";
-    pub const RESUME_SCHEDULE: &str = "DBOS.resume_schedule";
-    pub const DELETE_SCHEDULE: &str = "DBOS.delete_schedule";
+    pub const CREATE_SCHEDULE: &str = "DBOS.createSchedule";
+    pub const UPSERT_SCHEDULE: &str = "DBOS.upsertSchedule";
+    pub const GET_SCHEDULE: &str = "DBOS.getSchedule";
+    pub const LIST_SCHEDULES: &str = "DBOS.listSchedules";
+    pub const UPDATE_SCHEDULE: &str = "DBOS.updateSchedule";
+    pub const PAUSE_SCHEDULE: &str = "DBOS.pauseSchedule";
+    pub const RESUME_SCHEDULE: &str = "DBOS.resumeSchedule";
+    pub const DELETE_SCHEDULE: &str = "DBOS.deleteSchedule";
 }
 
 /// One message to deliver to a workflow.

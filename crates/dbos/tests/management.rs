@@ -1941,7 +1941,7 @@ async fn attributes_are_merged_from_outside_and_inside_a_workflow() {
         .into_iter()
         .map(|step| step.step_name)
         .collect();
-    assert_eq!(steps, ["DBOS.update_workflow_attributes"]);
+    assert_eq!(steps, ["DBOS.updateWorkflowAttributes"]);
 
     dbos.shutdown().await;
 }
@@ -1996,7 +1996,7 @@ async fn an_attribute_update_on_a_missing_workflow_is_refused_and_replayed() {
             .iter()
             .map(|step| (step.step_name.as_str(), step.error.is_some()))
             .collect::<Vec<_>>(),
-        [("DBOS.update_workflow_attributes", true)]
+        [("DBOS.updateWorkflowAttributes", true)]
     );
 
     // The id exists now, so only the record can answer a replay with the refusal.
@@ -2118,7 +2118,7 @@ async fn management_calls_from_inside_a_workflow_are_recorded_as_steps() {
         .collect();
     assert_eq!(
         recorded,
-        [(0, "DBOS.cancel_workflow"), (1, "DBOS.list_workflows")],
+        [(0, "DBOS.cancelWorkflow"), (1, "DBOS.listWorkflows")],
         "the management calls were not checkpointed under the library's names",
     );
 
@@ -2176,7 +2176,7 @@ async fn a_management_checkpoint_is_in_the_configured_serializer_and_replays_by_
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1, "{steps:?}");
-    assert_eq!(steps[0].step_name, "DBOS.list_workflows");
+    assert_eq!(steps[0].step_name, "DBOS.listWorkflows");
     assert_eq!(
         steps[0].serialization.as_deref(),
         Some("rust_serde"),
@@ -2307,7 +2307,7 @@ async fn a_replayed_fork_returns_the_id_it_recorded_and_does_not_fork_again() {
                 .await
                 .expect("read failed");
             if !steps.is_empty() {
-                assert_eq!(steps[0].step_name, "DBOS.fork_workflow");
+                assert_eq!(steps[0].step_name, "DBOS.forkWorkflow");
                 break;
             }
             assert!(
@@ -2424,7 +2424,7 @@ async fn a_refused_resume_replays_its_refusal_after_the_workflow_appears() {
         .await
         .unwrap();
     assert_eq!(steps.len(), 1, "{steps:?}");
-    assert_eq!(steps[0].step_name, "DBOS.resume_workflow");
+    assert_eq!(steps[0].step_name, "DBOS.resumeWorkflow");
     assert!(
         steps[0].error.is_some() && steps[0].output.is_none(),
         "the refusal is recorded as the step's error: {:?}",
@@ -3238,8 +3238,8 @@ async fn an_empty_management_batch_inside_a_workflow_records_its_step() {
     assert_eq!(
         seen,
         [
-            (0, "DBOS.cancel_workflow"),
-            (1, "DBOS.delete_workflow"),
+            (0, "DBOS.cancelWorkflow"),
+            (1, "DBOS.deleteWorkflow"),
             (2, "after")
         ],
         "each empty batch recorded its own row and left `after` where it would have been anyway"
@@ -3337,9 +3337,9 @@ async fn management_calls_driven_out_of_build_order_keep_the_ids_they_were_built
     assert_eq!(
         recorded,
         [
-            (0, "DBOS.cancel_workflow"),
-            (1, "DBOS.list_workflow_steps"),
-            (2, "DBOS.list_workflows"),
+            (0, "DBOS.cancelWorkflow"),
+            (1, "DBOS.listWorkflowSteps"),
+            (2, "DBOS.listWorkflows"),
         ],
         "the ids follow the order the calls were built in, not the order they were polled in",
     );
@@ -3926,35 +3926,35 @@ async fn a_workflow_with_no_handle_manages_others_through_the_free_forms() {
     assert_eq!(
         recorded,
         [
-            "DBOS.cancel_workflow",
-            "DBOS.resume_workflow",
-            "DBOS.get_result",
-            "DBOS.cancel_workflow",
-            "DBOS.resume_workflow",
-            "DBOS.get_result",
-            "DBOS.get_result",
-            "DBOS.resume_workflow",
-            "DBOS.fork_workflow",
-            "DBOS.fork_workflow",
-            "DBOS.fork_workflow",
-            "DBOS.get_result",
-            "DBOS.get_result",
-            "DBOS.get_result",
-            "DBOS.rewind_workflow",
-            "DBOS.get_result",
-            "DBOS.rewind_workflow",
-            "DBOS.get_result",
-            "DBOS.delete_workflow",
-            "DBOS.delete_workflow",
-            "DBOS.set_workflow_delay",
+            "DBOS.cancelWorkflow",
+            "DBOS.resumeWorkflow",
+            "DBOS.getResult",
+            "DBOS.cancelWorkflow",
+            "DBOS.resumeWorkflow",
+            "DBOS.getResult",
+            "DBOS.getResult",
+            "DBOS.resumeWorkflow",
+            "DBOS.forkWorkflow",
+            "DBOS.forkWorkflow",
+            "DBOS.forkWorkflow",
+            "DBOS.getResult",
+            "DBOS.getResult",
+            "DBOS.getResult",
+            "DBOS.rewindWorkflow",
+            "DBOS.getResult",
+            "DBOS.rewindWorkflow",
+            "DBOS.getResult",
+            "DBOS.deleteWorkflow",
+            "DBOS.deleteWorkflow",
+            "DBOS.setWorkflowDelay",
             // `retrieve_workflow` records nothing; awaiting its handle does.
-            "DBOS.get_result",
-            "DBOS.update_workflow_attributes",
-            "DBOS.update_workflow_attributes",
-            "DBOS.list_workflows",
-            "DBOS.list_workflow_steps",
-            "DBOS.list_workflow_steps",
-            "DBOS.fork_workflow",
+            "DBOS.getResult",
+            "DBOS.updateWorkflowAttributes",
+            "DBOS.updateWorkflowAttributes",
+            "DBOS.listWorkflows",
+            "DBOS.listWorkflowSteps",
+            "DBOS.listWorkflowSteps",
+            "DBOS.forkWorkflow",
         ],
         "the free forms did not record under the methods' step names",
     );
