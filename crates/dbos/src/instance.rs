@@ -824,4 +824,88 @@ mod tests {
         assert!(!shown.contains("hunter2"), "{shown}");
         assert!(shown.contains("test-app"), "{shown}");
     }
+
+    /// A launched instance against `db`, under its own application name and version.
+    fn launchable(app_name: &str, db: &dbos_test_support::TestDatabase) -> DBOS {
+        DBOS::new(Config {
+            migrate: false,
+            app_version: Some(format!("{app_name}-1.0.0")),
+            ..Config::new(app_name, db.url())
+        })
+    }
+
+    /// Shuts down the executor in `slot` the way [`DBOS::shutdown`] would, for a test that has
+    /// dropped every handle to the instance and so has nothing to call it on.
+    async fn shut_down(slot: &ExecutorSlot) {
+        let executor = slot.write().take().expect("still launched");
+        executor.stop(Duration::ZERO).await;
+        executor.close().await;
+    }
+
+    /// A `WorkflowRef` keeps starting workflows while its instance is launched, after the last
+    /// handle to the instance itself is dropped: it holds the executor's slot, not the instance.
+    ///
+    /// A unit test because nothing outside the crate can shut such an instance down.
+    #[tokio::test]
+    async fn a_workflow_ref_starts_workflows_after_the_instance_is_dropped() {
+        let db = dbos_test_support::test_database().await;
+        let dbos = launchable("surviving-ref", &db);
+        let child = dbos
+            .register_workflow("child", |n: u32| async move { Ok::<u32, Error>(n * 2) })
+            .expect("registration failed");
+        let parent = {
+            let child = child.clone();
+            dbos.register_workflow("parent", move |n: u32| {
+                let child = child.clone();
+                async move { child.run(n).await }
+            })
+            .expect("registration failed")
+        };
+        dbos.launch().await.expect("launch failed");
+        let slot = dbos.executor_slot();
+        drop(dbos);
+
+        assert_eq!(child.run(3).await.expect("the run failed"), 6);
+        let handle = child.start(4).await.expect("the start failed");
+        assert_eq!(handle.result().await.expect("the child failed"), 8);
+        assert_eq!(
+            parent.run(5).await.expect("the parent failed"),
+            10,
+            "a child started from a workflow body, with no handle to the instance anywhere"
+        );
+
+        shut_down(&slot).await;
+    }
+
+    /// A child started through a reference from another instance is still
+    /// [`Error::WrongInstance`] once every handle to that other instance is dropped, rather than
+    /// some other error that hides the wiring mistake.
+    #[tokio::test]
+    async fn a_dropped_instance_s_workflow_ref_is_still_the_wrong_instance() {
+        let db = dbos_test_support::test_database().await;
+        let other = launchable("dropped-other-instance", &db);
+        let owner = launchable("dropped-owner-instance", &db);
+        let child = other
+            .register_workflow("child", |()| async move { Ok::<u32, Error>(1) })
+            .expect("registration failed");
+        let parent = owner
+            .register_workflow("parent", move |()| {
+                let child = child.clone();
+                async move { child.run(()).await }
+            })
+            .expect("registration failed");
+        other.launch().await.expect("launch failed");
+        owner.launch().await.expect("launch failed");
+        let other_slot = other.executor_slot();
+        drop(other);
+
+        let error = parent.run(()).await.expect_err("the parent succeeded");
+        assert!(
+            matches!(&error, Error::WrongInstance { operation } if operation.contains("workflow")),
+            "expected a wrong-instance refusal, got {error:?}"
+        );
+
+        owner.shutdown().await;
+        shut_down(&other_slot).await;
+    }
 }
