@@ -509,7 +509,7 @@ async fn a_patch_before_a_waiting_get_event_takes_the_old_path_on_recovery() {
     assert_eq!(finished_output(&db, id).await.as_deref(), Some("3"));
     assert_eq!(
         names(&dbos, id).await,
-        ["step_one", "DBOS.get_event", "DBOS.sleep"],
+        ["step_one", "DBOS.getEvent", "DBOS.sleep"],
         "no marker: the old code had got past the patch's position"
     );
 
@@ -517,7 +517,7 @@ async fn a_patch_before_a_waiting_get_event_takes_the_old_path_on_recovery() {
     assert_eq!(run(&workflow, "new-reading-run").await, 103);
     assert_eq!(
         names(&dbos, "new-reading-run").await,
-        ["step_one", V2, "DBOS.get_event", "DBOS.sleep"]
+        ["step_one", V2, "DBOS.getEvent", "DBOS.sleep"]
     );
     dbos.shutdown().await;
 }

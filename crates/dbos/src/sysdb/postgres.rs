@@ -68,7 +68,7 @@ mod notifier;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgDatabaseError, PgPoolOptions, PgSeverity};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
 use self::listener::Listener;
@@ -155,6 +155,9 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// | `53…` | insufficient resources — out of memory, too many connections | connection |
 /// | `40001`, `40P01` | serialization failure, deadlock detected | conflict |
 /// | `25P03` | the session sat idle in a transaction too long, and was ended | connection |
+/// | `08P01` at `ERROR` | protocol violation — a malformed request | permanent |
+/// | `57014` | statement cancelled — but see CockroachDB's drain below | permanent |
+/// | `57P04` | database dropped | permanent |
 /// | anything else | the request reached the database and was refused | permanent |
 ///
 /// `53` is grouped with connections: `53300 too_many_connections` is a failure to obtain a
@@ -169,17 +172,44 @@ fn empty_to_none(value: Option<&str>) -> Option<&str> {
 /// an ambiguous result, where the transaction may have committed and a replay could apply it
 /// twice. Both are permanent, so they reach the caller.
 ///
+/// **Two codes are carved out of the connection classes**, because asking again cannot help.
+/// `57014` is a statement cancelled while the connection stayed healthy, by `statement_timeout`
+/// or by someone cancelling the backend; a timeout fires again on every attempt, and a deliberate
+/// cancel is meant to stop the work, not delay it. `57P04` names a database that was dropped,
+/// which no wait brings back: a standby reports it when the primary drops the database.
+///
+/// **CockroachDB's bare `query execution canceled` is the exception to `57014`.** A node that
+/// drains, as every rolling restart does, cuts off in-flight statements with it (or with `57P01`,
+/// depending on timing) and then closes the session; reconnecting reaches a live node. Its
+/// statement timeout says `query execution canceled due to statement timeout`, and Postgres's
+/// cancellations all start `canceling statement`, so the bare message is read as a connection
+/// failure and everything else under `57014` is not. The cost: a deliberate `CANCEL QUERY` on
+/// CockroachDB carries the same message and is retried.
+///
+/// **`08P01` is split by severity**, because two different failures share it. Postgres raises it
+/// at `ERROR` for a malformed request — a bind that supplies the wrong number of parameters, say
+/// — and leaves the session usable; the same request is malformed on every attempt, so it is
+/// permanent. PgBouncer uses it as the code for the errors it raises itself, and sends the ones
+/// that close the client connection at `FATAL`: a pool wait that timed out, a server shutting
+/// down, a client limit reached. Those are what reconnecting is for, so a `FATAL` one is a
+/// connection error. The cost is that PgBouncer's permanent refusals, such as a failed login, are
+/// retried too.
+///
+/// `08007`, transaction resolution unknown, stays in its class. Nothing Postgres raises carries
+/// it, and it is no more ambiguous than a connection lost during a commit, which usually arrives
+/// with no SQLSTATE, or as `57P01` when the backend is terminated, and is retried like any other
+/// lost connection.
+///
 /// `XX`, the internal-error class, is the one prefix whose message is read as well as its code:
 /// CockroachDB reports a lost client connection as an internal error, so the code alone would
 /// call a transport failure permanent. See [`is_transport_failure`].
-///
-/// TODO: classifying by class prefix puts a *protocol* violation in whichever class its code
-/// carries rather than calling it permanent, so some are retried instead of failing fast — a
-/// parameter-count mismatch, say. CockroachDB can also report its own i/o timeout as `XXUUU`,
-/// which lands in the internal-error class.
 fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     if let Some(code) = sqlstate {
-        return classify_sqlstate(code, error.as_database_error().map(|e| e.message()));
+        let database = error.as_database_error();
+        let severity = database
+            .and_then(|e| e.try_downcast_ref::<PgDatabaseError>())
+            .map(PgDatabaseError::severity);
+        return classify_sqlstate(code, severity, database.map(|e| e.message()));
     }
     // No SQLSTATE means the database never answered, so the request never reached it. sqlx
     // names the transport failure as a variant, so no message text needs reading.
@@ -197,10 +227,42 @@ fn classify(error: &sqlx::Error, sqlstate: Option<&str>) -> BackendErrorKind {
     }
 }
 
-/// [`classify`] for a failure the database answered, from its SQLSTATE and message alone.
-fn classify_sqlstate(code: &str, message: Option<&str>) -> BackendErrorKind {
+/// The message CockroachDB attaches to `57014` when it cuts off a statement by draining the node
+/// or cancelling the session, rather than by a statement timeout.
+const COCKROACH_SESSION_CANCELED: &str = "query execution canceled";
+
+/// [`classify`] for a failure the database answered, from its SQLSTATE, severity and message.
+///
+/// `severity` is `None` only for an error sqlx did not decode from a server response.
+fn classify_sqlstate(
+    code: &str,
+    severity: Option<PgSeverity>,
+    message: Option<&str>,
+) -> BackendErrorKind {
     if matches!(code, "40001" | "40P01") {
         return BackendErrorKind::Conflict;
+    }
+    // Inside the connection classes, but nothing a reconnect cures; see [`classify`].
+    if code == "57P04" {
+        return BackendErrorKind::Permanent;
+    }
+    // A cancelled statement, unless it is CockroachDB ending the session under it; see
+    // [`classify`].
+    if code == "57014" {
+        return match message {
+            Some(message) if message.trim() == COCKROACH_SESSION_CANCELED => {
+                BackendErrorKind::Connection
+            }
+            _ => BackendErrorKind::Permanent,
+        };
+    }
+    // A session-ending `08P01` is a pooler closing the connection; any other is a malformed
+    // request. See [`classify`].
+    if code == "08P01" {
+        return match severity {
+            Some(PgSeverity::Fatal | PgSeverity::Panic) => BackendErrorKind::Connection,
+            _ => BackendErrorKind::Permanent,
+        };
     }
     // `idle_in_transaction_session_timeout`: the server ended a session that sat idle inside a
     // transaction. The transaction rolled back with it, so asking again on a new connection is
@@ -8201,7 +8263,7 @@ impl PostgresSystemDatabase {
     /// Everything about a send but its recorded name is the same for one message and for many —
     /// the transaction, the fork fan-out, the replay skip, the duplicate-key check, the foreign
     /// key — so the two trait methods are a name apiece over this. Splitting them up there rather
-    /// than inferring the name down here is what makes a one-message batch record `DBOS.send_bulk`.
+    /// than inferring the name down here is what makes a one-message batch record `DBOS.sendBulk`.
     async fn deliver(
         &self,
         messages: &[Message<'_>],
@@ -8403,9 +8465,9 @@ impl PostgresSystemDatabase {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssertSqlSafe, NOW_MS_SQL, PollingConcurrency, PostgresSystemDatabase, Settings,
-        classify_sqlstate, is_transport_failure, latest_version_sql, split_database,
-        step_listing_query, timed_out_sweep_sql, with_retry,
+        AssertSqlSafe, NOW_MS_SQL, PgSeverity, PollingConcurrency, PostgresSystemDatabase,
+        RetryPolicy, Settings, classify_sqlstate, is_transport_failure, latest_version_sql,
+        split_database, step_listing_query, timed_out_sweep_sql, with_retry,
     };
     use crate::sysdb::types::{
         EncodedValue, NewWorkflow, Outcome, StepCaller, StepCodec, Timestamp,
@@ -8422,26 +8484,86 @@ mod tests {
     fn only_serialization_failures_and_deadlocks_are_conflicts() {
         for code in ["40001", "40P01"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Conflict,
                 "{code}"
             );
         }
         for code in ["40000", "40002", "40003"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Permanent,
                 "{code}"
             );
         }
     }
 
-    /// The prefix classes are unchanged by the exact-code rule for class 40.
+    /// A cancelled statement and a dropped database sit in connection classes, but asking again
+    /// cannot help, so they are refused rather than retried, whatever the severity.
+    #[test]
+    fn the_connection_class_exceptions_are_permanent() {
+        let cancellations = [
+            Some("canceling statement due to statement timeout"),
+            Some("canceling statement due to user request"),
+            Some("query execution canceled due to statement timeout"),
+            None,
+        ];
+        for severity in [Some(PgSeverity::Error), Some(PgSeverity::Fatal), None] {
+            for message in cancellations {
+                assert_eq!(
+                    classify_sqlstate("57014", severity, message),
+                    BackendErrorKind::Permanent,
+                    "{severity:?} {message:?}"
+                );
+            }
+            assert_eq!(
+                classify_sqlstate("57P04", severity, None),
+                BackendErrorKind::Permanent,
+                "{severity:?}"
+            );
+        }
+    }
+
+    /// CockroachDB cuts off an in-flight statement with a bare `query execution canceled` when the
+    /// node drains (or with `57P01`, depending on timing), and reconnecting reaches a live node.
+    #[test]
+    fn a_cockroach_session_cancel_is_a_connection_failure() {
+        assert_eq!(
+            classify_sqlstate(
+                "57014",
+                Some(PgSeverity::Error),
+                Some("query execution canceled")
+            ),
+            BackendErrorKind::Connection
+        );
+    }
+
+    /// A protocol violation the server raises as an error is a malformed request; one that ends
+    /// the session is a pooler closing the connection, which reconnecting cures.
+    #[test]
+    fn a_protocol_violation_is_split_by_severity() {
+        for severity in [Some(PgSeverity::Error), Some(PgSeverity::Log), None] {
+            assert_eq!(
+                classify_sqlstate("08P01", severity, None),
+                BackendErrorKind::Permanent,
+                "{severity:?}"
+            );
+        }
+        for severity in [PgSeverity::Fatal, PgSeverity::Panic] {
+            assert_eq!(
+                classify_sqlstate("08P01", Some(severity), Some("query_wait_timeout")),
+                BackendErrorKind::Connection,
+                "{severity:?}"
+            );
+        }
+    }
+
+    /// The prefix classes are unchanged by the exact-code rules.
     #[test]
     fn connection_classes_match_by_prefix() {
-        for code in ["08006", "53300", "57P01"] {
+        for code in ["08000", "08006", "08007", "53300", "57P01", "57P05"] {
             assert_eq!(
-                classify_sqlstate(code, None),
+                classify_sqlstate(code, Some(PgSeverity::Error), None),
                 BackendErrorKind::Connection,
                 "{code}"
             );
@@ -8449,16 +8571,17 @@ mod tests {
         assert_eq!(
             classify_sqlstate(
                 "XXUUU",
+                Some(PgSeverity::Error),
                 Some("read tcp 10.0.0.1:26257->10.0.0.2:5432: i/o timeout")
             ),
             BackendErrorKind::Connection
         );
         assert_eq!(
-            classify_sqlstate("XX000", Some("internal error")),
+            classify_sqlstate("XX000", Some(PgSeverity::Error), Some("internal error")),
             BackendErrorKind::Permanent
         );
         assert_eq!(
-            classify_sqlstate("23505", None),
+            classify_sqlstate("23505", Some(PgSeverity::Error), None),
             BackendErrorKind::Permanent
         );
     }
@@ -8669,6 +8792,78 @@ mod tests {
             .unwrap()
             .expect("wf-caller exists")
             .name
+    }
+
+    /// A statement the server rejects as malformed fails at once rather than being retried.
+    ///
+    /// Binding one parameter to a statement that takes two is a protocol violation the server
+    /// reports as `08P01`, a code in the connection class. Classified as a connection error,
+    /// [`with_retry`] would ask again forever; the timeout is what catches that.
+    #[tokio::test]
+    async fn a_malformed_statement_is_refused_not_retried() {
+        let db = dbos_test_support::test_database().await;
+        let pool = &db.pool().await;
+
+        let outcome = crate::rt::timeout(
+            std::time::Duration::from_secs(10),
+            with_retry(&RetryPolicy::default(), "malformed", move || async move {
+                let sum: i32 = sqlx::query_scalar("SELECT $1::INT4 + $2::INT4")
+                    .bind(1_i32)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(sum)
+            }),
+        )
+        .await
+        .expect("a malformed statement returns instead of being retried");
+
+        match outcome {
+            Err(Error::Backend(backend)) => {
+                assert_eq!(backend.kind, BackendErrorKind::Permanent, "{backend:?}");
+                if db.backend() == dbos_test_support::Backend::Postgres {
+                    assert_eq!(backend.sqlstate.as_deref(), Some("08P01"), "{backend:?}");
+                }
+            }
+            other => panic!("expected a backend error, got {other:?}"),
+        }
+    }
+
+    /// A statement cut off by `statement_timeout` fails at once rather than being retried.
+    ///
+    /// The cancellation is `57014`, in the operator-intervention class. Retried, the same timeout
+    /// would cut off the same statement on every attempt and the call would never return; the
+    /// timeout around it is what catches that.
+    #[tokio::test]
+    async fn a_statement_timeout_is_refused_not_retried() {
+        let db = dbos_test_support::test_database().await;
+        let pool = &db.pool().await;
+
+        let outcome = crate::rt::timeout(
+            std::time::Duration::from_secs(10),
+            with_retry(
+                &RetryPolicy::default(),
+                "statement_timeout",
+                move || async move {
+                    let mut tx = pool.begin().await?;
+                    sqlx::query("SET LOCAL statement_timeout = '50ms'")
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("SELECT pg_sleep(5)").execute(&mut *tx).await?;
+                    tx.commit().await?;
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("a cancelled statement returns instead of being retried");
+
+        match outcome {
+            Err(Error::Backend(backend)) => {
+                assert_eq!(backend.kind, BackendErrorKind::Permanent, "{backend:?}");
+                assert_eq!(backend.sqlstate.as_deref(), Some("57014"), "{backend:?}");
+            }
+            other => panic!("expected a backend error, got {other:?}"),
+        }
     }
 
     /// A backend failure inside the work leaves neither the work's writes nor a recorded error.
@@ -9132,7 +9327,7 @@ mod tests {
     #[test]
     fn an_idle_transaction_timeout_is_retried_as_a_lost_connection() {
         assert_eq!(
-            classify_sqlstate("25P03", None),
+            classify_sqlstate("25P03", Some(PgSeverity::Fatal), None),
             BackendErrorKind::Connection
         );
     }

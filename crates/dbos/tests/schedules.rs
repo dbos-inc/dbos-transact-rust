@@ -500,14 +500,14 @@ async fn schedule_calls_from_inside_a_workflow_are_steps_and_batches_are_refused
     assert_eq!(
         steps,
         [
-            "DBOS.create_schedule",
-            "DBOS.list_schedules",
-            "DBOS.get_schedule",
-            "DBOS.pause_schedule",
-            "DBOS.resume_schedule",
-            "DBOS.update_schedule",
-            "DBOS.delete_schedule",
-            "DBOS.get_schedule",
+            "DBOS.createSchedule",
+            "DBOS.listSchedules",
+            "DBOS.getSchedule",
+            "DBOS.pauseSchedule",
+            "DBOS.resumeSchedule",
+            "DBOS.updateSchedule",
+            "DBOS.deleteSchedule",
+            "DBOS.getSchedule",
         ]
     );
     dbos.shutdown().await;
@@ -1291,7 +1291,7 @@ async fn a_refused_create_replays_its_refusal_after_the_name_is_freed() {
         .await
         .unwrap();
     assert_eq!(steps.len(), 1, "{steps:?}");
-    assert_eq!(steps[0].step_name, "DBOS.create_schedule");
+    assert_eq!(steps[0].step_name, "DBOS.createSchedule");
     assert!(
         steps[0].error.is_some() && steps[0].output.is_none(),
         "the refusal is recorded as the step's error: {:?}",

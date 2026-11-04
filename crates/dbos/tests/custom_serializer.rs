@@ -244,7 +244,7 @@ async fn a_management_checkpoint_goes_through_the_custom_serializer() {
     let (output, tag) = row(
         &db,
         r#"SELECT output, serialization FROM "dbos"."operation_outputs"
-           WHERE workflow_uuid = $1 AND function_name = 'DBOS.list_workflows'"#,
+           WHERE workflow_uuid = $1 AND function_name = 'DBOS.listWorkflows'"#,
         id,
     )
     .await;

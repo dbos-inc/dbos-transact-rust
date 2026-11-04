@@ -438,7 +438,7 @@ async fn a_fresh_debounce_inside_a_workflow_replays_without_enqueueing_again() {
         .collect();
     assert_eq!(
         names,
-        [(0, "DBOS.debounce_delayed_workflow"), (1, "child")],
+        [(0, "DBOS.debounceDelayedWorkflow"), (1, "child")],
         "the bounce and the start are both recorded"
     );
     assert_eq!(
@@ -606,7 +606,7 @@ async fn a_debounce_dropped_while_it_enqueues_still_enqueues_and_records_it() {
     assert_eq!(
         recorded,
         [
-            (0, "DBOS.debounce_delayed_workflow", None),
+            (0, "DBOS.debounceDelayedWorkflow", None),
             (1, "child", Some(child_id.as_str())),
         ],
         "the dropped debounce recorded its bounce and its start"
@@ -669,7 +669,7 @@ async fn a_bounce_inside_a_workflow_replays_without_bouncing_again() {
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1, "only the bounce is recorded: {steps:?}");
-    assert_eq!(steps[0].step_name, "DBOS.debounce_delayed_workflow");
+    assert_eq!(steps[0].step_name, "DBOS.debounceDelayedWorkflow");
 
     // The replay returns the same holder, and the release stays where the first run put it.
     let replayed = dbos
@@ -756,9 +756,9 @@ async fn a_debounce_inside_a_workflow_that_loses_the_key_bounces_again_and_repla
     assert_eq!(
         names,
         [
-            (0, "DBOS.debounce_delayed_workflow"),
+            (0, "DBOS.debounceDelayedWorkflow"),
             (1, "child"),
-            (2, "DBOS.debounce_delayed_workflow"),
+            (2, "DBOS.debounceDelayedWorkflow"),
         ],
         "the lost enqueue and the second bounce are both recorded"
     );
@@ -1483,7 +1483,7 @@ async fn a_deduplicated_debounce_inside_a_workflow_replays_its_error() {
         .await
         .expect("read failed");
     assert_eq!(steps.len(), 1, "only the bounce is recorded: {steps:?}");
-    assert_eq!(steps[0].step_name, "DBOS.debounce_delayed_workflow");
+    assert_eq!(steps[0].step_name, "DBOS.debounceDelayedWorkflow");
 
     // Let the holder run, which frees the key.
     dbos.register_queue(
